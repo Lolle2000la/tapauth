@@ -19,7 +19,7 @@ message AuthenticationRequest {
 }
 
 /**
- * An AuthenticationGrant is sent unicast by the Server (phone) to the 
+ * An AuthenticationGrant is sent unicast by the Server (phone) to the
  * Client (desktop) after a successful user biometric verification.
  * It is signed by the Server to prove its identity.
  */
@@ -71,13 +71,16 @@ message PairingConfirmation {
  * A top-level wrapper for all possible messages.
  */
 message WrapperMessage {
+  // The version of the protocol being used. Currently 1.
+  uint32 version = 1;
+
   oneof payload {
-    PairingHandshake pairing_handshake = 1;
-    PairingConfirmation pairing_confirmation = 2;
-    AuthenticationRequest auth_request = 3;
-    AuthenticationGrant auth_grant = 4;
-    AuthenticationDenial auth_denial = 5;
-    GrantConfirmation grant_confirmation = 6;
-    AuthenticationCancel auth_cancel = 7;
+    PairingHandshake pairing_handshake = 2;
+    PairingConfirmation pairing_confirmation = 3;
+    AuthenticationRequest auth_request = 4;
+    AuthenticationGrant auth_grant = 5;
+    AuthenticationDenial auth_denial = 6;
+    GrantConfirmation grant_confirmation = 7;
+    AuthenticationCancel auth_cancel = 8;
   }
 }
