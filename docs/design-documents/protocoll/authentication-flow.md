@@ -1,68 +1,70 @@
 # Authentication Flow
 
-The basic authentication flow is as follows:
+## Overview
+
+The authentication flow is designed for minimal latency and maximum reliability. It uses a **dual IPv4 broadcast and IPv6 multicast** for discovery, followed by direct unicast communication. The protocol explicitly defines retransmission and confirmation steps to handle UDP packet loss and ensures that stale requests on other devices are canceled promptly.
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant Server
-    loop Client keeps asking for authentification
-        Client->>Server: Broadcast: Encrypted request for authentication 
-    end
-    Server ->> Server: User is asked if they want to authenticate
-    loop Server ensures client received authentication
-        Server ->> Client: Sends encrypted authentication grant
-    end
-    loop Client ensures other servers stop sending authentication grants (run 5 times)
-        Client ->> Server: Broadcast: Authentication complete
-    end
-    Note over Client,Server: User is now authenticated on the client and logged in
+    participant Client (Desktop)
+    participant Server A (Phone 1)
+    participant Server B (Phone 2)
+
+    Client (Desktop)->>+Server A (Phone 1): Broadcast/Multicast: AuthenticationRequest
+    Client (Desktop)->>+Server B (Phone 2): Broadcast/Multicast: AuthenticationRequest
+    Note over Client (Desktop): Client repeats this broadcast with exponential backoff.
+
+    Server A (Phone 1)-->>Client (Desktop): (User Approves) Unicast: AuthenticationGrant
+    Note over Server A (Phone 1): Server A repeats this unicast until it receives confirmation.
+    Server B (Phone 2)-->>-Client (Desktop): (User Ignores)
+    
+    Client (Desktop)->>Server A (Phone 1): Unicast: GrantConfirmation
+    Note over Client (Desktop): Login successful! Client stops broadcasting.
+    
+    Client (Desktop)->>Server B (Phone 2): Broadcast/Multicast: AuthenticationCancel
+    Note over Server B (Phone 2): Server B receives the cancelation and dismisses the user prompt.
 ```
 
-To reduce latency, as few round-trips as possible should be used. The client requesting authentication will keep broadcasting the request until it receives a valid authentication grant from the server. Otherwise it will keep asking in progressively longer intervals, to avoid spamming the network. The request is kept short to fit in a single UDP packet, and is encrypted to avoid leaking information about the user. By keeping it short, sending the request often will not be a big burden on the network.
+## Signature Generation
 
-When the server receives an authentication request, it will ask the user if they want to authenticate (see [user authentication interaction flow](user-authentication-flow.md#user-grants-authentication-on-server-ie-scans-their-fingerprint)). If they do, it will send an encrypted authentication grant back to the client. The grant is also kept short to fit in a single UDP packet, and is encrypted to avoid leaking information about the user.
+To ensure signatures are always valid and verifiable across platforms, the data being signed must have a canonical, unambiguous representation.
 
-## State diagram
+* **Data-To-Be-Signed**: The data to be signed is the **binary-serialized Protobuf message** (e.g., `AuthenticationRequest` or `AuthenticationGrant`) with its `signature` field temporarily empty.
+* **Process**:
+    1.  Construct the message object in code.
+    2.  Ensure the `signature` field within that object is empty or null.
+    3.  Serialize the object to a byte array using the standard Protobuf serialization library.
+    4.  Compute the digital signature of this resulting byte array.
+    5.  Place the computed signature back into the `signature` field of the object before wrapping and encrypting it for transmission.
 
-### Client asks for authentication
+This guarantees that both the signer and the verifier are operating on the exact same sequence of bytes.
 
-```mermaid
-stateDiagram-v2
-    state "Client asks for authentication" as ClientAsksForAuthentication
-    state "Client received authentication grant" as ClientReceivedAuthenticationGrant
-    [*] --> ClientAsksForAuthentication
-    ClientAsksForAuthentication --> ClientAsksForAuthentication: Sends authentication request
-    ClientAsksForAuthentication --> ClientReceivedAuthenticationGrant: Receives valid authentication grant
-    ClientAsksForAuthentication --> [*]: Timeout
+***
 
-    ClientReceivedAuthenticationGrant --> [*]: Authentication complete
-```
+## Protocol Steps & Reliability
 
-Notably timout doesn't really mean that the client stops listening, but it will no longer actively ask for authentication. The client will keep listening for authentication grants until it either receives one, or the user cancels the login attempt. This timeout is configurable, and should be long enough to allow the user to interact with the server.
+1.  **Request Broadcast & Multicast (Client)**:
+    * When the PAM module is activated, the **Client (desktop)** constructs an `AuthenticationRequest`.
+    * It signs the message as per the "Signature Generation" process and sends the encrypted `WrapperMessage` via both **IPv4 broadcast and IPv6 multicast**.
+    * **Reliability**: The Client will re-broadcast this request, starting with a short interval (e.g., 500ms) and using an exponential backoff, until it receives a valid `AuthenticationGrant` or the login process times out.
 
-### Server waits for authentication request
+2.  **Verification and Prompt (Server)**:
+    * All paired **Servers (phones)** receive the request and verify the signature to identify the Client.
+    * The `challenge` nonce is used to de-duplicate the IPv4 and IPv6 packets.
+    * Each Server then prompts its user for approval.
 
-```mermaid
-stateDiagram-v2
-    state "Server waits for authentication request" as ServerWaitsForAuthenticationRequest
-    state "Server asks user for authentication" as ServerAsksUserForAuthentication
-    state "Server sends authentication grant" as ServerSendsAuthenticationGrant
-    [*] --> ServerWaitsForAuthenticationRequest
-    ServerWaitsForAuthenticationRequest --> ServerWaitsForAuthenticationRequest: Receives invalid authentication request
-    ServerWaitsForAuthenticationRequest --> ServerAsksUserForAuthentication: Receives valid authentication request
-    ServerAsksUserForAuthentication --> ServerWaitsForAuthenticationRequest: User denies authentication
-    ServerAsksUserForAuthentication --> ServerSendsAuthenticationGrant: User grants authentication
-    ServerAsksUserForAuthentication --> ServerWaitsForAuthenticationRequest: Login complete received from client (cancels pending requests)
-    ServerSendsAuthenticationGrant --> ServerWaitsForAuthenticationRequest: Sends authentication grant
-```
+3.  **Grant/Denial Unicast (Server)**:
+    * **If the user approves**, the Server sends the `AuthenticationGrant` via **unicast** to the Client.
+    * **If the user denies**, the Server sends an `AuthenticationDenial` via **unicast**.
+    * **Reliability**: The Server will re-send the `AuthenticationGrant` or `AuthenticationDenial` at a fixed interval (e.g., every 1 second) until it receives a `GrantConfirmation` from the Client or a timeout occurs. This ensures the Client receives the response even if the first packet is dropped.
 
-When sending the authentication grant, the server will keep sending it until it receives a confirmation from the client that the authentication is complete. This ensures that the client has received the grant, even if packets are lost or arrive out of order. The client will send the confirmation as soon as it receives a valid authentication grant as a broadcast message. This should also cancel pending authentication requests from on other servers.
+4.  **Confirmation and Cancelation (Client)**:
+    * The Client accepts the **first valid `AuthenticationGrant`** it receives.
+    * **Immediately upon acceptance**:
+        1.  **Confirm**: The Client sends a **unicast** `GrantConfirmation` message directly back to the specific Server that sent the grant. This tells that Server to stop retransmitting.
+        2.  **Cancel**: The Client broadcasts/multicasts an `AuthenticationCancel` message to the entire network. This message contains the original `challenge` nonce.
+        3.  **Login**: The PAM module unlocks the user account.
 
-## Usage of a PAM module
-
-In order to unlock the user account on the client, a PAM (Pluggable Authentication Module) module will be used. This module will handle the communication with the authentication app, and will be responsible for unlocking the user account when a valid authentication grant is received. The PAM module will be invoked by the display manager (e.g. GDM, SDDM, LightDM) when the user selects their account on the login screen. The PAM module will then start the authentication flow as described above.
-
-## Replay attack mitigation
-
-A randomly generated nonce will be included in the authentication request, and the same nonce must be included in the authentication grant. This ensures that an attacker cannot simply replay a previously captured authentication grant to gain access.
+5.  **Handling Cancelation (Other Servers)**:
+    * Any other Server (e.g., a second phone) that still has a pending user prompt will receive the `AuthenticationCancel` message.
+    * It checks if the `challenge` in the cancel message matches the one in its active request. If it does, it automatically dismisses the notification from the user's screen.

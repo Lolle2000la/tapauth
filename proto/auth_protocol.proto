@@ -3,25 +3,25 @@ syntax = "proto3";
 package auth_protocol;
 
 /**
- * An AuthenticationRequest is sent by the Client (desktop) to the 
- * Server (phone), requesting the user to authenticate.
- * It is signed by the Client to prove its identity to the Server.
+ * An AuthenticationRequest is broadcast by the Client (desktop) to
+ * any available Server (phone), requesting authentication.
+ * It is signed by the Client to prove its identity.
  */
 message AuthenticationRequest {
-  // A random nonce for the Server (phone) to sign.
+  // A random nonce for this specific login attempt.
   bytes challenge = 1;
-  // The user account to be unlocked on the Client (desktop).
+  // The user account to be unlocked on the Client (e.g., "jdoe").
   string username = 2;
-  // The hostname of the Client (desktop) machine.
+  // The hostname of the Client machine (e.g., "my-laptop").
   string hostname = 3;
   // Client's signature over the serialized request (with this field empty).
   bytes signature = 4;
 }
 
 /**
- * An AuthenticationGrant is sent by the Server (phone) to the 
+ * An AuthenticationGrant is sent unicast by the Server (phone) to the 
  * Client (desktop) after a successful user biometric verification.
- * It is signed by the Server to prove its identity to the Client.
+ * It is signed by the Server to prove its identity.
  */
 message AuthenticationGrant {
   // The challenge from the request, now signed by the Server's private key.
@@ -31,29 +31,44 @@ message AuthenticationGrant {
 }
 
 /**
- * A PairingHandshake is sent by the Server (phone) to the Client (desktop)
- * during the initial pairing process. After this message is exchanged, both
- * parties have each other's public keys and can independently calculate the
- * shared secret and the SAS for user verification.
+ * An AuthenticationDenial is sent by the Server if the user denies
+ * the request. The Server will repeat sending this until confirmation.
  */
+message AuthenticationDenial {
+  // The challenge from the original request, for identification.
+  bytes challenge = 1;
+}
+
+/**
+ * A GrantConfirmation is sent unicast by the Client to the Server to
+ * confirm receipt of a Grant or Denial, telling the Server to stop retransmitting.
+ */
+message GrantConfirmation {
+  // The challenge from the original request, to identify the session.
+  bytes challenge = 1;
+}
+
+/**
+ * An AuthenticationCancel is broadcast by the Client once it has been
+ * unlocked, telling all other Servers to dismiss their pending prompts.
+ */
+message AuthenticationCancel {
+  // The challenge from the original request, to identify the session to cancel.
+  bytes challenge = 1;
+}
+
+// -- Pairing Messages remain the same --
+
 message PairingHandshake {
-  // The Server's 32-byte X25519 public key.
   bytes server_public_key = 1;
 }
 
-/**
- * A PairingConfirmation is an empty message sent by the Server (phone) to
- * the Client (desktop) *after* the user has visually confirmed the SAS matches.
- * This message is encrypted with the newly derived shared key. Successful
- * decryption by the Client confirms the pairing is complete.
- */
 message PairingConfirmation {
-  // This message has no fields. Its value is in its successful authenticated decryption.
+  // No fields needed.
 }
 
 /**
- * A top-level wrapper for all possible messages. This is the object
- * that gets serialized, encrypted, and sent in a single UDP packet.
+ * A top-level wrapper for all possible messages.
  */
 message WrapperMessage {
   oneof payload {
@@ -61,5 +76,8 @@ message WrapperMessage {
     PairingConfirmation pairing_confirmation = 2;
     AuthenticationRequest auth_request = 3;
     AuthenticationGrant auth_grant = 4;
+    AuthenticationDenial auth_denial = 5;
+    GrantConfirmation grant_confirmation = 6;
+    AuthenticationCancel auth_cancel = 7;
   }
 }
