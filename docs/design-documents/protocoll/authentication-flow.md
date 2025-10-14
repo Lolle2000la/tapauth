@@ -16,17 +16,15 @@ sequenceDiagram
     participant Server B (Phone 2)
 
     par
-        Client (Desktop)->>Server A (Phone 1): IP Discovery (Broadcast/Multicast)
-        Client (Desktop)->>Server B (Phone 2): IP Discovery (Broadcast/Multicast)
+        Client (Desktop)->>Server A (Phone 1): IP Discovery (AuthenticationRequest)
+        Client (Desktop)->>Server B (Phone 2): IP Discovery (AuthenticationRequest)
     and
         Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising)
         Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising)
     end
 
-    Note over Client (Desktop), Server A (Phone 1): Server A receives discovery and responds first.
-    Server A (Phone 1)-->>Client (Desktop): Unicast (IP or BLE): AuthenticationRequest
+    Note over Client (Desktop), Server A (Phone 1): Server A receives a discovery message and prompts its user.
     
-    Server A (Phone 1)->>Server A (Phone 1): User is prompted for biometrics
     alt User on Server A Approves
         Server A (Phone 1)-->>Client (Desktop): Unicast (IP or BLE): AuthenticationGrant
     end
