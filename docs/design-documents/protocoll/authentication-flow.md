@@ -19,8 +19,8 @@ sequenceDiagram
         Client (Desktop)->>Server A (Phone 1): IP Discovery (AuthenticationRequest)
         Client (Desktop)->>Server B (Phone 2): IP Discovery (AuthenticationRequest)
     and
-        Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising)
-        Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising)
+        Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising Ping)
+        Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising Ping)
     end
 
     Note over Client (Desktop), Server A (Phone 1): Server A receives a discovery message and prompts its user.
@@ -70,27 +70,28 @@ All signed messages must use a canonical format to guarantee verifiability.
 
 The protocol is transport-agnostic, but relies on specific behaviors for discovery.
 
-* **IP Network (Wired Ethernet or Wi-Fi)**: Uses UDP. The Client sends to the IPv4 broadcast and a designated IPv6 multicast address. The Server responds via UDP unicast to the source IP of the request packet.
+* **IP Network (Wired Ethernet or Wi-Fi)**: Uses UDP. The Client broadcasts/multicasts the complete `AuthenticationRequest`. The Server responds via UDP unicast to the source IP of the request packet.
 * **Bluetooth Low Energy (BLE)**:
-    * **No OS-level pairing is required.** The security is enforced by the application-layer cryptography established during the initial key exchange.
+    * **No OS-level pairing is required.** The security is enforced by the application-layer cryptography.
     * The Client acts in the **Advertiser/Peripheral** role.
     * The Server acts in the **Scanner/Central** role.
-    * The `AuthenticationRequest` is sent over a dedicated GATT characteristic after the connection is established.
+    * The Client **advertises** a small discovery packet. After the Server connects, the Client sends the full `AuthenticationRequest` over the dedicated GATT characteristic.
 
 ## 3. Protocol Flow
 
 ### Step 1: Parallel Discovery (Client)
 
 * When the PAM module is activated, the Client immediately initiates discovery on all available channels **simultaneously**:
-    1.  **IP Network**: It broadcasts/multicasts the signed `AuthenticationRequest` over IPv4 and IPv6.
-    2.  **BLE**: It begins BLE advertising, identifying itself as a ready-to-authenticate client.
-* The Client will continue this process according to the retransmission schedule until a valid grant is received.
+    1.  **IP Network**: It broadcasts/multicasts the complete, signed `AuthenticationRequest` over IPv4 and IPv6.
+    2.  **BLE**: It begins BLE advertising with the payload defined in the `ble-gatt-specification.md`.
+* The Client continues this process according to the retransmission schedule until a valid grant is received.
 
 ### Step 2: Request Handling (Server)
 
-* The Server (phone) simultaneously listens for IP packets and scans for BLE advertisements.
-* Upon receiving the **first successful discovery message** (either via IP or BLE), the Server proceeds and ignores subsequent discovery attempts for the same session (identified by the `challenge`).
-* It verifies the signature to authenticate the Client and displays a prompt for user interaction.
+* The Server simultaneously listens for IP packets and scans for BLE advertisements.
+* Upon receiving the **first successful discovery message** (either the full request via IP, or the advertisement ping via BLE), the Server proceeds.
+* If discovered via BLE, the Server connects to the Client to receive the full `AuthenticationRequest` over GATT.
+* It verifies the signature to authenticate the Client, ignores subsequent discovery attempts for the same session (using the `challenge` nonce), and displays a prompt for user interaction.
 * **Rate Limiting**: To prevent notification spam, the Server should implement rate limiting on incoming requests as specified in the Security Hardening Guidelines.
 * **Handling Superseded Requests**: If the Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown.
 
