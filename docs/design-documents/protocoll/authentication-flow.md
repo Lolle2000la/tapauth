@@ -2,12 +2,12 @@
 
 ## 1. Overview
 
-This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for minimal latency and high reliability on local networks, even with packet loss or multiple paired devices.
+This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency by attempting discovery over multiple transport layers simultaneously.
 
-The core design is a **hybrid discovery model**:
-* The Client initiates the process by sending a discovery message using **IPv4 broadcast and IPv6 multicast**. This ensures it can be found by any paired Server on any common network configuration (IPv4-only, IPv6-only, or dual-stack).
-* All subsequent communication is performed using direct **unicast** messages for efficiency and security.
-* The protocol includes explicit retransmission, confirmation, and cancelation mechanisms to create a robust and responsive user experience.
+The core design is a **parallel discovery model**:
+* The Client initiates the process by simultaneously attempting discovery over both the **Local IP Network (IPv4 Broadcast & IPv6 Multicast)** and **Bluetooth Low Energy (BLE)**.
+* The first successful discovery path triggers the authentication flow. All subsequent communication for that session continues over the successful transport.
+* This "race" approach ensures the fastest possible connection without waiting for timeouts, providing a seamless and highly responsive user experience.
 
 ```mermaid
 sequenceDiagram
@@ -15,19 +15,25 @@ sequenceDiagram
     participant Server A (Phone 1)
     participant Server B (Phone 2)
 
-    Client (Desktop)->>+Server A (Phone 1): Broadcast/Multicast: AuthenticationRequest
-    Client (Desktop)->>+Server B (Phone 2): Broadcast/Multicast: AuthenticationRequest
-    Note over Client (Desktop): Client repeats this broadcast with exponential backoff.
+    par
+        Client (Desktop)->>Server A (Phone 1): IP Discovery (Broadcast/Multicast)
+        Client (Desktop)->>Server B (Phone 2): IP Discovery (Broadcast/Multicast)
+    and
+        Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising)
+        Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising)
+    end
 
-    Server A (Phone 1)-->>Client (Desktop): (User Approves) Unicast: AuthenticationGrant
-    Note over Server A (Phone 1): Server A repeats this unicast until it receives confirmation.
-    Server B (Phone 2)-->>-Client (Desktop): (User Ignores)
+    Note over Client (Desktop), Server A (Phone 1): Server A receives discovery and responds first.
+    Server A (Phone 1)-->>Client (Desktop): Unicast (IP or BLE): AuthenticationRequest
     
-    Client (Desktop)->>Server A (Phone 1): Unicast: GrantConfirmation
-    Note over Client (Desktop): Login successful! Client stops broadcasting.
+    Server A (Phone 1)->>Server A (Phone 1): User is prompted for biometrics
+    alt User on Server A Approves
+        Server A (Phone 1)-->>Client (Desktop): Unicast (IP or BLE): AuthenticationGrant
+    end
     
-    Client (Desktop)->>Server B (Phone 2): Broadcast/Multicast: AuthenticationCancel
-    Note over Server B (Phone 2): Server B receives the cancelation and dismisses the user prompt.
+    Note over Client (Desktop), Server A (Phone 1): Client accepts the grant from Server A and logs in.
+    Client (Desktop)->>Server B (Phone 2): IP Cancel (Broadcast/Multicast) & BLE Cancel
+    Note over Server B (Phone 2): Server B receives cancelation and dismisses its prompt.
 ```
 
 ## 2. Technical Specifications
@@ -62,35 +68,50 @@ All signed messages must use a canonical format to guarantee verifiability.
     4.  Compute the digital signature of this byte array.
     5.  Place the computed signature back into the `signature` field before sending.
 
+### 2.3. Transport Layer Considerations
+
+The protocol is transport-agnostic, but relies on specific behaviors for discovery.
+
+* **IP Network (Wired Ethernet or Wi-Fi)**: Uses UDP. The Client sends to the IPv4 broadcast and a designated IPv6 multicast address. The Server responds via UDP unicast to the source IP of the request packet.
+* **Bluetooth Low Energy (BLE)**:
+    * **No OS-level pairing is required.** The security is enforced by the application-layer cryptography established during the initial key exchange.
+    * The Client acts in the **Advertiser/Peripheral** role.
+    * The Server acts in the **Scanner/Central** role.
+    * The `AuthenticationRequest` is sent over a dedicated GATT characteristic after the connection is established.
+
 ## 3. Protocol Flow
 
-### Step 1: Request Initiation (Client)
+### Step 1: Parallel Discovery (Client)
 
-* The Client's PAM module constructs an `AuthenticationRequest` containing its identity (`hostname`, `username`) and a unique `challenge` nonce.
-* It signs the message and sends the encrypted `WrapperMessage` via both IPv4 broadcast and IPv6 multicast.
-* The Client repeats this broadcast as per the specified retransmission schedule.
+* When the PAM module is activated, the Client immediately initiates discovery on all available channels **simultaneously**:
+    1.  **IP Network**: It broadcasts/multicasts the signed `AuthenticationRequest` over IPv4 and IPv6.
+    2.  **BLE**: It begins BLE advertising, identifying itself as a ready-to-authenticate client.
+* The Client will continue this process according to the retransmission schedule until a valid grant is received.
 
 ### Step 2: Request Handling (Server)
 
-* All paired Servers receive and decrypt the request. The signature is verified to authenticate the Client's identity.
-* The `challenge` nonce is used to de-duplicate any packets received over both IPv4 and IPv6.
-* **Handling Superseded Requests**: If a Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown for the new request.
-* The Server then displays a prompt for user interaction (e.g., biometric verification).
+* The Server (phone) simultaneously listens for IP packets and scans for BLE advertisements.
+* Upon receiving the **first successful discovery message** (either via IP or BLE), the Server proceeds and ignores subsequent discovery attempts for the same session (identified by the `challenge`).
+* It verifies the signature to authenticate the Client and displays a prompt for user interaction.
+* **Handling Superseded Requests**: If the Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown.
 
 ### Step 3: Response (Server)
 
-* Based on user action, the Server constructs either an `AuthenticationGrant` or an `AuthenticationDenial` message.
-* It sends the signed and encrypted message via **unicast** back to the Client.
-* The Server will retransmit this response according to the defined schedule until it receives a `GrantConfirmation` or the session times out.
+* The Server constructs an `AuthenticationGrant` or `AuthenticationDenial` message.
+* It sends the response back to the Client using the **same transport layer** (IP unicast or the established BLE connection) that the initial discovery message arrived on.
+* The Server will retransmit this response until it receives a `GrantConfirmation` or the session times out.
 
 ### Step 4: Finalization (Client)
 
-* The Client accepts the **first valid `AuthenticationGrant`** it receives.
-* Immediately upon validation, the Client performs two actions:
-    1.  **Confirmation**: It sends a unicast `GrantConfirmation` back to the specific Server that sent the successful grant. This stops that Server from retransmitting.
-    2.  **Cancelation**: It broadcasts/multicasts an `AuthenticationCancel` message containing the original `challenge`.
+* The Client accepts the **first valid `AuthenticationGrant`** it receives, regardless of which transport layer it arrived on.
+* Immediately upon validation, the Client performs its final actions in parallel:
+    1.  **Confirmation**: It sends a unicast `GrantConfirmation` back to the granting Server over the same channel that delivered the grant.
+    2.  **Cancelation**: It initiates the cancelation process described in Step 5.
 * The PAM module then unlocks the user account.
 
-### Step 5: Cancelation (Other Servers)
+### Step 5: Cancelation (All Transports)
 
-* Any other Servers that still have a pending user prompt will receive the `AuthenticationCancel` message. They compare the `challenge` to their active session, and if it matches, they dismiss the user notification.
+* To ensure all pending prompts are dismissed, the Client sends a cancelation signal across all transports:
+    * **IP Network**: The Client broadcasts/multicasts an `AuthenticationCancel` message.
+    * **BLE**: The Client immediately stops BLE advertising for this session and terminates any outstanding BLE connections related to this login attempt.
+* Any other Server that has a pending user prompt will either receive the IP `AuthenticationCancel` message or have its BLE connection terminated by the Client. Both signals should be interpreted as a session cancelation, causing the Server to dismiss the user notification.
