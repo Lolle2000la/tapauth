@@ -3,7 +3,16 @@
 This document specifies the GATT (Generic Attribute Profile) service and characteristics required for the Bluetooth Low Energy transport layer of the authentication protocol.
 
 * **Service UUID**: `b4ad84c0-2adb-4876-8315-b39d983b2bde`
-    * This unique UUID identifies the TapAuth service. Servers (phones) will scan for advertisement packets containing this service UUID.
+    * This unique UUID identifies the TapAuth service.
+
+## Advertisement Packet
+
+For discovery, the Client (desktop) **must** broadcast a BLE advertisement packet containing the following data to allow for pre-connection identification:
+
+* **Service UUID**: The full 128-bit TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`).
+* **Service Data**: A short, unique identifier for the Client. This **must** be a truncated hash (e.g., the first 8 bytes) of the Client's public key.
+
+This Service Data is critical for the Server (phone) to identify which specific Client is advertising before initiating a connection, which is essential for both efficiency and a clear user experience when multiple Clients are present.
 
 ### Characteristics
 
