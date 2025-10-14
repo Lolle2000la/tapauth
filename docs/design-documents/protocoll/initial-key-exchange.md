@@ -2,16 +2,15 @@
 
 ## Overview
 
-This document outlines a secure and byte-efficient protocol for the initial pairing of a **Client** (e.g., a Linux desktop) with a **Server** (e.g., an Android phone). The goal is to establish a mutually authenticated, secure channel for future communication, such as network-based PAM authentication. The protocol uses a QR code to bootstrap trust, the X25519 algorithm for a compact and fast key exchange, and a user-verified Short Authentication String (SAS) to prevent Man-in-the-Middle (MITM) attacks.
+This document outlines a secure and byte-efficient protocol for the initial pairing of a **Client** (e.g., a Linux desktop) with a **Server** (e.g., an Android phone). The goal is to establish a mutually authenticated, secure channel for future communication. The protocol uses a QR code to bootstrap trust, a high-speed key exchange for forward secrecy, and a user-verified Short Authentication String (SAS) to prevent Man-in-the-Middle (MITM) attacks.
 
 ***
 
 ## Cryptography and Keys
 
-* **Key Exchange Algorithm**: **X25519**. This is chosen for its high security, excellent performance, and small 32-byte key size.
-* **Client Key Pair** (`Client_Pub`, `Client_Priv`): An X25519 key pair for the desktop. The private key never leaves the Client.
-* **Server Key Pair** (`Server_Pub`, `Server_Priv`): An X25519 key pair for the phone. The private key never leaves the Server.
-* **Shared Symmetric Key** (`SK`): A key for a modern AEAD cipher like AES-256-GCM or ChaCha20-Poly1305. It is derived from the key exchange result using a KDF (e.g., HKDF-SHA256).
+* **Cryptographic Primitives**: All cryptographic algorithms used in this protocol (including the key exchange, signatures, and symmetric encryption) are explicitly defined in the [`cryptography-specification.md`](cryptography-specification.md) document.
+* **Key Exchange**: An X25519 key exchange is performed to generate a shared secret.
+* **Shared Symmetric Key** (`SK`): A key for the AEAD cipher derived from the key exchange result using the specified KDF.
 
 ***
 
