@@ -16,7 +16,7 @@ flowchart TD
 
 ## User flow from receiving authentication request to being logged in on client
 
-````mermaid
+```mermaid
 flowchart TD
     A[User starts their laptop, lands on login screen] --> B[User selects their account]
     B --> C[A notification is received on their phone]
