@@ -33,31 +33,40 @@ message AuthenticationGrant {
 /**
  * An AuthenticationDenial is sent by the Server if the user denies
  * the request. The Server will repeat sending this until confirmation.
+ * It is signed by the Server.
  */
 message AuthenticationDenial {
   // The challenge from the original request, for identification.
   bytes challenge = 1;
+  // Server's signature over this message (with this field empty).
+  bytes signature = 2;
 }
 
 /**
  * A GrantConfirmation is sent unicast by the Client to the Server to
  * confirm receipt of a Grant or Denial, telling the Server to stop retransmitting.
+ * It is signed by the Client.
  */
 message GrantConfirmation {
   // The challenge from the original request, to identify the session.
   bytes challenge = 1;
+  // Client's signature over this message (with this field empty).
+  bytes signature = 2;
 }
 
 /**
  * An AuthenticationCancel is broadcast by the Client once it has been
  * unlocked, telling all other Servers to dismiss their pending prompts.
+ * It is signed by the Client.
  */
 message AuthenticationCancel {
   // The challenge from the original request, to identify the session to cancel.
   bytes challenge = 1;
+  // Client's signature over this message (with this field empty).
+  bytes signature = 2;
 }
 
-// -- Pairing Messages remain the same --
+// -- Pairing Messages --
 
 message PairingHandshake {
   bytes server_public_key = 1;
