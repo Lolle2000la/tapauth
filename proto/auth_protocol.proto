@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package auth_protocol;
+
+/**
+ * An AuthenticationRequest is sent by the Client (desktop) to the 
+ * Server (phone), requesting the user to authenticate.
+ * It is signed by the Client to prove its identity to the Server.
+ */
+message AuthenticationRequest {
+  // A random nonce for the Server (phone) to sign.
+  bytes challenge = 1;
+  // The user account to be unlocked on the Client (desktop).
+  string username = 2;
+  // The hostname of the Client (desktop) machine.
+  string hostname = 3;
+  // Client's signature over the serialized request (with this field empty).
+  bytes signature = 4;
+}
+
+/**
+ * An AuthenticationGrant is sent by the Server (phone) to the 
+ * Client (desktop) after a successful user biometric verification.
+ * It is signed by the Server to prove its identity to the Client.
+ */
+message AuthenticationGrant {
+  // The challenge from the request, now signed by the Server's private key.
+  bytes signed_challenge = 1;
+  // Server's signature over the serialized grant (with this field empty).
+  bytes signature = 2;
+}
+
+/**
+ * A PairingHandshake is sent by the Server (phone) to the Client (desktop)
+ * during the initial pairing process. After this message is exchanged, both
+ * parties have each other's public keys and can independently calculate the
+ * shared secret and the SAS for user verification.
+ */
+message PairingHandshake {
+  // The Server's 32-byte X25519 public key.
+  bytes server_public_key = 1;
+}
+
+/**
+ * A PairingConfirmation is an empty message sent by the Server (phone) to
+ * the Client (desktop) *after* the user has visually confirmed the SAS matches.
+ * This message is encrypted with the newly derived shared key. Successful
+ * decryption by the Client confirms the pairing is complete.
+ */
+message PairingConfirmation {
+  // This message has no fields. Its value is in its successful authenticated decryption.
+}
+
+/**
+ * A top-level wrapper for all possible messages. This is the object
+ * that gets serialized, encrypted, and sent in a single UDP packet.
+ */
+message WrapperMessage {
+  oneof payload {
+    PairingHandshake pairing_handshake = 1;
+    PairingConfirmation pairing_confirmation = 2;
+    AuthenticationRequest auth_request = 3;
+    AuthenticationGrant auth_grant = 4;
+  }
+}
