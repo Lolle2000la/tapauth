@@ -93,6 +93,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * The Server (phone) simultaneously listens for IP packets and scans for BLE advertisements.
 * Upon receiving the **first successful discovery message** (either via IP or BLE), the Server proceeds and ignores subsequent discovery attempts for the same session (identified by the `challenge`).
 * It verifies the signature to authenticate the Client and displays a prompt for user interaction.
+* **Rate Limiting**: To prevent notification spam, the Server should implement rate limiting on incoming requests as specified in the Security Hardening Guidelines.
 * **Handling Superseded Requests**: If the Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown.
 
 ### Step 3: Response (Server)
@@ -111,7 +112,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 ### Step 5: Cancelation (All Transports)
 
-* To ensure all pending prompts are dismissed, the Client sends a cancelation signal across all transports:
+* To ensure all pending prompts are dismissed, the Client sends a cancelation signal across all active transports:
     * **IP Network**: The Client broadcasts/multicasts an `AuthenticationCancel` message.
-    * **BLE**: The Client immediately stops BLE advertising for this session and terminates any outstanding BLE connections related to this login attempt.
-* Any other Server that has a pending user prompt will either receive the IP `AuthenticationCancel` message or have its BLE connection terminated by the Client. Both signals should be interpreted as a session cancelation, causing the Server to dismiss the user notification.
+    * **BLE**: If the login session was initiated over BLE, the Client writes an `AuthenticationCancel` message to the **Client Command Characteristic**. In all cases, the Client should stop advertising and terminate any outstanding BLE connections related to the completed session.
+* Any other Server that has a pending user prompt will receive an explicit cancelation signal appropriate for its connection type, causing it to dismiss the user notification.
