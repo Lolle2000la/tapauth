@@ -1,8 +1,13 @@
-# Authentication Flow
+# Authentication Flow Protocol
 
-## Overview
+## 1. Overview
 
-The authentication flow is designed for minimal latency and maximum reliability. It uses a **dual IPv4 broadcast and IPv6 multicast** for discovery, followed by direct unicast communication. The protocol explicitly defines retransmission and confirmation steps to handle UDP packet loss and ensures that stale requests on other devices are canceled promptly.
+This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for minimal latency and high reliability on local networks, even with packet loss or multiple paired devices.
+
+The core design is a **hybrid discovery model**:
+* The Client initiates the process by sending a discovery message using **IPv4 broadcast and IPv6 multicast**. This ensures it can be found by any paired Server on any common network configuration (IPv4-only, IPv6-only, or dual-stack).
+* All subsequent communication is performed using direct **unicast** messages for efficiency and security.
+* The protocol includes explicit retransmission, confirmation, and cancelation mechanisms to create a robust and responsive user experience.
 
 ```mermaid
 sequenceDiagram
@@ -25,46 +30,67 @@ sequenceDiagram
     Note over Server B (Phone 2): Server B receives the cancelation and dismisses the user prompt.
 ```
 
-## Signature Generation
+## 2. Technical Specifications
 
-To ensure signatures are always valid and verifiable across platforms, the data being signed must have a canonical, unambiguous representation.
+### 2.1. Timings and Retransmission Strategy
 
-* **Data-To-Be-Signed**: The data to be signed is the **binary-serialized Protobuf message** (e.g., `AuthenticationRequest` or `AuthenticationGrant`) with its `signature` field temporarily empty.
+To ensure responsiveness, the protocol employs an aggressive retransmission strategy.
+
+* **Client `AuthenticationRequest` Retransmission**:
+    * **Strategy**: Exponential backoff.
+    * **Initial Interval**: **200ms**. The first retransmission is sent 200ms after the initial message.
+    * **Backoff Schedule**: The interval doubles with each subsequent retry (400ms, 800ms, etc.).
+    * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time.
+
+* **Server `AuthenticationGrant`/`Denial` Retransmission**:
+    * **Strategy**: Fixed interval.
+    * **Interval**: **500ms**.
+    * **Rationale**: After user interaction, the Server becomes persistent in delivering the result to ensure the login completes promptly.
+
+* **Session Timeouts**:
+    * The entire authentication attempt will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+
+### 2.2. Signature Generation
+
+All signed messages must use a canonical format to guarantee verifiability.
+
+* **Data-To-Be-Signed**: The **binary-serialized Protobuf message** with its `signature` field temporarily empty.
 * **Process**:
-    1.  Construct the message object in code.
-    2.  Ensure the `signature` field within that object is empty or null.
-    3.  Serialize the object to a byte array using the standard Protobuf serialization library.
-    4.  Compute the digital signature of this resulting byte array.
-    5.  Place the computed signature back into the `signature` field of the object before wrapping and encrypting it for transmission.
+    1.  Construct the message object.
+    2.  Ensure the `signature` field is empty.
+    3.  Serialize the object to a byte array using the standard Protobuf library.
+    4.  Compute the digital signature of this byte array.
+    5.  Place the computed signature back into the `signature` field before sending.
 
-This guarantees that both the signer and the verifier are operating on the exact same sequence of bytes.
+## 3. Protocol Flow
 
-***
+### Step 1: Request Initiation (Client)
 
-## Protocol Steps & Reliability
+* The Client's PAM module constructs an `AuthenticationRequest` containing its identity (`hostname`, `username`) and a unique `challenge` nonce.
+* It signs the message and sends the encrypted `WrapperMessage` via both IPv4 broadcast and IPv6 multicast.
+* The Client repeats this broadcast as per the specified retransmission schedule.
 
-1.  **Request Broadcast & Multicast (Client)**:
-    * When the PAM module is activated, the **Client (desktop)** constructs an `AuthenticationRequest`.
-    * It signs the message as per the "Signature Generation" process and sends the encrypted `WrapperMessage` via both **IPv4 broadcast and IPv6 multicast**.
-    * **Reliability**: The Client will re-broadcast this request, starting with a short interval (e.g., 500ms) and using an exponential backoff, until it receives a valid `AuthenticationGrant` or the login process times out.
+### Step 2: Request Handling (Server)
 
-2.  **Verification and Prompt (Server)**:
-    * All paired **Servers (phones)** receive the request and verify the signature to identify the Client.
-    * The `challenge` nonce is used to de-duplicate the IPv4 and IPv6 packets.
-    * Each Server then prompts its user for approval.
+* All paired Servers receive and decrypt the request. The signature is verified to authenticate the Client's identity.
+* The `challenge` nonce is used to de-duplicate any packets received over both IPv4 and IPv6.
+* **Handling Superseded Requests**: If a Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown for the new request.
+* The Server then displays a prompt for user interaction (e.g., biometric verification).
 
-3.  **Grant/Denial Unicast (Server)**:
-    * **If the user approves**, the Server sends the `AuthenticationGrant` via **unicast** to the Client.
-    * **If the user denies**, the Server sends an `AuthenticationDenial` via **unicast**.
-    * **Reliability**: The Server will re-send the `AuthenticationGrant` or `AuthenticationDenial` at a fixed interval (e.g., every 1 second) until it receives a `GrantConfirmation` from the Client or a timeout occurs. This ensures the Client receives the response even if the first packet is dropped.
+### Step 3: Response (Server)
 
-4.  **Confirmation and Cancelation (Client)**:
-    * The Client accepts the **first valid `AuthenticationGrant`** it receives.
-    * **Immediately upon acceptance**:
-        1.  **Confirm**: The Client sends a **unicast** `GrantConfirmation` message directly back to the specific Server that sent the grant. This tells that Server to stop retransmitting.
-        2.  **Cancel**: The Client broadcasts/multicasts an `AuthenticationCancel` message to the entire network. This message contains the original `challenge` nonce.
-        3.  **Login**: The PAM module unlocks the user account.
+* Based on user action, the Server constructs either an `AuthenticationGrant` or an `AuthenticationDenial` message.
+* It sends the signed and encrypted message via **unicast** back to the Client.
+* The Server will retransmit this response according to the defined schedule until it receives a `GrantConfirmation` or the session times out.
 
-5.  **Handling Cancelation (Other Servers)**:
-    * Any other Server (e.g., a second phone) that still has a pending user prompt will receive the `AuthenticationCancel` message.
-    * It checks if the `challenge` in the cancel message matches the one in its active request. If it does, it automatically dismisses the notification from the user's screen.
+### Step 4: Finalization (Client)
+
+* The Client accepts the **first valid `AuthenticationGrant`** it receives.
+* Immediately upon validation, the Client performs two actions:
+    1.  **Confirmation**: It sends a unicast `GrantConfirmation` back to the specific Server that sent the successful grant. This stops that Server from retransmitting.
+    2.  **Cancelation**: It broadcasts/multicasts an `AuthenticationCancel` message containing the original `challenge`.
+* The PAM module then unlocks the user account.
+
+### Step 5: Cancelation (Other Servers)
+
+* Any other Servers that still have a pending user prompt will receive the `AuthenticationCancel` message. They compare the `challenge` to their active session, and if it matches, they dismiss the user notification.
