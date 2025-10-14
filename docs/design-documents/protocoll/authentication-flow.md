@@ -62,3 +62,7 @@ When sending the authentication grant, the server will keep sending it until it 
 ## Usage of a PAM module
 
 In order to unlock the user account on the client, a PAM (Pluggable Authentication Module) module will be used. This module will handle the communication with the authentication app, and will be responsible for unlocking the user account when a valid authentication grant is received. The PAM module will be invoked by the display manager (e.g. GDM, SDDM, LightDM) when the user selects their account on the login screen. The PAM module will then start the authentication flow as described above.
+
+## Replay attack mitigation
+
+A randomly generated nonce will be included in the authentication request, and the same nonce must be included in the authentication grant. This ensures that an attacker cannot simply replay a previously captured authentication grant to gain access.
