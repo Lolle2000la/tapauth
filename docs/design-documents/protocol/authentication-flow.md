@@ -70,7 +70,12 @@ All signed messages must use a canonical format to guarantee verifiability.
 
 The protocol is transport-agnostic, but relies on specific behaviors for discovery.
 
-* **IP Network (Wired Ethernet or Wi-Fi)**: Uses UDP. The Client broadcasts/multicasts the complete `AuthenticationRequest`. The Server responds via UDP unicast to the source IP of the request packet.
+* **IP Network (Wired Ethernet or Wi-Fi)**:
+    * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable. If changed, all Clients and Servers on the same network must be configured to use the same port for discovery to function.
+    * **IPv4**: The Client sends to the broadcast address `255.255.255.255`.
+    * **IPv6**: The Client sends to the designated link-local multicast address **`ff02:bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8`**.
+    * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
+
 * **Bluetooth Low Energy (BLE)**:
     * **No OS-level pairing is required.** The security is enforced by the application-layer cryptography.
     * The Client acts in the **Advertiser/Peripheral** role.
