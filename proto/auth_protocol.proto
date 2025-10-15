@@ -2,6 +2,25 @@ syntax = "proto3";
 
 package auth_protocol;
 
+// -- Algorithm Definitions --
+
+enum SignatureAlgorithm {
+  SIGNATURE_ALGORITHM_UNSPECIFIED = 0;
+  ED25519 = 1;
+}
+
+enum SymmetricAlgorithm {
+  SYMMETRIC_ALGORITHM_UNSPECIFIED = 0;
+  AES_256_GCM = 1;
+}
+
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  SHA256 = 1;
+}
+
+// -- Core Authentication Messages --
+
 /**
  * An AuthenticationRequest is broadcast by the Client (desktop) to
  * any available Server (phone), requesting authentication.
@@ -16,8 +35,10 @@ message AuthenticationRequest {
   string hostname = 3;
   // The UTC time the request was created, to prevent replay attacks.
   uint64 timestamp_unix_seconds = 4;
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 5;
   // Client's signature over the serialized request (with this field empty).
-  bytes signature = 5;
+  bytes signature = 6;
 }
 
 /**
@@ -28,8 +49,10 @@ message AuthenticationRequest {
 message AuthenticationGrant {
   // The challenge from the request, now signed by the Server's private key.
   bytes signed_challenge = 1;
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 2;
   // Server's signature over the serialized grant (with this field empty).
-  bytes signature = 2;
+  bytes signature = 3;
 }
 
 /**
@@ -40,8 +63,10 @@ message AuthenticationGrant {
 message AuthenticationDenial {
   // The challenge from the original request, for identification.
   bytes challenge = 1;
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 2;
   // Server's signature over this message (with this field empty).
-  bytes signature = 2;
+  bytes signature = 3;
 }
 
 /**
@@ -52,8 +77,10 @@ message AuthenticationDenial {
 message GrantConfirmation {
   // The challenge from the original request, to identify the session.
   bytes challenge = 1;
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 2;
   // Client's signature over this message (with this field empty).
-  bytes signature = 2;
+  bytes signature = 3;
 }
 
 /**
@@ -64,8 +91,10 @@ message GrantConfirmation {
 message AuthenticationCancel {
   // The challenge from the original request, to identify the session to cancel.
   bytes challenge = 1;
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 2;
   // Client's signature over this message (with this field empty).
-  bytes signature = 2;
+  bytes signature = 3;
 }
 
 // -- Pairing Messages --
@@ -80,6 +109,12 @@ message EncryptedData {
 
 message PairingHandshake {
   bytes server_public_key = 1;
+  // A list of signature algorithms the server supports for general communication.
+  repeated SignatureAlgorithm supported_signature_algorithms = 2;
+  // A list of symmetric algorithms the server supports for packet encryption.
+  repeated SymmetricAlgorithm supported_symmetric_algorithms = 3;
+  // A list of hash algorithms the server supports.
+  repeated HashAlgorithm supported_hash_algorithms = 4;
 }
 
 /**
@@ -94,8 +129,10 @@ message ClientKeyDelivery {
  * Sent by the Server to the Client to confirm successful receipt of the shared key.
  */
 message PairingConfirmation {
-  // A SHA-256 hash of the CSK, encrypted with the temporary pairing key (PSK).
-  EncryptedData encrypted_confirmation_hash = 1;
+  // The algorithm used to produce the confirmation hash.
+  HashAlgorithm hash_algorithm = 1;
+  // A hash of the CSK (e.g., SHA-256), encrypted with the temporary pairing key (PSK).
+  EncryptedData encrypted_confirmation_hash = 2;
 }
 
 /**
@@ -127,6 +164,8 @@ message EncryptedPacket {
   // It is the first 16 bytes of an HMAC-SHA256 of the current time window,
   // keyed with the Client Symmetric Key (CSK).
   bytes temporal_identifier = 1;
-  // The serialized WrapperMessage, encrypted with the CSK using AES-256-GCM.
-  bytes ciphertext = 2;
+  // The algorithm used for encrypting the ciphertext.
+  SymmetricAlgorithm encryption_algorithm = 2;
+  // The serialized WrapperMessage, encrypted with the CSK.
+  bytes ciphertext = 3;
 }

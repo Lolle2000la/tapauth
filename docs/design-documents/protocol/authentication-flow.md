@@ -43,14 +43,14 @@ To ensure confidentiality and privacy, all post-pairing communication is encrypt
 * **Packet Structure**: The final message sent over the network **must** be an `EncryptedPacket`.
 * **Temporal Identifier Generation**:
     1.  Both Client and Server define a **time window** of 60 seconds. The current window is calculated as `floor(unix_timestamp / 60)`.
-    2.  The `temporal_identifier` is the **first 16 bytes** of the following calculation: `HMAC-SHA256(key = CSK, data = current_time_window)`.
+    2.  The identifier is the first 16 bytes of an HMAC-SHA256 of the time window, keyed with the shared `CSK`.
     3.  This creates a rotating identifier that is verifiable by the Server but appears random to an outside observer, preventing metadata tracking.
 * **Process**:
     1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
     2.  Serialize the `WrapperMessage` to a byte array.
-    3.  Encrypt this byte array using the `CSK` with **AES-256-GCM** to get the `ciphertext`.
-    4.  Calculate the current `temporal_identifier`.
-    5.  Construct an `EncryptedPacket` with the `temporal_identifier` and `ciphertext`.
+    3.  Construct the `EncryptedPacket`.
+    4.  Set the `encryption_algorithm` field to the algorithm agreed upon during pairing (e.g., `AES_256_GCM`).
+    5.  Encrypt the serialized `WrapperMessage` using the specified algorithm and the shared `CSK`. The result is placed in the `ciphertext` field.
     6.  Serialize and transmit the `EncryptedPacket`.
 
 ### 2.2. Timings and Retransmission Strategy
@@ -78,10 +78,10 @@ All signed messages must use a canonical format to guarantee verifiability *befo
 * **Data-To-Be-Signed**: The **binary-serialized Protobuf message** (e.g., `AuthenticationRequest`) with its `signature` field temporarily empty.
 * **Process**:
     1.  Construct the inner message object (e.g., `AuthenticationRequest`).
-    2.  Ensure its `signature` field is empty.
-    3.  Serialize the object to a byte array using the standard Protobuf library.
-    4.  Compute the digital signature of this byte array.
-    5.  Place the computed signature back into the `signature` field.
+    2.  Set the `signature_algorithm` field to the algorithm agreed upon during pairing (e.g., `ED25519`).
+    3.  Serialize this message to a byte array. This is the data to be signed.
+    4.  Sign the byte array using the sender's private key and the specified algorithm.
+    5.  Place the resulting signature into the `signature` field of the message object.
     6.  This completed message is then placed in a `WrapperMessage`, which is then encrypted for transmission.
 
 ### 2.4. Transport Layer Considerations
