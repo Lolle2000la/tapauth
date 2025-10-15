@@ -96,9 +96,17 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * The Server simultaneously listens for IP packets and scans for BLE advertisements.
 * Upon receiving the **first successful discovery message** (either the full request via IP, or the advertisement ping via BLE), the Server proceeds.
 * If discovered via BLE, the Server connects to the Client to receive the full `AuthenticationRequest` over GATT.
-* It verifies the signature to authenticate the Client, ignores subsequent discovery attempts for the same session (using the `challenge` nonce), and displays a prompt for user interaction.
+* It verifies the signature to authenticate the Client, then performs the replay mitigation checks.
+
+#### Replay Attack Mitigation
+To be considered valid, an incoming `AuthenticationRequest` **must** pass both of the following checks:
+
+1.  **Timestamp Check**: The Server compares the `timestamp_unix_seconds` in the request against its own current UTC time. If the timestamp is older than a short validity window (e.g., **10 seconds**), the request **must** be silently discarded. This prevents replay attacks using old requests.
+2.  **Nonce Check**: The Server checks if it has already processed a request with the same `challenge` nonce in the last 120 seconds. If it has, the request is a duplicate (e.g., from both IPv4 and IPv6) and **must** be silently discarded.
+
+* After passing these checks, the Server displays a prompt for user interaction.
 * **Rate Limiting**: To prevent notification spam, the Server should implement rate limiting on incoming requests as specified in the Security Hardening Guidelines.
-* **Handling Superseded Requests**: If the Server receives a new `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown.
+* **Handling Superseded Requests**: If the Server receives a new, valid `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown for the new request.
 
 ### Step 3: Response (Server)
 

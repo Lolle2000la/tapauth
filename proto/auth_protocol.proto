@@ -14,8 +14,10 @@ message AuthenticationRequest {
   string username = 2;
   // The hostname of the Client machine (e.g., "my-laptop").
   string hostname = 3;
+  // The UTC time the request was created, to prevent replay attacks.
+  uint64 timestamp_unix_seconds = 4;
   // Client's signature over the serialized request (with this field empty).
-  bytes signature = 4;
+  bytes signature = 5;
 }
 
 /**
