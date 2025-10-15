@@ -67,6 +67,8 @@ The **Client (desktop)** generates its key pair (if one doesn't exist) and its C
 * **`p`**: The **TCP** port the Client is listening on for the pairing connection.
 * **`ip4` / `ip6`**: The Client's IP addresses. At least one **must** be present.
 
+> **Security Warning**: The security of this initial step relies on the user scanning the QR code directly from the trusted Client's screen. An attacker could attempt to trick a user into scanning a malicious QR code (e.g., from a photo or a different screen), which would lead to pairing with the attacker's device. The Short Authentication String (SAS) in Step 4 is the critical defense against this.
+
 ### Step 2: Server Initiates Connection
 
 The **User** scans the code with the **Server (phone)**. The app parses the URL, extracts the Client's public key and connection details, generates its own key pair, and establishes a **TCP connection** to the Client. It sends its public key inside a `PairingHandshake` message.
@@ -77,7 +79,11 @@ Both devices independently compute the same temporary **Pairing Symmetric Key (`
 
 ### Step 4: Anti-MITM Verification
 
-Both devices compute and display a **Short Authentication String (SAS)** derived from the `PSK` and the public keys. The **User must visually confirm** that the SAS displayed on the Client and Server screens match before proceeding.
+This is the most critical security step in the pairing process. Both devices compute and display a **Short Authentication String (SAS)** derived from the `PSK` and the public keys.
+
+**The user MUST visually confirm that the SAS displayed on the Client screen and the Server screen are identical before proceeding.**
+
+Failure to verify the SAS could allow a Man-in-the-Middle (MITM) attacker to intercept the connection and compromise the shared key. The user interface on both devices must make this verification step prominent and mandatory.
 
 ### Step 5: Client Sends Shared Key
 
