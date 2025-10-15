@@ -9,17 +9,46 @@ use crate::crypto;
 pub extern "system" fn Java_com_tapauth_JniBridge_getSas(
     mut env: JNIEnv,
     _class: JClass,
-    client_pub_key_hex: JString,
-    server_pub_key_hex: JString,
+    psk_hex: JString,
 ) -> jstring {
-    let client_pk_hex: String = env.get_string(&client_pub_key_hex).unwrap().into();
-    let server_pk_hex: String = env.get_string(&server_pub_key_hex).unwrap().into();
+    let psk_hex: String = match env.get_string(&psk_hex) {
+        Ok(value) => value.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid UTF-8 input: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
 
-    let client_pk = hex::decode(client_pk_hex).unwrap();
-    let server_pk = hex::decode(server_pk_hex).unwrap();
+    let psk = match hex::decode(psk_hex) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid hex: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
 
-    let sas = crypto::generate_sas(&client_pk, &server_pk).unwrap();
+    let sas = match crypto::generate_sas(&psk) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
 
-    let output = env.new_string(sas).expect("Couldn't create java string!");
-    output.into_raw()
+    match env.new_string(sas) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
 }
