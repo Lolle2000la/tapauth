@@ -100,7 +100,7 @@ message PairingConfirmation {
 
 /**
  * A top-level wrapper for all possible messages.
- * Post-pairing, this entire message is encrypted before being sent.
+ * In post-pairing communication, this is serialized and then encrypted.
  */
 message WrapperMessage {
   // The version of the protocol being used. Currently 1.
@@ -116,4 +116,17 @@ message WrapperMessage {
     AuthenticationCancel auth_cancel = 8;
     ClientKeyDelivery client_key_delivery = 9;
   }
+}
+
+/**
+ * The final container for an encrypted message sent over the network.
+ * This is the message that is broadcast.
+ */
+message EncryptedPacket {
+  // A temporary, rotating identifier that prevents passive tracking.
+  // It is the first 16 bytes of an HMAC-SHA256 of the current time window,
+  // keyed with the Client Symmetric Key (CSK).
+  bytes temporal_identifier = 1;
+  // The serialized WrapperMessage, encrypted with the CSK using AES-256-GCM.
+  bytes ciphertext = 2;
 }

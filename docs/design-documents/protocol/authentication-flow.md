@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency by attempting discovery over multiple transport layers simultaneously. All communication after the initial pairing is encrypted.
+This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency and high privacy by default.
 
 The core design is a **parallel discovery model**:
 * The Client initiates the process by simultaneously attempting discovery over both the **Local IP Network (IPv4 Broadcast & IPv6 Multicast)** and **Bluetooth Low Energy (BLE)**.
@@ -16,37 +16,42 @@ sequenceDiagram
     participant Server B (Phone 2)
 
     par
-        Client (Desktop)->>Server A (Phone 1): Encrypted IP Discovery (AuthenticationRequest)
-        Client (Desktop)->>Server B (Phone 2): Encrypted IP Discovery (AuthenticationRequest)
+        Client (Desktop)->>Server A (Phone 1): EncryptedPacket (IP Broadcast)
+        Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Broadcast)
     and
         Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising Ping)
         Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising Ping)
     end
 
-    Note over Client (Desktop), Server A (Phone 1): Server A receives and decrypts a discovery message, then prompts its user.
+    Note over Server A (Phone 1): Server A receives packet, checks Temporal ID, and decrypts.
     
     alt User on Server A Approves
-        Server A (Phone 1)-->>Client (Desktop): Encrypted Unicast (IP or BLE): AuthenticationGrant
+        Server A (Phone 1)-->>Client (Desktop): EncryptedPacket (Unicast)
     end
     
     Note over Client (Desktop), Server A (Phone 1): Client accepts the grant from Server A and logs in.
-    Client (Desktop)->>Server B (Phone 2): Encrypted IP Cancel (Broadcast/Multicast) & BLE Cancel
+    Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Broadcast Cancel) & BLE Cancel
     Note over Server B (Phone 2): Server B receives cancelation and dismisses its prompt.
 ```
 
 ## 2. Technical Specifications
 
-### 2.1. Message Encryption
+### 2.1. Message Encryption & Packet Structure
 
-To ensure confidentiality and privacy, all network communication after the initial pairing **must** be encrypted.
+To ensure confidentiality and privacy, all post-pairing communication is encrypted and wrapped in a final packet structure that prevents passive tracking.
 
-* **Encryption Key**: The shared **Client Symmetric Key (`CSK`)** established during pairing.
-* **Algorithm**: **AES-256-GCM**.
+* **Packet Structure**: The final message sent over the network **must** be an `EncryptedPacket`.
+* **Temporal Identifier Generation**:
+    1.  Both Client and Server define a **time window** of 60 seconds. The current window is calculated as `floor(unix_timestamp / 60)`.
+    2.  The `temporal_identifier` is the **first 16 bytes** of the following calculation: `HMAC-SHA256(key = CSK, data = current_time_window)`.
+    3.  This creates a rotating identifier that is verifiable by the Server but appears random to an outside observer, preventing metadata tracking.
 * **Process**:
     1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
     2.  Serialize the `WrapperMessage` to a byte array.
-    3.  Encrypt the entire serialized byte array using the `CSK`.
-    4.  Transmit the resulting ciphertext. The receiver will perform the decryption before deserializing the `WrapperMessage`.
+    3.  Encrypt this byte array using the `CSK` with **AES-256-GCM** to get the `ciphertext`.
+    4.  Calculate the current `temporal_identifier`.
+    5.  Construct an `EncryptedPacket` with the `temporal_identifier` and `ciphertext`.
+    6.  Serialize and transmit the `EncryptedPacket`.
 
 ### 2.2. Timings and Retransmission Strategy
 
@@ -97,12 +102,17 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 ### Step 1: Parallel Discovery (Client)
 
-* When the PAM module is activated, the Client immediately begins broadcasting/advertising the encrypted `AuthenticationRequest` on all available channels **simultaneously**.
+* When the PAM module is activated, the Client immediately begins broadcasting/advertising the `EncryptedPacket` containing the `AuthenticationRequest` on all available channels.
 
 ### Step 2: Request Handling (Server)
 
-* The Server listens for discovery messages. Upon receiving a packet, it first decrypts it using the shared `CSK`.
-* It verifies the signature on the inner message to authenticate the Client, then performs replay mitigation checks.
+* The Server listens for discovery messages. Upon receiving an `EncryptedPacket`:
+    1.  It reads the `temporal_identifier`.
+    2.  For each `CSK` of its paired clients, it independently calculates the expected identifier for the **current time window** and the **previous time window** (to account for clock drift and network delay).
+    3.  It compares the received identifier against its calculated identifiers.
+    4.  If no match is found, the packet is silently discarded.
+    5.  If a match is found, it attempts a single decryption of the `ciphertext` using the corresponding `CSK`.
+* Once successfully decrypted and deserialized, it verifies the signature on the inner `WrapperMessage` payload and performs replay mitigation checks.
 
 #### Replay Attack Mitigation
 An incoming `AuthenticationRequest` **must** pass both checks:
@@ -113,13 +123,13 @@ An incoming `AuthenticationRequest` **must** pass both checks:
 ### Step 3: Response (Server)
 
 * The Server constructs and signs an `AuthenticationGrant` or `AuthenticationDenial` message.
-* It sends the encrypted response back to the Client using the **same transport layer** that the initial discovery message arrived on.
+* It wraps and encrypts this into an `EncryptedPacket` and sends it back to the Client using the **same transport layer** that the initial discovery message arrived on.
 
 ### Step 4: Finalization (Client)
 
-* The Client accepts the first valid, successfully decrypted `AuthenticationGrant` it receives.
-* It sends an encrypted `GrantConfirmation` back to the granting Server.
+* The Client accepts the first valid `EncryptedPacket` containing an `AuthenticationGrant` that it can successfully decrypt.
+* It sends a final `EncryptedPacket` containing a `GrantConfirmation` back to the granting Server.
 
 ### Step 5: Cancelation (All Transports)
 
-* The Client broadcasts/multicasts an encrypted `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.
+* The Client broadcasts/multicasts a final `EncryptedPacket` containing an `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.
