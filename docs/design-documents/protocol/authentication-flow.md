@@ -66,7 +66,7 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 * **Server `AuthenticationGrant`/`Denial` Retransmission**:
     * **Strategy**: Fixed interval.
     * **Interval**: **500ms**.
-    * **Rationale**: After user interaction, the Server becomes persistent in delivering the result to ensure the login completes promptly.
+    * **Rationale**: After user interaction, the Server becomes persistent in delivering the result to ensure the login completes promptly. This continues until a `GrantConfirmation` is received from the Client or timeout.
 
 * **Session Timeouts**:
     * The entire authentication attempt will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
@@ -108,8 +108,8 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 * The Server listens for discovery messages. Upon receiving an `EncryptedPacket`:
     1.  It reads the `temporal_identifier`.
-    2.  For each `CSK` of its paired clients, it independently calculates the expected identifier for the **current time window** and the **previous time window** (to account for clock drift and network delay).
-    3.  It compares the received identifier against its calculated identifiers.
+    2.  For each `CSK` of its paired clients, it independently calculates the expected identifier for the **current time window** and the **previous time window**. To avoid re-computation, these two valid identifiers for each client **should** be cached and only re-calculated when the time window changes.
+    3.  It compares the received identifier against its cached valid identifiers.
     4.  If no match is found, the packet is silently discarded.
     5.  If a match is found, it attempts a single decryption of the `ciphertext` using the corresponding `CSK`.
 * Once successfully decrypted and deserialized, it verifies the signature on the inner `WrapperMessage` payload and performs replay mitigation checks.
@@ -124,13 +124,13 @@ An incoming `AuthenticationRequest` **must** be validated against two independen
 ### Step 3: Response (Server)
 
 * The Server constructs and signs an `AuthenticationGrant` or `AuthenticationDenial` message.
-* It wraps and encrypts this into an `EncryptedPacket` and sends it back to the Client using the **same transport layer** that the initial discovery message arrived on.
+* It wraps and encrypts this into an `EncryptedPacket` and sends it back to the Client using the **same transport layer** that the initial discovery message arrived on, retransmitting until a confirmation is received or timeout.
 
 ### Step 4: Finalization (Client)
 
-* The Client accepts the first valid `EncryptedPacket` containing an `AuthenticationGrant` that it can successfully decrypt.
-* It sends a final `EncryptedPacket` containing a `GrantConfirmation` back to the granting Server.
+* The Client accepts the first valid `EncryptedPacket` containing an `AuthenticationGrant` or `AuthenticationDenial` that it can successfully decrypt.
+* Upon successful decryption of either message type, it **must** send a final `EncryptedPacket` containing a `GrantConfirmation` back to the granting Server to halt retransmissions. If further retransmissions are received after this point, the `GrantConfirmation` must be resent up to three times.
 
 ### Step 5: Cancelation (All Transports)
 
-* The Client broadcasts/multicasts a final `EncryptedPacket` containing an `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.
+* If the client is unlocked (e.g., through a successful `AuthenticationGrant`), it broadcasts/multicasts a final `EncryptedPacket` containing an `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.
