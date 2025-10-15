@@ -115,10 +115,11 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * Once successfully decrypted and deserialized, it verifies the signature on the inner `WrapperMessage` payload and performs replay mitigation checks.
 
 #### Replay Attack Mitigation
-An incoming `AuthenticationRequest` **must** pass both checks:
+An incoming `AuthenticationRequest` **must** be validated against two independent mechanisms to prevent replay attacks. Both checks must pass for the request to be considered valid.
 
-1.  **Timestamp Check**: The `timestamp_unix_seconds` in the request is compared against the Server's current UTC time. If the timestamp is older than a **60-second** validity window, it **must** be silently discarded. This timestamp check serves as a secondary defense to reject obviously stale packets (e.g., from a delayed network or a malicious replay hours later), preventing them from triggering user notifications.
-2.  **Nonce Check**: The primary cryptographic defense against replay attacks remains the single-use `challenge` nonce. The Server checks if it has already processed a request with the same `challenge` nonce in the last 120 seconds. If it has, the request is a duplicate and **must** be silently discarded.
+1.  **Nonce Check (Primary Defense)**: The `challenge` field in the request acts as a unique nonce for the authentication session. The Server **must** maintain a cache of all received `challenge` nonces for the duration of the session timeout (120 seconds). If a request is received with a `challenge` that is already in the cache, it is a replay and **must** be silently discarded.
+
+2.  **Timestamp Check (Secondary Defense)**: The `timestamp_unix_seconds` in the request is compared against the Server's current UTC time. If the timestamp is older than a **60-second** validity window, it is considered stale and **must** be silently discarded. This prevents the replay of very old packets that may have been captured from a previous session and are no longer in the nonce cache.
 
 ### Step 3: Response (Server)
 
