@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency by attempting discovery over multiple transport layers simultaneously.
+This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency by attempting discovery over multiple transport layers simultaneously. All communication after the initial pairing is encrypted.
 
 The core design is a **parallel discovery model**:
 * The Client initiates the process by simultaneously attempting discovery over both the **Local IP Network (IPv4 Broadcast & IPv6 Multicast)** and **Bluetooth Low Energy (BLE)**.
@@ -16,27 +16,39 @@ sequenceDiagram
     participant Server B (Phone 2)
 
     par
-        Client (Desktop)->>Server A (Phone 1): IP Discovery (AuthenticationRequest)
-        Client (Desktop)->>Server B (Phone 2): IP Discovery (AuthenticationRequest)
+        Client (Desktop)->>Server A (Phone 1): Encrypted IP Discovery (AuthenticationRequest)
+        Client (Desktop)->>Server B (Phone 2): Encrypted IP Discovery (AuthenticationRequest)
     and
         Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising Ping)
         Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising Ping)
     end
 
-    Note over Client (Desktop), Server A (Phone 1): Server A receives a discovery message and prompts its user.
+    Note over Client (Desktop), Server A (Phone 1): Server A receives and decrypts a discovery message, then prompts its user.
     
     alt User on Server A Approves
-        Server A (Phone 1)-->>Client (Desktop): Unicast (IP or BLE): AuthenticationGrant
+        Server A (Phone 1)-->>Client (Desktop): Encrypted Unicast (IP or BLE): AuthenticationGrant
     end
     
     Note over Client (Desktop), Server A (Phone 1): Client accepts the grant from Server A and logs in.
-    Client (Desktop)->>Server B (Phone 2): IP Cancel (Broadcast/Multicast) & BLE Cancel
+    Client (Desktop)->>Server B (Phone 2): Encrypted IP Cancel (Broadcast/Multicast) & BLE Cancel
     Note over Server B (Phone 2): Server B receives cancelation and dismisses its prompt.
 ```
 
 ## 2. Technical Specifications
 
-### 2.1. Timings and Retransmission Strategy
+### 2.1. Message Encryption
+
+To ensure confidentiality and privacy, all network communication after the initial pairing **must** be encrypted.
+
+* **Encryption Key**: The shared **Client Symmetric Key (`CSK`)** established during pairing.
+* **Algorithm**: **AES-256-GCM**.
+* **Process**:
+    1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
+    2.  Serialize the `WrapperMessage` to a byte array.
+    3.  Encrypt the entire serialized byte array using the `CSK`.
+    4.  Transmit the resulting ciphertext. The receiver will perform the decryption before deserializing the `WrapperMessage`.
+
+### 2.2. Timings and Retransmission Strategy
 
 To ensure responsiveness, the protocol employs an aggressive retransmission strategy.
 
@@ -54,77 +66,60 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 * **Session Timeouts**:
     * The entire authentication attempt will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
 
-### 2.2. Signature Generation
+### 2.3. Signature Generation
 
-All signed messages must use a canonical format to guarantee verifiability.
+All signed messages must use a canonical format to guarantee verifiability *before encryption*.
 
-* **Data-To-Be-Signed**: The **binary-serialized Protobuf message** with its `signature` field temporarily empty.
+* **Data-To-Be-Signed**: The **binary-serialized Protobuf message** (e.g., `AuthenticationRequest`) with its `signature` field temporarily empty.
 * **Process**:
-    1.  Construct the message object.
-    2.  Ensure the `signature` field is empty.
+    1.  Construct the inner message object (e.g., `AuthenticationRequest`).
+    2.  Ensure its `signature` field is empty.
     3.  Serialize the object to a byte array using the standard Protobuf library.
     4.  Compute the digital signature of this byte array.
-    5.  Place the computed signature back into the `signature` field before sending.
+    5.  Place the computed signature back into the `signature` field.
+    6.  This completed message is then placed in a `WrapperMessage`, which is then encrypted for transmission.
 
-### 2.3. Transport Layer Considerations
+### 2.4. Transport Layer Considerations
 
 The protocol is transport-agnostic, but relies on specific behaviors for discovery.
 
 * **IP Network (Wired Ethernet or Wi-Fi)**:
-    * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable. If changed, all Clients and Servers on the same network must be configured to use the same port for discovery to function.
+    * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable.
     * **IPv4**: The Client sends to the broadcast address `255.255.255.255`.
     * **IPv6**: The Client sends to the designated link-local multicast address **`ff02:bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8`**.
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
 
 * **Bluetooth Low Energy (BLE)**:
-    * **No OS-level pairing is required.** The security is enforced by the application-layer cryptography.
     * The Client acts in the **Advertiser/Peripheral** role.
     * The Server acts in the **Scanner/Central** role.
-    * The Client **advertises** a small discovery packet. After the Server connects, the Client sends the full `AuthenticationRequest` over the dedicated GATT characteristic.
 
 ## 3. Protocol Flow
 
 ### Step 1: Parallel Discovery (Client)
 
-* When the PAM module is activated, the Client immediately initiates discovery on all available channels **simultaneously**:
-    1.  **IP Network**: It broadcasts/multicasts the complete, signed `AuthenticationRequest` over IPv4 and IPv6.
-    2.  **BLE**: It begins BLE advertising with the payload defined in the `ble-gatt-specification.md`.
-* The Client continues this process according to the retransmission schedule until a valid grant is received.
+* When the PAM module is activated, the Client immediately begins broadcasting/advertising the encrypted `AuthenticationRequest` on all available channels **simultaneously**.
 
 ### Step 2: Request Handling (Server)
 
-* The Server simultaneously listens for IP packets and scans for BLE advertisements.
-* Upon receiving the **first successful discovery message** (either the full request via IP, or the advertisement ping via BLE), the Server proceeds.
-* If discovered via BLE, the Server connects to the Client to receive the full `AuthenticationRequest` over GATT.
-* It verifies the signature to authenticate the Client, then performs the replay mitigation checks.
+* The Server listens for discovery messages. Upon receiving a packet, it first decrypts it using the shared `CSK`.
+* It verifies the signature on the inner message to authenticate the Client, then performs replay mitigation checks.
 
 #### Replay Attack Mitigation
-To be considered valid, an incoming `AuthenticationRequest` **must** pass both of the following checks:
+An incoming `AuthenticationRequest` **must** pass both checks:
 
-1.  **Timestamp Check**: The Server compares the `timestamp_unix_seconds` in the request against its own current UTC time. If the timestamp is older than a short validity window (e.g., **10 seconds**), the request **must** be silently discarded. This prevents replay attacks using old requests.
-2.  **Nonce Check**: The Server checks if it has already processed a request with the same `challenge` nonce in the last 120 seconds. If it has, the request is a duplicate (e.g., from both IPv4 and IPv6) and **must** be silently discarded.
-
-* After passing these checks, the Server displays a prompt for user interaction.
-* **Rate Limiting**: To prevent notification spam, the Server should implement rate limiting on incoming requests as specified in the Security Hardening Guidelines.
-* **Handling Superseded Requests**: If the Server receives a new, valid `AuthenticationRequest` from a Client that already has an active prompt, the old request is immediately discarded, and a new prompt is shown for the new request.
+1.  **Timestamp Check**: The `timestamp_unix_seconds` in the request is compared against the Server's current UTC time. If the timestamp is older than a **60-second** validity window, it **must** be silently discarded. This timestamp check serves as a secondary defense to reject obviously stale packets (e.g., from a delayed network or a malicious replay hours later), preventing them from triggering user notifications.
+2.  **Nonce Check**: The primary cryptographic defense against replay attacks remains the single-use `challenge` nonce. The Server checks if it has already processed a request with the same `challenge` nonce in the last 120 seconds. If it has, the request is a duplicate and **must** be silently discarded.
 
 ### Step 3: Response (Server)
 
-* The Server constructs an `AuthenticationGrant` or `AuthenticationDenial` message.
-* It sends the response back to the Client using the **same transport layer** (IP unicast or the established BLE connection) that the initial discovery message arrived on.
-* The Server will retransmit this response until it receives a `GrantConfirmation` or the session times out.
+* The Server constructs and signs an `AuthenticationGrant` or `AuthenticationDenial` message.
+* It sends the encrypted response back to the Client using the **same transport layer** that the initial discovery message arrived on.
 
 ### Step 4: Finalization (Client)
 
-* The Client accepts the **first valid `AuthenticationGrant`** it receives, regardless of which transport layer it arrived on.
-* Immediately upon validation, the Client performs its final actions in parallel:
-    1.  **Confirmation**: It sends a unicast `GrantConfirmation` back to the granting Server over the same channel that delivered the grant.
-    2.  **Cancelation**: It initiates the cancelation process described in Step 5.
-* The PAM module then unlocks the user account.
+* The Client accepts the first valid, successfully decrypted `AuthenticationGrant` it receives.
+* It sends an encrypted `GrantConfirmation` back to the granting Server.
 
 ### Step 5: Cancelation (All Transports)
 
-* To ensure all pending prompts are dismissed, the Client sends a cancelation signal across all active transports:
-    * **IP Network**: The Client broadcasts/multicasts an `AuthenticationCancel` message.
-    * **BLE**: If the login session was initiated over BLE, the Client writes an `AuthenticationCancel` message to the **Client Command Characteristic**. In all cases, the Client should stop advertising and terminate any outstanding BLE connections related to the completed session.
-* Any other Server that has a pending user prompt will receive an explicit cancelation signal appropriate for its connection type, causing it to dismiss the user notification.
+* The Client broadcasts/multicasts an encrypted `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.

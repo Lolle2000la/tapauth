@@ -70,16 +70,37 @@ message AuthenticationCancel {
 
 // -- Pairing Messages --
 
+/**
+ * A generic container for encrypted data, used during pairing.
+ */
+message EncryptedData {
+  // The ciphertext of the encrypted payload.
+  bytes ciphertext = 1;
+}
+
 message PairingHandshake {
   bytes server_public_key = 1;
 }
 
+/**
+ * Sent by the Client to the Server during pairing to deliver the shared key.
+ */
+message ClientKeyDelivery {
+  // The Client Symmetric Key (CSK), encrypted with the temporary pairing key (PSK).
+  EncryptedData encrypted_csk = 1;
+}
+
+/**
+ * Sent by the Server to the Client to confirm successful receipt of the shared key.
+ */
 message PairingConfirmation {
-  // No fields needed.
+  // A SHA-256 hash of the CSK, encrypted with the temporary pairing key (PSK).
+  EncryptedData encrypted_confirmation_hash = 1;
 }
 
 /**
  * A top-level wrapper for all possible messages.
+ * Post-pairing, this entire message is encrypted before being sent.
  */
 message WrapperMessage {
   // The version of the protocol being used. Currently 1.
@@ -93,5 +114,6 @@ message WrapperMessage {
     AuthenticationDenial auth_denial = 6;
     GrantConfirmation grant_confirmation = 7;
     AuthenticationCancel auth_cancel = 8;
+    ClientKeyDelivery client_key_delivery = 9;
   }
 }
