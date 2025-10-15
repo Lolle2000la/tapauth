@@ -27,3 +27,9 @@ Once a BLE connection is established, the TapAuth service shall expose two chara
    * **UUID**: `ca6238be-c194-49b7-855b-58f41d3da626`
    * **Properties**: `NOTIFY`
    * **Purpose**: The Server (phone) sends the `EncryptedPacket` containing the `AuthenticationGrant` or `AuthenticationDenial` message to the Client via a notification on this characteristic.
+
+## BLE Security Best Practices
+
+To protect the confidentiality and integrity of the communication at the transport layer, the following BLE security practice **must** be implemented.
+
+* **LE Secure Connections**: The connection between the Client and Server **must** be established using **LE Secure Connections**. Legacy pairing is not sufficient and must be disabled. This provides strong, ECDH-based key exchange and protects against passive eavesdropping and Man-in-the-Middle attacks at the link layer.
