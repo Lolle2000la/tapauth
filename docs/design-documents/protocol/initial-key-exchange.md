@@ -79,11 +79,17 @@ Both devices independently compute the same temporary **Pairing Symmetric Key (`
 
 ### Step 4: Anti-MITM Verification
 
-This is the most critical security step in the pairing process. Both devices compute and display a **Short Authentication String (SAS)** derived from the `PSK` and the public keys.
+This is the most critical security step in the pairing process. Both devices compute and display a **Short Authentication String (SAS)**.
+
+**SAS Generation:**
+The SAS **must** be a 6-digit number derived as follows:
+1.  Create a byte string by concatenating the Client's public key and the Server's public key: `input_material = Client_Pub | Server_Pub`.
+2.  Use HKDF-SHA256 with the `PSK` as the input keying material (`IKM`), no salt, and the info string `"tapauth-sas"` to derive a 64-bit value.
+3.  Take the resulting value, calculate `value mod 1,000,000`, and pad with leading zeros if necessary to create a 6-digit string. This string should be displayed to the user in a friendly format (e.g., "123-456").
 
 **The user MUST visually confirm that the SAS displayed on the Client screen and the Server screen are identical before proceeding.**
 
-Failure to verify the SAS could allow a Man-in-the-Middle (MITM) attacker to intercept the connection and compromise the shared key. The user interface on both devices must make this verification step prominent and mandatory.
+Failure to verify the SAS could allow a Man-in-the-Middle (MITM) attacker to intercept the connection and compromise the shared key. The user interface on both devices **must** make this verification step prominent and mandatory. For example, the confirmation button could be disabled until the user actively confirms the match via a checkbox.
 
 ### Step 5: Client Sends Shared Key
 
