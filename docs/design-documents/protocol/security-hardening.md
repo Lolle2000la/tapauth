@@ -18,8 +18,11 @@ The cryptographic private keys are the foundation of the system's security. They
 
 ## 2. Rate Limiting
 
-To mitigate denial-of-service attacks from a malicious actor on the local network, the Server application must implement rate limiting on incoming authentication requests.
+To mitigate denial-of-service (DoS) and user annoyance attacks from a malicious or malfunctioning actor on the local network, the Server application **must** implement rate limiting on incoming authentication requests.
 
-* **Strategy**: Per-Client identifier (based on the public key from the verified signature).
-* **Rule**: After receiving a valid `AuthenticationRequest` from a given Client, the Server **should** ignore any further requests *from that same Client* for a short, escalating period (e.g., ignore for 1 second, then 2, then 4).
-* **Rationale**: This prevents a flood of notifications from a single rogue or misbehaving client from overwhelming the user or draining the Server's battery, while still allowing legitimate requests from other paired Clients.
+* **Strategy**: Per-Client identifier (based on the public key from the verified signature). A token bucket or similar algorithm is recommended.
+* **Rule**: After receiving a valid `AuthenticationRequest` from a given Client and displaying a notification, the Server **must** ignore subsequent requests from that *same Client* for a short, escalating period.
+    * **Initial Backoff**: A 1-second cooldown after the first request is processed.
+    * **Escalation**: The cooldown should double for each subsequent request (e.g., 2s, 4s, 8s) up to a maximum of 60 seconds.
+    * **Reset**: The rate limit for a Client should be reset after a successful `GrantConfirmation`, an `AuthenticationCancel` is received, or the session times out.
+* **Rationale**: This prevents a flood of notifications from a single rogue client from overwhelming the user or draining the Server's battery, while still allowing legitimate requests from other paired Clients to be processed immediately.
