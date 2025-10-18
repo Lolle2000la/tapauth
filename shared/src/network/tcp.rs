@@ -1,10 +1,10 @@
 use prost::Message;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use crate::protocol::pb::WrapperMessage;
 use super::NetworkError;
+use crate::protocol::pb::WrapperMessage;
 
 /// Create a TCP listener for pairing
 pub fn create_tcp_listener(port: u16) -> Result<TcpListener, NetworkError> {
@@ -19,7 +19,7 @@ pub fn accept_connection(
     timeout: Duration,
 ) -> Result<(TcpStream, SocketAddr), NetworkError> {
     listener.set_nonblocking(true)?;
-    
+
     let start = std::time::Instant::now();
     loop {
         match listener.accept() {
@@ -53,15 +53,15 @@ pub fn send_tcp_message(
     message: &WrapperMessage,
 ) -> Result<(), NetworkError> {
     let data = message.encode_to_vec();
-    
+
     // Send length prefix (4 bytes, big-endian)
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes())?;
-    
+
     // Send message data
     stream.write_all(&data)?;
     stream.flush()?;
-    
+
     Ok(())
 }
 
@@ -71,19 +71,19 @@ pub fn receive_tcp_message(stream: &mut TcpStream) -> Result<WrapperMessage, Net
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    
+
     // Sanity check: limit message size to 1MB
     if len > 1_000_000 {
         return Err(NetworkError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Message too large"
+            "Message too large",
         )));
     }
-    
+
     // Read message data
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data)?;
-    
+
     // Decode message
     let message = WrapperMessage::decode(&data[..])?;
     Ok(message)

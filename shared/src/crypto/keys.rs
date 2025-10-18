@@ -1,7 +1,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
 // OsRng implementation using getrandom
@@ -190,12 +190,8 @@ mod tests {
         let alice = X25519KeyPair::generate();
         let bob = X25519KeyPair::generate();
 
-        let alice_shared = alice
-            .diffie_hellman(&bob.public_key_bytes())
-            .unwrap();
-        let bob_shared = bob
-            .diffie_hellman(&alice.public_key_bytes())
-            .unwrap();
+        let alice_shared = alice.diffie_hellman(&bob.public_key_bytes()).unwrap();
+        let bob_shared = bob.diffie_hellman(&alice.public_key_bytes()).unwrap();
 
         assert_eq!(alice_shared, bob_shared);
     }
@@ -204,7 +200,7 @@ mod tests {
     fn test_csk_generation() {
         let csk1 = ClientSymmetricKey::generate();
         let csk2 = ClientSymmetricKey::generate();
-        
+
         // Keys should be different
         assert_ne!(csk1.as_bytes(), csk2.as_bytes());
     }

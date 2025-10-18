@@ -1,10 +1,10 @@
-pub mod udp;
-pub mod tcp;
 pub mod discovery;
+pub mod tcp;
+pub mod udp;
 
-pub use udp::*;
-pub use tcp::*;
 pub use discovery::*;
+pub use tcp::*;
+pub use udp::*;
 
 /// Default UDP port for authentication
 pub const DEFAULT_UDP_PORT: u16 = 36692;

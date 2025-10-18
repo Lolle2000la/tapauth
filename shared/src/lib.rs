@@ -1,17 +1,16 @@
-pub mod crypto;
-pub mod protocol;
 pub mod config;
-pub mod network;
+pub mod crypto;
 pub mod models;
+pub mod network;
+pub mod protocol;
 
 #[cfg(feature = "jni")]
 pub mod jni_api;
 
 // Re-export commonly used types
+pub use config::{ClientConfig, ClientConfigManager, ConfigError, PairedClient, PairedServer};
 pub use crypto::{
-    ClientSymmetricKey, Ed25519KeyPair, X25519KeyPair,
-    CryptoError, PairingSymmetricKey,
+    ClientSymmetricKey, CryptoError, Ed25519KeyPair, PairingSymmetricKey, X25519KeyPair,
 };
-pub use protocol::pb;
-pub use config::{ClientConfig, ClientConfigManager, PairedServer, PairedClient, ConfigError};
 pub use network::NetworkError;
+pub use protocol::pb;

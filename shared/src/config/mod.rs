@@ -261,7 +261,7 @@ impl ClientConfigManager {
     pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
         // Delete all paired servers since they have the old CSK
         let _ = self.clear_paired_servers();
-        
+
         // Generate and save new CSK
         self.generate_and_save_csk()
     }

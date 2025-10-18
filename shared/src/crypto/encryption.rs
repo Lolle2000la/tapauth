@@ -5,7 +5,7 @@ use aes_gcm::{
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use super::{CryptoError, ClientSymmetricKey, PairingSymmetricKey};
+use super::{ClientSymmetricKey, CryptoError, PairingSymmetricKey};
 
 /// Encrypt data using AES-256-GCM
 pub fn encrypt_aes_gcm(
@@ -87,7 +87,7 @@ pub fn encrypt_with_psk(
     let mut nonce = [0u8; 12];
     hk.expand(context, &mut nonce)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
-    
+
     encrypt_aes_gcm(psk.as_bytes(), &nonce, plaintext, &[])
 }
 
@@ -102,7 +102,7 @@ pub fn decrypt_with_psk(
     let mut nonce = [0u8; 12];
     hk.expand(context, &mut nonce)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
-    
+
     decrypt_aes_gcm(psk.as_bytes(), &nonce, ciphertext, &[])
 }
 

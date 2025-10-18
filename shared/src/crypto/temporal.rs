@@ -21,17 +21,17 @@ pub fn generate_temporal_identifier(
     csk: &ClientSymmetricKey,
     time_window: u64,
 ) -> Result<[u8; 16], CryptoError> {
-    let mut mac = HmacSha256::new_from_slice(csk.as_bytes())
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
-    
+    let mut mac =
+        HmacSha256::new_from_slice(csk.as_bytes()).map_err(|_| CryptoError::KeyDerivationFailed)?;
+
     mac.update(&time_window.to_be_bytes());
-    
+
     let result = mac.finalize();
     let bytes = result.into_bytes();
-    
+
     let mut identifier = [0u8; 16];
     identifier.copy_from_slice(&bytes[..16]);
-    
+
     Ok(identifier)
 }
 
@@ -62,7 +62,7 @@ pub fn verify_temporal_identifier(
     if identifier == &current {
         return Ok(true);
     }
-    
+
     let previous = generate_previous_temporal_identifier(csk)?;
     Ok(identifier == &previous)
 }
@@ -82,13 +82,13 @@ mod tests {
     fn test_temporal_identifier_generation() {
         let csk = ClientSymmetricKey::generate();
         let window = current_time_window();
-        
+
         let id1 = generate_temporal_identifier(&csk, window).unwrap();
         let id2 = generate_temporal_identifier(&csk, window).unwrap();
-        
+
         // Same window should produce same identifier
         assert_eq!(id1, id2);
-        
+
         // Different window should produce different identifier
         let id3 = generate_temporal_identifier(&csk, window + 1).unwrap();
         assert_ne!(id1, id3);
@@ -98,10 +98,10 @@ mod tests {
     fn test_temporal_identifier_verification() {
         let csk = ClientSymmetricKey::generate();
         let current_id = generate_current_temporal_identifier(&csk).unwrap();
-        
+
         // Current identifier should verify
         assert!(verify_temporal_identifier(&csk, &current_id).unwrap());
-        
+
         // Random identifier should not verify
         let random_id = [0u8; 16];
         assert!(!verify_temporal_identifier(&csk, &random_id).unwrap());
@@ -110,11 +110,11 @@ mod tests {
     #[test]
     fn test_previous_identifier_verification() {
         let csk = ClientSymmetricKey::generate();
-        
+
         // This test assumes we're not at time window 0
         if current_time_window() > 0 {
             let previous_id = generate_previous_temporal_identifier(&csk).unwrap();
-            
+
             // Previous identifier should also verify
             assert!(verify_temporal_identifier(&csk, &previous_id).unwrap());
         }

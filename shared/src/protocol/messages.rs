@@ -238,7 +238,11 @@ pub fn verify_auth_cancel(
     unsigned_cancel.signature = Vec::new();
     let data_to_verify = unsigned_cancel.encode_to_vec();
 
-    verify_ed25519(client_public_key, &data_to_verify, &unsigned_cancel.signature)?;
+    verify_ed25519(
+        client_public_key,
+        &data_to_verify,
+        &unsigned_cancel.signature,
+    )?;
     Ok(())
 }
 
@@ -276,7 +280,9 @@ mod tests {
 
         // Verification should fail with wrong challenge
         let wrong_challenge = [2u8; 32];
-        assert!(verify_auth_grant(&grant, &wrong_challenge, &keypair.verifying_key_bytes()).is_err());
+        assert!(
+            verify_auth_grant(&grant, &wrong_challenge, &keypair.verifying_key_bytes()).is_err()
+        );
     }
 
     #[test]

@@ -17,15 +17,15 @@ pub mod pairing {
         ipv6: Option<Ipv6Addr>,
     ) -> String {
         let mut url = format!("tapauth://pair?v=1&pk={}&p={}", public_key_hex, port);
-        
+
         if let Some(ip) = ipv4 {
             url.push_str(&format!("&ip4={}", ip));
         }
-        
+
         if let Some(ip) = ipv6 {
             url.push_str(&format!("&ip6={}", ip));
         }
-        
+
         url
     }
 
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn test_pairing_url_generation() {
         use std::net::{Ipv4Addr, Ipv6Addr};
-        
+
         let url = pairing::generate_pairing_url(
             "aabbccdd",
             12345,

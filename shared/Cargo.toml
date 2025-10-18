@@ -7,8 +7,16 @@ build = "build.rs"
 [dependencies]
 # Cryptography
 aes-gcm = "0.10"
-ed25519-dalek = { version = "3.0.0-pre.1", features = ["rand_core", "serde", "zeroize"] }
-x25519-dalek = { version = "3.0.0-pre.1", features = ["serde", "static_secrets", "zeroize"] }
+ed25519-dalek = { version = "3.0.0-pre.1", features = [
+    "rand_core",
+    "serde",
+    "zeroize",
+] }
+x25519-dalek = { version = "3.0.0-pre.1", features = [
+    "serde",
+    "static_secrets",
+    "zeroize",
+] }
 hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"

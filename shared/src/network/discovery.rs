@@ -58,10 +58,10 @@ mod tests {
     fn test_retry_intervals() {
         // First retry should be 200ms
         assert_eq!(get_client_retry_interval(0), Duration::from_millis(200));
-        
+
         // Second retry should be 400ms
         assert_eq!(get_client_retry_interval(1), Duration::from_millis(400));
-        
+
         // Third retry should be 800ms
         assert_eq!(get_client_retry_interval(2), Duration::from_millis(800));
     }
