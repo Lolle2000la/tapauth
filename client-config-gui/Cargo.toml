@@ -22,7 +22,9 @@ tokio = { version = "1.41", features = ["full"] }
 # Utilities
 thiserror = "2.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+local-ip-address = "0.6"
+hex = "0.4"
 
 # Privilege escalation
 sudo = "0.6"
