@@ -195,7 +195,10 @@ name = "client-pam"
 version = "0.1.0"
 dependencies = [
  "bluer",
- "pam",
+ "futures-util",
+ "getrandom 0.2.16",
+ "hex",
+ "pam-bindings",
  "shared",
  "socket2 0.5.10",
  "thiserror",
@@ -908,21 +911,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "pam"
-version = "0.7.0"
+name = "pam-bindings"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa2bdc959c201c047004a1420a92aaa1dd1a6b64d5ef333aa3a4ac764fb93097"
-dependencies = [
- "libc",
- "pam-sys",
- "users",
-]
-
-[[package]]
-name = "pam-sys"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4858311a097f01a0006ef7d0cd50bca81ec430c949d7bf95cbefd202282434"
+checksum = "95c337e922acb6ab9c3ddd1016fed13957a5bf14f51b6caa293ddc8dd47660ca"
 dependencies = [
  "libc",
 ]
@@ -1651,15 +1643,6 @@ checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
 dependencies = [
  "crypto-common 0.1.6",
  "subtle",
-]
-
-[[package]]
-name = "users"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fed7d0912567d35f88010c23dbaf865e9da8b5227295e8dc0f2fdd109155ab7"
-dependencies = [
- "libc",
 ]
 
 [[package]]
