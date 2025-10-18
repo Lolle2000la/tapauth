@@ -1,14 +1,14 @@
+mod device_list;
 mod main_menu;
 mod pairing;
-mod device_list;
 mod settings;
 
+pub use device_list::DeviceListScreen;
 pub use main_menu::MainMenuScreen;
 pub use pairing::PairingScreen;
-pub use device_list::DeviceListScreen;
 pub use settings::SettingsScreen;
 
-use iced::{Task, Element};
+use iced::{Element, Task};
 
 /// All possible screens in the application
 #[derive(Debug, Clone)]
@@ -33,22 +33,22 @@ pub enum ScreenMessage {
     NavigateToPairing,
     NavigateToDeviceList,
     NavigateToSettings,
-    
+
     // Main Menu
     StartPairing,
     ViewDevices,
     OpenSettings,
-    
+
     // Pairing
     PairingStarted,
     PairingComplete(String), // device_id
     PairingFailed(String),   // error message
     PairingCancelled,
-    
+
     // Device List
-    RemoveDevice(String),    // device_id
-    DeviceRemoved(String),   // device_id
-    
+    RemoveDevice(String),  // device_id
+    DeviceRemoved(String), // device_id
+
     // Settings
     RotateCSK,
     CSKRotated,
@@ -75,7 +75,7 @@ impl Screen {
                 *self = Screen::Settings(SettingsScreen::new());
                 Task::none()
             }
-            
+
             // Screen-specific messages
             _ => match self {
                 Screen::MainMenu(screen) => screen.update(message),

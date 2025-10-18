@@ -31,9 +31,7 @@ impl TapAuthConfig {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        self.current_screen
-            .view()
-            .map(Message::ScreenMessage)
+        self.current_screen.view().map(Message::ScreenMessage)
     }
 
     pub fn theme(&self) -> Theme {

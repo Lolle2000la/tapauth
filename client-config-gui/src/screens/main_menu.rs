@@ -1,7 +1,7 @@
 use super::ScreenMessage;
 use iced::{
     widget::{button, column, container, text, Space},
-    Task, Element, Length,
+    Element, Length, Task,
 };
 
 #[derive(Debug, Clone)]
@@ -37,25 +37,15 @@ impl MainMenuScreen {
         .width(Length::Fixed(300.0))
         .on_press(ScreenMessage::StartPairing);
 
-        let devices_button = button(
-            text("Manage Devices")
-                .size(20)
-                .center()
-                .width(Length::Fill),
-        )
-        .padding(20)
-        .width(Length::Fixed(300.0))
-        .on_press(ScreenMessage::ViewDevices);
+        let devices_button = button(text("Manage Devices").size(20).center().width(Length::Fill))
+            .padding(20)
+            .width(Length::Fixed(300.0))
+            .on_press(ScreenMessage::ViewDevices);
 
-        let settings_button = button(
-            text("Settings")
-                .size(20)
-                .center()
-                .width(Length::Fill),
-        )
-        .padding(20)
-        .width(Length::Fixed(300.0))
-        .on_press(ScreenMessage::OpenSettings);
+        let settings_button = button(text("Settings").size(20).center().width(Length::Fill))
+            .padding(20)
+            .width(Length::Fixed(300.0))
+            .on_press(ScreenMessage::OpenSettings);
 
         let content = column![
             Space::with_height(Length::Fixed(50.0)),

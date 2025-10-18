@@ -1,5 +1,4 @@
 /// Utility functions for the GUI application
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Get the local IPv4 address
@@ -11,7 +10,7 @@ pub fn get_local_ipv4() -> Option<Ipv4Addr> {
             if name == "lo" || name == "lo0" {
                 continue;
             }
-            
+
             if let IpAddr::V4(ipv4) = ip {
                 if !ipv4.is_loopback() {
                     return Some(ipv4);
@@ -30,7 +29,7 @@ pub fn get_local_ipv6() -> Option<Ipv6Addr> {
             if name == "lo" || name == "lo0" {
                 continue;
             }
-            
+
             if let IpAddr::V6(ipv6) = ip {
                 if !ipv6.is_loopback() {
                     return Some(ipv6);
