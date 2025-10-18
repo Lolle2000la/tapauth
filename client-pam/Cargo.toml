@@ -31,6 +31,6 @@ getrandom = "0.2"
 hex = "0.4"
 
 [features]
-default = []
+default = ["ble", "tpm"]
 ble = ["bluer", "futures-util"]
 tpm = ["tss-esapi"]
