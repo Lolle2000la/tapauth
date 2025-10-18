@@ -42,24 +42,18 @@ impl BleAdvertiser {
     }
 
     /// Start advertising with temporal identifier
-    pub async fn start_advertising(
-        &self,
-        temporal_identifier: &[u8; 16],
-    ) -> Result<(), BleError> {
+    pub async fn start_advertising(&self, temporal_identifier: &[u8; 16]) -> Result<(), BleError> {
         use shared::models::ble::SERVICE_UUID;
-        
+
         // Set adapter to be powered on
         self.adapter.set_powered(true).await?;
 
         // Create advertisement
         let advertisement = bluer::adv::Advertisement {
             service_uuids: vec![SERVICE_UUID.parse().unwrap()].into_iter().collect(),
-            service_data: [(
-                SERVICE_UUID.parse().unwrap(),
-                temporal_identifier.to_vec(),
-            )]
-            .into_iter()
-            .collect(),
+            service_data: [(SERVICE_UUID.parse().unwrap(), temporal_identifier.to_vec())]
+                .into_iter()
+                .collect(),
             discoverable: Some(true),
             local_name: Some("TapAuth".to_string()),
             ..Default::default()
@@ -85,7 +79,7 @@ impl BleAdvertiser {
         timeout_duration: Duration,
     ) -> Result<Option<Address>, BleError> {
         use futures_util::StreamExt;
-        
+
         let mut events = self.adapter.events().await?;
 
         match timeout(timeout_duration, async {
@@ -116,10 +110,7 @@ impl BleAdvertiser {
     }
 
     /// Start advertising with temporal identifier (stub when BLE is disabled)
-    pub async fn start_advertising(
-        &self,
-        _temporal_identifier: &[u8; 16],
-    ) -> Result<(), BleError> {
+    pub async fn start_advertising(&self, _temporal_identifier: &[u8; 16]) -> Result<(), BleError> {
         Err(BleError::NotCompiled)
     }
 
@@ -147,7 +138,7 @@ mod tests {
         // This test will fail if no Bluetooth adapter is available
         // which is expected in CI/testing environments
         let result = BleAdvertiser::new().await;
-        
+
         // Just verify it doesn't panic
         match result {
             Ok(_) => println!("BLE adapter found"),

@@ -2,8 +2,9 @@ use shared::{
     config::ClientConfigManager,
     crypto::{generate_current_temporal_identifier, ClientSymmetricKey, Ed25519KeyPair},
     network::{
-        create_broadcast_socket, send_udp_broadcast, send_udp_multicast, try_receive_udp_packet,
-        get_client_retry_interval, get_session_timeout, DEFAULT_UDP_PORT, IPV6_MULTICAST_ADDR,
+        create_broadcast_socket, get_client_retry_interval, get_session_timeout,
+        send_udp_broadcast, send_udp_multicast, try_receive_udp_packet, DEFAULT_UDP_PORT,
+        IPV6_MULTICAST_ADDR,
     },
     protocol::{
         messages::*,
@@ -47,12 +48,12 @@ impl AuthenticationClient {
     /// Create a new authentication client
     pub fn new(username: String) -> Result<Self, AuthError> {
         let config_manager = ClientConfigManager::new();
-        
+
         // Load keypair and CSK
         let keypair = config_manager
             .load_keypair()
             .map_err(|e| AuthError::InitError(format!("Failed to load keypair: {}", e)))?;
-        
+
         let csk = config_manager
             .load_csk()
             .map_err(|e| AuthError::InitError(format!("Failed to load CSK: {}", e)))?;
@@ -87,12 +88,8 @@ impl AuthenticationClient {
         let wrapper = wrap_auth_request(request);
 
         // Create encrypted packet
-        let packet = create_encrypted_packet(
-            &self.csk,
-            &self.challenge,
-            b"auth_request",
-            &wrapper,
-        )?;
+        let packet =
+            create_encrypted_packet(&self.csk, &self.challenge, b"auth_request", &wrapper)?;
 
         // Start parallel discovery: UDP + BLE
         let udp_result = self.try_udp_authentication(&packet).await;
@@ -144,10 +141,10 @@ impl AuthenticationClient {
                                 self.send_confirmation(&socket, port).await?;
                                 confirmation_sent = true;
                             }
-                            
+
                             // Send cancel to other servers
                             self.send_cancel_broadcast(&socket, port).await?;
-                            
+
                             return Ok(());
                         }
                         Ok(false) => {
@@ -175,7 +172,8 @@ impl AuthenticationClient {
         _server_addr: SocketAddr,
     ) -> Result<bool, AuthError> {
         // Decrypt the packet
-        let wrapper = decrypt_encrypted_packet(&self.csk, &self.challenge, b"auth_response", packet)?;
+        let wrapper =
+            decrypt_encrypted_packet(&self.csk, &self.challenge, b"auth_response", packet)?;
 
         // Check what kind of response we got
         match wrapper.payload {
@@ -183,47 +181,47 @@ impl AuthenticationClient {
                 // Verify the grant
                 // We need to find which server sent this by checking signatures
                 let paired_servers = self.config_manager.load_paired_servers()?;
-                
+
                 for (_id, server) in paired_servers.iter() {
                     let pub_key_bytes = hex::decode(&server.public_key)
                         .map_err(|_| AuthError::Protocol(ProtocolError::InvalidMessageFormat))?;
-                    
+
                     if pub_key_bytes.len() != 32 {
                         continue;
                     }
-                    
+
                     let mut pub_key = [0u8; 32];
                     pub_key.copy_from_slice(&pub_key_bytes);
-                    
+
                     if verify_auth_grant(&grant, &self.challenge, &pub_key).is_ok() {
                         tracing::info!("Authentication granted by server: {}", server.name);
                         return Ok(true);
                     }
                 }
-                
+
                 Err(AuthError::Protocol(ProtocolError::InvalidSignature))
             }
             Some(wrapper_message::Payload::AuthDenial(denial)) => {
                 // Verify the denial
                 let paired_servers = self.config_manager.load_paired_servers()?;
-                
+
                 for (_id, server) in paired_servers.iter() {
                     let pub_key_bytes = hex::decode(&server.public_key)
                         .map_err(|_| AuthError::Protocol(ProtocolError::InvalidMessageFormat))?;
-                    
+
                     if pub_key_bytes.len() != 32 {
                         continue;
                     }
-                    
+
                     let mut pub_key = [0u8; 32];
                     pub_key.copy_from_slice(&pub_key_bytes);
-                    
+
                     if verify_auth_denial(&denial, &pub_key).is_ok() {
                         tracing::info!("Authentication denied by server: {}", server.name);
                         return Ok(false);
                     }
                 }
-                
+
                 Err(AuthError::Protocol(ProtocolError::InvalidSignature))
             }
             _ => Err(AuthError::Protocol(ProtocolError::InvalidMessageFormat)),
@@ -238,12 +236,8 @@ impl AuthenticationClient {
     ) -> Result<(), AuthError> {
         let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)?;
         let wrapper = wrap_grant_confirmation(confirmation);
-        let packet = create_encrypted_packet(
-            &self.csk,
-            &self.challenge,
-            b"grant_confirmation",
-            &wrapper,
-        )?;
+        let packet =
+            create_encrypted_packet(&self.csk, &self.challenge, b"grant_confirmation", &wrapper)?;
 
         // Send on both IPv4 and IPv6
         send_udp_broadcast(socket, port, &packet)?;
@@ -260,12 +254,7 @@ impl AuthenticationClient {
     ) -> Result<(), AuthError> {
         let cancel = create_auth_cancel(&self.keypair, &self.challenge)?;
         let wrapper = wrap_auth_cancel(cancel);
-        let packet = create_encrypted_packet(
-            &self.csk,
-            &self.challenge,
-            b"auth_cancel",
-            &wrapper,
-        )?;
+        let packet = create_encrypted_packet(&self.csk, &self.challenge, b"auth_cancel", &wrapper)?;
 
         // Send on both IPv4 and IPv6
         send_udp_broadcast(socket, port, &packet)?;

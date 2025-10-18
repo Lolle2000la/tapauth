@@ -5,7 +5,10 @@ mod pam_logic;
 pub use auth_client::*;
 pub use ble_advertiser::*;
 
-use pam::{constants::{PamFlag, PamResultCode}, module::PamHandle};
+use pam::{
+    constants::{PamFlag, PamResultCode},
+    module::PamHandle,
+};
 use std::ffi::CStr;
 
 /// PAM service module entry point for authentication

@@ -1,5 +1,8 @@
 use crate::auth_client::AuthenticationClient;
-use pam::{constants::{PamFlag, PamResultCode}, module::PamHandle};
+use pam::{
+    constants::{PamFlag, PamResultCode},
+    module::PamHandle,
+};
 use std::ffi::CStr;
 use tracing_subscriber;
 
