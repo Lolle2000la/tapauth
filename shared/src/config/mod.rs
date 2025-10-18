@@ -1,0 +1,351 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Insufficient permissions")]
+    InsufficientPermissions,
+    #[error("Not running as root")]
+    NotRoot,
+    #[error("Invalid configuration")]
+    InvalidConfig,
+    #[error("Crypto error: {0}")]
+    Crypto(#[from] crate::crypto::CryptoError),
+}
+
+/// Well-known configuration directory
+pub const CONFIG_DIR: &str = "/etc/tapauth";
+
+/// Client configuration file
+pub const CLIENT_CONFIG_FILE: &str = "client_config.json";
+
+/// Server configuration file (for storing paired servers on client)
+pub const PAIRED_SERVERS_FILE: &str = "paired_servers.json";
+
+/// Client private key file
+pub const CLIENT_KEY_FILE: &str = "client_key";
+
+/// Client symmetric key file
+pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
+
+/// Check if running as root
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Ensure directory exists with root-only permissions (700)
+pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
+    if !is_root() {
+        return Err(ConfigError::NotRoot);
+    }
+
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+
+    // Set permissions to 700 (rwx for owner only)
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)?;
+
+    Ok(())
+}
+
+/// Write data to a file with root-only permissions (600)
+pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+    if !is_root() {
+        return Err(ConfigError::NotRoot);
+    }
+
+    fs::write(path, data)?;
+
+    // Set permissions to 600 (rw for owner only)
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+
+    Ok(())
+}
+
+/// Read data from a secure file
+pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    if !is_root() {
+        return Err(ConfigError::NotRoot);
+    }
+
+    // Verify file permissions
+    let metadata = fs::metadata(path)?;
+    let permissions = metadata.permissions();
+    let mode = permissions.mode() & 0o777;
+
+    if mode != 0o600 && mode != 0o400 {
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    Ok(fs::read(path)?)
+}
+
+/// Client configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    /// Hostname of this client
+    pub hostname: String,
+    /// UDP port for authentication (default: 36692)
+    pub udp_port: u16,
+    /// Whether to use TPM for key storage
+    pub use_tpm: bool,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            hostname: hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string()),
+            udp_port: 36692,
+            use_tpm: false,
+        }
+    }
+}
+
+/// Information about a paired server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairedServer {
+    /// Server's display name
+    pub name: String,
+    /// Server's Ed25519 public key (32 bytes, hex-encoded)
+    pub public_key: String,
+    /// When this pairing was created
+    pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Information about a paired client (stored on server)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairedClient {
+    /// Client's display name (hostname)
+    pub hostname: String,
+    /// Client's Ed25519 public key (32 bytes, hex-encoded)
+    pub public_key: String,
+    /// Client Symmetric Key (32 bytes, hex-encoded)
+    pub csk: String,
+    /// When this pairing was created
+    pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Client configuration manager
+pub struct ClientConfigManager {
+    config_dir: PathBuf,
+}
+
+impl ClientConfigManager {
+    /// Create a new configuration manager
+    pub fn new() -> Self {
+        Self {
+            config_dir: PathBuf::from(CONFIG_DIR),
+        }
+    }
+
+    /// Initialize configuration directory
+    pub fn init(&self) -> Result<(), ConfigError> {
+        ensure_secure_directory(&self.config_dir)?;
+        Ok(())
+    }
+
+    /// Load client configuration
+    pub fn load_config(&self) -> Result<ClientConfig, ConfigError> {
+        let config_path = self.config_dir.join(CLIENT_CONFIG_FILE);
+
+        if !config_path.exists() {
+            // Return default config if file doesn't exist
+            return Ok(ClientConfig::default());
+        }
+
+        let data = read_secure_file(&config_path)?;
+        let config = serde_json::from_slice(&data)?;
+        Ok(config)
+    }
+
+    /// Save client configuration
+    pub fn save_config(&self, config: &ClientConfig) -> Result<(), ConfigError> {
+        self.init()?;
+        let config_path = self.config_dir.join(CLIENT_CONFIG_FILE);
+        let data = serde_json::to_vec_pretty(config)?;
+        write_secure_file(&config_path, &data)?;
+        Ok(())
+    }
+
+    /// Load Ed25519 keypair
+    pub fn load_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+
+        if !key_path.exists() {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let data = read_secure_file(&key_path)?;
+
+        if data.len() != 32 {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data);
+
+        Ok(Ed25519KeyPair::from_signing_key_bytes(&bytes)?)
+    }
+
+    /// Save Ed25519 keypair
+    pub fn save_keypair(&self, keypair: &Ed25519KeyPair) -> Result<(), ConfigError> {
+        self.init()?;
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+        let bytes = keypair.signing_key_bytes();
+        write_secure_file(&key_path, &bytes)?;
+        Ok(())
+    }
+
+    /// Generate and save a new keypair
+    pub fn generate_and_save_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
+        let keypair = Ed25519KeyPair::generate();
+        self.save_keypair(&keypair)?;
+        Ok(keypair)
+    }
+
+    /// Load CSK
+    pub fn load_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        let csk_path = self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE);
+
+        if !csk_path.exists() {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let data = read_secure_file(&csk_path)?;
+
+        if data.len() != 32 {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data);
+
+        Ok(ClientSymmetricKey::from_bytes(bytes))
+    }
+
+    /// Save CSK
+    pub fn save_csk(&self, csk: &ClientSymmetricKey) -> Result<(), ConfigError> {
+        self.init()?;
+        let csk_path = self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE);
+        write_secure_file(&csk_path, csk.as_bytes())?;
+        Ok(())
+    }
+
+    /// Generate and save a new CSK
+    pub fn generate_and_save_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        let csk = ClientSymmetricKey::generate();
+        self.save_csk(&csk)?;
+        Ok(csk)
+    }
+
+    /// Rotate CSK (generates new one, invalidating all pairings)
+    pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        // Delete all paired servers since they have the old CSK
+        let _ = self.clear_paired_servers();
+        
+        // Generate and save new CSK
+        self.generate_and_save_csk()
+    }
+
+    /// Load paired servers
+    pub fn load_paired_servers(&self) -> Result<HashMap<String, PairedServer>, ConfigError> {
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+
+        if !servers_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let data = read_secure_file(&servers_path)?;
+        let servers = serde_json::from_slice(&data)?;
+        Ok(servers)
+    }
+
+    /// Save paired servers
+    pub fn save_paired_servers(
+        &self,
+        servers: &HashMap<String, PairedServer>,
+    ) -> Result<(), ConfigError> {
+        self.init()?;
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+        let data = serde_json::to_vec_pretty(servers)?;
+        write_secure_file(&servers_path, &data)?;
+        Ok(())
+    }
+
+    /// Add a paired server
+    pub fn add_paired_server(&self, id: String, server: PairedServer) -> Result<(), ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+        servers.insert(id, server);
+        self.save_paired_servers(&servers)?;
+        Ok(())
+    }
+
+    /// Remove a paired server
+    pub fn remove_paired_server(&self, id: &str) -> Result<(), ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+        servers.remove(id);
+        self.save_paired_servers(&servers)?;
+        Ok(())
+    }
+
+    /// Clear all paired servers
+    pub fn clear_paired_servers(&self) -> Result<(), ConfigError> {
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+        if servers_path.exists() {
+            fs::remove_file(servers_path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for ClientConfigManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ClientConfig::default();
+        assert_eq!(config.udp_port, 36692);
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = ClientConfig {
+            hostname: "test-host".to_string(),
+            udp_port: 12345,
+            use_tpm: true,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ClientConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.hostname, deserialized.hostname);
+        assert_eq!(config.udp_port, deserialized.udp_port);
+        assert_eq!(config.use_tpm, deserialized.use_tpm);
+    }
+}

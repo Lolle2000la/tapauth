@@ -1,9 +1,32 @@
 [package]
 name = "client-pam"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-bluer = { version = "0.17.4", features = ["full"] }
 shared = { path = "../shared" }
-tss-esapi = "7.6.0"
+
+# PAM interface
+pam = "0.7"
+
+# BLE support
+bluer = { version = "0.17", features = ["bluetoothd"] }
+
+# TPM support
+tss-esapi = { version = "7.6", optional = true }
+
+# Networking
+tokio = { version = "1.41", features = ["full"] }
+socket2 = "0.5"
+
+# Utilities
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[features]
+default = []
+tpm = ["tss-esapi"]
