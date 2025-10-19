@@ -1,9 +1,6 @@
 use crate::auth_client::AuthenticationClient;
-use pam::{
-    constants::{PamFlag, PamResultCode},
-    module::PamHandle,
-};
-use std::ffi::CStr;
+use crate::pam_sys;
+use std::os::raw::c_int;
 use tracing_subscriber;
 
 /// Initialize logging for PAM module
@@ -16,15 +13,22 @@ fn init_logging() {
 }
 
 /// Main authentication logic for PAM
-pub fn authenticate(pamh: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) -> PamResultCode {
+pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     init_logging();
 
-    // Get the username
-    let username = match pamh.get_user(None) {
-        Ok(user) => user,
-        Err(e) => {
-            tracing::error!("Failed to get username: {:?}", e);
-            return PamResultCode::PAM_USER_UNKNOWN;
+    tracing::info!("TapAuth PAM module called (custom bindings)");
+
+    // Get the username using our custom bindings
+    let username = unsafe {
+        match pam_sys::get_user(pamh) {
+            Ok(user) => {
+                tracing::info!("Got username from PAM: {}", user);
+                user
+            }
+            Err(code) => {
+                tracing::error!("Failed to get username, PAM error code: {}", code);
+                return pam_sys::PAM_USER_UNKNOWN;
+            }
         }
     };
 
@@ -33,7 +37,7 @@ pub fn authenticate(pamh: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) ->
     // Check if we're running as root
     if !shared::config::is_root() {
         tracing::error!("PAM module must be run as root");
-        return PamResultCode::PAM_PERM_DENIED;
+        return pam_sys::PAM_PERM_DENIED;
     }
 
     // Create authentication client
@@ -44,9 +48,9 @@ pub fn authenticate(pamh: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) ->
             return match e {
                 crate::auth_client::AuthError::NoPairedDevices => {
                     tracing::warn!("No paired devices found. Use tapauth-config to pair a device.");
-                    PamResultCode::PAM_AUTH_ERR
+                    pam_sys::PAM_AUTH_ERR
                 }
-                _ => PamResultCode::PAM_AUTH_ERR,
+                _ => pam_sys::PAM_AUTH_ERR,
             };
         }
     };
@@ -57,21 +61,21 @@ pub fn authenticate(pamh: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) ->
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!("Failed to create tokio runtime: {}", e);
-            return PamResultCode::PAM_AUTH_ERR;
+            return pam_sys::PAM_AUTH_ERR;
         }
     };
 
     match runtime.block_on(client.authenticate()) {
         Ok(()) => {
             tracing::info!("Authentication successful for user: {}", username);
-            PamResultCode::PAM_SUCCESS
+            pam_sys::PAM_SUCCESS
         }
         Err(e) => {
             tracing::error!("Authentication failed for user {}: {}", username, e);
             match e {
-                crate::auth_client::AuthError::Timeout => PamResultCode::PAM_AUTH_ERR,
-                crate::auth_client::AuthError::Denied => PamResultCode::PAM_AUTH_ERR,
-                _ => PamResultCode::PAM_AUTH_ERR,
+                crate::auth_client::AuthError::Timeout => pam_sys::PAM_AUTH_ERR,
+                crate::auth_client::AuthError::Denied => pam_sys::PAM_AUTH_ERR,
+                _ => pam_sys::PAM_AUTH_ERR,
             }
         }
     }

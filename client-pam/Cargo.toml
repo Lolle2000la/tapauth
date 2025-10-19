@@ -9,9 +9,6 @@ crate-type = ["cdylib"]
 [dependencies]
 shared = { path = "../shared" }
 
-# PAM interface
-pam-bindings = "0.1"
-
 # BLE support (optional due to dbus dependency requirements)
 bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 futures-util = { version = "0.3", optional = true }
