@@ -291,13 +291,37 @@ impl PairingScreen {
         };
 
         // Create pairing session
-        let mut session = ClientPairingSession::new(keypair);
+        let mut session = ClientPairingSession::new(keypair.clone());
 
-        // Complete pairing handshake
-        let (csk, server_public_key, sas) = session
-            .complete_pairing(stream)
+        // Phase 1: Initiate pairing (receive Hello, send Response, compute SAS)
+        let (stream, server_public_key, sas) = session
+            .initiate_pairing(stream)
             .await
-            .map_err(|e| format!("Pairing failed: {}", e))?;
+            .map_err(|e| format!("Pairing initiation failed: {}", e))?;
+
+        eprintln!("[DEBUG] Pairing initiated. SAS: {}", sas);
+
+        // TODO: Here we need to:
+        // 1. Return SAS to GUI to show to user
+        // 2. Wait for user confirmation
+        // 3. Then call session.finish_pairing(stream, &csk)
+        //
+        // For now, let's automatically continue after a delay (TEMPORARY!)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Load or generate CSK
+        let csk = config
+            .load_csk()
+            .or_else(|_| config.generate_and_save_csk())
+            .map_err(|e| format!("Failed to load/generate CSK: {}", e))?;
+
+        eprintln!("[DEBUG] Loaded/generated CSK");
+
+        // Phase 2: Finish pairing (send CSK, receive confirmation)
+        session
+            .finish_pairing(stream, &csk)
+            .await
+            .map_err(|e| format!("Pairing completion failed: {}", e))?;
 
         eprintln!("[DEBUG] Pairing handshake complete. SAS: {}", sas);
 

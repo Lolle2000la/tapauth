@@ -181,6 +181,52 @@ object TapAuthCrypto {
      * @return Decrypted data
      */
     external fun decryptWithCsk(cskHex: String, challenge: ByteArray, context: String, ciphertext: ByteArray): ByteArray
+    
+    // ========== Pairing Protocol Messages ==========
+    
+    /**
+     * Create a PairingHello message (protobuf)
+     * @param version Protocol version (usually 1)
+     * @param x25519PublicKey X25519 ephemeral public key (32 bytes)
+     * @param ed25519PublicKey Ed25519 identity public key (32 bytes)
+     * @return Protobuf-encoded PairingHello bytes
+     */
+    external fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray): ByteArray
+    
+    /**
+     * Parse a PairingResponse message (protobuf)
+     * @param responseBytes Protobuf-encoded PairingResponse
+     * @return JSON string: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key": "base64..."}
+     */
+    external fun parsePairingResponse(responseBytes: ByteArray): String
+    
+    /**
+     * Create a PairingCskMessage (protobuf)
+     * @param encryptedCsk CSK encrypted with PSK
+     * @return Protobuf-encoded PairingCskMessage bytes
+     */
+    external fun createPairingCskMessage(encryptedCsk: ByteArray): ByteArray
+    
+    /**
+     * Parse a PairingCskMessage (protobuf)
+     * @param messageBytes Protobuf-encoded PairingCskMessage
+     * @return Encrypted CSK bytes
+     */
+    external fun parsePairingCskMessage(messageBytes: ByteArray): ByteArray
+    
+    /**
+     * Create a PairingComplete message (protobuf)
+     * @param success Whether pairing was successful
+     * @return Protobuf-encoded PairingComplete bytes
+     */
+    external fun createPairingComplete(success: Boolean): ByteArray
+    
+    /**
+     * Parse a PairingComplete message (protobuf)
+     * @param completeBytes Protobuf-encoded PairingComplete
+     * @return JSON string: {"success": true/false}
+     */
+    external fun parsePairingComplete(completeBytes: ByteArray): String
 }
 
 /**
@@ -335,6 +381,59 @@ fun createEncryptedPacket(csk: ByteArray, wrapperMessage: ByteArray): ByteArray 
  */
 fun decryptEncryptedPacket(csk: ByteArray, encryptedPacket: ByteArray): ByteArray {
     return TapAuthCrypto.decryptEncryptedPacket(bytesToHex(csk), encryptedPacket)
+}
+
+// ========== Pairing Protocol Wrapper Functions ==========
+
+/**
+ * Create a PairingHello message
+ */
+fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray): ByteArray {
+    return TapAuthCrypto.createPairingHello(version, x25519PublicKey, ed25519PublicKey)
+}
+
+/**
+ * Parse a PairingResponse message and extract keys
+ * @return Triple of (version, x25519PublicKey, ed25519PublicKey)
+ */
+fun parsePairingResponse(responseBytes: ByteArray): Triple<Int, ByteArray, ByteArray> {
+    val json = TapAuthCrypto.parsePairingResponse(responseBytes)
+    val jsonObj = org.json.JSONObject(json)
+    val version = jsonObj.getInt("version")
+    val x25519Key = android.util.Base64.decode(jsonObj.getString("x25519_public_key"), android.util.Base64.DEFAULT)
+    val ed25519Key = android.util.Base64.decode(jsonObj.getString("ed25519_public_key"), android.util.Base64.DEFAULT)
+    return Triple(version, x25519Key, ed25519Key)
+}
+
+/**
+ * Create a PairingCskMessage
+ */
+fun createPairingCskMessage(encryptedCsk: ByteArray): ByteArray {
+    return TapAuthCrypto.createPairingCskMessage(encryptedCsk)
+}
+
+/**
+ * Parse a PairingCskMessage and extract encrypted CSK
+ */
+fun parsePairingCskMessage(messageBytes: ByteArray): ByteArray {
+    return TapAuthCrypto.parsePairingCskMessage(messageBytes)
+}
+
+/**
+ * Create a PairingComplete message
+ */
+fun createPairingComplete(success: Boolean): ByteArray {
+    return TapAuthCrypto.createPairingComplete(success)
+}
+
+/**
+ * Parse a PairingComplete message
+ * @return true if pairing was successful
+ */
+fun parsePairingComplete(completeBytes: ByteArray): Boolean {
+    val json = TapAuthCrypto.parsePairingComplete(completeBytes)
+    val jsonObj = org.json.JSONObject(json)
+    return jsonObj.getBoolean("success")
 }
 
 private fun hexToBytes(hex: String): ByteArray {

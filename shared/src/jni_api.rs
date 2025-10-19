@@ -1,5 +1,5 @@
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jlong, jstring};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use crate::crypto;
@@ -1729,6 +1729,321 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
                 format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ========== Pairing Protocol Message Functions ==========
+
+/// JNI wrapper for creating and serializing a PairingHello message.
+/// Returns protobuf-encoded bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPairingHello(
+    mut env: JNIEnv,
+    _class: JClass,
+    version: jint,
+    x25519_public_key: JByteArray,
+    ed25519_public_key: JByteArray,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract X25519 public key
+    let x25519_bytes = match env.convert_byte_array(x25519_public_key) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read x25519_public_key: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Extract Ed25519 public key
+    let ed25519_bytes = match env.convert_byte_array(ed25519_public_key) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read ed25519_public_key: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create PairingHello
+    let hello = pb::PairingHello {
+        version: version as u32,
+        x25519_public_key: x25519_bytes,
+        ed25519_public_key: ed25519_bytes,
+    };
+
+    // Serialize to protobuf
+    let buf = hello.encode_to_vec();
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// JNI wrapper for parsing a PairingResponse message from protobuf bytes.
+/// Returns JSON string with response contents: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key": "base64..."}
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingResponse(
+    mut env: JNIEnv,
+    _class: JClass,
+    response_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use prost::Message;
+
+    // Extract response bytes
+    let data = match env.convert_byte_array(response_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read response: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse PairingResponse
+    let response = match pb::PairingResponse::decode(&data[..]) {
+        Ok(resp) => resp,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse PairingResponse: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create JSON with base64-encoded keys
+    let json_result = serde_json::json!({
+        "version": response.version,
+        "x25519_public_key": BASE64.encode(&response.x25519_public_key),
+        "ed25519_public_key": BASE64.encode(&response.ed25519_public_key),
+    });
+
+    let json_str = match serde_json::to_string(&json_result) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to serialize to JSON: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    match env.new_string(json_str) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// JNI wrapper for creating and serializing a PairingCskMessage.
+/// Returns protobuf-encoded bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPairingCskMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    encrypted_csk: JByteArray,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract encrypted CSK
+    let encrypted_csk_bytes = match env.convert_byte_array(encrypted_csk) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read encrypted_csk: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create PairingCskMessage
+    let csk_msg = pb::PairingCskMessage {
+        encrypted_csk: encrypted_csk_bytes,
+    };
+
+    // Serialize to protobuf
+    let buf = csk_msg.encode_to_vec();
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// JNI wrapper for parsing a PairingCskMessage from protobuf bytes.
+/// Returns the encrypted CSK bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingCskMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    message_bytes: JByteArray,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract message bytes
+    let data = match env.convert_byte_array(message_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read message: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse PairingCskMessage
+    let csk_msg = match pb::PairingCskMessage::decode(&data[..]) {
+        Ok(msg) => msg,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse PairingCskMessage: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Return encrypted CSK as byte array
+    match env.byte_array_from_slice(&csk_msg.encrypted_csk) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// JNI wrapper for creating a PairingComplete message.
+/// Returns protobuf-encoded bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPairingComplete(
+    mut env: JNIEnv,
+    _class: JClass,
+    success: jboolean,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Create PairingComplete
+    let complete = pb::PairingComplete {
+        success: success != 0,
+    };
+
+    // Serialize to protobuf
+    let buf = complete.encode_to_vec();
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// JNI wrapper for parsing a PairingComplete message from protobuf bytes.
+/// Returns JSON string: {"success": true/false}
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingComplete(
+    mut env: JNIEnv,
+    _class: JClass,
+    complete_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract complete bytes
+    let data = match env.convert_byte_array(complete_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read complete message: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse PairingComplete
+    let complete = match pb::PairingComplete::decode(&data[..]) {
+        Ok(msg) => msg,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse PairingComplete: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create JSON
+    let json_result = serde_json::json!({
+        "success": complete.success,
+    });
+
+    let json_str = match serde_json::to_string(&json_result) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to serialize to JSON: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    match env.new_string(json_str) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate string: {err}"),
             );
             std::ptr::null_mut()
         }

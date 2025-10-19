@@ -55,11 +55,13 @@ impl ClientPairingSession {
     }
 
     /// Complete the pairing handshake as client
-    /// Returns (CSK, server_ed25519_public_key, SAS)
+    /// Takes the CSK to send to the server
+    /// Returns (server_ed25519_public_key, SAS)
     pub async fn complete_pairing(
         &mut self,
         mut stream: TcpStream,
-    ) -> Result<(ClientSymmetricKey, [u8; 32], String), ProtocolError> {
+        csk: &ClientSymmetricKey,
+    ) -> Result<([u8; 32], String), ProtocolError> {
         // Step 1: Receive server's PairingHello
         let hello = self.receive_pairing_hello(&mut stream).await?;
 
@@ -94,11 +96,11 @@ impl ClientPairingSession {
         // Step 5: Wait for user SAS confirmation (done outside this function)
         // This is where the GUI would show the SAS and wait for user confirmation
 
-        // Step 6: Receive CSK encrypted with PSK
-        let csk_message = self.receive_csk_message(&mut stream).await?;
+        // Step 6: Send CSK encrypted with PSK to server
+        self.send_csk_message(&mut stream, csk).await?;
 
-        // Step 7: Send PairingComplete acknowledgment
-        self.send_pairing_complete(&mut stream).await?;
+        // Step 7: Receive PairingComplete acknowledgment from server
+        self.receive_pairing_complete(&mut stream).await?;
 
         let server_ed25519_public: [u8; 32] = hello
             .ed25519_public_key
@@ -106,7 +108,73 @@ impl ClientPairingSession {
             .try_into()
             .map_err(|_| ProtocolError::InvalidMessageFormat)?;
 
-        Ok((csk_message, server_ed25519_public, sas))
+        Ok((server_ed25519_public, sas))
+    }
+
+    /// Phase 1: Initiate pairing - receive Hello, send Response, compute SAS
+    /// Returns (TcpStream, server_ed25519_public, SAS) for user verification
+    /// After user confirms SAS, call finish_pairing() with the stream
+    pub async fn initiate_pairing(
+        &mut self,
+        mut stream: TcpStream,
+    ) -> Result<(TcpStream, [u8; 32], String), ProtocolError> {
+        // Step 1: Receive server's PairingHello
+        let hello = self.receive_pairing_hello(&mut stream).await?;
+
+        // Step 2: Derive PSK from X25519 key exchange
+        self.server_x25519_public = Some(
+            hello
+                .x25519_public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidMessageFormat)?,
+        );
+
+        let shared_secret = self
+            .x25519_keypair
+            .diffie_hellman(&self.server_x25519_public.unwrap())?;
+        let psk = derive_psk_from_x25519(&shared_secret)?;
+        self.psk = Some(psk);
+
+        // Step 3: Derive and store SAS
+        let client_x25519_pub = self.x25519_keypair.public_key_bytes();
+        let server_x25519_pub = self.server_x25519_public.unwrap();
+        let sas = derive_sas(
+            self.psk.as_ref().unwrap(),
+            &client_x25519_pub,
+            &server_x25519_pub,
+        )?;
+        self.sas = Some(sas.clone());
+
+        // Step 4: Send PairingResponse with our X25519 public key
+        self.send_pairing_response(&mut stream).await?;
+
+        let server_ed25519_public: [u8; 32] = hello
+            .ed25519_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidMessageFormat)?;
+
+        // Return stream and SAS for user verification
+        // User must confirm SAS, then call finish_pairing()
+        Ok((stream, server_ed25519_public, sas))
+    }
+
+    /// Phase 2: Complete pairing after user confirms SAS
+    /// Sends CSK to server and receives confirmation
+    /// Takes the stream from initiate_pairing()
+    pub async fn finish_pairing(
+        &mut self,
+        mut stream: TcpStream,
+        csk: &ClientSymmetricKey,
+    ) -> Result<(), ProtocolError> {
+        // Step 6: Send CSK encrypted with PSK to server
+        self.send_csk_message(&mut stream, csk).await?;
+
+        // Step 7: Receive PairingComplete acknowledgment from server
+        self.receive_pairing_complete(&mut stream).await?;
+
+        Ok(())
     }
 
     async fn receive_pairing_hello(
@@ -145,10 +213,40 @@ impl ClientPairingSession {
         Ok(())
     }
 
-    async fn receive_csk_message(
+    async fn send_csk_message(
         &self,
         stream: &mut TcpStream,
-    ) -> Result<ClientSymmetricKey, ProtocolError> {
+        csk: &ClientSymmetricKey,
+    ) -> Result<(), ProtocolError> {
+        // Encrypt CSK with PSK
+        let psk = self.psk.as_ref().unwrap();
+        eprintln!(
+            "[DEBUG CLIENT] PSK for encryption: {}",
+            hex::encode(psk.as_bytes())
+        );
+        eprintln!(
+            "[DEBUG CLIENT] CSK to encrypt: {}",
+            hex::encode(csk.as_bytes())
+        );
+
+        let encrypted_csk = encrypt_with_psk(psk, b"csk_exchange", csk.as_bytes())?;
+
+        eprintln!(
+            "[DEBUG CLIENT] Encrypted CSK: {}",
+            hex::encode(&encrypted_csk)
+        );
+
+        let message = PairingCskMessage { encrypted_csk };
+
+        let buf = message.encode_to_vec();
+        stream.write_u32(buf.len() as u32).await?;
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+
+        Ok(())
+    }
+
+    async fn receive_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
         let len = stream.read_u32().await?;
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(ProtocolError::InvalidMessageFormat);
@@ -157,32 +255,11 @@ impl ClientPairingSession {
         let mut buf = vec![0u8; len as usize];
         stream.read_exact(&mut buf).await?;
 
-        let encrypted_msg = PairingCskMessage::decode(&buf[..])?;
+        let complete = PairingComplete::decode(&buf[..])?;
 
-        // Decrypt CSK with PSK
-        let plaintext = decrypt_with_psk(
-            self.psk.as_ref().unwrap(),
-            b"csk_exchange",
-            &encrypted_msg.encrypted_csk,
-        )?;
-
-        if plaintext.len() != 32 {
+        if !complete.success {
             return Err(ProtocolError::InvalidMessageFormat);
         }
-
-        let mut csk_bytes = [0u8; 32];
-        csk_bytes.copy_from_slice(&plaintext);
-
-        Ok(ClientSymmetricKey::from_bytes(csk_bytes))
-    }
-
-    async fn send_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
-        let complete = PairingComplete { success: true };
-
-        let buf = complete.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
 
         Ok(())
     }
@@ -206,12 +283,11 @@ impl ServerPairingSession {
     }
 
     /// Complete the pairing handshake as server
-    /// Returns (client_ed25519_public_key, SAS)
+    /// Returns (CSK received from client, client_ed25519_public_key, SAS)
     pub async fn complete_pairing(
         &mut self,
         mut stream: TcpStream,
-        csk: &ClientSymmetricKey,
-    ) -> Result<([u8; 32], String), ProtocolError> {
+    ) -> Result<(ClientSymmetricKey, [u8; 32], String), ProtocolError> {
         // Step 1: Send PairingHello with our X25519 public key
         self.send_pairing_hello(&mut stream).await?;
 
@@ -245,11 +321,11 @@ impl ServerPairingSession {
 
         // Step 5: Wait for user SAS confirmation (done outside this function)
 
-        // Step 6: Send CSK encrypted with PSK
-        self.send_csk_message(&mut stream, csk).await?;
+        // Step 6: Receive CSK encrypted with PSK from client
+        let csk = self.receive_csk_message(&mut stream).await?;
 
-        // Step 7: Receive PairingComplete acknowledgment
-        self.receive_pairing_complete(&mut stream).await?;
+        // Step 7: Send PairingComplete acknowledgment
+        self.send_pairing_complete(&mut stream).await?;
 
         let client_ed25519_public: [u8; 32] = response
             .ed25519_public_key
@@ -257,7 +333,7 @@ impl ServerPairingSession {
             .try_into()
             .map_err(|_| ProtocolError::InvalidMessageFormat)?;
 
-        Ok((client_ed25519_public, sas))
+        Ok((csk, client_ed25519_public, sas))
     }
 
     async fn send_pairing_hello(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
@@ -296,26 +372,10 @@ impl ServerPairingSession {
         Ok(response)
     }
 
-    async fn send_csk_message(
+    async fn receive_csk_message(
         &self,
         stream: &mut TcpStream,
-        csk: &ClientSymmetricKey,
-    ) -> Result<(), ProtocolError> {
-        // Encrypt CSK with PSK
-        let encrypted_csk =
-            encrypt_with_psk(self.psk.as_ref().unwrap(), b"csk_exchange", csk.as_bytes())?;
-
-        let message = PairingCskMessage { encrypted_csk };
-
-        let buf = message.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    async fn receive_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
+    ) -> Result<ClientSymmetricKey, ProtocolError> {
         let len = stream.read_u32().await?;
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(ProtocolError::InvalidMessageFormat);
@@ -324,11 +384,41 @@ impl ServerPairingSession {
         let mut buf = vec![0u8; len as usize];
         stream.read_exact(&mut buf).await?;
 
-        let complete = PairingComplete::decode(&buf[..])?;
+        let encrypted_msg = PairingCskMessage::decode(&buf[..])?;
 
-        if !complete.success {
+        eprintln!(
+            "[DEBUG SERVER] Received encrypted CSK: {}",
+            hex::encode(&encrypted_msg.encrypted_csk)
+        );
+
+        // Decrypt CSK with PSK
+        let psk = self.psk.as_ref().unwrap();
+        eprintln!(
+            "[DEBUG SERVER] PSK for decryption: {}",
+            hex::encode(psk.as_bytes())
+        );
+
+        let plaintext = decrypt_with_psk(psk, b"csk_exchange", &encrypted_msg.encrypted_csk)?;
+
+        eprintln!("[DEBUG SERVER] Decrypted CSK: {}", hex::encode(&plaintext));
+
+        if plaintext.len() != 32 {
             return Err(ProtocolError::InvalidMessageFormat);
         }
+
+        let mut csk_bytes = [0u8; 32];
+        csk_bytes.copy_from_slice(&plaintext);
+
+        Ok(ClientSymmetricKey::from_bytes(csk_bytes))
+    }
+
+    async fn send_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
+        let complete = PairingComplete { success: true };
+
+        let buf = complete.encode_to_vec();
+        stream.write_u32(buf.len() as u32).await?;
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
 
         Ok(())
     }
@@ -350,25 +440,25 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Server task
+        // Server task (Android - receives CSK)
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let server_keypair = Ed25519KeyPair::generate();
-            let csk = ClientSymmetricKey::generate();
             let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
 
-            session.complete_pairing(stream, &csk).await.unwrap();
-            (csk, session.sas().unwrap().to_string())
+            let (csk, _client_pub, sas) = session.complete_pairing(stream).await.unwrap();
+            (csk, sas)
         });
 
-        // Client task
+        // Client task (Desktop - sends CSK)
         let client_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
             let client_keypair = Ed25519KeyPair::generate();
+            let csk = ClientSymmetricKey::generate();
             let mut session = ClientPairingSession::new(client_keypair);
 
-            let (csk, _server_pub, sas) = session.complete_pairing(stream).await.unwrap();
+            let (_server_pub, sas) = session.complete_pairing(stream, &csk).await.unwrap();
             (csk, sas)
         });
 

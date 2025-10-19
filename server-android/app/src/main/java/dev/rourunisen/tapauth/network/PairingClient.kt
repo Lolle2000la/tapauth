@@ -54,21 +54,43 @@ class PairingClient {
             // Step 1: Generate our (server's) ephemeral X25519 keypair
             val serverEphemeralKeyPair = Ed25519Keypair.generate()
             
-            // Step 2: Send PairingHandshake - our ephemeral public key
-            output.writeInt(serverEphemeralKeyPair.publicKey.size)
-            output.write(serverEphemeralKeyPair.publicKey)
+            // Step 2: Send PairingHello message (protobuf) - SERVER SENDS FIRST
+            // Note: For pairing, we use Ed25519 keypair temporarily for X25519 DH
+            // The protocol specifies X25519 keys, so we're using Ed25519 keys as a stand-in
+            val pairingHello = dev.rourunisen.tapauth.crypto.createPairingHello(
+                version = 1,
+                x25519PublicKey = serverEphemeralKeyPair.publicKey,
+                ed25519PublicKey = serverEphemeralKeyPair.publicKey
+            )
+            
+            // Send length-prefixed protobuf message
+            output.writeInt(pairingHello.size)
+            output.write(pairingHello)
             output.flush()
             
-            Log.d(TAG, "Sent server ephemeral public key (${serverEphemeralKeyPair.publicKey.size} bytes)")
+            Log.d(TAG, "Sent PairingHello (${pairingHello.size} bytes)")
             
-            // Step 3: Perform X25519 key exchange to compute PSK
-            // PSK = ECDH(server_ephemeral_private, client_public_from_qr)
-            val clientPublicKey = hexToBytes(clientPublicKeyHex)
+            // Step 3: Receive PairingResponse message (protobuf) from CLIENT
+            val responseSize = input.readInt()
+            val responseBytes = ByteArray(responseSize)
+            input.readFully(responseBytes)
+            
+            Log.d(TAG, "Received PairingResponse (${responseBytes.size} bytes)")
+            
+            // Parse PairingResponse
+            val (clientVersion, clientX25519Key, clientEd25519Key) = 
+                dev.rourunisen.tapauth.crypto.parsePairingResponse(responseBytes)
+            
+            Log.d(TAG, "Parsed PairingResponse: version=$clientVersion")
+            
+            // Step 4: Perform X25519 key exchange to compute PSK
+            // PSK = ECDH(server_ephemeral_private, client_x25519_public_from_response)
+            val clientPublicKey = clientX25519Key
             val psk = performKeyExchange(serverEphemeralKeyPair.privateKey, clientPublicKey)
             
             Log.d(TAG, "Computed PSK (${psk.size} bytes)")
             
-            // Step 4: Generate SAS for anti-MITM verification
+            // Step 5: Generate SAS for anti-MITM verification
             // SAS is derived from both public keys using the PSK
             val sas = generateSAS(psk, clientPublicKey, serverEphemeralKeyPair.publicKey)
             
@@ -79,6 +101,7 @@ class PairingClient {
                 socket = socket,
                 psk = psk,
                 clientPublicKey = clientPublicKey,
+                clientEd25519Key = clientEd25519Key,
                 sas = sas
             )
             
@@ -97,6 +120,7 @@ class PairingClient {
         socket: Socket,
         psk: ByteArray,
         clientPublicKey: ByteArray,
+        clientEd25519Key: ByteArray,
         sasConfirmed: Boolean
     ): PairingResult = withContext(Dispatchers.IO) {
         try {
@@ -108,47 +132,44 @@ class PairingClient {
             val input = DataInputStream(socket.getInputStream())
             val output = DataOutputStream(socket.getOutputStream())
             
-            // Step 5: Receive ClientKeyDelivery (CSK encrypted with PSK)
-            val encryptedCskSize = input.readInt()
-            val encryptedCsk = ByteArray(encryptedCskSize)
-            input.readFully(encryptedCsk)
+            // Step 6: Receive PairingCskMessage (protobuf with CSK encrypted with PSK) from client
+            val cskMessageSize = input.readInt()
+            val cskMessageBytes = ByteArray(cskMessageSize)
+            input.readFully(cskMessageBytes)
             
-            Log.d(TAG, "Received encrypted CSK (${encryptedCsk.size} bytes)")
+            Log.d(TAG, "Received PairingCskMessage (${cskMessageBytes.size} bytes)")
+            
+            // Parse PairingCskMessage to extract encrypted CSK
+            val encryptedCsk = dev.rourunisen.tapauth.crypto.parsePairingCskMessage(cskMessageBytes)
+            
+            Log.d(TAG, "Extracted encrypted CSK (${encryptedCsk.size} bytes)")
+            Log.d(TAG, "PSK (hex): ${psk.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "Encrypted CSK (hex): ${encryptedCsk.joinToString("") { "%02x".format(it) }}")
             
             // Decrypt CSK using PSK with AES-256-GCM
             val csk = dev.rourunisen.tapauth.crypto.decryptWithPsk(
                 psk = psk,
-                context = "csk_delivery",
+                context = "csk_exchange",
                 ciphertext = encryptedCsk
             )
             
             Log.d(TAG, "Decrypted CSK (${csk.size} bytes)")
             
-            // Step 6: Compute SHA-256 hash of CSK
-            val cskHashHex = dev.rourunisen.tapauth.crypto.sha256(csk)
-            val cskHash = hexToBytes(cskHashHex)
+            // Step 7: Send PairingComplete message (protobuf) to confirm success
+            val completeMessage = dev.rourunisen.tapauth.crypto.createPairingComplete(true)
             
-            Log.d(TAG, "Computed CSK hash: $cskHashHex")
-            
-            // Encrypt hash with PSK and send PairingConfirmation
-            val encryptedHash = dev.rourunisen.tapauth.crypto.encryptWithPsk(
-                psk = psk,
-                context = "pairing_confirmation",
-                plaintext = cskHash
-            )
-            
-            output.writeInt(encryptedHash.size)
-            output.write(encryptedHash)
+            output.writeInt(completeMessage.size)
+            output.write(completeMessage)
             output.flush()
             
-            Log.d(TAG, "Sent pairing confirmation")
+            Log.d(TAG, "Sent PairingComplete message")
             
-            // Step 7: Generate device ID and create paired device
+            // Step 8: Generate device ID and create paired device
             val deviceId = generateDeviceId()
             
             val pairedDevice = PairedDevice(
                 deviceId = deviceId,
-                publicKey = clientPublicKey,
+                publicKey = clientEd25519Key,  // Use Ed25519 key for identification
                 csk = csk,  // Store the Client Symmetric Key
                 displayName = "Desktop Computer",
                 pairedAt = System.currentTimeMillis()
@@ -199,6 +220,7 @@ sealed class PairingInitResult {
         val socket: Socket,
         val psk: ByteArray,
         val clientPublicKey: ByteArray,
+        val clientEd25519Key: ByteArray,
         val sas: String
     ) : PairingInitResult()
     data class Error(val message: String) : PairingInitResult()
