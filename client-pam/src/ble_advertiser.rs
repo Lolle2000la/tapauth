@@ -1,7 +1,55 @@
+//! BLE Advertisement and GATT Client Implementation
+//!
+//! This module provides BLE (Bluetooth Low Energy) functionality for the TapAuth client:
+//!
+//! 1. **BLE Advertisement**: Broadcasts temporal identifiers so paired servers can discover
+//!    this client without revealing static identities.
+//!
+//! 2. **BLE GATT Client**: Connects to paired servers via GATT to exchange authentication
+//!    messages as an alternative transport to UDP.
+//!
+//! ## GATT Service Specification
+//!
+//! - **Service UUID**: `b4ad84c0-2adb-4876-8315-b39d983b2bde`
+//! - **Client Command Characteristic** (`caf54438-9d78-4697-8886-0a4cfa87ba8d`):
+//!   - Properties: WRITE (without response)
+//!   - Purpose: Client sends `EncryptedPacket` containing authentication requests
+//! - **Server Response Characteristic** (`ca6238be-c194-49b7-855b-58f41d3da626`):
+//!   - Properties: NOTIFY
+//!   - Purpose: Server sends `EncryptedPacket` containing authentication grants/denials
+//!
+//! ## Security Requirements
+//!
+//! - **LE Secure Connections** MUST be used (ECDH-based key exchange)
+//! - Legacy pairing is disabled
+//! - Protects against passive eavesdropping and MITM attacks at link layer
+//!
+//! ## Usage Example
+//!
+//! ```rust,ignore
+//! use client_pam::ble_advertiser::{BleAdvertiser, BleGattConnection};
+//!
+//! // Start advertising
+//! let advertiser = BleAdvertiser::new().await?;
+//! advertiser.start_advertising(&temporal_id).await?;
+//!
+//! // Connect to a server via GATT
+//! let connection = advertiser.connect_gatt(device_address).await?;
+//!
+//! // Send authentication request
+//! connection.send_command(&encrypted_packet).await?;
+//!
+//! // Receive authentication response
+//! let response = connection.receive_response(Duration::from_secs(5)).await?;
+//!
+//! // Cleanup
+//! connection.disconnect().await?;
+//! ```
+
 use std::time::Duration;
 
 #[cfg(feature = "ble")]
-use bluer::{Adapter, AdapterEvent, Address};
+use bluer::{Adapter, AdapterEvent, Address, Device, gatt::remote::Characteristic};
 
 #[cfg(feature = "ble")]
 use tokio::time::timeout;
@@ -19,6 +67,16 @@ pub enum BleError {
     AdvertisementFailed,
     #[error("BLE support not compiled")]
     NotCompiled,
+    #[error("Connection failed")]
+    ConnectionFailed,
+    #[error("Service not found")]
+    ServiceNotFound,
+    #[error("Characteristic not found")]
+    CharacteristicNotFound,
+    #[error("Write failed")]
+    WriteFailed,
+    #[error("Notification setup failed")]
+    NotificationFailed,
 }
 
 #[cfg(feature = "ble")]
@@ -26,8 +84,19 @@ pub struct BleAdvertiser {
     adapter: Adapter,
 }
 
+/// Represents a BLE GATT connection for sending commands and receiving responses
+#[cfg(feature = "ble")]
+pub struct BleGattConnection {
+    device: Device,
+    client_command_char: Characteristic,
+    server_response_char: Characteristic,
+}
+
 #[cfg(not(feature = "ble"))]
 pub struct BleAdvertiser;
+
+#[cfg(not(feature = "ble"))]
+pub struct BleGattConnection;
 
 #[cfg(feature = "ble")]
 impl BleAdvertiser {
@@ -100,6 +169,127 @@ impl BleAdvertiser {
             Err(_) => Err(BleError::Timeout),
         }
     }
+
+    /// Connect to a BLE device and discover GATT characteristics
+    pub async fn connect_gatt(
+        &self,
+        device_address: Address,
+    ) -> Result<BleGattConnection, BleError> {
+        use shared::models::ble::{CLIENT_COMMAND_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID, SERVICE_UUID};
+
+        let device = self.adapter.device(device_address)?;
+
+        // Ensure device is connected
+        if !device.is_connected().await? {
+            device.connect().await?;
+        }
+
+        // Wait for services to be resolved
+        let mut retries = 0;
+        while !device.is_services_resolved().await? && retries < 10 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            retries += 1;
+        }
+
+        if !device.is_services_resolved().await? {
+            return Err(BleError::ServiceNotFound);
+        }
+
+        // Find the TapAuth service
+        let service_uuid = SERVICE_UUID.parse::<bluer::Uuid>()
+            .map_err(|_| BleError::ServiceNotFound)?;
+        
+        let services = device.services().await?;
+        let mut service = None;
+        for s in services.iter() {
+            if s.uuid().await? == service_uuid {
+                service = Some(s);
+                break;
+            }
+        }
+        let service = service.ok_or(BleError::ServiceNotFound)?;
+
+        // Find the characteristics
+        let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID.parse::<bluer::Uuid>()
+            .map_err(|_| BleError::CharacteristicNotFound)?;
+        let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID.parse::<bluer::Uuid>()
+            .map_err(|_| BleError::CharacteristicNotFound)?;
+
+        let characteristics = service.characteristics().await?;
+        
+        let mut client_command_char = None;
+        let mut server_response_char = None;
+        
+        for c in characteristics.iter() {
+            let uuid = c.uuid().await?;
+            if uuid == client_cmd_uuid {
+                client_command_char = Some(c.clone());
+            } else if uuid == server_resp_uuid {
+                server_response_char = Some(c.clone());
+            }
+        }
+
+        let client_command_char = client_command_char.ok_or(BleError::CharacteristicNotFound)?;
+        let server_response_char = server_response_char.ok_or(BleError::CharacteristicNotFound)?;
+
+        tracing::info!("Connected to GATT service on device {}", device_address);
+
+        Ok(BleGattConnection {
+            device,
+            client_command_char,
+            server_response_char,
+        })
+    }
+}
+
+#[cfg(feature = "ble")]
+impl BleGattConnection {
+    /// Send an authentication command to the server via BLE GATT
+    pub async fn send_command(&self, command: &[u8]) -> Result<(), BleError> {
+        self.client_command_char
+            .write(command)
+            .await
+            .map_err(|_| BleError::WriteFailed)?;
+
+        tracing::debug!("Sent BLE command: {} bytes", command.len());
+        Ok(())
+    }
+
+    /// Wait for a response from the server via BLE GATT notifications
+    pub async fn receive_response(&self, timeout_duration: Duration) -> Result<Vec<u8>, BleError> {
+        use futures_util::StreamExt;
+
+        // Enable notifications
+        let notify_stream = self.server_response_char
+            .notify()
+            .await
+            .map_err(|_| BleError::NotificationFailed)?;
+
+        // Wait for notification with timeout
+        match timeout(timeout_duration, async {
+            tokio::pin!(notify_stream);
+            while let Some(notification) = notify_stream.next().await {
+                tracing::debug!("Received BLE notification: {} bytes", notification.len());
+                return Some(notification);
+            }
+            None
+        })
+        .await
+        {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) => Err(BleError::NotificationFailed),
+            Err(_) => Err(BleError::Timeout),
+        }
+    }
+
+    /// Disconnect from the GATT server
+    pub async fn disconnect(&self) -> Result<(), BleError> {
+        if self.device.is_connected().await? {
+            self.device.disconnect().await?;
+            tracing::info!("Disconnected from GATT device");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "ble"))]
@@ -125,6 +315,32 @@ impl BleAdvertiser {
         _timeout_duration: Duration,
     ) -> Result<Option<()>, BleError> {
         Err(BleError::NotCompiled)
+    }
+
+    /// Connect to a BLE device and discover GATT characteristics (stub when BLE is disabled)
+    pub async fn connect_gatt(
+        &self,
+        _device_address: (),
+    ) -> Result<BleGattConnection, BleError> {
+        Err(BleError::NotCompiled)
+    }
+}
+
+#[cfg(not(feature = "ble"))]
+impl BleGattConnection {
+    /// Send an authentication command to the server via BLE GATT (stub when BLE is disabled)
+    pub async fn send_command(&self, _command: &[u8]) -> Result<(), BleError> {
+        Err(BleError::NotCompiled)
+    }
+
+    /// Wait for a response from the server via BLE GATT notifications (stub when BLE is disabled)
+    pub async fn receive_response(&self, _timeout_duration: Duration) -> Result<Vec<u8>, BleError> {
+        Err(BleError::NotCompiled)
+    }
+
+    /// Disconnect from the GATT server (stub when BLE is disabled)
+    pub async fn disconnect(&self) -> Result<(), BleError> {
+        Ok(())
     }
 }
 

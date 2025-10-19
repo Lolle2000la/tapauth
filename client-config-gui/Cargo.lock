@@ -549,6 +549,7 @@ dependencies = [
 name = "client-config-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "iced",
  "local-ip-address",

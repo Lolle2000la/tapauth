@@ -1297,7 +1297,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
 }
 
 /// Parse a GrantConfirmation protobuf message and return as JSON
-/// 
+///
 /// Takes raw protobuf bytes and returns a JSON representation:
 /// {
 ///   "challenge": "base64...",
@@ -1363,7 +1363,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
 }
 
 /// Parse an AuthenticationCancel protobuf message and return as JSON
-/// 
+///
 /// Takes raw protobuf bytes and returns a JSON representation:
 /// {
 ///   "challenge": "base64...",
@@ -1428,9 +1428,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     }
 }
 
-
 /// Create a WrapperMessage containing an AuthenticationGrant
-/// 
+///
 /// @param signedChallenge The signed challenge bytes
 /// @return Serialized WrapperMessage protobuf bytes
 #[no_mangle]
@@ -1491,7 +1490,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
 }
 
 /// Create an EncryptedPacket from a WrapperMessage payload
-/// 
+///
 /// @param cskHex Client Symmetric Key (hex) for encryption and temporal ID  
 /// @param wrapperMessageBytes Serialized WrapperMessage protobuf
 /// @return Serialized EncryptedPacket protobuf bytes
@@ -1504,8 +1503,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
 ) -> jbyteArray {
     use crate::crypto;
     use crate::protocol::pb;
-    use prost::Message;
     use hkdf::Hkdf;
+    use prost::Message;
     use sha2::Sha256;
 
     // Parse CSK from hex
@@ -1534,10 +1533,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     let csk_array: [u8; 32] = match csk_bytes.try_into() {
         Ok(arr) => arr,
         Err(_) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                "CSK must be 32 bytes",
-            );
+            let _ = env.throw_new("java/lang/IllegalArgumentException", "CSK must be 32 bytes");
             return std::ptr::null_mut();
         }
     };
@@ -1569,16 +1565,17 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     }
 
     // Encrypt the WrapperMessage with CSK
-    let ciphertext = match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
-        Ok(ct) => ct,
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/security/GeneralSecurityException",
-                format!("encryption failed: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
+    let ciphertext =
+        match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
+            Ok(ct) => ct,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/security/GeneralSecurityException",
+                    format!("encryption failed: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
     // Generate temporal identifier for current time window
     let temporal_id = match crypto::temporal::generate_current_temporal_identifier(&csk) {
@@ -1623,7 +1620,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
 }
 
 /// Decrypt and parse an EncryptedPacket to get the WrapperMessage
-/// 
+///
 /// @param cskHex Client Symmetric Key (hex) for decryption
 /// @param encryptedPacketBytes Serialized EncryptedPacket protobuf
 /// @return Serialized WrapperMessage protobuf bytes
@@ -1636,8 +1633,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
 ) -> jbyteArray {
     use crate::crypto;
     use crate::protocol::pb;
-    use prost::Message;
     use hkdf::Hkdf;
+    use prost::Message;
     use sha2::Sha256;
 
     // Parse CSK from hex
@@ -1666,10 +1663,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
     let csk_array: [u8; 32] = match csk_bytes.try_into() {
         Ok(arr) => arr,
         Err(_) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                "CSK must be 32 bytes",
-            );
+            let _ = env.throw_new("java/lang/IllegalArgumentException", "CSK must be 32 bytes");
             return std::ptr::null_mut();
         }
     };

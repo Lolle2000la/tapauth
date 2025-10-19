@@ -136,6 +136,48 @@ message PairingConfirmation {
 }
 
 /**
+ * Initial message sent by server during TCP pairing handshake.
+ * Contains server's X25519 public key and Ed25519 public key.
+ */
+message PairingHello {
+  // Protocol version
+  uint32 version = 1;
+  // Server's ephemeral X25519 public key for DH
+  bytes x25519_public_key = 2;
+  // Server's long-term Ed25519 public key for identification
+  bytes ed25519_public_key = 3;
+}
+
+/**
+ * Response sent by client during TCP pairing handshake.
+ * Contains client's X25519 public key and Ed25519 public key.
+ */
+message PairingResponse {
+  // Protocol version
+  uint32 version = 1;
+  // Client's ephemeral X25519 public key for DH
+  bytes x25519_public_key = 2;
+  // Client's long-term Ed25519 public key for identification
+  bytes ed25519_public_key = 3;
+}
+
+/**
+ * Message containing CSK encrypted with PSK, sent from server to client.
+ */
+message PairingCskMessage {
+  // CSK encrypted with PSK derived from X25519 DH
+  bytes encrypted_csk = 1;
+}
+
+/**
+ * Final acknowledgment from client that pairing is complete.
+ */
+message PairingComplete {
+  // Whether pairing was successful
+  bool success = 1;
+}
+
+/**
  * A top-level wrapper for all possible messages.
  * In post-pairing communication, this is serialized and then encrypted.
  */

@@ -53,6 +53,11 @@ pub enum ScreenMessage {
     RotateCSK,
     CSKRotated,
     CSKRotationFailed(String),
+    HostnameChanged(String),
+    UdpPortChanged(String),
+    SaveConfig,
+    ConfigSaved,
+    ConfigSaveFailed(String),
 }
 
 impl Screen {

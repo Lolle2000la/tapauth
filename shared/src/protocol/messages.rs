@@ -17,6 +17,8 @@ pub enum ProtocolError {
     InvalidMessageFormat,
     #[error("Missing required field: {0}")]
     MissingField(&'static str),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Create an AuthenticationRequest message
@@ -241,7 +243,7 @@ pub fn verify_auth_cancel(
     verify_ed25519(
         client_public_key,
         &data_to_verify,
-        &unsigned_cancel.signature,
+        &cancel.signature,
     )?;
     Ok(())
 }
