@@ -2,6 +2,7 @@ package dev.rourunisen.tapauth.network
 
 import android.util.Log
 import dev.rourunisen.tapauth.crypto.Ed25519Keypair
+import dev.rourunisen.tapauth.crypto.X25519Keypair
 import dev.rourunisen.tapauth.crypto.generateSAS
 import dev.rourunisen.tapauth.crypto.performKeyExchange
 import dev.rourunisen.tapauth.data.PairedDevice
@@ -52,15 +53,13 @@ class PairingClient {
             val output = DataOutputStream(socket.getOutputStream())
             
             // Step 1: Generate our (server's) ephemeral X25519 keypair
-            val serverEphemeralKeyPair = Ed25519Keypair.generate()
+            val serverEphemeralKeyPair = X25519Keypair.generate()
             
             // Step 2: Send PairingHello message (protobuf) - SERVER SENDS FIRST
-            // Note: For pairing, we use Ed25519 keypair temporarily for X25519 DH
-            // The protocol specifies X25519 keys, so we're using Ed25519 keys as a stand-in
             val pairingHello = dev.rourunisen.tapauth.crypto.createPairingHello(
                 version = 1,
                 x25519PublicKey = serverEphemeralKeyPair.publicKey,
-                ed25519PublicKey = serverEphemeralKeyPair.publicKey
+                ed25519PublicKey = serverEphemeralKeyPair.publicKey // TODO: Use proper Ed25519 for signing
             )
             
             // Send length-prefixed protobuf message
@@ -86,9 +85,15 @@ class PairingClient {
             // Step 4: Perform X25519 key exchange to compute PSK
             // PSK = ECDH(server_ephemeral_private, client_x25519_public_from_response)
             val clientPublicKey = clientX25519Key
+            
+            Log.d(TAG, "Server X25519 private key: ${serverEphemeralKeyPair.privateKey.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "Server X25519 public key: ${serverEphemeralKeyPair.publicKey.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "Client X25519 public key: ${clientPublicKey.joinToString("") { "%02x".format(it) }}")
+            
             val psk = performKeyExchange(serverEphemeralKeyPair.privateKey, clientPublicKey)
             
             Log.d(TAG, "Computed PSK (${psk.size} bytes)")
+            Log.d(TAG, "PSK (hex): ${psk.joinToString("") { "%02x".format(it) }}")
             
             // Step 5: Generate SAS for anti-MITM verification
             // SAS is derived from both public keys using the PSK

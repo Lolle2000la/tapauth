@@ -29,8 +29,33 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     }
 }
 
+/// JNI wrapper for generating a new X25519 keypair (for ECDH key exchange).
+/// Returns the keypair as a hex-encoded string "private_key:public_key"
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateX25519Keypair(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let keypair = crypto::X25519KeyPair::generate();
+
+    let private_hex = hex::encode(keypair.secret_key_bytes());
+    let public_hex = hex::encode(keypair.public_key_bytes());
+    let combined = format!("{}:{}", private_hex, public_hex);
+
+    match env.new_string(combined) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// JNI wrapper for performing X25519 key exchange.
-/// Returns the shared secret as hex-encoded string
+/// Returns the PSK (derived from shared secret via HKDF) as hex-encoded string
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExchange(
     mut env: JNIEnv,
@@ -118,7 +143,24 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
         }
     };
 
-    let hex_result = hex::encode(shared_secret);
+    // Derive PSK from shared secret using HKDF
+    eprintln!("[JNI DEBUG] Shared secret: {}", hex::encode(shared_secret));
+    eprintln!("[JNI DEBUG] >>> MARKER: JNI FIX VERSION 2025-10-19-20:40 <<<");
+    let psk = match crypto::derive_psk_from_x25519(&shared_secret) {
+        Ok(key) => key,
+        Err(err) => {
+            eprintln!("[JNI DEBUG] PSK derivation FAILED: {}", err);
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("PSK derivation failed: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    eprintln!("[JNI DEBUG] Derived PSK: {}", hex::encode(psk.as_bytes()));
+
+    let hex_result = hex::encode(psk.as_bytes());
+    eprintln!("[JNI DEBUG] Returning hex PSK: {}", hex_result);
 
     match env.new_string(hex_result) {
         Ok(output) => output.into_raw(),

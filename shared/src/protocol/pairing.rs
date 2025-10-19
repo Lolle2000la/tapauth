@@ -130,10 +130,39 @@ impl ClientPairingSession {
                 .map_err(|_| ProtocolError::InvalidMessageFormat)?,
         );
 
+        let client_x25519_priv = self.x25519_keypair.secret_key_bytes();
+        let client_x25519_pub = self.x25519_keypair.public_key_bytes();
+        let server_x25519_pub = self.server_x25519_public.unwrap();
+
+        eprintln!(
+            "[DEBUG CLIENT] Client X25519 private key: {}",
+            hex::encode(client_x25519_priv)
+        );
+        eprintln!(
+            "[DEBUG CLIENT] Client X25519 public key: {}",
+            hex::encode(client_x25519_pub)
+        );
+        eprintln!(
+            "[DEBUG CLIENT] Server X25519 public key: {}",
+            hex::encode(server_x25519_pub)
+        );
+
         let shared_secret = self
             .x25519_keypair
             .diffie_hellman(&self.server_x25519_public.unwrap())?;
+
+        eprintln!(
+            "[DEBUG CLIENT] Shared secret: {}",
+            hex::encode(&shared_secret)
+        );
+
         let psk = derive_psk_from_x25519(&shared_secret)?;
+
+        eprintln!(
+            "[DEBUG CLIENT] Derived PSK: {}",
+            hex::encode(psk.as_bytes())
+        );
+
         self.psk = Some(psk);
 
         // Step 3: Derive and store SAS

@@ -23,10 +23,16 @@ object TapAuthCrypto {
     external fun generateKeypair(): String
     
     /**
+     * Generate a new X25519 keypair (for key exchange)
+     * @return Keypair as "private_hex:public_hex"
+     */
+    external fun generateX25519Keypair(): String
+    
+    /**
      * Perform X25519 key exchange
      * @param ourPrivateKeyHex Our X25519 private key (hex)
      * @param theirPublicKeyHex Their X25519 public key (hex)
-     * @return Shared secret (hex)
+     * @return PSK derived from shared secret (hex)
      */
     external fun keyExchange(ourPrivateKeyHex: String, theirPublicKeyHex: String): String
     
@@ -267,14 +273,60 @@ data class Ed25519Keypair(
 }
 
 /**
+ * X25519 keypair for ECDH key exchange
+ */
+data class X25519Keypair(
+    val privateKey: ByteArray,
+    val publicKey: ByteArray
+) {
+    companion object {
+        fun generate(): X25519Keypair {
+            val result = TapAuthCrypto.generateX25519Keypair()
+            val parts = result.split(":")
+            require(parts.size == 2) { "Invalid keypair format" }
+            return X25519Keypair(
+                privateKey = hexToBytes(parts[0]),
+                publicKey = hexToBytes(parts[1])
+            )
+        }
+    }
+    
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        
+        other as X25519Keypair
+        
+        if (!privateKey.contentEquals(other.privateKey)) return false
+        if (!publicKey.contentEquals(other.publicKey)) return false
+        
+        return true
+    }
+    
+    override fun hashCode(): Int {
+        var result = privateKey.contentHashCode()
+        result = 31 * result + publicKey.contentHashCode()
+        return result
+    }
+}
+
+/**
  * Perform X25519 Diffie-Hellman key exchange
  */
 fun performKeyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): ByteArray {
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] Calling JNI keyExchange")
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] Our private key: ${bytesToHex(ourPrivateKey)}")
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] Their public key: ${bytesToHex(theirPublicKey)}")
+    
     val result = TapAuthCrypto.keyExchange(
         bytesToHex(ourPrivateKey),
         bytesToHex(theirPublicKey)
     )
-    return hexToBytes(result)
+    
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] JNI returned: $result")
+    val psk = hexToBytes(result)
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] Converted to bytes (${psk.size} bytes): ${bytesToHex(psk)}")
+    return psk
 }
 
 /**
