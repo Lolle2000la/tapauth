@@ -7,8 +7,13 @@ set -e
 
 echo "Building TapAuth shared library for Android..."
 
+# Get the project root directory
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SHARED_DIR="$PROJECT_ROOT/shared"
+JNILIBS_DIR="$PROJECT_ROOT/server-android/app/src/main/jniLibs"
+
 # Change to shared library directory
-cd "$(dirname "$0")/../shared"
+cd "$SHARED_DIR"
 
 # Check if cargo-ndk is installed
 if ! command -v cargo-ndk &> /dev/null; then
@@ -25,18 +30,18 @@ for target in "${TARGETS[@]}"; do
 done
 
 echo "Creating jniLibs directory structure..."
-mkdir -p server-android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}
+mkdir -p "$JNILIBS_DIR"/{arm64-v8a,armeabi-v7a,x86_64,x86}
 
 echo "Copying libraries..."
-cp target/aarch64-linux-android/release/libshared.so server-android/app/src/main/jniLibs/arm64-v8a/
-cp target/armv7-linux-androideabi/release/libshared.so server-android/app/src/main/jniLibs/armeabi-v7a/
-cp target/x86_64-linux-android/release/libshared.so server-android/app/src/main/jniLibs/x86_64/
-cp target/i686-linux-android/release/libshared.so server-android/app/src/main/jniLibs/x86/
+cp target/aarch64-linux-android/release/libshared.so "$JNILIBS_DIR/arm64-v8a/"
+cp target/armv7-linux-androideabi/release/libshared.so "$JNILIBS_DIR/armeabi-v7a/"
+cp target/x86_64-linux-android/release/libshared.so "$JNILIBS_DIR/x86_64/"
+cp target/i686-linux-android/release/libshared.so "$JNILIBS_DIR/x86/"
 
 echo "✓ Build complete! Libraries copied to jniLibs/"
 echo ""
 echo "Library locations:"
-echo "  - arm64-v8a: server-android/app/src/main/jniLibs/arm64-v8a/libshared.so"
-echo "  - armeabi-v7a: server-android/app/src/main/jniLibs/armeabi-v7a/libshared.so"
-echo "  - x86_64: server-android/app/src/main/jniLibs/x86_64/libshared.so"
-echo "  - x86: server-android/app/src/main/jniLibs/x86/libshared.so"
+echo "  - arm64-v8a: $JNILIBS_DIR/arm64-v8a/libshared.so"
+echo "  - armeabi-v7a: $JNILIBS_DIR/armeabi-v7a/libshared.so"
+echo "  - x86_64: $JNILIBS_DIR/x86_64/libshared.so"
+echo "  - x86: $JNILIBS_DIR/x86/libshared.so"

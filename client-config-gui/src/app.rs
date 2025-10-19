@@ -35,6 +35,6 @@ impl TapAuthConfig {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::Dark
+        Theme::Light // Use Light theme so QR codes are black-on-white (required for scanning)
     }
 }

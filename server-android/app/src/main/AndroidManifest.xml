@@ -44,6 +44,14 @@
         <action android:name="android.intent.action.MAIN" />
         <category android:name="android.intent.category.LAUNCHER" />
       </intent-filter>
+      
+      <!-- Handle tapauth:// URLs -->
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <category android:name="android.intent.category.BROWSABLE" />
+        <data android:scheme="tapauth" android:host="pair" />
+      </intent-filter>
     </activity>
     <!-- Authentication Service -->
     <service

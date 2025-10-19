@@ -1,5 +1,6 @@
 package dev.rourunisen.tapauth
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -12,8 +13,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.google.accompanist.permissions.*
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.service.AuthRequestManager
 import dev.rourunisen.tapauth.ui.home.HomeScreen
@@ -159,8 +167,46 @@ class MainActivity : FragmentActivity() {
     }
 }
 
+@OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun TapAuthApp() {
+    // List of required permissions
+    val permissions = buildList {
+        add(Manifest.permission.CAMERA)
+        add(Manifest.permission.INTERNET)
+        add(Manifest.permission.ACCESS_NETWORK_STATE)
+        add(Manifest.permission.ACCESS_WIFI_STATE)
+        add(Manifest.permission.CHANGE_WIFI_MULTICAST_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            add(Manifest.permission.BLUETOOTH_CONNECT)
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+    
+    val permissionsState = rememberMultiplePermissionsState(permissions)
+    
+    // Request permissions on first composition
+    LaunchedEffect(Unit) {
+        if (!permissionsState.allPermissionsGranted) {
+            permissionsState.launchMultiplePermissionRequest()
+        }
+    }
+    
+    // Show permission request screen if not all granted
+    if (!permissionsState.allPermissionsGranted) {
+        PermissionRequestScreen(
+            permissionsState = permissionsState,
+            onRequestPermissions = {
+                permissionsState.launchMultiplePermissionRequest()
+            }
+        )
+        return
+    }
+    
+    // All permissions granted, show main app
     var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
     
     when (val screen = currentScreen) {
@@ -196,6 +242,94 @@ fun TapAuthApp() {
             SettingsScreen(
                 onBack = { currentScreen = AppScreen.Home }
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+fun PermissionRequestScreen(
+    permissionsState: MultiplePermissionsState,
+    onRequestPermissions: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "Permissions Required",
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            
+            Spacer(modifier = Modifier.height(24.dp))
+            
+            Text(
+                text = "TapAuth needs the following permissions to work:",
+                style = MaterialTheme.typography.bodyLarge,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            val permissionDescriptions = mapOf(
+                Manifest.permission.CAMERA to "Camera - for scanning QR codes",
+                Manifest.permission.BLUETOOTH_CONNECT to "Bluetooth - for BLE authentication",
+                Manifest.permission.BLUETOOTH_ADVERTISE to "Bluetooth - for BLE advertisement",
+                Manifest.permission.POST_NOTIFICATIONS to "Notifications - for auth requests"
+            )
+            
+            permissionsState.permissions.forEach { permState ->
+                permissionDescriptions[permState.permission]?.let { description ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (permState.status.isGranted) "✓" else "○",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = if (permState.status.isGranted) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = description,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            Button(
+                onClick = onRequestPermissions,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Grant Permissions")
+            }
+            
+            if (permissionsState.permissions.any { it.status.shouldShowRationale }) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Some permissions were denied. Please grant them in Settings if the prompt doesn't appear.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
         }
     }
 }
