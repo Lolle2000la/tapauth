@@ -41,9 +41,10 @@ pub enum ScreenMessage {
 
     // Pairing
     PairingStarted,
-    PairingComplete(String), // device_id
+    PairingComplete(String), // device_id or SAS
     PairingFailed(String),   // error message
     PairingCancelled,
+    PairingSASConfirmed, // User confirmed SAS
 
     // Device List
     RemoveDevice(String),  // device_id

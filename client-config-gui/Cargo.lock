@@ -558,6 +558,7 @@ dependencies = [
  "chrono",
  "hex",
  "iced",
+ "lazy_static",
  "local-ip-address",
  "qrcode 0.14.1",
  "shared",

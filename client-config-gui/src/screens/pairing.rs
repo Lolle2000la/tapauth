@@ -5,6 +5,7 @@ use iced::{
     widget::{button, column, container, text, QRCode, Space},
     Element, Length, Task,
 };
+use lazy_static::lazy_static;
 use shared::{
     config::{ClientConfigManager, PairedServer},
     crypto::Ed25519KeyPair,
@@ -12,14 +13,28 @@ use shared::{
     protocol::ClientPairingSession,
 };
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+// Global state to store pairing session between SAS display and completion
+lazy_static! {
+    static ref PAIRING_STATE: Mutex<Option<PairingSessionState>> = Mutex::new(None);
+}
+
+struct PairingSessionState {
+    stream: TcpStream,
+    session: ClientPairingSession,
+    server_public_key: [u8; 32],
+    keypair: Ed25519KeyPair,
+}
 
 #[derive(Debug, Clone)]
 pub enum PairingState {
     Loading,
     ShowingQRCode { url: String, qr_data: Arc<QrData> },
     WaitingForConnection,
-    VerifyingSAS { sas: String },
+    VerifyingSAS { sas: String, port: u16 },
+    CompletingPairing,
     Success { device_id: String },
     Error { message: String },
 }
@@ -75,15 +90,42 @@ impl PairingScreen {
                             return Task::perform(
                                 Self::wait_for_pairing_connection(port),
                                 |result| match result {
-                                    Ok(sas) => ScreenMessage::PairingComplete(sas),
+                                    Ok((sas, port)) => {
+                                        // Return SAS with port for continuation
+                                        ScreenMessage::PairingComplete(format!(
+                                            "SAS:{}:{}",
+                                            sas, port
+                                        ))
+                                    }
                                     Err(e) => ScreenMessage::PairingFailed(e),
                                 },
                             );
                         }
                     }
+                } else if data.starts_with("SAS:") {
+                    // Parse SAS:sas_value:port format
+                    let parts: Vec<&str> = data.splitn(3, ':').collect();
+                    if parts.len() == 3 {
+                        self.state = PairingState::VerifyingSAS {
+                            sas: parts[1].to_string(),
+                            port: parts[2].parse().unwrap_or(0),
+                        };
+                    }
                 } else {
-                    // This is the SAS
-                    self.state = PairingState::VerifyingSAS { sas: data };
+                    // This is a device_id (pairing success)
+                    self.state = PairingState::Success { device_id: data };
+                }
+                Task::none()
+            }
+            ScreenMessage::PairingSASConfirmed => {
+                // User confirmed SAS - complete pairing
+                if let PairingState::VerifyingSAS { port, .. } = &self.state {
+                    let port = *port;
+                    self.state = PairingState::CompletingPairing;
+                    return Task::perform(Self::complete_pairing(port), |result| match result {
+                        Ok(device_id) => ScreenMessage::PairingComplete(device_id),
+                        Err(e) => ScreenMessage::PairingFailed(e),
+                    });
                 }
                 Task::none()
             }
@@ -101,7 +143,8 @@ impl PairingScreen {
             PairingState::Loading => self.view_loading(),
             PairingState::ShowingQRCode { url, qr_data } => self.view_qr_code(url, qr_data),
             PairingState::WaitingForConnection => self.view_waiting(),
-            PairingState::VerifyingSAS { sas } => self.view_sas_verification(sas),
+            PairingState::VerifyingSAS { sas, .. } => self.view_sas_verification(sas),
+            PairingState::CompletingPairing => self.view_completing(),
             PairingState::Success { device_id } => self.view_success(device_id),
             PairingState::Error { message } => self.view_error(message),
         };
@@ -166,10 +209,20 @@ impl PairingScreen {
         .into()
     }
 
+    fn view_completing(&self) -> Element<'_, ScreenMessage> {
+        column![
+            text("Completing pairing...").size(24),
+            Space::with_height(Length::Fixed(20.0)),
+            text("Please wait").size(16),
+        ]
+        .align_x(iced::Alignment::Center)
+        .into()
+    }
+
     fn view_sas_verification<'a>(&self, sas: &'a str) -> Element<'a, ScreenMessage> {
         let confirm_button = button(text("Confirm").size(16))
             .padding(10)
-            .on_press(ScreenMessage::PairingComplete(sas.to_string()));
+            .on_press(ScreenMessage::PairingSASConfirmed);
 
         let cancel_button = button(text("Cancel").size(16))
             .padding(10)
@@ -261,7 +314,7 @@ impl PairingScreen {
         Ok((url, port))
     }
 
-    async fn wait_for_pairing_connection(port: u16) -> Result<String, String> {
+    async fn wait_for_pairing_connection(port: u16) -> Result<(String, u16), String> {
         use std::time::Duration;
         use tokio::time::timeout;
 
@@ -301,13 +354,36 @@ impl PairingScreen {
 
         eprintln!("[DEBUG] Pairing initiated. SAS: {}", sas);
 
-        // TODO: Here we need to:
-        // 1. Return SAS to GUI to show to user
-        // 2. Wait for user confirmation
-        // 3. Then call session.finish_pairing(stream, &csk)
-        //
-        // For now, let's automatically continue after a delay (TEMPORARY!)
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Store session state globally for phase 2
+        let state = PairingSessionState {
+            stream,
+            session,
+            server_public_key,
+            keypair: keypair.clone(),
+        };
+
+        *PAIRING_STATE.lock().await = Some(state);
+
+        // Return SAS immediately to show to user
+        Ok((shared::crypto::format_sas(&sas), port))
+    }
+
+    async fn complete_pairing(_port: u16) -> Result<String, String> {
+        eprintln!("[DEBUG] User confirmed SAS, completing pairing...");
+
+        let config = ClientConfigManager::new();
+
+        // Retrieve stored session state
+        let mut state_guard = PAIRING_STATE.lock().await;
+        let state = state_guard.take().ok_or("No pairing session in progress")?;
+        drop(state_guard); // Release lock early
+
+        let PairingSessionState {
+            stream,
+            mut session,
+            server_public_key,
+            keypair: _,
+        } = state;
 
         // Load or generate CSK
         let csk = config
@@ -323,7 +399,7 @@ impl PairingScreen {
             .await
             .map_err(|e| format!("Pairing completion failed: {}", e))?;
 
-        eprintln!("[DEBUG] Pairing handshake complete. SAS: {}", sas);
+        eprintln!("[DEBUG] Pairing handshake complete");
 
         // Store CSK
         config
@@ -339,11 +415,11 @@ impl PairingScreen {
         };
 
         config
-            .add_paired_server(server_hex, paired_server)
+            .add_paired_server(server_hex.clone(), paired_server)
             .map_err(|e| format!("Failed to save paired server: {}", e))?;
 
         eprintln!("[DEBUG] Pairing complete!");
 
-        Ok(shared::crypto::format_sas(&sas))
+        Ok(server_hex)
     }
 }
