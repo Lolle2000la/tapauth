@@ -36,15 +36,15 @@ When running `./dev-start.sh` and `run-gui`, four missing dependency groups were
    - Used for: GPU rendering or software fallback rendering
    - Root cause: No GPU drivers available in container, and no software rendering fallback
 
-6. **X11 Authorization and Window Management** (In Progress)
+6. **X11 Authorization and Window Management / XWayland Compatibility** ✅ **FIXED**
    - Error: `BadAccess (attempt to access private resource denied)` and `BadDrawable (invalid Pixmap or Window parameter)`
    - Context: GUI window briefly appears but then crashes during window mapping
    - Occurs after software rendering is set up correctly (llvmpipe detected)
-   - Possible causes:
-     - X11 authorization/authentication issues with compositor
-     - DRI/DRM access conflicts between container and host
-     - Root user running X11 applications
-     - Race condition in window creation with software rendering
+   - Root cause: **Vulkan backend incompatibility with XWayland compositor**
+     - Host system runs Wayland with XWayland (not pure X11)
+     - wgpu's Vulkan backend has issues with XWayland's compositor
+     - OpenGL backend has better XWayland compatibility
+   - Solution: Force OpenGL backend with `ENV WGPU_BACKEND=gl`
 
 ---
 
@@ -88,7 +88,14 @@ libdrm2 \              # Direct Rendering Manager
 # Environment variables for software rendering
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV GALLIUM_DRIVER=llvmpipe
+
+# Force OpenGL backend (XWayland compatibility)
+ENV WGPU_BACKEND=gl
 ```
+
+**Additional Configuration:**
+- X11 authentication: Mount `.Xauthority` file in docker-compose
+- X11 permissions: Run `xhost +local:docker` on host before starting container
 
 ---
 
