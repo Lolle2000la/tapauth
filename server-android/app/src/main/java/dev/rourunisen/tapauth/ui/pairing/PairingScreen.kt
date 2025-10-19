@@ -5,10 +5,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.network.PairingClient
 import dev.rourunisen.tapauth.network.PairingResult
@@ -25,6 +27,8 @@ fun PairingScreen(
     var pairingState by remember { mutableStateOf<PairingState>(PairingState.Connecting) }
     val scope = rememberCoroutineScope()
     val pairingClient = remember { PairingClient() }
+    val context = LocalContext.current
+    val deviceRepository = remember { DeviceRepository(context) }
     
     LaunchedEffect(pairingUrl) {
         scope.launch {
@@ -97,7 +101,8 @@ fun PairingScreen(
                                 
                                 when (result) {
                                     is PairingResult.Success -> {
-                                        // TODO: Save device to repository
+                                        // Save device to repository
+                                        deviceRepository.savePairedDevice(result.device)
                                         pairingState = PairingState.Success
                                         onPairingComplete()
                                     }

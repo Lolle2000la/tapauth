@@ -1,7 +1,7 @@
 use super::ScreenMessage;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Task, Element, Length,
+    Element, Length, Task,
 };
 use shared::config::{ClientConfigManager, PairedServer};
 use std::collections::HashMap;
@@ -14,38 +14,55 @@ pub struct DeviceListScreen {
 }
 
 impl DeviceListScreen {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> (Self, Task<ScreenMessage>) {
+        eprintln!("[DeviceListScreen] Creating new DeviceListScreen and starting load task");
+        let screen = Self {
             devices: HashMap::new(),
             loading: true,
             error: None,
-        }
+        };
+
+        let task = Task::perform(Self::load_devices(), |result| match result {
+            Ok(devices) => ScreenMessage::DevicesLoaded(devices),
+            Err(e) => ScreenMessage::PairingFailed(e),
+        });
+
+        (screen, task)
     }
 
     pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
         match message {
             ScreenMessage::NavigateToDeviceList => {
+                eprintln!("[DeviceListScreen] NavigateToDeviceList message received");
                 // Load devices when navigating to this screen
-                Task::perform(
-                    Self::load_devices(),
-                    |result| match result {
-                        Ok(_devices) => ScreenMessage::NavigateToDeviceList,
-                        Err(e) => ScreenMessage::PairingFailed(e),
-                    }
-                )
+                self.loading = true;
+                Task::perform(Self::load_devices(), |result| match result {
+                    Ok(devices) => ScreenMessage::DevicesLoaded(devices),
+                    Err(e) => ScreenMessage::PairingFailed(e),
+                })
             }
-            ScreenMessage::RemoveDevice(ref device_id) => {
-                let id = device_id.clone();
-                Task::perform(
-                    Self::remove_device(id),
-                    |result| match result {
-                        Ok(_) => ScreenMessage::NavigateToDeviceList, // Reload list after removal
-                        Err(e) => ScreenMessage::PairingFailed(e),
-                    }
-                )
+            ScreenMessage::DevicesLoaded(devices) => {
+                eprintln!(
+                    "[DeviceListScreen] DevicesLoaded message received with {} devices",
+                    devices.len()
+                );
+                self.devices = devices;
+                self.loading = false;
+                eprintln!(
+                    "[DeviceListScreen] State updated, now have {} devices",
+                    self.devices.len()
+                );
+                Task::none()
             }
-            ScreenMessage::DeviceRemoved(device_id) => {
+            ScreenMessage::RemoveDevice(device_id) => {
                 self.devices.remove(&device_id);
+                Task::perform(Self::remove_device(device_id), |result| match result {
+                    Ok(_) => ScreenMessage::NavigateToDeviceList,
+                    Err(e) => ScreenMessage::PairingFailed(e),
+                })
+            }
+            ScreenMessage::DeviceRemoved(_device_id) => {
+                // Already removed from self.devices in RemoveDevice
                 Task::none()
             }
             _ => Task::none(),
@@ -60,11 +77,10 @@ impl DeviceListScreen {
         let title = text("Paired Devices").size(32);
 
         let device_list = if self.devices.is_empty() {
-            column![text("No paired devices").size(16)]
-                .align_x(iced::Alignment::Center)
+            column![text("No paired devices").size(16)].align_x(iced::Alignment::Center)
         } else {
             let mut devices_column = column![].spacing(10);
-            
+
             for (device_id, server) in &self.devices {
                 let device_row = row![
                     text(&server.name).size(18).width(Length::Fill),
@@ -79,7 +95,7 @@ impl DeviceListScreen {
 
                 devices_column = devices_column.push(device_row);
             }
-            
+
             devices_column
         };
 
@@ -102,21 +118,32 @@ impl DeviceListScreen {
     }
 
     async fn load_devices() -> Result<HashMap<String, PairedServer>, String> {
+        eprintln!("[DeviceListScreen] load_devices() called");
         let config = ClientConfigManager::new();
 
-        config.load_paired_servers()
-            .map_err(|e| format!("Failed to load paired devices: {}", e))
+        let result = config
+            .load_paired_servers()
+            .map_err(|e| format!("Failed to load paired devices: {}", e));
+
+        match &result {
+            Ok(devices) => eprintln!("[DeviceListScreen] Loaded {} devices", devices.len()),
+            Err(e) => eprintln!("[DeviceListScreen] Error loading devices: {}", e),
+        }
+
+        result
     }
 
     async fn remove_device(device_id: String) -> Result<(), String> {
         let config = ClientConfigManager::new();
-        
-        let mut servers = config.load_paired_servers()
+
+        let mut servers = config
+            .load_paired_servers()
             .map_err(|e| format!("Failed to load devices: {}", e))?;
-        
+
         servers.remove(&device_id);
-        
-        config.save_paired_servers(&servers)
+
+        config
+            .save_paired_servers(&servers)
             .map_err(|e| format!("Failed to save devices: {}", e))
     }
 }

@@ -49,6 +49,7 @@ pub enum ScreenMessage {
     // Device List
     RemoveDevice(String),  // device_id
     DeviceRemoved(String), // device_id
+    DevicesLoaded(std::collections::HashMap<String, shared::config::PairedServer>), // loaded devices
 
     // Settings
     RotateCSK,
@@ -75,8 +76,10 @@ impl Screen {
                 Task::done(ScreenMessage::PairingStarted)
             }
             ScreenMessage::NavigateToDeviceList => {
-                *self = Screen::DeviceList(DeviceListScreen::new());
-                Task::done(ScreenMessage::NavigateToDeviceList)
+                eprintln!("[Screen] NavigateToDeviceList - creating DeviceListScreen");
+                let (screen, task) = DeviceListScreen::new();
+                *self = Screen::DeviceList(screen);
+                task
             }
             ScreenMessage::NavigateToSettings => {
                 *self = Screen::Settings(SettingsScreen::new());
