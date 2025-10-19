@@ -35,6 +35,20 @@ data class AuthenticationGrant(
     val signature: String  // Base64 encoded
 )
 
+data class GrantConfirmation(
+    val challenge: String,  // Base64 encoded
+    @SerializedName("signature_algorithm")
+    val signatureAlgorithm: Int,
+    val signature: String  // Base64 encoded
+)
+
+data class AuthenticationCancel(
+    val challenge: String,  // Base64 encoded
+    @SerializedName("signature_algorithm")
+    val signatureAlgorithm: Int,
+    val signature: String  // Base64 encoded
+)
+
 /**
  * Helper object for parsing protobuf messages via JNI
  */
@@ -63,6 +77,22 @@ object ProtobufParser {
      */
     fun createAuthGrant(signedChallenge: ByteArray): ByteArray {
         return dev.rourunisen.tapauth.crypto.TapAuthCrypto.createAuthGrant(signedChallenge)
+    }
+    
+    /**
+     * Parse GrantConfirmation from protobuf bytes
+     */
+    fun parseGrantConfirmation(confirmationBytes: ByteArray): GrantConfirmation {
+        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseGrantConfirmation(confirmationBytes)
+        return gson.fromJson(json, GrantConfirmation::class.java)
+    }
+    
+    /**
+     * Parse AuthenticationCancel from protobuf bytes
+     */
+    fun parseAuthenticationCancel(cancelBytes: ByteArray): AuthenticationCancel {
+        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthenticationCancel(cancelBytes)
+        return gson.fromJson(json, AuthenticationCancel::class.java)
     }
     
     private fun bytesToHex(bytes: ByteArray): String {

@@ -15,6 +15,7 @@ import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.biometric.BiometricHelper
+import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import kotlinx.coroutines.*
 import java.util.UUID
 
@@ -36,8 +37,11 @@ class BleGattService : Service() {
     
     private lateinit var deviceRepository: DeviceRepository
     private lateinit var biometricHelper: BiometricHelper
+    private val replayMitigationCache = ReplayMitigationCache.getInstance()
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var currentTemporalId: ByteArray? = null
+    private var temporalIdUpdateJob: Job? = null
     
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         
@@ -214,6 +218,24 @@ class BleGattService : Service() {
             return
         }
         
+        // Generate temporal identifier for the first paired device (if any)
+        // In a real deployment, you'd pick a specific device or rotate through them
+        serviceScope.launch {
+            val pairedDevices = deviceRepository.getAllPairedDevices()
+            if (pairedDevices.isNotEmpty()) {
+                val device = pairedDevices[0]
+                try {
+                    // Call JNI function to generate temporal identifier (returns hex string)
+                    val temporalIdHex = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk)
+                    // Convert hex string to bytes for service data
+                    currentTemporalId = hexStringToByteArray(temporalIdHex)
+                    Log.d(TAG, "Using temporal ID for BLE advertisement: ${temporalIdHex.take(16)}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to generate temporal ID for BLE advertisement", e)
+                }
+            }
+        }
+        
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true)
@@ -221,13 +243,22 @@ class BleGattService : Service() {
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .build()
         
-        val data = AdvertiseData.Builder()
+        val dataBuilder = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
+        
+        // Add temporal identifier as service data (per specification)
+        currentTemporalId?.let { temporalId ->
+            dataBuilder.addServiceData(ParcelUuid(SERVICE_UUID), temporalId)
+        }
+        
+        val data = dataBuilder.build()
         
         bluetoothLeAdvertiser?.startAdvertising(settings, data, advertiseCallback)
+        
+        // Start periodic temporal ID updates (every 60 seconds per specification)
+        startTemporalIdUpdates()
     }
     
     private fun stopAdvertising() {
@@ -239,6 +270,31 @@ class BleGattService : Service() {
             bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
             Log.i(TAG, "BLE advertising stopped")
         }
+        stopTemporalIdUpdates()
+    }
+    
+    private fun startTemporalIdUpdates() {
+        temporalIdUpdateJob?.cancel()
+        temporalIdUpdateJob = serviceScope.launch {
+            while (isActive) {
+                // Wait until next 60-second boundary
+                val now = System.currentTimeMillis()
+                val nextBoundary = ((now / 60_000) + 1) * 60_000
+                val delayMs = nextBoundary - now
+                
+                delay(delayMs)
+                
+                // Update temporal ID and restart advertising
+                stopAdvertising()
+                delay(100) // Brief pause to ensure clean restart
+                startAdvertising()
+            }
+        }
+    }
+    
+    private fun stopTemporalIdUpdates() {
+        temporalIdUpdateJob?.cancel()
+        temporalIdUpdateJob = null
     }
     
     private suspend fun handleClientCommand(device: BluetoothDevice, data: ByteArray) {
@@ -256,7 +312,19 @@ class BleGattService : Service() {
             
             Log.d(TAG, "Parsed BLE request: username=${authRequest.username}, hostname=${authRequest.hostname}")
             
-            // Step 2: Find paired device
+            // Decode Base64 strings to ByteArrays
+            val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
+            val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
+            
+            // Step 2: Replay attack mitigation
+            // Check for replayed challenges and stale timestamps
+            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
+                Log.w(TAG, "BLE replay attack detected, rejecting request")
+                sendResponse(device, "REPLAY_DETECTED".toByteArray())
+                return
+            }
+            
+            // Step 3: Find paired device
             val pairedDevices = deviceRepository.getAllPairedDevices()
             
             if (pairedDevices.isEmpty()) {
@@ -267,7 +335,7 @@ class BleGattService : Service() {
             
             Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
             
-            // Step 3: Verify signature
+            // Step 4: Verify signature
             // Reconstruct the message with signature field empty
             val gson = com.google.gson.Gson()
             val requestJson = gson.toJson(authRequest)
@@ -286,11 +354,11 @@ class BleGattService : Service() {
                     val isValid = dev.rourunisen.tapauth.crypto.verifySignature(
                         pairedDev.publicKey,
                         messageForVerification,
-                        authRequest.signature
+                        signatureBytes
                     )
                     if (isValid) {
                         matchedDevice = pairedDev
-                        Log.d(TAG, "BLE signature verified for device: ${pairedDev.name} (${pairedDev.deviceId})")
+                        Log.d(TAG, "BLE signature verified for device: ${pairedDev.displayName} (${pairedDev.deviceId})")
                         break
                     }
                 } catch (e: Exception) {
@@ -304,48 +372,33 @@ class BleGattService : Service() {
                 return
             }
             
-            // Step 4: Request biometric authentication via AuthRequestManager
+            // Step 5: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
                 context = this,
                 deviceId = matchedDevice.deviceId,
-                deviceName = matchedDevice.name,
+                deviceName = matchedDevice.displayName,
                 username = authRequest.username,
                 hostname = authRequest.hostname,
-                challenge = authRequest.challenge,
-                timestamp = authRequest.timestamp,
+                challenge = challengeBytes,
+                timestamp = authRequest.timestampUnixSeconds,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE
             ) { approved, signedChallenge ->
                 // Step 5: Create and send encrypted grant
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "BLE auth request approved, creating encrypted grant")
                     try {
-                        // Create AuthenticationGrant protobuf
-                        val grantBytes = dev.rourunisen.tapauth.crypto.TapAuthCrypto.createAuthGrant(signedChallenge)
+                        // Create WrapperMessage containing AuthenticationGrant
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(signedChallenge)
                         
-                        // Encrypt the grant with the client's CSK
-                        val encryptedGrant = dev.rourunisen.tapauth.crypto.encryptWithCsk(
+                        // Create proper EncryptedPacket per specification
+                        val encryptedPacket = dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                             matchedDevice.csk,
-                            authRequest.challenge,
-                            "auth_grant",
-                            grantBytes
+                            wrapperMessage
                         )
                         
-                        // Generate temporal ID for the response
-                        val temporalId = dev.rourunisen.tapauth.crypto.generateTemporalId(matchedDevice.csk)
-                        
-                        // Create EncryptedPacket wrapper
-                        // TODO: Use proper protobuf serialization for EncryptedPacket
-                        // For now, prepend temporal ID to encrypted data
-                        val temporalIdBytes = dev.rourunisen.tapauth.crypto.TapAuthCrypto.run {
-                            val hex = temporalId
-                            hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                        }
-                        
-                        val response = temporalIdBytes + encryptedGrant
-                        
-                        sendResponse(device, response)
-                        Log.d(TAG, "Sent encrypted grant via BLE (${response.size} bytes)")
+                        sendResponse(device, encryptedPacket)
+                        Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
                         sendResponse(device, "ERROR".toByteArray())
@@ -405,5 +458,18 @@ class BleGattService : Service() {
         
         serviceScope.cancel()
         Log.i(TAG, "BLE GATT Service destroyed")
+    }
+    
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+    
+    private fun hexStringToByteArray(hex: String): ByteArray {
+        val len = hex.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
     }
 }

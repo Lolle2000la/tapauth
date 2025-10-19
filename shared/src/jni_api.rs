@@ -1295,3 +1295,448 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
         }
     }
 }
+
+/// Parse a GrantConfirmation protobuf message and return as JSON
+/// 
+/// Takes raw protobuf bytes and returns a JSON representation:
+/// {
+///   "challenge": "base64...",
+///   "signature_algorithm": 1,
+///   "signature": "base64..."
+/// }
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGrantConfirmation(
+    mut env: JNIEnv,
+    _class: JClass,
+    confirmation_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Convert from jbyteArray to Rust Vec<u8>
+    let bytes = match env.convert_byte_array(confirmation_bytes) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read byte array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Decode the protobuf GrantConfirmation
+    let confirmation = match pb::GrantConfirmation::decode(&bytes[..]) {
+        Ok(conf) => conf,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse GrantConfirmation protobuf: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert to JSON
+    let json_str = match serde_json::to_string(&confirmation) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to serialize to JSON: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Return as Java String
+    match env.new_string(&json_str) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create java string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Parse an AuthenticationCancel protobuf message and return as JSON
+/// 
+/// Takes raw protobuf bytes and returns a JSON representation:
+/// {
+///   "challenge": "base64...",
+///   "signature_algorithm": 1,
+///   "signature": "base64..."
+/// }
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAuthenticationCancel(
+    mut env: JNIEnv,
+    _class: JClass,
+    cancel_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Convert from jbyteArray to Rust Vec<u8>
+    let bytes = match env.convert_byte_array(cancel_bytes) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read byte array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Decode the protobuf AuthenticationCancel
+    let cancel = match pb::AuthenticationCancel::decode(&bytes[..]) {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse AuthenticationCancel protobuf: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert to JSON
+    let json_str = match serde_json::to_string(&cancel) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to serialize to JSON: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Return as Java String
+    match env.new_string(&json_str) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create java string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+
+/// Create a WrapperMessage containing an AuthenticationGrant
+/// 
+/// @param signedChallenge The signed challenge bytes
+/// @return Serialized WrapperMessage protobuf bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGrantWrapperMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    signed_challenge: JByteArray,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Get signed challenge bytes
+    let signed_challenge_bytes = match env.convert_byte_array(signed_challenge) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read signed challenge: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create AuthenticationGrant
+    let grant = pb::AuthenticationGrant {
+        signed_challenge: signed_challenge_bytes,
+        signature_algorithm: pb::SignatureAlgorithm::Ed25519 as i32,
+        signature: vec![], // Will be filled by caller if needed
+    };
+
+    // Create WrapperMessage
+    let wrapper = pb::WrapperMessage {
+        version: 1,
+        payload: Some(pb::wrapper_message::Payload::AuthGrant(grant)),
+    };
+
+    // Serialize to protobuf
+    let mut buf = Vec::new();
+    if let Err(err) = wrapper.encode(&mut buf) {
+        let _ = env.throw_new(
+            "java/io/IOException",
+            format!("failed to encode WrapperMessage: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create an EncryptedPacket from a WrapperMessage payload
+/// 
+/// @param cskHex Client Symmetric Key (hex) for encryption and temporal ID  
+/// @param wrapperMessageBytes Serialized WrapperMessage protobuf
+/// @return Serialized EncryptedPacket protobuf bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEncryptedPacket(
+    mut env: JNIEnv,
+    _class: JClass,
+    csk_hex: JString,
+    wrapper_message_bytes: JByteArray,
+) -> jbyteArray {
+    use crate::crypto;
+    use crate::protocol::pb;
+    use prost::Message;
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    // Parse CSK from hex
+    let csk_str: String = match env.get_string(&csk_hex) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid CSK hex string: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_bytes = match hex::decode(&csk_str) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid CSK hex: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_array: [u8; 32] = match csk_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                "CSK must be 32 bytes",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
+
+    // Get WrapperMessage bytes
+    let payload = match env.convert_byte_array(wrapper_message_bytes) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read wrapper message: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Derive nonce from CSK for EncryptedPacket encryption
+    // Per spec, each EncryptedPacket uses a unique nonce derived from CSK
+    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    let mut nonce = [0u8; 12];
+    if hk.expand(b"encrypted_packet_nonce", &mut nonce).is_err() {
+        let _ = env.throw_new(
+            "java/security/GeneralSecurityException",
+            "nonce derivation failed",
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Encrypt the WrapperMessage with CSK
+    let ciphertext = match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
+        Ok(ct) => ct,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/security/GeneralSecurityException",
+                format!("encryption failed: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Generate temporal identifier for current time window
+    let temporal_id = match crypto::temporal::generate_current_temporal_identifier(&csk) {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/security/GeneralSecurityException",
+                format!("temporal ID generation failed: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create EncryptedPacket
+    let encrypted_packet = pb::EncryptedPacket {
+        temporal_identifier: temporal_id.to_vec(),
+        encryption_algorithm: pb::SymmetricAlgorithm::Aes256Gcm as i32,
+        ciphertext,
+    };
+
+    // Serialize to protobuf
+    let mut buf = Vec::new();
+    if let Err(err) = encrypted_packet.encode(&mut buf) {
+        let _ = env.throw_new(
+            "java/io/IOException",
+            format!("failed to encode EncryptedPacket: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Decrypt and parse an EncryptedPacket to get the WrapperMessage
+/// 
+/// @param cskHex Client Symmetric Key (hex) for decryption
+/// @param encryptedPacketBytes Serialized EncryptedPacket protobuf
+/// @return Serialized WrapperMessage protobuf bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptEncryptedPacket(
+    mut env: JNIEnv,
+    _class: JClass,
+    csk_hex: JString,
+    encrypted_packet_bytes: JByteArray,
+) -> jbyteArray {
+    use crate::crypto;
+    use crate::protocol::pb;
+    use prost::Message;
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    // Parse CSK from hex
+    let csk_str: String = match env.get_string(&csk_hex) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid CSK hex string: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_bytes = match hex::decode(&csk_str) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid CSK hex: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_array: [u8; 32] = match csk_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                "CSK must be 32 bytes",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
+
+    // Get EncryptedPacket bytes
+    let packet_bytes = match env.convert_byte_array(encrypted_packet_bytes) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read encrypted packet: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse EncryptedPacket
+    let encrypted_packet = match pb::EncryptedPacket::decode(&packet_bytes[..]) {
+        Ok(pkt) => pkt,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to decode EncryptedPacket: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Derive same nonce used for encryption
+    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    let mut nonce = [0u8; 12];
+    if hk.expand(b"encrypted_packet_nonce", &mut nonce).is_err() {
+        let _ = env.throw_new(
+            "java/security/GeneralSecurityException",
+            "nonce derivation failed",
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Decrypt the ciphertext
+    let wrapper_bytes = match crypto::encryption::decrypt_aes_gcm(
+        csk.as_bytes(),
+        &nonce,
+        &encrypted_packet.ciphertext,
+        &[],
+    ) {
+        Ok(plaintext) => plaintext,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/security/GeneralSecurityException",
+                format!("decryption failed: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Return decrypted WrapperMessage bytes
+    match env.byte_array_from_slice(&wrapper_bytes) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}

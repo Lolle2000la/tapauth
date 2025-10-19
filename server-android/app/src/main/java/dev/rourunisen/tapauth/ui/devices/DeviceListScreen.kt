@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeviceListScreen(
     onBack: () -> Unit
@@ -66,7 +67,7 @@ fun DeviceListScreen(
     
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("Paired Devices") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {

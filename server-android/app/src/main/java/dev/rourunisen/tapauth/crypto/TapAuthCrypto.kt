@@ -110,6 +110,43 @@ object TapAuthCrypto {
     external fun serializeAuthRequestForVerification(requestJson: String): ByteArray
     
     /**
+     * Parse GrantConfirmation from protobuf bytes
+     * @param confirmationBytes Protobuf-encoded confirmation
+     * @return JSON string with confirmation contents
+     */
+    external fun parseGrantConfirmation(confirmationBytes: ByteArray): String
+    
+    /**
+     * Parse AuthenticationCancel from protobuf bytes
+     * @param cancelBytes Protobuf-encoded cancel message
+     * @return JSON string with cancel contents
+     */
+    external fun parseAuthenticationCancel(cancelBytes: ByteArray): String
+    
+    /**
+     * Create a WrapperMessage containing an AuthenticationGrant
+     * @param signedChallenge The signed challenge bytes
+     * @return Serialized WrapperMessage protobuf bytes
+     */
+    external fun createGrantWrapperMessage(signedChallenge: ByteArray): ByteArray
+    
+    /**
+     * Create an EncryptedPacket from a WrapperMessage payload
+     * @param cskHex Client Symmetric Key (hex)
+     * @param wrapperMessageBytes Serialized WrapperMessage protobuf
+     * @return Serialized EncryptedPacket protobuf bytes
+     */
+    external fun createEncryptedPacket(cskHex: String, wrapperMessageBytes: ByteArray): ByteArray
+    
+    /**
+     * Decrypt an EncryptedPacket to get the WrapperMessage
+     * @param cskHex Client Symmetric Key (hex)
+     * @param encryptedPacketBytes Serialized EncryptedPacket protobuf
+     * @return Serialized WrapperMessage protobuf bytes
+     */
+    external fun decryptEncryptedPacket(cskHex: String, encryptedPacketBytes: ByteArray): ByteArray
+    
+    /**
      * Generate temporal identifier for a given timestamp
      * @param cskHex Client Symmetric Key (hex)
      * @param timestampSeconds Unix timestamp in seconds
@@ -277,6 +314,27 @@ fun encryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, plaint
  */
 fun decryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, ciphertext: ByteArray): ByteArray {
     return TapAuthCrypto.decryptWithCsk(bytesToHex(csk), challenge, context, ciphertext)
+}
+
+/**
+ * Create a WrapperMessage containing an AuthenticationGrant
+ */
+fun createGrantWrapperMessage(signedChallenge: ByteArray): ByteArray {
+    return TapAuthCrypto.createGrantWrapperMessage(signedChallenge)
+}
+
+/**
+ * Create an EncryptedPacket from a WrapperMessage
+ */
+fun createEncryptedPacket(csk: ByteArray, wrapperMessage: ByteArray): ByteArray {
+    return TapAuthCrypto.createEncryptedPacket(bytesToHex(csk), wrapperMessage)
+}
+
+/**
+ * Decrypt an EncryptedPacket to get the WrapperMessage
+ */
+fun decryptEncryptedPacket(csk: ByteArray, encryptedPacket: ByteArray): ByteArray {
+    return TapAuthCrypto.decryptEncryptedPacket(bytesToHex(csk), encryptedPacket)
 }
 
 private fun hexToBytes(hex: String): ByteArray {

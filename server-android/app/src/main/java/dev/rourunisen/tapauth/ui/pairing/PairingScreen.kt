@@ -14,6 +14,7 @@ import dev.rourunisen.tapauth.network.PairingClient
 import dev.rourunisen.tapauth.network.PairingResult
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
     pairingUrl: PairingUrl,
@@ -58,7 +59,7 @@ fun PairingScreen(
     
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("Device Pairing") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {

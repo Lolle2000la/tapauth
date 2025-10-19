@@ -12,6 +12,7 @@ import android.content.Intent
 import dev.rourunisen.tapauth.service.AuthenticationService
 import dev.rourunisen.tapauth.ble.BleGattService
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     onStartScanning: () -> Unit,
@@ -24,7 +25,7 @@ fun HomeScreen(
     
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("TapAuth") }
             )
         }
@@ -56,7 +57,7 @@ fun HomeScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = if (isServiceRunning) "Port 8442" else "Stopped",
+                            text = if (isServiceRunning) "Port 36692" else "Stopped",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

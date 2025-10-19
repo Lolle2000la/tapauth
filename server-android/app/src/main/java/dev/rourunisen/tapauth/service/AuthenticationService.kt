@@ -26,11 +26,15 @@ class AuthenticationService : Service() {
     private var udpSocket: DatagramSocket? = null
     private var isRunning = false
     private lateinit var deviceRepository: DeviceRepository
+    private val replayMitigationCache = ReplayMitigationCache.getInstance()
+    private val retransmissionManager = RetransmissionManager.getInstance()
+    private val requestRateLimiter = RequestRateLimiter()
+    private lateinit var temporalIdCache: TemporalIdCache
+    private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
     
     companion object {
         private const val TAG = "AuthenticationService"
         private const val NOTIFICATION_ID = 1
-        private const val UDP_PORT = 8442 // Default UDP port for auth requests
         
         fun start(context: Context) {
             val intent = Intent(context, AuthenticationService::class.java)
@@ -50,6 +54,18 @@ class AuthenticationService : Service() {
     override fun onCreate() {
         super.onCreate()
         deviceRepository = DeviceRepository(this)
+        appConfig = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
+        temporalIdCache = TemporalIdCache(deviceRepository, serviceScope)
+        temporalIdCache.start()
+        
+        // Start periodic cleanup of rate limiter
+        serviceScope.launch {
+            while (isActive) {
+                delay(300_000)  // Every 5 minutes
+                requestRateLimiter.cleanup()
+            }
+        }
+        
         Log.d(TAG, "Authentication service created")
     }
     
@@ -68,6 +84,8 @@ class AuthenticationService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stopListening()
+        retransmissionManager.stopAll()
+        temporalIdCache.stop()
         serviceScope.cancel()
         Log.d(TAG, "Authentication service destroyed")
     }
@@ -75,8 +93,8 @@ class AuthenticationService : Service() {
     private fun startListening() {
         serviceScope.launch {
             try {
-                udpSocket = DatagramSocket(UDP_PORT)
-                Log.d(TAG, "Listening for auth requests on UDP port $UDP_PORT")
+                udpSocket = DatagramSocket(appConfig.udpPort)
+                Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
                 
                 val buffer = ByteArray(1024)
                 
@@ -93,7 +111,7 @@ class AuthenticationService : Service() {
                         
                         // Process authentication request
                         launch {
-                            handleAuthRequest(data, senderAddress, senderPort)
+                            handleIncomingPacket(data, senderAddress, senderPort)
                         }
                         
                     } catch (e: Exception) {
@@ -116,40 +134,300 @@ class AuthenticationService : Service() {
         Log.d(TAG, "Stopped listening")
     }
     
-    private suspend fun handleAuthRequest(
+    /**
+     * Handle incoming packet and route to appropriate handler based on message type
+     */
+    private suspend fun handleIncomingPacket(
         data: ByteArray,
         senderAddress: InetAddress,
         senderPort: Int
     ) {
         try {
-            Log.d(TAG, "Processing auth request (${data.size} bytes) from ${senderAddress.hostAddress}")
+            Log.d(TAG, "Processing packet (${data.size} bytes) from ${senderAddress.hostAddress}:$senderPort")
             
-            // Step 1: Parse the EncryptedPacket
-            // The data contains a protobuf-encoded EncryptedPacket
-            val encryptedPacket = try {
-                dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(data)
+            // Step 0: Pre-authentication DoS mitigation
+            // Extract temporal_identifier from EncryptedPacket and check against cache
+            // This avoids expensive decryption on invalid packets
+            if (data.size < 16) {
+                Log.w(TAG, "Packet too small, dropping")
+                return
+            }
+            
+            // EncryptedPacket has temporal_identifier as first field (16 bytes)
+            // We need to parse the protobuf to extract it properly
+            val temporalId = try {
+                extractTemporalIdFromPacket(data)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse auth request", e)
+                Log.w(TAG, "Failed to extract temporal ID", e)
                 return
             }
             
-            Log.d(TAG, "Parsed auth request: username=${encryptedPacket.username}, hostname=${encryptedPacket.hostname}")
-            
-            // Step 2: Find the paired device by checking temporal identifier
-            // TODO: For now, we'll just get all devices and try each one
-            val pairedDevices = deviceRepository.getAllPairedDevices()
-            
-            if (pairedDevices.isEmpty()) {
-                Log.w(TAG, "No paired devices found, ignoring request")
+            if (temporalId == null) {
+                Log.w(TAG, "No temporal ID in packet, dropping")
                 return
             }
             
-            Log.d(TAG, "Checking ${pairedDevices.size} paired device(s)")
+            // Check temporal ID cache (O(1) lookup)
+            val (isValid, deviceId) = temporalIdCache.isValidTemporalId(temporalId)
+            if (!isValid) {
+                Log.w(TAG, "Invalid temporal ID, silently dropping packet (DoS mitigation)")
+                return
+            }
             
-            // Step 3: Verify signature
+            Log.d(TAG, "Temporal ID valid for device: $deviceId")
+            
+            // Now we know it's from a paired device, proceed with full decryption
+            // and message routing
+            
+            // Get the device
+            val device = deviceRepository.getPairedDevice(deviceId!!)
+            if (device == null) {
+                Log.w(TAG, "Device not found: $deviceId")
+                return
+            }
+            
+            // Decrypt the EncryptedPacket to get WrapperMessage
+            val wrapperMessage = try {
+                dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(
+                    device.csk,
+                    data
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decrypt packet", e)
+                return
+            }
+            
+            // Parse WrapperMessage to determine message type
+            // The WrapperMessage has a oneof field for different message types
+            val messageType = try {
+                determineMessageType(wrapperMessage)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to determine message type", e)
+                return
+            }
+            
+            Log.d(TAG, "Message type: $messageType")
+            
+            // Route to appropriate handler
+            when (messageType) {
+                MessageType.AUTH_REQUEST -> {
+                    handleAuthRequest(wrapperMessage, device, senderAddress, senderPort)
+                }
+                MessageType.GRANT_CONFIRMATION -> {
+                    handleGrantConfirmation(wrapperMessage, device)
+                }
+                MessageType.AUTH_CANCEL -> {
+                    handleAuthCancel(wrapperMessage, device)
+                }
+                else -> {
+                    Log.w(TAG, "Unknown message type, ignoring")
+                }
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to handle incoming packet", e)
+        }
+    }
+    
+    private enum class MessageType {
+        AUTH_REQUEST,
+        GRANT_CONFIRMATION,
+        AUTH_CANCEL,
+        UNKNOWN
+    }
+    
+    private fun extractTemporalIdFromPacket(data: ByteArray): ByteArray? {
+        // Parse the EncryptedPacket protobuf to extract temporal_identifier
+        // Field 1 is temporal_identifier (bytes)
+        // Protobuf wire format: tag (varint) + length (varint) + data
+        
+        try {
+            var pos = 0
+            
+            // Read field tag
+            if (pos >= data.size) return null
+            val tag = data[pos].toInt() and 0xFF
+            pos++
+            
+            // Field 1, type 2 (length-delimited) = 0x0A
+            if (tag != 0x0A) {
+                Log.w(TAG, "Unexpected tag: 0x${tag.toString(16)}, expected 0x0A")
+                return null
+            }
+            
+            // Read length
+            if (pos >= data.size) return null
+            val length = data[pos].toInt() and 0xFF
+            pos++
+            
+            if (length != 16) {
+                Log.w(TAG, "Unexpected temporal ID length: $length, expected 16")
+                return null
+            }
+            
+            // Read temporal ID
+            if (pos + 16 > data.size) return null
+            return data.copyOfRange(pos, pos + 16)
+            
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse temporal ID from packet", e)
+            return null
+        }
+    }
+    
+    private fun determineMessageType(wrapperMessage: ByteArray): MessageType {
+        // Parse WrapperMessage protobuf
+        // The oneof field numbers are:
+        // 1 = AuthenticationRequest
+        // 2 = AuthenticationGrant
+        // 3 = GrantConfirmation
+        // 4 = AuthenticationCancel
+        
+        try {
+            var pos = 0
+            
+            while (pos < wrapperMessage.size) {
+                // Read field tag
+                val tag = wrapperMessage[pos].toInt() and 0xFF
+                pos++
+                
+                val fieldNumber = tag shr 3
+                
+                when (fieldNumber) {
+                    1 -> return MessageType.AUTH_REQUEST
+                    3 -> return MessageType.GRANT_CONFIRMATION
+                    4 -> return MessageType.AUTH_CANCEL
+                    else -> {
+                        // Skip this field
+                        // This is a simplified parser, just checking field presence
+                        break
+                    }
+                }
+            }
+            
+            return MessageType.UNKNOWN
+            
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to determine message type", e)
+            return MessageType.UNKNOWN
+        }
+    }
+    
+    private fun ByteArray.toHex(): String {
+        return joinToString("") { "%02x".format(it) }
+    }
+    
+    private suspend fun handleGrantConfirmation(
+        wrapperMessage: ByteArray,
+        device: dev.rourunisen.tapauth.data.PairedDevice
+    ) {
+        try {
+            Log.d(TAG, "Handling GrantConfirmation from device: ${device.displayName}")
+            
+            // Parse the confirmation
+            val confirmation = try {
+                dev.rourunisen.tapauth.protocol.ProtobufParser.parseGrantConfirmation(wrapperMessage)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse GrantConfirmation", e)
+                return
+            }
+            
+            Log.d(TAG, "GrantConfirmation received for challenge: ${confirmation.challenge}")
+            
+            // Decode Base64 challenge to ByteArray for retransmission manager
+            val challengeBytes = android.util.Base64.decode(confirmation.challenge, android.util.Base64.NO_WRAP)
+            
+            // Stop retransmission for this challenge
+            retransmissionManager.stopRetransmission(challengeBytes)
+            
+            // Reset rate limiter for this device
+            requestRateLimiter.resetClient(device.publicKey.toHex())
+            
+            Log.d(TAG, "Stopped retransmission and reset rate limiter for device: ${device.displayName}")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to handle GrantConfirmation", e)
+        }
+    }
+    
+    private suspend fun handleAuthCancel(
+        wrapperMessage: ByteArray,
+        device: dev.rourunisen.tapauth.data.PairedDevice
+    ) {
+        try {
+            Log.d(TAG, "Handling AuthenticationCancel from device: ${device.displayName}")
+            
+            // Parse the cancel message
+            val cancel = try {
+                dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(wrapperMessage)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse AuthenticationCancel", e)
+                return
+            }
+            
+            Log.d(TAG, "AuthenticationCancel received for challenge: ${cancel.challenge}")
+            
+            // Decode Base64 challenge to ByteArray for retransmission manager
+            val challengeBytes = android.util.Base64.decode(cancel.challenge, android.util.Base64.NO_WRAP)
+            
+            // Stop retransmission for this challenge
+            retransmissionManager.stopRetransmission(challengeBytes)
+            
+            // Reset rate limiter for this device
+            requestRateLimiter.resetClient(device.publicKey.toHex())
+            
+            // Note: We don't automatically dismiss the auth request UI here
+            // because the user may still want to see and approve it.
+            // The timeout will handle cleanup if needed.
+            
+            Log.d(TAG, "Stopped retransmission and reset rate limiter for device: ${device.displayName}")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to handle AuthenticationCancel", e)
+        }
+    }
+    
+    private suspend fun handleAuthRequest(
+        wrapperMessage: ByteArray,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+        senderAddress: InetAddress,
+        senderPort: Int
+    ) {
+        try {
+            Log.d(TAG, "Handling AuthenticationRequest from device: ${device.displayName}")
+            
+            // Post-authentication rate limiting
+            // Check if we should accept this request from this device
+            if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex())) {
+                Log.w(TAG, "Rate limiting auth request from device: ${device.displayName}")
+                return
+            }
+    
+            // Parse the AuthenticationRequest from WrapperMessage
+            val authRequest = try {
+                dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(wrapperMessage)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse AuthenticationRequest", e)
+                return
+            }
+            
+            Log.d(TAG, "Parsed auth request: username=${authRequest.username}, hostname=${authRequest.hostname}")
+            
+            // Decode Base64 strings to ByteArrays
+            val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
+            val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
+            
+            // Replay attack mitigation
+            // Check for replayed challenges and stale timestamps
+            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
+                Log.w(TAG, "Replay attack detected, rejecting request")
+                return
+            }
+            
+            // Verify signature
             // Reconstruct the message with signature field empty
             val gson = com.google.gson.Gson()
-            val requestJson = gson.toJson(encryptedPacket)
+            val requestJson = gson.toJson(authRequest)
             val messageForVerification = try {
                 dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(requestJson)
             } catch (e: Exception) {
@@ -157,84 +435,76 @@ class AuthenticationService : Service() {
                 return
             }
             
-            // Try to verify signature against each paired device
-            var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
-            for (device in pairedDevices) {
-                try {
-                    val isValid = dev.rourunisen.tapauth.crypto.verifySignature(
-                        device.publicKey,
-                        messageForVerification,
-                        encryptedPacket.signature
-                    )
-                    if (isValid) {
-                        matchedDevice = device
-                        Log.d(TAG, "Signature verified for device: ${device.name} (${device.deviceId})")
-                        break
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to verify signature for device ${device.deviceId}", e)
-                }
-            }
+            val isValid = dev.rourunisen.tapauth.crypto.verifySignature(
+                device.publicKey,
+                messageForVerification,
+                signatureBytes
+            )
             
-            if (matchedDevice == null) {
-                Log.w(TAG, "Signature verification failed for all devices, rejecting request")
+            if (!isValid) {
+                Log.w(TAG, "Signature verification failed for device ${device.deviceId}, rejecting request")
                 return
             }
             
-            // Step 4: Request biometric authentication via AuthRequestManager
+            Log.d(TAG, "Signature verified for device: ${device.displayName} (${device.deviceId})")
+            
+            // Step 5: Request biometric authentication via AuthRequestManager
             val authRequestManager = AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
                 context = this,
-                deviceId = matchedDevice.deviceId,
-                deviceName = matchedDevice.name,
-                username = encryptedPacket.username,
-                hostname = encryptedPacket.hostname,
-                challenge = encryptedPacket.challenge,
-                timestamp = encryptedPacket.timestamp,
+                deviceId = device.deviceId,
+                deviceName = device.displayName,
+                username = authRequest.username,
+                hostname = authRequest.hostname,
+                challenge = challengeBytes,
+                timestamp = authRequest.timestampUnixSeconds * 1000,
                 transportType = dev.rourunisen.tapauth.data.TransportType.UDP
             ) { approved, signedChallenge ->
-                // Step 5: Create and send authentication grant
+                // Step 6: Create and send authentication grant
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "Auth request approved, creating encrypted grant")
                     try {
-                        // Create AuthenticationGrant protobuf
-                        val grantBytes = dev.rourunisen.tapauth.crypto.TapAuthCrypto.createAuthGrant(signedChallenge)
+                        // Create WrapperMessage containing AuthenticationGrant
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(signedChallenge)
                         
-                        // Encrypt the grant with the client's CSK
-                        val encryptedGrant = dev.rourunisen.tapauth.crypto.encryptWithCsk(
-                            matchedDevice.csk,
-                            encryptedPacket.challenge,
-                            "auth_grant",
-                            grantBytes
+                        // Create proper EncryptedPacket per specification
+                        val encryptedPacketBytes = dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            device.csk,
+                            wrapperMessage
                         )
                         
-                        // Generate temporal ID for the response
-                        val temporalId = dev.rourunisen.tapauth.crypto.generateTemporalId(matchedDevice.csk)
-                        
-                        // Create EncryptedPacket wrapper
-                        // TODO: Use proper protobuf serialization for EncryptedPacket
-                        // For now, prepend temporal ID to encrypted data
-                        val temporalIdBytes = dev.rourunisen.tapauth.crypto.TapAuthCrypto.run {
-                            val hex = temporalId
-                            hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                        }
-                        
-                        val response = temporalIdBytes + encryptedGrant
-                        
+                        // Send initial response
                         val responsePacket = DatagramPacket(
-                            response,
-                            response.size,
+                            encryptedPacketBytes,
+                            encryptedPacketBytes.size,
                             senderAddress,
                             senderPort
                         )
                         udpSocket?.send(responsePacket)
-                        Log.d(TAG, "Sent encrypted auth grant to ${senderAddress.hostAddress}:$senderPort (${response.size} bytes)")
+                        Log.d(TAG, "Sent encrypted auth grant to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)")
+                        
+                        // Start retransmission (500ms fixed interval per spec)
+                        udpSocket?.let { socket ->
+                            retransmissionManager.startUdpRetransmission(
+                                serviceScope,
+                                RetransmissionManager.UdpRetransmissionRequest(
+                                    challenge = challengeBytes,
+                                    responseData = encryptedPacketBytes,
+                                    socket = socket,
+                                    destinationAddress = senderAddress,
+                                    destinationPort = senderPort
+                                )
+                            )
+                        }
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send auth grant", e)
                     }
                 } else {
                     Log.d(TAG, "Auth request denied or timed out")
-                    // Optionally send a denial message
+                    // Reset rate limiter since request was resolved
+                    requestRateLimiter.resetClient(device.publicKey.toHex())
+                    // TODO: Send denial message with retransmission
+                    // For now, we just don't respond (client will timeout)
                 }
             }
             

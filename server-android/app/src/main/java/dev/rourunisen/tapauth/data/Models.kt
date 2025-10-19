@@ -68,11 +68,3 @@ data class PairedDevice(
     }
 }
 
-/**
- * Authentication request from a device
- */
-data class AuthRequest(
-    val deviceId: String,
-    val timestamp: Long,
-    val challenge: ByteArray
-)

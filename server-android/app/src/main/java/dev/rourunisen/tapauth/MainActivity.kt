@@ -7,7 +7,7 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.biometric.BiometricManager
@@ -24,7 +24,7 @@ import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
 import dev.rourunisen.tapauth.data.PairingUrl
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     
     private lateinit var biometricPrompt: BiometricPrompt
     private lateinit var authRequestReceiver: BroadcastReceiver

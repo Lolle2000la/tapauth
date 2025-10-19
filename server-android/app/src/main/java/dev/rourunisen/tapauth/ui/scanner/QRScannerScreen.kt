@@ -23,7 +23,7 @@ import com.google.accompanist.permissions.rememberPermissionState
 import dev.rourunisen.tapauth.data.PairingUrl
 import java.util.concurrent.Executors
 
-@OptIn(ExperimentalPermissionsApi::class)
+@OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun QRScannerScreen(
     onQRCodeScanned: (PairingUrl) -> Unit,
@@ -39,7 +39,7 @@ fun QRScannerScreen(
     
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("Scan QR Code") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
