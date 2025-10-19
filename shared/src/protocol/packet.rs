@@ -1,7 +1,8 @@
 use prost::Message as ProstMessage;
 
 use crate::crypto::{
-    encrypt_with_csk, decrypt_with_csk, generate_current_temporal_identifier,
+    encrypt_with_csk, decrypt_with_csk, encrypt_with_csk_static_nonce, 
+    decrypt_with_csk_static_nonce, generate_current_temporal_identifier,
     ClientSymmetricKey,
 };
 use crate::protocol::pb::*;
@@ -31,6 +32,30 @@ pub fn create_encrypted_packet(
     })
 }
 
+/// Encrypt and package a WrapperMessage into an EncryptedPacket using CSK-derived nonce
+/// This is used for authentication messages where the challenge is inside the encrypted
+/// payload and cannot be used for nonce derivation (chicken-egg problem).
+pub fn create_encrypted_packet_with_csk_nonce(
+    csk: &ClientSymmetricKey,
+    wrapper: &WrapperMessage,
+) -> Result<EncryptedPacket, ProtocolError> {
+    // Generate temporal identifier
+    let temporal_identifier = generate_current_temporal_identifier(csk)?
+        .to_vec();
+
+    // Serialize the wrapper message
+    let plaintext = wrapper.encode_to_vec();
+
+    // Encrypt with CSK using static nonce (derived from CSK only)
+    let ciphertext = encrypt_with_csk_static_nonce(csk, &plaintext)?;
+
+    Ok(EncryptedPacket {
+        temporal_identifier,
+        encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+        ciphertext,
+    })
+}
+
 /// Decrypt an EncryptedPacket and extract the WrapperMessage
 pub fn decrypt_encrypted_packet(
     csk: &ClientSymmetricKey,
@@ -40,6 +65,22 @@ pub fn decrypt_encrypted_packet(
 ) -> Result<WrapperMessage, ProtocolError> {
     // Decrypt the ciphertext
     let plaintext = decrypt_with_csk(csk, challenge, context, &packet.ciphertext)?;
+
+    // Deserialize the wrapper message
+    let wrapper = WrapperMessage::decode(&plaintext[..])?;
+
+    Ok(wrapper)
+}
+
+/// Decrypt an EncryptedPacket using CSK-derived nonce and extract the WrapperMessage
+/// This is used for authentication messages where the challenge is inside the encrypted
+/// payload and cannot be used for nonce derivation.
+pub fn decrypt_encrypted_packet_with_csk_nonce(
+    csk: &ClientSymmetricKey,
+    packet: &EncryptedPacket,
+) -> Result<WrapperMessage, ProtocolError> {
+    // Decrypt the ciphertext using static nonce (derived from CSK only)
+    let plaintext = decrypt_with_csk_static_nonce(csk, &packet.ciphertext)?;
 
     // Deserialize the wrapper message
     let wrapper = WrapperMessage::decode(&plaintext[..])?;

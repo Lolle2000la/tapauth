@@ -76,6 +76,38 @@ pub fn decrypt_with_csk(
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
 
+/// Encrypt with CSK using static nonce (derived from CSK only)
+/// This is used for authentication messages where the challenge is inside
+/// the encrypted payload and cannot be used for nonce derivation.
+pub fn encrypt_with_csk_static_nonce(
+    csk: &ClientSymmetricKey,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    // Derive nonce from CSK itself (same as Android server)
+    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    let mut nonce = [0u8; 12];
+    hk.expand(b"encrypted_packet_nonce", &mut nonce)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+
+    encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])
+}
+
+/// Decrypt with CSK using static nonce (derived from CSK only)
+/// This is used for authentication messages where the challenge is inside
+/// the encrypted payload and cannot be used for nonce derivation.
+pub fn decrypt_with_csk_static_nonce(
+    csk: &ClientSymmetricKey,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    // Derive nonce from CSK itself (same as Android server)
+    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    let mut nonce = [0u8; 12];
+    hk.expand(b"encrypted_packet_nonce", &mut nonce)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+
+    decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
+}
+
 /// Encrypt with PSK using derived nonce
 pub fn encrypt_with_psk(
     psk: &PairingSymmetricKey,

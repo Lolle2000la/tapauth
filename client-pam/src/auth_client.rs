@@ -88,8 +88,11 @@ impl AuthenticationClient {
         let wrapper = wrap_auth_request(request);
 
         // Create encrypted packet
+        // Note: For authentication, we use a static nonce derived from CSK only,
+        // since the challenge is INSIDE the encrypted message and can't be used
+        // to derive the decryption nonce (chicken-egg problem).
         let packet =
-            create_encrypted_packet(&self.csk, &self.challenge, b"auth_request", &wrapper)?;
+            create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Start parallel discovery: UDP + BLE
         let udp_result = self.try_udp_authentication(&packet).await;

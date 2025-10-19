@@ -625,20 +625,43 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
         }
     };
 
-    // Parse AuthenticationRequest
-    let auth_request = match pb::AuthenticationRequest::decode(&data[..]) {
-        Ok(req) => req,
+    // First decode as WrapperMessage
+    let wrapper = match pb::WrapperMessage::decode(&data[..]) {
+        Ok(w) => w,
         Err(err) => {
             let _ = env.throw_new(
                 "java/io/IOException",
-                format!("failed to parse request: {err}"),
+                format!("failed to decode Protobuf message: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    // Serialize to JSON for easy parsing in Kotlin
-    let json_result = match serde_json::to_string(&auth_request) {
+    // Extract AuthenticationRequest from WrapperMessage
+    let auth_request = match wrapper.payload {
+        Some(pb::wrapper_message::Payload::AuthRequest(req)) => req,
+        _ => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                "WrapperMessage does not contain AuthenticationRequest",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Manually create JSON with base64-encoded byte fields
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    
+    let json_result = serde_json::json!({
+        "challenge": BASE64.encode(&auth_request.challenge),
+        "username": auth_request.username,
+        "hostname": auth_request.hostname,
+        "timestamp_unix_seconds": auth_request.timestamp_unix_seconds,
+        "signature_algorithm": auth_request.signature_algorithm,
+        "signature": BASE64.encode(&auth_request.signature),
+    });
+    
+    let json_string = match serde_json::to_string(&json_result) {
         Ok(json) => json,
         Err(err) => {
             let _ = env.throw_new(
@@ -649,7 +672,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
         }
     };
 
-    match env.new_string(json_result) {
+    match env.new_string(json_string) {
         Ok(output) => output.into_raw(),
         Err(err) => {
             let _ = env.throw_new(
@@ -1287,6 +1310,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
     request_json: JString,
 ) -> jbyteArray {
     use crate::protocol::pb;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use prost::Message;
 
     // Parse JSON back to AuthenticationRequest
@@ -1301,8 +1325,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
         }
     };
 
-    let mut auth_request: pb::AuthenticationRequest = match serde_json::from_str(&json_str) {
-        Ok(req) => req,
+    // Parse JSON manually because it has base64-encoded byte fields
+    let json_value: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(val) => val,
         Err(err) => {
             let _ = env.throw_new(
                 "java/io/IOException",
@@ -1312,8 +1337,33 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
         }
     };
 
-    // Clear the signature field (set to empty for verification)
-    auth_request.signature = vec![];
+    // Extract and decode fields
+    let challenge_b64 = json_value["challenge"].as_str().unwrap_or("");
+    let challenge = match BASE64.decode(challenge_b64) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to decode challenge: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let username = json_value["username"].as_str().unwrap_or("").to_string();
+    let hostname = json_value["hostname"].as_str().unwrap_or("").to_string();
+    let timestamp = json_value["timestamp_unix_seconds"].as_u64().unwrap_or(0);
+    let sig_algorithm = json_value["signature_algorithm"].as_i64().unwrap_or(0) as i32;
+
+    // Create AuthenticationRequest with empty signature
+    let auth_request = pb::AuthenticationRequest {
+        challenge,
+        username,
+        hostname,
+        timestamp_unix_seconds: timestamp,
+        signature_algorithm: sig_algorithm,
+        signature: vec![], // Empty for verification
+    };
 
     // Serialize to protobuf
     let mut buf = Vec::new();
@@ -1367,20 +1417,40 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
         }
     };
 
-    // Decode the protobuf GrantConfirmation
-    let confirmation = match pb::GrantConfirmation::decode(&bytes[..]) {
-        Ok(conf) => conf,
+    // First decode as WrapperMessage
+    let wrapper = match pb::WrapperMessage::decode(&bytes[..]) {
+        Ok(w) => w,
         Err(err) => {
             let _ = env.throw_new(
                 "java/io/IOException",
-                format!("failed to parse GrantConfirmation protobuf: {err}"),
+                format!("failed to decode Protobuf message: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    // Convert to JSON
-    let json_str = match serde_json::to_string(&confirmation) {
+    // Extract GrantConfirmation from WrapperMessage
+    let confirmation = match wrapper.payload {
+        Some(pb::wrapper_message::Payload::GrantConfirmation(conf)) => conf,
+        _ => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                "WrapperMessage does not contain GrantConfirmation",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Manually create JSON with base64-encoded byte fields
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    
+    let json_result = serde_json::json!({
+        "challenge": BASE64.encode(&confirmation.challenge),
+        "signature_algorithm": confirmation.signature_algorithm,
+        "signature": BASE64.encode(&confirmation.signature),
+    });
+
+    let json_str = match serde_json::to_string(&json_result) {
         Ok(s) => s,
         Err(err) => {
             let _ = env.throw_new(
@@ -1433,20 +1503,40 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
         }
     };
 
-    // Decode the protobuf AuthenticationCancel
-    let cancel = match pb::AuthenticationCancel::decode(&bytes[..]) {
-        Ok(c) => c,
+    // First decode as WrapperMessage
+    let wrapper = match pb::WrapperMessage::decode(&bytes[..]) {
+        Ok(w) => w,
         Err(err) => {
             let _ = env.throw_new(
                 "java/io/IOException",
-                format!("failed to parse AuthenticationCancel protobuf: {err}"),
+                format!("failed to decode Protobuf message: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    // Convert to JSON
-    let json_str = match serde_json::to_string(&cancel) {
+    // Extract AuthenticationCancel from WrapperMessage
+    let cancel = match wrapper.payload {
+        Some(pb::wrapper_message::Payload::AuthCancel(c)) => c,
+        _ => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                "WrapperMessage does not contain AuthenticationCancel",
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Manually create JSON with base64-encoded byte fields
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    
+    let json_result = serde_json::json!({
+        "challenge": BASE64.encode(&cancel.challenge),
+        "signature_algorithm": cancel.signature_algorithm,
+        "signature": BASE64.encode(&cancel.signature),
+    });
+
+    let json_str = match serde_json::to_string(&json_result) {
         Ok(s) => s,
         Err(err) => {
             let _ = env.throw_new(
