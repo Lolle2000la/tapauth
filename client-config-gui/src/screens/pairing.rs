@@ -67,7 +67,9 @@ impl PairingScreen {
                     };
 
                     // Extract port from URL to start connection waiter
-                    if let Some(port_str) = data.split("&p=").nth(1).and_then(|s| s.split('&').next()) {
+                    if let Some(port_str) =
+                        data.split("&p=").nth(1).and_then(|s| s.split('&').next())
+                    {
                         if let Ok(port) = port_str.parse::<u16>() {
                             // Start waiting for connection in background
                             return Task::perform(

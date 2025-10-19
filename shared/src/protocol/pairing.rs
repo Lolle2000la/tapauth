@@ -130,10 +130,7 @@ impl ClientPairingSession {
         Ok(hello)
     }
 
-    async fn send_pairing_response(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<(), ProtocolError> {
+    async fn send_pairing_response(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
         let response = PairingResponse {
             version: PAIRING_VERSION,
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
@@ -179,10 +176,7 @@ impl ClientPairingSession {
         Ok(ClientSymmetricKey::from_bytes(csk_bytes))
     }
 
-    async fn send_pairing_complete(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<(), ProtocolError> {
+    async fn send_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
         let complete = PairingComplete { success: true };
 
         let buf = complete.encode_to_vec();
@@ -266,10 +260,7 @@ impl ServerPairingSession {
         Ok((client_ed25519_public, sas))
     }
 
-    async fn send_pairing_hello(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<(), ProtocolError> {
+    async fn send_pairing_hello(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
         let hello = PairingHello {
             version: PAIRING_VERSION,
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
@@ -311,11 +302,8 @@ impl ServerPairingSession {
         csk: &ClientSymmetricKey,
     ) -> Result<(), ProtocolError> {
         // Encrypt CSK with PSK
-        let encrypted_csk = encrypt_with_psk(
-            self.psk.as_ref().unwrap(),
-            b"csk_exchange",
-            csk.as_bytes(),
-        )?;
+        let encrypted_csk =
+            encrypt_with_psk(self.psk.as_ref().unwrap(), b"csk_exchange", csk.as_bytes())?;
 
         let message = PairingCskMessage { encrypted_csk };
 
@@ -327,10 +315,7 @@ impl ServerPairingSession {
         Ok(())
     }
 
-    async fn receive_pairing_complete(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<(), ProtocolError> {
+    async fn receive_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
         let len = stream.read_u32().await?;
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(ProtocolError::InvalidMessageFormat);

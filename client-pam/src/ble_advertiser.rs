@@ -49,7 +49,7 @@
 use std::time::Duration;
 
 #[cfg(feature = "ble")]
-use bluer::{Adapter, AdapterEvent, Address, Device, gatt::remote::Characteristic};
+use bluer::{gatt::remote::Characteristic, Adapter, AdapterEvent, Address, Device};
 
 #[cfg(feature = "ble")]
 use tokio::time::timeout;
@@ -175,7 +175,9 @@ impl BleAdvertiser {
         &self,
         device_address: Address,
     ) -> Result<BleGattConnection, BleError> {
-        use shared::models::ble::{CLIENT_COMMAND_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID, SERVICE_UUID};
+        use shared::models::ble::{
+            CLIENT_COMMAND_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID, SERVICE_UUID,
+        };
 
         let device = self.adapter.device(device_address)?;
 
@@ -196,9 +198,10 @@ impl BleAdvertiser {
         }
 
         // Find the TapAuth service
-        let service_uuid = SERVICE_UUID.parse::<bluer::Uuid>()
+        let service_uuid = SERVICE_UUID
+            .parse::<bluer::Uuid>()
             .map_err(|_| BleError::ServiceNotFound)?;
-        
+
         let services = device.services().await?;
         let mut service = None;
         for s in services.iter() {
@@ -210,16 +213,18 @@ impl BleAdvertiser {
         let service = service.ok_or(BleError::ServiceNotFound)?;
 
         // Find the characteristics
-        let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID.parse::<bluer::Uuid>()
+        let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID
+            .parse::<bluer::Uuid>()
             .map_err(|_| BleError::CharacteristicNotFound)?;
-        let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID.parse::<bluer::Uuid>()
+        let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID
+            .parse::<bluer::Uuid>()
             .map_err(|_| BleError::CharacteristicNotFound)?;
 
         let characteristics = service.characteristics().await?;
-        
+
         let mut client_command_char = None;
         let mut server_response_char = None;
-        
+
         for c in characteristics.iter() {
             let uuid = c.uuid().await?;
             if uuid == client_cmd_uuid {
@@ -260,7 +265,8 @@ impl BleGattConnection {
         use futures_util::StreamExt;
 
         // Enable notifications
-        let notify_stream = self.server_response_char
+        let notify_stream = self
+            .server_response_char
             .notify()
             .await
             .map_err(|_| BleError::NotificationFailed)?;
@@ -318,10 +324,7 @@ impl BleAdvertiser {
     }
 
     /// Connect to a BLE device and discover GATT characteristics (stub when BLE is disabled)
-    pub async fn connect_gatt(
-        &self,
-        _device_address: (),
-    ) -> Result<BleGattConnection, BleError> {
+    pub async fn connect_gatt(&self, _device_address: ()) -> Result<BleGattConnection, BleError> {
         Err(BleError::NotCompiled)
     }
 }

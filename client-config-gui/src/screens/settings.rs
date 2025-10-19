@@ -1,7 +1,7 @@
 use super::ScreenMessage;
 use iced::{
     widget::{button, column, container, text, text_input, Space},
-    Task, Element, Length,
+    Element, Length, Task,
 };
 use shared::config::{ClientConfig, ClientConfigManager};
 
@@ -19,7 +19,7 @@ impl SettingsScreen {
     pub fn new() -> Self {
         let config_manager = ClientConfigManager::new();
         let config = config_manager.load_config().unwrap_or_default();
-        
+
         Self {
             rotating_csk: false,
             error: None,
@@ -36,18 +36,16 @@ impl SettingsScreen {
                 self.rotating_csk = true;
                 self.error = None;
                 self.success = None;
-                Task::perform(
-                    Self::rotate_csk(),
-                    |result| match result {
-                        Ok(_) => ScreenMessage::CSKRotated,
-                        Err(e) => ScreenMessage::CSKRotationFailed(e),
-                    }
-                )
+                Task::perform(Self::rotate_csk(), |result| match result {
+                    Ok(_) => ScreenMessage::CSKRotated,
+                    Err(e) => ScreenMessage::CSKRotationFailed(e),
+                })
             }
             ScreenMessage::CSKRotated => {
                 self.rotating_csk = false;
                 self.error = None;
-                self.success = Some("CSK rotated successfully. All pairings have been cleared.".to_string());
+                self.success =
+                    Some("CSK rotated successfully. All pairings have been cleared.".to_string());
                 Task::none()
             }
             ScreenMessage::CSKRotationFailed(error) => {
@@ -72,13 +70,10 @@ impl SettingsScreen {
                 self.error = None;
                 self.success = None;
                 let config = self.config.clone();
-                Task::perform(
-                    Self::save_config(config),
-                    |result| match result {
-                        Ok(_) => ScreenMessage::ConfigSaved,
-                        Err(e) => ScreenMessage::ConfigSaveFailed(e),
-                    }
-                )
+                Task::perform(Self::save_config(config), |result| match result {
+                    Ok(_) => ScreenMessage::ConfigSaved,
+                    Err(e) => ScreenMessage::ConfigSaveFailed(e),
+                })
             }
             ScreenMessage::ConfigSaved => {
                 self.error = None;
@@ -103,19 +98,19 @@ impl SettingsScreen {
 
         // Configuration section
         let config_title = text("Configuration").size(24);
-        
+
         let hostname_label = text("Hostname:").size(16);
         let hostname_input = text_input("Enter hostname", &self.hostname_input)
             .on_input(ScreenMessage::HostnameChanged)
             .padding(10)
             .width(Length::Fixed(400.0));
-        
+
         let udp_port_label = text("UDP Port:").size(16);
         let udp_port_input = text_input("Enter UDP port (default: 36692)", &self.udp_port_input)
             .on_input(ScreenMessage::UdpPortChanged)
             .padding(10)
             .width(Length::Fixed(400.0));
-        
+
         let save_button = button(text("Save Configuration").size(16))
             .padding(15)
             .width(Length::Fixed(400.0))
@@ -123,7 +118,7 @@ impl SettingsScreen {
 
         // Security section
         let security_title = text("Security").size(24);
-        
+
         let rotate_button = if self.rotating_csk {
             button(text("Rotating...").size(16))
                 .padding(15)
@@ -186,14 +181,16 @@ impl SettingsScreen {
     async fn save_config(config: ClientConfig) -> Result<(), String> {
         let config_manager = ClientConfigManager::new();
 
-        config_manager.save_config(&config)
+        config_manager
+            .save_config(&config)
             .map_err(|e| format!("Failed to save configuration: {}", e))
     }
 
     async fn rotate_csk() -> Result<(), String> {
         let config = ClientConfigManager::new();
 
-        config.rotate_csk()
+        config
+            .rotate_csk()
             .map(|_| ()) // Discard the returned CSK, we just need success
             .map_err(|e| format!("Failed to rotate CSK: {}", e))
     }

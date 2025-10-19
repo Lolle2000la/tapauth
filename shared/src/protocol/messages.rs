@@ -240,11 +240,7 @@ pub fn verify_auth_cancel(
     unsigned_cancel.signature = Vec::new();
     let data_to_verify = unsigned_cancel.encode_to_vec();
 
-    verify_ed25519(
-        client_public_key,
-        &data_to_verify,
-        &cancel.signature,
-    )?;
+    verify_ed25519(client_public_key, &data_to_verify, &cancel.signature)?;
     Ok(())
 }
 
