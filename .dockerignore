@@ -1,0 +1,66 @@
+# Docker ignore file for TapAuth development
+# Excludes files that don't need to be copied into the Docker image
+
+# Build artifacts
+target/
+**/target/
+*.so
+*.a
+*.rlib
+
+# Cargo lock files (will be regenerated)
+Cargo.lock
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git files
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (except what's needed for build)
+*.md
+!BUILD*.md
+docs/
+
+# Test files
+**/test/
+**/*_test.rs
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Android build artifacts
+server-android/app/build/
+server-android/app/.cxx/
+server-android/.gradle/
+server-android/local.properties
+*.apk
+*.ap_
+*.dex
+*.class
+
+# Development scripts (not needed in container)
+dev-*.sh
+docker-compose*.yml
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+
+# Backup files
+*.backup
+*.bak
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class

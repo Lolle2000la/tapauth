@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  tapauth-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: tapauth-dev
+    hostname: tapauth-dev
+
+    # Privileged mode required for:
+    # - Bluetooth access
+    # - PAM testing
+    # - Network configuration
+    privileged: true
+
+    # Network configuration
+    network_mode: "host"
+
+    # X11 forwarding for GUI
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - XDG_RUNTIME_DIR=/tmp/runtime-root
+      - DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+    volumes:
+      # X11 socket for GUI
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+      # D-Bus socket for Bluetooth
+      - /var/run/dbus:/var/run/dbus:rw
+
+      # Bluetooth device access
+      - /sys/class/bluetooth:/sys/class/bluetooth:ro
+
+      # Source code (for live development)
+      - ./:/tapauth:rw
+
+      # Preserve Rust build cache
+      - tapauth-cargo-cache:/root/.cargo
+      - tapauth-target-cache:/tapauth/target
+
+      # Preserve configuration between restarts
+      - tapauth-config:/etc/tapauth
+
+    # Device access for Bluetooth
+    devices:
+      # Bluetooth HCI devices (if available)
+      - /dev/bus/usb:/dev/bus/usb
+
+    # Keep container running
+    stdin_open: true
+    tty: true
+
+    # Restart policy
+    restart: unless-stopped
+
+volumes:
+  # Named volumes for caching
+  tapauth-cargo-cache:
+    driver: local
+  tapauth-target-cache:
+    driver: local
+  tapauth-config:
+    driver: local

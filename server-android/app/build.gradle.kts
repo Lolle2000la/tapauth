@@ -29,6 +29,14 @@ android {
                 "proguard-rules.pro"
             )
         }
+        debug {
+            // Use different application ID suffix for debug builds
+            // This allows side-by-side installation with release builds
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            
+            resValue("string", "app_name", "TapAuth (Debug)")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
