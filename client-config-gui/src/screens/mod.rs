@@ -65,11 +65,12 @@ impl Screen {
             }
             ScreenMessage::NavigateToPairing => {
                 *self = Screen::Pairing(PairingScreen::new());
-                Task::none()
+                // Automatically trigger pairing when navigating to the screen
+                Task::done(ScreenMessage::PairingStarted)
             }
             ScreenMessage::NavigateToDeviceList => {
                 *self = Screen::DeviceList(DeviceListScreen::new());
-                Task::none()
+                Task::done(ScreenMessage::NavigateToDeviceList)
             }
             ScreenMessage::NavigateToSettings => {
                 *self = Screen::Settings(SettingsScreen::new());
