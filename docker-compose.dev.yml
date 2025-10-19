@@ -20,12 +20,16 @@ services:
     # X11 forwarding for GUI
     environment:
       - DISPLAY=${DISPLAY:-:0}
+      - XAUTHORITY=/tmp/.Xauthority
       - XDG_RUNTIME_DIR=/tmp/runtime-root
       - DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 
     volumes:
       # X11 socket for GUI
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+      # X11 authentication
+      - ${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.Xauthority:ro
 
       # D-Bus socket for Bluetooth
       - /var/run/dbus:/var/run/dbus:rw

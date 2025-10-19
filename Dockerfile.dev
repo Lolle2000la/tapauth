@@ -27,15 +27,41 @@ RUN apt-get update && apt-get install -y \
     libtss2-dev \
     # GUI dependencies (iced + X11)
     libx11-dev \
+    libx11-xcb1 \
+    libx11-xcb-dev \
     libxcb1-dev \
     libxcb-render0-dev \
     libxcb-shape0-dev \
     libxcb-xfixes0-dev \
     libxkbcommon-dev \
+    libxkbcommon-x11-0 \
     libfontconfig1-dev \
     libfreetype6-dev \
     libexpat1-dev \
-    # Bluetooth support
+    # X11 Input extension (for mouse/keyboard input)
+    libxi6 \
+    libxi-dev \
+    # X11 Randr extension (for display configuration)
+    libxrandr2 \
+    libxrandr-dev \
+    # X11 Cursor library
+    libxcursor1 \
+    libxcursor-dev \
+    # X11 Render extension
+    libxrender1 \
+    libxrender-dev \
+    # X11 Inenable extension
+    libxinerama1 \
+    libxinerama-dev \
+    # Mesa/DRI for software rendering (required for wgpu without GPU)
+    mesa-vulkan-drivers \
+    mesa-utils \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    libegl1-mesa \
+    libgbm1 \
+    libdrm2 \
+    # Bluetooth
     bluez \
     bluez-tools \
     libbluetooth-dev \
@@ -75,9 +101,24 @@ RUN mkdir -p /etc/tapauth /lib/security /usr/local/bin
 # Copy the entire project
 COPY . /tapauth/
 
-# Set environment variables for X11 forwarding
+# Set environment variables for X11 and runtime
 ENV DISPLAY=:0
 ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+
+# Enable software rendering with Mesa/llvmpipe
+ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV GALLIUM_DRIVER=llvmpipe
+
+# Disable DRI for compatibility
+ENV LIBGL_ALWAYS_INDIRECT=0
+
+# Disable compositor features that may cause X11 errors
+ENV __GLX_VENDOR_LIBRARY_NAME=mesa
+
+# Force OpenGL backend for wgpu (better XWayland compatibility)
+ENV WGPU_BACKEND=gl
+
+# Create helper scripts for common tasks
 
 # Create a script to build all components
 RUN echo '#!/bin/bash\n\
