@@ -80,7 +80,7 @@ class AuthRequestManager private constructor() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
 
-            val notification = NotificationCompat.Builder(context, TapAuthApplication.CHANNEL_ID)
+            val notification = NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                 .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                 .setContentTitle("Authentication request")
                 .setContentText("${deviceName}: ${username}@${hostname}")

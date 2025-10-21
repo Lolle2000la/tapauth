@@ -23,6 +23,17 @@ class TapAuthApplication : Application() {
             
             val notificationManager = getSystemService(NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
+            // High-priority channel for user approval notifications (heads-up)
+            val authChannel = NotificationChannel(
+                AUTH_CHANNEL_ID,
+                "TapAuth Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Authentication requests (tap to approve)"
+                enableVibration(true)
+                enableLights(true)
+            }
+            notificationManager.createNotificationChannel(authChannel)
         }
 
         // Start core background services so UDP listener and BLE GATT are active
@@ -48,5 +59,6 @@ class TapAuthApplication : Application() {
     
     companion object {
         const val CHANNEL_ID = "tapauth_service_channel"
+        const val AUTH_CHANNEL_ID = "tapauth_auth_channel"
     }
 }
