@@ -42,6 +42,19 @@ class MainActivity : FragmentActivity() {
         
         setupBiometricPrompt()
         setupAuthRequestReceiver()
+        // If activity was launched via notification intent containing an auth request,
+        // process it now.
+        intent?.let { incoming ->
+            if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
+                val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    incoming.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST, AuthRequest::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
+                }
+                authRequest?.let { handleAuthRequest(it) }
+            }
+        }
         
         enableEdgeToEdge()
         setContent {
@@ -162,6 +175,21 @@ class MainActivity : FragmentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(authRequestReceiver)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        intent?.let { incoming ->
+            if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
+                val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    incoming.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST, AuthRequest::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
+                }
+                authRequest?.let { handleAuthRequest(it) }
+            }
+        }
     }
     
     companion object {

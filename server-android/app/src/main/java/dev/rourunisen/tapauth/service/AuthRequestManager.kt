@@ -3,6 +3,10 @@ package dev.rourunisen.tapauth.service
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.TransportType
 import kotlinx.coroutines.CoroutineScope
@@ -61,6 +65,34 @@ class AuthRequestManager private constructor() {
             setPackage(context.packageName)
         }
         context.sendBroadcast(intent)
+
+        // Also post a notification so the user can tap to open the app and approve
+        try {
+            val activityIntent = Intent(context, dev.rourunisen.tapauth.MainActivity::class.java).apply {
+                action = ACTION_AUTH_REQUEST
+                putExtra(EXTRA_AUTH_REQUEST, authRequest)
+            }
+
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                requestId.hashCode(),
+                activityIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val notification = NotificationCompat.Builder(context, TapAuthApplication.CHANNEL_ID)
+                .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
+                .setContentTitle("Authentication request")
+                .setContentText("${deviceName}: ${username}@${hostname}")
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .build()
+
+            NotificationManagerCompat.from(context).notify(requestId.hashCode(), notification)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to post auth request notification: ${e.message}")
+        }
         
         Log.d(TAG, "Submitted auth request $requestId for ${username}@${hostname}")
         
