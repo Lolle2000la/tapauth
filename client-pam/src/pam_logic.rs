@@ -9,6 +9,16 @@ fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_target(false)
         .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Use debug level in debug builds, info level in release builds
+                if cfg!(debug_assertions) {
+                    tracing_subscriber::EnvFilter::new("debug")
+                } else {
+                    tracing_subscriber::EnvFilter::new("info")
+                }
+            }),
+        )
         .try_init();
 }
 

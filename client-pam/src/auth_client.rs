@@ -91,8 +91,7 @@ impl AuthenticationClient {
         // Note: For authentication, we use a static nonce derived from CSK only,
         // since the challenge is INSIDE the encrypted message and can't be used
         // to derive the decryption nonce (chicken-egg problem).
-        let packet =
-            create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
+        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Start parallel discovery: UDP + BLE
         let udp_result = self.try_udp_authentication(&packet).await;
@@ -155,7 +154,11 @@ impl AuthenticationClient {
                             return Err(AuthError::Denied);
                         }
                         Err(e) => {
-                            tracing::debug!("Failed to process response: {}", e);
+                            tracing::warn!(
+                                "Failed to process response from {}: {}",
+                                server_addr,
+                                e
+                            );
                             // Continue trying - might be from wrong server or corrupted
                         }
                     }
@@ -172,11 +175,21 @@ impl AuthenticationClient {
     async fn process_response(
         &self,
         packet: &EncryptedPacket,
-        _server_addr: SocketAddr,
+        server_addr: SocketAddr,
     ) -> Result<bool, AuthError> {
-        // Decrypt the packet
-        let wrapper =
-            decrypt_encrypted_packet(&self.csk, &self.challenge, b"auth_response", packet)?;
+        // Decrypt the packet using CSK-derived nonce (same as authentication request)
+        let wrapper = decrypt_encrypted_packet_with_csk_nonce(&self.csk, packet)?;
+
+        tracing::info!(
+            "Received message from {}: {:?}",
+            server_addr,
+            match &wrapper.payload {
+                Some(wrapper_message::Payload::AuthGrant(_)) => "AuthGrant",
+                Some(wrapper_message::Payload::AuthDenial(_)) => "AuthDenial",
+                Some(wrapper_message::Payload::AuthRequest(_)) => "AuthRequest",
+                _ => "Unknown",
+            }
+        );
 
         // Check what kind of response we got
         match wrapper.payload {
@@ -185,23 +198,60 @@ impl AuthenticationClient {
                 // We need to find which server sent this by checking signatures
                 let paired_servers = self.config_manager.load_paired_servers()?;
 
+                tracing::info!(
+                    "Trying to verify grant against {} paired servers",
+                    paired_servers.len()
+                );
+                tracing::info!(
+                    "Grant signature length: {}, signed_challenge length: {}",
+                    grant.signature.len(),
+                    grant.signed_challenge.len()
+                );
+                tracing::info!("Challenge (hex): {}", hex::encode(&self.challenge));
+
                 for (_id, server) in paired_servers.iter() {
                     let pub_key_bytes = hex::decode(&server.public_key)
                         .map_err(|_| AuthError::Protocol(ProtocolError::InvalidMessageFormat))?;
 
                     if pub_key_bytes.len() != 32 {
+                        tracing::warn!(
+                            "Server {} has invalid public key length: {}",
+                            server.name,
+                            pub_key_bytes.len()
+                        );
                         continue;
                     }
 
                     let mut pub_key = [0u8; 32];
                     pub_key.copy_from_slice(&pub_key_bytes);
 
-                    if verify_auth_grant(&grant, &self.challenge, &pub_key).is_ok() {
-                        tracing::info!("Authentication granted by server: {}", server.name);
-                        return Ok(true);
+                    tracing::info!(
+                        "Trying server: {} with public key: {}",
+                        server.name,
+                        server.public_key
+                    );
+                    tracing::info!("Grant signature (hex): {}", hex::encode(&grant.signature));
+                    tracing::info!(
+                        "Signed challenge (hex): {}",
+                        hex::encode(&grant.signed_challenge)
+                    );
+
+                    match verify_auth_grant(&grant, &self.challenge, &pub_key) {
+                        Ok(_) => {
+                            tracing::info!("Authentication granted by server: {}", server.name);
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Verification failed for server {}: {:?}",
+                                server.name,
+                                e
+                            );
+                        }
                     }
                 }
 
+                tracing::error!("No server matched the grant signature");
                 Err(AuthError::Protocol(ProtocolError::InvalidSignature))
             }
             Some(wrapper_message::Payload::AuthDenial(denial)) => {
@@ -239,8 +289,7 @@ impl AuthenticationClient {
     ) -> Result<(), AuthError> {
         let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)?;
         let wrapper = wrap_grant_confirmation(confirmation);
-        let packet =
-            create_encrypted_packet(&self.csk, &self.challenge, b"grant_confirmation", &wrapper)?;
+        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Send on both IPv4 and IPv6
         send_udp_broadcast(socket, port, &packet)?;
@@ -257,7 +306,7 @@ impl AuthenticationClient {
     ) -> Result<(), AuthError> {
         let cancel = create_auth_cancel(&self.keypair, &self.challenge)?;
         let wrapper = wrap_auth_cancel(cancel);
-        let packet = create_encrypted_packet(&self.csk, &self.challenge, b"auth_cancel", &wrapper)?;
+        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Send on both IPv4 and IPv6
         send_udp_broadcast(socket, port, &packet)?;

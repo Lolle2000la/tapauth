@@ -134,16 +134,16 @@ impl ClientPairingSession {
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
         let server_x25519_pub = self.server_x25519_public.unwrap();
 
-        eprintln!(
-            "[DEBUG CLIENT] Client X25519 private key: {}",
+        tracing::debug!(
+            "Client X25519 private key: {}",
             hex::encode(client_x25519_priv)
         );
-        eprintln!(
-            "[DEBUG CLIENT] Client X25519 public key: {}",
+        tracing::debug!(
+            "Client X25519 public key: {}",
             hex::encode(client_x25519_pub)
         );
-        eprintln!(
-            "[DEBUG CLIENT] Server X25519 public key: {}",
+        tracing::debug!(
+            "Server X25519 public key: {}",
             hex::encode(server_x25519_pub)
         );
 
@@ -151,17 +151,11 @@ impl ClientPairingSession {
             .x25519_keypair
             .diffie_hellman(&self.server_x25519_public.unwrap())?;
 
-        eprintln!(
-            "[DEBUG CLIENT] Shared secret: {}",
-            hex::encode(&shared_secret)
-        );
+        tracing::debug!("Shared secret: {}", hex::encode(&shared_secret));
 
         let psk = derive_psk_from_x25519(&shared_secret)?;
 
-        eprintln!(
-            "[DEBUG CLIENT] Derived PSK: {}",
-            hex::encode(psk.as_bytes())
-        );
+        tracing::debug!("Derived PSK: {}", hex::encode(psk.as_bytes()));
 
         self.psk = Some(psk);
 
@@ -249,21 +243,12 @@ impl ClientPairingSession {
     ) -> Result<(), ProtocolError> {
         // Encrypt CSK with PSK
         let psk = self.psk.as_ref().unwrap();
-        eprintln!(
-            "[DEBUG CLIENT] PSK for encryption: {}",
-            hex::encode(psk.as_bytes())
-        );
-        eprintln!(
-            "[DEBUG CLIENT] CSK to encrypt: {}",
-            hex::encode(csk.as_bytes())
-        );
+        tracing::debug!("PSK for encryption: {}", hex::encode(psk.as_bytes()));
+        tracing::debug!("CSK to encrypt: {}", hex::encode(csk.as_bytes()));
 
         let encrypted_csk = encrypt_with_psk(psk, b"csk_exchange", csk.as_bytes())?;
 
-        eprintln!(
-            "[DEBUG CLIENT] Encrypted CSK: {}",
-            hex::encode(&encrypted_csk)
-        );
+        tracing::debug!("Encrypted CSK: {}", hex::encode(&encrypted_csk));
 
         let message = PairingCskMessage { encrypted_csk };
 
@@ -415,21 +400,18 @@ impl ServerPairingSession {
 
         let encrypted_msg = PairingCskMessage::decode(&buf[..])?;
 
-        eprintln!(
-            "[DEBUG SERVER] Received encrypted CSK: {}",
+        tracing::debug!(
+            "Received encrypted CSK: {}",
             hex::encode(&encrypted_msg.encrypted_csk)
         );
 
         // Decrypt CSK with PSK
         let psk = self.psk.as_ref().unwrap();
-        eprintln!(
-            "[DEBUG SERVER] PSK for decryption: {}",
-            hex::encode(psk.as_bytes())
-        );
+        tracing::debug!("PSK for decryption: {}", hex::encode(psk.as_bytes()));
 
         let plaintext = decrypt_with_psk(psk, b"csk_exchange", &encrypted_msg.encrypted_csk)?;
 
-        eprintln!("[DEBUG SERVER] Decrypted CSK: {}", hex::encode(&plaintext));
+        tracing::debug!("Decrypted CSK: {}", hex::encode(&plaintext));
 
         if plaintext.len() != 32 {
             return Err(ProtocolError::InvalidMessageFormat);

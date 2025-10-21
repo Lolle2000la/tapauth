@@ -276,7 +276,7 @@ impl PairingScreen {
     }
 
     async fn start_pairing() -> Result<(String, u16), String> {
-        eprintln!("[DEBUG] Starting pairing...");
+        tracing::debug!("Starting pairing...");
         let config = ClientConfigManager::new();
 
         // Load or generate Ed25519 keypair
@@ -286,10 +286,10 @@ impl PairingScreen {
             .map_err(|e| format!("Failed to load/generate keypair: {}", e))?;
 
         // Get local IP addresses
-        eprintln!("[DEBUG] Getting local IP addresses...");
+        tracing::debug!("Getting local IP addresses...");
         let ipv4 = get_local_ipv4().ok_or("Failed to get IPv4 address")?;
         let ipv6 = get_local_ipv6().ok_or("Failed to get IPv6 address")?;
-        eprintln!("[DEBUG] IPv4: {}, IPv6: {}", ipv4, ipv6);
+        tracing::debug!("IPv4: {}, IPv6: {}", ipv4, ipv6);
 
         // Start TCP listener on ephemeral port
         let listener = TcpListener::bind("0.0.0.0:0")
@@ -301,14 +301,14 @@ impl PairingScreen {
             .map_err(|e| format!("Failed to get local address: {}", e))?
             .port();
 
-        eprintln!("[DEBUG] TCP listener on port {}", port);
+        tracing::debug!("TCP listener on port {}", port);
 
         // Generate pairing URL with X25519 public key
         let session = ClientPairingSession::new(keypair.clone());
         let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
 
         let url = generate_pairing_url(&x25519_pubkey_hex, port, Some(ipv4), Some(ipv6));
-        eprintln!("[DEBUG] Generated URL: {}", url);
+        tracing::debug!("Generated URL: {}", url);
 
         // Don't wait for connection here - just return URL and port
         Ok((url, port))
@@ -318,7 +318,7 @@ impl PairingScreen {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        eprintln!("[DEBUG] Waiting for pairing connection on port {}...", port);
+        tracing::debug!("Waiting for pairing connection on port {}...", port);
 
         let config = ClientConfigManager::new();
 
@@ -336,7 +336,7 @@ impl PairingScreen {
 
         let (stream, _addr) = match accept_result {
             Ok(Ok((s, a))) => {
-                eprintln!("[DEBUG] Connection from {:?}", a);
+                tracing::debug!("Connection from {:?}", a);
                 (s, a)
             }
             Ok(Err(e)) => return Err(format!("Accept error: {}", e)),
@@ -352,7 +352,7 @@ impl PairingScreen {
             .await
             .map_err(|e| format!("Pairing initiation failed: {}", e))?;
 
-        eprintln!("[DEBUG] Pairing initiated. SAS: {}", sas);
+        tracing::debug!("Pairing initiated. SAS: {}", sas);
 
         // Store session state globally for phase 2
         let state = PairingSessionState {
@@ -369,7 +369,7 @@ impl PairingScreen {
     }
 
     async fn complete_pairing(_port: u16) -> Result<String, String> {
-        eprintln!("[DEBUG] User confirmed SAS, completing pairing...");
+        tracing::debug!("User confirmed SAS, completing pairing...");
 
         let config = ClientConfigManager::new();
 
@@ -391,7 +391,7 @@ impl PairingScreen {
             .or_else(|_| config.generate_and_save_csk())
             .map_err(|e| format!("Failed to load/generate CSK: {}", e))?;
 
-        eprintln!("[DEBUG] Loaded/generated CSK");
+        tracing::debug!("Loaded/generated CSK");
 
         // Phase 2: Finish pairing (send CSK, receive confirmation)
         session
@@ -399,7 +399,7 @@ impl PairingScreen {
             .await
             .map_err(|e| format!("Pairing completion failed: {}", e))?;
 
-        eprintln!("[DEBUG] Pairing handshake complete");
+        tracing::debug!("Pairing handshake complete");
 
         // Store CSK
         config
@@ -418,7 +418,7 @@ impl PairingScreen {
             .add_paired_server(server_hex.clone(), paired_server)
             .map_err(|e| format!("Failed to save paired server: {}", e))?;
 
-        eprintln!("[DEBUG] Pairing complete!");
+        tracing::debug!("Pairing complete!");
 
         Ok(server_hex)
     }

@@ -144,12 +144,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
     };
 
     // Derive PSK from shared secret using HKDF
-    eprintln!("[JNI DEBUG] Shared secret: {}", hex::encode(shared_secret));
-    eprintln!("[JNI DEBUG] >>> MARKER: JNI FIX VERSION 2025-10-19-20:40 <<<");
+    tracing::debug!("Shared secret: {}", hex::encode(shared_secret));
+    tracing::debug!(">>> MARKER: JNI FIX VERSION 2025-10-19-20:40 <<<");
     let psk = match crypto::derive_psk_from_x25519(&shared_secret) {
         Ok(key) => key,
         Err(err) => {
-            eprintln!("[JNI DEBUG] PSK derivation FAILED: {}", err);
+            tracing::error!("PSK derivation FAILED: {}", err);
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
                 format!("PSK derivation failed: {err}"),
@@ -157,10 +157,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
             return std::ptr::null_mut();
         }
     };
-    eprintln!("[JNI DEBUG] Derived PSK: {}", hex::encode(psk.as_bytes()));
+    tracing::debug!("Derived PSK: {}", hex::encode(psk.as_bytes()));
 
     let hex_result = hex::encode(psk.as_bytes());
-    eprintln!("[JNI DEBUG] Returning hex PSK: {}", hex_result);
+    tracing::debug!("Returning hex PSK: {}", hex_result);
 
     match env.new_string(hex_result) {
         Ok(output) => output.into_raw(),
@@ -651,7 +651,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
 
     // Manually create JSON with base64-encoded byte fields
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    
+
     let json_result = serde_json::json!({
         "challenge": BASE64.encode(&auth_request.challenge),
         "username": auth_request.username,
@@ -660,7 +660,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
         "signature_algorithm": auth_request.signature_algorithm,
         "signature": BASE64.encode(&auth_request.signature),
     });
-    
+
     let json_string = match serde_json::to_string(&json_result) {
         Ok(json) => json,
         Err(err) => {
@@ -1443,7 +1443,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
 
     // Manually create JSON with base64-encoded byte fields
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    
+
     let json_result = serde_json::json!({
         "challenge": BASE64.encode(&confirmation.challenge),
         "signature_algorithm": confirmation.signature_algorithm,
@@ -1529,7 +1529,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
 
     // Manually create JSON with base64-encoded byte fields
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    
+
     let json_result = serde_json::json!({
         "challenge": BASE64.encode(&cancel.challenge),
         "signature_algorithm": cancel.signature_algorithm,
@@ -1569,7 +1569,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
     mut env: JNIEnv,
     _class: JClass,
     signed_challenge: JByteArray,
+    private_key_hex: JString,
 ) -> jbyteArray {
+    use crate::crypto::{signing::sign_ed25519, Ed25519KeyPair};
     use crate::protocol::pb;
     use prost::Message;
 
@@ -1585,12 +1587,76 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
         }
     };
 
-    // Create AuthenticationGrant
-    let grant = pb::AuthenticationGrant {
+    // Parse private key from hex
+    let private_key_str: String = match env.get_string(&private_key_hex) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid private key hex string: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let private_key_bytes = match hex::decode(&private_key_str) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid private key hex: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // The private key should be 64 bytes (full Ed25519 keypair) or 32 bytes (just signing key)
+    let keypair = if private_key_bytes.len() == 64 {
+        // Extract first 32 bytes (signing key)
+        let mut signing_key_bytes = [0u8; 32];
+        signing_key_bytes.copy_from_slice(&private_key_bytes[..32]);
+        match Ed25519KeyPair::from_signing_key_bytes(&signing_key_bytes) {
+            Ok(kp) => kp,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    format!("invalid Ed25519 keypair: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        }
+    } else if private_key_bytes.len() == 32 {
+        // Use directly as signing key
+        let mut signing_key_bytes = [0u8; 32];
+        signing_key_bytes.copy_from_slice(&private_key_bytes);
+        match Ed25519KeyPair::from_signing_key_bytes(&signing_key_bytes) {
+            Ok(kp) => kp,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    format!("invalid Ed25519 keypair: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        }
+    } else {
+        let _ = env.throw_new(
+            "java/lang/IllegalArgumentException",
+            "private key must be 32 bytes (signing key) or 64 bytes (full keypair)",
+        );
+        return std::ptr::null_mut();
+    };
+
+    // Create AuthenticationGrant with empty signature initially
+    let mut grant = pb::AuthenticationGrant {
         signed_challenge: signed_challenge_bytes,
         signature_algorithm: pb::SignatureAlgorithm::Ed25519 as i32,
-        signature: vec![], // Will be filled by caller if needed
+        signature: vec![],
     };
+
+    // Sign the grant message (without signature field)
+    let data_to_sign = grant.encode_to_vec();
+    grant.signature = sign_ed25519(&keypair, &data_to_sign);
 
     // Create WrapperMessage
     let wrapper = pb::WrapperMessage {

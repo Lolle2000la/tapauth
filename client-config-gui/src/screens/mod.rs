@@ -76,7 +76,7 @@ impl Screen {
                 Task::done(ScreenMessage::PairingStarted)
             }
             ScreenMessage::NavigateToDeviceList => {
-                eprintln!("[Screen] NavigateToDeviceList - creating DeviceListScreen");
+                tracing::debug!("NavigateToDeviceList - creating DeviceListScreen");
                 let (screen, task) = DeviceListScreen::new();
                 *self = Screen::DeviceList(screen);
                 task

@@ -360,9 +360,9 @@ mod tests {
 
         // Just verify it doesn't panic
         match result {
-            Ok(_) => println!("BLE adapter found"),
-            Err(BleError::NoAdapter) => println!("No BLE adapter (expected in CI)"),
-            Err(e) => println!("BLE error: {:?}", e),
+            Ok(_) => tracing::info!("BLE adapter found"),
+            Err(BleError::NoAdapter) => tracing::info!("No BLE adapter (expected in CI)"),
+            Err(e) => tracing::warn!("BLE error: {:?}", e),
         }
     }
 }

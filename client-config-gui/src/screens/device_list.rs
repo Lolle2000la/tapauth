@@ -15,7 +15,7 @@ pub struct DeviceListScreen {
 
 impl DeviceListScreen {
     pub fn new() -> (Self, Task<ScreenMessage>) {
-        eprintln!("[DeviceListScreen] Creating new DeviceListScreen and starting load task");
+        tracing::debug!("Creating new DeviceListScreen and starting load task");
         let screen = Self {
             devices: HashMap::new(),
             loading: true,
@@ -33,7 +33,7 @@ impl DeviceListScreen {
     pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
         match message {
             ScreenMessage::NavigateToDeviceList => {
-                eprintln!("[DeviceListScreen] NavigateToDeviceList message received");
+                tracing::debug!("NavigateToDeviceList message received");
                 // Load devices when navigating to this screen
                 self.loading = true;
                 Task::perform(Self::load_devices(), |result| match result {
@@ -42,16 +42,13 @@ impl DeviceListScreen {
                 })
             }
             ScreenMessage::DevicesLoaded(devices) => {
-                eprintln!(
-                    "[DeviceListScreen] DevicesLoaded message received with {} devices",
+                tracing::debug!(
+                    "DevicesLoaded message received with {} devices",
                     devices.len()
                 );
                 self.devices = devices;
                 self.loading = false;
-                eprintln!(
-                    "[DeviceListScreen] State updated, now have {} devices",
-                    self.devices.len()
-                );
+                tracing::debug!("State updated, now have {} devices", self.devices.len());
                 Task::none()
             }
             ScreenMessage::RemoveDevice(device_id) => {
@@ -118,7 +115,7 @@ impl DeviceListScreen {
     }
 
     async fn load_devices() -> Result<HashMap<String, PairedServer>, String> {
-        eprintln!("[DeviceListScreen] load_devices() called");
+        tracing::debug!("load_devices() called");
         let config = ClientConfigManager::new();
 
         let result = config
@@ -126,8 +123,8 @@ impl DeviceListScreen {
             .map_err(|e| format!("Failed to load paired devices: {}", e));
 
         match &result {
-            Ok(devices) => eprintln!("[DeviceListScreen] Loaded {} devices", devices.len()),
-            Err(e) => eprintln!("[DeviceListScreen] Error loading devices: {}", e),
+            Ok(devices) => tracing::debug!("Loaded {} devices", devices.len()),
+            Err(e) => tracing::error!("Error loading devices: {}", e),
         }
 
         result

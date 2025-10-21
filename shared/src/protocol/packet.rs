@@ -1,12 +1,11 @@
 use prost::Message as ProstMessage;
 
+use super::ProtocolError;
 use crate::crypto::{
-    encrypt_with_csk, decrypt_with_csk, encrypt_with_csk_static_nonce, 
-    decrypt_with_csk_static_nonce, generate_current_temporal_identifier,
-    ClientSymmetricKey,
+    decrypt_with_csk, decrypt_with_csk_static_nonce, encrypt_with_csk,
+    encrypt_with_csk_static_nonce, generate_current_temporal_identifier, ClientSymmetricKey,
 };
 use crate::protocol::pb::*;
-use super::ProtocolError;
 
 /// Encrypt and package a WrapperMessage into an EncryptedPacket
 pub fn create_encrypted_packet(
@@ -16,8 +15,7 @@ pub fn create_encrypted_packet(
     wrapper: &WrapperMessage,
 ) -> Result<EncryptedPacket, ProtocolError> {
     // Generate temporal identifier
-    let temporal_identifier = generate_current_temporal_identifier(csk)?
-        .to_vec();
+    let temporal_identifier = generate_current_temporal_identifier(csk)?.to_vec();
 
     // Serialize the wrapper message
     let plaintext = wrapper.encode_to_vec();
@@ -40,8 +38,7 @@ pub fn create_encrypted_packet_with_csk_nonce(
     wrapper: &WrapperMessage,
 ) -> Result<EncryptedPacket, ProtocolError> {
     // Generate temporal identifier
-    let temporal_identifier = generate_current_temporal_identifier(csk)?
-        .to_vec();
+    let temporal_identifier = generate_current_temporal_identifier(csk)?.to_vec();
 
     // Serialize the wrapper message
     let plaintext = wrapper.encode_to_vec();
@@ -160,7 +157,8 @@ mod tests {
         let packet = create_encrypted_packet(&csk, &challenge, context, &wrapper).unwrap();
 
         // Decrypt
-        let decrypted_wrapper = decrypt_encrypted_packet(&csk, &challenge, context, &packet).unwrap();
+        let decrypted_wrapper =
+            decrypt_encrypted_packet(&csk, &challenge, context, &packet).unwrap();
 
         // Verify the payload matches
         assert!(matches!(
