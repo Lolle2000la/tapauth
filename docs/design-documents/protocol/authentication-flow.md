@@ -91,7 +91,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * **IP Network (Wired Ethernet or Wi-Fi)**:
     * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable.
     * **IPv4**: The Client sends to the broadcast address `255.255.255.255`.
-    * **IPv6**: The Client sends to the designated link-local multicast address **`ff02:bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8`**.
+    * **IPv6**: The Client sends to the link-local multicast address **`ff02::1`** (all nodes on local network segment).
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
 
 * **Bluetooth Low Energy (BLE)**:

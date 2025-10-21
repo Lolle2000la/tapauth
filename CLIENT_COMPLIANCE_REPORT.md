@@ -41,7 +41,7 @@ All critical features (P0), high-priority features (P1), and medium-priority fea
 | Requirement | Specification | Implementation | Status |
 |------------|---------------|----------------|--------|
 | UDP Port | 36692 (user-configurable) | `DEFAULT_UDP_PORT = 36692` | ✅ COMPLIANT |
-| IPv6 Multicast | `ff02::bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8` | Correct address | ✅ COMPLIANT |
+| IPv6 Multicast | `ff02::1` (all nodes on local segment) | Correct address | ✅ COMPLIANT |
 
 **File**: `shared/src/network/udp.rs` (111 lines)
 

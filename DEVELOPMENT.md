@@ -201,7 +201,7 @@ exit
 
 - **Default**: 36692
 - **Protocol**: UDP broadcast/multicast
-- **IPv6 Multicast**: `ff02::bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8`
+- **IPv6 Multicast**: `ff02::1` (all nodes on local network segment)
 
 The container uses **host networking**, so it can communicate directly with your Android device on the same network.
 

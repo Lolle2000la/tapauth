@@ -9,8 +9,8 @@ pub use udp::*;
 /// Default UDP port for authentication
 pub const DEFAULT_UDP_PORT: u16 = 36692;
 
-/// IPv6 multicast address for discovery
-pub const IPV6_MULTICAST_ADDR: &str = "ff02::bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8";
+/// IPv6 multicast address for discovery (all nodes on local network segment)
+pub const IPV6_MULTICAST_ADDR: &str = "ff02::1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {

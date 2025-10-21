@@ -2,7 +2,7 @@ use shared::{
     config::ClientConfigManager,
     crypto::{generate_current_temporal_identifier, ClientSymmetricKey, Ed25519KeyPair},
     network::{
-        create_broadcast_socket, get_client_retry_interval, get_session_timeout,
+        create_broadcast_socket, get_client_retry_interval, get_session_timeout, is_ipv6_available,
         send_udp_broadcast, send_udp_multicast, try_receive_udp_packet, DEFAULT_UDP_PORT,
         IPV6_MULTICAST_ADDR,
     },
@@ -14,8 +14,11 @@ use shared::{
     },
 };
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
+
+// Track whether we've warned about IPv6 unavailability
+static IPV6_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -126,9 +129,16 @@ impl AuthenticationClient {
                 tracing::warn!("Failed to send IPv4 broadcast: {}", e);
             }
 
-            // Send multicast on IPv6
-            if let Err(e) = send_udp_multicast(&socket, IPV6_MULTICAST_ADDR, port, packet) {
-                tracing::warn!("Failed to send IPv6 multicast: {}", e);
+            // Send multicast on IPv6 (only if available)
+            if is_ipv6_available() {
+                if let Err(e) = send_udp_multicast(&socket, IPV6_MULTICAST_ADDR, port, packet) {
+                    tracing::warn!("Failed to send IPv6 multicast: {}", e);
+                    // Mark IPv6 as unavailable to avoid future attempts
+                    IPV6_WARNING_SHOWN.store(true, Ordering::Relaxed);
+                }
+            } else if !IPV6_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
+                // Only warn once about IPv6 being unavailable
+                tracing::info!("IPv6 not available, using IPv4 broadcast only");
             }
 
             // Wait for response
@@ -291,9 +301,11 @@ impl AuthenticationClient {
         let wrapper = wrap_grant_confirmation(confirmation);
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
-        // Send on both IPv4 and IPv6
+        // Send on both IPv4 and IPv6 (if available)
         send_udp_broadcast(socket, port, &packet)?;
-        send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet)?;
+        if is_ipv6_available() {
+            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet);
+        }
 
         Ok(())
     }
@@ -308,9 +320,11 @@ impl AuthenticationClient {
         let wrapper = wrap_auth_cancel(cancel);
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
-        // Send on both IPv4 and IPv6
+        // Send on both IPv4 and IPv6 (if available)
         send_udp_broadcast(socket, port, &packet)?;
-        send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet)?;
+        if is_ipv6_available() {
+            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet);
+        }
 
         Ok(())
     }

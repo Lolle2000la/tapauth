@@ -37,7 +37,7 @@ This checklist can be used by any reviewer to independently verify specification
 - **Status**: ✅
 
 #### 1.1.4 IPv6 Multicast Address
-- **Requirement**: MUST use multicast address ff02:bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8
+- **Requirement**: MUST use multicast address ff02::1 (all nodes on local network segment)
 - **Verification**: Search for IPv6 multicast group joining
 - **Evidence**: `AuthenticationService.kt` - IPv6 multicast socket configuration
 - **Status**: ✅

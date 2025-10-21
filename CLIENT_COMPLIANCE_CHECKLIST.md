@@ -10,7 +10,7 @@ This checklist can be used to verify client-side compliance with the TapAuth spe
 - [ ] Default UDP port is 36692
 - [ ] UDP port is user-configurable
 - [ ] IPv4 broadcast to 255.255.255.255
-- [ ] IPv6 multicast to ff02::bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8
+- [ ] IPv6 multicast to ff02::1 (all nodes on local network segment)
 - [ ] Unicast responses supported
 - [ ] Proper timeout handling
 

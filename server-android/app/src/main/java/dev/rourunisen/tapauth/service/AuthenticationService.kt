@@ -15,6 +15,8 @@ import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.MulticastSocket
+import java.net.NetworkInterface
 
 /**
  * Foreground service that listens for UDP authentication requests
@@ -23,7 +25,7 @@ import java.net.InetAddress
 class AuthenticationService : Service() {
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var udpSocket: DatagramSocket? = null
+    private var udpSocket: MulticastSocket? = null
     private var isRunning = false
     private lateinit var deviceRepository: DeviceRepository
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
@@ -93,8 +95,37 @@ class AuthenticationService : Service() {
     private fun startListening() {
         serviceScope.launch {
             try {
-                udpSocket = DatagramSocket(appConfig.udpPort)
+                // Use MulticastSocket to support both unicast and multicast
+                udpSocket = MulticastSocket(appConfig.udpPort)
+                
+                // Enable broadcast reception (for IPv4 255.255.255.255)
+                udpSocket?.broadcast = true
+                
+                // Join IPv6 multicast group ff02::1 (all nodes on local segment)
+                try {
+                    val multicastGroup = InetAddress.getByName("ff02::1")
+                    
+                    // Join the multicast group on all available network interfaces
+                    NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
+                        if (networkInterface.isUp && networkInterface.supportsMulticast()) {
+                            try {
+                                udpSocket?.joinGroup(
+                                    java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                                    networkInterface
+                                )
+                                Log.d(TAG, "Joined IPv6 multicast group ff02::1 on ${networkInterface.name}")
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed to join multicast on ${networkInterface.name}: ${e.message}")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to set up IPv6 multicast: ${e.message}")
+                }
+                
                 Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
+                Log.d(TAG, "  - IPv4 broadcast: enabled")
+                Log.d(TAG, "  - IPv6 multicast: ff02::1")
                 
                 val buffer = ByteArray(1024)
                 
@@ -129,6 +160,26 @@ class AuthenticationService : Service() {
     
     private fun stopListening() {
         isRunning = false
+        
+        // Leave IPv6 multicast group before closing socket
+        try {
+            val multicastGroup = InetAddress.getByName("ff02::1")
+            NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
+                if (networkInterface.isUp && networkInterface.supportsMulticast()) {
+                    try {
+                        udpSocket?.leaveGroup(
+                            java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                            networkInterface
+                        )
+                    } catch (e: Exception) {
+                        // Ignore errors on cleanup
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Ignore errors on cleanup
+        }
+        
         udpSocket?.close()
         udpSocket = null
         Log.d(TAG, "Stopped listening")

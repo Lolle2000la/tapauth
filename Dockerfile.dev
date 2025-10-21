@@ -283,7 +283,7 @@ Configuration:\n\
 \n\
 Network:\n\
   UDP Port:       36692 (default)\n\
-  IPv6 Multicast: ff02::bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8\n\
+  IPv6 Multicast: ff02::1 (all nodes on local segment)\n\
 \n\
 Bluetooth:\n\
   Service UUID:   b4ad84c0-2adb-4876-8315-b39d983b2bde\n\
