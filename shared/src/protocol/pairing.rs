@@ -9,6 +9,13 @@ use crate::crypto::{
 use crate::protocol::pb::*;
 use crate::protocol::ProtocolError;
 
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
 const MAX_MESSAGE_SIZE: usize = 16 * 1024; // 16KB max message size
 
 /// Pairing protocol version
@@ -130,32 +137,36 @@ impl ClientPairingSession {
                 .map_err(|_| ProtocolError::InvalidMessageFormat)?,
         );
 
-        let client_x25519_priv = self.x25519_keypair.secret_key_bytes();
+        let _client_x25519_priv = self.x25519_keypair.secret_key_bytes();
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
         let server_x25519_pub = self.server_x25519_public.unwrap();
 
         tracing::debug!(
-            "Client X25519 private key: {}",
-            hex::encode(client_x25519_priv)
+            "Client X25519 public key (trunc): {}…",
+            &hex::encode(client_x25519_pub)
+                [..std::cmp::min(16, hex::encode(client_x25519_pub).len())]
         );
         tracing::debug!(
-            "Client X25519 public key: {}",
-            hex::encode(client_x25519_pub)
-        );
-        tracing::debug!(
-            "Server X25519 public key: {}",
-            hex::encode(server_x25519_pub)
+            "Server X25519 public key (trunc): {}…",
+            &hex::encode(server_x25519_pub)
+                [..std::cmp::min(16, hex::encode(server_x25519_pub).len())]
         );
 
         let shared_secret = self
             .x25519_keypair
             .diffie_hellman(&self.server_x25519_public.unwrap())?;
 
-        tracing::debug!("Shared secret: {}", hex::encode(&shared_secret));
+        tracing::debug!(
+            "Shared secret (sha256): {}",
+            crate::protocol::messages::sha256_hex(&shared_secret)
+        );
 
         let psk = derive_psk_from_x25519(&shared_secret)?;
 
-        tracing::debug!("Derived PSK: {}", hex::encode(psk.as_bytes()));
+        tracing::debug!(
+            "Derived PSK (sha256): {}",
+            crate::protocol::messages::sha256_hex(psk.as_bytes())
+        );
 
         self.psk = Some(psk);
 
@@ -243,12 +254,21 @@ impl ClientPairingSession {
     ) -> Result<(), ProtocolError> {
         // Encrypt CSK with PSK
         let psk = self.psk.as_ref().unwrap();
-        tracing::debug!("PSK for encryption: {}", hex::encode(psk.as_bytes()));
-        tracing::debug!("CSK to encrypt: {}", hex::encode(csk.as_bytes()));
+        tracing::debug!(
+            "PSK for encryption (sha256): {}",
+            crate::protocol::messages::sha256_hex(psk.as_bytes())
+        );
+        tracing::debug!(
+            "CSK to encrypt (sha256): {}",
+            crate::protocol::messages::sha256_hex(csk.as_bytes())
+        );
 
         let encrypted_csk = encrypt_with_psk(psk, b"csk_exchange", csk.as_bytes())?;
 
-        tracing::debug!("Encrypted CSK: {}", hex::encode(&encrypted_csk));
+        tracing::debug!(
+            "Encrypted CSK (sha256): {}",
+            crate::protocol::messages::sha256_hex(&encrypted_csk)
+        );
 
         let message = PairingCskMessage { encrypted_csk };
 
@@ -401,17 +421,20 @@ impl ServerPairingSession {
         let encrypted_msg = PairingCskMessage::decode(&buf[..])?;
 
         tracing::debug!(
-            "Received encrypted CSK: {}",
-            hex::encode(&encrypted_msg.encrypted_csk)
+            "Received encrypted CSK (sha256): {}",
+            sha256_hex(&encrypted_msg.encrypted_csk)
         );
 
         // Decrypt CSK with PSK
         let psk = self.psk.as_ref().unwrap();
-        tracing::debug!("PSK for decryption: {}", hex::encode(psk.as_bytes()));
+        tracing::debug!(
+            "PSK for decryption (sha256): {}",
+            sha256_hex(psk.as_bytes())
+        );
 
         let plaintext = decrypt_with_psk(psk, b"csk_exchange", &encrypted_msg.encrypted_csk)?;
 
-        tracing::debug!("Decrypted CSK: {}", hex::encode(&plaintext));
+        tracing::debug!("Decrypted CSK (sha256): {}", sha256_hex(&plaintext));
 
         if plaintext.len() != 32 {
             return Err(ProtocolError::InvalidMessageFormat);

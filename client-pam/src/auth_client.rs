@@ -222,7 +222,12 @@ impl AuthenticationClient {
                     grant.signature.len(),
                     grant.signed_challenge.len()
                 );
-                tracing::info!("Challenge (hex): {}", hex::encode(&self.challenge));
+                // Sensitive values: log only truncated fingerprint and length
+                tracing::debug!(
+                    "Challenge (trunc): {}… (len={})",
+                    hex::encode(&self.challenge[..std::cmp::min(8, self.challenge.len())]),
+                    self.challenge.len()
+                );
 
                 for (_id, server) in paired_servers.iter() {
                     let pub_key_bytes = hex::decode(&server.public_key)
@@ -245,10 +250,18 @@ impl AuthenticationClient {
                         server.name,
                         server.public_key
                     );
-                    tracing::info!("Grant signature (hex): {}", hex::encode(&grant.signature));
-                    tracing::info!(
-                        "Signed challenge (hex): {}",
-                        hex::encode(&grant.signed_challenge)
+                    tracing::debug!(
+                        "Grant signature (trunc): {}… (len={})",
+                        hex::encode(&grant.signature[..std::cmp::min(8, grant.signature.len())]),
+                        grant.signature.len()
+                    );
+                    tracing::debug!(
+                        "Signed challenge (trunc): {}… (len={})",
+                        hex::encode(
+                            &grant.signed_challenge
+                                [..std::cmp::min(8, grant.signed_challenge.len())]
+                        ),
+                        grant.signed_challenge.len()
                     );
 
                     match verify_auth_grant(&grant, &self.challenge, &pub_key) {

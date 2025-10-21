@@ -103,11 +103,11 @@ class MainActivity : FragmentActivity() {
                         try {
                             val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(this@MainActivity)
                             val privateKey = keypairRepo.getPrivateKey()
-                            Log.d(TAG, "Signing challenge: ${authRequest.challenge.joinToString("") { "%02x".format(it) }}")
+                            Log.d(TAG, "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…")
                             val signedChallenge = dev.rourunisen.tapauth.crypto.signData(privateKey, authRequest.challenge)
                             
                             Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
-                            Log.d(TAG, "Signed challenge: ${signedChallenge.joinToString("") { "%02x".format(it) }}")
+                            Log.d(TAG, "Signed challenge (trunc): ${signedChallenge.take(8).joinToString("") { "%02x".format(it) }}…")
                             handleAuthResponse(authRequest.requestId, approved = true, signedChallenge = signedChallenge)
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to sign challenge", e)

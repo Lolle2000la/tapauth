@@ -2,6 +2,14 @@ use prost::Message as ProstMessage;
 
 use crate::crypto::{sign_ed25519, verify_ed25519, Ed25519KeyPair};
 use crate::protocol::pb::*;
+use sha2::{Digest, Sha256};
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    hex::encode(result)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -147,8 +155,14 @@ pub fn verify_auth_grant(
             grant.signature.len(),
             data_to_verify.len()
         );
-        tracing::error!("Grant (unsigned) hex: {}", hex::encode(&data_to_verify));
-        tracing::error!("Grant signature hex: {}", hex::encode(&grant.signature));
+        // For security, avoid logging raw signature/challenge material in error logs.
+        tracing::debug!("Grant (unsigned) sha256: {}", sha256_hex(&data_to_verify));
+        tracing::debug!(
+            "Grant signature (trunc): {}… (len={})",
+            &hex::encode(&grant.signature)
+                [..std::cmp::min(16, hex::encode(&grant.signature).len())],
+            grant.signature.len()
+        );
         return Err(ProtocolError::Crypto(e.into()));
     }
 
@@ -160,10 +174,12 @@ pub fn verify_auth_grant(
             grant.signed_challenge.len(),
             challenge.len()
         );
-        tracing::error!("Challenge (hex): {}", hex::encode(challenge));
-        tracing::error!(
-            "Signed challenge signature hex: {}",
-            hex::encode(&grant.signed_challenge)
+        tracing::debug!("Challenge (sha256): {}", sha256_hex(challenge));
+        tracing::debug!(
+            "Signed challenge (trunc): {}… (len={})",
+            &hex::encode(&grant.signed_challenge)
+                [..std::cmp::min(16, hex::encode(&grant.signed_challenge).len())],
+            grant.signed_challenge.len()
         );
         return Err(ProtocolError::Crypto(e.into()));
     }

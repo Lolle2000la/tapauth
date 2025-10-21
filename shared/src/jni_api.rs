@@ -3,6 +3,13 @@ use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use crate::crypto;
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
 
 /// JNI wrapper for generating a new Ed25519 keypair.
 /// Returns the keypair as a hex-encoded string "private_key:public_key"
@@ -144,8 +151,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
     };
 
     // Derive PSK from shared secret using HKDF
-    tracing::debug!("Shared secret: {}", hex::encode(shared_secret));
-    tracing::debug!(">>> MARKER: JNI FIX VERSION 2025-10-19-20:40 <<<");
+    tracing::debug!("Shared secret (sha256): {}", sha256_hex(&shared_secret));
     let psk = match crypto::derive_psk_from_x25519(&shared_secret) {
         Ok(key) => key,
         Err(err) => {
@@ -157,10 +163,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
             return std::ptr::null_mut();
         }
     };
-    tracing::debug!("Derived PSK: {}", hex::encode(psk.as_bytes()));
+    tracing::debug!("Derived PSK (sha256): {}", sha256_hex(psk.as_bytes()));
 
     let hex_result = hex::encode(psk.as_bytes());
-    tracing::debug!("Returning hex PSK: {}", hex_result);
+    tracing::debug!("Returning hex PSK (sha256): {}", sha256_hex(psk.as_bytes()));
 
     match env.new_string(hex_result) {
         Ok(output) => output.into_raw(),

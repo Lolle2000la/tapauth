@@ -91,14 +91,13 @@ class PairingClient(private val context: Context) {
             // PSK = ECDH(server_ephemeral_private, client_x25519_public_from_response)
             val clientPublicKey = clientX25519Key
             
-            Log.d(TAG, "Server X25519 private key: ${serverEphemeralKeyPair.privateKey.joinToString("") { "%02x".format(it) }}")
-            Log.d(TAG, "Server X25519 public key: ${serverEphemeralKeyPair.publicKey.joinToString("") { "%02x".format(it) }}")
-            Log.d(TAG, "Client X25519 public key: ${clientPublicKey.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "Server X25519 public key (trunc): ${serverEphemeralKeyPair.publicKey.take(8).joinToString("") { "%02x".format(it) }}…")
+            Log.d(TAG, "Client X25519 public key (trunc): ${clientPublicKey.take(8).joinToString("") { "%02x".format(it) }}…")
             
             val psk = performKeyExchange(serverEphemeralKeyPair.privateKey, clientPublicKey)
             
             Log.d(TAG, "Computed PSK (${psk.size} bytes)")
-            Log.d(TAG, "PSK (hex): ${psk.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "PSK (trunc): ${psk.take(8).joinToString("") { "%02x".format(it) }}…")
             
             // Step 5: Generate SAS for anti-MITM verification
             // SAS is derived from both public keys using the PSK
@@ -153,8 +152,8 @@ class PairingClient(private val context: Context) {
             val encryptedCsk = dev.rourunisen.tapauth.crypto.parsePairingCskMessage(cskMessageBytes)
             
             Log.d(TAG, "Extracted encrypted CSK (${encryptedCsk.size} bytes)")
-            Log.d(TAG, "PSK (hex): ${psk.joinToString("") { "%02x".format(it) }}")
-            Log.d(TAG, "Encrypted CSK (hex): ${encryptedCsk.joinToString("") { "%02x".format(it) }}")
+            Log.d(TAG, "PSK (trunc): ${psk.take(8).joinToString("") { "%02x".format(it) }}…")
+            Log.d(TAG, "Encrypted CSK (trunc): ${encryptedCsk.take(8).joinToString("") { "%02x".format(it) }}…")
             
             // Decrypt CSK using PSK with AES-256-GCM
             val csk = dev.rourunisen.tapauth.crypto.decryptWithPsk(

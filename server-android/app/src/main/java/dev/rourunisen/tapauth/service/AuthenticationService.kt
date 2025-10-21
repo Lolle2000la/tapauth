@@ -545,7 +545,7 @@ class AuthenticationService : Service() {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
                         val publicKey = keypairRepository.getPublicKey()
-                        Log.d(TAG, "Signing grant with server public key: ${publicKey.joinToString("") { "%02x".format(it) }}")
+                        Log.d(TAG, "Signing grant with server public key (trunc): ${publicKey.take(8).joinToString("") { "%02x".format(it) }}…")
                         
                         // Create WrapperMessage containing AuthenticationGrant (now properly signed)
                         val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
