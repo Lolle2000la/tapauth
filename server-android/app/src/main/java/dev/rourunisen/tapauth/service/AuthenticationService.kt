@@ -49,12 +49,26 @@ class AuthenticationService : Service() {
             try {
                 val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
                 config.udpLastStartMillis = System.currentTimeMillis()
+                config.udpRunning = true
+                // broadcast running state change
+                val b = Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
+                    putExtra("udp_running", true)
+                }
+                context.sendBroadcast(b)
             } catch (_: Exception) { }
         }
         
         fun stop(context: Context) {
             val intent = Intent(context, AuthenticationService::class.java)
             context.stopService(intent)
+            try {
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                config.udpRunning = false
+                val b = Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
+                    putExtra("udp_running", false)
+                }
+                context.sendBroadcast(b)
+            } catch (_: Exception) { }
         }
     }
     
@@ -132,6 +146,11 @@ class AuthenticationService : Service() {
                 Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
                 Log.d(TAG, "  - IPv4 broadcast: enabled")
                 Log.d(TAG, "  - IPv6 multicast: ff02::1")
+
+                // Mark UDP as running once we've successfully opened the socket
+                try {
+                    dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ applicationContext }, true)
+                } catch (_: Exception) { }
                 
                 val buffer = ByteArray(1024)
                 
@@ -160,6 +179,7 @@ class AuthenticationService : Service() {
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start UDP listener", e)
+                try { dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ applicationContext }, false) } catch (_: Exception) { }
             }
         }
     }
@@ -189,6 +209,7 @@ class AuthenticationService : Service() {
         udpSocket?.close()
         udpSocket = null
         Log.d(TAG, "Stopped listening")
+        try { dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false) } catch (_: Exception) { }
     }
     
     /**

@@ -52,7 +52,23 @@ class MainActivity : FragmentActivity() {
                     @Suppress("DEPRECATION")
                     incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
                 }
-                authRequest?.let { handleAuthRequest(it) }
+                authRequest?.let {
+                    val notifAction = incoming.getStringExtra("notification_action")
+                    when (notifAction) {
+                        "deny" -> {
+                            // Immediately deny without UI
+                            handleAuthResponse(it.requestId, approved = false, signedChallenge = null)
+                        }
+                        "approve" -> {
+                            // Start the biometric approval flow
+                            handleAuthRequest(it)
+                        }
+                        else -> {
+                            // Default behavior: open approval UI
+                            handleAuthRequest(it)
+                        }
+                    }
+                }
             }
         }
         
@@ -187,7 +203,14 @@ class MainActivity : FragmentActivity() {
                     @Suppress("DEPRECATION")
                     incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
                 }
-                authRequest?.let { handleAuthRequest(it) }
+                authRequest?.let {
+                    val notifAction = incoming.getStringExtra("notification_action")
+                    when (notifAction) {
+                        "deny" -> handleAuthResponse(it.requestId, approved = false, signedChallenge = null)
+                        "approve" -> handleAuthRequest(it)
+                        else -> handleAuthRequest(it)
+                    }
+                }
             }
         }
     }

@@ -69,5 +69,11 @@
         <action android:name="android.intent.action.BOOT_COMPLETED" />
       </intent-filter>
     </receiver>
+    <!-- Receiver to handle quick notification actions (deny) -->
+    <receiver android:name=".service.AuthActionReceiver" android:exported="true">
+      <intent-filter>
+        <action android:name="dev.rourunisen.tapauth.ACTION_NOTIFICATION_ACTION" />
+      </intent-filter>
+    </receiver>
   </application>
 </manifest>

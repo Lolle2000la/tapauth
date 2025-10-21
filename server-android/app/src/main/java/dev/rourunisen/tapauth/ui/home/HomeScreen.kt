@@ -19,9 +19,7 @@ fun HomeScreen(
     onViewDevices: () -> Unit,
     onSettings: () -> Unit
 ) {
-    val context = LocalContext.current
-    var isServiceRunning by remember { mutableStateOf(false) }
-    var isBleEnabled by remember { mutableStateOf(false) }
+    // Status display only; toggles were removed in favor of Settings controls
     
     Scaffold(
         topBar = {
@@ -57,23 +55,11 @@ fun HomeScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = if (isServiceRunning) "Port 36692" else "Stopped",
+                            text = "Port 36692",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    
-                    Switch(
-                        checked = isServiceRunning,
-                        onCheckedChange = { enabled ->
-                            if (enabled) {
-                                AuthenticationService.start(context)
-                            } else {
-                                AuthenticationService.stop(context)
-                            }
-                            isServiceRunning = enabled
-                        }
-                    )
                 }
             }
             
@@ -94,23 +80,11 @@ fun HomeScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = if (isBleEnabled) "Advertising" else "Stopped",
+                            text = "Advertising",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    
-                    Switch(
-                        checked = isBleEnabled,
-                        onCheckedChange = { enabled ->
-                            if (enabled) {
-                                context.startService(Intent(context, BleGattService::class.java))
-                            } else {
-                                context.stopService(Intent(context, BleGattService::class.java))
-                            }
-                            isBleEnabled = enabled
-                        }
-                    )
                 }
             }
             

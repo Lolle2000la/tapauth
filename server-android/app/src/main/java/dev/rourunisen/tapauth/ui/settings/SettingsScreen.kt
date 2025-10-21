@@ -5,6 +5,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.content.Intent as AndroidIntent
+import androidx.compose.material3.Switch
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalLifecycleOwner as ComposeLocalLifecycleOwner
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -30,6 +37,9 @@ fun SettingsScreen(
     val config = AppConfiguration.getInstance(context)
     val coroutineScope = rememberCoroutineScope()
     var showBatteryConfirm by remember { mutableStateOf(false) }
+    // Observe live state from ServiceStatusManager
+    val udpState by dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.collectAsState(initial = config.udpRunning)
+    val bleState by dev.rourunisen.tapauth.service.ServiceStatusManager.bleRunning.collectAsState(initial = config.bleRunning)
     
     Scaffold(
         topBar = {
@@ -108,7 +118,7 @@ fun SettingsScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     InfoRow("App Version", "1.0.0")
-                    Divider()
+                    HorizontalDivider()
                     InfoRow("Protocol Version", "1")
                     Divider()
                     InfoRow("Encryption", "AES-256-GCM")
@@ -138,6 +148,50 @@ fun SettingsScreen(
                     // Battery optimization prompt
                     Button(onClick = { showBatteryConfirm = true }) {
                         Text("Allow background operation / Battery optimizations")
+                    }
+
+                    // Service running switches
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("UDP Service", style = MaterialTheme.typography.bodyMedium)
+                            Text("UDP listener for auth requests", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        var udpBusy by remember { mutableStateOf(false) }
+                        Switch(checked = udpState, onCheckedChange = { checked ->
+                            coroutineScope.launch {
+                                udpBusy = true
+                                config.udpRunning = checked
+                                try {
+                                    if (checked) dev.rourunisen.tapauth.service.AuthenticationService.start(context)
+                                    else dev.rourunisen.tapauth.service.AuthenticationService.stop(context)
+                                } catch (_: Exception) {}
+                                // wait briefly for service to report state; timeout after 2s
+                                withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
+                                udpBusy = false
+                            }
+                        })
+                        if (udpBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                    }
+
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("BLE GATT Server", style = MaterialTheme.typography.bodyMedium)
+                            Text("BLE advertisement and GATT server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        var bleBusy by remember { mutableStateOf(false) }
+                        Switch(checked = bleState, onCheckedChange = { checked ->
+                            coroutineScope.launch {
+                                bleBusy = true
+                                config.bleRunning = checked
+                                try {
+                                    if (checked) dev.rourunisen.tapauth.ble.BleGattService.start(context)
+                                    else dev.rourunisen.tapauth.ble.BleGattService.stop(context)
+                                } catch (_: Exception) {}
+                                withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
+                                bleBusy = false
+                            }
+                        })
+                        if (bleBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
                     }
 
                     // Service status display

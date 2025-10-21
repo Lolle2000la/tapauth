@@ -42,12 +42,21 @@ class BleGattService : Service() {
             try {
                 val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
                 config.bleLastStartMillis = System.currentTimeMillis()
+                // Do not mark running=true here; mark when advertising actually starts
             } catch (_: Exception) { }
         }
 
         fun stop(context: Context) {
             val intent = Intent(context, BleGattService::class.java)
             context.stopService(intent)
+            try {
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                config.bleRunning = false
+                val b = Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
+                    putExtra("ble_running", false)
+                }
+                context.sendBroadcast(b)
+            } catch (_: Exception) { }
         }
     }
     
@@ -158,10 +167,12 @@ class BleGattService : Service() {
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             Log.i(TAG, "BLE advertising started successfully")
+            try { dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this@BleGattService }, true) } catch (_: Exception) { }
         }
         
         override fun onStartFailure(errorCode: Int) {
             Log.e(TAG, "BLE advertising failed with error: $errorCode")
+            try { dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this@BleGattService }, false) } catch (_: Exception) { }
         }
     }
     
@@ -187,6 +198,7 @@ class BleGattService : Service() {
             try {
                 val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
                 config.bleLastStartMillis = System.currentTimeMillis()
+                // advertising success will mark running=true via ServiceStatusManager
             } catch (_: Exception) { }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to start foreground for BLE service: ${e.message}")
@@ -516,6 +528,7 @@ class BleGattService : Service() {
             bluetoothGattServer?.close()
         }
         
+        try { dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false) } catch (_: Exception) { }
         serviceScope.cancel()
         Log.i(TAG, "BLE GATT Service destroyed")
     }

@@ -22,6 +22,8 @@ class AppConfiguration private constructor(context: Context) {
     private const val KEY_UDP_ENABLED = "udp_enabled"
     private const val KEY_UDP_LAST_START = "udp_last_start_millis"
     private const val KEY_BLE_LAST_START = "ble_last_start_millis"
+    private const val KEY_UDP_RUNNING = "udp_running"
+    private const val KEY_BLE_RUNNING = "ble_running"
         
         // Default values per specification
         private const val DEFAULT_UDP_PORT = 36692
@@ -100,6 +102,20 @@ class AppConfiguration private constructor(context: Context) {
         set(value) {
             prefs.edit().putLong(KEY_BLE_LAST_START, value).apply()
         }
+
+    /**
+     * Whether UDP service is currently running.
+     */
+    var udpRunning: Boolean
+        get() = prefs.getBoolean(KEY_UDP_RUNNING, false)
+        set(value) { prefs.edit().putBoolean(KEY_UDP_RUNNING, value).apply() }
+
+    /**
+     * Whether BLE GATT service is currently running.
+     */
+    var bleRunning: Boolean
+        get() = prefs.getBoolean(KEY_BLE_RUNNING, false)
+        set(value) { prefs.edit().putBoolean(KEY_BLE_RUNNING, value).apply() }
     
     /**
      * Reset all settings to defaults.

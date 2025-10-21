@@ -12,6 +12,9 @@ import dev.rourunisen.tapauth.data.TransportType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import dev.rourunisen.tapauth.data.KeypairRepository
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -25,7 +28,8 @@ class AuthRequestManager private constructor() {
     
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
-        val callback: (Boolean, ByteArray?) -> Unit
+        val callback: (Boolean, ByteArray?) -> Unit,
+        val appContext: android.content.Context
     )
     
     /**
@@ -56,8 +60,8 @@ class AuthRequestManager private constructor() {
             transportType = transportType
         )
         
-        // Store the pending request
-        pendingRequests[requestId] = PendingAuthRequest(authRequest, callback)
+    // Store the pending request
+    pendingRequests[requestId] = PendingAuthRequest(authRequest, callback, context.applicationContext)
         
         // Broadcast to MainActivity
         val intent = Intent(ACTION_AUTH_REQUEST).apply {
@@ -66,7 +70,7 @@ class AuthRequestManager private constructor() {
         }
         context.sendBroadcast(intent)
 
-        // Also post a notification so the user can tap to open the app and approve
+        // Also post a persistent notification so the user can tap to open the app and approve
         try {
             val activityIntent = Intent(context, dev.rourunisen.tapauth.MainActivity::class.java).apply {
                 action = ACTION_AUTH_REQUEST
@@ -80,12 +84,54 @@ class AuthRequestManager private constructor() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
 
+            // Action: Approve -> open app and show biometric prompt
+            val approveIntent = Intent(context, dev.rourunisen.tapauth.MainActivity::class.java).apply {
+                action = ACTION_AUTH_REQUEST
+                putExtra(EXTRA_AUTH_REQUEST, authRequest)
+                putExtra("notification_action", "approve")
+            }
+            val approvePending = PendingIntent.getActivity(
+                context,
+                (requestId + "_approve").hashCode(),
+                approveIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            // Action: Deny -> quick deny handled by BroadcastReceiver (no UI)
+            // Create HMAC token over the request ID using the server private key to prevent spoofing
+            var hmacBytes: ByteArray? = null
+            try {
+                val keypairRepo = KeypairRepository(context)
+                val hmacKey = keypairRepo.getOrCreateHmacKey()
+                val mac = Mac.getInstance("HmacSHA256")
+                mac.init(hmacKey)
+                hmacBytes = mac.doFinal(requestId.toByteArray(Charsets.UTF_8))
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to compute HMAC for deny action: ${e.message}")
+            }
+
+            val denyBroadcast = Intent(context, dev.rourunisen.tapauth.service.AuthActionReceiver::class.java).apply {
+                action = dev.rourunisen.tapauth.service.AuthActionReceiver.ACTION_NOTIFICATION_ACTION
+                putExtra("notification_action", "deny")
+                putExtra(EXTRA_AUTH_REQUEST, authRequest)
+                hmacBytes?.let { putExtra("hmac", it) }
+            }
+            val denyPending = PendingIntent.getBroadcast(
+                context,
+                (requestId + "_deny").hashCode(),
+                denyBroadcast,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
             val notification = NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                 .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                 .setContentTitle("Authentication request")
                 .setContentText("${deviceName}: ${username}@${hostname}")
                 .setContentIntent(pendingIntent)
-                .setAutoCancel(true)
+                .addAction(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground, "Approve", approvePending)
+                .addAction(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground, "Deny", denyPending)
+                .setOngoing(true)
+                .setAutoCancel(false)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .build()
 
@@ -110,6 +156,10 @@ class AuthRequestManager private constructor() {
             scope.launch {
                 pending.callback(approved, signedChallenge)
             }
+            // Cancel the persistent notification
+            try {
+                NotificationManagerCompat.from(pending.appContext).cancel(requestId.hashCode())
+            } catch (_: Exception) { }
         } else {
             Log.w(TAG, "Received response for unknown request ID: $requestId")
         }
