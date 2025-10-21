@@ -1,5 +1,6 @@
 package dev.rourunisen.tapauth.network
 
+import android.content.Context
 import android.util.Log
 import dev.rourunisen.tapauth.crypto.Ed25519Keypair
 import dev.rourunisen.tapauth.crypto.X25519Keypair
@@ -24,7 +25,7 @@ import java.security.SecureRandom
  * 5. Server confirms by sending hash of CSK encrypted with PSK
  * 6. Both discard PSK and store CSK for future communication
  */
-class PairingClient {
+class PairingClient(private val context: Context) {
     
     companion object {
         private const val TAG = "PairingClient"
@@ -55,11 +56,15 @@ class PairingClient {
             // Step 1: Generate our (server's) ephemeral X25519 keypair
             val serverEphemeralKeyPair = X25519Keypair.generate()
             
+            // Get the server's permanent Ed25519 keypair for signing
+            val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(context)
+            val serverEd25519PublicKey = keypairRepo.getPublicKey()
+            
             // Step 2: Send PairingHello message (protobuf) - SERVER SENDS FIRST
             val pairingHello = dev.rourunisen.tapauth.crypto.createPairingHello(
                 version = 1,
                 x25519PublicKey = serverEphemeralKeyPair.publicKey,
-                ed25519PublicKey = serverEphemeralKeyPair.publicKey // TODO: Use proper Ed25519 for signing
+                ed25519PublicKey = serverEd25519PublicKey // Use actual Ed25519 signing key
             )
             
             // Send length-prefixed protobuf message

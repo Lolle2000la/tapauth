@@ -27,9 +27,26 @@ pub fn create_auth_request(
     username: &str,
     hostname: &str,
 ) -> Result<AuthenticationRequest, ProtocolError> {
-    // Generate random challenge
+    // Convenience: generate a random challenge and delegate to the
+    // variant that accepts an externally-supplied challenge. This keeps
+    // existing callers working while allowing callers who already
+    // track the challenge (e.g. client) to sign/verify the same nonce.
     let mut challenge = [0u8; 32];
     getrandom::getrandom(&mut challenge).expect("getrandom failed");
+
+    create_auth_request_with_challenge(keypair, username, hostname, &challenge)
+}
+
+/// Create an AuthenticationRequest with an externally supplied 32-byte challenge.
+pub fn create_auth_request_with_challenge(
+    keypair: &Ed25519KeyPair,
+    username: &str,
+    hostname: &str,
+    challenge: &[u8],
+) -> Result<AuthenticationRequest, ProtocolError> {
+    if challenge.len() != 32 {
+        return Err(ProtocolError::InvalidMessageFormat);
+    }
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,10 +138,35 @@ pub fn verify_auth_grant(
     unsigned_grant.signature = Vec::new();
     let data_to_verify = unsigned_grant.encode_to_vec();
 
-    verify_ed25519(server_public_key, &data_to_verify, &grant.signature)?;
+    // First check: grant.signature over the grant message (with signature cleared)
+    if let Err(e) = verify_ed25519(server_public_key, &data_to_verify, &grant.signature) {
+        // Log diagnostic details for debugging
+        tracing::error!(
+            "Grant signature verification failed: {:?}; grant_sig_len={}, data_len={}",
+            e,
+            grant.signature.len(),
+            data_to_verify.len()
+        );
+        tracing::error!("Grant (unsigned) hex: {}", hex::encode(&data_to_verify));
+        tracing::error!("Grant signature hex: {}", hex::encode(&grant.signature));
+        return Err(ProtocolError::Crypto(e.into()));
+    }
 
-    // Verify the signed challenge
-    verify_ed25519(server_public_key, challenge, &grant.signed_challenge)?;
+    // Second check: signed_challenge is a signature over the original challenge
+    if let Err(e) = verify_ed25519(server_public_key, challenge, &grant.signed_challenge) {
+        tracing::error!(
+            "Signed-challenge verification failed: {:?}; signed_challenge_len={}, challenge_len={}",
+            e,
+            grant.signed_challenge.len(),
+            challenge.len()
+        );
+        tracing::error!("Challenge (hex): {}", hex::encode(challenge));
+        tracing::error!(
+            "Signed challenge signature hex: {}",
+            hex::encode(&grant.signed_challenge)
+        );
+        return Err(ProtocolError::Crypto(e.into()));
+    }
 
     Ok(())
 }

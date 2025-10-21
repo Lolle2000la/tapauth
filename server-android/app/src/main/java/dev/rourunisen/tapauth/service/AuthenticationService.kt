@@ -28,6 +28,7 @@ class AuthenticationService : Service() {
     private var udpSocket: MulticastSocket? = null
     private var isRunning = false
     private lateinit var deviceRepository: DeviceRepository
+    private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val retransmissionManager = RetransmissionManager.getInstance()
     private val requestRateLimiter = RequestRateLimiter()
@@ -56,6 +57,7 @@ class AuthenticationService : Service() {
     override fun onCreate() {
         super.onCreate()
         deviceRepository = DeviceRepository(this)
+        keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
         appConfig = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
         temporalIdCache = TemporalIdCache(deviceRepository, serviceScope)
         temporalIdCache.start()
@@ -515,8 +517,16 @@ class AuthenticationService : Service() {
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "Auth request approved, creating encrypted grant")
                     try {
-                        // Create WrapperMessage containing AuthenticationGrant
-                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(signedChallenge)
+                        // Get server private key for signing
+                        val privateKey = keypairRepository.getPrivateKey()
+                        val publicKey = keypairRepository.getPublicKey()
+                        Log.d(TAG, "Signing grant with server public key: ${publicKey.joinToString("") { "%02x".format(it) }}")
+                        
+                        // Create WrapperMessage containing AuthenticationGrant (now properly signed)
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
+                            signedChallenge,
+                            privateKey
+                        )
                         
                         // Create proper EncryptedPacket per specification
                         val encryptedPacketBytes = dev.rourunisen.tapauth.crypto.createEncryptedPacket(

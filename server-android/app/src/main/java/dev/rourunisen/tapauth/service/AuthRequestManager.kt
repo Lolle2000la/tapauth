@@ -5,6 +5,9 @@ import android.content.Intent
 import android.util.Log
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.TransportType
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -14,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 class AuthRequestManager private constructor() {
     
     private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
+    private val scope = CoroutineScope(Dispatchers.IO)
     
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
@@ -70,7 +74,10 @@ class AuthRequestManager private constructor() {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
             Log.d(TAG, "Auth request $requestId ${if (approved) "approved" else "denied"}")
-            pending.callback(approved, signedChallenge)
+            // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
+            scope.launch {
+                pending.callback(approved, signedChallenge)
+            }
         } else {
             Log.w(TAG, "Received response for unknown request ID: $requestId")
         }
@@ -83,7 +90,10 @@ class AuthRequestManager private constructor() {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
             Log.d(TAG, "Cancelled auth request $requestId")
-            pending.callback(false, null)
+            // Launch callback on IO dispatcher
+            scope.launch {
+                pending.callback(false, null)
+            }
         }
     }
     

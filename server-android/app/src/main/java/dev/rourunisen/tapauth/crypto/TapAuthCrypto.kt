@@ -134,7 +134,7 @@ object TapAuthCrypto {
      * @param signedChallenge The signed challenge bytes
      * @return Serialized WrapperMessage protobuf bytes
      */
-    external fun createGrantWrapperMessage(signedChallenge: ByteArray): ByteArray
+    external fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKeyHex: String): ByteArray
     
     /**
      * Create an EncryptedPacket from a WrapperMessage payload
@@ -417,8 +417,8 @@ fun decryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, cipher
 /**
  * Create a WrapperMessage containing an AuthenticationGrant
  */
-fun createGrantWrapperMessage(signedChallenge: ByteArray): ByteArray {
-    return TapAuthCrypto.createGrantWrapperMessage(signedChallenge)
+fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKey: ByteArray): ByteArray {
+    return TapAuthCrypto.createGrantWrapperMessage(signedChallenge, bytesToHex(privateKey))
 }
 
 /**

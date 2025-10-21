@@ -86,8 +86,13 @@ impl AuthenticationClient {
             return Err(AuthError::NoPairedDevices);
         }
 
-        // Create the authentication request
-        let request = create_auth_request(&self.keypair, &self.username, &self.hostname)?;
+        // Create the authentication request using the challenge we generated
+        let request = create_auth_request_with_challenge(
+            &self.keypair,
+            &self.username,
+            &self.hostname,
+            &self.challenge,
+        )?;
         let wrapper = wrap_auth_request(request);
 
         // Create encrypted packet

@@ -36,6 +36,7 @@ class BleGattService : Service() {
     private var bluetoothLeAdvertiser: BluetoothLeAdvertiser? = null
     
     private lateinit var deviceRepository: DeviceRepository
+    private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private lateinit var biometricHelper: BiometricHelper
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     
@@ -146,6 +147,7 @@ class BleGattService : Service() {
     override fun onCreate() {
         super.onCreate()
         deviceRepository = DeviceRepository(this)
+        keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
         biometricHelper = BiometricHelper(this)
         
         bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
@@ -388,8 +390,14 @@ class BleGattService : Service() {
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "BLE auth request approved, creating encrypted grant")
                     try {
-                        // Create WrapperMessage containing AuthenticationGrant
-                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(signedChallenge)
+                        // Get server private key for signing
+                        val privateKey = keypairRepository.getPrivateKey()
+                        
+                        // Create WrapperMessage containing AuthenticationGrant (now properly signed)
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
+                            signedChallenge,
+                            privateKey
+                        )
                         
                         // Create proper EncryptedPacket per specification
                         val encryptedPacket = dev.rourunisen.tapauth.crypto.createEncryptedPacket(

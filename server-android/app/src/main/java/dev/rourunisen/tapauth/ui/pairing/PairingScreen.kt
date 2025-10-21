@@ -26,8 +26,8 @@ fun PairingScreen(
 ) {
     var pairingState by remember { mutableStateOf<PairingState>(PairingState.Connecting) }
     val scope = rememberCoroutineScope()
-    val pairingClient = remember { PairingClient() }
     val context = LocalContext.current
+    val pairingClient = remember { PairingClient(context) }
     val deviceRepository = remember { DeviceRepository(context) }
     
     LaunchedEffect(pairingUrl) {

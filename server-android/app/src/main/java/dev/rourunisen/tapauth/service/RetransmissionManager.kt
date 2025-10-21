@@ -23,6 +23,7 @@ class RetransmissionManager {
         private const val TAG = "RetransmissionManager"
         private const val RETRANSMISSION_INTERVAL_MS = 500L // Fixed 500ms per spec
         private const val MAX_RETRANSMISSION_DURATION_MS = 120_000L // 120 seconds (session timeout per spec)
+        private const val MAX_RETRANSMISSION_ATTEMPTS = 20 // Maximum 20 attempts (10 seconds total)
         
         @Volatile
         private var instance: RetransmissionManager? = null
@@ -94,7 +95,7 @@ class RetransmissionManager {
             var attempts = 0
             val startTime = System.currentTimeMillis()
             
-            while (isActive) {
+            while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
                 try {
                     // Send the response
                     val packet = DatagramPacket(
@@ -109,9 +110,14 @@ class RetransmissionManager {
                     val elapsed = System.currentTimeMillis() - startTime
                     Log.d(TAG, "UDP retransmission attempt #$attempts (elapsed=${elapsed}ms)")
                     
-                    // Check if we've exceeded max duration
+                    // Check if we've exceeded max duration or attempts
                     if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
                         Log.w(TAG, "UDP retransmission timeout after ${elapsed}ms, stopping")
+                        break
+                    }
+                    
+                    if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
+                        Log.w(TAG, "UDP retransmission max attempts reached ($attempts), stopping")
                         break
                     }
                     
@@ -152,7 +158,7 @@ class RetransmissionManager {
             var attempts = 0
             val startTime = System.currentTimeMillis()
             
-            while (isActive) {
+            while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
                 try {
                     // Send the response via callback
                     request.sendCallback(request.responseData)
@@ -161,9 +167,14 @@ class RetransmissionManager {
                     val elapsed = System.currentTimeMillis() - startTime
                     Log.d(TAG, "BLE retransmission attempt #$attempts (elapsed=${elapsed}ms)")
                     
-                    // Check if we've exceeded max duration
+                    // Check if we've exceeded max duration or attempts
                     if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
                         Log.w(TAG, "BLE retransmission timeout after ${elapsed}ms, stopping")
+                        break
+                    }
+                    
+                    if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
+                        Log.w(TAG, "BLE retransmission max attempts reached ($attempts), stopping")
                         break
                     }
                     
