@@ -169,6 +169,33 @@ class KeypairRepository(private val context: Context) {
         keyGenerator.init(keyGenParameterSpec)
         return keyGenerator.generateKey()
     }
+
+    /**
+     * Get or create a symmetric HMAC key stored in Android Keystore for use with HmacSHA256.
+     */
+    fun getOrCreateHmacKey(): SecretKey {
+        // If key already exists in keystore, return it
+        if (keyStore.containsAlias(KEYSTORE_HMAC_ALIAS)) {
+            return keyStore.getKey(KEYSTORE_HMAC_ALIAS, null) as SecretKey
+        }
+
+        // Generate new HMAC key in Android Keystore
+        val keyGenerator = KeyGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_HMAC_SHA256,
+            KEYSTORE_PROVIDER
+        )
+
+        val keyGenParameterSpec = KeyGenParameterSpec.Builder(
+            KEYSTORE_HMAC_ALIAS,
+            KeyProperties.PURPOSE_SIGN
+        )
+            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setUserAuthenticationRequired(false)
+            .build()
+
+        keyGenerator.init(keyGenParameterSpec)
+        return keyGenerator.generateKey()
+    }
     
     companion object {
         private const val TAG = "KeypairRepository"
@@ -178,6 +205,7 @@ class KeypairRepository(private val context: Context) {
         private const val KEY_PRIVATE_KEY_IV = "private_key_iv"
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val KEYSTORE_ALIAS = "tapauth_keypair_encryption_key"
+        private const val KEYSTORE_HMAC_ALIAS = "tapauth_hmac_key"
         private const val ENCRYPTION_TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_LENGTH = 128
     }
