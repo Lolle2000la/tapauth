@@ -19,11 +19,16 @@ class AppConfiguration private constructor(context: Context) {
         private const val KEY_UDP_PORT = "udp_port"
         private const val KEY_SESSION_TIMEOUT = "session_timeout_seconds"
         private const val KEY_BLE_ENABLED = "ble_enabled"
+    private const val KEY_UDP_ENABLED = "udp_enabled"
+    private const val KEY_UDP_LAST_START = "udp_last_start_millis"
+    private const val KEY_BLE_LAST_START = "ble_last_start_millis"
         
         // Default values per specification
         private const val DEFAULT_UDP_PORT = 36692
         private const val DEFAULT_SESSION_TIMEOUT = 120L // 120 seconds per spec
         private const val DEFAULT_BLE_ENABLED = true
+    private const val DEFAULT_UDP_ENABLED = true
+    private const val DEFAULT_LAST_START = 0L
         
         @Volatile
         private var instance: AppConfiguration? = null
@@ -66,6 +71,34 @@ class AppConfiguration private constructor(context: Context) {
         get() = prefs.getBoolean(KEY_BLE_ENABLED, DEFAULT_BLE_ENABLED)
         set(value) {
             prefs.edit().putBoolean(KEY_BLE_ENABLED, value).apply()
+        }
+
+    /**
+     * Whether UDP server is enabled.
+     * Default: true
+     */
+    var udpEnabled: Boolean
+        get() = prefs.getBoolean(KEY_UDP_ENABLED, DEFAULT_UDP_ENABLED)
+        set(value) {
+            prefs.edit().putBoolean(KEY_UDP_ENABLED, value).apply()
+        }
+
+    /**
+     * Last time the UDP authentication service was started (epoch millis). 0 = never
+     */
+    var udpLastStartMillis: Long
+        get() = prefs.getLong(KEY_UDP_LAST_START, DEFAULT_LAST_START)
+        set(value) {
+            prefs.edit().putLong(KEY_UDP_LAST_START, value).apply()
+        }
+
+    /**
+     * Last time the BLE GATT service was started (epoch millis). 0 = never
+     */
+    var bleLastStartMillis: Long
+        get() = prefs.getLong(KEY_BLE_LAST_START, DEFAULT_LAST_START)
+        set(value) {
+            prefs.edit().putLong(KEY_BLE_LAST_START, value).apply()
         }
     
     /**

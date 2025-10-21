@@ -46,6 +46,10 @@ class AuthenticationService : Service() {
             } else {
                 context.startService(intent)
             }
+            try {
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                config.udpLastStartMillis = System.currentTimeMillis()
+            } catch (_: Exception) { }
         }
         
         fun stop(context: Context) {

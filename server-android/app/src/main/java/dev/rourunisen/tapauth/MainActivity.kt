@@ -190,12 +190,10 @@ fun TapAuthApp() {
     
     val permissionsState = rememberMultiplePermissionsState(permissions)
     
-    // Request permissions on first composition
-    LaunchedEffect(Unit) {
-        if (!permissionsState.allPermissionsGranted) {
-            permissionsState.launchMultiplePermissionRequest()
-        }
-    }
+    // NOTE: Do not automatically launch the permission dialog on composition.
+    // Some devices / OEMs can crash when multiple permission dialogs are launched
+    // immediately during composition. The PermissionRequestScreen provides an
+    // explicit "Grant Permissions" button so the user can start the flow.
     
     // Show permission request screen if not all granted
     if (!permissionsState.allPermissionsGranted) {

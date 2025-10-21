@@ -18,6 +18,8 @@
   <!-- Foreground service permission for authentication listener -->
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+  <!-- Allow app to start services after device boot so background listeners resume -->
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <!-- Biometric authentication -->
   <uses-permission android:name="android.permission.USE_BIOMETRIC" />
@@ -61,5 +63,11 @@
     />
     <!-- BLE GATT Service -->
     <service android:name=".ble.BleGattService" android:enabled="true" android:exported="false" />
+    <!-- Receiver to restart services after device boot -->
+    <receiver android:name=".BootReceiver" android:exported="false">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+      </intent-filter>
+    </receiver>
   </application>
 </manifest>

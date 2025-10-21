@@ -1,6 +1,7 @@
 package dev.rourunisen.tapauth.ble
 
 import android.Manifest
+import android.content.Context
 import android.app.Service
 import android.bluetooth.*
 import android.bluetooth.le.AdvertiseCallback
@@ -9,6 +10,8 @@ import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.app.Notification
+import android.app.PendingIntent
 import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
@@ -23,11 +26,29 @@ class BleGattService : Service() {
     
     companion object {
         private const val TAG = "BleGattService"
+        private const val NOTIFICATION_ID = 2
         
         // UUIDs from shared library specification
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
         val CLIENT_COMMAND_CHAR_UUID: UUID = UUID.fromString("caf54438-9d78-4697-8886-0a4cfa87ba8d")
         val SERVER_RESPONSE_CHAR_UUID: UUID = UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
+        fun start(context: Context) {
+            val intent = Intent(context, BleGattService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+            try {
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                config.bleLastStartMillis = System.currentTimeMillis()
+            } catch (_: Exception) { }
+        }
+
+        fun stop(context: Context) {
+            val intent = Intent(context, BleGattService::class.java)
+            context.stopService(intent)
+        }
     }
     
     private var bluetoothManager: BluetoothManager? = null
@@ -160,8 +181,39 @@ class BleGattService : Service() {
             return
         }
         
+        // Start as foreground so the system keeps the service alive in background
+        try {
+            startForeground(NOTIFICATION_ID, createNotification())
+            try {
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
+                config.bleLastStartMillis = System.currentTimeMillis()
+            } catch (_: Exception) { }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to start foreground for BLE service: ${e.message}")
+        }
+
         startGattServer()
         startAdvertising()
+    }
+
+    // onDestroy is implemented once further down; keep that implementation
+
+    private fun createNotification(): Notification {
+        val notificationIntent = Intent(this, dev.rourunisen.tapauth.MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return androidx.core.app.NotificationCompat.Builder(this, dev.rourunisen.tapauth.TapAuthApplication.CHANNEL_ID)
+            .setContentTitle("TapAuth BLE")
+            .setContentText("BLE advertisement and GATT server active")
+            .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .build()
     }
     
     private fun startGattServer() {
