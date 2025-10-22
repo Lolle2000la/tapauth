@@ -21,7 +21,7 @@ Complete Docker-based development environment for testing and developing TapAuth
 
 ### Host System Requirements
 
-1. **Docker** (20.10+ recommended)
+1. **Docker** (20.10+ recommended, podman works transparently)
    ```bash
    # Ubuntu/Debian
    sudo apt-get install docker.io docker-compose
@@ -428,8 +428,8 @@ xhost +SI:localuser:$(whoami)
 ### Volumes
 
 The following Docker volumes persist data:
-- `tapauth-cargo-cache`: Rust build cache (~500MB)
-- `tapauth-target-cache`: Compiled binaries (~2GB)
+- `tapauth-cargo-cache`: Rust build cache
+- `tapauth-target-cache`: Compiled binaries
 - `tapauth-config`: Configuration files
 
 To reset everything:

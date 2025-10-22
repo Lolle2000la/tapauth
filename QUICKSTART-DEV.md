@@ -20,7 +20,7 @@ echo $DISPLAY
 # ✅ Should show: :0 or :1
 ```
 
-If any of these fail, see `DEVELOPMENT.md` for installation instructions.
+If any of these fail, see [`DEVELOPMENT.md`](DEVELOPMENT.md) for installation instructions.
 
 ---
 
@@ -106,7 +106,7 @@ exit
 
 ### Start Environment
 ```bash
-./dev-start.sh  # Usually fast (~10 seconds)
+./dev-start.sh  # will rebuild if needed, press 'y' if prompted
 ./dev-shell.sh  # Enter container
 ```
 
