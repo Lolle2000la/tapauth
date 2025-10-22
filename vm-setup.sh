@@ -120,7 +120,7 @@ network:
   ethernets:
     ens3:
       dhcp4: true
-      dhcp6: false
+      dhcp6: true
 
 # Package updates
 package_update: true

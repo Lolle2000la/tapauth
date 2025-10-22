@@ -10,10 +10,32 @@ cd "$SCRIPT_DIR"
 # Load configuration
 source ./vm-config.sh
 
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ This script must be run as root (using sudo) to manage network devices."
+  exit 1
+fi
+
+# Fix paths when run with sudo
+if [ -n "$SUDO_USER" ]; then
+    ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
+    VM_IMAGE_DIR="${ORIGINAL_HOME}/.tapauth-vm"
+    VM_DISK_IMAGE="${VM_IMAGE_DIR}/${VM_NAME}.qcow2"
+    VM_CLOUD_INIT_ISO="${VM_IMAGE_DIR}/${VM_NAME}-cloud-init.iso"
+    SSH_KEY_FILE="${VM_IMAGE_DIR}/id_rsa"
+fi
+
+# Auto-detect HOST ETHERNET interface
+HOST_OUT_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+if [ -z "$HOST_OUT_IFACE" ]; then
+    HOST_OUT_IFACE=$(ip link | grep -E 'enp|eth' | awk '{print $2}' | sed 's/://' | head -1)
+fi
+if [ -z "$HOST_OUT_IFACE" ]; then
+    echo "⚠️  Could not auto-detect host internet interface for cleanup."
+fi
+
 echo "Stopping TapAuth VM..."
 echo ""
 
-# Check if VM is running
 if [ ! -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     echo "⚠️  VM is not running (no PID file)"
 else
@@ -22,28 +44,12 @@ else
     if ps -p "$VM_PID" > /dev/null 2>&1; then
         echo "==> Shutting down VM gracefully..."
         
-        # Try graceful shutdown via SSH
-        if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-               -o IdentitiesOnly=yes -o ConnectTimeout=2 -i "${VM_IMAGE_DIR}/id_rsa" \
-               -p "$VM_SSH_PORT" "${VM_SSH_USER}@localhost" "sudo poweroff" 2>/dev/null; then
-            echo "   Sent shutdown command, waiting..."
-            
-            # Wait up to 30 seconds for graceful shutdown
-            for i in {1..30}; do
-                if ! ps -p "$VM_PID" > /dev/null 2>&1; then
-                    echo "✅ VM shut down gracefully"
-                    break
-                fi
-                sleep 1
-            done
-        fi
+        echo "   Cannot guess VM IP, skipping SSH shutdown."
         
-        # If still running, use QEMU monitor
         if ps -p "$VM_PID" > /dev/null 2>&1; then
             echo "   Sending ACPI shutdown via QEMU monitor..."
             echo "system_powerdown" | socat - "UNIX-CONNECT:${VM_IMAGE_DIR}/${VM_NAME}.monitor" 2>/dev/null || true
             
-            # Wait up to 15 seconds
             for i in {1..15}; do
                 if ! ps -p "$VM_PID" > /dev/null 2>&1; then
                     echo "✅ VM shut down via ACPI"
@@ -53,7 +59,6 @@ else
             done
         fi
         
-        # Last resort: kill the process
         if ps -p "$VM_PID" > /dev/null 2>&1; then
             echo "   Forcing shutdown..."
             kill "$VM_PID"
@@ -68,9 +73,52 @@ else
         echo "⚠️  VM is not running (stale PID file)"
     fi
     
-    # Remove PID file
     rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
 fi
+
+# Function to tear down the bridge
+teardown_bridge() {
+    echo "==> Tearing down network bridge..."
+    echo "⚠️  This will temporarily disrupt host networking."
+
+    if ip link show "$VM_TAP_DEVICE" > /dev/null 2>&1; then
+        echo "   Removing TAP device '$VM_TAP_DEVICE'..."
+        ip link set "$VM_TAP_DEVICE" down
+        ip link del "$VM_TAP_DEVICE"
+    else
+        echo "   TAP device '$VM_TAP_DEVICE' already gone."
+    fi
+
+    if ip link show "$VM_BRIDGE" > /dev/null 2>&1; then
+        
+        if [ -n "$HOST_OUT_IFACE" ] && ip link show "$HOST_OUT_IFACE" | grep -q "master $VM_BRIDGE"; then
+            echo "   Removing $HOST_OUT_IFACE from bridge..."
+            ip link set "$HOST_OUT_IFACE" nomaster
+        fi
+        
+        echo "   Removing bridge '$VM_BRIDGE'..."
+        ip link set "$VM_BRIDGE" down
+        ip link del "$VM_BRIDGE"
+    else
+        echo "   Bridge '$VM_BRIDGE' already gone."
+    fi
+    
+    if [ -n "$HOST_OUT_IFACE" ]; then
+        # --- MODIFIED: Make DHCP request more robust ---
+        echo "   Releasing any old DHCP leases..."
+        dhclient -r "$VM_BRIDGE" &> /dev/null || true
+        dhclient -r "$HOST_OUT_IFACE" &> /dev/null || true
+        # --- END MODIFICATION ---
+        echo "   Requesting DHCP for host on '$HOST_OUT_IFACE'..."
+        dhclient "$HOST_OUT_IFACE"
+    fi
+    
+    echo "✅ Network bridge teardown complete."
+}
+
+# Call teardown function
+teardown_bridge
+echo ""
 
 # Restore host Bluetooth
 echo ""
