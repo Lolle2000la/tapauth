@@ -710,8 +710,6 @@ The container is **ephemeral** - your code changes are on the host!
 ## 📚 Additional Resources
 
 - **Project Documentation**: `/tapauth/docs/`
-- **Compliance Reports**: `/tapauth/CLIENT_COMPLIANCE_REPORT.md`
-- **Feature Status**: `/tapauth/FEATURE_COMPLETE_STATUS.md`
 - **Android Build**: `/tapauth/server-android/BUILD_NATIVE.md`
 
 ---

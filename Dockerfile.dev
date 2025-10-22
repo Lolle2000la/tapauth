@@ -327,7 +327,6 @@ Logs:\n\
 \n\
 Documentation:\n\
   See /tapauth/docs/ for detailed documentation\n\
-  See /tapauth/FEATURE_COMPLETE_STATUS.md for project status\n\
 \n\
 EOF\n\
 ' > /usr/local/bin/tapauth-welcome && chmod +x /usr/local/bin/tapauth-welcome

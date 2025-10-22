@@ -181,7 +181,6 @@ test-pam-auth root
 
 - **Full Guide**: `DEVELOPMENT.md` - Complete documentation
 - **Architecture**: `docs/` - Design documents
-- **Status**: `FEATURE_COMPLETE_STATUS.md` - What's implemented
 
 ---
 
