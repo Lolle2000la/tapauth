@@ -1,97 +1,100 @@
 # TapAuth Development Environment
 
-Complete Docker-based development environment for testing and developing TapAuth authentication system.
+**⚠️ IMPORTANT: This project now uses a VM-based development environment instead of Docker.**
+
+For the latest VM-based setup, see: **[VM-DEVELOPMENT.md](VM-DEVELOPMENT.md)**
+
+If you're migrating from Docker, see: **[DOCKER-TO-VM-MIGRATION.md](DOCKER-TO-VM-MIGRATION.md)**
 
 ---
 
-## 🎯 Features
+## 🎯 Why VM Instead of Docker?
 
-- ✅ **Complete Linux client environment** (PAM module + GUI)
-- ✅ **X11 forwarding** for GUI testing
-- ✅ **Bluetooth support** via host passthrough
-- ✅ **Full network access** (host networking)
-- ✅ **PAM testing** with `pamtester`
-- ✅ **Live code editing** (source mounted as volume)
-- ✅ **Build caching** (fast rebuilds)
-- ✅ **Side-by-side Android** debug builds
+The development environment has been migrated to QEMU/KVM virtual machines for:
+
+- ✅ **Full network broadcast support** - Critical for UDP discovery protocol
+- ✅ **Exclusive Bluetooth access** - USB passthrough for complete BLE control
+- ✅ **Better isolation** - True virtualization for realistic testing
+- ✅ **Same workflow** - Same dev-start.sh, dev-shell.sh commands work!
 
 ---
 
-## 📋 Prerequisites
+## � Quick Start (VM)
 
-### Host System Requirements
-
-1. **Docker** (20.10+ recommended, podman works transparently)
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install docker.io docker-compose
-   
-   # Or install Docker Desktop
-   # https://docs.docker.com/get-docker/
-   ```
-
-2. **X11 Server** (for GUI)
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install x11-xserver-utils
-   ```
-
-3. **Bluetooth** (optional, for BLE GATT testing)
-   - Bluetooth adapter on host
-   - BlueZ installed on host
-
-4. **Android Studio** (for Android server testing)
-   - Download from: https://developer.android.com/studio
-
----
-
-## 🚀 Quick Start
-
-### 1. Start Development Environment
+### Prerequisites
 
 ```bash
-# From the tapauth repository root
+# Install QEMU/KVM and dependencies
+sudo apt-get install qemu-system-x86 qemu-utils cloud-image-utils \
+    libvirt-daemon-system libvirt-clients bridge-utils socat \
+    x11-xserver-utils
+
+# Add yourself to required groups
+sudo usermod -a -G kvm,libvirt $USER
+# Log out and back in for changes to take effect
+```
+
+### 1. Setup VM (First Time Only)
+
+```bash
+cd /home/luca/source/repos/tapauth
+./vm-setup.sh
+```
+
+This downloads Ubuntu cloud image and creates the VM (~5 minutes).
+
+### 2. Start Development Environment
+
+```bash
 ./dev-start.sh
 ```
 
-This will:
-- Build the Docker image (first run takes ~5-10 minutes)
-- Start the container in the background
-- Build all TapAuth components
-- Display welcome message
+**First boot takes 5-10 minutes** to install packages. Watch the QEMU window.
 
-### 2. Enter the Container
+### 3. Enter the VM
 
 ```bash
 ./dev-shell.sh
 ```
 
-You're now inside the development environment!
+You're now inside the development environment via SSH!
 
-### 3. Pair a Device
+### 4. Build TapAuth
 
-Inside the container:
+Inside the VM:
 ```bash
-run-gui
+build-tapauth
 ```
 
-This opens the TapAuth GUI where you can:
-- Pair your Android device (QR code)
-- Manage paired devices
-- Configure settings
+### 5. Test Authentication
 
-### 4. Test Authentication
-
-Inside the container:
+Inside the VM:
 ```bash
+# Run unit tests
+test-tapauth
+
+# Test PAM authentication
 test-pam-auth root
 ```
 
-This will:
-- Start BLE advertisement
-- Broadcast UDP discovery packets
-- Wait for authentication from your Android device
-- Show authentication result
+---
+
+## 📖 Documentation
+
+- **[VM-DEVELOPMENT.md](VM-DEVELOPMENT.md)** - Complete VM environment guide
+  - Architecture details
+  - Network configuration
+  - Bluetooth USB passthrough
+  - Troubleshooting
+  - Advanced configuration
+
+- **[DOCKER-TO-VM-MIGRATION.md](DOCKER-TO-VM-MIGRATION.md)** - Migration guide
+  - Why we switched
+  - Step-by-step migration
+  - Comparison
+  - Rollback instructions
+
+- **[QUICKSTART-DEV.md](QUICKSTART-DEV.md)** - Quick reference
 
 ---
 

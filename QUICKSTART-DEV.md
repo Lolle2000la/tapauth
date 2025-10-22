@@ -1,48 +1,84 @@
 # 🚀 TapAuth Development Quick Start
 
-Get up and running with TapAuth development in 5 minutes!
+**⚠️ The development environment now uses VMs instead of Docker for better network broadcast and Bluetooth support.**
+
+Get up and running with TapAuth development in 10 minutes!
 
 ---
 
 ## Prerequisites Check
 
 ```bash
-# Check if you have Docker
-docker --version
-# ✅ Should show: Docker version 20.10+
+# Check if you have QEMU/KVM
+qemu-system-x86_64 --version
+# ✅ Should show: QEMU emulator version 6.0+
 
-# Check if you have Docker Compose
-docker-compose --version
-# ✅ Should show: docker-compose version 1.29+
+# Check KVM support
+egrep -c '(vmx|svm)' /proc/cpuinfo
+# ✅ Should show: > 0 (number of CPU cores)
 
 # Check if you have X11
 echo $DISPLAY
 # ✅ Should show: :0 or :1
+
+# Check your user is in kvm group
+groups
+# ✅ Should include: kvm libvirt
 ```
 
-If any of these fail, see [`DEVELOPMENT.md`](DEVELOPMENT.md) for installation instructions.
+If any of these fail, install prerequisites:
+
+```bash
+# Install QEMU/KVM and tools
+sudo apt-get install qemu-system-x86 qemu-utils cloud-image-utils \
+    libvirt-daemon-system libvirt-clients bridge-utils socat \
+    x11-xserver-utils
+
+# Add yourself to required groups
+sudo usermod -a -G kvm,libvirt $USER
+
+# Log out and back in for group changes to take effect
+```
 
 ---
 
-## 1️⃣ Start Development Environment (First Time)
+## 1️⃣ Setup VM (First Time Only)
 
 ```bash
 cd /home/luca/source/repos/tapauth
 
-# Start the environment (builds Docker image + compiles everything)
-# ⏱️ First run: ~5-10 minutes
+# Create the VM (downloads Ubuntu cloud image, ~5 minutes)
+./vm-setup.sh
+```
+
+**What this does:**
+- ✅ Downloads Ubuntu 24.04 cloud image (~700MB)
+- ✅ Creates VM disk image (20GB)
+- ✅ Generates SSH keys
+- ✅ Creates cloud-init configuration
+
+---
+
+## 2️⃣ Start Development Environment (First Time)
+
+```bash
+# Start the VM
+# ⏱️ First boot: ~10 minutes (installs packages)
 ./dev-start.sh
 ```
 
 **What this does:**
-- ✅ Builds Docker container with all dependencies
-- ✅ Compiles TapAuth (shared, PAM, GUI)
-- ✅ Installs PAM module and GUI
-- ✅ Starts container in background
+- ✅ Starts QEMU/KVM VM
+- ✅ Sets up network bridge
+- ✅ Passes through Bluetooth USB device
+- ✅ Mounts shared folder
+- ✅ Installs all dependencies (first boot only)
+
+**Watch the QEMU window** to see installation progress.
 
 ---
 
-## 2️⃣ Enter the Development Environment
+## 3️⃣ Enter the Development Environment
 
 ```bash
 ./dev-shell.sh
