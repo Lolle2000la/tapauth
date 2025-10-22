@@ -1,7 +1,7 @@
 # TapAuth Development Environment
 # This container provides a complete development and testing environment for the TapAuth client
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -57,16 +57,21 @@ RUN apt-get update && apt-get install -y \
     mesa-vulkan-drivers \
     mesa-utils \
     libgl1-mesa-dri \
-    libgl1-mesa-glx \
-    libegl1-mesa \
+    libgl1 \
+    libglx-mesa0 \
+    libegl-mesa0 \
     libgbm1 \
     libdrm2 \
+    # X11 shared memory extension
+    libxext6 \
     # Bluetooth
     bluez \
     bluez-tools \
     libbluetooth-dev \
     libdbus-1-dev \
-    # Network tools
+    rfkill \
+    linux-firmware \
+  # Network tools
     iproute2 \
     iputils-ping \
     net-tools \
@@ -118,15 +123,14 @@ COPY . /tapauth/
 ENV DISPLAY=:0
 ENV XDG_RUNTIME_DIR=/tmp/runtime-root
 
-# Enable software rendering with Mesa/llvmpipe
+# Disable X11 MIT-SHM extension to avoid shared memory issues in containers
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV GALLIUM_DRIVER=llvmpipe
-
-# Disable DRI for compatibility
-ENV LIBGL_ALWAYS_INDIRECT=0
-
-# Disable compositor features that may cause X11 errors
 ENV __GLX_VENDOR_LIBRARY_NAME=mesa
+
+# Disable MIT-SHM to prevent "Failed to attach to x11 shm" errors
+ENV QT_X11_NO_MITSHM=1
+ENV _JAVA_AWT_WM_NONREPARENTING=1
 
 # Force OpenGL backend for wgpu (better XWayland compatibility)
 ENV WGPU_BACKEND=gl
@@ -357,13 +361,55 @@ bluetoothd &\n\
 sleep 2\n\
 \n\
 # Power on Bluetooth adapter if available\n\
+echo "Powering on Bluetooth adapter..."\n\
+ADAPTER_FOUND=false\n\
+\n\
+# Try multiple methods to power on the adapter\n\
 if command -v hciconfig &> /dev/null; then\n\
+    # Method 1: Use hciconfig\n\
     if hciconfig hci0 up 2>/dev/null; then\n\
-        echo "✅ Bluetooth adapter powered on"\n\
-    else\n\
-        echo "⚠️  No Bluetooth adapter found or failed to power on"\n\
-        echo "   Container will still work, but BLE features will be unavailable"\n\
+        echo "✅ Bluetooth adapter powered on (hciconfig)"\n\
+        ADAPTER_FOUND=true\n\
     fi\n\
+fi\n\
+\n\
+# Method 2: Use bluetoothctl\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    if command -v bluetoothctl &> /dev/null; then\n\
+        sleep 1\n\
+        echo "power on" | bluetoothctl 2>/dev/null\n\
+        echo "agent on" | bluetoothctl 2>/dev/null\n\
+        sleep 1\n\
+        # Check if it worked\n\
+        if hciconfig hci0 2>/dev/null | grep -q "UP"; then\n\
+            echo "✅ Bluetooth adapter powered on (bluetoothctl)"\n\
+            ADAPTER_FOUND=true\n\
+        fi\n\
+    fi\n\
+fi\n\
+\n\
+# Method 3: Use rfkill to unblock\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    if command -v rfkill &> /dev/null; then\n\
+        rfkill unblock bluetooth 2>/dev/null || true\n\
+        sleep 1\n\
+        hciconfig hci0 up 2>/dev/null || true\n\
+        if hciconfig hci0 2>/dev/null | grep -q "UP"; then\n\
+            echo "✅ Bluetooth adapter powered on (rfkill)"\n\
+            ADAPTER_FOUND=true\n\
+        fi\n\
+    fi\n\
+fi\n\
+\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    echo "⚠️  No Bluetooth adapter found or failed to power on"\n\
+    echo "   Container will still work, but BLE features will be unavailable"\n\
+    echo ""\n\
+    echo "   Troubleshooting:"\n\
+    echo "   1. Make sure host Bluetooth is stopped: sudo systemctl stop bluetooth"\n\
+    echo "   2. Check USB devices are accessible: ls -la /dev/bus/usb"\n\
+    echo "   3. Try manually: hciconfig hci0 up"\n\
+    echo "   4. Or use: echo '\''power on'\'' | bluetoothctl"\n\
 fi\n\
 \n\
 echo ""\n\

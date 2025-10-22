@@ -17,6 +17,9 @@ services:
     # Network configuration
     network_mode: "host"
 
+    # Use host IPC namespace to fix X11 shared memory issues
+    ipc: "host"
+
     # X11 forwarding for GUI
     environment:
       - DISPLAY=${DISPLAY:-:0}
