@@ -47,6 +47,7 @@
 //! ```
 
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(feature = "ble")]
 use bluer::{gatt::remote::Characteristic, Adapter, AdapterEvent, Address, Device};
@@ -92,8 +93,18 @@ pub struct BleGattConnection {
     server_response_char: Characteristic,
 }
 
+/// Represents a BLE GATT server for receiving commands and sending responses
+#[cfg(feature = "ble")]
+pub struct BleGattServer {
+    // Will be implemented with bluer's GATT server capabilities
+    _adapter: Adapter,
+}
+
 #[cfg(not(feature = "ble"))]
-pub struct BleAdvertiser;
+pub struct BleGattConnection;
+
+#[cfg(not(feature = "ble"))]
+pub struct BleGattServer;
 
 #[cfg(not(feature = "ble"))]
 pub struct BleGattConnection;
@@ -140,6 +151,71 @@ impl BleAdvertiser {
     pub async fn stop_advertising(&self) -> Result<(), BleError> {
         // Advertising is stopped when the handle is dropped
         Ok(())
+    }
+
+    /// Run a GATT server to handle authentication requests/responses
+    /// This is the client's role as advertiser/peripheral
+    pub async fn run_authentication_server(
+        &self,
+        _request_packet: &shared::protocol::pb::EncryptedPacket,
+        csk: &shared::crypto::ClientSymmetricKey,
+        challenge: &[u8; 32],
+        keypair: &shared::crypto::Ed25519KeyPair,
+        config_manager: &shared::config::ClientConfigManager,
+        timeout: Duration,
+    ) -> Result<(), crate::auth_client::AuthError> {
+        use futures_util::StreamExt;
+
+        tracing::info!("BLE GATT server waiting for connections and responses");
+
+        let start = Instant::now();
+        let mut events = self
+            .adapter
+            .events()
+            .await
+            .map_err(|e| crate::auth_client::AuthError::Ble(BleError::Bluer(e)))?;
+
+        // Wait for a server to connect and send a response
+        while start.elapsed() < timeout {
+            let timeout_remaining = timeout.saturating_sub(start.elapsed());
+
+            match tokio::time::timeout(timeout_remaining, events.next()).await {
+                Ok(Some(AdapterEvent::DeviceAdded(addr))) => {
+                    tracing::info!("BLE device connected: {}", addr);
+
+                    // Note: In a full implementation, we would set up GATT server
+                    // characteristics here and wait for the server to write a response
+                    // to our Server Response characteristic.
+                    //
+                    // For now, this is a placeholder that shows the structure.
+                    // Full GATT server implementation requires:
+                    // 1. Register GATT service with characteristics
+                    // 2. Handle characteristic write requests (for server responses)
+                    // 3. Allow characteristic reads (for our authentication request)
+                    //
+                    // This is complex with bluer and may require a different approach
+                    // or using a different BLE library that better supports peripheral mode.
+
+                    tracing::warn!("BLE GATT server mode not fully implemented yet");
+                    return Err(crate::auth_client::AuthError::InitError(
+                        "BLE peripheral/server mode requires additional implementation".to_string(),
+                    ));
+                }
+                Ok(Some(_)) => {
+                    // Other events, ignore
+                }
+                Ok(None) => {
+                    // Stream ended
+                    break;
+                }
+                Err(_) => {
+                    // Timeout
+                    return Err(crate::auth_client::AuthError::Timeout);
+                }
+            }
+        }
+
+        Err(crate::auth_client::AuthError::Timeout)
     }
 
     /// Wait for incoming connection with timeout

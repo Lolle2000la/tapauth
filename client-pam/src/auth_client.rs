@@ -1,21 +1,25 @@
 use shared::{
     config::ClientConfigManager,
-    crypto::{generate_current_temporal_identifier, ClientSymmetricKey, Ed25519KeyPair},
+    crypto::{
+        generate_current_temporal_identifier, ClientSymmetricKey, CryptoError, Ed25519KeyPair,
+    },
     network::{
         create_broadcast_socket, get_client_retry_interval, get_session_timeout, is_ipv6_available,
-        send_udp_broadcast, send_udp_multicast, try_receive_udp_packet, DEFAULT_UDP_PORT,
-        IPV6_MULTICAST_ADDR,
+        send_udp_broadcast, send_udp_multicast, try_receive_udp_packet, IPV6_MULTICAST_ADDR,
     },
     protocol::{
         messages::*,
         packet::*,
-        pb::{wrapper_message, EncryptedPacket, WrapperMessage},
+        pb::{wrapper_message, EncryptedPacket},
         ProtocolError,
     },
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+#[cfg(feature = "ble")]
+use crate::ble_advertiser::{BleAdvertiser, BleError};
 
 // Track whether we've warned about IPv6 unavailability
 static IPV6_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -28,6 +32,8 @@ pub enum AuthError {
     Network(#[from] shared::network::NetworkError),
     #[error("Protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    #[error("Crypto error: {0}")]
+    Crypto(#[from] CryptoError),
     #[error("Authentication timeout")]
     Timeout,
     #[error("Authentication denied")]
@@ -36,6 +42,9 @@ pub enum AuthError {
     NoPairedDevices,
     #[error("Failed to initialize: {0}")]
     InitError(String),
+    #[cfg(feature = "ble")]
+    #[error("BLE error: {0}")]
+    Ble(#[from] BleError),
 }
 
 pub struct AuthenticationClient {
@@ -102,18 +111,85 @@ impl AuthenticationClient {
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Start parallel discovery: UDP + BLE
-        let udp_result = self.try_udp_authentication(&packet).await;
+        // According to spec, we race both transports and use whichever responds first
+        #[cfg(feature = "ble")]
+        {
+            // Try both UDP and BLE in parallel
+            self.try_parallel_authentication(&packet).await
+        }
 
-        match udp_result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("UDP authentication failed: {}", e);
-                Err(e)
+        #[cfg(not(feature = "ble"))]
+        {
+            // BLE not compiled, fall back to UDP only
+            tracing::info!("BLE not available, using UDP only");
+            self.try_udp_authentication(&packet).await
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    /// Try authentication over both UDP and BLE in parallel (spec-compliant)
+    async fn try_parallel_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+        use tokio::select;
+
+        // Generate temporal identifier for BLE advertising
+        let temporal_id = generate_current_temporal_identifier(&self.csk)?;
+
+        tracing::info!("Starting parallel discovery over UDP and BLE");
+
+        // Spawn both authentication attempts in parallel
+        let udp_future = self.try_udp_authentication(packet);
+        let ble_future = self.try_ble_authentication(packet, &temporal_id);
+
+        // Race both transports - first one to succeed wins
+        select! {
+            udp_result = udp_future => {
+                tracing::info!("UDP authentication completed first");
+                udp_result
+            }
+            ble_result = ble_future => {
+                tracing::info!("BLE authentication completed first");
+                ble_result
             }
         }
     }
 
+    #[cfg(feature = "ble")]
+    /// Try authentication over BLE (as advertiser/peripheral with GATT server)
+    async fn try_ble_authentication(
+        &self,
+        packet: &EncryptedPacket,
+        temporal_id: &[u8; 16],
+    ) -> Result<(), AuthError> {
+        tracing::info!("Starting BLE authentication as advertiser/peripheral");
+
+        // Create BLE advertiser
+        let advertiser = BleAdvertiser::new().await?;
+
+        // Start advertising with temporal identifier
+        advertiser.start_advertising(temporal_id).await?;
+        tracing::info!("BLE advertising started with temporal ID");
+
+        // Start GATT server to handle incoming connections and messages
+        // The server will receive authentication responses via GATT writes
+        let result = advertiser
+            .run_authentication_server(
+                packet,
+                &self.csk,
+                &self.challenge,
+                &self.keypair,
+                &self.config_manager,
+                get_session_timeout(),
+            )
+            .await;
+
+        // Stop advertising before returning
+        let _ = advertiser.stop_advertising().await;
+
+        result
+    }
+
     /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast)
+    #[allow(unused_assignments)]
     async fn try_udp_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         let socket = create_broadcast_socket()?;
         let config = self.config_manager.load_config()?;
