@@ -21,8 +21,8 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     if ps -p "$VM_PID" > /dev/null 2>&1; then
         echo "⚠️  VM is already running (PID: $VM_PID)"
         echo ""
-        echo "To connect: ./dev-shell.sh"
-        echo "To stop:    ./dev-stop.sh"
+        echo "To connect: ./vm-shell.sh"
+        echo "To stop:    ./vm-stop.sh"
         exit 0
     else
         # Stale PID file
@@ -30,12 +30,12 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     fi
 fi
 
-# Check if VM image exists
+# Check if VM image exists, run setup if needed
 if [ ! -f "$VM_DISK_IMAGE" ]; then
-    echo "❌ VM disk image not found: $VM_DISK_IMAGE"
+    echo "VM not set up yet. Running initial setup..."
     echo ""
-    echo "Run VM setup first: ./vm-setup.sh"
-    exit 1
+    ./vm-setup.sh
+    echo ""
 fi
 
 # Detect Bluetooth device
@@ -181,7 +181,7 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
         echo "Watch the VM window for progress."
         echo ""
         echo "To connect via SSH:"
-        echo "  ./dev-shell.sh"
+        echo "  ./vm-shell.sh"
         echo ""
         echo "To check initialization status:"
         echo "  ssh -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -i ~/.tapauth-vm/id_rsa -p 2222 tapauth@localhost \"cloud-init status\""
@@ -192,7 +192,7 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
         echo "    'status: error'    → Check logs with: cloud-init status --long"
         echo ""
         echo "To stop the VM:"
-        echo "  ./dev-stop.sh"
+        echo "  ./vm-stop.sh"
         echo ""
     else
         echo "❌ VM failed to start"

@@ -28,11 +28,26 @@ groups
 
 If any of these fail, install prerequisites:
 
+### Ubuntu/Debian
+
 ```bash
 # Install QEMU/KVM and tools
 sudo apt-get install qemu-system-x86 qemu-utils cloud-image-utils \
     libvirt-daemon-system libvirt-clients bridge-utils socat \
     x11-xserver-utils
+
+# Add yourself to required groups
+sudo usermod -a -G kvm,libvirt $USER
+
+# Log out and back in for group changes to take effect
+```
+
+### Fedora 42
+
+```bash
+# Install QEMU/KVM and tools
+sudo dnf install qemu-system-x86 qemu-img libvirt libvirt-daemon \
+    libvirt-client bridge-utils socat xhost cloud-utils
 
 # Add yourself to required groups
 sudo usermod -a -G kvm,libvirt $USER
@@ -64,7 +79,7 @@ cd /home/luca/source/repos/tapauth
 ```bash
 # Start the VM
 # ⏱️ First boot: ~10 minutes (installs packages)
-./dev-start.sh
+./vm-start.sh
 ```
 
 **What this does:**
@@ -81,10 +96,10 @@ cd /home/luca/source/repos/tapauth
 ## 3️⃣ Enter the Development Environment
 
 ```bash
-./dev-shell.sh
+./vm-shell.sh
 ```
 
-You're now inside the container! 🎉
+You're now inside the VM! 🎉
 
 ---
 
@@ -129,11 +144,11 @@ test-pam-auth root
 ## 5️⃣ Stop When Done
 
 ```bash
-# Exit the container
+# Exit the VM
 exit
 
 # Stop the environment (on host)
-./dev-stop.sh
+./vm-stop.sh
 ```
 
 ---
@@ -142,25 +157,30 @@ exit
 
 ### Start Environment
 ```bash
-./dev-start.sh  # will rebuild if needed, press 'y' if prompted
-./dev-shell.sh  # Enter container
+./vm-start.sh  # Start VM (auto-setup if needed)
+./vm-shell.sh  # Enter VM
 ```
 
 ### Make Changes
 - Edit code on your host (use your favorite IDE)
-- Files are automatically synced to container
+- Files are automatically synced to VM
 
 ### Build & Test
 ```bash
-# Inside container
+# Option 1: Use helper scripts from host
+./vm-build.sh       # Rebuild everything
+./vm-test.sh        # Run all tests
+
+# Option 2: Run commands inside VM
 build-tapauth       # Rebuild everything
+test-tapauth        # Run unit tests
 test-pam-auth root  # Test authentication
 ```
 
 ### Stop Environment
 ```bash
-exit             # Exit container
-./dev-stop.sh    # Stop environment
+exit            # Exit VM
+./vm-stop.sh    # Stop VM
 ```
 
 ---
@@ -236,21 +256,21 @@ btmon
 
 ### Run Tests
 ```bash
-./dev-test.sh  # On host
+./vm-test.sh   # On host
 # OR
-test-tapauth   # Inside container
+test-tapauth   # Inside VM
 ```
 
 ### Rebuild After Changes
 ```bash
-./dev-rebuild.sh  # On host
+./vm-build.sh  # On host
 # OR
-build-tapauth     # Inside container
+build-tapauth  # Inside VM
 ```
 
 ### Check Status
 ```bash
-# Inside container
+# Inside VM
 bluetooth-status              # Bluetooth
 netstat -uln | grep 36692     # Network
 ls -la /etc/tapauth/          # Config files
@@ -261,10 +281,11 @@ ls -la /etc/tapauth/          # Config files
 ## ✅ You're Ready!
 
 You now have:
-- ✅ Complete development environment
-- ✅ Docker container with PAM + GUI
-- ✅ Android debug build capability
-- ✅ Testing tools (pamtester)
+- ✅ Complete VM development environment
+- ✅ PAM authentication module
+- ✅ GUI client (tapauth-config)
+- ✅ Android app support
+- ✅ Testing tools
 - ✅ Network and Bluetooth access
 
 **Happy hacking!** 🚀

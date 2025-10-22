@@ -14,7 +14,7 @@ source ./vm-config.sh
 if [ ! -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     echo "❌ VM is not running"
     echo ""
-    echo "Start it with: ./dev-start.sh"
+    echo "Start it with: ./vm-start.sh"
     exit 1
 fi
 
@@ -23,7 +23,7 @@ if ! ps -p "$VM_PID" > /dev/null 2>&1; then
     echo "❌ VM is not running (stale PID file)"
     rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
     echo ""
-    echo "Start it with: ./dev-start.sh"
+    echo "Start it with: ./vm-start.sh"
     exit 1
 fi
 
