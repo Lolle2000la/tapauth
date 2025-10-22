@@ -48,6 +48,26 @@ else
 fi
 echo ""
 
+# Stop host Bluetooth service to allow container access
+echo "==> Preparing Bluetooth access..."
+if command -v systemctl &> /dev/null; then
+    if systemctl is-active --quiet bluetooth; then
+        echo "Stopping host Bluetooth service (will be restored when container stops)..."
+        if sudo systemctl stop bluetooth 2>/dev/null; then
+            echo "✅ Host Bluetooth service stopped"
+            echo "   (Container will run its own Bluetooth daemon)"
+        else
+            echo "⚠️  Could not stop host Bluetooth service"
+            echo "   Container BLE features may not work properly"
+        fi
+    else
+        echo "✅ Host Bluetooth service already stopped"
+    fi
+else
+    echo "⚠️  systemctl not found, cannot manage Bluetooth service"
+fi
+echo ""
+
 # Check if container is already running
 if docker ps --format '{{.Names}}' | grep -q '^tapauth-dev$'; then
     echo "==> Container is already running"

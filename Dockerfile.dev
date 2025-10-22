@@ -92,6 +92,19 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Install Rust components
 RUN rustup component add clippy rustfmt
 
+# Set up D-Bus and Bluetooth services
+RUN mkdir -p /var/run/dbus && \
+    mkdir -p /var/lib/bluetooth && \
+    mkdir -p /etc/bluetooth
+
+# Configure Bluetooth to run in container
+RUN echo '[General]\n\
+Name = TapAuth-Dev\n\
+Class = 0x000100\n\
+DiscoverableTimeout = 0\n\
+PairableTimeout = 0\n\
+' > /etc/bluetooth/main.conf
+
 # Set up working directory
 WORKDIR /tapauth
 
@@ -231,25 +244,40 @@ RUN echo '#!/bin/bash\n\
 echo "=== Bluetooth Status ==="\n\
 echo ""\n\
 \n\
-# Check if bluetooth service is running\n\
-if systemctl is-active --quiet bluetooth; then\n\
-    echo "✅ Bluetooth service: RUNNING"\n\
+# Check if bluetooth daemon is running\n\
+if pgrep -x bluetoothd > /dev/null; then\n\
+    echo "✅ Bluetooth daemon: RUNNING"\n\
 else\n\
-    echo "❌ Bluetooth service: NOT RUNNING"\n\
-    echo "   Try: systemctl start bluetooth"\n\
+    echo "❌ Bluetooth daemon: NOT RUNNING"\n\
+    echo "   The container should auto-start it"\n\
+fi\n\
+\n\
+# Check D-Bus\n\
+if pgrep -x dbus-daemon > /dev/null; then\n\
+    echo "✅ D-Bus: RUNNING"\n\
+else\n\
+    echo "❌ D-Bus: NOT RUNNING"\n\
 fi\n\
 \n\
 echo ""\n\
 echo "=== Bluetooth Adapters ==="\n\
-hciconfig -a || echo "No adapters found or hciconfig not available"\n\
+hciconfig -a 2>/dev/null || echo "⚠️  No adapters found. Make sure host Bluetooth is disabled and container has access."\n\
 \n\
 echo ""\n\
-echo "=== Bluetooth Devices ==="\n\
-bluetoothctl devices || echo "bluetoothctl not available"\n\
+echo "=== Bluetooth Controller Info ==="\n\
+bluetoothctl show 2>/dev/null || echo "Cannot query Bluetooth controller"\n\
 \n\
 echo ""\n\
-echo "=== D-Bus Bluetooth Info ==="\n\
-dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null || echo "Cannot connect to D-Bus"\n\
+echo "=== Paired Devices ==="\n\
+bluetoothctl devices 2>/dev/null || echo "Cannot list devices"\n\
+\n\
+echo ""\n\
+echo "=== D-Bus Bluetooth Service ==="\n\
+if dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null | grep -q "interface"; then\n\
+    echo "✅ Bluetooth service accessible via D-Bus"\n\
+else\n\
+    echo "❌ Cannot connect to Bluetooth via D-Bus"\n\
+fi\n\
 ' > /usr/local/bin/bluetooth-status && chmod +x /usr/local/bin/bluetooth-status
 
 # Create a helpful motd
@@ -288,11 +316,14 @@ Network:\n\
 Bluetooth:\n\
   Service UUID:   b4ad84c0-2adb-4876-8315-b39d983b2bde\n\
   Check status:   bluetooth-status\n\
+  Note:           Running in-container D-Bus and Bluetooth services\n\
+  Adapter:        Requires host Bluetooth to be stopped (auto-managed by dev scripts)\n\
 \n\
 Logs:\n\
   PAM logs:       journalctl -f | grep pam\n\
   Network:        tcpdump -i any port 36692\n\
-  Bluetooth:      btmon\n\
+  Bluetooth:      btmon (if available)\n\
+  D-Bus monitor:  dbus-monitor --system\n\
 \n\
 Documentation:\n\
   See /tapauth/docs/ for detailed documentation\n\
@@ -304,10 +335,51 @@ EOF\n\
 # Show welcome message on login
 RUN echo 'tapauth-welcome' >> /root/.bashrc
 
+# Create container startup script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "Starting TapAuth development environment services..."\n\
+\n\
+# Start D-Bus\n\
+echo "Starting D-Bus..."\n\
+mkdir -p /var/run/dbus\n\
+rm -f /var/run/dbus/pid\n\
+dbus-daemon --system --fork\n\
+\n\
+# Wait a moment for D-Bus to be ready\n\
+sleep 1\n\
+\n\
+# Start Bluetooth daemon\n\
+echo "Starting Bluetooth daemon..."\n\
+bluetoothd &\n\
+\n\
+# Wait for Bluetooth to initialize\n\
+sleep 2\n\
+\n\
+# Power on Bluetooth adapter if available\n\
+if command -v hciconfig &> /dev/null; then\n\
+    if hciconfig hci0 up 2>/dev/null; then\n\
+        echo "✅ Bluetooth adapter powered on"\n\
+    else\n\
+        echo "⚠️  No Bluetooth adapter found or failed to power on"\n\
+        echo "   Container will still work, but BLE features will be unavailable"\n\
+    fi\n\
+fi\n\
+\n\
+echo ""\n\
+echo "Services started successfully!"\n\
+echo ""\n\
+\n\
+# Execute the main command (usually bash)\n\
+exec "$@"\n\
+' > /usr/local/bin/container-start && chmod +x /usr/local/bin/container-start
+
 # Expose ports
 # 36692: UDP authentication port
 # 0: Dynamic port for TCP pairing (allocated at runtime)
 EXPOSE 36692/udp
 
-# Default command: show welcome and start bash
+# Default command: start services, show welcome and start bash
+ENTRYPOINT ["/usr/local/bin/container-start"]
 CMD ["bash", "-c", "tapauth-welcome && /bin/bash"]
