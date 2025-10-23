@@ -1,7 +1,8 @@
 use prost::Message;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::net::UdpSocket;
 
 use super::NetworkError;
 use crate::protocol::pb::EncryptedPacket;
@@ -26,36 +27,34 @@ pub fn is_ipv6_available() -> bool {
     available
 }
 
-/// Create a UDP socket for broadcasting/multicasting
-pub fn create_broadcast_socket() -> Result<UdpSocket, NetworkError> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+/// Create a UDP socket for broadcasting/multicasting (async)
+pub async fn create_broadcast_socket() -> Result<UdpSocket, NetworkError> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     Ok(socket)
 }
 
-/// Create a UDP socket for listening on a specific port
-pub fn create_listen_socket(port: u16) -> Result<UdpSocket, NetworkError> {
-    let socket = UdpSocket::bind(("0.0.0.0", port))?;
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+/// Create a UDP socket for listening on a specific port (async)
+pub async fn create_listen_socket(port: u16) -> Result<UdpSocket, NetworkError> {
+    let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
     Ok(socket)
 }
 
-/// Send an encrypted packet via UDP broadcast (IPv4)
-pub fn send_udp_broadcast(
+/// Send an encrypted packet via UDP broadcast (IPv4) - async
+pub async fn send_udp_broadcast(
     socket: &UdpSocket,
     port: u16,
     packet: &EncryptedPacket,
 ) -> Result<(), NetworkError> {
     let data = packet.encode_to_vec();
     let addr = SocketAddr::from((Ipv4Addr::BROADCAST, port));
-    socket.send_to(&data, addr)?;
+    socket.send_to(&data, addr).await?;
     Ok(())
 }
 
-/// Send an encrypted packet via UDP multicast (IPv6)
+/// Send an encrypted packet via UDP multicast (IPv6) - async
 /// Returns Ok(()) if sent successfully, or Err if IPv6 is unavailable or send fails
-pub fn send_udp_multicast(
+pub async fn send_udp_multicast(
     socket: &UdpSocket,
     multicast_addr: &str,
     port: u16,
@@ -72,7 +71,7 @@ pub fn send_udp_multicast(
         })?;
 
     // Try to send, but provide a more specific error for IPv6 unavailability
-    match socket.send_to(&data, addr) {
+    match socket.send_to(&data, addr).await {
         Ok(_) => Ok(()),
         Err(e) if e.raw_os_error() == Some(97) => {
             // EAFNOSUPPORT (97) - Address family not supported by protocol
@@ -85,40 +84,37 @@ pub fn send_udp_multicast(
     }
 }
 
-/// Send an encrypted packet via UDP unicast
-pub fn send_udp_unicast(
+/// Send an encrypted packet via UDP unicast - async
+pub async fn send_udp_unicast(
     socket: &UdpSocket,
     addr: SocketAddr,
     packet: &EncryptedPacket,
 ) -> Result<(), NetworkError> {
     let data = packet.encode_to_vec();
-    socket.send_to(&data, addr)?;
+    socket.send_to(&data, addr).await?;
     Ok(())
 }
 
-/// Receive an encrypted packet from UDP
-pub fn receive_udp_packet(
+/// Receive an encrypted packet from UDP - async
+pub async fn receive_udp_packet(
     socket: &UdpSocket,
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
     let mut buf = [0u8; 65536];
-    let (len, addr) = socket.recv_from(&mut buf)?;
+    let (len, addr) = socket.recv_from(&mut buf).await?;
 
     let packet = EncryptedPacket::decode(&buf[..len])?;
     Ok((packet, addr))
 }
 
-/// Try to receive an encrypted packet with timeout
-pub fn try_receive_udp_packet(
+/// Try to receive an encrypted packet with timeout - async
+pub async fn try_receive_udp_packet(
     socket: &UdpSocket,
     timeout: Duration,
 ) -> Result<Option<(EncryptedPacket, SocketAddr)>, NetworkError> {
-    socket.set_read_timeout(Some(timeout))?;
-
-    match receive_udp_packet(socket) {
-        Ok(result) => Ok(Some(result)),
-        Err(NetworkError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(NetworkError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
-        Err(e) => Err(e),
+    match tokio::time::timeout(timeout, receive_udp_packet(socket)).await {
+        Ok(Ok(result)) => Ok(Some(result)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(None), // Timeout elapsed
     }
 }
 

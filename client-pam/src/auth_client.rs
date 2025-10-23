@@ -1,3 +1,4 @@
+use prost::Message;
 use shared::{
     config::ClientConfigManager,
     crypto::{
@@ -16,10 +17,11 @@ use shared::{
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "ble")]
-use crate::ble_advertiser::{BleAdvertiser, BleError};
+use crate::ble_client::BleClient;
 
 // Track whether we've warned about IPv6 unavailability
 static IPV6_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -42,13 +44,12 @@ pub enum AuthError {
     NoPairedDevices,
     #[error("Failed to initialize: {0}")]
     InitError(String),
-    #[cfg(feature = "ble")]
     #[error("BLE error: {0}")]
-    Ble(#[from] BleError),
+    BleError(String),
 }
 
 pub struct AuthenticationClient {
-    config_manager: ClientConfigManager,
+    config_manager: Arc<ClientConfigManager>,
     keypair: Ed25519KeyPair,
     csk: ClientSymmetricKey,
     username: String,
@@ -78,7 +79,7 @@ impl AuthenticationClient {
         getrandom::getrandom(&mut challenge).expect("Failed to generate challenge");
 
         Ok(Self {
-            config_manager,
+            config_manager: Arc::new(config_manager),
             keypair,
             csk,
             username,
@@ -131,67 +132,93 @@ impl AuthenticationClient {
     async fn try_parallel_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use tokio::select;
 
+        tracing::debug!("==> try_parallel_authentication called");
+
         // Generate temporal identifier for BLE advertising
         let temporal_id = generate_current_temporal_identifier(&self.csk)?;
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
-        // Spawn both authentication attempts in parallel
-        let udp_future = self.try_udp_authentication(packet);
+        tracing::debug!("==> About to create UDP and BLE futures");
+
+        // Create both futures
         let ble_future = self.try_ble_authentication(packet, &temporal_id);
+        let udp_future = self.try_udp_authentication(packet);
+
+        tracing::debug!("==> Futures created, entering select!");
 
         // Race both transports - first one to succeed wins
         select! {
-            udp_result = udp_future => {
-                tracing::info!("UDP authentication completed first");
-                udp_result
-            }
             ble_result = ble_future => {
-                tracing::info!("BLE authentication completed first");
+                tracing::info!("BLE authentication completed first with result: {:?}", ble_result.as_ref().map(|_| "Ok").unwrap_or("Err"));
                 ble_result
+            }
+            udp_result = udp_future => {
+                tracing::info!("UDP authentication completed first with result: {:?}", udp_result.as_ref().map(|_| "Ok").unwrap_or("Err"));
+                udp_result
             }
         }
     }
 
     #[cfg(feature = "ble")]
-    /// Try authentication over BLE (as advertiser/peripheral with GATT server)
+    /// Try authentication over BLE via the daemon
     async fn try_ble_authentication(
         &self,
         packet: &EncryptedPacket,
         temporal_id: &[u8; 16],
     ) -> Result<(), AuthError> {
-        tracing::info!("Starting BLE authentication as advertiser/peripheral");
+        tracing::info!("Starting BLE authentication via daemon");
 
-        // Create BLE advertiser
-        let advertiser = BleAdvertiser::new().await?;
+        // Create BLE client
+        let client = BleClient::new()
+            .await
+            .map_err(|e| AuthError::BleError(format!("Failed to create BLE client: {}", e)))?;
 
-        // Start advertising with temporal identifier
-        advertiser.start_advertising(temporal_id).await?;
-        tracing::info!("BLE advertising started with temporal ID");
+        // Check if daemon is available
+        if !client.is_daemon_available().await {
+            return Err(AuthError::BleError(
+                "BLE daemon is not available".to_string(),
+            ));
+        }
 
-        // Start GATT server to handle incoming connections and messages
-        // The server will receive authentication responses via GATT writes
-        let result = advertiser
-            .run_authentication_server(
-                packet,
-                &self.csk,
-                &self.challenge,
-                &self.keypair,
-                &self.config_manager,
-                get_session_timeout(),
-            )
-            .await;
+        // Encode the packet
+        let mut packet_bytes = Vec::new();
+        packet
+            .encode(&mut packet_bytes)
+            .map_err(|e| AuthError::BleError(format!("Failed to encode packet: {}", e)))?;
 
-        // Stop advertising before returning
-        let _ = advertiser.stop_advertising().await;
+        // Call the daemon
+        let timeout_secs = get_session_timeout().as_secs();
+        let result = client
+            .authenticate(packet_bytes, temporal_id.to_vec(), timeout_secs)
+            .await
+            .map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?;
 
-        result
+        // Convert result to authentication outcome
+        match result {
+            shared::AuthResult::Granted => {
+                tracing::info!("BLE authentication granted by daemon");
+                Ok(())
+            }
+            shared::AuthResult::Denied => {
+                tracing::warn!("BLE authentication denied by daemon");
+                Err(AuthError::Denied)
+            }
+            shared::AuthResult::Timeout => {
+                tracing::warn!("BLE authentication timed out");
+                Err(AuthError::Timeout)
+            }
+            shared::AuthResult::Error => {
+                tracing::error!("BLE authentication error from daemon");
+                Err(AuthError::BleError("Daemon returned error".to_string()))
+            }
+        }
     }
 
     /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast)
     #[allow(unused_assignments)]
     async fn try_udp_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        let socket = create_broadcast_socket()?;
+        let socket = create_broadcast_socket().await?;
         let config = self.config_manager.load_config()?;
         let port = config.udp_port;
 
@@ -206,13 +233,14 @@ impl AuthenticationClient {
             }
 
             // Send broadcast on IPv4
-            if let Err(e) = send_udp_broadcast(&socket, port, packet) {
+            if let Err(e) = send_udp_broadcast(&socket, port, packet).await {
                 tracing::warn!("Failed to send IPv4 broadcast: {}", e);
             }
 
             // Send multicast on IPv6 (only if available)
             if is_ipv6_available() {
-                if let Err(e) = send_udp_multicast(&socket, IPV6_MULTICAST_ADDR, port, packet) {
+                if let Err(e) = send_udp_multicast(&socket, IPV6_MULTICAST_ADDR, port, packet).await
+                {
                     tracing::warn!("Failed to send IPv6 multicast: {}", e);
                     // Mark IPv6 as unavailable to avoid future attempts
                     IPV6_WARNING_SHOWN.store(true, Ordering::Relaxed);
@@ -224,19 +252,24 @@ impl AuthenticationClient {
 
             // Wait for response
             let retry_interval = get_client_retry_interval(attempt);
-            match try_receive_udp_packet(&socket, retry_interval)? {
+            match try_receive_udp_packet(&socket, retry_interval).await? {
                 Some((response_packet, server_addr)) => {
                     // Try to decrypt and process response
                     match self.process_response(&response_packet, server_addr).await {
                         Ok(true) => {
                             // Authentication granted
+                            tracing::info!("Processing successful grant response");
                             if !confirmation_sent {
+                                tracing::debug!("Sending confirmation to server");
                                 self.send_confirmation(&socket, port).await?;
                                 confirmation_sent = true;
+                                tracing::debug!("Confirmation sent successfully");
                             }
 
                             // Send cancel to other servers
+                            tracing::debug!("Sending cancel broadcast to other servers");
                             self.send_cancel_broadcast(&socket, port).await?;
+                            tracing::info!("UDP authentication completed successfully, returning");
 
                             return Ok(());
                         }
@@ -388,7 +421,7 @@ impl AuthenticationClient {
     /// Send confirmation to server
     async fn send_confirmation(
         &self,
-        socket: &std::net::UdpSocket,
+        socket: &tokio::net::UdpSocket,
         port: u16,
     ) -> Result<(), AuthError> {
         let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)?;
@@ -396,9 +429,9 @@ impl AuthenticationClient {
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Send on both IPv4 and IPv6 (if available)
-        send_udp_broadcast(socket, port, &packet)?;
+        send_udp_broadcast(socket, port, &packet).await?;
         if is_ipv6_available() {
-            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet);
+            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet).await;
         }
 
         Ok(())
@@ -407,7 +440,7 @@ impl AuthenticationClient {
     /// Send cancel broadcast to all servers
     async fn send_cancel_broadcast(
         &self,
-        socket: &std::net::UdpSocket,
+        socket: &tokio::net::UdpSocket,
         port: u16,
     ) -> Result<(), AuthError> {
         let cancel = create_auth_cancel(&self.keypair, &self.challenge)?;
@@ -415,9 +448,9 @@ impl AuthenticationClient {
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
         // Send on both IPv4 and IPv6 (if available)
-        send_udp_broadcast(socket, port, &packet)?;
+        send_udp_broadcast(socket, port, &packet).await?;
         if is_ipv6_available() {
-            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet);
+            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet).await;
         }
 
         Ok(())

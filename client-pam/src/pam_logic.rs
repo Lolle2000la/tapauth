@@ -11,12 +11,8 @@ fn init_logging() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // Use debug level in debug builds, info level in release builds
-                if cfg!(debug_assertions) {
-                    tracing_subscriber::EnvFilter::new("debug")
-                } else {
-                    tracing_subscriber::EnvFilter::new("info")
-                }
+                // Default to debug level for now to see BLE issues
+                tracing_subscriber::EnvFilter::new("debug")
             }),
         )
         .try_init();

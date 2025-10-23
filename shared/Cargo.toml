@@ -47,12 +47,16 @@ tracing = "0.1.41"
 # JNI support (optional)
 jni = { version = "0.21", optional = true }
 
+# D-Bus support for BLE daemon (optional)
+zbus = { version = "4.0", optional = true }
+
 [build-dependencies]
 prost-build = "0.13"
 
 [features]
 default = []
 jni = ["dep:jni"]
+dbus = ["dep:zbus"]
 
 [dev-dependencies]
 tokio-test = "0.4"

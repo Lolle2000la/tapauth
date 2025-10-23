@@ -1,10 +1,14 @@
 mod auth_client;
-mod ble_advertiser;
 mod pam_logic;
 mod pam_sys;
 
+#[cfg(feature = "ble")]
+mod ble_client;
+
 pub use auth_client::*;
-pub use ble_advertiser::*;
+
+#[cfg(feature = "ble")]
+pub use ble_client::*;
 
 use std::os::raw::c_int;
 

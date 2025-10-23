@@ -83,6 +83,8 @@ pub enum BleError {
 #[cfg(feature = "ble")]
 pub struct BleAdvertiser {
     adapter: Adapter,
+    // Keep advertisement handle alive
+    adv_handle: std::sync::Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
 }
 
 /// Represents a BLE GATT connection for sending commands and receiving responses
@@ -113,12 +115,47 @@ pub struct BleGattConnection;
 impl BleAdvertiser {
     /// Create a new BLE advertiser
     pub async fn new() -> Result<Self, BleError> {
-        let session = bluer::Session::new().await?;
-        let adapter_names = session.adapter_names().await?;
-        let adapter_name = adapter_names.first().ok_or(BleError::NoAdapter)?;
-        let adapter = session.adapter(adapter_name)?;
+        use tokio::time::{timeout, Duration};
 
-        Ok(Self { adapter })
+        tracing::debug!("BLE: Creating new BlueZ session...");
+        let session = match timeout(Duration::from_secs(2), bluer::Session::new()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::error!("BLE: Failed to create BlueZ session: {}", e);
+                return Err(e.into());
+            }
+            Err(_) => {
+                tracing::error!("BLE: Timeout creating BlueZ session (D-Bus not accessible?)");
+                return Err(BleError::Timeout);
+            }
+        };
+
+        tracing::debug!("BLE: Getting adapter names...");
+        let adapter_names = session.adapter_names().await.map_err(|e| {
+            tracing::error!("BLE: Failed to get adapter names: {}", e);
+            e
+        })?;
+
+        tracing::debug!("BLE: Found {} adapters", adapter_names.len());
+        let adapter_name = adapter_names.first().ok_or_else(|| {
+            tracing::error!("BLE: No Bluetooth adapter found");
+            BleError::NoAdapter
+        })?;
+
+        tracing::debug!("BLE: Using adapter: {}", adapter_name);
+        let adapter = session.adapter(adapter_name).map_err(|e| {
+            tracing::error!("BLE: Failed to get adapter {}: {}", adapter_name, e);
+            e
+        })?;
+
+        tracing::info!(
+            "BLE: Advertiser created successfully with adapter {}",
+            adapter_name
+        );
+        Ok(Self {
+            adapter,
+            adv_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     /// Start advertising with temporal identifier
@@ -139,8 +176,9 @@ impl BleAdvertiser {
             ..Default::default()
         };
 
-        // Start advertising
-        let _handle = self.adapter.advertise(advertisement).await?;
+        // Start advertising and keep handle alive
+        let handle = self.adapter.advertise(advertisement).await?;
+        *self.adv_handle.lock().await = Some(handle);
 
         tracing::info!("Started BLE advertising");
 
@@ -149,7 +187,9 @@ impl BleAdvertiser {
 
     /// Stop advertising
     pub async fn stop_advertising(&self) -> Result<(), BleError> {
-        // Advertising is stopped when the handle is dropped
+        // Drop the advertisement handle to stop advertising
+        *self.adv_handle.lock().await = None;
+        tracing::info!("Stopped BLE advertising");
         Ok(())
     }
 
@@ -157,65 +197,264 @@ impl BleAdvertiser {
     /// This is the client's role as advertiser/peripheral
     pub async fn run_authentication_server(
         &self,
-        _request_packet: &shared::protocol::pb::EncryptedPacket,
+        request_packet: &shared::protocol::pb::EncryptedPacket,
         csk: &shared::crypto::ClientSymmetricKey,
         challenge: &[u8; 32],
-        keypair: &shared::crypto::Ed25519KeyPair,
+        _keypair: &shared::crypto::Ed25519KeyPair,
         config_manager: &shared::config::ClientConfigManager,
         timeout: Duration,
     ) -> Result<(), crate::auth_client::AuthError> {
-        use futures_util::StreamExt;
+        use bluer::gatt::local::{
+            Application, Characteristic, CharacteristicRead, CharacteristicWrite, Service,
+        };
+        use prost::Message as ProstMessage;
+        use shared::models::ble::{
+            CLIENT_COMMAND_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID, SERVICE_UUID,
+        };
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
 
-        tracing::info!("BLE GATT server waiting for connections and responses");
+        tracing::info!("Starting BLE GATT server (peripheral mode)");
 
-        let start = Instant::now();
-        let mut events = self
+        // Serialize the request packet for the characteristic
+        let request_data = request_packet.encode_to_vec();
+        let request_data = Arc::new(request_data);
+
+        // Shared state for receiving the server's response
+        let response_data: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let response_data_clone = response_data.clone();
+
+        // Create the GATT service
+        let service_uuid = SERVICE_UUID.parse::<bluer::Uuid>().map_err(|_| {
+            crate::auth_client::AuthError::InitError("Invalid service UUID".to_string())
+        })?;
+
+        let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID
+            .parse::<bluer::Uuid>()
+            .map_err(|_| {
+                crate::auth_client::AuthError::InitError("Invalid characteristic UUID".to_string())
+            })?;
+
+        let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID
+            .parse::<bluer::Uuid>()
+            .map_err(|_| {
+                crate::auth_client::AuthError::InitError("Invalid characteristic UUID".to_string())
+            })?;
+
+        // Client Command Characteristic - allows server to READ our auth request
+        let request_data_for_read = request_data.clone();
+        let client_cmd_char = Characteristic {
+            uuid: client_cmd_uuid,
+            read: Some(CharacteristicRead {
+                read: true,
+                fun: Box::new(move |_req| {
+                    let data = request_data_for_read.clone();
+                    Box::pin(async move {
+                        tracing::debug!(
+                            "BLE: Server reading authentication request ({} bytes)",
+                            data.len()
+                        );
+                        Ok((*data).clone())
+                    })
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Server Response Characteristic - allows server to WRITE response to us
+        let server_resp_char = Characteristic {
+            uuid: server_resp_uuid,
+            write: Some(CharacteristicWrite {
+                write: true,
+                write_without_response: true,
+                method: bluer::gatt::local::CharacteristicWriteMethod::Fun(Box::new(
+                    move |new_value, _req| {
+                        let response_data = response_data_clone.clone();
+                        Box::pin(async move {
+                            tracing::info!(
+                                "BLE: Received server response ({} bytes)",
+                                new_value.len()
+                            );
+                            *response_data.lock().await = Some(new_value);
+                            Ok(())
+                        })
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let service = Service {
+            uuid: service_uuid,
+            primary: true,
+            characteristics: vec![client_cmd_char, server_resp_char],
+            ..Default::default()
+        };
+
+        let app = Application {
+            services: vec![service],
+            ..Default::default()
+        };
+
+        // Register the GATT application
+        let app_handle = self
             .adapter
-            .events()
+            .serve_gatt_application(app)
             .await
             .map_err(|e| crate::auth_client::AuthError::Ble(BleError::Bluer(e)))?;
 
-        // Wait for a server to connect and send a response
-        while start.elapsed() < timeout {
-            let timeout_remaining = timeout.saturating_sub(start.elapsed());
+        tracing::info!("BLE GATT server registered, waiting for server connection and response");
 
-            match tokio::time::timeout(timeout_remaining, events.next()).await {
-                Ok(Some(AdapterEvent::DeviceAdded(addr))) => {
-                    tracing::info!("BLE device connected: {}", addr);
+        // Wait for response with timeout
+        let start = Instant::now();
+        loop {
+            if start.elapsed() >= timeout {
+                tracing::warn!("BLE authentication timeout");
+                drop(app_handle); // Unregister GATT service
+                return Err(crate::auth_client::AuthError::Timeout);
+            }
 
-                    // Note: In a full implementation, we would set up GATT server
-                    // characteristics here and wait for the server to write a response
-                    // to our Server Response characteristic.
-                    //
-                    // For now, this is a placeholder that shows the structure.
-                    // Full GATT server implementation requires:
-                    // 1. Register GATT service with characteristics
-                    // 2. Handle characteristic write requests (for server responses)
-                    // 3. Allow characteristic reads (for our authentication request)
-                    //
-                    // This is complex with bluer and may require a different approach
-                    // or using a different BLE library that better supports peripheral mode.
+            // Check if we received a response
+            {
+                let response_lock = response_data.lock().await;
+                if let Some(ref response_bytes) = *response_lock {
+                    tracing::info!("BLE: Processing received response");
 
-                    tracing::warn!("BLE GATT server mode not fully implemented yet");
-                    return Err(crate::auth_client::AuthError::InitError(
-                        "BLE peripheral/server mode requires additional implementation".to_string(),
-                    ));
-                }
-                Ok(Some(_)) => {
-                    // Other events, ignore
-                }
-                Ok(None) => {
-                    // Stream ended
-                    break;
-                }
-                Err(_) => {
-                    // Timeout
-                    return Err(crate::auth_client::AuthError::Timeout);
+                    // Decrypt and verify the response
+                    let result = self
+                        .process_ble_response(response_bytes, csk, challenge, config_manager)
+                        .await;
+
+                    drop(app_handle); // Unregister GATT service
+                    return result;
                 }
             }
-        }
 
-        Err(crate::auth_client::AuthError::Timeout)
+            // Sleep briefly before checking again
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Process a BLE response (decrypt and verify grant)
+    async fn process_ble_response(
+        &self,
+        encrypted_bytes: &[u8],
+        csk: &shared::crypto::ClientSymmetricKey,
+        challenge: &[u8; 32],
+        config_manager: &shared::config::ClientConfigManager,
+    ) -> Result<(), crate::auth_client::AuthError> {
+        use prost::Message as ProstMessage;
+        use shared::protocol::messages::{verify_auth_denial, verify_auth_grant};
+        use shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce;
+        use shared::protocol::pb::{wrapper_message, EncryptedPacket, WrapperMessage};
+
+        // Parse the encrypted packet
+        let encrypted_packet = EncryptedPacket::decode(&encrypted_bytes[..]).map_err(|e| {
+            crate::auth_client::AuthError::InitError(format!(
+                "Failed to decode BLE response: {}",
+                e
+            ))
+        })?;
+
+        tracing::debug!("BLE: Decrypting response packet");
+
+        // Decrypt the packet using CSK-based nonce (same as UDP flow)
+        let wrapper = decrypt_encrypted_packet_with_csk_nonce(csk, &encrypted_packet)
+            .map_err(|e| crate::auth_client::AuthError::Protocol(e))?;
+
+        // Extract AuthenticationGrant or AuthenticationDenial
+        match wrapper.payload {
+            Some(wrapper_message::Payload::AuthGrant(ref grant)) => {
+                tracing::info!("BLE: Received authentication grant");
+
+                // Get all paired servers
+                let paired_servers = config_manager.load_paired_servers()?;
+
+                // Try to verify against each paired server
+                for (_id, server) in paired_servers.iter() {
+                    let pub_key_bytes = hex::decode(&server.public_key).map_err(|_| {
+                        crate::auth_client::AuthError::Protocol(
+                            shared::protocol::ProtocolError::InvalidMessageFormat,
+                        )
+                    })?;
+
+                    if pub_key_bytes.len() != 32 {
+                        tracing::warn!(
+                            "Server {} has invalid public key length: {}",
+                            server.name,
+                            pub_key_bytes.len()
+                        );
+                        continue;
+                    }
+
+                    let mut pub_key = [0u8; 32];
+                    pub_key.copy_from_slice(&pub_key_bytes);
+
+                    match verify_auth_grant(grant, challenge, &pub_key) {
+                        Ok(_) => {
+                            tracing::info!(
+                                "BLE: Authentication grant verified for server: {}",
+                                server.name
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "BLE: Verification failed for server {}: {:?}",
+                                server.name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                tracing::error!("BLE: No server matched the grant signature");
+                Err(crate::auth_client::AuthError::Protocol(
+                    shared::protocol::ProtocolError::InvalidSignature,
+                ))
+            }
+            Some(wrapper_message::Payload::AuthDenial(ref denial)) => {
+                tracing::warn!("BLE: Received authentication denial");
+
+                // Verify the denial
+                let paired_servers = config_manager.load_paired_servers()?;
+
+                for (_id, server) in paired_servers.iter() {
+                    let pub_key_bytes = hex::decode(&server.public_key).map_err(|_| {
+                        crate::auth_client::AuthError::Protocol(
+                            shared::protocol::ProtocolError::InvalidMessageFormat,
+                        )
+                    })?;
+
+                    if pub_key_bytes.len() != 32 {
+                        continue;
+                    }
+
+                    let mut pub_key = [0u8; 32];
+                    pub_key.copy_from_slice(&pub_key_bytes);
+
+                    if verify_auth_denial(denial, &pub_key).is_ok() {
+                        tracing::info!(
+                            "BLE: Authentication denial verified for server: {}",
+                            server.name
+                        );
+                        return Err(crate::auth_client::AuthError::Denied);
+                    }
+                }
+
+                Err(crate::auth_client::AuthError::Protocol(
+                    shared::protocol::ProtocolError::InvalidSignature,
+                ))
+            }
+            _ => {
+                tracing::error!("BLE: Unexpected message type in response");
+                Err(crate::auth_client::AuthError::InitError(
+                    "Unexpected BLE response type".to_string(),
+                ))
+            }
+        }
     }
 
     /// Wait for incoming connection with timeout
