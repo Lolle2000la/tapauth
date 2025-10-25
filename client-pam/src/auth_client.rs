@@ -165,7 +165,7 @@ impl AuthenticationClient {
     async fn try_ble_authentication(
         &self,
         packet: &EncryptedPacket,
-        temporal_id: &[u8; 16],
+        temporal_id: &[u8; 10],
     ) -> Result<(), AuthError> {
         tracing::info!("Starting BLE authentication via daemon");
 

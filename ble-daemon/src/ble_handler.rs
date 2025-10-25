@@ -49,20 +49,19 @@ impl BleAuthHandler {
         );
 
         // Start advertising with temporal ID
-        // Use SERVICE_UUID in the service list (for Android filter to match)
-        // Use TEMPORAL_ID_DATA_UUID as the key for service data (to avoid conflict)
+        // Only advertise service data to stay within 31-byte BLE advertisement limit
+        // The service data itself identifies this as a TapAuth advertisement
         let advertisement = Advertisement {
-            service_uuids: vec![shared::models::ble::SERVICE_UUID.parse().unwrap()]
-                .into_iter()
-                .collect(),
+            // Do NOT include service_uuids - it adds 18 bytes and causes packet overflow
             service_data: [(
-                shared::models::ble::TEMPORAL_ID_DATA_UUID.parse().unwrap(),
+                shared::models::ble::SERVICE_UUID.parse().unwrap(),
                 request.temporal_id.to_vec(),
             )]
             .into_iter()
             .collect(),
             discoverable: Some(true),
-            local_name: Some("TapAuth".to_string()),
+            // Empty local name to save bytes (would add 10+ bytes)
+            local_name: Some("".to_string()),
             ..Default::default()
         };
 

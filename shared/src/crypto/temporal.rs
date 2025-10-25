@@ -17,10 +17,11 @@ pub fn current_time_window() -> u64 {
 }
 
 /// Generate temporal identifier for a given time window
+/// Returns a 10-byte identifier (reduced from 16 to fit in BLE advertisement)
 pub fn generate_temporal_identifier(
     csk: &ClientSymmetricKey,
     time_window: u64,
-) -> Result<[u8; 16], CryptoError> {
+) -> Result<[u8; 10], CryptoError> {
     let mut mac =
         HmacSha256::new_from_slice(csk.as_bytes()).map_err(|_| CryptoError::KeyDerivationFailed)?;
 
@@ -29,8 +30,8 @@ pub fn generate_temporal_identifier(
     let result = mac.finalize();
     let bytes = result.into_bytes();
 
-    let mut identifier = [0u8; 16];
-    identifier.copy_from_slice(&bytes[..16]);
+    let mut identifier = [0u8; 10];
+    identifier.copy_from_slice(&bytes[..10]);
 
     Ok(identifier)
 }
@@ -38,14 +39,14 @@ pub fn generate_temporal_identifier(
 /// Generate temporal identifier for current time window
 pub fn generate_current_temporal_identifier(
     csk: &ClientSymmetricKey,
-) -> Result<[u8; 16], CryptoError> {
+) -> Result<[u8; 10], CryptoError> {
     generate_temporal_identifier(csk, current_time_window())
 }
 
 /// Generate temporal identifier for previous time window
 pub fn generate_previous_temporal_identifier(
     csk: &ClientSymmetricKey,
-) -> Result<[u8; 16], CryptoError> {
+) -> Result<[u8; 10], CryptoError> {
     let window = current_time_window();
     if window == 0 {
         return Err(CryptoError::KeyDerivationFailed);
@@ -56,7 +57,7 @@ pub fn generate_previous_temporal_identifier(
 /// Verify if a temporal identifier matches current or previous window
 pub fn verify_temporal_identifier(
     csk: &ClientSymmetricKey,
-    identifier: &[u8; 16],
+    identifier: &[u8; 10],
 ) -> Result<bool, CryptoError> {
     let current = generate_current_temporal_identifier(csk)?;
     if identifier == &current {
@@ -103,7 +104,7 @@ mod tests {
         assert!(verify_temporal_identifier(&csk, &current_id).unwrap());
 
         // Random identifier should not verify
-        let random_id = [0u8; 16];
+        let random_id = [0u8; 10];
         assert!(!verify_temporal_identifier(&csk, &random_id).unwrap());
     }
 

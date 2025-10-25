@@ -11,8 +11,8 @@ use zbus::interface;
 pub struct AuthRequest {
     /// Encrypted authentication request packet (serialized protobuf)
     pub encrypted_packet: Vec<u8>,
-    /// Temporal identifier for BLE advertising
-    pub temporal_id: [u8; 16],
+    /// Temporal identifier for BLE advertising (10 bytes)
+    pub temporal_id: [u8; 10],
     /// Timeout in seconds
     pub timeout_secs: u64,
 }
@@ -59,12 +59,12 @@ impl BleService {
         );
 
         // Validate temporal_id length
-        if temporal_id.len() != 16 {
+        if temporal_id.len() != 10 {
             tracing::error!("D-Bus: Invalid temporal_id length: {}", temporal_id.len());
             return AuthResult::Error.to_u32();
         }
 
-        let mut temporal_id_array = [0u8; 16];
+        let mut temporal_id_array = [0u8; 10];
         temporal_id_array.copy_from_slice(&temporal_id);
 
         let request = AuthRequest {

@@ -94,50 +94,51 @@ class BleGattService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             super.onScanResult(callbackType, result)
             
-            Log.d(TAG, "BLE scan result received: device=${result.device.address}, rssi=${result.rssi}")
+//            Log.d(TAG, "BLE scan result received: device=${result.device.address}, rssi=${result.rssi}")
             
-            // Log all available service UUIDs
+//            // Log all available service UUIDs
             val scanRecord = result.scanRecord
-            if (scanRecord != null) {
-                Log.d(TAG, "  Device name: ${scanRecord.deviceName}")
-                Log.d(TAG, "  Service UUIDs: ${scanRecord.serviceUuids?.joinToString()}")
-                
-                // Log detailed service data information
-                val serviceDataMap = scanRecord.serviceData
-                if (serviceDataMap != null && serviceDataMap.isNotEmpty()) {
-                    Log.d(TAG, "  Service data entries: ${serviceDataMap.size}")
-                    serviceDataMap.forEach { (uuid, data) ->
-                        Log.d(TAG, "    UUID: $uuid, Data size: ${data.size} bytes")
-                    }
-                } else {
-                    Log.d(TAG, "  Service data: empty or null")
-                }
-            }
+//            if (scanRecord != null) {
+//                Log.d(TAG, "  Device name: ${scanRecord.deviceName}")
+//                Log.d(TAG, "  Service UUIDs: ${scanRecord.serviceUuids?.joinToString()}")
+//
+//                // Log detailed service data information
+//                val serviceDataMap = scanRecord.serviceData
+//                if (serviceDataMap != null && serviceDataMap.isNotEmpty()) {
+//                    Log.d(TAG, "  Service data entries: ${serviceDataMap.size}")
+//                    serviceDataMap.forEach { (uuid, data) ->
+//                        Log.d(TAG, "    UUID: $uuid, Data size: ${data.size} bytes")
+//                    }
+//                } else {
+//                    Log.d(TAG, "  Service data: empty or null")
+//                }
+//            }
             
             // Extract service data containing temporal identifier
-            // Use TEMPORAL_ID_DATA_UUID (not SERVICE_UUID) to get the temporal ID
-            val serviceData = scanRecord?.getServiceData(ParcelUuid(TEMPORAL_ID_DATA_UUID))
-            if (serviceData != null) {
-                Log.d(TAG, "  Found TapAuth service data (${serviceData.size} bytes)")
-                if (serviceData.size == 16) {
-                    val temporalIdHex = serviceData.toHex()
-                    Log.i(TAG, "  Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(16)}...")
-                    
-                    // Check if this temporal ID matches any of our paired devices
-                    serviceScope.launch {
-                        val matchedCsk = temporalIdCache[temporalIdHex]
-                        if (matchedCsk != null) {
-                            Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                            connectToClient(result.device, matchedCsk)
-                        } else {
-                            Log.d(TAG, "Temporal ID does not match any paired device")
-                        }
+            // Use SERVICE_UUID as the key (daemon uses this to stay under 31-byte limit)
+            val serviceData = scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+            if (serviceData == null) {
+                // Most devices won't have TapAuth service data - silently ignore
+                return
+            }
+            
+            Log.d(TAG, "  Found TapAuth service data (${serviceData.size} bytes)")
+            if (serviceData.size == 10) {
+                val temporalIdHex = serviceData.toHex()
+                Log.i(TAG, "  Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}...")
+                
+                // Check if this temporal ID matches any of our paired devices
+                serviceScope.launch {
+                    val matchedCsk = temporalIdCache[temporalIdHex]
+                    if (matchedCsk != null) {
+                        Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                        connectToClient(result.device, matchedCsk)
+                    } else {
+                        Log.d(TAG, "Temporal ID does not match any paired device")
                     }
-                } else {
-                    Log.w(TAG, "  Service data size mismatch: expected 16 bytes, got ${serviceData.size}")
                 }
             } else {
-                Log.d(TAG, "  No TapAuth service data found")
+                Log.w(TAG, "  Service data size mismatch: expected 16 bytes, got ${serviceData.size}")
             }
         }
         
@@ -336,13 +337,14 @@ class BleGattService : Service() {
         temporalIdCache.clear()
         
         val pairedDevices = deviceRepository.getAllPairedDevices()
-        val currentWindow = System.currentTimeMillis() / 60_000
+        val currentTimestampSeconds = System.currentTimeMillis() / 1000
+        val previousTimestampSeconds = currentTimestampSeconds - 60 // Previous 60-second window
         
         for (device in pairedDevices) {
             try {
                 // Generate both current and previous temporal IDs
-                val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentWindow)
-                val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentWindow - 1)
+                val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestampSeconds)
+                val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, previousTimestampSeconds)
                 
                 // Store CSK as hex string for later retrieval
                 val cskHex = device.csk.toHex()
@@ -372,10 +374,10 @@ class BleGattService : Service() {
         
         Log.i(TAG, "BLUETOOTH_SCAN permission granted")
         
-        // Create scan filter for TapAuth service UUID
-        val scanFilter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
+        // No scan filter - we scan all devices and filter in the callback
+        // This is necessary because the advertisement doesn't include service UUIDs
+        // (to stay under the 31-byte BLE advertisement limit)
+        val scanFilters = emptyList<ScanFilter>()
         
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -383,11 +385,11 @@ class BleGattService : Service() {
         
         Log.i(TAG, "Scanner object: $bluetoothLeScanner")
         Log.i(TAG, "Callback object: $scanCallback")
-        Log.i(TAG, "Filtering for TapAuth service UUID: $SERVICE_UUID")
+        Log.i(TAG, "Starting BLE scanning with NO filter (will check service data in callback)")
         
-        // Start scan with filter to only see TapAuth advertisements
-        bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, scanCallback)
-        Log.i(TAG, "BLE scanning started with TapAuth service UUID filter")
+        // Start scan without filter - callback will check for TapAuth service data
+        bluetoothLeScanner?.startScan(scanFilters, scanSettings, scanCallback)
+        Log.i(TAG, "BLE scanning started (no filter - checking service data in callback)")
     }
     
     private fun stopScanning() {
@@ -420,11 +422,68 @@ class BleGattService : Service() {
         try {
             Log.d(TAG, "Handling BLE authentication request: ${data.size} bytes from ${gatt.device.address}")
             
-            // Step 1: Parse the encrypted packet
-            val authRequest = try {
-                dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(data)
+            // Step 1: Parse the EncryptedPacket
+            val encryptedPacket = try {
+                dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse BLE auth request", e)
+                Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
+                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray())
+                return
+            }
+            
+            Log.d(TAG, "Parsed EncryptedPacket: temporal_id=${encryptedPacket.temporalIdentifier.take(20)}..., ciphertext=${encryptedPacket.ciphertext.take(20)}...")
+            
+            // Decode Base64 fields to ByteArrays
+            val temporalIdBytes = android.util.Base64.decode(encryptedPacket.temporalIdentifier, android.util.Base64.NO_WRAP)
+            val ciphertextBytes = android.util.Base64.decode(encryptedPacket.ciphertext, android.util.Base64.NO_WRAP)
+            
+            // Step 2: Find the CSK by matching temporal ID
+            val pairedDevices = deviceRepository.getAllPairedDevices()
+            
+            if (pairedDevices.isEmpty()) {
+                Log.w(TAG, "No paired devices found, rejecting BLE request")
+                sendResponseToClient(gatt, "NO_PAIRED_DEVICES".toByteArray())
+                return
+            }
+            
+            Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
+            
+            // Try to match temporal ID with paired devices
+            var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
+            for (device in pairedDevices) {
+                val temporalIdHex = temporalIdBytes.toHex()
+                // Check if this temporal ID matches (current or previous window)
+                val currentTimestamp = System.currentTimeMillis() / 1000
+                val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp)
+                val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp - 60)
+                
+                if (temporalIdHex == currentId || temporalIdHex == previousId) {
+                    matchedDevice = device
+                    Log.d(TAG, "Temporal ID matched device: ${device.displayName}")
+                    break
+                }
+            }
+            
+            if (matchedDevice == null) {
+                Log.w(TAG, "No device matched the temporal ID")
+                sendResponseToClient(gatt, "UNKNOWN_DEVICE".toByteArray())
+                return
+            }
+            
+            // Step 3: Decrypt the EncryptedPacket to get the WrapperMessage
+            val wrapperMessageBytes = try {
+                dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(matchedDevice.csk, data)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
+                sendResponseToClient(gatt, "DECRYPTION_ERROR".toByteArray())
+                return
+            }
+            
+            // Step 4: Parse the AuthenticationRequest from the WrapperMessage
+            val authRequest = try {
+                dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(wrapperMessageBytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
                 sendResponseToClient(gatt, "PARSE_ERROR".toByteArray())
                 return
             }
@@ -435,23 +494,15 @@ class BleGattService : Service() {
             val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
             val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
             
-            // Step 2: Replay attack mitigation
+            // Step 5: Replay attack mitigation
             if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
                 Log.w(TAG, "BLE replay attack detected, rejecting request")
                 sendResponseToClient(gatt, "REPLAY_DETECTED".toByteArray())
                 return
             }
             
-            // Step 3: Find paired device and verify signature
-            val pairedDevices = deviceRepository.getAllPairedDevices()
-            
-            if (pairedDevices.isEmpty()) {
-                Log.w(TAG, "No paired devices found, rejecting BLE request")
-                sendResponseToClient(gatt, "NO_PAIRED_DEVICES".toByteArray())
-                return
-            }
-            
-            Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
+            // Step 6: Verify signature
+            Log.d(TAG, "Verifying signature for matched device: ${matchedDevice.displayName}")
             
             // Reconstruct message for verification
             val gson = com.google.gson.Gson()
@@ -464,32 +515,27 @@ class BleGattService : Service() {
                 return
             }
             
-            // Try to verify signature against each paired device
-            var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
-            for (pairedDev in pairedDevices) {
-                try {
-                    val isValid = dev.rourunisen.tapauth.crypto.verifySignature(
-                        pairedDev.publicKey,
-                        messageForVerification,
-                        signatureBytes
-                    )
-                    if (isValid) {
-                        matchedDevice = pairedDev
-                        Log.d(TAG, "BLE signature verified for device: ${pairedDev.displayName} (${pairedDev.deviceId})")
-                        break
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to verify BLE signature for device ${pairedDev.deviceId}", e)
-                }
+            // Verify signature with the matched device
+            val isValid = try {
+                dev.rourunisen.tapauth.crypto.verifySignature(
+                    matchedDevice.publicKey,
+                    messageForVerification,
+                    signatureBytes
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to verify BLE signature for device ${matchedDevice.deviceId}", e)
+                false
             }
             
-            if (matchedDevice == null) {
-                Log.w(TAG, "BLE signature verification failed for all devices, rejecting request")
+            if (!isValid) {
+                Log.w(TAG, "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request")
                 sendResponseToClient(gatt, "INVALID_SIGNATURE".toByteArray())
                 return
             }
             
-            // Step 4: Request biometric authentication via AuthRequestManager
+            Log.d(TAG, "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})")
+            
+            // Step 7: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
                 context = this,

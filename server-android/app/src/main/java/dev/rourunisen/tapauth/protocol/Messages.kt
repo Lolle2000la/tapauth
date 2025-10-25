@@ -56,7 +56,15 @@ object ProtobufParser {
     private val gson = Gson()
     
     /**
-     * Parse an EncryptedPacket from raw bytes using native library
+     * Parse an EncryptedPacket structure from raw protobuf bytes (without decryption)
+     */
+    fun parseEncryptedPacket(packetBytes: ByteArray): EncryptedPacket {
+        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseEncryptedPacketStructure(packetBytes)
+        return gson.fromJson(json, EncryptedPacket::class.java)
+    }
+    
+    /**
+     * Parse an EncryptedPacket from raw bytes using native library (with decryption - deprecated, use decrypt + parse separately)
      */
     fun parseEncryptedPacket(csk: ByteArray, packetBytes: ByteArray): EncryptedPacket {
         val cskHex = bytesToHex(csk)

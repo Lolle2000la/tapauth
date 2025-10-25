@@ -130,6 +130,13 @@ object TapAuthCrypto {
     external fun parseAuthenticationCancel(cancelBytes: ByteArray): String
     
     /**
+     * Parse EncryptedPacket structure from protobuf bytes (without decryption)
+     * @param packetBytes Protobuf-encoded EncryptedPacket
+     * @return JSON string with packet structure (temporal_identifier, encryption_algorithm, ciphertext)
+     */
+    external fun parseEncryptedPacketStructure(packetBytes: ByteArray): String
+    
+    /**
      * Create a WrapperMessage containing an AuthenticationGrant
      * @param signedChallenge The signed challenge bytes
      * @return Serialized WrapperMessage protobuf bytes

@@ -743,8 +743,74 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createAu
     }
 }
 
+/// JNI wrapper for parsing EncryptedPacket from protobuf bytes (without decryption).
+/// Returns JSON string with packet structure
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEncryptedPacketStructure(
+    mut env: JNIEnv,
+    _class: JClass,
+    packet_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use prost::Message;
+
+    // Extract packet bytes
+    let data = match env.convert_byte_array(packet_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read packet: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse EncryptedPacket
+    let encrypted_packet = match pb::EncryptedPacket::decode(&data[..]) {
+        Ok(pkt) => pkt,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse EncryptedPacket: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create JSON with base64-encoded byte fields
+    let json_result = serde_json::json!({
+        "temporal_identifier": BASE64.encode(&encrypted_packet.temporal_identifier),
+        "encryption_algorithm": encrypted_packet.encryption_algorithm,
+        "ciphertext": BASE64.encode(&encrypted_packet.ciphertext),
+    });
+
+    let json_str = match serde_json::to_string(&json_result) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to serialize to JSON: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    match env.new_string(&json_str) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create java string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// JNI wrapper for generating temporal identifier
-/// Returns 16-byte identifier as hex string
+/// Returns 10-byte identifier as hex string
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateTemporalId(
     mut env: JNIEnv,
@@ -847,12 +913,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
         }
     };
 
-    let id_array: [u8; 16] = match id_bytes.try_into() {
+    let id_array: [u8; 10] = match id_bytes.try_into() {
         Ok(arr) => arr,
         Err(_) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                "temporal ID must be 16 bytes",
+                "temporal ID must be 10 bytes",
             );
             return false as jboolean;
         }
