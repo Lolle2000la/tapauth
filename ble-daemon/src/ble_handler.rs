@@ -49,12 +49,14 @@ impl BleAuthHandler {
         );
 
         // Start advertising with temporal ID
+        // Use SERVICE_UUID in the service list (for Android filter to match)
+        // Use TEMPORAL_ID_DATA_UUID as the key for service data (to avoid conflict)
         let advertisement = Advertisement {
             service_uuids: vec![shared::models::ble::SERVICE_UUID.parse().unwrap()]
                 .into_iter()
                 .collect(),
             service_data: [(
-                shared::models::ble::SERVICE_UUID.parse().unwrap(),
+                shared::models::ble::TEMPORAL_ID_DATA_UUID.parse().unwrap(),
                 request.temporal_id.to_vec(),
             )]
             .into_iter()
@@ -107,7 +109,9 @@ impl BleAuthHandler {
         let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID.parse().unwrap();
         let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID.parse().unwrap();
 
-        // Client Command Characteristic - server reads our auth request
+        // Client Command Characteristic - Server (Android Central) READS auth request from this
+        // Desktop (Peripheral) provides the authentication request here
+        // NOTE: Spec says WRITE property, but that's backwards - Central needs to READ from Peripheral
         let request_data_for_read = request_data.clone();
         let client_cmd_char = Characteristic {
             uuid: client_cmd_uuid,
@@ -125,7 +129,9 @@ impl BleAuthHandler {
             ..Default::default()
         };
 
-        // Server Response Characteristic - server writes response to us
+        // Server Response Characteristic - Server (Android Central) WRITES response to this
+        // Desktop (Peripheral) receives the authentication response here
+        // NOTE: Spec says NOTIFY property, but that's backwards - Central needs to WRITE to Peripheral
         let server_resp_char = Characteristic {
             uuid: server_resp_uuid,
             write: Some(CharacteristicWrite {

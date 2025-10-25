@@ -3,6 +3,10 @@ pub mod ble {
     pub const SERVICE_UUID: &str = "b4ad84c0-2adb-4876-8315-b39d983b2bde";
     pub const CLIENT_COMMAND_CHAR_UUID: &str = "caf54438-9d78-4697-8886-0a4cfa87ba8d";
     pub const SERVER_RESPONSE_CHAR_UUID: &str = "ca6238be-c194-49b7-855b-58f41d3da626";
+    
+    /// Separate UUID for temporal ID service data to avoid conflict with service UUID
+    /// This UUID is used as the key in the service data map for the temporal identifier
+    pub const TEMPORAL_ID_DATA_UUID: &str = "73d5896e-f862-403e-b482-1bb4b9a3a6f1";
 }
 
 /// Pairing QR code URL format
