@@ -93,31 +93,57 @@ class BleGattService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             super.onScanResult(callbackType, result)
             
-            // Extract service data containing temporal identifier
-            val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
-            if (serviceData != null && serviceData.size == 16) {
-                val temporalIdHex = serviceData.toHex()
-                Log.d(TAG, "Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(16)}...")
+            Log.d(TAG, "BLE scan result received: device=${result.device.address}, rssi=${result.rssi}")
+            
+            // Log all available service UUIDs
+            val scanRecord = result.scanRecord
+            if (scanRecord != null) {
+                Log.d(TAG, "  Device name: ${scanRecord.deviceName}")
+                Log.d(TAG, "  Service UUIDs: ${scanRecord.serviceUuids?.joinToString()}")
                 
-                // Check if this temporal ID matches any of our paired devices
-                serviceScope.launch {
-                    val matchedCsk = temporalIdCache[temporalIdHex]
-                    if (matchedCsk != null) {
-                        Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                        connectToClient(result.device, matchedCsk)
-                    } else {
-                        Log.d(TAG, "Temporal ID does not match any paired device")
+                // Log detailed service data information
+                val serviceDataMap = scanRecord.serviceData
+                if (serviceDataMap != null && serviceDataMap.isNotEmpty()) {
+                    Log.d(TAG, "  Service data entries: ${serviceDataMap.size}")
+                    serviceDataMap.forEach { (uuid, data) ->
+                        Log.d(TAG, "    UUID: $uuid, Data size: ${data.size} bytes")
                     }
+                } else {
+                    Log.d(TAG, "  Service data: empty or null")
                 }
+            }
+            
+            // Extract service data containing temporal identifier
+            val serviceData = scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+            if (serviceData != null) {
+                Log.d(TAG, "  Found TapAuth service data (${serviceData.size} bytes)")
+                if (serviceData.size == 16) {
+                    val temporalIdHex = serviceData.toHex()
+                    Log.i(TAG, "  Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(16)}...")
+                    
+                    // Check if this temporal ID matches any of our paired devices
+                    serviceScope.launch {
+                        val matchedCsk = temporalIdCache[temporalIdHex]
+                        if (matchedCsk != null) {
+                            Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                            connectToClient(result.device, matchedCsk)
+                        } else {
+                            Log.d(TAG, "Temporal ID does not match any paired device")
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "  Service data size mismatch: expected 16 bytes, got ${serviceData.size}")
+                }
+            } else {
+                Log.d(TAG, "  No TapAuth service data found")
             }
         }
         
         override fun onScanFailed(errorCode: Int) {
             super.onScanFailed(errorCode)
             Log.e(TAG, "BLE scan failed with error: $errorCode")
-            try { 
-                dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this@BleGattService }, false) 
-            } catch (_: Exception) { }
+            dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this@BleGattService }, false)
+            stopSelf()
         }
     }
     
@@ -217,6 +243,9 @@ class BleGattService : Service() {
     
     override fun onCreate() {
         super.onCreate()
+        Log.wtf(TAG, "=== BLE GATT SERVICE STARTING ===")
+        Log.i(TAG, "onCreate() called")
+        
         deviceRepository = DeviceRepository(this)
         keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
         biometricHelper = BiometricHelper(this)
@@ -225,8 +254,22 @@ class BleGattService : Service() {
         bluetoothAdapter = bluetoothManager?.adapter
         bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
         
+        Log.i(TAG, "Bluetooth adapter: $bluetoothAdapter")
+        Log.i(TAG, "BLE scanner: $bluetoothLeScanner")
+        
         if (bluetoothAdapter == null || bluetoothLeScanner == null) {
             Log.e(TAG, "Bluetooth or BLE scanning not supported on this device")
+            dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
+            stopSelf()
+            return
+        }
+        
+        // Check if Bluetooth is actually enabled
+        val isEnabled = bluetoothAdapter?.isEnabled
+        Log.i(TAG, "Bluetooth enabled: $isEnabled")
+        if (isEnabled != true) {
+            Log.e(TAG, "Bluetooth is disabled")
+            dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
             stopSelf()
             return
         }
@@ -243,7 +286,14 @@ class BleGattService : Service() {
         }
 
         startTemporalIdCache()
+        
+        Log.i(TAG, "About to start BLE scanning...")
         startScanning()
+        Log.i(TAG, "Scanning start call completed")
+        
+        // Mark service as running after successful initialization
+        dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, true)
+        Log.i(TAG, "=== BLE GATT SERVICE STARTED SUCCESSFULLY ===")
     }
 
     private fun createNotification(): Notification {
@@ -307,6 +357,8 @@ class BleGattService : Service() {
     }
     
     private fun startScanning() {
+        Log.i(TAG, "startScanning() called")
+        
         if (ActivityCompat.checkSelfPermission(
                 this,
                 Manifest.permission.BLUETOOTH_SCAN
@@ -315,6 +367,8 @@ class BleGattService : Service() {
             Log.e(TAG, "BLUETOOTH_SCAN permission not granted")
             return
         }
+        
+        Log.i(TAG, "BLUETOOTH_SCAN permission granted")
         
         // Create scan filter for TapAuth service UUID
         val scanFilter = ScanFilter.Builder()
@@ -325,12 +379,13 @@ class BleGattService : Service() {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
         
-        bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, scanCallback)
-        Log.i(TAG, "BLE scanning started for TapAuth service")
+        Log.i(TAG, "Scanner object: $bluetoothLeScanner")
+        Log.i(TAG, "Callback object: $scanCallback")
+        Log.i(TAG, "Filtering for TapAuth service UUID: $SERVICE_UUID")
         
-        try { 
-            dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, true) 
-        } catch (_: Exception) { }
+        // Start scan with filter to only see TapAuth advertisements
+        bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, scanCallback)
+        Log.i(TAG, "BLE scanning started with TapAuth service UUID filter")
     }
     
     private fun stopScanning() {

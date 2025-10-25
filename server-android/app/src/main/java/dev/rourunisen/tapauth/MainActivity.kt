@@ -233,6 +233,11 @@ fun TapAuthApp() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             add(Manifest.permission.BLUETOOTH_CONNECT)
             add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_SCAN)
+        }
+        // Location permission required for BLE scanning on Android 10+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
@@ -334,6 +339,8 @@ fun PermissionRequestScreen(
                 Manifest.permission.CAMERA to "Camera - for scanning QR codes",
                 Manifest.permission.BLUETOOTH_CONNECT to "Bluetooth - for BLE authentication",
                 Manifest.permission.BLUETOOTH_ADVERTISE to "Bluetooth - for BLE advertisement",
+                Manifest.permission.BLUETOOTH_SCAN to "Bluetooth - for scanning BLE devices",
+                Manifest.permission.ACCESS_FINE_LOCATION to "Location - required for BLE scanning",
                 Manifest.permission.POST_NOTIFICATIONS to "Notifications - for auth requests"
             )
             
