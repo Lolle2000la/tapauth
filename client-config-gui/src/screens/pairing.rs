@@ -373,16 +373,10 @@ impl PairingScreen {
 
         let config = ClientConfigManager::new();
 
-        // Get the current username
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .or_else(|_| {
-                // Fallback: use whoami crate or system call
-                Ok::<String, String>(whoami::username())
-            })
-            .map_err(|e| format!("Failed to get current username: {}", e))?;
+        // Get the original username (before any privilege escalation)
+        let username = crate::utils::elevation::get_username();
 
-        tracing::debug!("Pairing as user: {}", username);
+        tracing::info!("Pairing as user: {}", username);
 
         // Retrieve stored session state
         let mut state_guard = PAIRING_STATE.lock().await;

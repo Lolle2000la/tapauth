@@ -1,4 +1,5 @@
 use super::ScreenMessage;
+use crate::utils::elevation;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Element, Length, Task,
@@ -18,10 +19,10 @@ impl DeviceListScreen {
     pub fn new() -> (Self, Task<ScreenMessage>) {
         tracing::debug!("Creating new DeviceListScreen and starting load task");
 
-        // Get current username
-        let current_username = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| whoami::username());
+        // Get original username (before any privilege escalation)
+        let current_username = elevation::get_username();
+
+        tracing::info!("Device list for user: {}", current_username);
 
         let screen = Self {
             devices: HashMap::new(),

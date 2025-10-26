@@ -1,4 +1,6 @@
 /// Utility functions for the GUI application
+pub mod elevation;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Get the local IPv4 address
