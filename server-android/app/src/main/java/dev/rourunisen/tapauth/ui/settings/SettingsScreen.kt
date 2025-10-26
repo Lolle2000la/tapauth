@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.compose.material3.HorizontalDivider
 // Switch removed; toggles are deprecated in this screen
 import androidx.compose.ui.platform.LocalContext
 import dev.rourunisen.tapauth.data.AppConfiguration
@@ -82,12 +83,16 @@ fun SettingsScreen(
                     )
                     Text(
                         text = "Each paired desktop client generates its own CSK and shares it with you during pairing. " +
-                        "This key is used to encrypt all authentication communication. " +
-                        "The CSK is controlled by the desktop client, not this app.",
+                                "This key is used to encrypt all authentication communication. " +
+                                "The CSK is controlled by the desktop client, not this app.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 8.dp),
+                        thickness = DividerDefaults.Thickness,
+                        color = DividerDefaults.color
+                    )
                     Text(
                         text = "Security Note",
                         style = MaterialTheme.typography.titleSmall,
@@ -95,7 +100,7 @@ fun SettingsScreen(
                     )
                     Text(
                         text = "If a desktop client rotates its CSK, you will need to re-pair with that device. " +
-                        "Each paired device maintains its own separate encryption key.",
+                                "Each paired device maintains its own separate encryption key.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -120,11 +125,11 @@ fun SettingsScreen(
                     InfoRow("App Version", "1.0.0")
                     HorizontalDivider()
                     InfoRow("Protocol Version", "1")
-                    Divider()
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
                     InfoRow("Encryption", "AES-256-GCM")
-                    Divider()
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
                     InfoRow("Key Exchange", "X25519")
-                    Divider()
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
                     InfoRow("Signing", "Ed25519")
                 }
             }
@@ -143,7 +148,7 @@ fun SettingsScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Divider()
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
 
                     // Battery optimization prompt
                     Button(onClick = { showBatteryConfirm = true }) {
@@ -151,10 +156,17 @@ fun SettingsScreen(
                     }
 
                     // Service running switches
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("UDP Service", style = MaterialTheme.typography.bodyMedium)
-                            Text("UDP listener for auth requests", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "UDP listener for auth requests",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                         var udpBusy by remember { mutableStateOf(false) }
                         Switch(checked = udpState, onCheckedChange = { checked ->
@@ -162,9 +174,14 @@ fun SettingsScreen(
                                 udpBusy = true
                                 config.udpRunning = checked
                                 try {
-                                    if (checked) dev.rourunisen.tapauth.service.AuthenticationService.start(context)
-                                    else dev.rourunisen.tapauth.service.AuthenticationService.stop(context)
-                                } catch (_: Exception) {}
+                                    if (checked) dev.rourunisen.tapauth.service.AuthenticationService.start(
+                                        context
+                                    )
+                                    else dev.rourunisen.tapauth.service.AuthenticationService.stop(
+                                        context
+                                    )
+                                } catch (_: Exception) {
+                                }
                                 // wait briefly for service to report state; timeout after 2s
                                 withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                 udpBusy = false
@@ -173,10 +190,17 @@ fun SettingsScreen(
                         if (udpBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
                     }
 
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("BLE GATT Server", style = MaterialTheme.typography.bodyMedium)
-                            Text("BLE advertisement and GATT server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "BLE advertisement and GATT server",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                         var bleBusy by remember { mutableStateOf(false) }
                         Switch(checked = bleState, onCheckedChange = { checked ->
@@ -184,9 +208,12 @@ fun SettingsScreen(
                                 bleBusy = true
                                 config.bleRunning = checked
                                 try {
-                                    if (checked) dev.rourunisen.tapauth.ble.BleGattService.start(context)
+                                    if (checked) dev.rourunisen.tapauth.ble.BleGattService.start(
+                                        context
+                                    )
                                     else dev.rourunisen.tapauth.ble.BleGattService.stop(context)
-                                } catch (_: Exception) {}
+                                } catch (_: Exception) {
+                                }
                                 withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                 bleBusy = false
                             }
@@ -196,13 +223,21 @@ fun SettingsScreen(
 
                     // Service status display
                     val df = DateFormat.getDateTimeInstance()
-                    val udpLast = if (config.udpLastStartMillis == 0L) "never" else df.format(Date(config.udpLastStartMillis))
-                    val bleLast = if (config.bleLastStartMillis == 0L) "never" else df.format(Date(config.bleLastStartMillis))
+                    val udpLast =
+                        if (config.udpLastStartMillis == 0L) "never" else df.format(Date(config.udpLastStartMillis))
+                    val bleLast =
+                        if (config.bleLastStartMillis == 0L) "never" else df.format(Date(config.bleLastStartMillis))
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text("Service status:")
-                    Text("UDP listener last started: $udpLast", style = MaterialTheme.typography.bodySmall)
-                    Text("BLE GATT last started: $bleLast", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "UDP listener last started: $udpLast",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "BLE GATT last started: $bleLast",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
 

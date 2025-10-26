@@ -5,12 +5,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.*
@@ -21,7 +23,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.google.accompanist.permissions.*
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.service.AuthRequestManager
 import dev.rourunisen.tapauth.ui.home.HomeScreen
@@ -37,8 +38,26 @@ class MainActivity : FragmentActivity() {
     private lateinit var biometricPrompt: BiometricPrompt
     private lateinit var authRequestReceiver: BroadcastReceiver
     
+    // Track individual permission states
+    internal val cameraGranted = mutableStateOf(false)
+    internal val bluetoothGranted = mutableStateOf(false)
+    internal val locationGranted = mutableStateOf(false)
+    internal val notificationGranted = mutableStateOf(false)
+    
+    // Request codes for classic permission requests
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val REQUEST_CAMERA = 1
+        private const val REQUEST_BLUETOOTH = 2
+        private const val REQUEST_LOCATION = 3
+        private const val REQUEST_NOTIFICATION = 4
+    }
+    
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        // Check initial permission status
+        checkAllPermissions()
         
         setupBiometricPrompt()
         setupAuthRequestReceiver()
@@ -188,6 +207,110 @@ class MainActivity : FragmentActivity() {
         authRequestManager.handleResponse(requestId, approved, signedChallenge)
     }
     
+    private fun checkAllPermissions() {
+        // Check camera
+        cameraGranted.value = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        
+        // Check Bluetooth permissions (Android 12+)
+        bluetoothGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            listOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_SCAN
+            ).all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+        } else {
+            true // Not needed on older versions
+        }
+        
+        // Check location (Android 10+)
+        locationGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true // Not needed on older versions
+        }
+        
+        // Check notifications (Android 13+)
+        notificationGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true // Not needed on older versions
+        }
+    }
+    
+    fun requestCamera() {
+        requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
+    }
+    
+    fun requestBluetooth() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestPermissions(arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_SCAN
+            ), REQUEST_BLUETOOTH)
+        } else {
+            bluetoothGranted.value = true
+            checkAllPermissions()
+        }
+    }
+    
+    fun requestLocation() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQUEST_LOCATION)
+        } else {
+            locationGranted.value = true
+            checkAllPermissions()
+        }
+    }
+    
+    fun requestNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION)
+        } else {
+            notificationGranted.value = true
+            checkAllPermissions()
+        }
+    }
+    
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        
+        when (requestCode) {
+            REQUEST_CAMERA -> {
+                cameraGranted.value = grantResults.isNotEmpty() && 
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            }
+            REQUEST_BLUETOOTH -> {
+                bluetoothGranted.value = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            }
+            REQUEST_LOCATION -> {
+                locationGranted.value = grantResults.isNotEmpty() && 
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            }
+            REQUEST_NOTIFICATION -> {
+                notificationGranted.value = grantResults.isNotEmpty() && 
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        
+        checkAllPermissions()
+    }
+    
+    fun allPermissionsGranted(): Boolean {
+        return cameraGranted.value && bluetoothGranted.value && 
+               locationGranted.value && notificationGranted.value
+    }
+    
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(authRequestReceiver)
@@ -214,51 +337,19 @@ class MainActivity : FragmentActivity() {
             }
         }
     }
-    
-    companion object {
-        private const val TAG = "MainActivity"
-    }
 }
 
-@OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun TapAuthApp() {
-    // List of required permissions
-    val permissions = buildList {
-        add(Manifest.permission.CAMERA)
-        add(Manifest.permission.INTERNET)
-        add(Manifest.permission.ACCESS_NETWORK_STATE)
-        add(Manifest.permission.ACCESS_WIFI_STATE)
-        add(Manifest.permission.CHANGE_WIFI_MULTICAST_STATE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            add(Manifest.permission.BLUETOOTH_CONNECT)
-            add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            add(Manifest.permission.BLUETOOTH_SCAN)
-        }
-        // Location permission required for BLE scanning on Android 10+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val activity = context as? MainActivity
     
-    val permissionsState = rememberMultiplePermissionsState(permissions)
-    
-    // NOTE: Do not automatically launch the permission dialog on composition.
-    // Some devices / OEMs can crash when multiple permission dialogs are launched
-    // immediately during composition. The PermissionRequestScreen provides an
-    // explicit "Grant Permissions" button so the user can start the flow.
+    // Observe individual permission states from activity
+    val allGranted = activity?.allPermissionsGranted() ?: false
     
     // Show permission request screen if not all granted
-    if (!permissionsState.allPermissionsGranted) {
-        PermissionRequestScreen(
-            permissionsState = permissionsState,
-            onRequestPermissions = {
-                permissionsState.launchMultiplePermissionRequest()
-            }
-        )
+    if (!allGranted) {
+        PermissionRequestScreen(activity)
         return
     }
     
@@ -302,12 +393,14 @@ fun TapAuthApp() {
     }
 }
 
-@OptIn(ExperimentalPermissionsApi::class)
 @Composable
-fun PermissionRequestScreen(
-    permissionsState: MultiplePermissionsState,
-    onRequestPermissions: () -> Unit
-) {
+fun PermissionRequestScreen(activity: MainActivity?) {
+    // Observe permission states
+    val cameraGranted by activity?.cameraGranted ?: remember { mutableStateOf(false) }
+    val bluetoothGranted by activity?.bluetoothGranted ?: remember { mutableStateOf(false) }
+    val locationGranted by activity?.locationGranted ?: remember { mutableStateOf(false) }
+    val notificationGranted by activity?.notificationGranted ?: remember { mutableStateOf(false) }
+    
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
@@ -328,65 +421,109 @@ fun PermissionRequestScreen(
             Spacer(modifier = Modifier.height(24.dp))
             
             Text(
-                text = "TapAuth needs the following permissions to work:",
+                text = "Grant each permission individually:",
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
             
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(24.dp))
             
-            val permissionDescriptions = mapOf(
-                Manifest.permission.CAMERA to "Camera - for scanning QR codes",
-                Manifest.permission.BLUETOOTH_CONNECT to "Bluetooth - for BLE authentication",
-                Manifest.permission.BLUETOOTH_ADVERTISE to "Bluetooth - for BLE advertisement",
-                Manifest.permission.BLUETOOTH_SCAN to "Bluetooth - for scanning BLE devices",
-                Manifest.permission.ACCESS_FINE_LOCATION to "Location - required for BLE scanning",
-                Manifest.permission.POST_NOTIFICATIONS to "Notifications - for auth requests"
+            // Camera Permission
+            PermissionButton(
+                label = "Camera",
+                description = "For scanning QR codes",
+                isGranted = cameraGranted,
+                onClick = { activity?.requestCamera() }
             )
             
-            permissionsState.permissions.forEach { permState ->
-                permissionDescriptions[permState.permission]?.let { description ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = if (permState.status.isGranted) "✓" else "○",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = if (permState.status.isGranted) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            }
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = description,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            // Bluetooth Permission
+            PermissionButton(
+                label = "Bluetooth",
+                description = "For BLE authentication",
+                isGranted = bluetoothGranted,
+                onClick = { activity?.requestBluetooth() }
+            )
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            // Location Permission
+            PermissionButton(
+                label = "Location",
+                description = "Required for BLE scanning",
+                isGranted = locationGranted,
+                onClick = { activity?.requestLocation() }
+            )
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            // Notification Permission
+            PermissionButton(
+                label = "Notifications",
+                description = "For auth requests",
+                isGranted = notificationGranted,
+                onClick = { activity?.requestNotification() }
+            )
+        }
+    }
+}
+
+@Composable
+fun PermissionButton(
+    label: String,
+    description: String,
+    isGranted: Boolean,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isGranted) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
             }
-            
-            Spacer(modifier = Modifier.height(32.dp))
-            
-            Button(
-                onClick = onRequestPermissions,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Grant Permissions")
-            }
-            
-            if (permissionsState.permissions.any { it.status.shouldShowRationale }) {
-                Spacer(modifier = Modifier.height(16.dp))
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Some permissions were denied. Please grant them in Settings if the prompt doesn't appear.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    text = label,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (isGranted) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                 )
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isGranted) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+            
+            if (isGranted) {
+                Text(
+                    text = "✓",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                Button(onClick = onClick) {
+                    Text("Grant")
+                }
             }
         }
     }
