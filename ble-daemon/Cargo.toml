@@ -9,26 +9,26 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared library with protocol definitions
-shared = { path = "../shared", features = ["dbus"] }
+shared = { workspace = true, features = ["dbus"] }
 
 # BLE support
 bluer = { version = "0.17", features = ["bluetoothd"] }
 futures-util = "0.3"
 
 # D-Bus for IPC
-zbus = { version = "4.0", default-features = false, features = ["tokio"] }
+zbus = { workspace = true, default-features = false, features = ["tokio"] }
 
 # Async runtime
-tokio = { version = "1.41", features = ["full"] }
+tokio.workspace = true
 
 # Serialization
-prost = "0.14"
-hex = "0.4"
+prost.workspace = true
+hex.workspace = true
 
 # Logging
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # Error handling
-thiserror = "2.0"
+thiserror.workspace = true
 anyhow = "1.0"

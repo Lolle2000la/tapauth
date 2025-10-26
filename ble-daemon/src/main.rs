@@ -12,7 +12,7 @@ use dbus_interface::{AuthRequest, BleService};
 use shared::{AuthResult, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
-use zbus::ConnectionBuilder;
+use zbus::connection;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Registering D-Bus service: {}", DBUS_SERVICE_NAME);
     let service = BleService::new(auth_tx);
 
-    let _connection = ConnectionBuilder::system()?
+    let _connection = connection::Builder::system()?
         .name(DBUS_SERVICE_NAME)?
         .serve_at(DBUS_OBJECT_PATH, service)?
         .build()

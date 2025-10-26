@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["shared", "client-pam", "client-config-gui", "ble-daemon"]
+
+[workspace.dependencies]
+# Shared library (used by all consuming crates)
+shared = { path = "shared" }
+
+# Serialization (used by: shared, client-pam, ble-daemon)
+prost = "0.14"
+prost-build = "0.14"
+
+# Async runtime (used by: shared, client-pam, client-config-gui, ble-daemon)
+tokio = { version = "1.41", features = ["full"] }
+
+# D-Bus for IPC (used by: shared, client-pam, ble-daemon)
+zbus = "5.0"
+
+# Utilities (used by multiple crates)
+hex = "0.4" # shared, client-pam, client-config-gui, ble-daemon
+thiserror = "2.0" # shared, client-pam, client-config-gui, ble-daemon
+tracing = "0.1.41" # shared, client-pam, client-config-gui, ble-daemon
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+] } # client-pam, client-config-gui, ble-daemon
+getrandom = "0.3" # shared, client-pam
+libc = "0.2" # shared, client-config-gui
+chrono = "0.4" # shared, client-config-gui
+
+# Dev dependencies
+tokio-test = "0.4"

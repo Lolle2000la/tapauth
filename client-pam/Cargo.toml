@@ -7,27 +7,29 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-shared = { path = "../shared", features = ["dbus"] }
+shared = { workspace = true, features = ["dbus"] }
 
 # BLE support via daemon (using async zbus)
-zbus = { version = "5.0", optional = true }
+zbus = { workspace = true, optional = true }
 
 # Protocol buffers
-prost = "0.14"
+prost.workspace = true
 
 # TPM support
 tss-esapi = { version = "7.6", optional = true }
 
 # Networking
-tokio = { version = "1.41", features = ["full"] }
 socket2 = "0.5"
 
+# Async runtime
+tokio.workspace = true
+
 # Utilities
-thiserror = "2.0"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-getrandom = "0.3"
-hex = "0.4"
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 
 [features]
 default = ["ble"]
