@@ -192,12 +192,29 @@ impl BleAuthHandler {
 
             // Check if we received a response
             {
-                let response_lock = response_data.lock().await;
+                let mut response_lock = response_data.lock().await;
                 if let Some(ref response_bytes) = *response_lock {
                     tracing::info!("Processing received response");
                     let result = self.process_response(response_bytes).await;
-                    drop(app_handle);
-                    return result;
+
+                    match result {
+                        AuthResult::Granted | AuthResult::Denied => {
+                            // Valid response - success or explicit denial
+                            drop(app_handle);
+                            return result;
+                        }
+                        AuthResult::Error => {
+                            // Malformed response - log and continue waiting for other devices
+                            tracing::warn!("Received malformed response, clearing and waiting for other devices");
+                            *response_lock = None;
+                            // Continue loop - keep GATT server running
+                        }
+                        AuthResult::Timeout => {
+                            // Shouldn't happen here, but handle it
+                            tracing::warn!("Timed out, clearing and waiting for other devices ");
+                            *response_lock = None;
+                        }
+                    }
                 }
             }
 
