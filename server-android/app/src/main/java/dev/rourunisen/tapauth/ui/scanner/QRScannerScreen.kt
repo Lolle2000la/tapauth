@@ -3,12 +3,15 @@ package dev.rourunisen.tapauth.ui.scanner
 import android.Manifest
 import android.util.Log
 import android.util.Size
+import androidx.activity.compose.BackHandler
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,6 +37,9 @@ fun QRScannerScreen(
     var scanStatus by remember { mutableStateOf("Initializing camera...") }
     var lastScannedCode by remember { mutableStateOf<String?>(null) }
     
+    // Handle system back button
+    BackHandler(onBack = onBack)
+    
     LaunchedEffect(Unit) {
         if (!cameraPermissionState.status.isGranted) {
             cameraPermissionState.launchPermissionRequest()
@@ -46,7 +52,10 @@ fun QRScannerScreen(
                 title = { Text("Scan QR Code") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Text("←")
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
                     }
                 }
             )

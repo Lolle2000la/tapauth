@@ -1,8 +1,11 @@
 package dev.rourunisen.tapauth.ui.devices
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +32,9 @@ fun DeviceListScreen(
     var isLoading by remember { mutableStateOf(true) }
     var deviceToDelete by remember { mutableStateOf<PairedDevice?>(null) }
     var userToRemove by remember { mutableStateOf<Pair<PairedDevice, String>?>(null) }
+    
+    // Handle system back button
+    BackHandler(onBack = onBack)
     
     LaunchedEffect(Unit) {
         devices = repository.getAllPairedDevices()
@@ -123,7 +129,10 @@ fun DeviceListScreen(
                 title = { Text("Paired Devices") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Text("←")
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
                     }
                 }
             )

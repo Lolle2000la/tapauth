@@ -1,6 +1,9 @@
 package dev.rourunisen.tapauth.ui.pairing
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +32,9 @@ fun PairingScreen(
     val context = LocalContext.current
     val pairingClient = remember { PairingClient(context) }
     val deviceRepository = remember { DeviceRepository(context) }
+    
+    // Handle system back button
+    BackHandler(onBack = onBack)
     
     LaunchedEffect(pairingUrl) {
         scope.launch {
@@ -68,7 +74,10 @@ fun PairingScreen(
                 title = { Text("Device Pairing") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Text("←")
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
                     }
                 }
             )

@@ -1,8 +1,11 @@
 package dev.rourunisen.tapauth.ui.settings
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import android.content.BroadcastReceiver
@@ -42,13 +45,19 @@ fun SettingsScreen(
     val udpState by dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.collectAsState(initial = config.udpRunning)
     val bleState by dev.rourunisen.tapauth.service.ServiceStatusManager.bleRunning.collectAsState(initial = config.bleRunning)
     
+    // Handle system back button
+    BackHandler(onBack = onBack)
+    
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Text("←")
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
                     }
                 }
             )
