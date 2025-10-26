@@ -244,10 +244,14 @@ sudo cp "$BUILD_OUTPUT_FULL_PATH" "$TEMP_INSTALL_PATH"
 echo "    Creating temporary PAM service file at $PAM_CONFIG_PATH"
 # Note: Using the temporary *name* (not full path) is correct here,
 # PAM searches standard directories automatically.
+#
+# IMPORTANT: Using "required" instead of "sufficient" to ensure authentication
+# actually fails when TapAuth denies access. The second line (pam_deny.so) is
+# a safety measure that will deny access if TapAuth somehow doesn't return a result.
 sudo bash -c "cat > '$PAM_CONFIG_PATH'" << EOF
 # Temporary PAM config for local tapauth testing
-auth sufficient ${TEMP_INSTALL_NAME}
-auth required pam_permit.so
+auth required ${TEMP_INSTALL_NAME}
+auth required pam_deny.so
 account required pam_permit.so
 EOF
 echo "✅ Temporary setup complete."
