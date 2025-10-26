@@ -94,51 +94,28 @@ class BleGattService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             super.onScanResult(callbackType, result)
             
-//            Log.d(TAG, "BLE scan result received: device=${result.device.address}, rssi=${result.rssi}")
+            // Thanks to hardware filtering, we only receive advertisements with TapAuth service data
+            val scanRecord = result.scanRecord ?: return
             
-//            // Log all available service UUIDs
-            val scanRecord = result.scanRecord
-//            if (scanRecord != null) {
-//                Log.d(TAG, "  Device name: ${scanRecord.deviceName}")
-//                Log.d(TAG, "  Service UUIDs: ${scanRecord.serviceUuids?.joinToString()}")
-//
-//                // Log detailed service data information
-//                val serviceDataMap = scanRecord.serviceData
-//                if (serviceDataMap != null && serviceDataMap.isNotEmpty()) {
-//                    Log.d(TAG, "  Service data entries: ${serviceDataMap.size}")
-//                    serviceDataMap.forEach { (uuid, data) ->
-//                        Log.d(TAG, "    UUID: $uuid, Data size: ${data.size} bytes")
-//                    }
-//                } else {
-//                    Log.d(TAG, "  Service data: empty or null")
-//                }
-//            }
-            
-            // Extract service data containing temporal identifier
-            // Use SERVICE_UUID as the key (daemon uses this to stay under 31-byte limit)
-            val serviceData = scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
-            if (serviceData == null) {
-                // Most devices won't have TapAuth service data - silently ignore
+            // Extract the 10-byte temporal identifier from service data
+            val serviceData = scanRecord.getServiceData(ParcelUuid(SERVICE_UUID))
+            if (serviceData == null || serviceData.size != 10) {
+                Log.w(TAG, "Received filtered result but service data is invalid (size: ${serviceData?.size})")
                 return
             }
             
-            Log.d(TAG, "  Found TapAuth service data (${serviceData.size} bytes)")
-            if (serviceData.size == 10) {
-                val temporalIdHex = serviceData.toHex()
-                Log.i(TAG, "  Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}...")
-                
-                // Check if this temporal ID matches any of our paired devices
-                serviceScope.launch {
-                    val matchedCsk = temporalIdCache[temporalIdHex]
-                    if (matchedCsk != null) {
-                        Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                        connectToClient(result.device, matchedCsk)
-                    } else {
-                        Log.d(TAG, "Temporal ID does not match any paired device")
-                    }
+            val temporalIdHex = serviceData.toHex()
+            Log.i(TAG, "Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}...")
+            
+            // Check if this temporal ID matches any of our paired devices (from cache)
+            serviceScope.launch {
+                val matchedCsk = temporalIdCache[temporalIdHex]
+                if (matchedCsk != null) {
+                    Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                    connectToClient(result.device, matchedCsk)
+                } else {
+                    Log.d(TAG, "Temporal ID does not match any paired device")
                 }
-            } else {
-                Log.w(TAG, "  Service data size mismatch: expected 16 bytes, got ${serviceData.size}")
             }
         }
         
@@ -374,10 +351,21 @@ class BleGattService : Service() {
         
         Log.i(TAG, "BLUETOOTH_SCAN permission granted")
         
-        // No scan filter - we scan all devices and filter in the callback
-        // This is necessary because the advertisement doesn't include service UUIDs
-        // (to stay under the 31-byte BLE advertisement limit)
-        val scanFilters = emptyList<ScanFilter>()
+        // Use hardware-level filtering to only receive advertisements with TapAuth service data
+        // This dramatically reduces battery consumption by filtering at the Bluetooth chip level
+        // 
+        // We filter for devices advertising service data with the TapAuth Service UUID.
+        // Since the temporal ID value changes every 60 seconds, we use a mask of all zeros
+        // which means "match any value" - we only care that the service data UUID is present.
+        // The actual temporal ID matching happens in the callback against our cache.
+        val filterData = ByteArray(10) { 0x00 }  // 10-byte placeholder (matches any temporal ID)
+        val filterMask = ByteArray(10) { 0x00 }  // All zeros = wildcard (don't care about value)
+        
+        val scanFilter = ScanFilter.Builder()
+            .setServiceData(ParcelUuid(SERVICE_UUID), filterData, filterMask)
+            .build()
+        
+        val scanFilters = listOf(scanFilter)
         
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -385,11 +373,11 @@ class BleGattService : Service() {
         
         Log.i(TAG, "Scanner object: $bluetoothLeScanner")
         Log.i(TAG, "Callback object: $scanCallback")
-        Log.i(TAG, "Starting BLE scanning with NO filter (will check service data in callback)")
+        Log.i(TAG, "Starting BLE scanning with service data filter (UUID: $SERVICE_UUID)")
         
-        // Start scan without filter - callback will check for TapAuth service data
+        // Start scan with hardware-level filter
         bluetoothLeScanner?.startScan(scanFilters, scanSettings, scanCallback)
-        Log.i(TAG, "BLE scanning started (no filter - checking service data in callback)")
+        Log.i(TAG, "BLE scanning started with hardware filter")
     }
     
     private fun stopScanning() {

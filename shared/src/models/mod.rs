@@ -3,10 +3,10 @@ pub mod ble {
     /// TapAuth BLE GATT Service UUID
     /// Also used as the key for service data in BLE advertisements
     pub const SERVICE_UUID: &str = "b4ad84c0-2adb-4876-8315-b39d983b2bde";
-    
+
     /// Client Command Characteristic UUID (Server reads auth request from this)
     pub const CLIENT_COMMAND_CHAR_UUID: &str = "caf54438-9d78-4697-8886-0a4cfa87ba8d";
-    
+
     /// Server Response Characteristic UUID (Server writes auth response to this)
     pub const SERVER_RESPONSE_CHAR_UUID: &str = "ca6238be-c194-49b7-855b-58f41d3da626";
 }
