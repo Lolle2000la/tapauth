@@ -163,21 +163,60 @@ impl AuthenticationClient {
 
         tracing::debug!("==> About to create UDP and BLE futures");
 
-        // Create both futures
-        let ble_future = self.try_ble_authentication(packet, &temporal_id);
-        let udp_future = self.try_udp_authentication(packet);
+        // Pin both futures so we can poll them selectively
+        let mut ble_future = Box::pin(self.try_ble_authentication(packet, &temporal_id));
+        let mut udp_future = Box::pin(self.try_udp_authentication(packet));
 
-        tracing::debug!("==> Futures created, entering select!");
+        let mut ble_completed = false;
+        let mut udp_completed = false;
+        let mut udp_result: Option<Result<(), AuthError>> = None;
 
-        // Race both transports - first one to succeed wins
-        select! {
-            ble_result = ble_future => {
-                tracing::info!("BLE authentication completed first with result: {:?}", ble_result.as_ref().map(|_| "Ok").unwrap_or("Err"));
-                ble_result
+        tracing::debug!("==> Futures created, entering select loop");
+
+        // Poll both futures until we have a definitive result
+        loop {
+            select! {
+                result = &mut ble_future, if !ble_completed => {
+                    tracing::info!("BLE completed: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
+                    ble_completed = true;
+
+                    match result {
+                        Ok(()) => {
+                            // BLE granted - success immediately
+                            tracing::info!("BLE authentication granted");
+                            return Ok(());
+                        }
+                        Err(AuthError::Denied) => {
+                            // Explicit denial - terminal failure
+                            tracing::warn!("BLE authentication explicitly denied");
+                            return Err(AuthError::Denied);
+                        }
+                        Err(ref e) => {
+                            // BLE failed non-fatally - store result and wait for UDP
+                            tracing::warn!("BLE failed: {}, waiting for UDP", e);
+                        }
+                    }
+                }
+                result = &mut udp_future, if !udp_completed => {
+                    tracing::info!("UDP completed: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
+                    udp_completed = true;
+
+                    // If UDP succeeds, return immediately
+                    if result.is_ok() {
+                        tracing::info!("UDP authentication granted");
+                        return Ok(());
+                    }
+
+                    // Store the error result
+                    udp_result = Some(result);
+                }
             }
-            udp_result = udp_future => {
-                tracing::info!("UDP authentication completed first with result: {:?}", udp_result.as_ref().map(|_| "Ok").unwrap_or("Err"));
-                udp_result
+
+            // Check if both have completed
+            if ble_completed && udp_completed {
+                // Both failed - return UDP error (more informative)
+                tracing::warn!("Both BLE and UDP authentication failed");
+                return udp_result.unwrap();
             }
         }
     }
