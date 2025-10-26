@@ -460,10 +460,18 @@ mod tests {
             let csk = ClientSymmetricKey::generate();
             let mut session = ClientPairingSession::new(client_keypair);
 
-            let (_server_pub, _server_name, sas) = session
-                .complete_pairing(stream, &csk, "testuser", "TestClient")
+            // Phase 1: Initiate pairing
+            let (stream, _server_pub, _server_name, sas) = session
+                .initiate_pairing(stream, "TestClient")
                 .await
                 .unwrap();
+
+            // Phase 2: Finish pairing
+            session
+                .finish_pairing(stream, &csk, "testuser")
+                .await
+                .unwrap();
+
             (csk, sas)
         });
 

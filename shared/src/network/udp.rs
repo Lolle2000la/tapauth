@@ -284,14 +284,14 @@ pub async fn try_receive_udp_packet(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_create_sockets() {
+    #[tokio::test]
+    async fn test_create_sockets() {
         // Test creating broadcast socket
-        let broadcast_socket = create_broadcast_socket();
+        let broadcast_socket = create_broadcast_socket().await;
         assert!(broadcast_socket.is_ok());
 
         // Test creating listen socket on a random port
-        let listen_socket = create_listen_socket(0);
+        let listen_socket = create_listen_socket(0).await;
         assert!(listen_socket.is_ok());
     }
 }
