@@ -5550,14 +5550,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b622b18155f7a93d1cd2dc8c01d2d6a44e08fb9ebb7b3f9e6ed101488bad6c91"
 dependencies = [
  "async-broadcast",
- "async-executor",
- "async-io",
- "async-lock",
- "async-process",
  "async-recursion",
- "async-task",
  "async-trait",
- "blocking",
  "enumflags2",
  "event-listener",
  "futures-core",

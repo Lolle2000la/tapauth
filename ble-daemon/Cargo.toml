@@ -16,7 +16,7 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 futures-util = "0.3"
 
 # D-Bus for IPC
-zbus = { workspace = true, default-features = false, features = ["tokio"] }
+zbus = { workspace = true, features = ["tokio"] }
 
 # Async runtime
 tokio.workspace = true

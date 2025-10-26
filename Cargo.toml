@@ -14,7 +14,7 @@ prost-build = "0.14"
 tokio = { version = "1.41", features = ["full"] }
 
 # D-Bus for IPC (used by: shared, client-pam, ble-daemon)
-zbus = "5.0"
+zbus = { version = "5.0", default-features = false }
 
 # Utilities (used by multiple crates)
 hex = "0.4" # shared, client-pam, client-config-gui, ble-daemon

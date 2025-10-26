@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 shared = { workspace = true, features = ["dbus"] }
 
 # BLE support via daemon (using async zbus)
-zbus = { workspace = true, optional = true }
+zbus = { workspace = true, optional = true, features = ["tokio"] }
 
 # Protocol buffers
 prost.workspace = true
