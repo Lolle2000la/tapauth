@@ -33,10 +33,11 @@ echo "Creating jniLibs directory structure..."
 mkdir -p "$JNILIBS_DIR"/{arm64-v8a,armeabi-v7a,x86_64,x86}
 
 echo "Copying libraries..."
-cp target/aarch64-linux-android/release/libshared.so "$JNILIBS_DIR/arm64-v8a/"
-cp target/armv7-linux-androideabi/release/libshared.so "$JNILIBS_DIR/armeabi-v7a/"
-cp target/x86_64-linux-android/release/libshared.so "$JNILIBS_DIR/x86_64/"
-cp target/i686-linux-android/release/libshared.so "$JNILIBS_DIR/x86/"
+# With workspace, build output is at root target directory
+cp "$PROJECT_ROOT/target/aarch64-linux-android/release/libshared.so" "$JNILIBS_DIR/arm64-v8a/"
+cp "$PROJECT_ROOT/target/armv7-linux-androideabi/release/libshared.so" "$JNILIBS_DIR/armeabi-v7a/"
+cp "$PROJECT_ROOT/target/x86_64-linux-android/release/libshared.so" "$JNILIBS_DIR/x86_64/"
+cp "$PROJECT_ROOT/target/i686-linux-android/release/libshared.so" "$JNILIBS_DIR/x86/"
 
 echo "✓ Build complete! Libraries copied to jniLibs/"
 echo ""

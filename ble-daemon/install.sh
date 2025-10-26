@@ -22,7 +22,8 @@ fi
 echo "==> Building BLE daemon..."
 cargo build --release
 
-if [ ! -f "target/release/tapauth-ble-daemon" ]; then
+# With workspace, build output is at root level
+if [ ! -f "../target/release/tapauth-ble-daemon" ]; then
     echo "❌ Build failed: Executable not found"
     exit 1
 fi
@@ -31,11 +32,9 @@ echo "✅ Build successful"
 # Install binary
 echo ""
 echo "==> Installing binary (requires sudo)..."
-sudo cp target/release/tapauth-ble-daemon /usr/local/bin/
-sudo chmod +x /usr/local/bin/tapauth-ble-daemon
 echo "    Installing daemon binary to /usr/local/bin/tapauth-ble-daemon"
-cp target/release/tapauth-ble-daemon /usr/local/bin/tapauth-ble-daemon
-chmod 755 /usr/local/bin/tapauth-ble-daemon
+sudo cp ../target/release/tapauth-ble-daemon /usr/local/bin/
+sudo chmod 755 /usr/local/bin/tapauth-ble-daemon
 echo "✅ Binary installed"
 
 echo "==> Installing D-Bus policy..."

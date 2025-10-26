@@ -54,11 +54,12 @@ cargo ndk --target i686-linux-android --platform 24 build --release --features j
 Then copy the libraries:
 
 ```bash
+# Note: With Cargo workspace, build output is at the root target directory
 mkdir -p ../server-android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}
-cp target/aarch64-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/arm64-v8a/
-cp target/armv7-linux-androideabi/release/libshared.so ../server-android/app/src/main/jniLibs/armeabi-v7a/
-cp target/x86_64-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/x86_64/
-cp target/i686-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/x86/
+cp ../target/aarch64-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/arm64-v8a/
+cp ../target/armv7-linux-androideabi/release/libshared.so ../server-android/app/src/main/jniLibs/armeabi-v7a/
+cp ../target/x86_64-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/x86_64/
+cp ../target/i686-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/x86/
 ```
 
 ## JNI Functions Available

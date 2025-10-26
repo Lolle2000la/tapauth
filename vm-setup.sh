@@ -356,10 +356,11 @@ runcmd:
     cd ../client-config-gui && cargo build --release
     
     echo "==> Installing PAM module..."
-    sudo cp ../client-pam/target/release/libclient_pam.so /lib/security/pam_tapauth.so
+    # With workspace, build output is at root target directory
+    sudo cp ../target/release/libclient_pam.so /lib/security/pam_tapauth.so
     
     echo "==> Installing GUI..."
-    sudo cp ../client-config-gui/target/release/tapauth-config /usr/local/bin/
+    sudo cp ../target/release/tapauth-config /usr/local/bin/
     
     echo "Build complete!"
     SCRIPT

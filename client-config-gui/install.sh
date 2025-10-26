@@ -15,9 +15,9 @@ fi
 echo "Building release binary..."
 cargo build --release
 
-# Install binary
+# Install binary (workspace target is at root level)
 echo "Installing binary to /usr/bin/tapauth-config..."
-install -Dm755 target/release/tapauth-config /usr/bin/tapauth-config
+install -Dm755 ../target/release/tapauth-config /usr/bin/tapauth-config
 
 # Install polkit policy
 echo "Installing polkit policy..."

@@ -36,7 +36,7 @@ echo ""
 
 # --- Configuration ---
 PAM_CRATE_DIR="client-pam"
-BUILD_OUTPUT_FILE="target/release/libclient_pam.so"
+BUILD_OUTPUT_FILE="target/release/libclient_pam.so"  # Workspace target at root level
 # Use a temporary name to avoid conflicts during testing
 TEMP_INSTALL_NAME="pam_tapauth_test.so"
 # TEMP_INSTALL_PATH will be detected below
@@ -150,7 +150,8 @@ fi
 
 cd .. # Return to project root
 
-BUILD_OUTPUT_FULL_PATH="${PAM_CRATE_DIR}/${BUILD_OUTPUT_FILE}"
+# With workspace, build output is at root level
+BUILD_OUTPUT_FULL_PATH="${BUILD_OUTPUT_FILE}"
 
 if [ ! -f "$BUILD_OUTPUT_FULL_PATH" ]; then
     echo "❌ Build failed: Output file not found at $BUILD_OUTPUT_FULL_PATH"
@@ -206,7 +207,8 @@ fi
 
 # Install the test daemon
 echo "    Installing test daemon binary..."
-sudo cp target/release/tapauth-ble-daemon /usr/local/bin/tapauth-ble-daemon
+# With workspace, build output is at root target directory
+sudo cp ../target/release/tapauth-ble-daemon /usr/local/bin/tapauth-ble-daemon
 sudo chmod 755 /usr/local/bin/tapauth-ble-daemon
 
 # Install D-Bus policy

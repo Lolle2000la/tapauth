@@ -152,10 +152,10 @@ echo "==> Building GUI..."\n\
 cd /tapauth/client-config-gui && cargo build --release\n\
 \n\
 echo "==> Installing PAM module..."\n\
-cp /tapauth/client-pam/target/release/libclient_pam.so /lib/security/pam_tapauth.so\n\
+cp /tapauth/target/release/libclient_pam.so /lib/security/pam_tapauth.so\n\
 \n\
 echo "==> Installing GUI..."\n\
-cp /tapauth/client-config-gui/target/release/tapauth-config /usr/local/bin/\n\
+cp /tapauth/target/release/tapauth-config /usr/local/bin/\n\
 \n\
 echo "Build complete!"\n\
 ' > /usr/local/bin/build-tapauth && chmod +x /usr/local/bin/build-tapauth

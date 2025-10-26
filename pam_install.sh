@@ -13,7 +13,7 @@ echo ""
 
 # --- Configuration ---
 PAM_CRATE_DIR="client-pam"
-BUILD_OUTPUT_FILE="target/release/libclient_pam.so"
+BUILD_OUTPUT_FILE="target/release/libclient_pam.so"  # Workspace target at root level
 INSTALL_NAME="pam_tapauth.so"
 # INSTALL_PATH will be detected below
 # --- End Configuration ---
@@ -72,7 +72,8 @@ else
 fi
 cd .. # Return to project root
 
-BUILD_OUTPUT_FULL_PATH="${PAM_CRATE_DIR}/${BUILD_OUTPUT_FILE}"
+# With workspace, build output is at root level
+BUILD_OUTPUT_FULL_PATH="${BUILD_OUTPUT_FILE}"
 
 if [ ! -f "$BUILD_OUTPUT_FULL_PATH" ]; then
     echo "❌ Build failed: Output file not found at $BUILD_OUTPUT_FULL_PATH"
