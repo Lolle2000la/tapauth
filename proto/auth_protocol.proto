@@ -100,42 +100,6 @@ message AuthenticationCancel {
 // -- Pairing Messages --
 
 /**
- * A generic container for encrypted data, used during pairing.
- */
-message EncryptedData {
-  // The ciphertext of the encrypted payload.
-  bytes ciphertext = 1;
-}
-
-message PairingHandshake {
-  bytes server_public_key = 1;
-  // A list of signature algorithms the server supports for general communication.
-  repeated SignatureAlgorithm supported_signature_algorithms = 2;
-  // A list of symmetric algorithms the server supports for packet encryption.
-  repeated SymmetricAlgorithm supported_symmetric_algorithms = 3;
-  // A list of hash algorithms the server supports.
-  repeated HashAlgorithm supported_hash_algorithms = 4;
-}
-
-/**
- * Sent by the Client to the Server during pairing to deliver the shared key.
- */
-message ClientKeyDelivery {
-  // The Client Symmetric Key (CSK), encrypted with the temporary pairing key (PSK).
-  EncryptedData encrypted_csk = 1;
-}
-
-/**
- * Sent by the Server to the Client to confirm successful receipt of the shared key.
- */
-message PairingConfirmation {
-  // The algorithm used to produce the confirmation hash.
-  HashAlgorithm hash_algorithm = 1;
-  // A hash of the CSK (e.g., SHA-256), encrypted with the temporary pairing key (PSK).
-  EncryptedData encrypted_confirmation_hash = 2;
-}
-
-/**
  * Initial message sent by server during TCP pairing handshake.
  * Contains server's X25519 public key and Ed25519 public key.
  */
@@ -189,14 +153,11 @@ message WrapperMessage {
   uint32 version = 1;
 
   oneof payload {
-    PairingHandshake pairing_handshake = 2;
-    PairingConfirmation pairing_confirmation = 3;
     AuthenticationRequest auth_request = 4;
     AuthenticationGrant auth_grant = 5;
     AuthenticationDenial auth_denial = 6;
     GrantConfirmation grant_confirmation = 7;
     AuthenticationCancel auth_cancel = 8;
-    ClientKeyDelivery client_key_delivery = 9;
   }
 }
 
