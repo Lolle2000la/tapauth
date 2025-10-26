@@ -110,6 +110,8 @@ message PairingHello {
   bytes x25519_public_key = 2;
   // Server's long-term Ed25519 public key for identification
   bytes ed25519_public_key = 3;
+  // Server's device name for display purposes only (e.g., device model/hostname)
+  string device_name = 4;
 }
 
 /**
@@ -123,6 +125,8 @@ message PairingResponse {
   bytes x25519_public_key = 2;
   // Client's long-term Ed25519 public key for identification
   bytes ed25519_public_key = 3;
+  // Client's device name for display purposes only (e.g., hostname)
+  string device_name = 4;
 }
 
 /**

@@ -58,7 +58,8 @@ fun PairingScreen(
                         socket = initResult.socket,
                         psk = initResult.psk,
                         clientPublicKey = initResult.clientPublicKey,
-                        clientEd25519Key = initResult.clientEd25519Key
+                        clientEd25519Key = initResult.clientEd25519Key,
+                        clientDeviceName = initResult.clientDeviceName
                     )
                 }
                 is dev.rourunisen.tapauth.network.PairingInitResult.Error -> {
@@ -105,6 +106,7 @@ fun PairingScreen(
                                     psk = state.psk,
                                     clientPublicKey = state.clientPublicKey,
                                     clientEd25519Key = state.clientEd25519Key,
+                                    clientDeviceName = state.clientDeviceName,
                                     sasConfirmed = true
                                 )
                                 
@@ -351,7 +353,8 @@ private sealed class PairingState {
         val socket: java.net.Socket,
         val psk: ByteArray,
         val clientPublicKey: ByteArray,
-        val clientEd25519Key: ByteArray
+        val clientEd25519Key: ByteArray,
+        val clientDeviceName: String
     ) : PairingState()
     object Confirming : PairingState()
     object Success : PairingState()

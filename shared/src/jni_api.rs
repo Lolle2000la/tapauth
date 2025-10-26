@@ -2106,6 +2106,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     version: jint,
     x25519_public_key: JByteArray,
     ed25519_public_key: JByteArray,
+    device_name: JString,
 ) -> jbyteArray {
     use crate::protocol::pb;
     use prost::Message;
@@ -2134,11 +2135,24 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
         }
     };
 
+    // Extract device name
+    let device_name_str: String = match env.get_string(&device_name) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read device_name: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
     // Create PairingHello
     let hello = pb::PairingHello {
         version: version as u32,
         x25519_public_key: x25519_bytes,
         ed25519_public_key: ed25519_bytes,
+        device_name: device_name_str,
     };
 
     // Serialize to protobuf
@@ -2158,7 +2172,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
 }
 
 /// JNI wrapper for parsing a PairingResponse message from protobuf bytes.
-/// Returns JSON string with response contents: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key": "base64..."}
+/// Returns JSON string with response contents: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key": "base64...", "device_name": "client-device"}
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingResponse(
     mut env: JNIEnv,
@@ -2198,6 +2212,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
         "version": response.version,
         "x25519_public_key": BASE64.encode(&response.x25519_public_key),
         "ed25519_public_key": BASE64.encode(&response.ed25519_public_key),
+        "device_name": response.device_name,
     });
 
     let json_str = match serde_json::to_string(&json_result) {

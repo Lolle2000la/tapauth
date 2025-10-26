@@ -61,73 +61,16 @@ impl ClientPairingSession {
         self.ed25519_keypair.verifying_key_bytes()
     }
 
-    /// Complete the pairing handshake as client
-    /// Takes the CSK to send to the server and the username of the user pairing
-    /// Returns (server_ed25519_public_key, SAS)
-    pub async fn complete_pairing(
-        &mut self,
-        mut stream: TcpStream,
-        csk: &ClientSymmetricKey,
-        username: &str,
-    ) -> Result<([u8; 32], String), ProtocolError> {
-        // Step 1: Receive server's PairingHello
-        let hello = self.receive_pairing_hello(&mut stream).await?;
-
-        // Step 2: Derive PSK from X25519 key exchange
-        self.server_x25519_public = Some(
-            hello
-                .x25519_public_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidMessageFormat)?,
-        );
-
-        let shared_secret = self
-            .x25519_keypair
-            .diffie_hellman(&self.server_x25519_public.unwrap())?;
-        let psk = derive_psk_from_x25519(&shared_secret)?;
-        self.psk = Some(psk);
-
-        // Step 3: Derive and store SAS
-        let client_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let server_x25519_pub = self.server_x25519_public.unwrap();
-        let sas = derive_sas(
-            self.psk.as_ref().unwrap(),
-            &client_x25519_pub,
-            &server_x25519_pub,
-        )?;
-        self.sas = Some(sas.clone());
-
-        // Step 4: Send PairingResponse with our X25519 public key
-        self.send_pairing_response(&mut stream).await?;
-
-        // Step 5: Wait for user SAS confirmation (done outside this function)
-        // This is where the GUI would show the SAS and wait for user confirmation
-
-        // Step 6: Send CSK encrypted with PSK to server along with username
-        self.send_csk_message(&mut stream, csk, username).await?;
-
-        // Step 7: Receive PairingComplete acknowledgment from server
-        self.receive_pairing_complete(&mut stream).await?;
-
-        let server_ed25519_public: [u8; 32] = hello
-            .ed25519_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidMessageFormat)?;
-
-        Ok((server_ed25519_public, sas))
-    }
-
-    /// Phase 1: Initiate pairing - receive Hello, send Response, compute SAS
-    /// Returns (TcpStream, server_ed25519_public, SAS) for user verification
-    /// After user confirms SAS, call finish_pairing() with the stream
+    /// Initiate client-side pairing and perform key exchange
+    /// Returns: (stream, server_ed25519_public_key, server_device_name, SAS)
     pub async fn initiate_pairing(
         &mut self,
         mut stream: TcpStream,
-    ) -> Result<(TcpStream, [u8; 32], String), ProtocolError> {
-        // Step 1: Receive server's PairingHello
+        client_device_name: &str,
+    ) -> Result<(TcpStream, [u8; 32], String, String), ProtocolError> {
+        // Step 1: Client receives PairingHello from server
         let hello = self.receive_pairing_hello(&mut stream).await?;
+        let server_device_name = hello.device_name;
 
         // Step 2: Derive PSK from X25519 key exchange
         self.server_x25519_public = Some(
@@ -182,7 +125,8 @@ impl ClientPairingSession {
         self.sas = Some(sas.clone());
 
         // Step 4: Send PairingResponse with our X25519 public key
-        self.send_pairing_response(&mut stream).await?;
+        self.send_pairing_response(&mut stream, client_device_name)
+            .await?;
 
         let server_ed25519_public: [u8; 32] = hello
             .ed25519_public_key
@@ -192,7 +136,7 @@ impl ClientPairingSession {
 
         // Return stream and SAS for user verification
         // User must confirm SAS, then call finish_pairing()
-        Ok((stream, server_ed25519_public, sas))
+        Ok((stream, server_ed25519_public, server_device_name, sas))
     }
 
     /// Phase 2: Complete pairing after user confirms SAS
@@ -234,11 +178,16 @@ impl ClientPairingSession {
         Ok(hello)
     }
 
-    async fn send_pairing_response(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
+    async fn send_pairing_response(
+        &self,
+        stream: &mut TcpStream,
+        client_device_name: &str,
+    ) -> Result<(), ProtocolError> {
         let response = PairingResponse {
             version: PAIRING_VERSION,
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
             ed25519_public_key: self.ed25519_keypair.verifying_key_bytes().to_vec(),
+            device_name: client_device_name.to_string(),
         };
 
         let buf = response.encode_to_vec();
@@ -323,16 +272,21 @@ impl ServerPairingSession {
     }
 
     /// Complete the pairing handshake as server
-    /// Returns (CSK received from client, client_ed25519_public_key, SAS)
+    /// Returns (CSK received from client, client_ed25519_public_key, client_device_name, SAS)
     pub async fn complete_pairing(
         &mut self,
         mut stream: TcpStream,
-    ) -> Result<(ClientSymmetricKey, [u8; 32], String), ProtocolError> {
+        server_device_name: &str,
+    ) -> Result<(ClientSymmetricKey, [u8; 32], String, String), ProtocolError> {
         // Step 1: Send PairingHello with our X25519 public key
-        self.send_pairing_hello(&mut stream).await?;
+        self.send_pairing_hello(&mut stream, server_device_name)
+            .await?;
 
         // Step 2: Receive client's PairingResponse
         let response = self.receive_pairing_response(&mut stream).await?;
+
+        // Extract client device name
+        let client_device_name = response.device_name.clone();
 
         // Step 3: Derive PSK from X25519 key exchange
         self.client_x25519_public = Some(
@@ -373,14 +327,19 @@ impl ServerPairingSession {
             .try_into()
             .map_err(|_| ProtocolError::InvalidMessageFormat)?;
 
-        Ok((csk, client_ed25519_public, sas))
+        Ok((csk, client_ed25519_public, client_device_name, sas))
     }
 
-    async fn send_pairing_hello(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
+    async fn send_pairing_hello(
+        &self,
+        stream: &mut TcpStream,
+        server_device_name: &str,
+    ) -> Result<(), ProtocolError> {
         let hello = PairingHello {
             version: PAIRING_VERSION,
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
             ed25519_public_key: self.ed25519_public_key.to_vec(),
+            device_name: server_device_name.to_string(),
         };
 
         let buf = hello.encode_to_vec();
@@ -486,7 +445,10 @@ mod tests {
             let server_keypair = Ed25519KeyPair::generate();
             let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
 
-            let (csk, _client_pub, sas) = session.complete_pairing(stream).await.unwrap();
+            let (csk, _client_pub, _client_device_name, sas) = session
+                .complete_pairing(stream, "TestServer")
+                .await
+                .unwrap();
             (csk, sas)
         });
 
@@ -498,8 +460,8 @@ mod tests {
             let csk = ClientSymmetricKey::generate();
             let mut session = ClientPairingSession::new(client_keypair);
 
-            let (_server_pub, sas) = session
-                .complete_pairing(stream, &csk, "testuser")
+            let (_server_pub, _server_name, sas) = session
+                .complete_pairing(stream, &csk, "testuser", "TestClient")
                 .await
                 .unwrap();
             (csk, sas)

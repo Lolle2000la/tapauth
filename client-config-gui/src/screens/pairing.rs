@@ -25,6 +25,7 @@ struct PairingSessionState {
     stream: TcpStream,
     session: ClientPairingSession,
     server_public_key: [u8; 32],
+    server_device_name: String,
     keypair: Ed25519KeyPair,
 }
 
@@ -346,19 +347,28 @@ impl PairingScreen {
         // Create pairing session
         let mut session = ClientPairingSession::new(keypair.clone());
 
+        // Get client device name (hostname)
+        let client_device_name =
+            whoami::fallible::hostname().unwrap_or_else(|_| "Unknown".to_string());
+
         // Phase 1: Initiate pairing (receive Hello, send Response, compute SAS)
-        let (stream, server_public_key, sas) = session
-            .initiate_pairing(stream)
+        let (stream, server_public_key, server_device_name, sas) = session
+            .initiate_pairing(stream, &client_device_name)
             .await
             .map_err(|e| format!("Pairing initiation failed: {}", e))?;
 
-        tracing::debug!("Pairing initiated. SAS: {}", sas);
+        tracing::debug!(
+            "Pairing initiated. Server: {}, SAS: {}",
+            server_device_name,
+            sas
+        );
 
         // Store session state globally for phase 2
         let state = PairingSessionState {
             stream,
             session,
             server_public_key,
+            server_device_name: server_device_name.clone(),
             keypair: keypair.clone(),
         };
 
@@ -387,6 +397,7 @@ impl PairingScreen {
             stream,
             mut session,
             server_public_key,
+            server_device_name,
             keypair: _,
         } = state;
 
@@ -414,7 +425,7 @@ impl PairingScreen {
         // Store paired server with current user in allowed_users list
         let server_hex = hex::encode(server_public_key);
         let paired_server = PairedServer {
-            name: format!("Server {}", &server_hex[..8]),
+            name: server_device_name,
             public_key: server_hex.clone(),
             paired_at: chrono::Utc::now(),
             allowed_users: vec![username], // Store the pairing user

@@ -210,9 +210,10 @@ object TapAuthCrypto {
      * @param version Protocol version (usually 1)
      * @param x25519PublicKey X25519 ephemeral public key (32 bytes)
      * @param ed25519PublicKey Ed25519 identity public key (32 bytes)
+     * @param deviceName Server's device name for display purposes
      * @return Protobuf-encoded PairingHello bytes
      */
-    external fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray): ByteArray
+    external fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray, deviceName: String): ByteArray
     
     /**
      * Parse a PairingResponse message (protobuf)
@@ -326,6 +327,16 @@ data class X25519Keypair(
         return result
     }
 }
+
+/**
+ * Simple Quadruple data class to hold 4 values
+ */
+data class Quadruple<out A, out B, out C, out D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D
+)
 
 /**
  * Perform X25519 Diffie-Hellman key exchange
@@ -472,21 +483,22 @@ fun decryptEncryptedPacket(csk: ByteArray, encryptedPacket: ByteArray): ByteArra
 /**
  * Create a PairingHello message
  */
-fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray): ByteArray {
-    return TapAuthCrypto.createPairingHello(version, x25519PublicKey, ed25519PublicKey)
+fun createPairingHello(version: Int, x25519PublicKey: ByteArray, ed25519PublicKey: ByteArray, deviceName: String): ByteArray {
+    return TapAuthCrypto.createPairingHello(version, x25519PublicKey, ed25519PublicKey, deviceName)
 }
 
 /**
  * Parse a PairingResponse message and extract keys
- * @return Triple of (version, x25519PublicKey, ed25519PublicKey)
+ * @return Quadruple of (version, x25519PublicKey, ed25519PublicKey, deviceName)
  */
-fun parsePairingResponse(responseBytes: ByteArray): Triple<Int, ByteArray, ByteArray> {
+fun parsePairingResponse(responseBytes: ByteArray): Quadruple<Int, ByteArray, ByteArray, String> {
     val json = TapAuthCrypto.parsePairingResponse(responseBytes)
     val jsonObj = org.json.JSONObject(json)
     val version = jsonObj.getInt("version")
     val x25519Key = android.util.Base64.decode(jsonObj.getString("x25519_public_key"), android.util.Base64.DEFAULT)
     val ed25519Key = android.util.Base64.decode(jsonObj.getString("ed25519_public_key"), android.util.Base64.DEFAULT)
-    return Triple(version, x25519Key, ed25519Key)
+    val deviceName = jsonObj.getString("device_name")
+    return Quadruple(version, x25519Key, ed25519Key, deviceName)
 }
 
 /**

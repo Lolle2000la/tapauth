@@ -61,11 +61,15 @@ class PairingClient(private val context: Context) {
             val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(context)
             val serverEd25519PublicKey = keypairRepo.getPublicKey()
             
+            // Get device name for friendly identification
+            val deviceName = android.os.Build.MODEL ?: "Android Device"
+            
             // Step 2: Send PairingHello message (protobuf) - SERVER SENDS FIRST
             val pairingHello = dev.rourunisen.tapauth.crypto.createPairingHello(
                 version = 1,
                 x25519PublicKey = serverEphemeralKeyPair.publicKey,
-                ed25519PublicKey = serverEd25519PublicKey // Use actual Ed25519 signing key
+                ed25519PublicKey = serverEd25519PublicKey, // Use actual Ed25519 signing key
+                deviceName = deviceName
             )
             
             // Send length-prefixed protobuf message
@@ -83,10 +87,10 @@ class PairingClient(private val context: Context) {
             Log.d(TAG, "Received PairingResponse (${responseBytes.size} bytes)")
             
             // Parse PairingResponse
-            val (clientVersion, clientX25519Key, clientEd25519Key) = 
+            val (clientVersion, clientX25519Key, clientEd25519Key, clientDeviceName) = 
                 dev.rourunisen.tapauth.crypto.parsePairingResponse(responseBytes)
             
-            Log.d(TAG, "Parsed PairingResponse: version=$clientVersion")
+            Log.d(TAG, "Parsed PairingResponse: version=$clientVersion, device_name=$clientDeviceName")
             
             // Step 4: Perform X25519 key exchange to compute PSK
             // PSK = ECDH(server_ephemeral_private, client_x25519_public_from_response)
@@ -112,6 +116,7 @@ class PairingClient(private val context: Context) {
                 psk = psk,
                 clientPublicKey = clientPublicKey,
                 clientEd25519Key = clientEd25519Key,
+                clientDeviceName = clientDeviceName,
                 sas = sas
             )
             
@@ -131,6 +136,7 @@ class PairingClient(private val context: Context) {
         psk: ByteArray,
         clientPublicKey: ByteArray,
         clientEd25519Key: ByteArray,
+        clientDeviceName: String,
         sasConfirmed: Boolean
     ): PairingResult = withContext(Dispatchers.IO) {
         try {
@@ -204,7 +210,7 @@ class PairingClient(private val context: Context) {
                     deviceId = deviceId,
                     publicKey = clientEd25519Key,
                     csk = csk,
-                    displayName = "Desktop Computer",
+                    displayName = clientDeviceName,
                     pairedAt = System.currentTimeMillis(),
                     allowedUsers = listOf(username) // Only this user allowed
                 )
@@ -256,6 +262,7 @@ sealed class PairingInitResult {
         val psk: ByteArray,
         val clientPublicKey: ByteArray,
         val clientEd25519Key: ByteArray,
+        val clientDeviceName: String,
         val sas: String
     ) : PairingInitResult()
     data class Error(val message: String) : PairingInitResult()
