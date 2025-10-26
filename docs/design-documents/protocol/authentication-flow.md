@@ -60,9 +60,8 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 
 * **Client `AuthenticationRequest` Retransmission**:
     * **Strategy**: Exponential backoff.
-    * **Initial Interval**: **200ms**. The first retransmission is sent 200ms after the initial message.
-    * **Backoff Schedule**: The interval doubles with each subsequent retry (400ms, 800ms, etc.).
-    * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time.
+    * **Intervals**: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms (doubling each retry).
+    * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time, while avoiding excessive network traffic.
 
 * **Server `AuthenticationGrant`/`Denial` Retransmission**:
     * **Strategy**: Fixed interval.

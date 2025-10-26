@@ -39,6 +39,8 @@ Once a BLE connection is established, the TapAuth service shall expose two chara
 
 ## BLE Security Best Practices
 
-To protect the confidentiality and integrity of the communication at the transport layer, the following BLE security practice **must** be implemented.
+To protect the confidentiality and integrity of the communication at the transport layer, the following BLE security practice is **strongly recommended** if your implementation has low-level control over BLE security parameters.
 
-* **LE Secure Connections**: The connection between the Client and Server **must** be established using **LE Secure Connections**. Legacy pairing is not sufficient and must be disabled. This provides strong, ECDH-based key exchange and protects against passive eavesdropping and Man-in-the-Middle attacks at the link layer.
+* **LE Secure Connections**: If your BLE stack allows configuration of security requirements, the connection between the Client and Server **should** be established using **LE Secure Connections**. Legacy pairing should be disabled where possible. LE Secure Connections provides strong, ECDH-based key exchange and protects against passive eavesdropping and Man-in-the-Middle attacks at the link layer.
+
+**Note**: Many high-level BLE APIs (such as those provided by Android and Linux BlueZ) do not expose direct control over LE Secure Connections enforcement. In such cases, the OS-level BLE stack will negotiate the strongest available security mode automatically. The application-layer encryption provided by the `EncryptedPacket` structure ensures security even when BLE link-layer security cannot be explicitly controlled.
