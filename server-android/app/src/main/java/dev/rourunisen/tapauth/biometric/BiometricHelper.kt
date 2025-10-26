@@ -73,7 +73,18 @@ class BiometricHelper(private val context: Context) {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                     super.onAuthenticationSucceeded(result)
                     if (continuation.isActive) {
-                        continuation.resume(BiometricResult.Success)
+                        // Check the authentication type - only accept hardware-backed biometrics
+                        val authenticationType = result.authenticationType
+                        if (authenticationType == BiometricPrompt.AUTHENTICATION_RESULT_TYPE_BIOMETRIC) {
+                            // True biometric authentication (fingerprint, iris, etc.)
+                            continuation.resume(BiometricResult.Success)
+                        } else {
+                            // Device credential or other non-biometric authentication
+                            continuation.resume(BiometricResult.Error(
+                                BiometricPrompt.ERROR_NEGATIVE_BUTTON,
+                                "Only biometric authentication is allowed"
+                            ))
+                        }
                     }
                 }
                 
@@ -89,6 +100,7 @@ class BiometricHelper(private val context: Context) {
             .setSubtitle(subtitle)
             .setNegativeButtonText(negativeButtonText)
             .setAllowedAuthenticators(AUTHENTICATORS)
+            .setConfirmationRequired(false)  // Don't require additional confirmation after biometric
             .build()
         
         biometricPrompt.authenticate(promptInfo)
@@ -99,9 +111,12 @@ class BiometricHelper(private val context: Context) {
     }
     
     companion object {
-        private const val AUTHENTICATORS = 
-            BiometricManager.Authenticators.BIOMETRIC_STRONG or
-            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        // Only allow BIOMETRIC_STRONG (Class 3 biometrics):
+        // - Fingerprint sensors
+        // - Iris scanners
+        // - Secure face unlock (on devices with dedicated secure hardware)
+        // This excludes weak face unlock and device credentials (PIN/password)
+        private const val AUTHENTICATORS = BiometricManager.Authenticators.BIOMETRIC_STRONG
     }
 }
 

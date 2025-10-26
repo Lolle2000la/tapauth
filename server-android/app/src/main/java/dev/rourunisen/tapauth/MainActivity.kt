@@ -197,6 +197,7 @@ class MainActivity : FragmentActivity() {
             .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
             .setDescription("From device: ${authRequest.deviceName}")
             .setNegativeButtonText("Deny")
+            .setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .build()
         
         biometricPrompt.authenticate(promptInfo)
