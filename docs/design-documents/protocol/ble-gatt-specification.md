@@ -9,10 +9,19 @@ This document specifies the GATT (Generic Attribute Profile) service and charact
 
 For discovery, the Client (desktop) **must** broadcast a BLE advertisement packet containing the following data to allow for private and secure pre-connection identification:
 
-* **Service UUID**: The full 128-bit TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`).
-* **Service Data**: The 16-byte **`temporal_identifier`** as defined in the main `authentication-flow.md` document.
+* **Service Data**: A 10-byte **shortened temporal identifier** as service data with the TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`) as the key.
 
-This rotating identifier allows the Server (phone) to recognize a trusted Client is advertising without revealing any static information that could be used for tracking. The Server will scan for advertisements containing a `temporal_identifier` that matches one of its paired clients, at which point it will initiate a connection.
+The BLE advertisement uses the service data format where:
+- **Key**: The TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`)
+- **Value**: The 10-byte shortened temporal identifier
+
+This structure allows the Server (phone) to identify TapAuth advertisements by scanning for service data with the known TapAuth Service UUID, while keeping the advertisement packet small enough to fit within the 31-byte standard advertisement size limit.
+
+The shortened temporal identifier is derived using the same HMAC-SHA256 process as the standard temporal identifier (see `authentication-flow.md`), but truncated to the first **10 bytes** instead of 16 bytes. This optimization ensures the BLE advertisement fits within size constraints while still providing sufficient entropy for secure device matching.
+
+This rotating identifier allows the Server (phone) to recognize a trusted Client is advertising without revealing any static information that could be used for tracking. The Server will scan for advertisements containing service data with the TapAuth Service UUID and match the temporal identifier against its paired clients, at which point it will initiate a connection.
+
+**Important**: The shortened 10-byte temporal identifier is used **only** for BLE advertisement discovery. Once the GATT connection is established, all subsequent communication uses the standard `EncryptedPacket` format with the full 16-byte temporal identifier as specified in `auth_protocol.proto`.
 
 ### Characteristics
 

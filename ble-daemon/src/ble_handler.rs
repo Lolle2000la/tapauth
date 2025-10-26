@@ -50,7 +50,9 @@ impl BleAuthHandler {
 
         // Start advertising with temporal ID
         // Only advertise service data to stay within 31-byte BLE advertisement limit
-        // The service data itself identifies this as a TapAuth advertisement
+        // The SERVICE_UUID is used as the key in the service_data map, with the
+        // 10-byte temporal identifier as the value. This identifies the advertisement
+        // as TapAuth while keeping the packet size minimal.
         let advertisement = Advertisement {
             // Do NOT include service_uuids - it adds 18 bytes and causes packet overflow
             service_data: [(

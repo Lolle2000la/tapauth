@@ -41,10 +41,10 @@ class BleGattService : Service() {
         private const val NOTIFICATION_ID = 2
         
         // UUIDs from shared library specification
+        // SERVICE_UUID is also used as the key for service data in BLE advertisements
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
         val CLIENT_COMMAND_CHAR_UUID: UUID = UUID.fromString("caf54438-9d78-4697-8886-0a4cfa87ba8d")
         val SERVER_RESPONSE_CHAR_UUID: UUID = UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
-        val TEMPORAL_ID_DATA_UUID: UUID = UUID.fromString("73d5896e-f862-403e-b482-1bb4b9a3a6f1")
         
         fun start(context: Context) {
             val intent = Intent(context, BleGattService::class.java)

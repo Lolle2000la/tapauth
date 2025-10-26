@@ -45,6 +45,7 @@ To ensure confidentiality and privacy, all post-pairing communication is encrypt
     1.  Both Client and Server define a **time window** of 60 seconds. The current window is calculated as `floor(unix_timestamp / 60)`.
     2.  The identifier is the first 16 bytes of an HMAC-SHA256 of the time window, keyed with the shared `CSK`.
     3.  This creates a rotating identifier that is verifiable by the Server but appears random to an outside observer, preventing metadata tracking.
+    4.  **BLE Advertisement Exception**: For BLE advertisements only, a shortened 10-byte temporal identifier (first 10 bytes of the HMAC-SHA256) is used to fit within the 31-byte BLE advertisement size limit. See `ble-gatt-specification.md` for details.
 * **Process**:
     1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
     2.  Serialize the `WrapperMessage` to a byte array.
@@ -97,6 +98,8 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * **Bluetooth Low Energy (BLE)**:
     * The Client acts in the **Advertiser/Peripheral** role.
     * The Server acts in the **Scanner/Central** role.
+    * **Advertisement**: Uses a 10-byte shortened temporal identifier in service data for discovery.
+    * **GATT Transfer**: Once connected, uses standard `EncryptedPacket` with 16-byte temporal identifier via GATT characteristics.
 
 ## 3. Protocol Flow
 

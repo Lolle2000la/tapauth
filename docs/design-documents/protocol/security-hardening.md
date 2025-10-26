@@ -36,4 +36,5 @@ To prevent resource exhaustion from an attacker replaying captured network packe
     1.  On startup and whenever the system's time window changes, the Server **must** pre-calculate the two valid `temporal_identifier` values (for the current and previous time windows) for each paired client.
     2.  These values should be stored in a fast-access data structure (e.g., a hash set) for immediate lookups.
     3.  When a packet arrives, its `temporal_identifier` is checked against this set. If it is not present, the packet is silently dropped. This avoids performing any cryptographic operations for invalid or replayed identifiers.
+    4.  **BLE-Specific**: For BLE advertisements, the Server maintains a separate cache of 10-byte shortened temporal identifiers (used for discovery). For BLE GATT characteristic transfers, the Server uses the standard 16-byte temporal identifier cache (same as UDP).
 * **Rationale**: This significantly reduces the attack surface for DoS attacks by making the initial packet check a very low-cost operation, protecting the CPU and battery from being wasted on expensive HMAC and decryption attempts.
