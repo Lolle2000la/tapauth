@@ -40,7 +40,7 @@ pub fn create_auth_request(
     // existing callers working while allowing callers who already
     // track the challenge (e.g. client) to sign/verify the same nonce.
     let mut challenge = [0u8; 32];
-    getrandom::getrandom(&mut challenge).expect("getrandom failed");
+    getrandom::fill(&mut challenge).expect("getrandom failed");
 
     create_auth_request_with_challenge(keypair, username, hostname, &challenge)
 }

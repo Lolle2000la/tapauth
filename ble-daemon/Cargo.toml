@@ -22,7 +22,7 @@ zbus = { version = "4.0", default-features = false, features = ["tokio"] }
 tokio = { version = "1.41", features = ["full"] }
 
 # Serialization
-prost = "0.13"
+prost = "0.14"
 hex = "0.4"
 
 # Logging

@@ -1906,20 +1906,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
         }
     };
 
-    // Derive nonce from CSK for EncryptedPacket encryption
-    // Per spec, each EncryptedPacket uses a unique nonce derived from CSK
-    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    // Generate cryptographically secure random nonce for EncryptedPacket encryption
+    // Each packet must have a unique random nonce to prevent AES-GCM reuse attacks
+    use rand::{rngs::OsRng, TryRngCore};
     let mut nonce = [0u8; 12];
-    if hk.expand(b"encrypted_packet_nonce", &mut nonce).is_err() {
-        let _ = env.throw_new(
-            "java/security/GeneralSecurityException",
-            "nonce derivation failed",
-        );
-        return std::ptr::null_mut();
-    }
+    OsRng.try_fill_bytes(&mut nonce).expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
 
     // Encrypt the WrapperMessage with CSK
-    let ciphertext =
+    let mut ciphertext_with_nonce =
         match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
             Ok(ct) => ct,
             Err(err) => {
@@ -1930,6 +1924,11 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
                 return std::ptr::null_mut();
             }
         };
+
+    // Prepend the nonce to the ciphertext
+    let mut ciphertext = Vec::with_capacity(12 + ciphertext_with_nonce.len());
+    ciphertext.extend_from_slice(&nonce);
+    ciphertext.extend_from_slice(&ciphertext_with_nonce);
 
     // Generate temporal identifier for current time window
     let temporal_id = match crypto::temporal::generate_current_temporal_identifier(&csk) {
@@ -2048,33 +2047,40 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
         }
     };
 
-    // Derive same nonce used for encryption
-    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
-    let mut nonce = [0u8; 12];
-    if hk.expand(b"encrypted_packet_nonce", &mut nonce).is_err() {
+    // Extract nonce from ciphertext (first 12 bytes)
+    if encrypted_packet.ciphertext.len() < 12 {
         let _ = env.throw_new(
             "java/security/GeneralSecurityException",
-            "nonce derivation failed",
+            "ciphertext too short - missing nonce",
         );
         return std::ptr::null_mut();
     }
 
-    // Decrypt the ciphertext
-    let wrapper_bytes = match crypto::encryption::decrypt_aes_gcm(
-        csk.as_bytes(),
-        &nonce,
-        &encrypted_packet.ciphertext,
-        &[],
-    ) {
-        Ok(plaintext) => plaintext,
-        Err(err) => {
+    let nonce: [u8; 12] = match encrypted_packet.ciphertext[..12].try_into() {
+        Ok(n) => n,
+        Err(_) => {
             let _ = env.throw_new(
                 "java/security/GeneralSecurityException",
-                format!("decryption failed: {err}"),
+                "failed to extract nonce",
             );
             return std::ptr::null_mut();
         }
     };
+
+    let actual_ciphertext = &encrypted_packet.ciphertext[12..];
+
+    // Decrypt the ciphertext
+    let wrapper_bytes =
+        match crypto::encryption::decrypt_aes_gcm(csk.as_bytes(), &nonce, actual_ciphertext, &[]) {
+            Ok(plaintext) => plaintext,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/security/GeneralSecurityException",
+                    format!("decryption failed: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
     // Return decrypted WrapperMessage bytes
     match env.byte_array_from_slice(&wrapper_bytes) {

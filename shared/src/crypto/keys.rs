@@ -1,31 +1,8 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand_core::{CryptoRng, RngCore};
+use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::ZeroizeOnDrop;
-
-// OsRng implementation using getrandom
-struct OsRng;
-
-impl CryptoRng for OsRng {}
-
-impl RngCore for OsRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut bytes = [0u8; 4];
-        self.fill_bytes(&mut bytes);
-        u32::from_le_bytes(bytes)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut bytes = [0u8; 8];
-        self.fill_bytes(&mut bytes);
-        u64::from_le_bytes(bytes)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("getrandom failed");
-    }
-}
 
 /// Ed25519 key pair for signing
 #[derive(Clone)]
@@ -37,7 +14,8 @@ pub struct Ed25519KeyPair {
 impl Ed25519KeyPair {
     /// Generate a new Ed25519 key pair
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut rng = OsRng.unwrap_err(); // Create an INSTANCE
+        let signing_key = SigningKey::generate(&mut rng); // Use the INSTANCE
         let verifying_key = signing_key.verifying_key();
         Self {
             signing_key,
@@ -82,7 +60,8 @@ pub struct X25519KeyPair {
 impl X25519KeyPair {
     /// Generate a new X25519 key pair
     pub fn generate() -> Self {
-        let secret = X25519StaticSecret::random_from_rng(&mut OsRng);
+        let mut rng = OsRng.unwrap_err(); // Create an INSTANCE
+        let secret = X25519StaticSecret::random_from_rng(&mut rng); // Use the INSTANCE
         let public = X25519PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -120,7 +99,10 @@ impl ClientSymmetricKey {
     /// Generate a new random CSK
     pub fn generate() -> Self {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        let mut rng = OsRng; // Create an INSTANCE
+                             // Use .fill_bytes() from the RngCore trait.
+                             // This panics on failure, which is the same behavior as your .expect()
+        rng.try_fill_bytes(&mut key).expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
         Self(key)
     }
 

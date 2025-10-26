@@ -76,7 +76,7 @@ impl AuthenticationClient {
 
         // Generate challenge
         let mut challenge = [0u8; 32];
-        getrandom::getrandom(&mut challenge).expect("Failed to generate challenge");
+        getrandom::fill(&mut challenge).expect("Failed to generate challenge");
 
         Ok(Self {
             config_manager: Arc::new(config_manager),

@@ -3,6 +3,7 @@ use aes_gcm::{
     Aes256Gcm,
 };
 use hkdf::Hkdf;
+use rand::TryRngCore;
 use sha2::Sha256;
 
 use super::{ClientSymmetricKey, CryptoError, PairingSymmetricKey};
@@ -76,34 +77,52 @@ pub fn decrypt_with_csk(
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
 
-/// Encrypt with CSK using static nonce (derived from CSK only)
+/// Encrypt with CSK using random nonce
 /// This is used for authentication messages where the challenge is inside
 /// the encrypted payload and cannot be used for nonce derivation.
+/// The random nonce is prepended to the ciphertext.
 pub fn encrypt_with_csk_static_nonce(
     csk: &ClientSymmetricKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // Derive nonce from CSK itself (same as Android server)
-    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
+    // Generate a cryptographically secure random 12-byte nonce using OS RNG
+    use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
-    hk.expand(b"encrypted_packet_nonce", &mut nonce)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
 
-    encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])
+    // Encrypt the plaintext
+    let ciphertext = encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])?;
+
+    // Prepend the nonce to the ciphertext (nonce is not secret)
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&ciphertext);
+
+    Ok(result)
 }
 
-/// Decrypt with CSK using static nonce (derived from CSK only)
+/// Decrypt with CSK using random nonce
 /// This is used for authentication messages where the challenge is inside
 /// the encrypted payload and cannot be used for nonce derivation.
+/// The nonce is extracted from the first 12 bytes of the input.
 pub fn decrypt_with_csk_static_nonce(
     csk: &ClientSymmetricKey,
-    ciphertext: &[u8],
+    ciphertext_with_nonce: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // Derive nonce from CSK itself (same as Android server)
-    let hk = Hkdf::<Sha256>::new(None, csk.as_bytes());
-    let mut nonce = [0u8; 12];
-    hk.expand(b"encrypted_packet_nonce", &mut nonce)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    // Ensure we have at least a nonce
+    if ciphertext_with_nonce.len() < 12 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+
+    // Extract the nonce from the first 12 bytes
+    let nonce: [u8; 12] = ciphertext_with_nonce[..12]
+        .try_into()
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+
+    // Extract the actual ciphertext
+    let ciphertext = &ciphertext_with_nonce[12..];
 
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
