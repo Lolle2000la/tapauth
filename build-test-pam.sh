@@ -30,7 +30,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
 fi
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║         TapAuth PAM Module - Build and Test                 ║"
+echo "║         TapAuth PAM Module - Build and Test                   ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 

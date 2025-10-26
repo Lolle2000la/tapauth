@@ -48,6 +48,7 @@ pub enum AuthError {
     BleError(String),
 }
 
+#[derive(Clone)]
 pub struct AuthenticationClient {
     config_manager: Arc<ClientConfigManager>,
     keypair: Ed25519KeyPair,
@@ -156,66 +157,99 @@ impl AuthenticationClient {
 
         tracing::debug!("==> try_parallel_authentication called");
 
-        // Generate temporal identifier for BLE advertising (10 bytes for BLE advertisement)
         let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
-
         tracing::info!("Starting parallel discovery over UDP and BLE");
+        tracing::debug!("==> About to spawn UDP and BLE tasks");
 
-        tracing::debug!("==> About to create UDP and BLE futures");
+        // Clone data for the BLE task
+        let self_ble = self.clone();
+        let packet_ble = packet.clone();
+        let temporal_id_ble = temporal_id.clone();
 
-        // Pin both futures so we can poll them selectively
-        let mut ble_future = Box::pin(self.try_ble_authentication(packet, &temporal_id));
-        let mut udp_future = Box::pin(self.try_udp_authentication(packet));
+        let mut ble_handle = tokio::spawn(async move {
+            self_ble
+                .try_ble_authentication(&packet_ble, &temporal_id_ble)
+                .await
+        });
+
+        // Clone data for the UDP task
+        let self_udp = self.clone();
+        let packet_udp = packet.clone();
+
+        let mut udp_handle =
+            tokio::spawn(async move { self_udp.try_udp_authentication(&packet_udp).await });
 
         let mut ble_completed = false;
         let mut udp_completed = false;
         let mut udp_result: Option<Result<(), AuthError>> = None;
 
-        tracing::debug!("==> Futures created, entering select loop");
+        tracing::debug!("==> Tasks spawned, entering select loop");
 
-        // Poll both futures until we have a definitive result
         loop {
             select! {
-                result = &mut ble_future, if !ble_completed => {
-                    tracing::info!("BLE completed: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
+                // Poll the BLE JoinHandle
+                result = &mut ble_handle, if !ble_completed => {
+                    tracing::info!("BLE task completed"); // Log from the task handle
                     ble_completed = true;
 
                     match result {
-                        Ok(()) => {
-                            // BLE granted - success immediately
+                        // Task succeeded with Ok(())
+                        Ok(Ok(())) => {
                             tracing::info!("BLE authentication granted");
+                            udp_handle.abort(); // Cancel UDP task
                             return Ok(());
                         }
-                        Err(AuthError::Denied) => {
-                            // Explicit denial - terminal failure
+                        // Task succeeded with Err(Denied)
+                        Ok(Err(AuthError::Denied)) => {
                             tracing::warn!("BLE authentication explicitly denied");
+                            udp_handle.abort(); // Cancel UDP task
                             return Err(AuthError::Denied);
                         }
-                        Err(ref e) => {
-                            // BLE failed non-fatally - store result and wait for UDP
+                        // Task succeeded with a different error
+                        Ok(Err(ref e)) => {
+                            // THIS IS THE CRITICAL LOGIC:
+                            // We log and continue, waiting for UDP. We do NOT return.
                             tracing::warn!("BLE failed: {}, waiting for UDP", e);
+                        }
+                        // Task panicked or was cancelled
+                        Err(join_err) => {
+                            tracing::error!("BLE task failed to execute: {}", join_err);
                         }
                     }
                 }
-                result = &mut udp_future, if !udp_completed => {
-                    tracing::info!("UDP completed: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
+                // Poll the UDP JoinHandle
+                result = &mut udp_handle, if !udp_completed => {
+                    tracing::info!("UDP task completed");
                     udp_completed = true;
 
-                    // If UDP succeeds, return immediately
-                    if result.is_ok() {
-                        tracing::info!("UDP authentication granted");
-                        return Ok(());
+                    match result {
+                        // Task succeeded with Ok(())
+                        Ok(Ok(())) => {
+                            tracing::info!("UDP authentication granted");
+                            ble_handle.abort(); // Cancel BLE task
+                            return Ok(());
+                        }
+                        // Task succeeded with an error
+                        Ok(Err(e)) => {
+                            tracing::warn!("UDP authentication failed: {}", e);
+                            udp_result = Some(Err(e)); // Store the UDP error
+                        }
+                        // Task panicked or was cancelled
+                        Err(join_err) => {
+                            tracing::error!("UDP task failed to execute: {}", join_err);
+                            udp_result = Some(Err(AuthError::InitError(format!("UDP task failed: {}", join_err))));
+                        }
                     }
-
-                    // Store the error result
-                    udp_result = Some(result);
                 }
             }
 
-            // Check if both have completed
+            // Check if *both* have completed
             if ble_completed && udp_completed {
-                // Both failed - return UDP error (more informative)
                 tracing::warn!("Both BLE and UDP authentication failed");
+                // Both failed. We return the stored UDP result.
+                // If UDP was OK but BLE failed, udp_result is None,
+                // but our logic above would have returned Ok(()) from the UDP branch.
+                // Therefore, if we reach this point, udp_result *must* contain an error.
                 return udp_result.unwrap();
             }
         }
