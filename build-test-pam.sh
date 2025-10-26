@@ -6,6 +6,29 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Check for help flag
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Usage: sudo $0 [username]"
+    echo ""
+    echo "Build and test the TapAuth PAM module for a specific user."
+    echo ""
+    echo "Arguments:"
+    echo "  username    Optional. The user to test authentication for."
+    echo "              Defaults to the user who invoked sudo (currently: ${SUDO_USER:-$(whoami)})"
+    echo ""
+    echo "Examples:"
+    echo "  sudo $0           # Test as current user (${SUDO_USER:-$(whoami)})"
+    echo "  sudo $0 alice     # Test as user 'alice'"
+    echo "  sudo $0 root      # Test as root user"
+    echo ""
+    echo "Note:"
+    echo "  - This script requires root privileges (use sudo)"
+    echo "  - The test user must have paired devices in /etc/tapauth/"
+    echo "  - User-specific pairing: only users in allowed_users list can authenticate"
+    echo ""
+    exit 0
+fi
+
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║         TapAuth PAM Module - Build and Test                 ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
@@ -21,6 +44,32 @@ PAM_SERVICE_NAME="tapauth-test-local"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
 BLE_DAEMON_SERVICE="tapauth-ble-daemon"
 BLE_DAEMON_DIR="ble-daemon"
+
+# --- Determine test user ---
+# Default to the user who invoked sudo, or current user if not using sudo
+if [ -n "$SUDO_USER" ]; then
+    DEFAULT_TEST_USER="$SUDO_USER"
+else
+    DEFAULT_TEST_USER="$(whoami)"
+fi
+
+# Allow user to override via command line argument
+TEST_USER="${1:-$DEFAULT_TEST_USER}"
+
+echo "ℹ️  Test user: $TEST_USER"
+if [ "$TEST_USER" != "$DEFAULT_TEST_USER" ]; then
+    echo "   (Overriding default user: $DEFAULT_TEST_USER)"
+fi
+echo ""
+
+# Verify the test user exists
+if ! id "$TEST_USER" &>/dev/null; then
+    echo "❌ User '$TEST_USER' does not exist on this system"
+    echo "   Usage: $0 [username]"
+    echo "   Example: sudo $0 alice"
+    exit 1
+fi
+
 # --- End Configuration ---
 
 # --- Track daemon state for cleanup ---
@@ -245,12 +294,12 @@ echo "    Creating temporary PAM service file at $PAM_CONFIG_PATH"
 # Note: Using the temporary *name* (not full path) is correct here,
 # PAM searches standard directories automatically.
 #
-# IMPORTANT: Using "required" instead of "sufficient" to ensure authentication
-# actually fails when TapAuth denies access. The second line (pam_deny.so) is
-# a safety measure that will deny access if TapAuth somehow doesn't return a result.
+# IMPORTANT: Using "sufficient" means if TapAuth succeeds, authentication succeeds.
+# If TapAuth fails, it falls through to pam_deny.so which denies access.
+# This ensures that authentication only succeeds when TapAuth explicitly grants it.
 sudo bash -c "cat > '$PAM_CONFIG_PATH'" << EOF
 # Temporary PAM config for local tapauth testing
-auth required ${TEMP_INSTALL_NAME}
+auth sufficient ${TEMP_INSTALL_NAME}
 auth required pam_deny.so
 account required pam_permit.so
 EOF
@@ -260,18 +309,19 @@ echo "✅ Temporary setup complete."
 echo ""
 echo "==> Running pamtester..."
 echo "    Service: $PAM_SERVICE_NAME"
-echo "    User:    root"
+echo "    User:    $TEST_USER"
 echo ""
 echo "---------------------------------------------------------------------"
-echo "  Attempting authentication. Watch for BLE/UDP activity."
+echo "  Attempting authentication for user: $TEST_USER"
+echo "  Watch for BLE/UDP activity."
 echo "  Use your paired Android device if prompted."
 echo "---------------------------------------------------------------------"
 echo ""
 
-# Run pamtester with verbose output, targeting the root user
+# Run pamtester with verbose output, targeting the specified user
 # Requires running the script with sudo
 set +e
-sudo pamtester -v "$PAM_SERVICE_NAME" "root" authenticate
+sudo pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
 PAMTESTER_EXIT_CODE=$?
 set -e # Re-enable exit on error
 
@@ -280,9 +330,13 @@ echo "---------------------------------------------------------------------"
 echo "  pamtester finished with exit code: $PAMTESTER_EXIT_CODE"
 if [ $PAMTESTER_EXIT_CODE -eq 0 ]; then
     echo "  ✅ Authentication successful (according to pamtester)."
+    echo "     User '$TEST_USER' was authenticated successfully."
 else
     echo "  ⚠️  Authentication failed or denied (pamtester exit code $PAMTESTER_EXIT_CODE)."
-    echo "     This might be expected if you didn't approve on the device."
+    echo "     This might be expected if:"
+    echo "       - You didn't approve on the device"
+    echo "       - User '$TEST_USER' has no paired devices"
+    echo "       - User '$TEST_USER' is not in the allowed_users list for any pairing"
 fi
 echo "---------------------------------------------------------------------"
 echo ""
