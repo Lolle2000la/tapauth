@@ -62,12 +62,13 @@ impl ClientPairingSession {
     }
 
     /// Complete the pairing handshake as client
-    /// Takes the CSK to send to the server
+    /// Takes the CSK to send to the server and the username of the user pairing
     /// Returns (server_ed25519_public_key, SAS)
     pub async fn complete_pairing(
         &mut self,
         mut stream: TcpStream,
         csk: &ClientSymmetricKey,
+        username: &str,
     ) -> Result<([u8; 32], String), ProtocolError> {
         // Step 1: Receive server's PairingHello
         let hello = self.receive_pairing_hello(&mut stream).await?;
@@ -103,8 +104,8 @@ impl ClientPairingSession {
         // Step 5: Wait for user SAS confirmation (done outside this function)
         // This is where the GUI would show the SAS and wait for user confirmation
 
-        // Step 6: Send CSK encrypted with PSK to server
-        self.send_csk_message(&mut stream, csk).await?;
+        // Step 6: Send CSK encrypted with PSK to server along with username
+        self.send_csk_message(&mut stream, csk, username).await?;
 
         // Step 7: Receive PairingComplete acknowledgment from server
         self.receive_pairing_complete(&mut stream).await?;
@@ -195,15 +196,16 @@ impl ClientPairingSession {
     }
 
     /// Phase 2: Complete pairing after user confirms SAS
-    /// Sends CSK to server and receives confirmation
+    /// Sends CSK to server with username and receives confirmation
     /// Takes the stream from initiate_pairing()
     pub async fn finish_pairing(
         &mut self,
         mut stream: TcpStream,
         csk: &ClientSymmetricKey,
+        username: &str,
     ) -> Result<(), ProtocolError> {
-        // Step 6: Send CSK encrypted with PSK to server
-        self.send_csk_message(&mut stream, csk).await?;
+        // Step 6: Send CSK encrypted with PSK to server along with username
+        self.send_csk_message(&mut stream, csk, username).await?;
 
         // Step 7: Receive PairingComplete acknowledgment from server
         self.receive_pairing_complete(&mut stream).await?;
@@ -251,6 +253,7 @@ impl ClientPairingSession {
         &self,
         stream: &mut TcpStream,
         csk: &ClientSymmetricKey,
+        username: &str,
     ) -> Result<(), ProtocolError> {
         // Encrypt CSK with PSK
         let psk = self.psk.as_ref().unwrap();
@@ -270,7 +273,10 @@ impl ClientPairingSession {
             crate::protocol::messages::sha256_hex(&encrypted_csk)
         );
 
-        let message = PairingCskMessage { encrypted_csk };
+        let message = PairingCskMessage {
+            encrypted_csk,
+            username: username.to_string(),
+        };
 
         let buf = message.encode_to_vec();
         stream.write_u32(buf.len() as u32).await?;
@@ -492,7 +498,10 @@ mod tests {
             let csk = ClientSymmetricKey::generate();
             let mut session = ClientPairingSession::new(client_keypair);
 
-            let (_server_pub, sas) = session.complete_pairing(stream, &csk).await.unwrap();
+            let (_server_pub, sas) = session
+                .complete_pairing(stream, &csk, "testuser")
+                .await
+                .unwrap();
             (csk, sas)
         });
 

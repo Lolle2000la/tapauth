@@ -96,6 +96,28 @@ impl AuthenticationClient {
             return Err(AuthError::NoPairedDevices);
         }
 
+        // Filter servers that are allowed to authenticate this user
+        let allowed_servers: Vec<_> = paired_servers
+            .iter()
+            .filter(|(_, server)| server.is_user_allowed(&self.username))
+            .collect();
+
+        if allowed_servers.is_empty() {
+            tracing::warn!("No paired servers authorized for user: {}", self.username);
+            tracing::warn!(
+                "Total paired servers: {}, but none allow this user",
+                paired_servers.len()
+            );
+            return Err(AuthError::NoPairedDevices);
+        }
+
+        tracing::info!(
+            "{} server(s) authorized for user {} (out of {} total)",
+            allowed_servers.len(),
+            self.username,
+            paired_servers.len()
+        );
+
         // Create the authentication request using the challenge we generated
         let request = create_auth_request_with_challenge(
             &self.keypair,

@@ -1,5 +1,5 @@
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
+use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
 use jni::JNIEnv;
 
 use crate::crypto;
@@ -2219,11 +2219,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
 
 /// JNI wrapper for creating and serializing a PairingCskMessage.
 /// Returns protobuf-encoded bytes
+/// Note: This is not used by the Android server (only by clients), but kept for API completeness
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPairingCskMessage(
     mut env: JNIEnv,
     _class: JClass,
     encrypted_csk: JByteArray,
+    username: JString,
 ) -> jbyteArray {
     use crate::protocol::pb;
     use prost::Message;
@@ -2240,9 +2242,22 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
         }
     };
 
+    // Extract username
+    let username_str: String = match env.get_string(&username) {
+        Ok(s) => s.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read username: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
     // Create PairingCskMessage
     let csk_msg = pb::PairingCskMessage {
         encrypted_csk: encrypted_csk_bytes,
+        username: username_str,
     };
 
     // Serialize to protobuf
@@ -2262,13 +2277,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
 }
 
 /// JNI wrapper for parsing a PairingCskMessage from protobuf bytes.
-/// Returns the encrypted CSK bytes
+/// Returns a tuple: (encrypted CSK bytes, username)
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingCskMessage(
     mut env: JNIEnv,
     _class: JClass,
     message_bytes: JByteArray,
-) -> jbyteArray {
+) -> jobjectArray {
     use crate::protocol::pb;
     use prost::Message;
 
@@ -2278,35 +2293,89 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("failed to read message: {err}"),
+                format!("failed to read message_bytes: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    // Parse PairingCskMessage
+    // Parse protobuf
     let csk_msg = match pb::PairingCskMessage::decode(&data[..]) {
         Ok(msg) => msg,
         Err(err) => {
             let _ = env.throw_new(
-                "java/io/IOException",
+                "java/lang/IllegalArgumentException",
                 format!("failed to parse PairingCskMessage: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    // Return encrypted CSK as byte array
-    match env.byte_array_from_slice(&csk_msg.encrypted_csk) {
-        Ok(output) => output.into_raw(),
+    // Convert username to JString
+    let username_jstring = match env.new_string(&csk_msg.username) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create username string: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create byte array for encrypted CSK
+    let encrypted_csk_array = match env.byte_array_from_slice(&csk_msg.encrypted_csk) {
+        Ok(arr) => arr,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
                 format!("failed to allocate byte array: {err}"),
             );
-            std::ptr::null_mut()
+            return std::ptr::null_mut();
         }
+    };
+
+    // Create object array [byte[], String]
+    let object_class = match env.find_class("java/lang/Object") {
+        Ok(cls) => cls,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to find Object class: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let result_array = match env.new_object_array(2, object_class, JObject::null()) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Set elements: [0] = encrypted_csk (byte[]), [1] = username (String)
+    if let Err(err) = env.set_object_array_element(&result_array, 0, encrypted_csk_array) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set encrypted_csk: {err}"),
+        );
+        return std::ptr::null_mut();
     }
+
+    if let Err(err) = env.set_object_array_element(&result_array, 1, username_jstring) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set username: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    result_array.into_raw()
 }
 
 /// JNI wrapper for creating a PairingComplete message.

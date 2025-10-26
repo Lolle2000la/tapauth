@@ -28,33 +28,85 @@ fun DeviceListScreen(
     var devices by remember { mutableStateOf<List<PairedDevice>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var deviceToDelete by remember { mutableStateOf<PairedDevice?>(null) }
+    var userToRemove by remember { mutableStateOf<Pair<PairedDevice, String>?>(null) }
     
     LaunchedEffect(Unit) {
         devices = repository.getAllPairedDevices()
         isLoading = false
     }
     
-    // Confirmation dialog for device removal
-    if (deviceToDelete != null) {
+    // Confirmation dialog for removing a specific user
+    if (userToRemove != null) {
+        val (device, username) = userToRemove!!
+        val isLastUser = device.allowedUsers.size == 1
+        
         AlertDialog(
-            onDismissRequest = { deviceToDelete = null },
-            title = { Text("Remove Device?") },
+            onDismissRequest = { userToRemove = null },
+            title = { Text(if (isLastUser) "Remove Device?" else "Remove User?") },
             text = {
-                Text("Are you sure you want to remove \"${deviceToDelete?.displayName}\"? You will need to pair again to authenticate with this device.")
+                Text(
+                    if (isLastUser) {
+                        "Remove user \"$username\" from \"${device.displayName}\"?\n\nThis is the last user, so the entire pairing will be removed."
+                    } else {
+                        "Remove user \"$username\" from \"${device.displayName}\"?\n\nOther users (${device.allowedUsers.filter { it != username }.joinToString(", ")}) will still be able to authenticate."
+                    }
+                )
             },
             confirmButton = {
                 TextButton(
                     onClick = {
                         scope.launch {
-                            deviceToDelete?.let {
-                                repository.removePairedDevice(it.deviceId)
-                                devices = repository.getAllPairedDevices()
-                            }
-                            deviceToDelete = null
+                            repository.removeUserFromDevice(device.deviceId, username)
+                            devices = repository.getAllPairedDevices()
+                            userToRemove = null
                         }
                     }
                 ) {
                     Text("Remove", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { userToRemove = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+    
+    // Confirmation dialog for device removal (all users)
+    if (deviceToDelete != null) {
+        val device = deviceToDelete!!
+        val multipleUsers = device.allowedUsers.size > 1
+        
+        AlertDialog(
+            onDismissRequest = { deviceToDelete = null },
+            title = { Text("Remove Entire Pairing?") },
+            text = {
+                Column {
+                    if (multipleUsers) {
+                        Text(
+                            "⚠️ WARNING: This pairing is used by ${device.allowedUsers.size} users!",
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Users: ${device.allowedUsers.joinToString(", ")}")
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    Text("Are you sure you want to remove \"${device.displayName}\"? ${if (multipleUsers) "All users" else "You"} will need to pair again to authenticate with this device.")
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            repository.removePairedDevice(device.deviceId)
+                            devices = repository.getAllPairedDevices()
+                            deviceToDelete = null
+                        }
+                    }
+                ) {
+                    Text("Remove All", color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
@@ -100,7 +152,8 @@ fun DeviceListScreen(
                         items(devices) { device ->
                             DeviceCard(
                                 device = device,
-                                onRemove = { deviceToDelete = device }
+                                onRemoveDevice = { deviceToDelete = device },
+                                onRemoveUser = { username -> userToRemove = device to username }
                             )
                         }
                     }
@@ -133,12 +186,15 @@ private fun EmptyState(modifier: Modifier = Modifier) {
 @Composable
 private fun DeviceCard(
     device: PairedDevice,
-    onRemove: () -> Unit
+    onRemoveDevice: () -> Unit,
+    onRemoveUser: (String) -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy 'at' HH:mm", Locale.getDefault()) }
     val pairedDate = remember(device.pairedAt) {
         dateFormat.format(Date(device.pairedAt))
     }
+    
+    var showUserMenu by remember { mutableStateOf(false) }
     
     Card(
         modifier = Modifier.fillMaxWidth()
@@ -170,13 +226,72 @@ private fun DeviceCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     )
+                    
+                    // Show allowed users
+                    if (device.allowedUsers.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Allowed users: ${device.allowedUsers.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
                 
-                IconButton(onClick = onRemove) {
-                    Text(
-                        text = "🗑️",
-                        style = MaterialTheme.typography.titleLarge
-                    )
+                Column(horizontalAlignment = Alignment.End) {
+                    // Remove entire device button
+                    IconButton(onClick = onRemoveDevice) {
+                        Text(
+                            text = "🗑️",
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                    }
+                    
+                    // Manage users button (only show if multiple users)
+                    if (device.allowedUsers.size > 1) {
+                        IconButton(onClick = { showUserMenu = !showUserMenu }) {
+                            Text(
+                                text = "👥",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                        }
+                    }
+                }
+            }
+            
+            // User management menu
+            if (showUserMenu && device.allowedUsers.size > 1) {
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Text(
+                    text = "Remove individual user:",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                device.allowedUsers.forEach { username ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = username,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        TextButton(
+                            onClick = { onRemoveUser(username) }
+                        ) {
+                            Text("Remove", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
                 }
             }
         }

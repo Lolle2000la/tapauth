@@ -39,14 +39,31 @@ data class PairingUrl(
  * Each client generates ONE CSK (Client Symmetric Key) that it shares with all its paired servers.
  * During pairing, the client sends its CSK encrypted with the temporary PSK.
  * This CSK is then used for all future authenticated communication.
+ * 
+ * SECURITY: The allowedUsers list controls which users can authenticate with this pairing.
+ * When a user pairs their desktop, their username is added to this list.
+ * If multiple users on the same desktop pair, they are all added to the list.
  */
 data class PairedDevice(
     val deviceId: String,
     val publicKey: ByteArray,  // Client's Ed25519 public key from QR code
     val csk: ByteArray,         // Client Symmetric Key (32 bytes) - received during pairing
     val displayName: String,
-    val pairedAt: Long
+    val pairedAt: Long,
+    val allowedUsers: List<String> = emptyList()  // Username(s) this pairing can authenticate (MUST NOT be empty for security)
 ) {
+    /**
+     * Check if this pairing is allowed to authenticate the given username
+     * @param username The username from the authentication request
+     * @return true if this pairing can authenticate the user
+     * 
+     * SECURITY: Empty list means NO users allowed (prevents privilege escalation)
+     * The username must be explicitly added during pairing.
+     */
+    fun isUserAllowed(username: String): Boolean {
+        return allowedUsers.contains(username)
+    }
+    
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false

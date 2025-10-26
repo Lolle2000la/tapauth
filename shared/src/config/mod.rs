@@ -127,8 +127,21 @@ pub struct PairedServer {
     pub name: String,
     /// Server's Ed25519 public key (32 bytes, hex-encoded)
     pub public_key: String,
+    /// Username(s) on the client that this server can authenticate
+    /// SECURITY: Must contain at least one username to prevent privilege escalation
+    /// When a user pairs, their username is added to this list
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     /// When this pairing was created
     pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PairedServer {
+    /// Check if this server is allowed to authenticate the given user
+    /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        self.allowed_users.iter().any(|u| u == username)
+    }
 }
 
 /// Information about a paired client (stored on server)
@@ -140,8 +153,21 @@ pub struct PairedClient {
     pub public_key: String,
     /// Client Symmetric Key (32 bytes, hex-encoded)
     pub csk: String,
+    /// Username(s) on the client that this pairing can authenticate
+    /// SECURITY: Must contain at least one username to prevent privilege escalation
+    /// When a user pairs, their username is added to this list
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     /// When this pairing was created
     pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PairedClient {
+    /// Check if this client pairing is allowed to authenticate the given user
+    /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        self.allowed_users.iter().any(|u| u == username)
+    }
 }
 
 /// Client configuration manager
@@ -305,6 +331,32 @@ impl ClientConfigManager {
         servers.remove(id);
         self.save_paired_servers(&servers)?;
         Ok(())
+    }
+
+    /// Remove current user from a paired server's allowed list
+    /// If this is the last user, removes the entire pairing
+    /// Returns true if the entire pairing was removed, false if just the user was removed
+    pub fn remove_user_from_pairing(&self, id: &str, username: &str) -> Result<bool, ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+
+        if let Some(server) = servers.get_mut(id) {
+            // Remove the username from allowed_users
+            server.allowed_users.retain(|u| u != username);
+
+            // If no users left, remove the entire pairing
+            if server.allowed_users.is_empty() {
+                servers.remove(id);
+                self.save_paired_servers(&servers)?;
+                Ok(true) // Entire pairing removed
+            } else {
+                // Save with updated user list
+                self.save_paired_servers(&servers)?;
+                Ok(false) // Only user removed
+            }
+        } else {
+            // Server not found - nothing to remove
+            Ok(true)
+        }
     }
 
     /// Clear all paired servers

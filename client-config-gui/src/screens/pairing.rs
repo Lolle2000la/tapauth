@@ -373,6 +373,17 @@ impl PairingScreen {
 
         let config = ClientConfigManager::new();
 
+        // Get the current username
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .or_else(|_| {
+                // Fallback: use whoami crate or system call
+                Ok::<String, String>(whoami::username())
+            })
+            .map_err(|e| format!("Failed to get current username: {}", e))?;
+
+        tracing::debug!("Pairing as user: {}", username);
+
         // Retrieve stored session state
         let mut state_guard = PAIRING_STATE.lock().await;
         let state = state_guard.take().ok_or("No pairing session in progress")?;
@@ -393,9 +404,9 @@ impl PairingScreen {
 
         tracing::debug!("Loaded/generated CSK");
 
-        // Phase 2: Finish pairing (send CSK, receive confirmation)
+        // Phase 2: Finish pairing (send CSK with username, receive confirmation)
         session
-            .finish_pairing(stream, &csk)
+            .finish_pairing(stream, &csk, &username)
             .await
             .map_err(|e| format!("Pairing completion failed: {}", e))?;
 
@@ -406,12 +417,13 @@ impl PairingScreen {
             .save_csk(&csk)
             .map_err(|e| format!("Failed to save CSK: {}", e))?;
 
-        // Store paired server
+        // Store paired server with current user in allowed_users list
         let server_hex = hex::encode(server_public_key);
         let paired_server = PairedServer {
             name: format!("Server {}", &server_hex[..8]),
             public_key: server_hex.clone(),
             paired_at: chrono::Utc::now(),
+            allowed_users: vec![username], // Store the pairing user
         };
 
         config

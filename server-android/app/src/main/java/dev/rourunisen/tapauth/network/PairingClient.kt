@@ -6,6 +6,7 @@ import dev.rourunisen.tapauth.crypto.Ed25519Keypair
 import dev.rourunisen.tapauth.crypto.X25519Keypair
 import dev.rourunisen.tapauth.crypto.generateSAS
 import dev.rourunisen.tapauth.crypto.performKeyExchange
+import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -148,10 +149,11 @@ class PairingClient(private val context: Context) {
             
             Log.d(TAG, "Received PairingCskMessage (${cskMessageBytes.size} bytes)")
             
-            // Parse PairingCskMessage to extract encrypted CSK
-            val encryptedCsk = dev.rourunisen.tapauth.crypto.parsePairingCskMessage(cskMessageBytes)
+            // Parse PairingCskMessage to extract encrypted CSK and username
+            val (encryptedCsk, username) = dev.rourunisen.tapauth.crypto.parsePairingCskMessage(cskMessageBytes)
             
             Log.d(TAG, "Extracted encrypted CSK (${encryptedCsk.size} bytes)")
+            Log.d(TAG, "Pairing username: $username")
             Log.d(TAG, "PSK (trunc): ${psk.take(8).joinToString("") { "%02x".format(it) }}…")
             Log.d(TAG, "Encrypted CSK (trunc): ${encryptedCsk.take(8).joinToString("") { "%02x".format(it) }}…")
             
@@ -176,18 +178,42 @@ class PairingClient(private val context: Context) {
             // Step 8: Generate device ID and create paired device
             val deviceId = generateDeviceId()
             
-            val pairedDevice = PairedDevice(
-                deviceId = deviceId,
-                publicKey = clientEd25519Key,  // Use Ed25519 key for identification
-                csk = csk,  // Store the Client Symmetric Key
-                displayName = "Desktop Computer",
-                pairedAt = System.currentTimeMillis()
-            )
+            // Check if this device is already paired
+            val deviceRepo = DeviceRepository(context)
+            val existingDevice = deviceRepo.getAllPairedDevices().find { device ->
+                device.publicKey.contentEquals(clientEd25519Key)
+            }
+            
+            val pairedDevice = if (existingDevice != null) {
+                // Device already paired - append username to allowed users if not already present
+                Log.d(TAG, "Device already paired, adding user '$username' to allowed list")
+                val updatedUsers = if (existingDevice.allowedUsers.contains(username)) {
+                    Log.d(TAG, "User '$username' already in allowed list")
+                    existingDevice.allowedUsers
+                } else {
+                    existingDevice.allowedUsers + username
+                }
+                existingDevice.copy(
+                    allowedUsers = updatedUsers,
+                    pairedAt = System.currentTimeMillis() // Update pairing timestamp
+                )
+            } else {
+                // New device - create with username in allowed list
+                Log.d(TAG, "New device pairing for user '$username'")
+                PairedDevice(
+                    deviceId = deviceId,
+                    publicKey = clientEd25519Key,
+                    csk = csk,
+                    displayName = "Desktop Computer",
+                    pairedAt = System.currentTimeMillis(),
+                    allowedUsers = listOf(username) // Only this user allowed
+                )
+            }
             
             // Important: Discard PSK immediately
             psk.fill(0)
             
-            Log.d(TAG, "Pairing completed successfully")
+            Log.d(TAG, "Pairing completed successfully for user '$username'")
             
             PairingResult.Success(pairedDevice)
             

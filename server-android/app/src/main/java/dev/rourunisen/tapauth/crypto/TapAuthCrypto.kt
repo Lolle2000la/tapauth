@@ -223,17 +223,19 @@ object TapAuthCrypto {
     
     /**
      * Create a PairingCskMessage (protobuf)
+     * Note: Not used by Android server (only by clients), kept for API completeness
      * @param encryptedCsk CSK encrypted with PSK
+     * @param username Username of the user pairing
      * @return Protobuf-encoded PairingCskMessage bytes
      */
-    external fun createPairingCskMessage(encryptedCsk: ByteArray): ByteArray
+    external fun createPairingCskMessage(encryptedCsk: ByteArray, username: String): ByteArray
     
     /**
      * Parse a PairingCskMessage (protobuf)
      * @param messageBytes Protobuf-encoded PairingCskMessage
-     * @return Encrypted CSK bytes
+     * @return Array of [ByteArray (encrypted CSK), String (username)]
      */
-    external fun parsePairingCskMessage(messageBytes: ByteArray): ByteArray
+    external fun parsePairingCskMessage(messageBytes: ByteArray): Array<Any>
     
     /**
      * Create a PairingComplete message (protobuf)
@@ -489,16 +491,19 @@ fun parsePairingResponse(responseBytes: ByteArray): Triple<Int, ByteArray, ByteA
 
 /**
  * Create a PairingCskMessage
+ * Note: Not used by Android server, kept for API completeness
  */
-fun createPairingCskMessage(encryptedCsk: ByteArray): ByteArray {
-    return TapAuthCrypto.createPairingCskMessage(encryptedCsk)
+fun createPairingCskMessage(encryptedCsk: ByteArray, username: String): ByteArray {
+    return TapAuthCrypto.createPairingCskMessage(encryptedCsk, username)
 }
 
 /**
- * Parse a PairingCskMessage and extract encrypted CSK
+ * Parse a PairingCskMessage and extract encrypted CSK and username
+ * @return Pair of (encrypted CSK bytes, username)
  */
-fun parsePairingCskMessage(messageBytes: ByteArray): ByteArray {
-    return TapAuthCrypto.parsePairingCskMessage(messageBytes)
+fun parsePairingCskMessage(messageBytes: ByteArray): Pair<ByteArray, String> {
+    val result = TapAuthCrypto.parsePairingCskMessage(messageBytes)
+    return Pair(result[0] as ByteArray, result[1] as String)
 }
 
 /**

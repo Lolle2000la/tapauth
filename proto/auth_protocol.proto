@@ -162,11 +162,14 @@ message PairingResponse {
 }
 
 /**
- * Message containing CSK encrypted with PSK, sent from server to client.
+ * Message containing CSK encrypted with PSK, sent from client to server.
+ * Includes the username of the user initiating the pairing.
  */
 message PairingCskMessage {
   // CSK encrypted with PSK derived from X25519 DH
   bytes encrypted_csk = 1;
+  // The username of the user on the client who is pairing this device
+  string username = 2;
 }
 
 /**

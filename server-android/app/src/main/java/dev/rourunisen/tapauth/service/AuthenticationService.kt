@@ -491,6 +491,17 @@ class AuthenticationService : Service() {
             
             Log.d(TAG, "Parsed auth request: username=${authRequest.username}, hostname=${authRequest.hostname}")
             
+            // CHECK: Verify this pairing is allowed to authenticate this user
+            if (!device.isUserAllowed(authRequest.username)) {
+                Log.w(TAG, "Pairing not authorized for user: ${authRequest.username}")
+                Log.w(TAG, "  Device: ${device.displayName}")
+                Log.w(TAG, "  Allowed users: ${device.allowedUsers}")
+                // Silently reject - don't notify user to avoid information leakage about valid usernames
+                return
+            }
+            
+            Log.d(TAG, "Pairing authorized for user: ${authRequest.username}")
+            
             // Decode Base64 strings to ByteArrays
             val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
             val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
