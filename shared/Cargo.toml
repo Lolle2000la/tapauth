@@ -43,6 +43,8 @@ getrandom.workspace = true
 libc.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 hostname = "0.4"
+if-addrs = "0.14"
+socket2 = "0.6"
 
 # JNI support (optional)
 jni = { version = "0.21", optional = true }

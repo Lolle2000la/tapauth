@@ -1,5 +1,5 @@
 use prost::Message;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -10,6 +10,111 @@ use crate::protocol::pb::EncryptedPacket;
 // Track whether IPv6 is available (cached after first check)
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static IPV6_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Represents a network interface suitable for IPv6 multicast
+#[derive(Debug, Clone)]
+pub struct MulticastInterface {
+    pub name: String,
+    pub index: u32,
+}
+
+/// Get all network interfaces suitable for IPv6 multicast
+/// Returns interfaces that are:
+/// - UP (active)
+/// - Not loopback
+/// - Support IPv6
+/// - Not point-to-point links
+pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
+    let mut interfaces = Vec::new();
+    let mut ipv6_interface_names = std::collections::HashSet::new();
+
+    match if_addrs::get_if_addrs() {
+        Ok(addrs) => {
+            tracing::trace!("Enumerating network interfaces for IPv6 multicast");
+
+            // First pass: collect all interface names that have IPv6 addresses
+            for iface in &addrs {
+                tracing::trace!(
+                    "Found interface: {} (loopback: {}, addr: {:?})",
+                    iface.name,
+                    iface.is_loopback(),
+                    iface.addr
+                );
+
+                // Skip loopback interfaces
+                if iface.is_loopback() {
+                    tracing::trace!("  Skipping {} - loopback", iface.name);
+                    continue;
+                }
+
+                // Check if this address is IPv6
+                if matches!(iface.addr, if_addrs::IfAddr::V6(_)) {
+                    tracing::trace!("  Interface {} has IPv6 address", iface.name);
+                    ipv6_interface_names.insert(iface.name.clone());
+                }
+            }
+
+            tracing::trace!("Interfaces with IPv6: {:?}", ipv6_interface_names);
+
+            // Second pass: get interface indices for IPv6-capable interfaces
+            for name in ipv6_interface_names {
+                match get_interface_index(&name) {
+                    Ok(index) => {
+                        tracing::trace!("  Added interface {} with index {}", name, index);
+                        interfaces.push(MulticastInterface {
+                            name: name.clone(),
+                            index,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::trace!("  Failed to get index for {}: {}", name, e);
+                    }
+                }
+            }
+
+            tracing::trace!(
+                "Found {} suitable IPv6 interface(s): {:?}",
+                interfaces.len(),
+                interfaces.iter().map(|i| &i.name).collect::<Vec<_>>()
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to enumerate network interfaces: {}", e);
+        }
+    }
+
+    interfaces
+}
+
+/// Get the interface index for a given interface name
+/// This is needed for IPv6 multicast scope specification
+#[cfg(unix)]
+fn get_interface_index(name: &str) -> Result<u32, std::io::Error> {
+    use std::ffi::CString;
+
+    let c_name = CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
+    })?;
+
+    // SAFETY: if_nametoindex is a standard POSIX function
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+
+    if index == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
+}
+
+#[cfg(not(unix))]
+fn get_interface_index(_name: &str) -> Result<u32, std::io::Error> {
+    // On non-Unix platforms, we can't easily get interface indices
+    // This is a limitation - Windows would need different API calls
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Interface index lookup not supported on this platform",
+    ))
+}
 
 /// Check if IPv6 is available on this system
 pub fn is_ipv6_available() -> bool {
@@ -52,36 +157,93 @@ pub async fn send_udp_broadcast(
     Ok(())
 }
 
-/// Send an encrypted packet via UDP multicast (IPv6) - async
-/// Returns Ok(()) if sent successfully, or Err if IPv6 is unavailable or send fails
-pub async fn send_udp_multicast(
-    socket: &UdpSocket,
+/// Send an encrypted packet via UDP multicast on all available IPv6 interfaces
+/// This function creates separate sockets for each interface and uses socket2 to
+/// properly set the IPV6_MULTICAST_IF option for each send.
+pub async fn send_udp_multicast_all_interfaces(
     multicast_addr: &str,
     port: u16,
     packet: &EncryptedPacket,
-) -> Result<(), NetworkError> {
+) -> Result<usize, NetworkError> {
     let data = packet.encode_to_vec();
-    let addr: SocketAddr = format!("[{}]:{}", multicast_addr, port)
-        .parse()
-        .map_err(|_| {
-            NetworkError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Invalid multicast address",
-            ))
-        })?;
 
-    // Try to send, but provide a more specific error for IPv6 unavailability
-    match socket.send_to(&data, addr).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(97) => {
-            // EAFNOSUPPORT (97) - Address family not supported by protocol
-            Err(NetworkError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "IPv6 not available on this system",
-            )))
-        }
-        Err(e) => Err(NetworkError::Io(e)),
+    // Parse the multicast address
+    let multicast_ip: Ipv6Addr = multicast_addr.parse().map_err(|_| {
+        NetworkError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid multicast address",
+        ))
+    })?;
+
+    // Get all suitable interfaces
+    let interfaces = get_multicast_interfaces();
+
+    if interfaces.is_empty() {
+        tracing::debug!("No suitable IPv6 interfaces found for multicast");
+        return Ok(0);
     }
+
+    let mut success_count = 0;
+
+    // Send on each interface by setting the multicast interface option
+    for iface in interfaces {
+        // Create a UDP socket for IPv6
+        let socket_addr = "[::]:0".parse::<std::net::SocketAddr>().unwrap();
+        let socket = match socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Failed to create IPv6 socket for {}: {}", iface.name, e);
+                continue;
+            }
+        };
+
+        // Bind to any address
+        if let Err(e) = socket.bind(&socket_addr.into()) {
+            tracing::debug!("Failed to bind IPv6 socket for {}: {}", iface.name, e);
+            continue;
+        }
+
+        // Set the multicast interface to this specific interface
+        if let Err(e) = socket.set_multicast_if_v6(iface.index) {
+            tracing::debug!(
+                "Failed to set multicast interface for {}: {}",
+                iface.name,
+                e
+            );
+            continue;
+        }
+
+        // Send using the std socket (synchronous, but fast)
+        let dest_addr = SocketAddr::new(std::net::IpAddr::V6(multicast_ip), port);
+
+        match socket.send_to(&data, &dest_addr.into()) {
+            Ok(_) => {
+                tracing::trace!(
+                    "Sent IPv6 multicast on interface {} (index {})",
+                    iface.name,
+                    iface.index
+                );
+                success_count += 1;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to send IPv6 multicast on interface {}: {}",
+                    iface.name,
+                    e
+                );
+            }
+        }
+    }
+
+    if success_count > 0 {
+        tracing::trace!("Sent IPv6 multicast on {} interface(s)", success_count);
+    }
+
+    Ok(success_count)
 }
 
 /// Send an encrypted packet via UDP unicast - async

@@ -6,10 +6,13 @@ pub use discovery::*;
 pub use tcp::*;
 pub use udp::*;
 
+pub use udp::{get_multicast_interfaces, MulticastInterface};
+
 /// Default UDP port for authentication
 pub const DEFAULT_UDP_PORT: u16 = 36692;
 
 /// IPv6 multicast address for discovery (all nodes on local network segment)
+/// Note: This is a link-local multicast address that requires an interface scope
 pub const IPV6_MULTICAST_ADDR: &str = "ff02::1";
 
 #[derive(Debug, thiserror::Error)]

@@ -6,7 +6,8 @@ use shared::{
     },
     network::{
         create_broadcast_socket, get_client_retry_interval, get_session_timeout, is_ipv6_available,
-        send_udp_broadcast, send_udp_multicast, try_receive_udp_packet, IPV6_MULTICAST_ADDR,
+        send_udp_broadcast, send_udp_multicast_all_interfaces, try_receive_udp_packet,
+        IPV6_MULTICAST_ADDR,
     },
     protocol::{
         messages::*,
@@ -332,13 +333,20 @@ impl AuthenticationClient {
                 tracing::warn!("Failed to send IPv4 broadcast: {}", e);
             }
 
-            // Send multicast on IPv6 (only if available)
+            // Send multicast on IPv6 (on all available interfaces)
             if is_ipv6_available() {
-                if let Err(e) = send_udp_multicast(&socket, IPV6_MULTICAST_ADDR, port, packet).await
-                {
-                    tracing::warn!("Failed to send IPv6 multicast: {}", e);
-                    // Mark IPv6 as unavailable to avoid future attempts
-                    IPV6_WARNING_SHOWN.store(true, Ordering::Relaxed);
+                match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, packet).await {
+                    Ok(count) if count > 0 => {
+                        tracing::trace!("Sent IPv6 multicast on {} interface(s)", count);
+                    }
+                    Ok(_) => {
+                        if !IPV6_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
+                            tracing::info!("No suitable IPv6 interfaces found for multicast");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to send IPv6 multicast: {}", e);
+                    }
                 }
             } else if !IPV6_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
                 // Only warn once about IPv6 being unavailable
@@ -526,7 +534,7 @@ impl AuthenticationClient {
         // Send on both IPv4 and IPv6 (if available)
         send_udp_broadcast(socket, port, &packet).await?;
         if is_ipv6_available() {
-            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet).await;
+            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, &packet).await;
         }
 
         Ok(())
@@ -545,7 +553,7 @@ impl AuthenticationClient {
         // Send on both IPv4 and IPv6 (if available)
         send_udp_broadcast(socket, port, &packet).await?;
         if is_ipv6_available() {
-            let _ = send_udp_multicast(socket, IPV6_MULTICAST_ADDR, port, &packet).await;
+            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, &packet).await;
         }
 
         Ok(())
