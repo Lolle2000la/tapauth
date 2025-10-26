@@ -342,9 +342,9 @@ class BleGattService : Service() {
         
         for (device in pairedDevices) {
             try {
-                // Generate both current and previous temporal IDs
-                val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestampSeconds)
-                val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, previousTimestampSeconds)
+                // Generate both current and previous temporal IDs (10 bytes for BLE)
+                val currentId = dev.rourunisen.tapauth.crypto.generateTemporalIdBle(device.csk, currentTimestampSeconds)
+                val previousId = dev.rourunisen.tapauth.crypto.generateTemporalIdBle(device.csk, previousTimestampSeconds)
                 
                 // Store CSK as hex string for later retrieval
                 val cskHex = device.csk.toHex()
@@ -449,10 +449,12 @@ class BleGattService : Service() {
             Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
             
             // Try to match temporal ID with paired devices
+            // Note: EncryptedPacket contains 16-byte temporal ID (same as UDP)
             var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
             for (device in pairedDevices) {
                 val temporalIdHex = temporalIdBytes.toHex()
                 // Check if this temporal ID matches (current or previous window)
+                // Use standard generateTemporalId (16 bytes) for EncryptedPacket
                 val currentTimestamp = System.currentTimeMillis() / 1000
                 val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp)
                 val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp - 60)

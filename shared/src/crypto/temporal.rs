@@ -17,8 +17,27 @@ pub fn current_time_window() -> u64 {
 }
 
 /// Generate temporal identifier for a given time window
-/// Returns a 10-byte identifier (reduced from 16 to fit in BLE advertisement)
+/// Returns a 16-byte identifier (full HMAC-SHA256 output truncated to 16 bytes)
 pub fn generate_temporal_identifier(
+    csk: &ClientSymmetricKey,
+    time_window: u64,
+) -> Result<[u8; 16], CryptoError> {
+    let mut mac =
+        HmacSha256::new_from_slice(csk.as_bytes()).map_err(|_| CryptoError::KeyDerivationFailed)?;
+
+    mac.update(&time_window.to_be_bytes());
+
+    let result = mac.finalize();
+    let bytes = result.into_bytes();
+
+    let mut identifier = [0u8; 16];
+    identifier.copy_from_slice(&bytes[..16]);
+
+    Ok(identifier)
+}
+
+/// Generate temporal identifier for BLE advertisement (10 bytes to fit in 31-byte BLE limit)
+pub fn generate_temporal_identifier_ble(
     csk: &ClientSymmetricKey,
     time_window: u64,
 ) -> Result<[u8; 10], CryptoError> {
@@ -39,14 +58,21 @@ pub fn generate_temporal_identifier(
 /// Generate temporal identifier for current time window
 pub fn generate_current_temporal_identifier(
     csk: &ClientSymmetricKey,
-) -> Result<[u8; 10], CryptoError> {
+) -> Result<[u8; 16], CryptoError> {
     generate_temporal_identifier(csk, current_time_window())
+}
+
+/// Generate temporal identifier for BLE advertisement (current window, 10 bytes)
+pub fn generate_current_temporal_identifier_ble(
+    csk: &ClientSymmetricKey,
+) -> Result<[u8; 10], CryptoError> {
+    generate_temporal_identifier_ble(csk, current_time_window())
 }
 
 /// Generate temporal identifier for previous time window
 pub fn generate_previous_temporal_identifier(
     csk: &ClientSymmetricKey,
-) -> Result<[u8; 10], CryptoError> {
+) -> Result<[u8; 16], CryptoError> {
     let window = current_time_window();
     if window == 0 {
         return Err(CryptoError::KeyDerivationFailed);
@@ -54,10 +80,21 @@ pub fn generate_previous_temporal_identifier(
     generate_temporal_identifier(csk, window - 1)
 }
 
+/// Generate temporal identifier for BLE advertisement (previous window, 10 bytes)
+pub fn generate_previous_temporal_identifier_ble(
+    csk: &ClientSymmetricKey,
+) -> Result<[u8; 10], CryptoError> {
+    let window = current_time_window();
+    if window == 0 {
+        return Err(CryptoError::KeyDerivationFailed);
+    }
+    generate_temporal_identifier_ble(csk, window - 1)
+}
+
 /// Verify if a temporal identifier matches current or previous window
 pub fn verify_temporal_identifier(
     csk: &ClientSymmetricKey,
-    identifier: &[u8; 10],
+    identifier: &[u8; 16],
 ) -> Result<bool, CryptoError> {
     let current = generate_current_temporal_identifier(csk)?;
     if identifier == &current {
@@ -65,6 +102,20 @@ pub fn verify_temporal_identifier(
     }
 
     let previous = generate_previous_temporal_identifier(csk)?;
+    Ok(identifier == &previous)
+}
+
+/// Verify if a BLE temporal identifier (10 bytes) matches current or previous window
+pub fn verify_temporal_identifier_ble(
+    csk: &ClientSymmetricKey,
+    identifier: &[u8; 10],
+) -> Result<bool, CryptoError> {
+    let current = generate_current_temporal_identifier_ble(csk)?;
+    if identifier == &current {
+        return Ok(true);
+    }
+
+    let previous = generate_previous_temporal_identifier_ble(csk)?;
     Ok(identifier == &previous)
 }
 
@@ -104,7 +155,7 @@ mod tests {
         assert!(verify_temporal_identifier(&csk, &current_id).unwrap());
 
         // Random identifier should not verify
-        let random_id = [0u8; 10];
+        let random_id = [0u8; 16];
         assert!(!verify_temporal_identifier(&csk, &random_id).unwrap());
     }
 

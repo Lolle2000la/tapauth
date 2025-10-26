@@ -168,6 +168,14 @@ object TapAuthCrypto {
     external fun generateTemporalId(cskHex: String, timestampSeconds: Long): String
     
     /**
+     * Generate temporal identifier for BLE (10 bytes) for matching advertisements
+     * @param cskHex Client Symmetric Key (hex)
+     * @param timestampSeconds Unix timestamp in seconds
+     * @return Temporal ID as hex string (20 chars, 10 bytes)
+     */
+    external fun generateTemporalIdBle(cskHex: String, timestampSeconds: Long): String
+    
+    /**
      * Verify temporal identifier matches current or previous time window
      * @param idHex Temporal ID to verify (hex)
      * @param cskHex Client Symmetric Key (hex)
@@ -398,6 +406,21 @@ fun generateTemporalId(csk: ByteArray): String {
  */
 fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): String {
     return TapAuthCrypto.generateTemporalId(bytesToHex(csk), timestampSeconds)
+}
+
+/**
+ * Generate BLE temporal identifier (10 bytes) for current time
+ */
+fun generateTemporalIdBle(csk: ByteArray): String {
+    val timestampSeconds = System.currentTimeMillis() / 1000
+    return TapAuthCrypto.generateTemporalIdBle(bytesToHex(csk), timestampSeconds)
+}
+
+/**
+ * Generate BLE temporal identifier (10 bytes) for specific timestamp
+ */
+fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): String {
+    return TapAuthCrypto.generateTemporalIdBle(bytesToHex(csk), timestampSeconds)
 }
 
 /**

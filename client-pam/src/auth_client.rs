@@ -2,7 +2,7 @@ use prost::Message;
 use shared::{
     config::ClientConfigManager,
     crypto::{
-        generate_current_temporal_identifier, ClientSymmetricKey, CryptoError, Ed25519KeyPair,
+        generate_current_temporal_identifier_ble, ClientSymmetricKey, CryptoError, Ed25519KeyPair,
     },
     network::{
         create_broadcast_socket, get_client_retry_interval, get_session_timeout, is_ipv6_available,
@@ -134,8 +134,8 @@ impl AuthenticationClient {
 
         tracing::debug!("==> try_parallel_authentication called");
 
-        // Generate temporal identifier for BLE advertising
-        let temporal_id = generate_current_temporal_identifier(&self.csk)?;
+        // Generate temporal identifier for BLE advertising (10 bytes for BLE advertisement)
+        let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 

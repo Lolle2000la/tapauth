@@ -881,6 +881,78 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     }
 }
 
+/// JNI wrapper for generating temporal identifier for BLE (10 bytes)
+/// Used by Android BLE cache to match BLE advertisements
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateTemporalIdBle(
+    mut env: JNIEnv,
+    _class: JClass,
+    csk_hex: JString,
+    timestamp_seconds: jlong,
+) -> jstring {
+    // Extract CSK
+    let csk_hex_str: String = match env.get_string(&csk_hex) {
+        Ok(value) => value.into(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid UTF-8 in csk: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_bytes = match hex::decode(csk_hex_str) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("invalid hex in csk: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk_array: [u8; 32] = match csk_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", "CSK must be 32 bytes");
+            return std::ptr::null_mut();
+        }
+    };
+
+    let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
+
+    // Calculate time window
+    let time_window = (timestamp_seconds as u64) / crypto::temporal::TIME_WINDOW_SECONDS;
+
+    // Generate temporal identifier (10 bytes for BLE)
+    let identifier = match crypto::temporal::generate_temporal_identifier_ble(&csk, time_window) {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to generate temporal ID: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert to hex string
+    let hex_string = hex::encode(identifier);
+
+    match env.new_string(hex_string) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// JNI wrapper for verifying temporal identifier
 /// Returns true if identifier matches current or previous time window
 #[no_mangle]
@@ -913,16 +985,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
         }
     };
 
-    let id_array: [u8; 10] = match id_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                "temporal ID must be 10 bytes",
-            );
-            return false as jboolean;
-        }
-    };
+    // Support both 16-byte (UDP) and 10-byte (BLE) temporal IDs
+    let id_len = id_bytes.len();
 
     // Extract CSK
     let csk_hex_str: String = match env.get_string(&csk_hex) {
@@ -957,8 +1021,28 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
 
     let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
 
-    // Verify temporal identifier
-    match crypto::temporal::verify_temporal_identifier(&csk, &id_array) {
+    // Verify temporal identifier (support both 16-byte and 10-byte IDs)
+    let result = if id_len == 16 {
+        let id_array: [u8; 16] = match id_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => unreachable!(), // Already checked length
+        };
+        crypto::temporal::verify_temporal_identifier(&csk, &id_array)
+    } else if id_len == 10 {
+        let id_array: [u8; 10] = match id_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => unreachable!(), // Already checked length
+        };
+        crypto::temporal::verify_temporal_identifier_ble(&csk, &id_array)
+    } else {
+        let _ = env.throw_new(
+            "java/lang/IllegalArgumentException",
+            format!("temporal ID must be 10 or 16 bytes, got {}", id_len),
+        );
+        return false as jboolean;
+    };
+
+    match result {
         Ok(valid) => valid as jboolean,
         Err(err) => {
             let _ = env.throw_new(
