@@ -23,9 +23,10 @@ To mitigate denial-of-service (DoS) and user annoyance attacks from a malicious 
 * **Strategy**: Per-Client identifier (based on the public key from the verified signature). A token bucket or similar algorithm is recommended.
 * **Rule**: After receiving a valid `AuthenticationRequest` from a given Client and displaying a notification, the Server **must** ignore subsequent requests from that *same Client* for a short, escalating period.
     * **Initial Backoff**: A 1-second cooldown after the first request is processed.
-    * **Escalation**: The cooldown should double for each subsequent request (e.g., 2s, 4s, 8s) up to a maximum of 60 seconds.
+    * **Escalation**: The cooldown should double for each subsequent request (e.g., 2s, 4s) up to a maximum of 5 seconds.
+    * **Maximum Backoff**: 5 seconds. This ensures that rapid legitimate requests (e.g., retry after a failed attempt) are not blocked for too long.
     * **Reset**: The rate limit for a Client should be reset after a successful `GrantConfirmation`, an `AuthenticationCancel` is received, or the session times out.
-* **Rationale**: This prevents a flood of notifications from a single rogue client from overwhelming the user or draining the Server's battery, while still allowing legitimate requests from other paired Clients to be processed immediately.
+* **Rationale**: This prevents a flood of notifications from a single rogue client from overwhelming the user or draining the Server's battery, while still allowing legitimate requests from other paired Clients to be processed immediately. The relatively short maximum backoff (5s) ensures that legitimate rapid retry scenarios work smoothly.
 
 ## 3. Pre-Authentication DoS Mitigation
 

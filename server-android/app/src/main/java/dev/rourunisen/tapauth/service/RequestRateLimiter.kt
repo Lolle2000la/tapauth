@@ -11,8 +11,8 @@ import kotlin.math.min
  * - After receiving a valid AuthenticationRequest from a client, subsequent requests
  *   from the same client are ignored for a cooldown period
  * - Initial cooldown: 1 second
- * - Escalation: Doubles on each subsequent request (2s, 4s, 8s, 16s, 32s)
- * - Maximum cooldown: 60 seconds
+ * - Escalation: Doubles on each subsequent request (2s, 4s)
+ * - Maximum cooldown: 5 seconds
  * - Reset: On successful authentication, cancel, or timeout
  * 
  * This prevents notification spam from malicious or malfunctioning clients.
@@ -99,8 +99,8 @@ class RequestRateLimiter {
         // Initial backoff: 1 second
         private const val INITIAL_BACKOFF_SECONDS = 1
         
-        // Maximum backoff: 60 seconds
-        private const val MAX_BACKOFF_SECONDS = 60
+        // Maximum backoff: 5 seconds
+        private const val MAX_BACKOFF_SECONDS = 5
         
         // Remove backoff states older than 5 minutes
         private const val CLEANUP_AGE_SECONDS = 300
