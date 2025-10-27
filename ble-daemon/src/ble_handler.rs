@@ -289,7 +289,8 @@ impl BleAuthHandler {
 
     /// Process the BLE response from server
     async fn process_response(&self, response_bytes: &[u8]) -> AuthResult {
-        use shared::protocol::pb::EncryptedPacket;
+        use shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce;
+        use shared::protocol::pb::{wrapper_message, EncryptedPacket};
 
         // Parse encrypted packet
         let encrypted_packet = match EncryptedPacket::decode(&response_bytes[..]) {
@@ -302,27 +303,41 @@ impl BleAuthHandler {
 
         tracing::debug!("Response packet decoded successfully");
 
-        // Note: Full decryption and verification would require CSK and paired server keys
-        // For the daemon, we'll do a simplified check - just parse the wrapper
-        // The actual crypto verification should happen in the PAM module with proper context
+        // Load CSK from config to decrypt the response
+        // This allows us to determine if it's a Grant or Denial
+        let config_manager = shared::config::ClientConfigManager::new();
 
-        // For now, return a simple signal that we got a response
-        // The PAM module will need to decrypt and verify with its own keys
-        //
-        // In a production system, you'd want to:
-        // 1. Load CSK from secure storage
-        // 2. Decrypt the packet
-        // 3. Verify signatures
-        // 4. Return grant/deny based on verification
+        let csk = match config_manager.load_csk() {
+            Ok(csk) => csk,
+            Err(e) => {
+                tracing::error!("Failed to load CSK: {}", e);
+                return AuthResult::Error;
+            }
+        };
 
-        // For this implementation, we'll just check if we got data
-        if !encrypted_packet.ciphertext.is_empty() {
-            tracing::info!("Received valid encrypted response from server");
-            // Return the encrypted response for the PAM module to verify
-            AuthResult::Granted
-        } else {
-            tracing::warn!("Received empty response");
-            AuthResult::Error
+        // Decrypt the packet using CSK-based nonce
+        let wrapper = match decrypt_encrypted_packet_with_csk_nonce(&csk, &encrypted_packet) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to decrypt response: {}", e);
+                return AuthResult::Error;
+            }
+        };
+
+        // Check what type of message we received
+        match wrapper.payload {
+            Some(wrapper_message::Payload::AuthGrant(_)) => {
+                tracing::info!("Received authentication grant from server");
+                AuthResult::Granted
+            }
+            Some(wrapper_message::Payload::AuthDenial(_)) => {
+                tracing::warn!("Received authentication denial from server");
+                AuthResult::Denied
+            }
+            _ => {
+                tracing::error!("Received unexpected message type in response");
+                AuthResult::Error
+            }
         }
     }
 }
