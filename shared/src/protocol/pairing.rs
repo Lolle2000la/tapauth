@@ -576,10 +576,7 @@ mod tests {
         assert_eq!(session.x25519_public_key().len(), 32);
 
         // Ed25519 public key should match the input keypair
-        assert_eq!(
-            session.ed25519_public_key(),
-            keypair.verifying_key_bytes()
-        );
+        assert_eq!(session.ed25519_public_key(), keypair.verifying_key_bytes());
     }
 
     #[test]

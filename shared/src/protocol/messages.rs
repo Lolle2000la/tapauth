@@ -388,8 +388,7 @@ mod tests {
         // Verification should fail with wrong key
         let other_keypair = Ed25519KeyPair::generate();
         assert!(
-            verify_grant_confirmation(&confirmation, &other_keypair.verifying_key_bytes())
-                .is_err()
+            verify_grant_confirmation(&confirmation, &other_keypair.verifying_key_bytes()).is_err()
         );
     }
 

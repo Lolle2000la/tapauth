@@ -155,7 +155,8 @@ mod tests {
         let original_port = 9999;
         let original_ip = Ipv4Addr::new(10, 0, 0, 1);
 
-        let url = pairing::generate_pairing_url(original_key, original_port, Some(original_ip), None);
+        let url =
+            pairing::generate_pairing_url(original_key, original_port, Some(original_ip), None);
         let parsed = pairing::PairingInfo::parse(&url).unwrap();
 
         assert_eq!(parsed.public_key_hex, original_key);
