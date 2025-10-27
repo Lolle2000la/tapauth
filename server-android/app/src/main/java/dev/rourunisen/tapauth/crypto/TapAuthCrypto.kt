@@ -69,14 +69,6 @@ object TapAuthCrypto {
     external fun sha256(data: ByteArray): String
     
     /**
-     * Decrypt and parse an EncryptedPacket
-     * @param csk Client Symmetric Key (32 bytes)
-     * @param packetBytes Raw packet bytes
-     * @return JSON string with packet contents
-     */
-    external fun decryptAndParsePacket(csk: ByteArray, packetBytes: ByteArray): String
-    
-    /**
      * Parse AuthenticationRequest from protobuf bytes
      * @param requestBytes Protobuf-encoded request
      * @return JSON string with request contents
