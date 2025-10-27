@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -64,3 +67,6 @@ echo "  sudo gpasswd -d $USER plugdev"
 echo ""
 echo "After removing from plugdev group, you'll need to log out and back in."
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

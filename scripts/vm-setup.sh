@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -558,7 +561,10 @@ echo "  SSH User: $VM_SSH_USER"
 echo "  SSH Pass: $VM_SSH_PASSWORD (change on first login)"
 echo ""
 echo "Next steps:"
-echo "  1. Start VM:  ./vm-start.sh"
+echo "  1. Start VM:  ./scripts/vm-start.sh"
 echo "  2. Wait for VM to boot and install packages (first boot takes 5-10 minutes)"
-echo "  3. Connect:   ./vm-shell.sh"
+echo "  3. Connect:   ./scripts/vm-shell.sh"
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

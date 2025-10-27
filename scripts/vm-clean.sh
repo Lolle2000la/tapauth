@@ -3,6 +3,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -67,5 +70,8 @@ echo "╔═══════════════════════�
 echo "║         Cleanup Complete                                      ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
-echo "To create a fresh VM, run: ./vm-setup.sh"
+echo "To create a fresh VM, run: ./scripts/vm-setup.sh"
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

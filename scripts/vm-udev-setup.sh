@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -77,5 +80,8 @@ cat "$UDEV_RULE_FILE"
 echo ""
 echo "Next steps:"
 echo "  1. If you were added to plugdev group, log out and back in"
-echo "  2. Restart the VM: ./vm-stop.sh && ./vm-start.sh"
+echo "  2. Restart the VM: ./scripts/vm-stop.sh && ./scripts/vm-start.sh"
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

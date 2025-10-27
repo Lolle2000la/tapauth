@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -13,6 +16,7 @@ source ./vm-config.sh
 # --- MODIFIED: ADDED SUDO CHECK ---
 if [ "$EUID" -ne 0 ]; then
   echo "❌ This script must be run as root (using sudo) to scan the network."
+  cd "$ORIGINAL_DIR"
   exit 1
 fi
 
@@ -30,6 +34,7 @@ fi
 if ! command -v arp-scan &> /dev/null; then
     echo "❌ 'arp-scan' tool not found. This is required to find the VM's IP."
     echo "   Please install it (e.g., 'sudo apt install arp-scan' or 'sudo dnf install arp-scan')"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -37,7 +42,8 @@ fi
 if [ ! -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     echo "❌ VM is not running"
     echo ""
-    echo "Start it with: sudo -E ./vm-start.sh"
+    echo "Start it with: sudo -E ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -46,7 +52,8 @@ if ! ps -p "$VM_PID" > /dev/null 2>&1; then
     echo "❌ VM is not running (stale PID file)"
     rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
     echo ""
-    echo "Start it with: sudo -E ./vm-start.sh"
+    echo "Start it with: sudo -E ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -81,6 +88,7 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         echo "  1. Is the VM fully booted? Check the QEMU window."
         echo "  2. Is the bridge '$VM_BRIDGE' up? (check 'ip addr')"
         echo "  3. Try scanning manually: sudo arp-scan --interface=$VM_BRIDGE --localnet"
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     
@@ -119,6 +127,7 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         echo "     ssh -i $SSH_KEY_FILE ${VM_SSH_USER}@${VM_IP} \"cloud-init status\""
         echo ""
         echo "On first boot, the VM needs 5-10 minutes to install packages."
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     
@@ -144,3 +153,6 @@ echo ""
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o IdentitiesOnly=yes -X -i "${SSH_KEY_FILE}" \
     "${VM_SSH_USER}@${VM_IP}"
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

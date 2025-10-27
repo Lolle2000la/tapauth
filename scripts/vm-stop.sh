@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -12,6 +15,7 @@ source ./vm-config.sh
 
 if [ "$EUID" -ne 0 ]; then
   echo "❌ This script must be run as root (using sudo) to manage network devices."
+  cd "$ORIGINAL_DIR"
   exit 1
 fi
 
@@ -154,5 +158,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     fi
     
     echo ""
-    echo "To create a fresh VM, run: ./vm-setup.sh"
+    echo "To create a fresh VM, run: ./scripts/vm-setup.sh"
 fi
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

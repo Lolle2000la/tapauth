@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -14,7 +17,8 @@ source ./vm-config.sh
 if [ ! -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     echo "❌ ERROR: VM is not running"
     echo ""
-    echo "Start it with: ./vm-start.sh"
+    echo "Start it with: ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -23,7 +27,8 @@ if ! ps -p "$VM_PID" > /dev/null 2>&1; then
     echo "❌ ERROR: VM is not running (stale PID file)"
     rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
     echo ""
-    echo "Start it with: ./vm-start.sh"
+    echo "Start it with: ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -37,4 +42,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 echo ""
 echo "✅ Rebuild complete!"
 echo ""
-echo "You can now test with: ./vm-test.sh"
+echo "You can now test with: ./scripts/vm-test.sh"
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

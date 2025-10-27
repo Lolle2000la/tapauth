@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -14,7 +17,8 @@ source ./vm-config.sh
 if [ ! -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     echo "❌ ERROR: VM is not running"
     echo ""
-    echo "Start it with: ./vm-start.sh"
+    echo "Start it with: ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -23,7 +27,8 @@ if ! ps -p "$VM_PID" > /dev/null 2>&1; then
     echo "❌ ERROR: VM is not running (stale PID file)"
     rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
     echo ""
-    echo "Start it with: ./vm-start.sh"
+    echo "Start it with: ./scripts/vm-start.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -41,5 +46,8 @@ echo ""
 echo "✅ All tests passed!"
 echo ""
 echo "To test PAM authentication:"
-echo "  ./vm-shell.sh"
+echo "  ./scripts/vm-shell.sh"
 echo "  test-pam-auth root"
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

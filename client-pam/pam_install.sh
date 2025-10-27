@@ -3,11 +3,15 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║         TapAuth PAM Module - Build and Install              ║"
+echo "║         TapAuth PAM Module - Build and Install                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -96,6 +100,9 @@ echo "       - Edit /etc/pam.d/sshd"
 echo "       - Add 'auth sufficient $INSTALL_NAME' near the top"
 echo "  2. Test the configuration (e.g., try logging in via SSH)"
 echo ""
-echo "To uninstall, run: sudo ./pam-uninstall.sh"
+echo "To uninstall, run: sudo ./client-pam/pam_uninstall.sh"
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"
 

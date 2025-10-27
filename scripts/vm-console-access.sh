@@ -1,6 +1,9 @@
 #!/bin/bash
 # Access VM console via QEMU monitor to check/configure network
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -30,3 +33,6 @@ echo "  ip addr"
 echo "  sudo netplan apply"
 echo "  ping 192.168.100.1"
 echo ""
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"

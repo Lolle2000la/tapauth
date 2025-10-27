@@ -3,8 +3,12 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # Check for help flag
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -26,6 +30,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "  - The test user must have paired devices in /etc/tapauth/"
     echo "  - User-specific pairing: only users in allowed_users list can authenticate"
     echo ""
+    cd "$ORIGINAL_DIR"
     exit 0
 fi
 
@@ -35,15 +40,15 @@ echo "╚═══════════════════════�
 echo ""
 
 # --- Configuration ---
-PAM_CRATE_DIR="client-pam"
-BUILD_OUTPUT_FILE="target/release/libclient_pam.so"  # Workspace target at root level
+PAM_CRATE_DIR="${PROJECT_ROOT}/client-pam"
+BUILD_OUTPUT_FILE="${PROJECT_ROOT}/target/release/libclient_pam.so"  # Workspace target at root level
 # Use a temporary name to avoid conflicts during testing
 TEMP_INSTALL_NAME="pam_tapauth_test.so"
 # TEMP_INSTALL_PATH will be detected below
 PAM_SERVICE_NAME="tapauth-test-local"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
 BLE_DAEMON_SERVICE="tapauth-ble-daemon"
-BLE_DAEMON_DIR="ble-daemon"
+BLE_DAEMON_DIR="${PROJECT_ROOT}/ble-daemon"
 
 # --- Determine test user ---
 # Default to the user who invoked sudo, or current user if not using sudo
@@ -67,6 +72,7 @@ if ! id "$TEST_USER" &>/dev/null; then
     echo "❌ User '$TEST_USER' does not exist on this system"
     echo "   Usage: $0 [username]"
     echo "   Example: sudo $0 alice"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -80,6 +86,7 @@ DAEMON_WAS_INSTALLED=false
 if ! command -v pamtester &> /dev/null; then
     echo "❌ 'pamtester' command not found."
     echo "   Please install it (e.g., 'sudo apt install pamtester' or 'sudo dnf install pamtester')"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 echo "✅ pamtester found."
@@ -114,6 +121,7 @@ done
 if [ -z "$PAM_MODULE_DIR" ]; then
     echo "❌ Could not find a suitable PAM module directory."
     echo "   Checked: ${possible_pam_dirs[*]}"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 TEMP_INSTALL_PATH="${PAM_MODULE_DIR}/${TEMP_INSTALL_NAME}"
@@ -132,6 +140,7 @@ if [ -n "$SUDO_USER" ]; then
     if [ ! -x "$CARGO_PATH" ]; then
         echo "❌ Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
         echo "   Ensure Rust is installed correctly for the user who ran sudo."
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     echo "    Running build as user $SUDO_USER using $CARGO_PATH..."
@@ -141,6 +150,7 @@ else
     if ! command -v cargo &> /dev/null; then
         echo "❌ cargo command not found in PATH."
         echo "   Ensure Rust is installed correctly."
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     echo "    Running build as current user ($(whoami))..."
@@ -148,13 +158,14 @@ else
 fi
 # --- END MODIFICATION ---
 
-cd .. # Return to project root
+# Already at project root, no need to cd
 
 # With workspace, build output is at root level
 BUILD_OUTPUT_FULL_PATH="${BUILD_OUTPUT_FILE}"
 
 if [ ! -f "$BUILD_OUTPUT_FULL_PATH" ]; then
     echo "❌ Build failed: Output file not found at $BUILD_OUTPUT_FULL_PATH"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 echo "✅ Build successful: $BUILD_OUTPUT_FULL_PATH"
@@ -192,6 +203,7 @@ if [ -n "$SUDO_USER" ]; then
     CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
     if [ ! -x "$CARGO_PATH" ]; then
         echo "❌ Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     echo "    Building daemon as user $SUDO_USER..."
@@ -199,6 +211,7 @@ if [ -n "$SUDO_USER" ]; then
 else
     if ! command -v cargo &> /dev/null; then
         echo "❌ cargo command not found in PATH."
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
     echo "    Building daemon as current user..."
@@ -243,10 +256,11 @@ else
     echo "❌ Test daemon failed to start"
     echo "    Error logs:"
     sudo journalctl -u "$BLE_DAEMON_SERVICE" -n 10 --no-pager | sed 's/^/      /'
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
-cd .. # Return to project root
+# Already at project root
 
 # --- Cleanup function ---
 # Ensures temporary files are removed even if the script exits unexpectedly
@@ -282,6 +296,9 @@ cleanup() {
             echo "✅ Test daemon removed"
         fi
     fi
+    
+    # Restore original working directory on cleanup
+    cd "$ORIGINAL_DIR"
 }
 # Register the cleanup function to run on script exit (normal or error)
 trap cleanup EXIT
@@ -346,6 +363,9 @@ echo ""
 # 4. Cleanup happens automatically via the 'trap' command when the script exits
 
 echo "✅ Build and test script finished."
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"
 
 exit $PAMTESTER_EXIT_CODE
 

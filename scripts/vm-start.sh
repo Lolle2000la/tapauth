@@ -4,6 +4,9 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -12,6 +15,7 @@ source ./vm-config.sh
 
 if [ "$EUID" -ne 0 ]; then
   echo "❌ This script must be run as root (using sudo) to manage network devices."
+  cd "$ORIGINAL_DIR"
   exit 1
 fi
 
@@ -28,12 +32,14 @@ fi
 HOST_OUT_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 if [ -z "$HOST_OUT_IFACE" ]; then
     echo "❌ Could not auto-detect host internet interface."
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 if [[ "$HOST_OUT_IFACE" == "wlan"* ]]; then
     echo "❌ Host interface '$HOST_OUT_IFACE' appears to be Wi-Fi."
     echo "   Bridging is not supported on most Wi-Fi adapters."
     echo "   Please connect via Ethernet."
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 echo "==> Using host internet interface: $HOST_OUT_IFACE"
@@ -50,8 +56,9 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
     if ps -p "$VM_PID" > /dev/null 2>&1; then
         echo "⚠️  VM is already running (PID: $VM_PID)"
         echo ""
-        echo "To connect: ./vm-shell.sh (must be updated for new IP)"
-        echo "To stop:    sudo ./vm-stop.sh"
+        echo "To connect: ./scripts/vm-shell.sh (must be updated for new IP)"
+        echo "To stop:    sudo ./scripts/vm-stop.sh"
+        cd "$ORIGINAL_DIR"
         exit 0
     else
         rm -f "${VM_IMAGE_DIR}/${VM_NAME}.pid"
@@ -61,7 +68,8 @@ fi
 # Check if VM image exists
 if [ ! -f "$VM_DISK_IMAGE" ]; then
     echo "❌ VM disk image not found at: $VM_DISK_IMAGE"
-    echo "   Please run './vm-setup.sh' (without sudo) first to create it."
+    echo "   Please run './scripts/vm-setup.sh' (without sudo) first to create it."
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 
@@ -305,15 +313,18 @@ if [ -f "${VM_IMAGE_DIR}/${VM_NAME}.pid" ]; then
         echo "    'status: error'    → Check logs with: cloud-init status --long"
         echo ""
         echo "To stop the VM:"
-        echo "  sudo ./vm-stop.sh"
+        echo "  sudo ./scripts/vm-stop.sh"
         echo ""
+        cd "$ORIGINAL_DIR"
     else
         echo "❌ VM failed to start"
         teardown_bridge
+        cd "$ORIGINAL_DIR"
         exit 1
     fi
 else
     echo "❌ VM PID file not created"
     teardown_bridge
+    cd "$ORIGINAL_DIR"
     exit 1
 fi

@@ -35,8 +35,8 @@ VM_SSH_PASSWORD="tapauth"  # Will prompt to change on first login
 # X11 Forwarding
 VM_X11_DISPLAY="${DISPLAY:-:0}"
 
-# Shared Folder
-VM_SHARED_FOLDER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared Folder - point to project root (parent of scripts directory)
+VM_SHARED_FOLDER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Bluetooth USB Device
 # Leave empty to auto-detect, or set to specific device

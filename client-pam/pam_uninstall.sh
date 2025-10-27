@@ -3,11 +3,15 @@
 
 set -e
 
+# Save original working directory
+ORIGINAL_DIR="$(pwd)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║         TapAuth PAM Module - Uninstall                      ║"
+echo "║         TapAuth PAM Module - Uninstall                        ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -19,6 +23,7 @@ INSTALL_NAME="pam_tapauth.so"
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
   echo "❌ This script must be run as root (using sudo) to remove system files."
+  cd "$ORIGINAL_DIR"
   exit 1
 fi
 
@@ -68,4 +73,7 @@ echo "Remember to remove '$INSTALL_NAME' from any PAM configuration files"
 echo "in /etc/pam.d/ where you added it (e.g., sshd, login, gdm-password)."
 echo ""
 echo "✅ Uninstallation script finished."
+
+# Restore original working directory
+cd "$ORIGINAL_DIR"
 
