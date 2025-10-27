@@ -18,48 +18,48 @@ object TapAuthCrypto {
     
     /**
      * Generate a new Ed25519 keypair
-     * @return Keypair as "private_hex:public_hex"
+     * @return Array of [privateKey: ByteArray, publicKey: ByteArray]
      */
-    external fun generateKeypair(): String
+    external fun generateKeypair(): Array<ByteArray>
     
     /**
      * Generate a new X25519 keypair (for key exchange)
-     * @return Keypair as "private_hex:public_hex"
+     * @return Array of [privateKey: ByteArray, publicKey: ByteArray]
      */
-    external fun generateX25519Keypair(): String
+    external fun generateX25519Keypair(): Array<ByteArray>
     
     /**
      * Perform X25519 key exchange
-     * @param ourPrivateKeyHex Our X25519 private key (hex)
-     * @param theirPublicKeyHex Their X25519 public key (hex)
-     * @return PSK derived from shared secret (hex)
+     * @param ourPrivateKey Our X25519 private key (32 bytes)
+     * @param theirPublicKey Their X25519 public key (32 bytes)
+     * @return PSK derived from shared secret (32 bytes)
      */
-    external fun keyExchange(ourPrivateKeyHex: String, theirPublicKeyHex: String): String
+    external fun keyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): ByteArray
     
     /**
      * Generate Short Authentication String (SAS) from shared secret
-     * @param pskHex Pre-shared key / shared secret (hex)
+     * @param psk Pre-shared key / shared secret (32 bytes)
      * @return 6-digit SAS string
      */
-    external fun getSas(pskHex: String, clientPublic: ByteArray, serverPublic: ByteArray): String
+    external fun getSas(psk: ByteArray, clientPublic: ByteArray, serverPublic: ByteArray): String
     
     /**
      * Decrypt data with PSK (used during pairing)
-     * @param pskHex Pairing Symmetric Key (hex)
+     * @param psk Pairing Symmetric Key (32 bytes)
      * @param context Context string for nonce derivation
      * @param ciphertext Encrypted data
      * @return Decrypted plaintext
      */
-    external fun decryptWithPsk(pskHex: String, context: String, ciphertext: ByteArray): ByteArray
+    external fun decryptWithPsk(psk: ByteArray, context: String, ciphertext: ByteArray): ByteArray
     
     /**
      * Encrypt data with PSK (used during pairing)
-     * @param pskHex Pairing Symmetric Key (hex)
+     * @param psk Pairing Symmetric Key (32 bytes)
      * @param context Context string for nonce derivation
      * @param plaintext Data to encrypt
      * @return Encrypted ciphertext
      */
-    external fun encryptWithPsk(pskHex: String, context: String, plaintext: ByteArray): ByteArray
+    external fun encryptWithPsk(psk: ByteArray, context: String, plaintext: ByteArray): ByteArray
     
     /**
      * Compute SHA-256 hash
@@ -70,11 +70,11 @@ object TapAuthCrypto {
     
     /**
      * Decrypt and parse an EncryptedPacket
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param packetBytes Raw packet bytes
      * @return JSON string with packet contents
      */
-    external fun decryptAndParsePacket(cskHex: String, packetBytes: ByteArray): String
+    external fun decryptAndParsePacket(csk: ByteArray, packetBytes: ByteArray): String
     
     /**
      * Parse AuthenticationRequest from protobuf bytes
@@ -101,11 +101,11 @@ object TapAuthCrypto {
     
     /**
      * Sign data with Ed25519 private key
-     * @param privateKeyHex Private key (hex)
+     * @param privateKey Private key (32 bytes)
      * @param message Data to sign
      * @return Signature bytes (64 bytes)
      */
-    external fun signData(privateKeyHex: String, message: ByteArray): ByteArray
+    external fun signData(privateKey: ByteArray, message: ByteArray): ByteArray
     
     /**
      * Serialize an AuthenticationRequest for signature verification
@@ -139,69 +139,70 @@ object TapAuthCrypto {
     /**
      * Create a WrapperMessage containing an AuthenticationGrant
      * @param signedChallenge The signed challenge bytes
+     * @param privateKey Private key (32 bytes)
      * @return Serialized WrapperMessage protobuf bytes
      */
-    external fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKeyHex: String): ByteArray
+    external fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKey: ByteArray): ByteArray
     
     /**
      * Create an EncryptedPacket from a WrapperMessage payload
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param wrapperMessageBytes Serialized WrapperMessage protobuf
      * @return Serialized EncryptedPacket protobuf bytes
      */
-    external fun createEncryptedPacket(cskHex: String, wrapperMessageBytes: ByteArray): ByteArray
+    external fun createEncryptedPacket(csk: ByteArray, wrapperMessageBytes: ByteArray): ByteArray
     
     /**
      * Decrypt an EncryptedPacket to get the WrapperMessage
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param encryptedPacketBytes Serialized EncryptedPacket protobuf
      * @return Serialized WrapperMessage protobuf bytes
      */
-    external fun decryptEncryptedPacket(cskHex: String, encryptedPacketBytes: ByteArray): ByteArray
+    external fun decryptEncryptedPacket(csk: ByteArray, encryptedPacketBytes: ByteArray): ByteArray
     
     /**
      * Generate temporal identifier for a given timestamp
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param timestampSeconds Unix timestamp in seconds
-     * @return Temporal ID as hex string (32 chars, 16 bytes)
+     * @return Temporal ID as byte array (16 bytes for UDP)
      */
-    external fun generateTemporalId(cskHex: String, timestampSeconds: Long): String
+    external fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): ByteArray
     
     /**
      * Generate temporal identifier for BLE (10 bytes) for matching advertisements
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param timestampSeconds Unix timestamp in seconds
-     * @return Temporal ID as hex string (20 chars, 10 bytes)
+     * @return Temporal ID as byte array (10 bytes for BLE)
      */
-    external fun generateTemporalIdBle(cskHex: String, timestampSeconds: Long): String
+    external fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): ByteArray
     
     /**
      * Verify temporal identifier matches current or previous time window
-     * @param idHex Temporal ID to verify (hex)
-     * @param cskHex Client Symmetric Key (hex)
+     * @param id Temporal ID to verify (10 or 16 bytes)
+     * @param csk Client Symmetric Key (32 bytes)
      * @return true if ID is valid
      */
-    external fun verifyTemporalId(idHex: String, cskHex: String): Boolean
+    external fun verifyTemporalId(id: ByteArray, csk: ByteArray): Boolean
     
     /**
      * Encrypt data with CSK using challenge-derived nonce
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param challenge Challenge bytes (32 bytes)
      * @param context Context string for nonce derivation
      * @param plaintext Data to encrypt
      * @return Encrypted data
      */
-    external fun encryptWithCsk(cskHex: String, challenge: ByteArray, context: String, plaintext: ByteArray): ByteArray
+    external fun encryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, plaintext: ByteArray): ByteArray
     
     /**
      * Decrypt data with CSK using challenge-derived nonce
-     * @param cskHex Client Symmetric Key (hex)
+     * @param csk Client Symmetric Key (32 bytes)
      * @param challenge Challenge bytes (32 bytes)
      * @param context Context string for nonce derivation
      * @param ciphertext Data to decrypt
      * @return Decrypted data
      */
-    external fun decryptWithCsk(cskHex: String, challenge: ByteArray, context: String, ciphertext: ByteArray): ByteArray
+    external fun decryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, ciphertext: ByteArray): ByteArray
     
     // ========== Pairing Protocol Messages ==========
     
@@ -262,11 +263,10 @@ data class Ed25519Keypair(
 ) {
     companion object {
         fun generate(): Ed25519Keypair {
-            val combined = TapAuthCrypto.generateKeypair()
-            val parts = combined.split(":")
+            val result = TapAuthCrypto.generateKeypair()
             return Ed25519Keypair(
-                privateKey = hexToBytes(parts[0]),
-                publicKey = hexToBytes(parts[1])
+                privateKey = result[0],
+                publicKey = result[1]
             )
         }
     }
@@ -300,11 +300,9 @@ data class X25519Keypair(
     companion object {
         fun generate(): X25519Keypair {
             val result = TapAuthCrypto.generateX25519Keypair()
-            val parts = result.split(":")
-            require(parts.size == 2) { "Invalid keypair format" }
             return X25519Keypair(
-                privateKey = hexToBytes(parts[0]),
-                publicKey = hexToBytes(parts[1])
+                privateKey = result[0],
+                publicKey = result[1]
             )
         }
     }
@@ -346,14 +344,9 @@ fun performKeyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): Byt
     android.util.Log.d("TapAuthCrypto", "[KOTLIN] Our private key: ${bytesToHex(ourPrivateKey)}")
     android.util.Log.d("TapAuthCrypto", "[KOTLIN] Their public key: ${bytesToHex(theirPublicKey)}")
     
-    val result = TapAuthCrypto.keyExchange(
-        bytesToHex(ourPrivateKey),
-        bytesToHex(theirPublicKey)
-    )
+    val psk = TapAuthCrypto.keyExchange(ourPrivateKey, theirPublicKey)
     
-    android.util.Log.d("TapAuthCrypto", "[KOTLIN] JNI returned: $result")
-    val psk = hexToBytes(result)
-    android.util.Log.d("TapAuthCrypto", "[KOTLIN] Converted to bytes (${psk.size} bytes): ${bytesToHex(psk)}")
+    android.util.Log.d("TapAuthCrypto", "[KOTLIN] JNI returned (${psk.size} bytes): ${bytesToHex(psk)}")
     return psk
 }
 
@@ -361,21 +354,21 @@ fun performKeyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): Byt
  * Generate 6-digit Short Authentication String
  */
 fun generateSAS(sharedSecret: ByteArray, clientPublic: ByteArray, serverPublic: ByteArray): String {
-    return TapAuthCrypto.getSas(bytesToHex(sharedSecret), clientPublic, serverPublic)
+    return TapAuthCrypto.getSas(sharedSecret, clientPublic, serverPublic)
 }
 
 /**
  * Decrypt data with PSK
  */
 fun decryptWithPsk(psk: ByteArray, context: String, ciphertext: ByteArray): ByteArray {
-    return TapAuthCrypto.decryptWithPsk(bytesToHex(psk), context, ciphertext)
+    return TapAuthCrypto.decryptWithPsk(psk, context, ciphertext)
 }
 
 /**
  * Encrypt data with PSK
  */
 fun encryptWithPsk(psk: ByteArray, context: String, plaintext: ByteArray): ByteArray {
-    return TapAuthCrypto.encryptWithPsk(bytesToHex(psk), context, plaintext)
+    return TapAuthCrypto.encryptWithPsk(psk, context, plaintext)
 }
 
 /**
@@ -396,7 +389,7 @@ fun verifySignature(publicKey: ByteArray, message: ByteArray, signature: ByteArr
  * Sign data with Ed25519 private key
  */
 fun signData(privateKey: ByteArray, message: ByteArray): ByteArray {
-    return TapAuthCrypto.signData(bytesToHex(privateKey), message)
+    return TapAuthCrypto.signData(privateKey, message)
 }
 
 /**
@@ -408,74 +401,78 @@ fun serializeAuthRequestForVerification(requestJson: String): ByteArray {
 
 /**
  * Generate temporal identifier for current time
+ * @return Temporal ID as byte array (16 bytes)
  */
-fun generateTemporalId(csk: ByteArray): String {
+fun generateTemporalId(csk: ByteArray): ByteArray {
     val timestampSeconds = System.currentTimeMillis() / 1000
-    return TapAuthCrypto.generateTemporalId(bytesToHex(csk), timestampSeconds)
+    return TapAuthCrypto.generateTemporalId(csk, timestampSeconds)
 }
 
 /**
  * Generate temporal identifier for specific timestamp
+ * @return Temporal ID as byte array (16 bytes)
  */
-fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): String {
-    return TapAuthCrypto.generateTemporalId(bytesToHex(csk), timestampSeconds)
+fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): ByteArray {
+    return TapAuthCrypto.generateTemporalId(csk, timestampSeconds)
 }
 
 /**
  * Generate BLE temporal identifier (10 bytes) for current time
+ * @return Temporal ID as byte array (10 bytes)
  */
-fun generateTemporalIdBle(csk: ByteArray): String {
+fun generateTemporalIdBle(csk: ByteArray): ByteArray {
     val timestampSeconds = System.currentTimeMillis() / 1000
-    return TapAuthCrypto.generateTemporalIdBle(bytesToHex(csk), timestampSeconds)
+    return TapAuthCrypto.generateTemporalIdBle(csk, timestampSeconds)
 }
 
 /**
  * Generate BLE temporal identifier (10 bytes) for specific timestamp
+ * @return Temporal ID as byte array (10 bytes)
  */
-fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): String {
-    return TapAuthCrypto.generateTemporalIdBle(bytesToHex(csk), timestampSeconds)
+fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): ByteArray {
+    return TapAuthCrypto.generateTemporalIdBle(csk, timestampSeconds)
 }
 
 /**
  * Verify temporal identifier
  */
-fun verifyTemporalId(idHex: String, csk: ByteArray): Boolean {
-    return TapAuthCrypto.verifyTemporalId(idHex, bytesToHex(csk))
+fun verifyTemporalId(id: ByteArray, csk: ByteArray): Boolean {
+    return TapAuthCrypto.verifyTemporalId(id, csk)
 }
 
 /**
  * Encrypt data with CSK
  */
 fun encryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, plaintext: ByteArray): ByteArray {
-    return TapAuthCrypto.encryptWithCsk(bytesToHex(csk), challenge, context, plaintext)
+    return TapAuthCrypto.encryptWithCsk(csk, challenge, context, plaintext)
 }
 
 /**
  * Decrypt data with CSK
  */
 fun decryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, ciphertext: ByteArray): ByteArray {
-    return TapAuthCrypto.decryptWithCsk(bytesToHex(csk), challenge, context, ciphertext)
+    return TapAuthCrypto.decryptWithCsk(csk, challenge, context, ciphertext)
 }
 
 /**
  * Create a WrapperMessage containing an AuthenticationGrant
  */
 fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKey: ByteArray): ByteArray {
-    return TapAuthCrypto.createGrantWrapperMessage(signedChallenge, bytesToHex(privateKey))
+    return TapAuthCrypto.createGrantWrapperMessage(signedChallenge, privateKey)
 }
 
 /**
  * Create an EncryptedPacket from a WrapperMessage
  */
 fun createEncryptedPacket(csk: ByteArray, wrapperMessage: ByteArray): ByteArray {
-    return TapAuthCrypto.createEncryptedPacket(bytesToHex(csk), wrapperMessage)
+    return TapAuthCrypto.createEncryptedPacket(csk, wrapperMessage)
 }
 
 /**
  * Decrypt an EncryptedPacket to get the WrapperMessage
  */
 fun decryptEncryptedPacket(csk: ByteArray, encryptedPacket: ByteArray): ByteArray {
-    return TapAuthCrypto.decryptEncryptedPacket(bytesToHex(csk), encryptedPacket)
+    return TapAuthCrypto.decryptEncryptedPacket(csk, encryptedPacket)
 }
 
 // ========== Pairing Protocol Wrapper Functions ==========

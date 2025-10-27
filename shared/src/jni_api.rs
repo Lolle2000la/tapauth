@@ -12,103 +12,189 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// JNI wrapper for generating a new Ed25519 keypair.
-/// Returns the keypair as a hex-encoded string "private_key:public_key"
+/// Returns a 2-element Object array: [byte[] privateKey, byte[] publicKey]
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateKeypair(
     mut env: JNIEnv,
     _class: JClass,
-) -> jstring {
+) -> jobjectArray {
     let keypair = crypto::Ed25519KeyPair::generate();
 
-    let private_hex = hex::encode(keypair.signing_key.to_bytes());
-    let public_hex = hex::encode(keypair.verifying_key.to_bytes());
-    let combined = format!("{}:{}", private_hex, public_hex);
+    let private_bytes = keypair.signing_key.to_bytes();
+    let public_bytes = keypair.verifying_key.to_bytes();
 
-    match env.new_string(combined) {
-        Ok(output) => output.into_raw(),
+    // Create byte array for private key
+    let private_array = match env.byte_array_from_slice(&private_bytes) {
+        Ok(arr) => arr,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
-                format!("failed to allocate string: {err}"),
+                format!("failed to allocate byte array: {err}"),
             );
-            std::ptr::null_mut()
+            return std::ptr::null_mut();
         }
+    };
+
+    // Create byte array for public key
+    let public_array = match env.byte_array_from_slice(&public_bytes) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create object array [byte[], byte[]]
+    let byte_array_class = match env.find_class("[B") {
+        Ok(cls) => cls,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to find byte array class: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let result_array = match env.new_object_array(2, byte_array_class, JObject::null()) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create object array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Set elements: [0] = private_key, [1] = public_key
+    if let Err(err) = env.set_object_array_element(&result_array, 0, private_array) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set array element: {err}"),
+        );
+        return std::ptr::null_mut();
     }
+
+    if let Err(err) = env.set_object_array_element(&result_array, 1, public_array) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set array element: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    result_array.into_raw()
 }
 
 /// JNI wrapper for generating a new X25519 keypair (for ECDH key exchange).
-/// Returns the keypair as a hex-encoded string "private_key:public_key"
+/// Returns a 2-element Object array: [byte[] privateKey, byte[] publicKey]
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateX25519Keypair(
     mut env: JNIEnv,
     _class: JClass,
-) -> jstring {
+) -> jobjectArray {
     let keypair = crypto::X25519KeyPair::generate();
 
-    let private_hex = hex::encode(keypair.secret_key_bytes());
-    let public_hex = hex::encode(keypair.public_key_bytes());
-    let combined = format!("{}:{}", private_hex, public_hex);
+    let private_bytes = keypair.secret_key_bytes();
+    let public_bytes = keypair.public_key_bytes();
 
-    match env.new_string(combined) {
-        Ok(output) => output.into_raw(),
+    // Create byte array for private key
+    let private_array = match env.byte_array_from_slice(&private_bytes) {
+        Ok(arr) => arr,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
-                format!("failed to allocate string: {err}"),
+                format!("failed to allocate byte array: {err}"),
             );
-            std::ptr::null_mut()
+            return std::ptr::null_mut();
         }
+    };
+
+    // Create byte array for public key
+    let public_array = match env.byte_array_from_slice(&public_bytes) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create object array [byte[], byte[]]
+    let byte_array_class = match env.find_class("[B") {
+        Ok(cls) => cls,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to find byte array class: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let result_array = match env.new_object_array(2, byte_array_class, JObject::null()) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create object array: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Set elements: [0] = private_key, [1] = public_key
+    if let Err(err) = env.set_object_array_element(&result_array, 0, private_array) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set array element: {err}"),
+        );
+        return std::ptr::null_mut();
     }
+
+    if let Err(err) = env.set_object_array_element(&result_array, 1, public_array) {
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            format!("failed to set array element: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    result_array.into_raw()
 }
 
 /// JNI wrapper for performing X25519 key exchange.
-/// Returns the PSK (derived from shared secret via HKDF) as hex-encoded string
+/// Returns the PSK (derived from shared secret via HKDF) as byte array
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExchange(
     mut env: JNIEnv,
     _class: JClass,
-    our_private_key_hex: JString,
-    their_public_key_hex: JString,
-) -> jstring {
-    let our_private: String = match env.get_string(&our_private_key_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 input: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let their_public: String = match env.get_string(&their_public_key_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 input: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let our_key_bytes = match hex::decode(our_private) {
+    our_private_key: JByteArray,
+    their_public_key: JByteArray,
+) -> jbyteArray {
+    let our_key_bytes = match env.convert_byte_array(our_private_key) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex: {err}"),
+                format!("failed to read private key: {err}"),
             );
             return std::ptr::null_mut();
         }
     };
 
-    let their_key_bytes = match hex::decode(their_public) {
+    let their_key_bytes = match env.convert_byte_array(their_public_key) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex: {err}"),
+                format!("failed to read public key: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -165,15 +251,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
     };
     tracing::debug!("Derived PSK (sha256): {}", sha256_hex(psk.as_bytes()));
 
-    let hex_result = hex::encode(psk.as_bytes());
-    tracing::debug!("Returning hex PSK (sha256): {}", sha256_hex(psk.as_bytes()));
-
-    match env.new_string(hex_result) {
+    // Return PSK as byte array
+    match env.byte_array_from_slice(psk.as_bytes()) {
         Ok(output) => output.into_raw(),
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
-                format!("failed to allocate string: {err}"),
+                format!("failed to allocate byte array: {err}"),
             );
             std::ptr::null_mut()
         }
@@ -185,27 +269,16 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
     mut env: JNIEnv,
     _class: JClass,
-    psk_hex: JString,
+    psk: JByteArray,
     client_public: JByteArray,
     server_public: JByteArray,
 ) -> jstring {
-    let psk_hex: String = match env.get_string(&psk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 input: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let psk_bytes = match hex::decode(psk_hex) {
+    let psk_bytes = match env.convert_byte_array(psk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex: {err}"),
+                format!("failed to read PSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -291,28 +364,17 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptWithPsk(
     mut env: JNIEnv,
     _class: JClass,
-    psk_hex: JString,
+    psk: JByteArray,
     context: JString,
     ciphertext: JByteArray,
 ) -> jbyteArray {
     // Extract PSK
-    let psk_hex: String = match env.get_string(&psk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in psk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let psk_bytes = match hex::decode(psk_hex) {
+    let psk_bytes = match env.convert_byte_array(psk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in psk: {err}"),
+                format!("failed to read PSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -384,28 +446,17 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptWithPsk(
     mut env: JNIEnv,
     _class: JClass,
-    psk_hex: JString,
+    psk: JByteArray,
     context: JString,
     plaintext: JByteArray,
 ) -> jbyteArray {
     // Extract PSK
-    let psk_hex: String = match env.get_string(&psk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in psk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let psk_bytes = match hex::decode(psk_hex) {
+    let psk_bytes = match env.convert_byte_array(psk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in psk: {err}"),
+                format!("failed to read PSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -519,30 +570,19 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptAndParsePacket(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     packet_bytes: JByteArray,
 ) -> jstring {
     use crate::protocol::pb;
     use prost::Message;
 
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -556,7 +596,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptA
         }
     };
 
-    let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
+    let _csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
 
     // Extract packet bytes
     let packet_data = match env.convert_byte_array(packet_bytes) {
@@ -810,32 +850,21 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEnc
 }
 
 /// JNI wrapper for generating temporal identifier
-/// Returns 10-byte identifier as hex string
+/// Returns 16-byte identifier as byte array
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateTemporalId(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     timestamp_seconds: jlong,
-) -> jstring {
+) -> jbyteArray {
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -866,15 +895,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
         }
     };
 
-    // Convert to hex string
-    let hex_string = hex::encode(identifier);
-
-    match env.new_string(hex_string) {
+    // Return as byte array
+    match env.byte_array_from_slice(&identifier) {
         Ok(output) => output.into_raw(),
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
-                format!("failed to allocate string: {err}"),
+                format!("failed to allocate byte array: {err}"),
             );
             std::ptr::null_mut()
         }
@@ -887,27 +914,16 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generateTemporalIdBle(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     timestamp_seconds: jlong,
-) -> jstring {
+) -> jbyteArray {
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -938,15 +954,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
         }
     };
 
-    // Convert to hex string
-    let hex_string = hex::encode(identifier);
-
-    match env.new_string(hex_string) {
+    // Return as byte array
+    match env.byte_array_from_slice(&identifier) {
         Ok(output) => output.into_raw(),
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalStateException",
-                format!("failed to allocate string: {err}"),
+                format!("failed to allocate byte array: {err}"),
             );
             std::ptr::null_mut()
         }
@@ -959,27 +973,16 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTemporalId(
     mut env: JNIEnv,
     _class: JClass,
-    id_hex: JString,
-    csk_hex: JString,
+    id: JByteArray,
+    csk: JByteArray,
 ) -> jboolean {
     // Extract identifier
-    let id_hex_str: String = match env.get_string(&id_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in id: {err}"),
-            );
-            return false as jboolean;
-        }
-    };
-
-    let id_bytes = match hex::decode(id_hex_str) {
+    let id_bytes = match env.convert_byte_array(id) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in id: {err}"),
+                format!("failed to read ID: {err}"),
             );
             return false as jboolean;
         }
@@ -989,23 +992,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
     let id_len = id_bytes.len();
 
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return false as jboolean;
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return false as jboolean;
         }
@@ -1060,29 +1052,18 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptWithCsk(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     challenge: JByteArray,
     context: JString,
     plaintext: JByteArray,
 ) -> jbyteArray {
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -1181,29 +1162,18 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptW
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptWithCsk(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     challenge: JByteArray,
     context: JString,
     ciphertext: JByteArray,
 ) -> jbyteArray {
     // Extract CSK
-    let csk_hex_str: String = match env.get_string(&csk_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in csk: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(csk_hex_str) {
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in csk: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -1389,29 +1359,18 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifySi
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_signData(
     mut env: JNIEnv,
     _class: JClass,
-    private_key_hex: JString,
+    private_key: JByteArray,
     message: JByteArray,
 ) -> jbyteArray {
     use ed25519_dalek::{Signer, SigningKey};
 
     // Extract private key
-    let private_key_hex_str: String = match env.get_string(&private_key_hex) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid UTF-8 in private_key: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let private_key_bytes = match hex::decode(private_key_hex_str) {
+    let private_key_bytes = match env.convert_byte_array(private_key) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid hex in private_key: {err}"),
+                format!("failed to read private key: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -1725,7 +1684,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
     mut env: JNIEnv,
     _class: JClass,
     signed_challenge: JByteArray,
-    private_key_hex: JString,
+    private_key: JByteArray,
 ) -> jbyteArray {
     use crate::crypto::{signing::sign_ed25519, Ed25519KeyPair};
     use crate::protocol::pb;
@@ -1743,24 +1702,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
         }
     };
 
-    // Parse private key from hex
-    let private_key_str: String = match env.get_string(&private_key_hex) {
-        Ok(s) => s.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid private key hex string: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let private_key_bytes = match hex::decode(&private_key_str) {
+    // Parse private key
+    let private_key_bytes = match env.convert_byte_array(private_key) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid private key hex: {err}"),
+                format!("failed to read private key: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -1845,40 +1793,27 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
 
 /// Create an EncryptedPacket from a WrapperMessage payload
 ///
-/// @param cskHex Client Symmetric Key (hex) for encryption and temporal ID  
+/// @param csk Client Symmetric Key for encryption and temporal ID  
 /// @param wrapperMessageBytes Serialized WrapperMessage protobuf
 /// @return Serialized EncryptedPacket protobuf bytes
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEncryptedPacket(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     wrapper_message_bytes: JByteArray,
 ) -> jbyteArray {
     use crate::crypto;
     use crate::protocol::pb;
-    use hkdf::Hkdf;
     use prost::Message;
-    use sha2::Sha256;
 
-    // Parse CSK from hex
-    let csk_str: String = match env.get_string(&csk_hex) {
-        Ok(s) => s.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid CSK hex string: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(&csk_str) {
+    // Parse CSK
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid CSK hex: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }
@@ -1913,7 +1848,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     OsRng.try_fill_bytes(&mut nonce).expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
 
     // Encrypt the WrapperMessage with CSK
-    let mut ciphertext_with_nonce =
+    let ciphertext_with_nonce =
         match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
             Ok(ct) => ct,
             Err(err) => {
@@ -1974,40 +1909,27 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
 
 /// Decrypt and parse an EncryptedPacket to get the WrapperMessage
 ///
-/// @param cskHex Client Symmetric Key (hex) for decryption
+/// @param csk Client Symmetric Key for decryption
 /// @param encryptedPacketBytes Serialized EncryptedPacket protobuf
 /// @return Serialized WrapperMessage protobuf bytes
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptEncryptedPacket(
     mut env: JNIEnv,
     _class: JClass,
-    csk_hex: JString,
+    csk: JByteArray,
     encrypted_packet_bytes: JByteArray,
 ) -> jbyteArray {
     use crate::crypto;
     use crate::protocol::pb;
-    use hkdf::Hkdf;
     use prost::Message;
-    use sha2::Sha256;
 
-    // Parse CSK from hex
-    let csk_str: String = match env.get_string(&csk_hex) {
-        Ok(s) => s.into(),
-        Err(err) => {
-            let _ = env.throw_new(
-                "java/lang/IllegalArgumentException",
-                format!("invalid CSK hex string: {err}"),
-            );
-            return std::ptr::null_mut();
-        }
-    };
-
-    let csk_bytes = match hex::decode(&csk_str) {
+    // Parse CSK
+    let csk_bytes = match env.convert_byte_array(csk) {
         Ok(bytes) => bytes,
         Err(err) => {
             let _ = env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("invalid CSK hex: {err}"),
+                format!("failed to read CSK: {err}"),
             );
             return std::ptr::null_mut();
         }

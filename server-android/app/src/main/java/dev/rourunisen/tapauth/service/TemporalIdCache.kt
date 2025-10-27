@@ -107,7 +107,7 @@ class TemporalIdCache(
      */
     private fun generateTemporalIdentifier(csk: ByteArray, timestampMs: Long): String {
         val timestampSeconds = timestampMs / 1000
-        return generateTemporalId(csk, timestampSeconds)
+        return generateTemporalId(csk, timestampSeconds).toHex()
     }
     
     /**

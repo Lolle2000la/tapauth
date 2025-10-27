@@ -325,8 +325,8 @@ class BleGattService : Service() {
                 
                 // Store CSK as hex string for later retrieval
                 val cskHex = device.csk.toHex()
-                temporalIdCache[currentId] = cskHex
-                temporalIdCache[previousId] = cskHex
+                temporalIdCache[currentId.toHex()] = cskHex
+                temporalIdCache[previousId.toHex()] = cskHex
                 
                 Log.d(TAG, "Cached temporal IDs for device: ${device.displayName}")
             } catch (e: Exception) {
@@ -447,7 +447,7 @@ class BleGattService : Service() {
                 val currentId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp)
                 val previousId = dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp - 60)
                 
-                if (temporalIdHex == currentId || temporalIdHex == previousId) {
+                if (temporalIdHex == currentId.toHex() || temporalIdHex == previousId.toHex()) {
                     matchedDevice = device
                     Log.d(TAG, "Temporal ID matched device: ${device.displayName}")
                     break
