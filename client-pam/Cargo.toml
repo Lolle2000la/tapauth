@@ -16,7 +16,7 @@ zbus = { workspace = true, optional = true, features = ["tokio"] }
 prost.workspace = true
 
 # TPM support
-tss-esapi = { version = "7.6", optional = true }
+tss-esapi = { version = "8.0.0-alpha.1", optional = true }
 
 # Networking
 socket2 = "0.5"
