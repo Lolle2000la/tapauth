@@ -22,9 +22,12 @@ class RetransmissionManager {
     companion object {
         private const val TAG = "RetransmissionManager"
         private const val RETRANSMISSION_INTERVAL_MS = 500L // Fixed 500ms per spec
-        private const val MAX_RETRANSMISSION_DURATION_MS =
-            120_000L // 120 seconds (session timeout per spec)
-        private const val MAX_RETRANSMISSION_ATTEMPTS = 20 // Maximum 20 attempts (10 seconds total)
+        // Retransmission timeout: 10 seconds provides ~20 retry attempts
+        // This is sufficient for local network delivery even with poor conditions
+        // The session timeout (120s) governs user interaction time separately
+        private const val MAX_RETRANSMISSION_DURATION_MS = 10_000L
+        // With 500ms interval and 10s timeout, max 20 attempts possible
+        private const val MAX_RETRANSMISSION_ATTEMPTS = 20
 
         @Volatile private var instance: RetransmissionManager? = null
 

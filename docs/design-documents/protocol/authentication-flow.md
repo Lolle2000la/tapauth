@@ -66,10 +66,12 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 * **Server `AuthenticationGrant`/`Denial` Retransmission**:
     * **Strategy**: Fixed interval.
     * **Interval**: **500ms**.
-    * **Rationale**: After user interaction, the Server becomes persistent in delivering the result to ensure the login completes promptly. This continues until a `GrantConfirmation` is received from the Client or timeout.
+    * **Timeout**: **10 seconds** (maximum 20 retransmission attempts).
+    * **Rationale**: After user interaction, the Server persistently delivers the result to ensure the login completes promptly even with network packet loss. The 10-second timeout with 20 attempts is sufficient for reliable delivery on local networks while conserving battery and network resources. Retransmission continues until a `GrantConfirmation` is received from the Client or the retransmission timeout expires.
 
 * **Session Timeouts**:
-    * The entire authentication attempt will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+    * The entire authentication attempt (from initial request to user interaction) will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+    * Server response retransmission has a separate timeout of **10 seconds** as described above.
 
 ### 2.3. Signature Generation
 
