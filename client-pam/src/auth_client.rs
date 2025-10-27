@@ -225,12 +225,18 @@ impl AuthenticationClient {
                         Ok(Ok(())) => {
                             tracing::info!("BLE authentication granted");
                             udp_handle.abort(); // Cancel UDP task
+                            // Wait for UDP task to finish cleanup
+                            let _ = udp_handle.await;
+                            tracing::debug!("UDP task cleanup completed");
                             return Ok(());
                         }
                         // Task succeeded with Err(Denied)
                         Ok(Err(AuthError::Denied)) => {
                             tracing::warn!("BLE authentication explicitly denied");
                             udp_handle.abort(); // Cancel UDP task
+                            // Wait for UDP task to finish cleanup
+                            let _ = udp_handle.await;
+                            tracing::debug!("UDP task cleanup completed");
                             return Err(AuthError::Denied);
                         }
                         // Task succeeded with a different error
@@ -255,6 +261,9 @@ impl AuthenticationClient {
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication granted");
                             ble_handle.abort(); // Cancel BLE task
+                            // Wait for BLE task to finish cleanup
+                            let _ = ble_handle.await;
+                            tracing::debug!("BLE task cleanup completed");
                             return Ok(());
                         }
                         // Task succeeded with an error
@@ -317,6 +326,11 @@ impl AuthenticationClient {
             .await
             .map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?;
 
+        // Explicitly drop the BLE client to close D-Bus connection before returning
+        // PAM modules may be unloaded immediately after return
+        drop(client);
+        tracing::debug!("BLE D-Bus connection explicitly closed");
+
         // Convert result to authentication outcome
         match result {
             shared::AuthResult::Granted => {
@@ -353,9 +367,9 @@ impl AuthenticationClient {
         let mut confirmation_sent = false;
         let mut final_result: Option<Result<(), AuthError>> = None;
 
-        loop {
+        let auth_result = loop {
             if start.elapsed() >= timeout {
-                return Err(AuthError::Timeout);
+                break Err(AuthError::Timeout);
             }
 
             // If we've already determined the result, drain remaining packets and return
@@ -375,7 +389,7 @@ impl AuthenticationClient {
                         // Timeout - no more packets, safe to return
                         tracing::debug!("Socket buffer drained, returning final result");
                         // Unwrap is safe here because we checked is_some() above
-                        return final_result.unwrap();
+                        break final_result.unwrap();
                     }
                 }
             }
@@ -476,7 +490,14 @@ impl AuthenticationClient {
                     }
                 }
             }
-        }
+        };
+
+        // Explicitly drop the socket to ensure it's closed before returning to PAM
+        // PAM modules may be unloaded immediately after return
+        drop(socket);
+        tracing::debug!("UDP socket explicitly closed");
+
+        auth_result
     }
 
     /// Process a response packet from a server
