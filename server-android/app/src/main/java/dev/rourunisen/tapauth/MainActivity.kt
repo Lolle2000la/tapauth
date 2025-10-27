@@ -9,29 +9,44 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
-import dev.rourunisen.tapauth.ui.home.HomeScreen
-import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
-import dev.rourunisen.tapauth.ui.pairing.PairingScreen
 import dev.rourunisen.tapauth.ui.devices.DeviceListScreen
+import dev.rourunisen.tapauth.ui.home.HomeScreen
+import dev.rourunisen.tapauth.ui.pairing.PairingScreen
+import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
-import dev.rourunisen.tapauth.data.PairingUrl
 
 class MainActivity : FragmentActivity() {
     
@@ -206,9 +221,15 @@ class MainActivity : FragmentActivity() {
         
         val filter = IntentFilter(AuthRequestManager.ACTION_AUTH_REQUEST)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(authRequestReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(authRequestReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
-            registerReceiver(authRequestReceiver, filter)
+            // For older versions, use ContextCompat which handles the flag appropriately
+            ContextCompat.registerReceiver(
+                this,
+                authRequestReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
         }
     }
     
@@ -237,7 +258,7 @@ class MainActivity : FragmentActivity() {
             .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
             .setDescription("From device: ${authRequest.deviceName}")
             .setNegativeButtonText("Deny")
-            .setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .build()
         
         biometricPrompt.authenticate(promptInfo)
@@ -450,7 +471,7 @@ fun PermissionRequestScreen(activity: MainActivity?) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(32.dp),
-            horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+            horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             Text(
@@ -464,7 +485,7 @@ fun PermissionRequestScreen(activity: MainActivity?) {
             Text(
                 text = "Grant each permission individually:",
                 style = MaterialTheme.typography.bodyLarge,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                textAlign = TextAlign.Center
             )
             
             Spacer(modifier = Modifier.height(24.dp))
