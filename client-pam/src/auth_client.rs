@@ -19,7 +19,7 @@ use shared::{
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "ble")]
 use crate::ble_client::BleClient;
@@ -322,10 +322,33 @@ impl AuthenticationClient {
         let timeout = get_session_timeout();
         let mut attempt = 0u32;
         let mut confirmation_sent = false;
+        let mut final_result: Option<Result<(), AuthError>> = None;
 
         loop {
             if start.elapsed() >= timeout {
                 return Err(AuthError::Timeout);
+            }
+
+            // If we've already determined the result, drain remaining packets and return
+            if final_result.is_some() {
+                // Drain any remaining packets with a short timeout to clear the buffer
+                match tokio::time::timeout(
+                    Duration::from_millis(100),
+                    socket.recv_from(&mut [0u8; 65536]),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::trace!("Draining additional packet from socket buffer");
+                        continue; // Keep draining
+                    }
+                    Err(_) => {
+                        // Timeout - no more packets, safe to return
+                        tracing::debug!("Socket buffer drained, returning final result");
+                        // Unwrap is safe here because we checked is_some() above
+                        return final_result.unwrap();
+                    }
+                }
             }
 
             // Send broadcast on IPv4
@@ -372,9 +395,11 @@ impl AuthenticationClient {
                             // Send cancel to other servers
                             tracing::debug!("Sending cancel broadcast to other servers");
                             self.send_cancel_broadcast(&socket, port).await?;
-                            tracing::info!("UDP authentication completed successfully, returning");
+                            tracing::info!("UDP authentication completed successfully");
 
-                            return Ok(());
+                            // Store result and continue to drain buffer
+                            final_result = Some(Ok(()));
+                            continue;
                         }
                         Ok(false) => {
                             // Authentication denied
@@ -387,7 +412,10 @@ impl AuthenticationClient {
                                 self.send_confirmation(&socket, port).await?;
                                 confirmation_sent = true;
                             }
-                            return Err(AuthError::Denied);
+
+                            // Store result and continue to drain buffer
+                            final_result = Some(Err(AuthError::Denied));
+                            continue;
                         }
                         Err(e) => {
                             tracing::warn!(
