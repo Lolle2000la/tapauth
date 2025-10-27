@@ -20,6 +20,7 @@ tss-esapi = { version = "8.0.0-alpha.1", optional = true }
 
 # Networking
 socket2 = "0.5"
+if-addrs.workspace = true
 
 # Async runtime
 tokio.workspace = true

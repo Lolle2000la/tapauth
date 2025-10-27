@@ -13,6 +13,9 @@ prost-build = "0.14"
 # Async runtime (used by: shared, client-pam, client-config-gui, ble-daemon)
 tokio = { version = "1.41", features = ["full"] }
 
+# Networking
+if-addrs = "0.14"
+
 # D-Bus for IPC (used by: shared, client-pam, ble-daemon)
 zbus = { version = "5.0", default-features = false }
 

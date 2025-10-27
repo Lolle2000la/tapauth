@@ -59,6 +59,33 @@ pub struct AuthenticationClient {
     challenge: [u8; 32],
 }
 
+/// Check if an IP address belongs to one of this machine's network interfaces
+fn is_local_address(ip: &std::net::IpAddr) -> bool {
+    use if_addrs::get_if_addrs;
+
+    // Check if it's loopback
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // Get all network interface addresses
+    match get_if_addrs() {
+        Ok(interfaces) => {
+            for iface in interfaces {
+                if iface.ip() == *ip {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => {
+            // If we can't get interface addresses, be conservative and don't filter
+            // (better to process a loopback than to miss a real server response)
+            false
+        }
+    }
+}
+
 impl AuthenticationClient {
     /// Create a new authentication client
     pub fn new(username: String) -> Result<Self, AuthError> {
@@ -314,9 +341,11 @@ impl AuthenticationClient {
     /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast)
     #[allow(unused_assignments)]
     async fn try_udp_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        let socket = create_broadcast_socket().await?;
         let config = self.config_manager.load_config()?;
         let port = config.udp_port;
+
+        // Bind to the configured UDP port to receive responses
+        let socket = create_broadcast_socket(port).await?;
 
         let start = Instant::now();
         let timeout = get_session_timeout();
@@ -376,60 +405,75 @@ impl AuthenticationClient {
                 tracing::info!("IPv6 not available, using IPv4 broadcast only");
             }
 
-            // Wait for response
+            // Wait for response with exponential backoff
             let retry_interval = get_client_retry_interval(attempt);
-            match try_receive_udp_packet(&socket, retry_interval).await? {
-                Some((response_packet, server_addr)) => {
-                    // Try to decrypt and process response
-                    match self.process_response(&response_packet, server_addr).await {
-                        Ok(true) => {
-                            // Authentication granted
-                            tracing::info!("Processing successful grant response");
-                            if !confirmation_sent {
-                                tracing::debug!("Sending confirmation to server");
-                                self.send_confirmation(&socket, port).await?;
-                                confirmation_sent = true;
-                                tracing::debug!("Confirmation sent successfully");
-                            }
 
-                            // Send cancel to other servers
-                            tracing::debug!("Sending cancel broadcast to other servers");
-                            self.send_cancel_broadcast(&socket, port).await?;
-                            tracing::info!("UDP authentication completed successfully");
-
-                            // Store result and continue to drain buffer
-                            final_result = Some(Ok(()));
-                            continue;
-                        }
-                        Ok(false) => {
-                            // Authentication denied
-                            // Per spec: must send GrantConfirmation to halt retransmissions
-                            tracing::info!("Processing denial response");
-                            if !confirmation_sent {
-                                tracing::debug!(
-                                    "Sending confirmation to server to halt retransmissions"
-                                );
-                                self.send_confirmation(&socket, port).await?;
-                                confirmation_sent = true;
-                            }
-
-                            // Store result and continue to drain buffer
-                            final_result = Some(Err(AuthError::Denied));
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to process response from {}: {}",
-                                server_addr,
-                                e
+            loop {
+                match try_receive_udp_packet(&socket, retry_interval).await? {
+                    Some((response_packet, server_addr)) => {
+                        // Filter out packets from our own IP address (loopback from broadcasts)
+                        if is_local_address(&server_addr.ip()) {
+                            tracing::debug!(
+                                "Ignoring packet from local address {} (own broadcast echo)",
+                                server_addr
                             );
-                            // Continue trying - might be from wrong server or corrupted
+                            // Continue receiving packets without resending broadcast
+                            continue;
+                        }
+
+                        // Try to decrypt and process response
+                        match self.process_response(&response_packet, server_addr).await {
+                            Ok(true) => {
+                                // Authentication granted
+                                tracing::info!("Processing successful grant response");
+                                if !confirmation_sent {
+                                    tracing::debug!("Sending confirmation to server");
+                                    self.send_confirmation(&socket, port).await?;
+                                    confirmation_sent = true;
+                                    tracing::debug!("Confirmation sent successfully");
+                                }
+
+                                // Send cancel to other servers
+                                tracing::debug!("Sending cancel broadcast to other servers");
+                                self.send_cancel_broadcast(&socket, port).await?;
+                                tracing::info!("UDP authentication completed successfully");
+
+                                // Store result and break out of receive loop
+                                final_result = Some(Ok(()));
+                                break;
+                            }
+                            Ok(false) => {
+                                // Authentication denied
+                                // Per spec: must send GrantConfirmation to halt retransmissions
+                                tracing::info!("Processing denial response");
+                                if !confirmation_sent {
+                                    tracing::debug!(
+                                        "Sending confirmation to server to halt retransmissions"
+                                    );
+                                    self.send_confirmation(&socket, port).await?;
+                                    confirmation_sent = true;
+                                }
+
+                                // Store result and break out of receive loop
+                                final_result = Some(Err(AuthError::Denied));
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to process response from {}: {}",
+                                    server_addr,
+                                    e
+                                );
+                                // Continue trying - might be from wrong server or corrupted
+                                continue;
+                            }
                         }
                     }
-                }
-                None => {
-                    // No response yet, retry
-                    attempt += 1;
+                    None => {
+                        // Timeout waiting for response, break out to send next broadcast
+                        attempt += 1;
+                        break;
+                    }
                 }
             }
         }

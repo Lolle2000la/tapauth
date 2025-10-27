@@ -133,19 +133,16 @@ pub fn is_ipv6_available() -> bool {
 }
 
 /// Create a UDP socket for broadcasting/multicasting (async)
-/// Binds to 0.0.0.0:0 which on most systems with dual-stack kernel support
-/// will receive both IPv4 packets and IPv6 packets as IPv4-mapped addresses
-pub async fn create_broadcast_socket() -> Result<UdpSocket, NetworkError> {
-    // Bind to 0.0.0.0:0 for receiving responses
-    // On dual-stack systems, this will receive:
-    // 1. IPv4 unicast responses directly
-    // 2. IPv6 unicast responses as IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+/// Binds to the configured UDP port to receive responses on that port
+pub async fn create_broadcast_socket(port: u16) -> Result<UdpSocket, NetworkError> {
+    // Bind to the configured port for receiving responses
+    // Server will respond to this port, not to an ephemeral port
+    let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
     socket.set_broadcast(true)?;
 
     let local_addr = socket.local_addr()?;
     tracing::info!(
-        "Created broadcast socket on {} (will receive IPv4 and IPv4-mapped IPv6 responses)",
+        "Created broadcast socket on {} (listening for responses on configured port)",
         local_addr
     );
 
@@ -277,7 +274,7 @@ pub async fn receive_udp_packet(
     let mut buf = [0u8; 65536];
     let (len, addr) = socket.recv_from(&mut buf).await?;
 
-    tracing::debug!(
+    tracing::trace!(
         "Received UDP packet from {} ({} bytes, protocol: {})",
         addr,
         len,
@@ -306,8 +303,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_sockets() {
-        // Test creating broadcast socket
-        let broadcast_socket = create_broadcast_socket().await;
+        // Test creating broadcast socket on an ephemeral port (0 = OS assigns)
+        let broadcast_socket = create_broadcast_socket(0).await;
         assert!(broadcast_socket.is_ok());
 
         // Test creating listen socket on a random port
@@ -319,14 +316,17 @@ mod tests {
     async fn test_send_udp_broadcast() {
         use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
 
-        let socket = create_broadcast_socket().await.unwrap();
+        // Use ephemeral port (0) to avoid conflicts when tests run in parallel
+        let socket = create_broadcast_socket(0).await.unwrap();
+        let local_port = socket.local_addr().unwrap().port();
+
         let packet = EncryptedPacket {
             temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
             ciphertext: vec![0u8; 64],
         };
 
-        let result = send_udp_broadcast(&socket, 36692, &packet).await;
+        let result = send_udp_broadcast(&socket, local_port, &packet).await;
 
         // Should succeed (or fail gracefully if no network interface)
         assert!(result.is_ok() || result.is_err());

@@ -178,6 +178,10 @@ class AuthenticationService : Service() {
                             TAG,
                             "Received auth request from ${senderAddress.hostAddress}:$senderPort",
                         )
+                        Log.d(
+                            TAG,
+                            "Will respond to ${senderAddress.hostAddress}:${appConfig.udpPort} (configured port)",
+                        )
 
                         // Process authentication request
                         launch { handleIncomingPacket(data, senderAddress, senderPort) }
@@ -632,12 +636,12 @@ class AuthenticationService : Service() {
                                 encryptedPacketBytes,
                                 encryptedPacketBytes.size,
                                 senderAddress,
-                                senderPort,
+                                appConfig.udpPort,
                             )
                         udpSocket?.send(responsePacket)
                         Log.d(
                             TAG,
-                            "Sent encrypted auth grant to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)",
+                            "Sent encrypted auth grant to ${senderAddress.hostAddress}:${appConfig.udpPort} (${encryptedPacketBytes.size} bytes)",
                         )
 
                         // Release transport lock after successful grant
@@ -652,7 +656,7 @@ class AuthenticationService : Service() {
                                     responseData = encryptedPacketBytes,
                                     socket = socket,
                                     destinationAddress = senderAddress,
-                                    destinationPort = senderPort,
+                                    destinationPort = appConfig.udpPort,
                                 ),
                             )
                         }
@@ -690,12 +694,12 @@ class AuthenticationService : Service() {
                                 encryptedPacketBytes,
                                 encryptedPacketBytes.size,
                                 senderAddress,
-                                senderPort,
+                                appConfig.udpPort,
                             )
                         udpSocket?.send(responsePacket)
                         Log.d(
                             TAG,
-                            "Sent encrypted auth denial to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)",
+                            "Sent encrypted auth denial to ${senderAddress.hostAddress}:${appConfig.udpPort} (${encryptedPacketBytes.size} bytes)",
                         )
 
                         // Release transport lock after denial
@@ -710,7 +714,7 @@ class AuthenticationService : Service() {
                                     responseData = encryptedPacketBytes,
                                     socket = socket,
                                     destinationAddress = senderAddress,
-                                    destinationPort = senderPort,
+                                    destinationPort = appConfig.udpPort,
                                 ),
                             )
                         }
