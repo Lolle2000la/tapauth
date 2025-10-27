@@ -159,6 +159,18 @@ object TapAuthCrypto {
     external fun extractTemporalIdentifier(packetBytes: ByteArray): ByteArray
 
     /**
+     * Determine the message type from a WrapperMessage protobuf.
+     *
+     * Returns a string indicating which oneof payload field is set.
+     *
+     * @param wrapperMessageBytes Serialized WrapperMessage protobuf
+     * @return "AUTH_REQUEST", "AUTH_GRANT", "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL",
+     *   or "UNKNOWN"
+     * @throws IOException if the message cannot be parsed
+     */
+    external fun determineMessageType(wrapperMessageBytes: ByteArray): String
+
+    /**
      * Create a WrapperMessage containing an AuthenticationGrant
      *
      * @param signedChallenge The signed challenge bytes

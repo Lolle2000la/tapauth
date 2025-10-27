@@ -831,6 +831,70 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
     }
 }
 
+/// Determine the message type from a WrapperMessage protobuf.
+///
+/// Returns a string indicating the message type: "AUTH_REQUEST", "AUTH_GRANT",
+/// "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL", or "UNKNOWN".
+///
+/// @param wrapperMessageBytes Serialized WrapperMessage protobuf
+/// @return String indicating message type
+/// @throws IOException if the message cannot be parsed
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_determineMessageType(
+    mut env: JNIEnv,
+    _class: JClass,
+    wrapper_message_bytes: JByteArray,
+) -> jstring {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract wrapper message bytes
+    let data = match env.convert_byte_array(wrapper_message_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read wrapper message: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse WrapperMessage using prost
+    let wrapper = match pb::WrapperMessage::decode(&data[..]) {
+        Ok(msg) => msg,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse WrapperMessage: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Determine which oneof field is set
+    let message_type = match wrapper.payload {
+        Some(pb::wrapper_message::Payload::AuthRequest(_)) => "AUTH_REQUEST",
+        Some(pb::wrapper_message::Payload::AuthGrant(_)) => "AUTH_GRANT",
+        Some(pb::wrapper_message::Payload::AuthDenial(_)) => "AUTH_DENIAL",
+        Some(pb::wrapper_message::Payload::GrantConfirmation(_)) => "GRANT_CONFIRMATION",
+        Some(pb::wrapper_message::Payload::AuthCancel(_)) => "AUTH_CANCEL",
+        None => "UNKNOWN",
+    };
+
+    // Return as Java string
+    match env.new_string(message_type) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create string: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// JNI wrapper for generating temporal identifier
 /// Returns 16-byte identifier as byte array
 #[no_mangle]
@@ -2651,5 +2715,131 @@ mod extract_temporal_id_tests {
                 byte_val
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod determine_message_type_tests {
+    use super::*;
+    use crate::protocol::pb::{
+        wrapper_message, AuthenticationCancel, AuthenticationRequest, GrantConfirmation,
+        SignatureAlgorithm, WrapperMessage,
+    };
+    use prost::Message;
+
+    #[test]
+    fn test_determine_auth_request_type() {
+        let request = AuthenticationRequest {
+            challenge: vec![0xAA; 32],
+            username: "testuser".to_string(),
+            hostname: "testhost".to_string(),
+            timestamp_unix_seconds: 1234567890,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xBB; 64],
+        };
+
+        let wrapper = WrapperMessage {
+            version: 1,
+            payload: Some(wrapper_message::Payload::AuthRequest(request)),
+        };
+
+        let mut buf = Vec::new();
+        wrapper.encode(&mut buf).unwrap();
+
+        // Parse and verify type
+        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
+        assert!(matches!(
+            parsed.payload,
+            Some(wrapper_message::Payload::AuthRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_determine_grant_confirmation_type() {
+        let confirmation = GrantConfirmation {
+            challenge: vec![0xCC; 32],
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xBB; 64],
+        };
+
+        let wrapper = WrapperMessage {
+            version: 1,
+            payload: Some(wrapper_message::Payload::GrantConfirmation(confirmation)),
+        };
+
+        let mut buf = Vec::new();
+        wrapper.encode(&mut buf).unwrap();
+
+        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
+        assert!(matches!(
+            parsed.payload,
+            Some(wrapper_message::Payload::GrantConfirmation(_))
+        ));
+    }
+
+    #[test]
+    fn test_determine_auth_cancel_type() {
+        let cancel = AuthenticationCancel {
+            challenge: vec![0xDD; 32],
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xCC; 64],
+        };
+
+        let wrapper = WrapperMessage {
+            version: 1,
+            payload: Some(wrapper_message::Payload::AuthCancel(cancel)),
+        };
+
+        let mut buf = Vec::new();
+        wrapper.encode(&mut buf).unwrap();
+
+        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
+        assert!(matches!(
+            parsed.payload,
+            Some(wrapper_message::Payload::AuthCancel(_))
+        ));
+    }
+
+    #[test]
+    fn test_determine_message_type_with_version() {
+        // Verify that version field doesn't interfere with message type detection
+        let request = AuthenticationRequest {
+            challenge: vec![0xEE; 32],
+            username: "user".to_string(),
+            hostname: "host".to_string(),
+            timestamp_unix_seconds: 1234567890,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xFF; 64],
+        };
+
+        let wrapper = WrapperMessage {
+            version: 42, // Non-standard version
+            payload: Some(wrapper_message::Payload::AuthRequest(request)),
+        };
+
+        let mut buf = Vec::new();
+        wrapper.encode(&mut buf).unwrap();
+
+        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
+        assert_eq!(parsed.version, 42);
+        assert!(matches!(
+            parsed.payload,
+            Some(wrapper_message::Payload::AuthRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_determine_message_type_unknown() {
+        // Empty wrapper message (no payload set)
+        let wrapper = WrapperMessage {
+            version: 1,
+            payload: None,
+        };
+
+        let mut buf = Vec::new();
+        wrapper.encode(&mut buf).unwrap();
+
+        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
+        assert!(parsed.payload.is_none());
     }
 }

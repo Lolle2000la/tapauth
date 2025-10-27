@@ -352,39 +352,17 @@ class AuthenticationService : Service() {
     }
 
     private fun determineMessageType(wrapperMessage: ByteArray): MessageType {
-        // Parse WrapperMessage protobuf
-        // The oneof field numbers are:
-        // 1 = AuthenticationRequest
-        // 2 = AuthenticationGrant
-        // 3 = GrantConfirmation
-        // 4 = AuthenticationCancel
-
-        try {
-            var pos = 0
-
-            while (pos < wrapperMessage.size) {
-                // Read field tag
-                val tag = wrapperMessage[pos].toInt() and 0xFF
-                pos++
-
-                val fieldNumber = tag shr 3
-
-                when (fieldNumber) {
-                    1 -> return MessageType.AUTH_REQUEST
-                    3 -> return MessageType.GRANT_CONFIRMATION
-                    4 -> return MessageType.AUTH_CANCEL
-                    else -> {
-                        // Skip this field
-                        // This is a simplified parser, just checking field presence
-                        break
-                    }
-                }
+        return try {
+            val typeStr = TapAuthCrypto.determineMessageType(wrapperMessage)
+            when (typeStr) {
+                "AUTH_REQUEST" -> MessageType.AUTH_REQUEST
+                "GRANT_CONFIRMATION" -> MessageType.GRANT_CONFIRMATION
+                "AUTH_CANCEL" -> MessageType.AUTH_CANCEL
+                else -> MessageType.UNKNOWN
             }
-
-            return MessageType.UNKNOWN
         } catch (e: Exception) {
             Log.w(TAG, "Failed to determine message type", e)
-            return MessageType.UNKNOWN
+            MessageType.UNKNOWN
         }
     }
 
