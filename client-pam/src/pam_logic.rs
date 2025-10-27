@@ -11,7 +11,7 @@ fn init_logging() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 // Default to debug level for now to see BLE issues
-                tracing_subscriber::EnvFilter::new("debug")
+                tracing_subscriber::EnvFilter::new("info")
             }),
         )
         .try_init();
