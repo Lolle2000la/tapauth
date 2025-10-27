@@ -457,7 +457,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
             let client_keypair = Ed25519KeyPair::generate();
-            let csk = ClientSymmetricKey::generate();
+            let csk = ClientSymmetricKey::generate().unwrap();
             let mut session = ClientPairingSession::new(client_keypair);
 
             // Phase 1: Initiate pairing
@@ -507,7 +507,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
             let client_keypair = Ed25519KeyPair::generate();
-            let csk = ClientSymmetricKey::generate();
+            let csk = ClientSymmetricKey::generate().unwrap();
             let mut session = ClientPairingSession::new(client_keypair);
 
             let (stream, _, server_device_name, _) = session
@@ -549,7 +549,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
             let client_keypair = Ed25519KeyPair::generate();
-            let csk = ClientSymmetricKey::generate();
+            let csk = ClientSymmetricKey::generate().unwrap();
             let mut session = ClientPairingSession::new(client_keypair);
 
             let result = session.initiate_pairing(stream, "").await;

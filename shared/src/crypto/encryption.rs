@@ -90,7 +90,7 @@ pub fn encrypt_with_csk_static_nonce(
     let mut nonce = [0u8; 12];
     OsRng
         .try_fill_bytes(&mut nonce)
-        .expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
+        .map_err(|_| CryptoError::RandomGenerationFailed)?;
 
     // Encrypt the plaintext
     let ciphertext = encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])?;
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_csk_encryption() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let challenge = [2u8; 32];
         let context = b"test_context";
         let plaintext = b"Secret message";
@@ -206,8 +206,8 @@ mod tests {
 
     #[test]
     fn test_wrong_key_decryption_fails() {
-        let csk1 = ClientSymmetricKey::generate();
-        let csk2 = ClientSymmetricKey::generate();
+        let csk1 = ClientSymmetricKey::generate().unwrap();
+        let csk2 = ClientSymmetricKey::generate().unwrap();
         let challenge = [3u8; 32];
         let context = b"test";
         let plaintext = b"data";
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_wrong_context_decryption_fails() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let challenge = [4u8; 32];
         let plaintext = b"data";
 
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_tampered_ciphertext_fails() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let challenge = [5u8; 32];
         let context = b"test";
         let plaintext = b"data";
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_empty_plaintext_encryption() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let challenge = [6u8; 32];
         let context = b"test";
         let plaintext = b"";
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_large_plaintext_encryption() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let challenge = [7u8; 32];
         let context = b"test";
         let plaintext = vec![42u8; 10000]; // 10KB of data

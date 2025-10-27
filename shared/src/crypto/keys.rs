@@ -97,13 +97,12 @@ pub struct ClientSymmetricKey([u8; 32]);
 
 impl ClientSymmetricKey {
     /// Generate a new random CSK
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self, CryptoError> {
         let mut key = [0u8; 32];
-        let mut rng = OsRng; // Create an INSTANCE
-                             // Use .fill_bytes() from the RngCore trait.
-                             // This panics on failure, which is the same behavior as your .expect()
-        rng.try_fill_bytes(&mut key).expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
-        Self(key)
+        let mut rng = OsRng;
+        rng.try_fill_bytes(&mut key)
+            .map_err(|_| CryptoError::RandomGenerationFailed)?;
+        Ok(Self(key))
     }
 
     /// Create from bytes
@@ -150,6 +149,8 @@ pub enum CryptoError {
     DecryptionFailed,
     #[error("Key derivation failed")]
     KeyDerivationFailed,
+    #[error("Random number generation failed")]
+    RandomGenerationFailed,
 }
 
 #[cfg(test)]
@@ -180,8 +181,8 @@ mod tests {
 
     #[test]
     fn test_csk_generation() {
-        let csk1 = ClientSymmetricKey::generate();
-        let csk2 = ClientSymmetricKey::generate();
+        let csk1 = ClientSymmetricKey::generate().unwrap();
+        let csk2 = ClientSymmetricKey::generate().unwrap();
 
         // Keys should be different
         assert_ne!(csk1.as_bytes(), csk2.as_bytes());

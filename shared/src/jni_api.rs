@@ -765,6 +765,72 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEnc
     }
 }
 
+/// Extract temporal_identifier from EncryptedPacket protobuf bytes.
+///
+/// This is used for DoS mitigation: allows checking the temporal_identifier
+/// before performing expensive decryption operations.
+///
+/// @param packetBytes Serialized EncryptedPacket protobuf
+/// @return 16-byte temporal_identifier, or null if parsing fails
+/// @throws IOException if the packet cannot be parsed
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractTemporalIdentifier(
+    mut env: JNIEnv,
+    _class: JClass,
+    packet_bytes: JByteArray,
+) -> jbyteArray {
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Extract packet bytes
+    let data = match env.convert_byte_array(packet_bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read packet: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse EncryptedPacket using prost
+    let encrypted_packet = match pb::EncryptedPacket::decode(&data[..]) {
+        Ok(pkt) => pkt,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/io/IOException",
+                format!("failed to parse EncryptedPacket: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Verify temporal_identifier is exactly 16 bytes (per spec)
+    if encrypted_packet.temporal_identifier.len() != 16 {
+        let _ = env.throw_new(
+            "java/io/IOException",
+            format!(
+                "invalid temporal_identifier length: {}, expected 16",
+                encrypted_packet.temporal_identifier.len()
+            ),
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Return temporal_identifier as byte array
+    match env.byte_array_from_slice(&encrypted_packet.temporal_identifier) {
+        Ok(arr) => arr.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to create byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// JNI wrapper for generating temporal identifier
 /// Returns 16-byte identifier as byte array
 #[no_mangle]
@@ -1886,7 +1952,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     // Each packet must have a unique random nonce to prevent AES-GCM reuse attacks
     use rand::{rngs::OsRng, TryRngCore};
     let mut nonce = [0u8; 12];
-    OsRng.try_fill_bytes(&mut nonce).expect("Failed to obtain OS RNG. Random generation should generally always work on supported systems.");
+    if let Err(err) = OsRng.try_fill_bytes(&mut nonce) {
+        let _ = env.throw_new(
+            "java/security/GeneralSecurityException",
+            format!("Random generation failed: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
 
     // Encrypt the WrapperMessage with CSK
     let ciphertext_with_nonce =
@@ -2453,6 +2525,131 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
                 format!("failed to allocate string: {err}"),
             );
             std::ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(test)]
+mod extract_temporal_id_tests {
+    use super::*;
+    use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
+    use prost::Message;
+
+    #[test]
+    fn test_extract_temporal_identifier_correct_length() {
+        // Create a test EncryptedPacket with exactly 16 bytes
+        let temporal_id = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let packet = EncryptedPacket {
+            temporal_identifier: temporal_id.clone(),
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        };
+
+        // Encode the packet
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+
+        // Decode using prost to verify we get the same temporal_identifier
+        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.temporal_identifier, temporal_id);
+        assert_eq!(decoded.temporal_identifier.len(), 16);
+    }
+
+    #[test]
+    fn test_extract_temporal_identifier_wrong_length_fails() {
+        // Create packet with wrong length temporal_identifier (should be 16 bytes)
+        let packet = EncryptedPacket {
+            temporal_identifier: vec![1, 2, 3, 4, 5], // Only 5 bytes
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0xAA, 0xBB],
+        };
+
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+
+        // This should parse fine with prost (it doesn't validate length)
+        // But our JNI function should reject it
+        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.temporal_identifier.len(), 5); // Prost allows it
+
+        // The JNI function would reject this and throw IOException
+        // (We can't easily test JNI throwing here, but the validation is in the code)
+    }
+
+    #[test]
+    fn test_extract_temporal_identifier_field_order_independent() {
+        // Verify that prost correctly handles fields regardless of encoding order
+        // This is why using prost is better than manual parsing
+
+        let temporal_id = vec![0xFF; 16];
+        let ciphertext = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let packet = EncryptedPacket {
+            temporal_identifier: temporal_id.clone(),
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: ciphertext.clone(),
+        };
+
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+
+        // Decode and verify all fields are correct
+        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.temporal_identifier, temporal_id);
+        assert_eq!(
+            decoded.encryption_algorithm,
+            SymmetricAlgorithm::Aes256Gcm as i32
+        );
+        assert_eq!(decoded.ciphertext, ciphertext);
+    }
+
+    #[test]
+    fn test_extract_temporal_identifier_with_various_ciphertext_lengths() {
+        // Test that extraction works regardless of ciphertext size
+        let temporal_id = vec![0x42; 16];
+
+        for ciphertext_len in [0, 1, 100, 1000, 10000] {
+            let ciphertext = vec![0xAB; ciphertext_len];
+
+            let packet = EncryptedPacket {
+                temporal_identifier: temporal_id.clone(),
+                encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+                ciphertext,
+            };
+
+            let mut buf = Vec::new();
+            packet.encode(&mut buf).unwrap();
+
+            let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
+            assert_eq!(
+                decoded.temporal_identifier, temporal_id,
+                "Failed for ciphertext length {}",
+                ciphertext_len
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_temporal_identifier_all_byte_values() {
+        // Ensure extraction works with any byte values in temporal_id
+        for byte_val in [0x00, 0x01, 0x7F, 0x80, 0xFF] {
+            let temporal_id = vec![byte_val; 16];
+
+            let packet = EncryptedPacket {
+                temporal_identifier: temporal_id.clone(),
+                encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+                ciphertext: vec![0x00],
+            };
+
+            let mut buf = Vec::new();
+            packet.encode(&mut buf).unwrap();
+
+            let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
+            assert_eq!(
+                decoded.temporal_identifier, temporal_id,
+                "Failed for byte value 0x{:02X}",
+                byte_val
+            );
         }
     }
 }

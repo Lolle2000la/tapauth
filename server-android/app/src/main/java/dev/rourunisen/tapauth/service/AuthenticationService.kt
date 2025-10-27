@@ -10,6 +10,7 @@ import androidx.core.app.NotificationCompat
 import dev.rourunisen.tapauth.MainActivity
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.TapAuthApplication
+import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.net.DatagramPacket
 import java.net.InetAddress
@@ -335,41 +336,18 @@ class AuthenticationService : Service() {
         UNKNOWN,
     }
 
+    /**
+     * Extract temporal_identifier from EncryptedPacket without full deserialization.
+     *
+     * Uses the Rust prost library via JNI for robust protobuf parsing.
+     * This allows DoS mitigation by checking the temporal_identifier before expensive decryption.
+     */
     private fun extractTemporalIdFromPacket(data: ByteArray): ByteArray? {
-        // Parse the EncryptedPacket protobuf to extract temporal_identifier
-        // Field 1 is temporal_identifier (bytes)
-        // Protobuf wire format: tag (varint) + length (varint) + data
-
-        try {
-            var pos = 0
-
-            // Read field tag
-            if (pos >= data.size) return null
-            val tag = data[pos].toInt() and 0xFF
-            pos++
-
-            // Field 1, type 2 (length-delimited) = 0x0A
-            if (tag != 0x0A) {
-                Log.w(TAG, "Unexpected tag: 0x${tag.toString(16)}, expected 0x0A")
-                return null
-            }
-
-            // Read length
-            if (pos >= data.size) return null
-            val length = data[pos].toInt() and 0xFF
-            pos++
-
-            if (length != 16) {
-                Log.w(TAG, "Unexpected temporal ID length: $length, expected 16")
-                return null
-            }
-
-            // Read temporal ID
-            if (pos + 16 > data.size) return null
-            return data.copyOfRange(pos, pos + 16)
+        return try {
+            TapAuthCrypto.extractTemporalIdentifier(data)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse temporal ID from packet", e)
-            return null
+            Log.w(TAG, "Failed to extract temporal ID from packet", e)
+            null
         }
     }
 

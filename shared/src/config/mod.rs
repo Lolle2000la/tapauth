@@ -278,7 +278,7 @@ impl ClientConfigManager {
 
     /// Generate and save a new CSK
     pub fn generate_and_save_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate()?;
         self.save_csk(&csk)?;
         Ok(csk)
     }

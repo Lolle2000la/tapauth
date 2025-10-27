@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_packet_encryption_decryption() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let keypair = Ed25519KeyPair::generate();
         let challenge = [1u8; 32];
         let context = b"test_context";

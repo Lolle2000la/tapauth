@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_temporal_identifier_generation() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let window = current_time_window();
 
         let id1 = generate_temporal_identifier(&csk, window).unwrap();
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_temporal_identifier_verification() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let current_id = generate_current_temporal_identifier(&csk).unwrap();
 
         // Current identifier should verify
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn test_previous_identifier_verification() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
 
         // This test assumes we're not at time window 0
         if current_time_window() > 0 {
@@ -174,8 +174,8 @@ mod tests {
 
     #[test]
     fn test_different_csk_produces_different_identifier() {
-        let csk1 = ClientSymmetricKey::generate();
-        let csk2 = ClientSymmetricKey::generate();
+        let csk1 = ClientSymmetricKey::generate().unwrap();
+        let csk2 = ClientSymmetricKey::generate().unwrap();
         let window = current_time_window();
 
         let id1 = generate_temporal_identifier(&csk1, window).unwrap();
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_temporal_identifier_length() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let id = generate_current_temporal_identifier(&csk).unwrap();
 
         // Should be exactly 16 bytes
@@ -196,8 +196,8 @@ mod tests {
 
     #[test]
     fn test_verify_wrong_key_fails() {
-        let csk1 = ClientSymmetricKey::generate();
-        let csk2 = ClientSymmetricKey::generate();
+        let csk1 = ClientSymmetricKey::generate().unwrap();
+        let csk2 = ClientSymmetricKey::generate().unwrap();
 
         let id = generate_current_temporal_identifier(&csk1).unwrap();
 
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_old_identifier_does_not_verify() {
-        let csk = ClientSymmetricKey::generate();
+        let csk = ClientSymmetricKey::generate().unwrap();
         let current_window = current_time_window();
 
         // Generate identifier from 2 windows ago

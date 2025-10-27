@@ -147,6 +147,18 @@ object TapAuthCrypto {
     external fun parseEncryptedPacketStructure(packetBytes: ByteArray): String
 
     /**
+     * Extract temporal_identifier from EncryptedPacket protobuf bytes.
+     *
+     * This is used for DoS mitigation: allows checking the temporal_identifier
+     * before performing expensive decryption operations.
+     *
+     * @param packetBytes Serialized EncryptedPacket protobuf
+     * @return 16-byte temporal_identifier
+     * @throws IOException if the packet cannot be parsed
+     */
+    external fun extractTemporalIdentifier(packetBytes: ByteArray): ByteArray
+
+    /**
      * Create a WrapperMessage containing an AuthenticationGrant
      *
      * @param signedChallenge The signed challenge bytes

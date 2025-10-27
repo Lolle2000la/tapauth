@@ -1,6 +1,17 @@
 use crate::auth_client::AuthenticationClient;
 use crate::pam_sys;
+use once_cell::sync::Lazy;
 use std::os::raw::c_int;
+use tokio::runtime::Runtime;
+
+/// Shared Tokio runtime for all PAM authentication attempts
+/// Creating a runtime is expensive (~100ms), so we reuse a single instance
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime for PAM module")
+});
 
 /// Initialize logging for PAM module
 fn init_logging() {
@@ -60,17 +71,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     };
 
-    // Run the authentication flow
-    // We need to use tokio runtime
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!("Failed to create tokio runtime: {}", e);
-            return pam_sys::PAM_AUTH_ERR;
-        }
-    };
-
-    match runtime.block_on(client.authenticate()) {
+    // Run the authentication flow using the shared runtime
+    match RUNTIME.block_on(client.authenticate()) {
         Ok(()) => {
             tracing::info!("Authentication successful for user: {}", username);
             pam_sys::PAM_SUCCESS
