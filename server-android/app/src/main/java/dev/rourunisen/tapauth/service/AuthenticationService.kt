@@ -600,8 +600,50 @@ class AuthenticationService : Service() {
                     Log.d(TAG, "Auth request denied or timed out")
                     // Reset rate limiter since request was resolved
                     requestRateLimiter.resetClient(device.publicKey.toHex())
-                    // TODO: Send denial message with retransmission
-                    // For now, we just don't respond (client will timeout)
+                    
+                    // Send denial message with retransmission
+                    try {
+                        // Get server private key for signing
+                        val privateKey = keypairRepository.getPrivateKey()
+                        
+                        // Create WrapperMessage containing AuthenticationDenial
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
+                            challengeBytes,
+                            privateKey
+                        )
+                        
+                        // Create proper EncryptedPacket per specification
+                        val encryptedPacketBytes = dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            device.csk,
+                            wrapperMessage
+                        )
+                        
+                        // Send initial denial response
+                        val responsePacket = DatagramPacket(
+                            encryptedPacketBytes,
+                            encryptedPacketBytes.size,
+                            senderAddress,
+                            senderPort
+                        )
+                        udpSocket?.send(responsePacket)
+                        Log.d(TAG, "Sent encrypted auth denial to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)")
+                        
+                        // Start retransmission (500ms fixed interval per spec)
+                        udpSocket?.let { socket ->
+                            retransmissionManager.startUdpRetransmission(
+                                serviceScope,
+                                RetransmissionManager.UdpRetransmissionRequest(
+                                    challenge = challengeBytes,
+                                    responseData = encryptedPacketBytes,
+                                    socket = socket,
+                                    destinationAddress = senderAddress,
+                                    destinationPort = senderPort
+                                )
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to create or send auth denial", e)
+                    }
                 }
             }
             

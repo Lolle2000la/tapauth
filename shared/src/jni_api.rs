@@ -1791,6 +1791,131 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
     }
 }
 
+/// Create a WrapperMessage containing an AuthenticationDenial
+///
+/// @param challenge The challenge bytes (32 bytes)
+/// @param privateKey Private key (32 bytes)
+/// @return Serialized WrapperMessage protobuf bytes
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createDenialWrapperMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    challenge: JByteArray,
+    private_key: JByteArray,
+) -> jbyteArray {
+    use crate::crypto::{signing::sign_ed25519, Ed25519KeyPair};
+    use crate::protocol::pb;
+    use prost::Message;
+
+    // Get challenge bytes
+    let challenge_bytes = match env.convert_byte_array(challenge) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read challenge: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    if challenge_bytes.len() != 32 {
+        let _ = env.throw_new(
+            "java/lang/IllegalArgumentException",
+            "challenge must be 32 bytes",
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Parse private key
+    let private_key_bytes = match env.convert_byte_array(private_key) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("failed to read private key: {err}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    // The private key should be 64 bytes (full Ed25519 keypair) or 32 bytes (just signing key)
+    let keypair = if private_key_bytes.len() == 64 {
+        // Extract first 32 bytes (signing key)
+        let mut signing_key_bytes = [0u8; 32];
+        signing_key_bytes.copy_from_slice(&private_key_bytes[..32]);
+        match Ed25519KeyPair::from_signing_key_bytes(&signing_key_bytes) {
+            Ok(kp) => kp,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    format!("invalid Ed25519 keypair: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        }
+    } else if private_key_bytes.len() == 32 {
+        // Use directly as signing key
+        let mut signing_key_bytes = [0u8; 32];
+        signing_key_bytes.copy_from_slice(&private_key_bytes);
+        match Ed25519KeyPair::from_signing_key_bytes(&signing_key_bytes) {
+            Ok(kp) => kp,
+            Err(err) => {
+                let _ = env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    format!("invalid Ed25519 keypair: {err}"),
+                );
+                return std::ptr::null_mut();
+            }
+        }
+    } else {
+        let _ = env.throw_new(
+            "java/lang/IllegalArgumentException",
+            "private key must be 32 bytes (signing key) or 64 bytes (full keypair)",
+        );
+        return std::ptr::null_mut();
+    };
+
+    // Create AuthenticationDenial with empty signature initially
+    let mut denial = pb::AuthenticationDenial {
+        challenge: challenge_bytes,
+        signature_algorithm: pb::SignatureAlgorithm::Ed25519 as i32,
+        signature: vec![],
+    };
+
+    // Sign the denial message (without signature field)
+    let data_to_sign = denial.encode_to_vec();
+    denial.signature = sign_ed25519(&keypair, &data_to_sign);
+
+    // Create WrapperMessage
+    let wrapper = pb::WrapperMessage {
+        version: 1,
+        payload: Some(pb::wrapper_message::Payload::AuthDenial(denial)),
+    };
+
+    // Serialize to protobuf
+    let mut buf = Vec::new();
+    if let Err(err) = wrapper.encode(&mut buf) {
+        let _ = env.throw_new(
+            "java/io/IOException",
+            format!("failed to encode WrapperMessage: {err}"),
+        );
+        return std::ptr::null_mut();
+    }
+
+    // Return as byte array
+    match env.byte_array_from_slice(&buf) {
+        Ok(output) => output.into_raw(),
+        Err(err) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                format!("failed to allocate byte array: {err}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Create an EncryptedPacket from a WrapperMessage payload
 ///
 /// @param csk Client Symmetric Key for encryption and temporal ID  

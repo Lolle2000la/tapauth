@@ -576,7 +576,28 @@ class BleGattService : Service() {
                     }
                 } else {
                     Log.d(TAG, "BLE auth request denied or timed out")
-                    sendResponseToClient(gatt, "AUTH_DENIED".toByteArray())
+                    try {
+                        // Get server private key for signing
+                        val privateKey = keypairRepository.getPrivateKey()
+                        
+                        // Create WrapperMessage containing AuthenticationDenial
+                        val wrapperMessage = dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
+                            challengeBytes,
+                            privateKey
+                        )
+                        
+                        // Create proper EncryptedPacket per specification
+                        val encryptedPacket = dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            matchedDevice.csk,
+                            wrapperMessage
+                        )
+                        
+                        sendResponseToClient(gatt, encryptedPacket)
+                        Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to create or send BLE denial", e)
+                        sendResponseToClient(gatt, "ERROR".toByteArray())
+                    }
                 }
             }
             

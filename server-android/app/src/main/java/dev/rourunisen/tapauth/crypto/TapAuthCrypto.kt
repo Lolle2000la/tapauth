@@ -145,6 +145,14 @@ object TapAuthCrypto {
     external fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKey: ByteArray): ByteArray
     
     /**
+     * Create a WrapperMessage containing an AuthenticationDenial
+     * @param challenge The challenge bytes (32 bytes)
+     * @param privateKey Private key (32 bytes)
+     * @return Serialized WrapperMessage protobuf bytes
+     */
+    external fun createDenialWrapperMessage(challenge: ByteArray, privateKey: ByteArray): ByteArray
+    
+    /**
      * Create an EncryptedPacket from a WrapperMessage payload
      * @param csk Client Symmetric Key (32 bytes)
      * @param wrapperMessageBytes Serialized WrapperMessage protobuf
@@ -459,6 +467,13 @@ fun decryptWithCsk(csk: ByteArray, challenge: ByteArray, context: String, cipher
  */
 fun createGrantWrapperMessage(signedChallenge: ByteArray, privateKey: ByteArray): ByteArray {
     return TapAuthCrypto.createGrantWrapperMessage(signedChallenge, privateKey)
+}
+
+/**
+ * Create a WrapperMessage containing an AuthenticationDenial
+ */
+fun createDenialWrapperMessage(challenge: ByteArray, privateKey: ByteArray): ByteArray {
+    return TapAuthCrypto.createDenialWrapperMessage(challenge, privateKey)
 }
 
 /**
