@@ -106,33 +106,48 @@ class MainActivity : FragmentActivity() {
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                     super.onAuthenticationError(errorCode, errString)
                     Log.e(TAG, "Biometric authentication error: $errString (code: $errorCode)")
-                    // Handle current auth request denial
+                    // Handle current auth request
                     currentAuthRequest?.let { authRequest ->
-                        // Check if this is an explicit user cancellation (clicking "Deny" button)
-                        val explicitDenial = (errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON || 
-                                             errorCode == BiometricPrompt.ERROR_USER_CANCELED)
-                        
-                        // Only clear currentAuthRequest and send response for explicit denials or permanent errors
-                        // Temporary errors like timeout, lockout should not clear the request
-                        val shouldClearRequest = when (errorCode) {
-                            BiometricPrompt.ERROR_NEGATIVE_BUTTON -> true  // User clicked "Deny"
-                            BiometricPrompt.ERROR_USER_CANCELED -> true    // User dismissed prompt
-                            BiometricPrompt.ERROR_CANCELED -> false        // System canceled (e.g., another biometric prompt)
-                            BiometricPrompt.ERROR_TIMEOUT -> false         // Biometric timeout - user can still retry
-                            BiometricPrompt.ERROR_LOCKOUT -> false         // Too many attempts - temporary
-                            BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> true // Permanent lockout
-                            BiometricPrompt.ERROR_HW_NOT_PRESENT -> true   // No biometric hardware
-                            BiometricPrompt.ERROR_HW_UNAVAILABLE -> true   // Hardware error
-                            BiometricPrompt.ERROR_NO_BIOMETRICS -> true    // No biometrics enrolled
-                            BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> true // No credentials
-                            else -> true  // Unknown error - assume it's permanent
-                        }
-                        
-                        if (shouldClearRequest) {
-                            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial)
-                            currentAuthRequest = null
-                        } else {
-                            Log.d(TAG, "Temporary biometric error (code: $errorCode), keeping request active for retry")
+                        // Only ERROR_NEGATIVE_BUTTON is an explicit denial (user clicked "Deny")
+                        // All other errors are either dismissals, system errors, or temporary conditions
+                        when (errorCode) {
+                            BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
+                                // User explicitly clicked "Deny" button - send denial response
+                                Log.d(TAG, "User explicitly denied authentication")
+                                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = true)
+                                currentAuthRequest = null
+                            }
+                            BiometricPrompt.ERROR_USER_CANCELED -> {
+                                // User dismissed prompt (back button, tapped outside) - just clear, don't send denial
+                                Log.d(TAG, "User dismissed biometric prompt, clearing request without sending denial")
+                                currentAuthRequest = null
+                            }
+                            BiometricPrompt.ERROR_CANCELED -> {
+                                // System canceled (e.g., another biometric prompt) - keep request active
+                                Log.d(TAG, "Biometric prompt canceled by system, keeping request active")
+                            }
+                            BiometricPrompt.ERROR_TIMEOUT -> {
+                                // Biometric timeout - user can still retry, keep request active
+                                Log.d(TAG, "Biometric timeout, keeping request active for retry")
+                            }
+                            BiometricPrompt.ERROR_LOCKOUT -> {
+                                // Too many attempts - temporary lockout, keep request active
+                                Log.d(TAG, "Biometric lockout (temporary), keeping request active")
+                            }
+                            BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
+                            BiometricPrompt.ERROR_HW_NOT_PRESENT,
+                            BiometricPrompt.ERROR_HW_UNAVAILABLE,
+                            BiometricPrompt.ERROR_NO_BIOMETRICS,
+                            BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> {
+                                // Permanent errors - clear request without sending denial (not user's fault)
+                                Log.w(TAG, "Permanent biometric error (code: $errorCode), clearing request without denial")
+                                currentAuthRequest = null
+                            }
+                            else -> {
+                                // Unknown error - clear request without sending denial
+                                Log.w(TAG, "Unknown biometric error (code: $errorCode), clearing request without denial")
+                                currentAuthRequest = null
+                            }
                         }
                     }
                 }
