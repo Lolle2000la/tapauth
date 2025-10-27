@@ -25,6 +25,7 @@ pub struct PamHandle {
 
 /// PAM message structure
 #[repr(C)]
+#[allow(dead_code)]
 pub struct PamMessage {
     pub msg_style: c_int,
     pub msg: *const c_char,
@@ -32,12 +33,14 @@ pub struct PamMessage {
 
 /// PAM response structure
 #[repr(C)]
+#[allow(dead_code)]
 pub struct PamResponse {
     pub resp: *mut c_char,
     pub resp_retcode: c_int,
 }
 
 /// PAM conversation function pointer
+#[allow(dead_code)]
 pub type PamConvFunc = unsafe extern "C" fn(
     num_msg: c_int,
     msg: *mut *const PamMessage,
@@ -47,6 +50,7 @@ pub type PamConvFunc = unsafe extern "C" fn(
 
 /// PAM conversation structure
 #[repr(C)]
+#[allow(dead_code)]
 pub struct PamConv {
     pub conv: Option<PamConvFunc>,
     pub appdata_ptr: *mut c_void,
@@ -61,10 +65,12 @@ extern "C" {
     ) -> c_int;
 
     /// Set a PAM item
+    #[allow(dead_code)]
     pub fn pam_set_item(pamh: *mut PamHandle, item_type: c_int, item: *const c_void) -> c_int;
 }
 
 /// Safe wrapper to get username from PAM
+#[allow(dead_code)]
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
     let mut item: *const c_void = std::ptr::null();
     let ret = pam_get_item(pamh, PAM_USER, &mut item);
@@ -92,6 +98,7 @@ pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
 }
 
 /// Safe wrapper to set username in PAM
+#[allow(dead_code)]
 pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int> {
     let username_cstring = CString::new(username).map_err(|_| PAM_USER_UNKNOWN)?;
     let ret = pam_set_item(pamh, PAM_USER, username_cstring.as_ptr() as *const c_void);
