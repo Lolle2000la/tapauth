@@ -13,6 +13,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.app.Notification
 import android.app.PendingIntent
+import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
@@ -628,9 +629,21 @@ class BleGattService : Service() {
         val confirmationChar = service?.getCharacteristic(CLIENT_CONFIRMATION_CHAR_UUID)
         
         if (responseChar != null) {
-            responseChar.value = response
-            gatt.writeCharacteristic(responseChar)
-            Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
+            // Use new API for Android 13+ (API 33+), fallback to deprecated API for older versions
+            val writeSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(responseChar, response, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                responseChar.value = response
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(responseChar)
+            }
+            
+            if (writeSuccess) {
+                Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
+            } else {
+                Log.w(TAG, "Failed to write response to ${gatt.device.address}")
+            }
             
             // If challenge provided, start retransmission with confirmation checking
             if (challenge != null && confirmationChar != null) {
@@ -677,16 +690,34 @@ class BleGattService : Service() {
                     // Wait a bit for the read to complete
                     delay(100)
                     
-                    val confirmationBytes = confirmationChar.value
+                    // Use new API for Android 13+ (API 33+), fallback to deprecated API
+                    val confirmationBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        // For API 33+, value is read via onCharacteristicRead callback
+                        // We'll check in the callback, so read current cached value here
+                        @Suppress("DEPRECATION")
+                        confirmationChar.value
+                    } else {
+                        @Suppress("DEPRECATION")
+                        confirmationChar.value
+                    }
+                    
                     if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
                         Log.d(TAG, "Received confirmation, stopping retransmission")
                         break
                     }
                 }
                 
-                // Retransmit
-                responseChar.value = response
-                if (gatt.writeCharacteristic(responseChar)) {
+                // Retransmit using new API for Android 13+ (API 33+)
+                val retransmitSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(responseChar, response, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    responseChar.value = response
+                    @Suppress("DEPRECATION")
+                    gatt.writeCharacteristic(responseChar)
+                }
+                
+                if (retransmitSuccess) {
                     Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
                 } else {
                     Log.w(TAG, "Failed to retransmit BLE response")
