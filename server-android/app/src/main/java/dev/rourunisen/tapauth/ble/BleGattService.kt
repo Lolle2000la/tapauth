@@ -21,6 +21,7 @@ import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.biometric.BiometricHelper
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
+import dev.rourunisen.tapauth.service.TransportLockManager
 import kotlinx.coroutines.*
 import java.util.UUID
 
@@ -84,6 +85,7 @@ class BleGattService : Service() {
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private lateinit var biometricHelper: BiometricHelper
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
+    private val transportLockManager = TransportLockManager.getInstance()
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
@@ -417,7 +419,14 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
-                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray(), null)
+                // Silently disconnect on parse error - don't send invalid response
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -432,7 +441,14 @@ class BleGattService : Service() {
             
             if (pairedDevices.isEmpty()) {
                 Log.w(TAG, "No paired devices found, rejecting BLE request")
-                sendResponseToClient(gatt, "NO_PAIRED_DEVICES".toByteArray(), null)
+                // Silently disconnect - no valid response possible without CSK
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -458,7 +474,14 @@ class BleGattService : Service() {
             
             if (matchedDevice == null) {
                 Log.w(TAG, "No device matched the temporal ID")
-                sendResponseToClient(gatt, "UNKNOWN_DEVICE".toByteArray(), null)
+                // Silently disconnect - no valid response possible without CSK
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -467,7 +490,14 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(matchedDevice.csk, data)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
-                sendResponseToClient(gatt, "DECRYPTION_ERROR".toByteArray(), null)
+                // Silently disconnect on decryption error
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -476,7 +506,14 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(wrapperMessageBytes)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
-                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray(), null)
+                // Silently disconnect on parse error
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -487,8 +524,14 @@ class BleGattService : Service() {
                 Log.w(TAG, "BLE pairing not authorized for user: ${authRequest.username}")
                 Log.w(TAG, "  Device: ${matchedDevice.displayName}")
                 Log.w(TAG, "  Allowed users: ${matchedDevice.allowedUsers}")
-                // Silently reject - send generic error to avoid username enumeration
-                sendResponseToClient(gatt, "UNAUTHORIZED".toByteArray(), null)
+                // Silently disconnect - this device shouldn't handle this user
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -498,14 +541,35 @@ class BleGattService : Service() {
             val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
             val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
             
-            // Step 5: Replay attack mitigation
-            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
-                Log.w(TAG, "BLE replay attack detected, rejecting request")
-                sendResponseToClient(gatt, "REPLAY_DETECTED".toByteArray(), null)
+            // Step 5: Transport lock - ensure only one channel handles this request
+            if (!transportLockManager.tryClaimTransport(challengeBytes, dev.rourunisen.tapauth.data.TransportType.BLE)) {
+                Log.i(TAG, "BLE request ignored - challenge already claimed by another transport")
+                // Silently disconnect - UDP is handling this
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
-            // Step 6: Verify signature
+            // Step 6: Replay attack mitigation
+            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
+                Log.w(TAG, "BLE replay attack detected, rejecting request")
+                // Silently disconnect - don't help attacker with denial message
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
+                return
+            }
+            
+            // Step 7: Verify signature
             Log.d(TAG, "Verifying signature for matched device: ${matchedDevice.displayName}")
             
             // Reconstruct message for verification
@@ -515,7 +579,14 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(requestJson)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to serialize BLE request for verification", e)
-                sendResponseToClient(gatt, "VERIFICATION_ERROR".toByteArray(), null)
+                // Disconnect on serialization error
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
@@ -533,13 +604,20 @@ class BleGattService : Service() {
             
             if (!isValid) {
                 Log.w(TAG, "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request")
-                sendResponseToClient(gatt, "INVALID_SIGNATURE".toByteArray(), null)
+                // Silently disconnect - likely attack or corrupted data
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
                 return
             }
             
             Log.d(TAG, "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})")
             
-            // Step 7: Request biometric authentication via AuthRequestManager
+            // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
                 context = this,
@@ -550,8 +628,8 @@ class BleGattService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE
-            ) { approved, signedChallenge ->
-                // Step 5: Create and send encrypted grant/denial
+            ) { approved, signedChallenge, explicitDenial ->
+                // Create and send encrypted grant/denial
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "BLE auth request approved, creating encrypted grant")
                     try {
@@ -572,12 +650,23 @@ class BleGattService : Service() {
                         
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
+                        
+                        // Release transport lock after successful grant
+                        transportLockManager.releaseLock(challengeBytes)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
-                        sendResponseToClient(gatt, "ERROR".toByteArray(), null)
+                        // Just disconnect on error - can't send valid response
+                        if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
                     }
-                } else {
-                    Log.d(TAG, "BLE auth request denied or timed out")
+                } else if (explicitDenial) {
+                    // Only send denial if user explicitly denied (not timeout/error)
+                    Log.d(TAG, "BLE auth request explicitly denied by user")
                     try {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
@@ -596,16 +685,45 @@ class BleGattService : Service() {
                         
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
+                        
+                        // Release transport lock after denial
+                        transportLockManager.releaseLock(challengeBytes)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
-                        sendResponseToClient(gatt, "ERROR".toByteArray(), null)
+                        // Just disconnect on error - can't send valid response
+                        if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
                     }
+                } else {
+                    // Timeout or error - silently disconnect, don't send denial
+                    Log.d(TAG, "BLE auth request timed out or failed - disconnecting silently")
+                    if (ActivityCompat.checkSelfPermission(
+                            this@BleGattService,
+                            Manifest.permission.BLUETOOTH_CONNECT
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        gatt.disconnect()
+                    }
+                    // Release transport lock even on timeout
+                    transportLockManager.releaseLock(challengeBytes)
                 }
             }
             
         } catch (e: Exception) {
             Log.e(TAG, "Error handling BLE authentication request", e)
-            sendResponseToClient(gatt, "ERROR".toByteArray(), null)
+            // Just disconnect on unexpected error
+            if (ActivityCompat.checkSelfPermission(
+                    this@BleGattService,
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                gatt.disconnect()
+            }
         }
     }
     

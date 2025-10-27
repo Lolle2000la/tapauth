@@ -105,11 +105,35 @@ class MainActivity : FragmentActivity() {
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                     super.onAuthenticationError(errorCode, errString)
-                    Log.e(TAG, "Biometric authentication error: $errString")
+                    Log.e(TAG, "Biometric authentication error: $errString (code: $errorCode)")
                     // Handle current auth request denial
                     currentAuthRequest?.let { authRequest ->
-                        handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
-                        currentAuthRequest = null
+                        // Check if this is an explicit user cancellation (clicking "Deny" button)
+                        val explicitDenial = (errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON || 
+                                             errorCode == BiometricPrompt.ERROR_USER_CANCELED)
+                        
+                        // Only clear currentAuthRequest and send response for explicit denials or permanent errors
+                        // Temporary errors like timeout, lockout should not clear the request
+                        val shouldClearRequest = when (errorCode) {
+                            BiometricPrompt.ERROR_NEGATIVE_BUTTON -> true  // User clicked "Deny"
+                            BiometricPrompt.ERROR_USER_CANCELED -> true    // User dismissed prompt
+                            BiometricPrompt.ERROR_CANCELED -> false        // System canceled (e.g., another biometric prompt)
+                            BiometricPrompt.ERROR_TIMEOUT -> false         // Biometric timeout - user can still retry
+                            BiometricPrompt.ERROR_LOCKOUT -> false         // Too many attempts - temporary
+                            BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> true // Permanent lockout
+                            BiometricPrompt.ERROR_HW_NOT_PRESENT -> true   // No biometric hardware
+                            BiometricPrompt.ERROR_HW_UNAVAILABLE -> true   // Hardware error
+                            BiometricPrompt.ERROR_NO_BIOMETRICS -> true    // No biometrics enrolled
+                            BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> true // No credentials
+                            else -> true  // Unknown error - assume it's permanent
+                        }
+                        
+                        if (shouldClearRequest) {
+                            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial)
+                            currentAuthRequest = null
+                        } else {
+                            Log.d(TAG, "Temporary biometric error (code: $errorCode), keeping request active for retry")
+                        }
                     }
                 }
 
@@ -130,7 +154,8 @@ class MainActivity : FragmentActivity() {
                             handleAuthResponse(authRequest.requestId, approved = true, signedChallenge = signedChallenge)
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to sign challenge", e)
-                            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+                            // Signature failure is not explicit denial - just error
+                            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = false)
                         }
                         currentAuthRequest = null
                     }
@@ -203,9 +228,9 @@ class MainActivity : FragmentActivity() {
         biometricPrompt.authenticate(promptInfo)
     }
     
-    private fun handleAuthResponse(requestId: String, approved: Boolean, signedChallenge: ByteArray?) {
+    private fun handleAuthResponse(requestId: String, approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean = false) {
         val authRequestManager = AuthRequestManager.getInstance()
-        authRequestManager.handleResponse(requestId, approved, signedChallenge)
+        authRequestManager.handleResponse(requestId, approved, signedChallenge, explicitDenial)
     }
     
     private fun checkAllPermissions() {

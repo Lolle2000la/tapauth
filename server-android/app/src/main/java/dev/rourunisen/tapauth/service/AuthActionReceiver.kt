@@ -52,7 +52,8 @@ class AuthActionReceiver : BroadcastReceiver() {
                 if (ok) {
                     Log.d(TAG, "Quick deny for request ${authRequest.requestId}")
                     try {
-                        AuthRequestManager.getInstance().handleResponse(authRequest.requestId, approved = false, signedChallenge = null)
+                        // Notification "Deny" button is explicit user denial
+                        AuthRequestManager.getInstance().handleResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = true)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to handle quick deny", e)
                     }

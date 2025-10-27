@@ -28,7 +28,7 @@ class AuthRequestManager private constructor() {
     
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
-        val callback: (Boolean, ByteArray?) -> Unit,
+        val callback: (Boolean, ByteArray?, Boolean) -> Unit,  // (approved, signedChallenge, explicitDenial)
         val appContext: android.content.Context
     )
     
@@ -45,7 +45,7 @@ class AuthRequestManager private constructor() {
         challenge: ByteArray,
         timestamp: Long,
         transportType: TransportType,
-        callback: (approved: Boolean, signedChallenge: ByteArray?) -> Unit
+        callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit
     ): String {
         val requestId = UUID.randomUUID().toString()
         
@@ -147,14 +147,15 @@ class AuthRequestManager private constructor() {
     
     /**
      * Handle response from MainActivity (approved or denied)
+     * @param explicitDenial: true if user clicked "Deny", false if timeout/cancel
      */
-    fun handleResponse(requestId: String, approved: Boolean, signedChallenge: ByteArray?) {
+    fun handleResponse(requestId: String, approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean = false) {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
-            Log.d(TAG, "Auth request $requestId ${if (approved) "approved" else "denied"}")
+            Log.d(TAG, "Auth request $requestId ${if (approved) "approved" else if (explicitDenial) "explicitly denied" else "timed out/cancelled"}")
             // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
             scope.launch {
-                pending.callback(approved, signedChallenge)
+                pending.callback(approved, signedChallenge, explicitDenial)
             }
             // Cancel the persistent notification
             try {
@@ -167,14 +168,15 @@ class AuthRequestManager private constructor() {
     
     /**
      * Cancel a pending request (e.g., on timeout)
+     * This is NOT an explicit user denial - just silently cancel
      */
     fun cancelRequest(requestId: String) {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
-            Log.d(TAG, "Cancelled auth request $requestId")
-            // Launch callback on IO dispatcher
+            Log.d(TAG, "Cancelled auth request $requestId (timeout)")
+            // Launch callback on IO dispatcher - explicitDenial = false
             scope.launch {
-                pending.callback(false, null)
+                pending.callback(false, null, false)
             }
         }
     }

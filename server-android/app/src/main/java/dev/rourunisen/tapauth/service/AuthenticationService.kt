@@ -31,6 +31,7 @@ class AuthenticationService : Service() {
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val retransmissionManager = RetransmissionManager.getInstance()
+    private val transportLockManager = TransportLockManager.getInstance()
     private val requestRateLimiter = RequestRateLimiter()
     private lateinit var temporalIdCache: TemporalIdCache
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
@@ -506,6 +507,12 @@ class AuthenticationService : Service() {
             val challengeBytes = android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
             val signatureBytes = android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
             
+            // Transport lock - ensure only one channel handles this request
+            if (!transportLockManager.tryClaimTransport(challengeBytes, dev.rourunisen.tapauth.data.TransportType.UDP)) {
+                Log.i(TAG, "UDP request ignored - challenge already claimed by another transport")
+                return
+            }
+            
             // Replay attack mitigation
             // Check for replayed challenges and stale timestamps
             if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
@@ -548,7 +555,7 @@ class AuthenticationService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds * 1000,
                 transportType = dev.rourunisen.tapauth.data.TransportType.UDP
-            ) { approved, signedChallenge ->
+            ) { approved, signedChallenge, explicitDenial ->
                 // Step 6: Create and send authentication grant
                 if (approved && signedChallenge != null) {
                     Log.d(TAG, "Auth request approved, creating encrypted grant")
@@ -580,6 +587,9 @@ class AuthenticationService : Service() {
                         udpSocket?.send(responsePacket)
                         Log.d(TAG, "Sent encrypted auth grant to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)")
                         
+                        // Release transport lock after successful grant
+                        transportLockManager.releaseLock(challengeBytes)
+                        
                         // Start retransmission (500ms fixed interval per spec)
                         udpSocket?.let { socket ->
                             retransmissionManager.startUdpRetransmission(
@@ -596,8 +606,9 @@ class AuthenticationService : Service() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send auth grant", e)
                     }
-                } else {
-                    Log.d(TAG, "Auth request denied or timed out")
+                } else if (explicitDenial) {
+                    // Only send denial if user explicitly denied (not timeout/error)
+                    Log.d(TAG, "Auth request explicitly denied by user")
                     // Reset rate limiter since request was resolved
                     requestRateLimiter.resetClient(device.publicKey.toHex())
                     
@@ -628,6 +639,9 @@ class AuthenticationService : Service() {
                         udpSocket?.send(responsePacket)
                         Log.d(TAG, "Sent encrypted auth denial to ${senderAddress.hostAddress}:$senderPort (${encryptedPacketBytes.size} bytes)")
                         
+                        // Release transport lock after denial
+                        transportLockManager.releaseLock(challengeBytes)
+                        
                         // Start retransmission (500ms fixed interval per spec)
                         udpSocket?.let { socket ->
                             retransmissionManager.startUdpRetransmission(
@@ -644,6 +658,13 @@ class AuthenticationService : Service() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send auth denial", e)
                     }
+                } else {
+                    // Timeout or error - silently ignore, don't send denial
+                    Log.d(TAG, "Auth request timed out or failed - no response sent")
+                    // Reset rate limiter since request was resolved
+                    requestRateLimiter.resetClient(device.publicKey.toHex())
+                    // Release transport lock even on timeout
+                    transportLockManager.releaseLock(challengeBytes)
                 }
             }
             
