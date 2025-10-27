@@ -517,8 +517,8 @@ runcmd:
     SCRIPT
     chmod +x /usr/local/bin/bluetooth-status
     
-    # TODO: Welcome message - temporarily disabled due to YAML escaping issues
-    # Will be added via write_files directive in next iteration
+    # Create welcome message using simple echo to avoid YAML escaping complexity
+    # Using runcmd instead of write_files directive for simplicity
     echo "Welcome to TapAuth VM. Run 'init-status' to check setup." > /etc/motd
     
     echo "Cloud-init setup completed successfully"

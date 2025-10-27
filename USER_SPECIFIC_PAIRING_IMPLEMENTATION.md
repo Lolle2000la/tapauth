@@ -160,7 +160,7 @@ val device = PairedDevice(
     csk = receivedCsk,
     displayName = hostname,
     pairedAt = System.currentTimeMillis(),
-    allowedUsers = listOf() // TODO: Get from UI - empty means all users
+    allowedUsers = listOf() // Empty list means all users (to be configured via UI - see below)
 )
 ```
 
