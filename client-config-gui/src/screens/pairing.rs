@@ -26,6 +26,7 @@ struct PairingSessionState {
     session: ClientPairingSession,
     server_public_key: [u8; 32],
     server_device_name: String,
+    #[allow(dead_code)]
     keypair: Ed25519KeyPair,
 }
 
@@ -33,7 +34,6 @@ struct PairingSessionState {
 pub enum PairingState {
     Loading,
     ShowingQRCode { url: String, qr_data: Arc<QrData> },
-    WaitingForConnection,
     VerifyingSAS { sas: String, port: u16 },
     CompletingPairing,
     Success { device_id: String },
@@ -143,7 +143,6 @@ impl PairingScreen {
         let content = match &self.state {
             PairingState::Loading => self.view_loading(),
             PairingState::ShowingQRCode { url, qr_data } => self.view_qr_code(url, qr_data),
-            PairingState::WaitingForConnection => self.view_waiting(),
             PairingState::VerifyingSAS { sas, .. } => self.view_sas_verification(sas),
             PairingState::CompletingPairing => self.view_completing(),
             PairingState::Success { device_id } => self.view_success(device_id),
@@ -190,22 +189,6 @@ impl PairingScreen {
             back_button,
         ]
         .width(Length::Fill)
-        .align_x(iced::Alignment::Center)
-        .into()
-    }
-
-    fn view_waiting(&self) -> Element<'_, ScreenMessage> {
-        let back_button = button(text("Cancel").size(16))
-            .padding(10)
-            .on_press(ScreenMessage::PairingCancelled);
-
-        column![
-            text("Waiting for device connection...").size(24),
-            Space::with_height(Length::Fixed(20.0)),
-            text("Please complete pairing on your device").size(16),
-            Space::with_height(Length::Fixed(40.0)),
-            back_button,
-        ]
         .align_x(iced::Alignment::Center)
         .into()
     }

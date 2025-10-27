@@ -12,6 +12,7 @@ pub struct DeviceListScreen {
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
+    #[allow(dead_code)]
     error: Option<String>,
 }
 

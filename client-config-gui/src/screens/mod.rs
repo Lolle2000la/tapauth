@@ -47,7 +47,8 @@ pub enum ScreenMessage {
     PairingSASConfirmed, // User confirmed SAS
 
     // Device List
-    RemoveDevice(String),  // device_id
+    RemoveDevice(String), // device_id
+    #[allow(dead_code)]
     DeviceRemoved(String), // device_id
     DevicesLoaded(std::collections::HashMap<String, shared::config::PairedServer>), // loaded devices
 
