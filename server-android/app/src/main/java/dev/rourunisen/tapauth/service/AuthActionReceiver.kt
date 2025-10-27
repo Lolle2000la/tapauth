@@ -6,10 +6,9 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import dev.rourunisen.tapauth.data.AuthRequest
-import java.security.MessageDigest
 import dev.rourunisen.tapauth.data.KeypairRepository
+import java.security.MessageDigest
 import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 class AuthActionReceiver : BroadcastReceiver() {
 
@@ -25,12 +24,16 @@ class AuthActionReceiver : BroadcastReceiver() {
         val notifAction = intent.getStringExtra("notification_action")
         if (notifAction == "deny") {
             // Extract auth request from extras
-            val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST, AuthRequest::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
-            }
+            val authRequest =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(
+                        AuthRequestManager.EXTRA_AUTH_REQUEST,
+                        AuthRequest::class.java,
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
+                }
 
             if (authRequest != null) {
                 // Verify HMAC token
@@ -42,7 +45,8 @@ class AuthActionReceiver : BroadcastReceiver() {
                         val hmacKey = keypairRepo.getOrCreateHmacKey()
                         val mac = Mac.getInstance("HmacSHA256")
                         mac.init(hmacKey)
-                        val expected = mac.doFinal(authRequest.requestId.toByteArray(Charsets.UTF_8))
+                        val expected =
+                            mac.doFinal(authRequest.requestId.toByteArray(Charsets.UTF_8))
                         ok = MessageDigest.isEqual(expected, hmac)
                     } catch (e: Exception) {
                         Log.w(TAG, "HMAC verification failed: ${e.message}")
@@ -53,12 +57,21 @@ class AuthActionReceiver : BroadcastReceiver() {
                     Log.d(TAG, "Quick deny for request ${authRequest.requestId}")
                     try {
                         // Notification "Deny" button is explicit user denial
-                        AuthRequestManager.getInstance().handleResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = true)
+                        AuthRequestManager.getInstance()
+                            .handleResponse(
+                                authRequest.requestId,
+                                approved = false,
+                                signedChallenge = null,
+                                explicitDenial = true,
+                            )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to handle quick deny", e)
                     }
                 } else {
-                    Log.w(TAG, "Rejected deny: HMAC missing or invalid for request ${authRequest.requestId}")
+                    Log.w(
+                        TAG,
+                        "Rejected deny: HMAC missing or invalid for request ${authRequest.requestId}",
+                    )
                 }
             } else {
                 Log.w(TAG, "Received deny action without auth request payload")

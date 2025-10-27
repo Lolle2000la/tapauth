@@ -12,7 +12,8 @@ class BootReceiver : BroadcastReceiver() {
             Log.d("BootReceiver", "Device boot completed, starting TapAuth background services")
             try {
                 AuthenticationService.start(context)
-                val bleIntent = Intent(context, dev.rourunisen.tapauth.ble.BleGattService::class.java)
+                val bleIntent =
+                    Intent(context, dev.rourunisen.tapauth.ble.BleGattService::class.java)
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                     context.startForegroundService(bleIntent)
                 } else {

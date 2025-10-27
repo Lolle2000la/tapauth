@@ -25,42 +25,43 @@ fun PairingScreen(
     pairingUrl: PairingUrl,
     onPairingComplete: () -> Unit,
     onPairingFailed: (String) -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
 ) {
     var pairingState by remember { mutableStateOf<PairingState>(PairingState.Connecting) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val pairingClient = remember { PairingClient(context) }
     val deviceRepository = remember { DeviceRepository(context) }
-    
+
     // Handle system back button
     BackHandler(onBack = onBack)
-    
+
     LaunchedEffect(pairingUrl) {
         scope.launch {
             // Prefer IPv4 if available, fallback to IPv6
-            val ipAddress = pairingUrl.ipv4 ?: pairingUrl.ipv6 ?: run {
-                pairingState = PairingState.Failed("No IP address available")
-                return@launch
-            }
-            
+            val ipAddress =
+                pairingUrl.ipv4
+                    ?: pairingUrl.ipv6
+                    ?: run {
+                        pairingState = PairingState.Failed("No IP address available")
+                        return@launch
+                    }
+
             // Phase 1: Initiate pairing and get SAS for verification
-            val initResult = pairingClient.initiatePairing(
-                ipAddress, 
-                pairingUrl.port, 
-                pairingUrl.publicKey
-            )
-            
+            val initResult =
+                pairingClient.initiatePairing(ipAddress, pairingUrl.port, pairingUrl.publicKey)
+
             when (initResult) {
                 is dev.rourunisen.tapauth.network.PairingInitResult.AwaitingSASVerification -> {
-                    pairingState = PairingState.VerifySAS(
-                        sas = initResult.sas,
-                        socket = initResult.socket,
-                        psk = initResult.psk,
-                        clientPublicKey = initResult.clientPublicKey,
-                        clientEd25519Key = initResult.clientEd25519Key,
-                        clientDeviceName = initResult.clientDeviceName
-                    )
+                    pairingState =
+                        PairingState.VerifySAS(
+                            sas = initResult.sas,
+                            socket = initResult.socket,
+                            psk = initResult.psk,
+                            clientPublicKey = initResult.clientPublicKey,
+                            clientEd25519Key = initResult.clientEd25519Key,
+                            clientDeviceName = initResult.clientDeviceName,
+                        )
                 }
                 is dev.rourunisen.tapauth.network.PairingInitResult.Error -> {
                     pairingState = PairingState.Failed(initResult.message)
@@ -68,7 +69,7 @@ fun PairingScreen(
             }
         }
     }
-    
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -77,18 +78,16 @@ fun PairingScreen(
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back"
+                            contentDescription = "Back",
                         )
                     }
-                }
+                },
             )
         }
     ) { padding ->
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-            contentAlignment = Alignment.Center
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentAlignment = Alignment.Center,
         ) {
             when (val state = pairingState) {
                 is PairingState.Connecting -> {
@@ -101,15 +100,16 @@ fun PairingScreen(
                             pairingState = PairingState.Confirming
                             scope.launch {
                                 // Phase 2: Complete pairing after SAS verification
-                                val result = pairingClient.completePairing(
-                                    socket = state.socket,
-                                    psk = state.psk,
-                                    clientPublicKey = state.clientPublicKey,
-                                    clientEd25519Key = state.clientEd25519Key,
-                                    clientDeviceName = state.clientDeviceName,
-                                    sasConfirmed = true
-                                )
-                                
+                                val result =
+                                    pairingClient.completePairing(
+                                        socket = state.socket,
+                                        psk = state.psk,
+                                        clientPublicKey = state.clientPublicKey,
+                                        clientEd25519Key = state.clientEd25519Key,
+                                        clientDeviceName = state.clientDeviceName,
+                                        sasConfirmed = true,
+                                    )
+
                                 when (result) {
                                     is PairingResult.Success -> {
                                         // Save device to repository
@@ -130,7 +130,7 @@ fun PairingScreen(
                             state.psk.fill(0)
                             pairingState = PairingState.Failed("User cancelled")
                             onPairingFailed("Pairing cancelled")
-                        }
+                        },
                     )
                 }
                 is PairingState.Confirming -> {
@@ -142,10 +142,8 @@ fun PairingScreen(
                 is PairingState.Failed -> {
                     FailedView(
                         message = state.message,
-                        onRetry = {
-                            pairingState = PairingState.Connecting
-                        },
-                        onBack = onBack
+                        onRetry = { pairingState = PairingState.Connecting },
+                        onBack = onBack,
                     )
                 }
             }
@@ -157,51 +155,41 @@ fun PairingScreen(
 private fun ConnectingView() {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         CircularProgressIndicator()
-        Text(
-            text = "Connecting to device...",
-            style = MaterialTheme.typography.titleMedium
-        )
+        Text(text = "Connecting to device...", style = MaterialTheme.typography.titleMedium)
         Text(
             text = "Please wait",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
 @Composable
-private fun VerifySASView(
-    sas: String,
-    onConfirm: () -> Unit,
-    onCancel: () -> Unit
-) {
+private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(32.dp),
+        modifier = Modifier.fillMaxWidth().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+        verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         Text(
             text = "Verify Security Code",
             style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold
+            fontWeight = FontWeight.Bold,
         )
-        
+
         Text(
             text = "Compare this code with the one shown on your computer:",
             style = MaterialTheme.typography.bodyLarge,
-            textAlign = TextAlign.Center
+            textAlign = TextAlign.Center,
         )
-        
+
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer
-            )
+            colors =
+                CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
         ) {
             Text(
                 text = sas,
@@ -210,33 +198,25 @@ private fun VerifySASView(
                 fontWeight = FontWeight.Bold,
                 fontSize = 48.sp,
                 textAlign = TextAlign.Center,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
         }
-        
+
         Text(
             text = "Do the codes match?",
             style = MaterialTheme.typography.titleMedium,
-            textAlign = TextAlign.Center
+            textAlign = TextAlign.Center,
         )
-        
+
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            OutlinedButton(
-                onClick = onCancel,
-                modifier = Modifier.weight(1f)
-            ) {
+            OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
                 Text("No, Cancel")
             }
-            
-            Button(
-                onClick = onConfirm,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Yes, Pair")
-            }
+
+            Button(onClick = onConfirm, modifier = Modifier.weight(1f)) { Text("Yes, Pair") }
         }
     }
 }
@@ -245,13 +225,10 @@ private fun VerifySASView(
 private fun ConfirmingView() {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         CircularProgressIndicator()
-        Text(
-            text = "Finalizing pairing...",
-            style = MaterialTheme.typography.titleMedium
-        )
+        Text(text = "Finalizing pairing...", style = MaterialTheme.typography.titleMedium)
     }
 }
 
@@ -260,103 +237,88 @@ private fun SuccessView(onDone: () -> Unit) {
     Column(
         modifier = Modifier.padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+        verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         Text(
             text = "✓",
             style = MaterialTheme.typography.displayLarge,
             fontSize = 72.sp,
-            color = MaterialTheme.colorScheme.primary
+            color = MaterialTheme.colorScheme.primary,
         )
-        
+
         Text(
             text = "Pairing Successful!",
             style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold
+            fontWeight = FontWeight.Bold,
         )
-        
+
         Text(
             text = "Your device is now paired and ready for authentication",
             style = MaterialTheme.typography.bodyLarge,
-            textAlign = TextAlign.Center
+            textAlign = TextAlign.Center,
         )
-        
+
         Spacer(modifier = Modifier.height(16.dp))
-        
-        Button(
-            onClick = onDone,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Done")
-        }
+
+        Button(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text("Done") }
     }
 }
 
 @Composable
-private fun FailedView(
-    message: String,
-    onRetry: () -> Unit,
-    onBack: () -> Unit
-) {
+private fun FailedView(message: String, onRetry: () -> Unit, onBack: () -> Unit) {
     Column(
         modifier = Modifier.padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+        verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         Text(
             text = "✗",
             style = MaterialTheme.typography.displayLarge,
             fontSize = 72.sp,
-            color = MaterialTheme.colorScheme.error
+            color = MaterialTheme.colorScheme.error,
         )
-        
+
         Text(
             text = "Pairing Failed",
             style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold
+            fontWeight = FontWeight.Bold,
         )
-        
+
         Text(
             text = message,
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        
+
         Spacer(modifier = Modifier.height(16.dp))
-        
+
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            OutlinedButton(
-                onClick = onBack,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Back")
-            }
-            
-            Button(
-                onClick = onRetry,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Retry")
-            }
+            OutlinedButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
+
+            Button(onClick = onRetry, modifier = Modifier.weight(1f)) { Text("Retry") }
         }
     }
 }
 
 private sealed class PairingState {
     object Connecting : PairingState()
+
     data class VerifySAS(
         val sas: String,
         val socket: java.net.Socket,
         val psk: ByteArray,
         val clientPublicKey: ByteArray,
         val clientEd25519Key: ByteArray,
-        val clientDeviceName: String
+        val clientDeviceName: String,
     ) : PairingState()
+
     object Confirming : PairingState()
+
     object Success : PairingState()
+
     data class Failed(val message: String) : PairingState()
 }

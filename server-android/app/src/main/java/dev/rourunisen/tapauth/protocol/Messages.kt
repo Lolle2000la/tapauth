@@ -4,115 +4,95 @@ import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 
 /**
- * Protobuf message representations parsed from JSON
- * These match the structure of the messages in auth_protocol.proto
+ * Protobuf message representations parsed from JSON These match the structure of the messages in
+ * auth_protocol.proto
  */
-
 data class EncryptedPacket(
-    @SerializedName("temporal_identifier")
-    val temporalIdentifier: String,  // Base64 encoded
-    @SerializedName("encryption_algorithm")
-    val encryptionAlgorithm: Int,
-    val ciphertext: String  // Base64 encoded
+    @SerializedName("temporal_identifier") val temporalIdentifier: String, // Base64 encoded
+    @SerializedName("encryption_algorithm") val encryptionAlgorithm: Int,
+    val ciphertext: String, // Base64 encoded
 )
 
 data class AuthenticationRequest(
-    val challenge: String,  // Base64 encoded
+    val challenge: String, // Base64 encoded
     val username: String,
     val hostname: String,
-    @SerializedName("timestamp_unix_seconds")
-    val timestampUnixSeconds: Long,
-    @SerializedName("signature_algorithm")
-    val signatureAlgorithm: Int,
-    val signature: String  // Base64 encoded
+    @SerializedName("timestamp_unix_seconds") val timestampUnixSeconds: Long,
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
+    val signature: String, // Base64 encoded
 )
 
 data class AuthenticationGrant(
-    @SerializedName("signed_challenge")
-    val signedChallenge: String,  // Base64 encoded
-    @SerializedName("signature_algorithm")
-    val signatureAlgorithm: Int,
-    val signature: String  // Base64 encoded
+    @SerializedName("signed_challenge") val signedChallenge: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
+    val signature: String, // Base64 encoded
 )
 
 data class GrantConfirmation(
-    val challenge: String,  // Base64 encoded
-    @SerializedName("signature_algorithm")
-    val signatureAlgorithm: Int,
-    val signature: String  // Base64 encoded
+    val challenge: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
+    val signature: String, // Base64 encoded
 )
 
 data class AuthenticationCancel(
-    val challenge: String,  // Base64 encoded
-    @SerializedName("signature_algorithm")
-    val signatureAlgorithm: Int,
-    val signature: String  // Base64 encoded
+    val challenge: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
+    val signature: String, // Base64 encoded
 )
 
-/**
- * Helper object for parsing protobuf messages via JNI
- */
+/** Helper object for parsing protobuf messages via JNI */
 object ProtobufParser {
     private val gson = Gson()
-    
-    /**
-     * Parse an EncryptedPacket structure from raw protobuf bytes (without decryption)
-     */
+
+    /** Parse an EncryptedPacket structure from raw protobuf bytes (without decryption) */
     fun parseEncryptedPacket(packetBytes: ByteArray): EncryptedPacket {
-        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseEncryptedPacketStructure(packetBytes)
+        val json =
+            dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseEncryptedPacketStructure(packetBytes)
         return gson.fromJson(json, EncryptedPacket::class.java)
     }
-    
-    /**
-     * Parse an AuthenticationRequest from protobuf bytes
-     */
+
+    /** Parse an AuthenticationRequest from protobuf bytes */
     fun parseAuthRequest(requestBytes: ByteArray): AuthenticationRequest {
         val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthRequest(requestBytes)
         return gson.fromJson(json, AuthenticationRequest::class.java)
     }
-    
-    /**
-     * Create an AuthenticationGrant protobuf message
-     */
+
+    /** Create an AuthenticationGrant protobuf message */
     fun createAuthGrant(signedChallenge: ByteArray): ByteArray {
         return dev.rourunisen.tapauth.crypto.TapAuthCrypto.createAuthGrant(signedChallenge)
     }
-    
-    /**
-     * Parse GrantConfirmation from protobuf bytes
-     */
+
+    /** Parse GrantConfirmation from protobuf bytes */
     fun parseGrantConfirmation(confirmationBytes: ByteArray): GrantConfirmation {
-        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseGrantConfirmation(confirmationBytes)
+        val json =
+            dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseGrantConfirmation(confirmationBytes)
         return gson.fromJson(json, GrantConfirmation::class.java)
     }
-    
-    /**
-     * Parse AuthenticationCancel from protobuf bytes
-     */
+
+    /** Parse AuthenticationCancel from protobuf bytes */
     fun parseAuthenticationCancel(cancelBytes: ByteArray): AuthenticationCancel {
-        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthenticationCancel(cancelBytes)
+        val json =
+            dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthenticationCancel(cancelBytes)
         return gson.fromJson(json, AuthenticationCancel::class.java)
     }
-    
+
     private fun bytesToHex(bytes: ByteArray): String {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 }
 
-/**
- * Algorithm enums matching the protobuf definitions
- */
+/** Algorithm enums matching the protobuf definitions */
 enum class SignatureAlgorithm(val value: Int) {
     UNSPECIFIED(0),
-    ED25519(1)
+    ED25519(1),
 }
 
 enum class SymmetricAlgorithm(val value: Int) {
     UNSPECIFIED(0),
-    AES_256_GCM(1)
+    AES_256_GCM(1),
 }
 
 enum class HashAlgorithm(val value: Int) {
     UNSPECIFIED(0),
-    SHA256(1)
+    SHA256(1),
 }

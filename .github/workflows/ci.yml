@@ -184,6 +184,11 @@ jobs:
                   cd server-android
                   ./gradlew assembleDebug --stacktrace
 
+            - name: Check Kotlin formatting with Spotless
+              run: |
+                  cd server-android
+                  ./gradlew spotlessCheck
+
             - name: Upload APK artifact
               uses: actions/upload-artifact@v4
               with:

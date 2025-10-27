@@ -3,9 +3,7 @@ package dev.rourunisen.tapauth.data
 import android.os.Parcelable
 import kotlinx.parcelize.Parcelize
 
-/**
- * Represents an authentication request that needs biometric approval
- */
+/** Represents an authentication request that needs biometric approval */
 @Parcelize
 data class AuthRequest(
     val requestId: String,
@@ -15,7 +13,7 @@ data class AuthRequest(
     val hostname: String,
     val challenge: ByteArray,
     val timestamp: Long,
-    val transportType: TransportType
+    val transportType: TransportType,
 ) : Parcelable {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
@@ -50,5 +48,5 @@ data class AuthRequest(
 
 enum class TransportType {
     UDP,
-    BLE
+    BLE,
 }

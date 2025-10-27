@@ -49,16 +49,16 @@ import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
 
 class MainActivity : FragmentActivity() {
-    
+
     private lateinit var biometricPrompt: BiometricPrompt
     private lateinit var authRequestReceiver: BroadcastReceiver
-    
+
     // Track individual permission states
     internal val cameraGranted = mutableStateOf(false)
     internal val bluetoothGranted = mutableStateOf(false)
     internal val locationGranted = mutableStateOf(false)
     internal val notificationGranted = mutableStateOf(false)
-    
+
     // Request codes for classic permission requests
     companion object {
         private const val TAG = "MainActivity"
@@ -67,31 +67,41 @@ class MainActivity : FragmentActivity() {
         private const val REQUEST_LOCATION = 3
         private const val REQUEST_NOTIFICATION = 4
     }
-    
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         // Check initial permission status
         checkAllPermissions()
-        
+
         setupBiometricPrompt()
         setupAuthRequestReceiver()
         // If activity was launched via notification intent containing an auth request,
         // process it now.
         intent?.let { incoming ->
             if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
-                val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    incoming.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST, AuthRequest::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
-                }
+                val authRequest =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        incoming.getParcelableExtra(
+                            AuthRequestManager.EXTRA_AUTH_REQUEST,
+                            AuthRequest::class.java,
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        incoming.getParcelableExtra<AuthRequest>(
+                            AuthRequestManager.EXTRA_AUTH_REQUEST
+                        )
+                    }
                 authRequest?.let {
                     val notifAction = incoming.getStringExtra("notification_action")
                     when (notifAction) {
                         "deny" -> {
                             // Immediately deny without UI
-                            handleAuthResponse(it.requestId, approved = false, signedChallenge = null)
+                            handleAuthResponse(
+                                it.requestId,
+                                approved = false,
+                                signedChallenge = null,
+                            )
                         }
                         "approve" -> {
                             // Start the biometric approval flow
@@ -105,120 +115,175 @@ class MainActivity : FragmentActivity() {
                 }
             }
         }
-        
+
         enableEdgeToEdge()
-        setContent {
-            TapAuthTheme {
-                TapAuthApp()
-            }
-        }
+        setContent { TapAuthTheme { TapAuthApp() } }
     }
-    
+
     private fun setupBiometricPrompt() {
         val executor = ContextCompat.getMainExecutor(this)
-        biometricPrompt = BiometricPrompt(this, executor,
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    super.onAuthenticationError(errorCode, errString)
-                    Log.e(TAG, "Biometric authentication error: $errString (code: $errorCode)")
-                    // Handle current auth request
-                    currentAuthRequest?.let { authRequest ->
-                        // Only ERROR_NEGATIVE_BUTTON is an explicit denial (user clicked "Deny")
-                        // All other errors are either dismissals, system errors, or temporary conditions
-                        when (errorCode) {
-                            BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
-                                // User explicitly clicked "Deny" button - send denial response
-                                Log.d(TAG, "User explicitly denied authentication")
-                                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = true)
-                                currentAuthRequest = null
-                            }
-                            BiometricPrompt.ERROR_USER_CANCELED -> {
-                                // User dismissed prompt (back button, tapped outside) - just clear, don't send denial
-                                Log.d(TAG, "User dismissed biometric prompt, clearing request without sending denial")
-                                currentAuthRequest = null
-                            }
-                            BiometricPrompt.ERROR_CANCELED -> {
-                                // System canceled (e.g., another biometric prompt) - keep request active
-                                Log.d(TAG, "Biometric prompt canceled by system, keeping request active")
-                            }
-                            BiometricPrompt.ERROR_TIMEOUT -> {
-                                // Biometric timeout - user can still retry, keep request active
-                                Log.d(TAG, "Biometric timeout, keeping request active for retry")
-                            }
-                            BiometricPrompt.ERROR_LOCKOUT -> {
-                                // Too many attempts - temporary lockout, keep request active
-                                Log.d(TAG, "Biometric lockout (temporary), keeping request active")
-                            }
-                            BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
-                            BiometricPrompt.ERROR_HW_NOT_PRESENT,
-                            BiometricPrompt.ERROR_HW_UNAVAILABLE,
-                            BiometricPrompt.ERROR_NO_BIOMETRICS,
-                            BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> {
-                                // Permanent errors - clear request without sending denial (not user's fault)
-                                Log.w(TAG, "Permanent biometric error (code: $errorCode), clearing request without denial")
-                                currentAuthRequest = null
-                            }
-                            else -> {
-                                // Unknown error - clear request without sending denial
-                                Log.w(TAG, "Unknown biometric error (code: $errorCode), clearing request without denial")
-                                currentAuthRequest = null
+        biometricPrompt =
+            BiometricPrompt(
+                this,
+                executor,
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        super.onAuthenticationError(errorCode, errString)
+                        Log.e(TAG, "Biometric authentication error: $errString (code: $errorCode)")
+                        // Handle current auth request
+                        currentAuthRequest?.let { authRequest ->
+                            // Only ERROR_NEGATIVE_BUTTON is an explicit denial (user clicked
+                            // "Deny")
+                            // All other errors are either dismissals, system errors, or temporary
+                            // conditions
+                            when (errorCode) {
+                                BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
+                                    // User explicitly clicked "Deny" button - send denial response
+                                    Log.d(TAG, "User explicitly denied authentication")
+                                    handleAuthResponse(
+                                        authRequest.requestId,
+                                        approved = false,
+                                        signedChallenge = null,
+                                        explicitDenial = true,
+                                    )
+                                    currentAuthRequest = null
+                                }
+                                BiometricPrompt.ERROR_USER_CANCELED -> {
+                                    // User dismissed prompt (back button, tapped outside) - just
+                                    // clear, don't send denial
+                                    Log.d(
+                                        TAG,
+                                        "User dismissed biometric prompt, clearing request without sending denial",
+                                    )
+                                    currentAuthRequest = null
+                                }
+                                BiometricPrompt.ERROR_CANCELED -> {
+                                    // System canceled (e.g., another biometric prompt) - keep
+                                    // request active
+                                    Log.d(
+                                        TAG,
+                                        "Biometric prompt canceled by system, keeping request active",
+                                    )
+                                }
+                                BiometricPrompt.ERROR_TIMEOUT -> {
+                                    // Biometric timeout - user can still retry, keep request active
+                                    Log.d(
+                                        TAG,
+                                        "Biometric timeout, keeping request active for retry",
+                                    )
+                                }
+                                BiometricPrompt.ERROR_LOCKOUT -> {
+                                    // Too many attempts - temporary lockout, keep request active
+                                    Log.d(
+                                        TAG,
+                                        "Biometric lockout (temporary), keeping request active",
+                                    )
+                                }
+                                BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
+                                BiometricPrompt.ERROR_HW_NOT_PRESENT,
+                                BiometricPrompt.ERROR_HW_UNAVAILABLE,
+                                BiometricPrompt.ERROR_NO_BIOMETRICS,
+                                BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> {
+                                    // Permanent errors - clear request without sending denial (not
+                                    // user's fault)
+                                    Log.w(
+                                        TAG,
+                                        "Permanent biometric error (code: $errorCode), clearing request without denial",
+                                    )
+                                    currentAuthRequest = null
+                                }
+                                else -> {
+                                    // Unknown error - clear request without sending denial
+                                    Log.w(
+                                        TAG,
+                                        "Unknown biometric error (code: $errorCode), clearing request without denial",
+                                    )
+                                    currentAuthRequest = null
+                                }
                             }
                         }
                     }
-                }
 
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    super.onAuthenticationSucceeded(result)
-                    Log.d(TAG, "Biometric authentication succeeded")
-                    // Handle current auth request approval
-                    currentAuthRequest?.let { authRequest ->
-                        // Sign the challenge with server keypair
-                        try {
-                            val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(this@MainActivity)
-                            val privateKey = keypairRepo.getPrivateKey()
-                            Log.d(TAG, "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…")
-                            val signedChallenge = dev.rourunisen.tapauth.crypto.signData(privateKey, authRequest.challenge)
-                            
-                            Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
-                            Log.d(TAG, "Signed challenge (trunc): ${signedChallenge.take(8).joinToString("") { "%02x".format(it) }}…")
-                            handleAuthResponse(authRequest.requestId, approved = true, signedChallenge = signedChallenge)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to sign challenge", e)
-                            // Signature failure is not explicit denial - just error
-                            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null, explicitDenial = false)
+                    override fun onAuthenticationSucceeded(
+                        result: BiometricPrompt.AuthenticationResult
+                    ) {
+                        super.onAuthenticationSucceeded(result)
+                        Log.d(TAG, "Biometric authentication succeeded")
+                        // Handle current auth request approval
+                        currentAuthRequest?.let { authRequest ->
+                            // Sign the challenge with server keypair
+                            try {
+                                val keypairRepo =
+                                    dev.rourunisen.tapauth.data.KeypairRepository(this@MainActivity)
+                                val privateKey = keypairRepo.getPrivateKey()
+                                Log.d(
+                                    TAG,
+                                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                                )
+                                val signedChallenge =
+                                    dev.rourunisen.tapauth.crypto.signData(
+                                        privateKey,
+                                        authRequest.challenge,
+                                    )
+
+                                Log.d(
+                                    TAG,
+                                    "Successfully signed challenge (${signedChallenge.size} bytes)",
+                                )
+                                Log.d(
+                                    TAG,
+                                    "Signed challenge (trunc): ${signedChallenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                                )
+                                handleAuthResponse(
+                                    authRequest.requestId,
+                                    approved = true,
+                                    signedChallenge = signedChallenge,
+                                )
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to sign challenge", e)
+                                // Signature failure is not explicit denial - just error
+                                handleAuthResponse(
+                                    authRequest.requestId,
+                                    approved = false,
+                                    signedChallenge = null,
+                                    explicitDenial = false,
+                                )
+                            }
+                            currentAuthRequest = null
                         }
-                        currentAuthRequest = null
                     }
-                }
 
-                override fun onAuthenticationFailed() {
-                    super.onAuthenticationFailed()
-                    Log.w(TAG, "Biometric authentication failed")
-                }
-            })
+                    override fun onAuthenticationFailed() {
+                        super.onAuthenticationFailed()
+                        Log.w(TAG, "Biometric authentication failed")
+                    }
+                },
+            )
     }
-    
+
     private var currentAuthRequest: AuthRequest? = null
-    
+
     private fun setupAuthRequestReceiver() {
-        authRequestReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
-                    val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableExtra(
-                            AuthRequestManager.EXTRA_AUTH_REQUEST,
-                            AuthRequest::class.java
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST)
+        authRequestReceiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
+                        val authRequest =
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(
+                                    AuthRequestManager.EXTRA_AUTH_REQUEST,
+                                    AuthRequest::class.java,
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST)
+                            }
+
+                        authRequest?.let { handleAuthRequest(it) }
                     }
-                    
-                    authRequest?.let { handleAuthRequest(it) }
                 }
             }
-        }
-        
+
         val filter = IntentFilter(AuthRequestManager.ACTION_AUTH_REQUEST)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(authRequestReceiver, filter, RECEIVER_NOT_EXPORTED)
@@ -228,14 +293,14 @@ class MainActivity : FragmentActivity() {
                 this,
                 authRequestReceiver,
                 filter,
-                ContextCompat.RECEIVER_NOT_EXPORTED
+                ContextCompat.RECEIVER_NOT_EXPORTED,
             )
         }
     }
-    
+
     private fun handleAuthRequest(authRequest: AuthRequest) {
         Log.d(TAG, "Received auth request for ${authRequest.username}@${authRequest.hostname}")
-        
+
         // Check if biometric authentication is available
         val biometricManager = BiometricManager.from(this)
         when (biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
@@ -251,77 +316,91 @@ class MainActivity : FragmentActivity() {
             }
         }
     }
-    
+
     private fun showBiometricPrompt(authRequest: AuthRequest) {
-        val promptInfo = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Authentication Request")
-            .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
-            .setDescription("From device: ${authRequest.deviceName}")
-            .setNegativeButtonText("Deny")
-            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-            .build()
-        
+        val promptInfo =
+            BiometricPrompt.PromptInfo.Builder()
+                .setTitle("Authentication Request")
+                .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
+                .setDescription("From device: ${authRequest.deviceName}")
+                .setNegativeButtonText("Deny")
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .build()
+
         biometricPrompt.authenticate(promptInfo)
     }
-    
-    private fun handleAuthResponse(requestId: String, approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean = false) {
+
+    private fun handleAuthResponse(
+        requestId: String,
+        approved: Boolean,
+        signedChallenge: ByteArray?,
+        explicitDenial: Boolean = false,
+    ) {
         val authRequestManager = AuthRequestManager.getInstance()
         authRequestManager.handleResponse(requestId, approved, signedChallenge, explicitDenial)
     }
-    
+
     private fun checkAllPermissions() {
         // Check camera
-        cameraGranted.value = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
-        
+        cameraGranted.value =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+
         // Check Bluetooth permissions (Android 12+)
-        bluetoothGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            listOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_SCAN
-            ).all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
-        } else {
-            true // Not needed on older versions
-        }
-        
+        bluetoothGranted.value =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                listOf(
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_ADVERTISE,
+                        Manifest.permission.BLUETOOTH_SCAN,
+                    )
+                    .all {
+                        ContextCompat.checkSelfPermission(this, it) ==
+                            PackageManager.PERMISSION_GRANTED
+                    }
+            } else {
+                true // Not needed on older versions
+            }
+
         // Check location (Android 10+)
-        locationGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true // Not needed on older versions
-        }
-        
+        locationGranted.value =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                    PackageManager.PERMISSION_GRANTED
+            } else {
+                true // Not needed on older versions
+            }
+
         // Check notifications (Android 13+)
-        notificationGranted.value = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true // Not needed on older versions
-        }
+        notificationGranted.value =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+                    PackageManager.PERMISSION_GRANTED
+            } else {
+                true // Not needed on older versions
+            }
     }
-    
+
     fun requestCamera() {
         requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
     }
-    
+
     fun requestBluetooth() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            requestPermissions(arrayOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_SCAN
-            ), REQUEST_BLUETOOTH)
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_ADVERTISE,
+                    Manifest.permission.BLUETOOTH_SCAN,
+                ),
+                REQUEST_BLUETOOTH,
+            )
         } else {
             bluetoothGranted.value = true
             checkAllPermissions()
         }
     }
-    
+
     fun requestLocation() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQUEST_LOCATION)
@@ -330,49 +409,58 @@ class MainActivity : FragmentActivity() {
             checkAllPermissions()
         }
     }
-    
+
     fun requestNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION)
+            requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_NOTIFICATION,
+            )
         } else {
             notificationGranted.value = true
             checkAllPermissions()
         }
     }
-    
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
-        grantResults: IntArray
+        grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        
+
         when (requestCode) {
             REQUEST_CAMERA -> {
-                cameraGranted.value = grantResults.isNotEmpty() && 
-                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                cameraGranted.value =
+                    grantResults.isNotEmpty() &&
+                        grantResults[0] == PackageManager.PERMISSION_GRANTED
             }
             REQUEST_BLUETOOTH -> {
-                bluetoothGranted.value = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                bluetoothGranted.value =
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }
             }
             REQUEST_LOCATION -> {
-                locationGranted.value = grantResults.isNotEmpty() && 
-                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                locationGranted.value =
+                    grantResults.isNotEmpty() &&
+                        grantResults[0] == PackageManager.PERMISSION_GRANTED
             }
             REQUEST_NOTIFICATION -> {
-                notificationGranted.value = grantResults.isNotEmpty() && 
-                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                notificationGranted.value =
+                    grantResults.isNotEmpty() &&
+                        grantResults[0] == PackageManager.PERMISSION_GRANTED
             }
         }
-        
+
         checkAllPermissions()
     }
-    
+
     fun allPermissionsGranted(): Boolean {
-        return cameraGranted.value && bluetoothGranted.value && 
-               locationGranted.value && notificationGranted.value
+        return cameraGranted.value &&
+            bluetoothGranted.value &&
+            locationGranted.value &&
+            notificationGranted.value
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(authRequestReceiver)
@@ -382,16 +470,27 @@ class MainActivity : FragmentActivity() {
         super.onNewIntent(intent)
         intent?.let { incoming ->
             if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
-                val authRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    incoming.getParcelableExtra(AuthRequestManager.EXTRA_AUTH_REQUEST, AuthRequest::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    incoming.getParcelableExtra<AuthRequest>(AuthRequestManager.EXTRA_AUTH_REQUEST)
-                }
+                val authRequest =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        incoming.getParcelableExtra(
+                            AuthRequestManager.EXTRA_AUTH_REQUEST,
+                            AuthRequest::class.java,
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        incoming.getParcelableExtra<AuthRequest>(
+                            AuthRequestManager.EXTRA_AUTH_REQUEST
+                        )
+                    }
                 authRequest?.let {
                     val notifAction = incoming.getStringExtra("notification_action")
                     when (notifAction) {
-                        "deny" -> handleAuthResponse(it.requestId, approved = false, signedChallenge = null)
+                        "deny" ->
+                            handleAuthResponse(
+                                it.requestId,
+                                approved = false,
+                                signedChallenge = null,
+                            )
                         "approve" -> handleAuthRequest(it)
                         else -> handleAuthRequest(it)
                     }
@@ -405,52 +504,47 @@ class MainActivity : FragmentActivity() {
 fun TapAuthApp() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? MainActivity
-    
+
     // Observe individual permission states from activity
     val allGranted = activity?.allPermissionsGranted() ?: false
-    
+
     // Show permission request screen if not all granted
     if (!allGranted) {
         PermissionRequestScreen(activity)
         return
     }
-    
+
     // All permissions granted, show main app
     var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
-    
+
     when (val screen = currentScreen) {
         is AppScreen.Home -> {
             HomeScreen(
                 onStartScanning = { currentScreen = AppScreen.Scanner },
                 onViewDevices = { currentScreen = AppScreen.DeviceList },
-                onSettings = { currentScreen = AppScreen.Settings }
+                onSettings = { currentScreen = AppScreen.Settings },
             )
         }
         is AppScreen.Scanner -> {
             QRScannerScreen(
-                onQRCodeScanned = { pairingUrl ->
-                    currentScreen = AppScreen.Pairing(pairingUrl)
-                },
-                onBack = { currentScreen = AppScreen.Home }
+                onQRCodeScanned = { pairingUrl -> currentScreen = AppScreen.Pairing(pairingUrl) },
+                onBack = { currentScreen = AppScreen.Home },
             )
         }
         is AppScreen.Pairing -> {
             PairingScreen(
                 pairingUrl = screen.url,
                 onPairingComplete = { currentScreen = AppScreen.Home },
-                onPairingFailed = { /* Handle error specifically if necessary (currently this callback is unused) */ },
-                onBack = { currentScreen = AppScreen.Home }
+                onPairingFailed = { /* Handle error specifically if necessary (currently this callback is unused) */
+                },
+                onBack = { currentScreen = AppScreen.Home },
             )
         }
         is AppScreen.DeviceList -> {
-            DeviceListScreen(
-                onBack = { currentScreen = AppScreen.Home }
-            )
+            DeviceListScreen(onBack = { currentScreen = AppScreen.Home })
         }
         is AppScreen.Settings -> {
-            SettingsScreen(
-                onBack = { currentScreen = AppScreen.Home }
-            )
+            SettingsScreen(onBack = { currentScreen = AppScreen.Home })
         }
     }
 }
@@ -462,130 +556,120 @@ fun PermissionRequestScreen(activity: MainActivity?) {
     val bluetoothGranted by activity?.bluetoothGranted ?: remember { mutableStateOf(false) }
     val locationGranted by activity?.locationGranted ?: remember { mutableStateOf(false) }
     val notificationGranted by activity?.notificationGranted ?: remember { mutableStateOf(false) }
-    
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
-    ) {
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(32.dp),
+            modifier = Modifier.fillMaxSize().padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+            verticalArrangement = Arrangement.Center,
         ) {
             Text(
                 text = "Permissions Required",
                 style = MaterialTheme.typography.headlineMedium,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.primary,
             )
-            
+
             Spacer(modifier = Modifier.height(24.dp))
-            
+
             Text(
                 text = "Grant each permission individually:",
                 style = MaterialTheme.typography.bodyLarge,
-                textAlign = TextAlign.Center
+                textAlign = TextAlign.Center,
             )
-            
+
             Spacer(modifier = Modifier.height(24.dp))
-            
+
             // Camera Permission
             PermissionButton(
                 label = "Camera",
                 description = "For scanning QR codes",
                 isGranted = cameraGranted,
-                onClick = { activity?.requestCamera() }
+                onClick = { activity?.requestCamera() },
             )
-            
+
             Spacer(modifier = Modifier.height(12.dp))
-            
+
             // Bluetooth Permission
             PermissionButton(
                 label = "Bluetooth",
                 description = "For BLE authentication",
                 isGranted = bluetoothGranted,
-                onClick = { activity?.requestBluetooth() }
+                onClick = { activity?.requestBluetooth() },
             )
-            
+
             Spacer(modifier = Modifier.height(12.dp))
-            
+
             // Location Permission
             PermissionButton(
                 label = "Location",
                 description = "Required for BLE scanning",
                 isGranted = locationGranted,
-                onClick = { activity?.requestLocation() }
+                onClick = { activity?.requestLocation() },
             )
-            
+
             Spacer(modifier = Modifier.height(12.dp))
-            
+
             // Notification Permission
             PermissionButton(
                 label = "Notifications",
                 description = "For auth requests",
                 isGranted = notificationGranted,
-                onClick = { activity?.requestNotification() }
+                onClick = { activity?.requestNotification() },
             )
         }
     }
 }
 
 @Composable
-fun PermissionButton(
-    label: String,
-    description: String,
-    isGranted: Boolean,
-    onClick: () -> Unit
-) {
+fun PermissionButton(label: String, description: String, isGranted: Boolean, onClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isGranted) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceVariant
-            }
-        )
+        colors =
+            CardDefaults.cardColors(
+                containerColor =
+                    if (isGranted) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    }
+            ),
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = label,
                     style = MaterialTheme.typography.titleMedium,
-                    color = if (isGranted) {
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    }
+                    color =
+                        if (isGranted) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                 )
                 Text(
                     text = description,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (isGranted) {
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    }
+                    color =
+                        if (isGranted) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                 )
             }
-            
+
             if (isGranted) {
                 Text(
                     text = "✓",
                     style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary
+                    color = MaterialTheme.colorScheme.primary,
                 )
             } else {
-                Button(onClick = onClick) {
-                    Text("Grant")
-                }
+                Button(onClick = onClick) { Text("Grant") }
             }
         }
     }
@@ -593,8 +677,12 @@ fun PermissionButton(
 
 sealed class AppScreen {
     object Home : AppScreen()
+
     object Scanner : AppScreen()
+
     data class Pairing(val url: PairingUrl) : AppScreen()
+
     object DeviceList : AppScreen()
+
     object Settings : AppScreen()
 }
