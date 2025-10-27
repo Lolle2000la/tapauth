@@ -31,6 +31,11 @@ import androidx.compose.ui.platform.LocalContext
 import dev.rourunisen.tapauth.data.AppConfiguration
 import java.text.DateFormat
 import java.util.Date
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -41,6 +46,8 @@ fun SettingsScreen(
     val config = AppConfiguration.getInstance(context)
     val coroutineScope = rememberCoroutineScope()
     var showBatteryConfirm by remember { mutableStateOf(false) }
+    var udpPortText by remember { mutableStateOf(config.udpPort.toString()) }
+    var udpPortError by remember { mutableStateOf<String?>(null) }
     // Observe live state from ServiceStatusManager
     val udpState by dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.collectAsState(initial = config.udpRunning)
     val bleState by dev.rourunisen.tapauth.service.ServiceStatusManager.bleRunning.collectAsState(initial = config.bleRunning)
@@ -157,6 +164,57 @@ fun SettingsScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    // UDP Port Configuration
+                    Text(
+                        text = "Network Configuration",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = udpPortText,
+                        onValueChange = { newValue ->
+                            udpPortText = newValue
+                            val port = newValue.toIntOrNull()
+                            when {
+                                port == null -> {
+                                    udpPortError = "Must be a number"
+                                }
+                                port < 1024 -> {
+                                    udpPortError = "Port must be ≥ 1024"
+                                }
+                                port > 65535 -> {
+                                    udpPortError = "Port must be ≤ 65535"
+                                }
+                                else -> {
+                                    udpPortError = null
+                                    config.udpPort = port
+                                    // Restart UDP service if running to apply new port
+                                    coroutineScope.launch {
+                                        if (udpState) {
+                                            dev.rourunisen.tapauth.service.AuthenticationService.stop(context)
+                                            kotlinx.coroutines.delay(500)
+                                            dev.rourunisen.tapauth.service.AuthenticationService.start(context)
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        label = { Text("UDP Port") },
+                        supportingText = {
+                            Text(
+                                if (udpPortError != null) udpPortError!!
+                                else "Default: 36692 (Requires service restart if running)",
+                                color = if (udpPortError != null) MaterialTheme.colorScheme.error
+                                       else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        },
+                        isError = udpPortError != null,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    
                     HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
 
                     // Battery optimization prompt
