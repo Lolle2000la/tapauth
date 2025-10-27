@@ -9,6 +9,9 @@ pub mod ble {
 
     /// Server Response Characteristic UUID (Server writes auth response to this)
     pub const SERVER_RESPONSE_CHAR_UUID: &str = "ca6238be-c194-49b7-855b-58f41d3da626";
+
+    /// Client Confirmation Characteristic UUID (Server reads confirmation from this)
+    pub const CLIENT_CONFIRMATION_CHAR_UUID: &str = "ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf";
 }
 
 /// Pairing QR code URL format

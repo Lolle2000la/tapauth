@@ -25,7 +25,7 @@ This rotating identifier allows the Server (phone) to recognize a trusted Client
 
 ### Characteristics
 
-Once a BLE connection is established, the TapAuth service shall expose two characteristics for the exchange of the full, encrypted protocol messages.
+Once a BLE connection is established, the TapAuth service shall expose three characteristics for the exchange of the full, encrypted protocol messages.
 
 1. **Client Command Characteristic**
    * **UUID**: `caf54438-9d78-4697-8886-0a4cfa87ba8d`
@@ -35,7 +35,24 @@ Once a BLE connection is established, the TapAuth service shall expose two chara
 2. **Server Response Characteristic**
    * **UUID**: `ca6238be-c194-49b7-855b-58f41d3da626`
    * **Properties**: `NOTIFY`
-   * **Purpose**: The Server (phone) sends the `EncryptedPacket` containing the `AuthenticationGrant` or `AuthenticationDenial` message to the Client via a notification on this characteristic.
+   * **Purpose**: The Server (phone) sends the `EncryptedPacket` containing the `AuthenticationGrant` or `AuthenticationDenial` message to the Client via a notification on this characteristic. Per the authentication flow specification, the Server will retransmit the response every 500ms until a confirmation is received or timeout occurs.
+
+3. **Client Confirmation Characteristic**
+   * **UUID**: `ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf`
+   * **Properties**: `READ`
+   * **Purpose**: The Client (desktop) writes the `EncryptedPacket` containing a `GrantConfirmation` message to this characteristic after successfully receiving and processing an `AuthenticationGrant` or `AuthenticationDenial`. The Server reads this characteristic to detect when the Client has received the response, allowing it to stop retransmitting. This implements the confirmation mechanism required by the authentication flow specification for both UDP and BLE transports.
+
+## BLE Transport Flow
+
+The BLE transport implements the same retransmission and confirmation protocol as the UDP transport:
+
+1. **Client sends request**: The Client writes an `EncryptedPacket` containing an `AuthenticationRequest` to the **Client Command Characteristic**.
+2. **Server responds**: The Server sends an `EncryptedPacket` containing an `AuthenticationGrant` or `AuthenticationDenial` via notification on the **Server Response Characteristic**.
+3. **Retransmission**: The Server retransmits the response every 500ms by re-sending the notification.
+4. **Confirmation**: Upon receiving the response, the Client writes an `EncryptedPacket` containing a `GrantConfirmation` to the **Client Confirmation Characteristic**.
+5. **Stop retransmission**: The Server periodically reads the **Client Confirmation Characteristic** during retransmission. When it detects the confirmation, it stops retransmitting.
+
+This design ensures reliable delivery of authentication results over BLE while maintaining consistency with the UDP transport behavior specified in `authentication-flow.md`.
 
 ## BLE Security Best Practices
 

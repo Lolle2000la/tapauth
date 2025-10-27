@@ -45,6 +45,7 @@ class BleGattService : Service() {
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
         val CLIENT_COMMAND_CHAR_UUID: UUID = UUID.fromString("caf54438-9d78-4697-8886-0a4cfa87ba8d")
         val SERVER_RESPONSE_CHAR_UUID: UUID = UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
+        val CLIENT_CONFIRMATION_CHAR_UUID: UUID = UUID.fromString("ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf")
         
         fun start(context: Context) {
             val intent = Intent(context, BleGattService::class.java)
@@ -415,7 +416,7 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
-                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray())
+                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray(), null)
                 return
             }
             
@@ -430,7 +431,7 @@ class BleGattService : Service() {
             
             if (pairedDevices.isEmpty()) {
                 Log.w(TAG, "No paired devices found, rejecting BLE request")
-                sendResponseToClient(gatt, "NO_PAIRED_DEVICES".toByteArray())
+                sendResponseToClient(gatt, "NO_PAIRED_DEVICES".toByteArray(), null)
                 return
             }
             
@@ -456,7 +457,7 @@ class BleGattService : Service() {
             
             if (matchedDevice == null) {
                 Log.w(TAG, "No device matched the temporal ID")
-                sendResponseToClient(gatt, "UNKNOWN_DEVICE".toByteArray())
+                sendResponseToClient(gatt, "UNKNOWN_DEVICE".toByteArray(), null)
                 return
             }
             
@@ -465,7 +466,7 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(matchedDevice.csk, data)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
-                sendResponseToClient(gatt, "DECRYPTION_ERROR".toByteArray())
+                sendResponseToClient(gatt, "DECRYPTION_ERROR".toByteArray(), null)
                 return
             }
             
@@ -474,7 +475,7 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(wrapperMessageBytes)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
-                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray())
+                sendResponseToClient(gatt, "PARSE_ERROR".toByteArray(), null)
                 return
             }
             
@@ -486,7 +487,7 @@ class BleGattService : Service() {
                 Log.w(TAG, "  Device: ${matchedDevice.displayName}")
                 Log.w(TAG, "  Allowed users: ${matchedDevice.allowedUsers}")
                 // Silently reject - send generic error to avoid username enumeration
-                sendResponseToClient(gatt, "UNAUTHORIZED".toByteArray())
+                sendResponseToClient(gatt, "UNAUTHORIZED".toByteArray(), null)
                 return
             }
             
@@ -499,7 +500,7 @@ class BleGattService : Service() {
             // Step 5: Replay attack mitigation
             if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
                 Log.w(TAG, "BLE replay attack detected, rejecting request")
-                sendResponseToClient(gatt, "REPLAY_DETECTED".toByteArray())
+                sendResponseToClient(gatt, "REPLAY_DETECTED".toByteArray(), null)
                 return
             }
             
@@ -513,7 +514,7 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(requestJson)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to serialize BLE request for verification", e)
-                sendResponseToClient(gatt, "VERIFICATION_ERROR".toByteArray())
+                sendResponseToClient(gatt, "VERIFICATION_ERROR".toByteArray(), null)
                 return
             }
             
@@ -531,7 +532,7 @@ class BleGattService : Service() {
             
             if (!isValid) {
                 Log.w(TAG, "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request")
-                sendResponseToClient(gatt, "INVALID_SIGNATURE".toByteArray())
+                sendResponseToClient(gatt, "INVALID_SIGNATURE".toByteArray(), null)
                 return
             }
             
@@ -568,11 +569,11 @@ class BleGattService : Service() {
                             wrapperMessage
                         )
                         
-                        sendResponseToClient(gatt, encryptedPacket)
+                        sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
-                        sendResponseToClient(gatt, "ERROR".toByteArray())
+                        sendResponseToClient(gatt, "ERROR".toByteArray(), null)
                     }
                 } else {
                     Log.d(TAG, "BLE auth request denied or timed out")
@@ -592,22 +593,26 @@ class BleGattService : Service() {
                             wrapperMessage
                         )
                         
-                        sendResponseToClient(gatt, encryptedPacket)
+                        sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
-                        sendResponseToClient(gatt, "ERROR".toByteArray())
+                        sendResponseToClient(gatt, "ERROR".toByteArray(), null)
                     }
                 }
             }
             
         } catch (e: Exception) {
             Log.e(TAG, "Error handling BLE authentication request", e)
-            sendResponseToClient(gatt, "ERROR".toByteArray())
+            sendResponseToClient(gatt, "ERROR".toByteArray(), null)
         }
     }
     
-    private fun sendResponseToClient(gatt: BluetoothGatt, response: ByteArray) {
+    /**
+     * Send response to client with retransmission (per spec: 500ms interval)
+     * If challenge is provided, will retransmit until GrantConfirmation is received
+     */
+    private fun sendResponseToClient(gatt: BluetoothGatt, response: ByteArray, challenge: ByteArray?) {
         if (ActivityCompat.checkSelfPermission(
                 this,
                 Manifest.permission.BLUETOOTH_CONNECT
@@ -619,15 +624,77 @@ class BleGattService : Service() {
         
         // Write to the server response characteristic on the client's GATT server
         val service = gatt.getService(SERVICE_UUID)
-        val characteristic = service?.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
+        val responseChar = service?.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
+        val confirmationChar = service?.getCharacteristic(CLIENT_CONFIRMATION_CHAR_UUID)
         
-        if (characteristic != null) {
-            characteristic.value = response
-            gatt.writeCharacteristic(characteristic)
+        if (responseChar != null) {
+            responseChar.value = response
+            gatt.writeCharacteristic(responseChar)
             Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
+            
+            // If challenge provided, start retransmission with confirmation checking
+            if (challenge != null && confirmationChar != null) {
+                serviceScope.launch {
+                    retransmitWithConfirmationCheck(gatt, responseChar, confirmationChar, response, challenge)
+                }
+            }
         } else {
             Log.e(TAG, "Server response characteristic not found on client")
             gatt.disconnect()
+        }
+    }
+    
+    /**
+     * Retransmit response every 500ms until confirmation received or timeout
+     */
+    private suspend fun retransmitWithConfirmationCheck(
+        gatt: BluetoothGatt,
+        responseChar: BluetoothGattCharacteristic,
+        confirmationChar: BluetoothGattCharacteristic,
+        response: ByteArray,
+        challenge: ByteArray
+    ) {
+        val startTime = System.currentTimeMillis()
+        val maxDuration = 10_000L // 10 seconds max retransmission
+        var attempt = 0
+        
+        withContext(Dispatchers.IO) {
+            while (System.currentTimeMillis() - startTime < maxDuration && isActive) {
+                delay(500) // 500ms interval per spec
+                attempt++
+                
+                // Try to read confirmation characteristic
+                if (ActivityCompat.checkSelfPermission(
+                        this@BleGattService,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    break
+                }
+                
+                // Read confirmation - this is synchronous in older Android APIs
+                if (gatt.readCharacteristic(confirmationChar)) {
+                    // Wait a bit for the read to complete
+                    delay(100)
+                    
+                    val confirmationBytes = confirmationChar.value
+                    if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
+                        Log.d(TAG, "Received confirmation, stopping retransmission")
+                        break
+                    }
+                }
+                
+                // Retransmit
+                responseChar.value = response
+                if (gatt.writeCharacteristic(responseChar)) {
+                    Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
+                } else {
+                    Log.w(TAG, "Failed to retransmit BLE response")
+                    break
+                }
+            }
+            
+            Log.d(TAG, "BLE retransmission ended after $attempt attempts")
         }
     }
     

@@ -157,7 +157,8 @@ impl BleAuthHandler {
     /// Run GATT server and wait for authentication response
     async fn run_gatt_server(&self, request: &AuthRequest, timeout: Duration) -> AuthResult {
         use shared::models::ble::{
-            CLIENT_COMMAND_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID, SERVICE_UUID,
+            CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID,
+            SERVICE_UUID,
         };
 
         tracing::info!("Setting up GATT server");
@@ -166,6 +167,10 @@ impl BleAuthHandler {
         let response_data: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let response_data_clone = response_data.clone();
 
+        // Shared state for sending confirmation
+        let confirmation_data: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let confirmation_data_for_read = confirmation_data.clone();
+
         // Prepare request data
         let request_data = Arc::new(request.encrypted_packet.clone());
 
@@ -173,6 +178,7 @@ impl BleAuthHandler {
         let service_uuid = SERVICE_UUID.parse().unwrap();
         let client_cmd_uuid = CLIENT_COMMAND_CHAR_UUID.parse().unwrap();
         let server_resp_uuid = SERVER_RESPONSE_CHAR_UUID.parse().unwrap();
+        let client_conf_uuid = CLIENT_CONFIRMATION_CHAR_UUID.parse().unwrap();
 
         // Client Command Characteristic - Server (Android Central) READS auth request from this
         // Desktop (Peripheral) provides the authentication request here
@@ -220,11 +226,41 @@ impl BleAuthHandler {
             ..Default::default()
         };
 
+        // Client Confirmation Characteristic - Server (Android Central) READS confirmation from this
+        // Desktop (Peripheral) provides the GrantConfirmation here
+        let client_conf_char = Characteristic {
+            uuid: client_conf_uuid,
+            read: Some(CharacteristicRead {
+                read: true,
+                fun: Box::new(move |_req| {
+                    let conf_data = confirmation_data_for_read.clone();
+                    Box::pin(async move {
+                        let data = conf_data.lock().await;
+                        match &*data {
+                            Some(bytes) => {
+                                tracing::debug!(
+                                    "GATT: Server reading confirmation ({} bytes)",
+                                    bytes.len()
+                                );
+                                Ok(bytes.clone())
+                            }
+                            None => {
+                                tracing::debug!("GATT: No confirmation available yet");
+                                Ok(vec![])
+                            }
+                        }
+                    })
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
         // Create GATT service
         let service = Service {
             uuid: service_uuid,
             primary: true,
-            characteristics: vec![client_cmd_char, server_resp_char],
+            characteristics: vec![client_cmd_char, server_resp_char, client_conf_char],
             ..Default::default()
         };
 
@@ -263,7 +299,24 @@ impl BleAuthHandler {
 
                     match result {
                         AuthResult::Granted | AuthResult::Denied => {
-                            // Valid response - success or explicit denial
+                            // Valid response - create and store confirmation per spec
+                            tracing::debug!(
+                                "Creating GrantConfirmation to halt server retransmissions"
+                            );
+                            if let Ok(conf_bytes) =
+                                self.create_confirmation(&request.encrypted_packet).await
+                            {
+                                *confirmation_data.lock().await = Some(conf_bytes);
+                                tracing::debug!(
+                                    "GrantConfirmation stored and ready for server to read"
+                                );
+                            } else {
+                                tracing::warn!("Failed to create GrantConfirmation");
+                            }
+
+                            // Keep GATT server alive briefly to allow server to read confirmation
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
                             drop(app_handle);
                             return result;
                         }
@@ -339,5 +392,65 @@ impl BleAuthHandler {
                 AuthResult::Error
             }
         }
+    }
+
+    /// Create a GrantConfirmation message to send back to the server
+    async fn create_confirmation(&self, request_packet: &[u8]) -> Result<Vec<u8>, String> {
+        use prost::Message;
+        use shared::config::ClientConfigManager;
+        use shared::protocol::messages::create_grant_confirmation;
+        use shared::protocol::packet::{
+            create_encrypted_packet_with_csk_nonce, wrap_grant_confirmation,
+        };
+        use shared::protocol::pb::EncryptedPacket;
+
+        // Decode the original request to extract the challenge
+        let request_encrypted_packet = EncryptedPacket::decode(&request_packet[..])
+            .map_err(|e| format!("Failed to decode request packet: {}", e))?;
+
+        // We need to decrypt it to get the challenge
+        let config_manager = ClientConfigManager::new();
+        let csk = config_manager
+            .load_csk()
+            .map_err(|e| format!("Failed to load CSK: {}", e))?;
+
+        let request_wrapper = shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce(
+            &csk,
+            &request_encrypted_packet,
+        )
+        .map_err(|e| format!("Failed to decrypt request: {}", e))?;
+
+        // Extract challenge from the request
+        let challenge = shared::protocol::packet::extract_challenge(&request_wrapper)
+            .ok_or_else(|| "No challenge in request".to_string())?;
+
+        if challenge.len() != 32 {
+            return Err(format!("Invalid challenge length: {}", challenge.len()));
+        }
+
+        let mut challenge_array = [0u8; 32];
+        challenge_array.copy_from_slice(&challenge);
+
+        // Load keypair to sign the confirmation
+        let keypair = config_manager
+            .load_keypair()
+            .map_err(|e| format!("Failed to load keypair: {}", e))?;
+
+        // Create and sign the confirmation
+        let confirmation = create_grant_confirmation(&keypair, &challenge_array)
+            .map_err(|e| format!("Failed to create confirmation: {}", e))?;
+
+        // Wrap and encrypt it
+        let wrapper = wrap_grant_confirmation(confirmation);
+        let encrypted_packet = create_encrypted_packet_with_csk_nonce(&csk, &wrapper)
+            .map_err(|e| format!("Failed to encrypt confirmation: {}", e))?;
+
+        // Serialize to bytes
+        let mut bytes = Vec::new();
+        encrypted_packet
+            .encode(&mut bytes)
+            .map_err(|e| format!("Failed to encode confirmation: {}", e))?;
+
+        Ok(bytes)
     }
 }
