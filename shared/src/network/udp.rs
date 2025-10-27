@@ -133,42 +133,23 @@ pub fn is_ipv6_available() -> bool {
 }
 
 /// Create a UDP socket for broadcasting/multicasting (async)
-/// Uses dual-stack (IPv6 with IPv4-mapped addresses) to receive responses from both protocols
+/// Binds to 0.0.0.0:0 which on most systems with dual-stack kernel support
+/// will receive both IPv4 packets and IPv6 packets as IPv4-mapped addresses
 pub async fn create_broadcast_socket() -> Result<UdpSocket, NetworkError> {
-    // Try to create dual-stack socket (IPv6 that also handles IPv4)
-    // This allows receiving responses regardless of which protocol the server uses
-    match UdpSocket::bind("[::]:0").await {
-        Ok(socket) => {
-            // Try to enable dual-stack mode (accept IPv4-mapped IPv6 addresses)
-            // This may fail on some systems, but is best effort
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                let raw_fd = socket.as_raw_fd();
-                unsafe {
-                    let optval: libc::c_int = 0; // 0 = enable dual-stack
-                    libc::setsockopt(
-                        raw_fd,
-                        libc::IPPROTO_IPV6,
-                        libc::IPV6_V6ONLY,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    );
-                }
-            }
+    // Bind to 0.0.0.0:0 for receiving responses
+    // On dual-stack systems, this will receive:
+    // 1. IPv4 unicast responses directly
+    // 2. IPv6 unicast responses as IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.set_broadcast(true)?;
 
-            // Enable broadcast for IPv4-mapped addresses
-            socket.set_broadcast(true)?;
-            Ok(socket)
-        }
-        Err(_) => {
-            // Fallback to IPv4-only if IPv6 not available
-            tracing::debug!("IPv6 socket creation failed, falling back to IPv4-only");
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
-            socket.set_broadcast(true)?;
-            Ok(socket)
-        }
-    }
+    let local_addr = socket.local_addr()?;
+    tracing::info!(
+        "Created broadcast socket on {} (will receive IPv4 and IPv4-mapped IPv6 responses)",
+        local_addr
+    );
+
+    Ok(socket)
 }
 
 /// Create a UDP socket for listening on a specific port (async)
@@ -295,6 +276,13 @@ pub async fn receive_udp_packet(
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
     let mut buf = [0u8; 65536];
     let (len, addr) = socket.recv_from(&mut buf).await?;
+
+    tracing::debug!(
+        "Received UDP packet from {} ({} bytes, protocol: {})",
+        addr,
+        len,
+        if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+    );
 
     let packet = EncryptedPacket::decode(&buf[..len])?;
     Ok((packet, addr))
