@@ -377,7 +377,7 @@ fun TapAuthApp() {
             PairingScreen(
                 pairingUrl = screen.url,
                 onPairingComplete = { currentScreen = AppScreen.Home },
-                onPairingFailed = { /* TODO: Show error */ },
+                onPairingFailed = { /* Handle error specifically if necessary (currently this callback is unused) */ },
                 onBack = { currentScreen = AppScreen.Home }
             )
         }
