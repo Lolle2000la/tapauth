@@ -171,4 +171,51 @@ mod tests {
             assert!(verify_temporal_identifier(&csk, &previous_id).unwrap());
         }
     }
+
+    #[test]
+    fn test_different_csk_produces_different_identifier() {
+        let csk1 = ClientSymmetricKey::generate();
+        let csk2 = ClientSymmetricKey::generate();
+        let window = current_time_window();
+
+        let id1 = generate_temporal_identifier(&csk1, window).unwrap();
+        let id2 = generate_temporal_identifier(&csk2, window).unwrap();
+
+        // Different keys should produce different identifiers
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_temporal_identifier_length() {
+        let csk = ClientSymmetricKey::generate();
+        let id = generate_current_temporal_identifier(&csk).unwrap();
+
+        // Should be exactly 16 bytes
+        assert_eq!(id.len(), 16);
+    }
+
+    #[test]
+    fn test_verify_wrong_key_fails() {
+        let csk1 = ClientSymmetricKey::generate();
+        let csk2 = ClientSymmetricKey::generate();
+
+        let id = generate_current_temporal_identifier(&csk1).unwrap();
+
+        // Verification with wrong key should fail
+        assert!(!verify_temporal_identifier(&csk2, &id).unwrap());
+    }
+
+    #[test]
+    fn test_old_identifier_does_not_verify() {
+        let csk = ClientSymmetricKey::generate();
+        let current_window = current_time_window();
+
+        // Generate identifier from 2 windows ago
+        if current_window > 1 {
+            let old_id = generate_temporal_identifier(&csk, current_window - 2).unwrap();
+
+            // Should not verify (only current and previous are accepted)
+            assert!(!verify_temporal_identifier(&csk, &old_id).unwrap());
+        }
+    }
 }

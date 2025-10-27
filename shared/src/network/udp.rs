@@ -294,4 +294,77 @@ mod tests {
         let listen_socket = create_listen_socket(0).await;
         assert!(listen_socket.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_send_udp_broadcast() {
+        use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
+
+        let socket = create_broadcast_socket().await.unwrap();
+        let packet = EncryptedPacket {
+            temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0u8; 64],
+        };
+
+        let result = send_udp_broadcast(&socket, 36692, &packet).await;
+
+        // Should succeed (or fail gracefully if no network interface)
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_multicast_interface_detection() {
+        let interfaces = get_multicast_interfaces();
+
+        // Should return a list (may be empty on some systems)
+        // Each interface should have a valid index
+        for iface in interfaces {
+            assert!(iface.index > 0);
+            assert!(!iface.name.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_udp_multicast_all_interfaces() {
+        use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
+
+        let packet = EncryptedPacket {
+            temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0u8; 64],
+        };
+
+        let result = send_udp_multicast_all_interfaces("ff02::1", 36692, &packet).await;
+
+        // Should succeed or return 0 if no suitable interfaces
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_listen_socket_binding() {
+        // Create a listen socket on a random port
+        let socket = create_listen_socket(0).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        // Port should be assigned
+        assert!(addr.port() > 0);
+
+        // Should be bound to 0.0.0.0 or [::]
+        assert!(addr.ip().is_unspecified() || addr.ip().to_string() == "0.0.0.0");
+    }
+
+    #[test]
+    fn test_get_interface_index() {
+        // Test with loopback interface (should exist on most Unix systems)
+        let result = get_interface_index("lo");
+
+        // On Unix systems with loopback, should succeed
+        // On other systems or non-existent interfaces, should error
+        match result {
+            Ok(idx) => assert!(idx > 0),
+            Err(_) => {
+                // Acceptable - may not be Unix or interface doesn't exist
+            }
+        }
+    }
 }

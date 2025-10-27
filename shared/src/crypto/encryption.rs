@@ -203,4 +203,78 @@ mod tests {
 
         assert_eq!(plaintext, decrypted.as_slice());
     }
+
+    #[test]
+    fn test_wrong_key_decryption_fails() {
+        let csk1 = ClientSymmetricKey::generate();
+        let csk2 = ClientSymmetricKey::generate();
+        let challenge = [3u8; 32];
+        let context = b"test";
+        let plaintext = b"data";
+
+        let ciphertext = encrypt_with_csk(&csk1, &challenge, context, plaintext).unwrap();
+
+        // Decryption with wrong key should fail
+        let result = decrypt_with_csk(&csk2, &challenge, context, &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrong_context_decryption_fails() {
+        let csk = ClientSymmetricKey::generate();
+        let challenge = [4u8; 32];
+        let plaintext = b"data";
+
+        let ciphertext = encrypt_with_csk(&csk, &challenge, b"context1", plaintext).unwrap();
+
+        // Decryption with wrong context should fail (different nonce)
+        let result = decrypt_with_csk(&csk, &challenge, b"context2", &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        let csk = ClientSymmetricKey::generate();
+        let challenge = [5u8; 32];
+        let context = b"test";
+        let plaintext = b"data";
+
+        let mut ciphertext = encrypt_with_csk(&csk, &challenge, context, plaintext).unwrap();
+
+        // Tamper with ciphertext
+        if !ciphertext.is_empty() {
+            ciphertext[0] ^= 0xFF;
+        }
+
+        // Decryption should fail due to authentication tag mismatch
+        let result = decrypt_with_csk(&csk, &challenge, context, &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_plaintext_encryption() {
+        let csk = ClientSymmetricKey::generate();
+        let challenge = [6u8; 32];
+        let context = b"test";
+        let plaintext = b"";
+
+        let ciphertext = encrypt_with_csk(&csk, &challenge, context, plaintext).unwrap();
+        let decrypted = decrypt_with_csk(&csk, &challenge, context, &ciphertext).unwrap();
+
+        assert_eq!(plaintext, decrypted.as_slice());
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_large_plaintext_encryption() {
+        let csk = ClientSymmetricKey::generate();
+        let challenge = [7u8; 32];
+        let context = b"test";
+        let plaintext = vec![42u8; 10000]; // 10KB of data
+
+        let ciphertext = encrypt_with_csk(&csk, &challenge, context, &plaintext).unwrap();
+        let decrypted = decrypt_with_csk(&csk, &challenge, context, &ciphertext).unwrap();
+
+        assert_eq!(plaintext, decrypted);
+    }
 }

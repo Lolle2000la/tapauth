@@ -400,4 +400,57 @@ mod tests {
         assert_eq!(config.udp_port, deserialized.udp_port);
         assert_eq!(config.use_tpm, deserialized.use_tpm);
     }
+
+    #[test]
+    fn test_paired_server_user_authorization() {
+        let server = PairedServer {
+            name: "TestServer".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec!["alice".to_string(), "bob".to_string()],
+            paired_at: chrono::Utc::now(),
+        };
+
+        // Allowed users should pass
+        assert!(server.is_user_allowed("alice"));
+        assert!(server.is_user_allowed("bob"));
+
+        // Non-allowed users should fail
+        assert!(!server.is_user_allowed("charlie"));
+        assert!(!server.is_user_allowed(""));
+    }
+
+    #[test]
+    fn test_paired_server_empty_allowed_users() {
+        // SECURITY: Empty allowed_users list should deny all users
+        let server = PairedServer {
+            name: "TestServer".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec![],
+            paired_at: chrono::Utc::now(),
+        };
+
+        // No user should be allowed when list is empty
+        assert!(!server.is_user_allowed("alice"));
+        assert!(!server.is_user_allowed("root"));
+        assert!(!server.is_user_allowed(""));
+    }
+
+    #[test]
+    fn test_paired_client_serialization() {
+        let client = PairedClient {
+            hostname: "client-laptop".to_string(),
+            public_key: "def456".to_string(),
+            csk: "encrypted_key_data".to_string(),
+            allowed_users: vec!["user1".to_string()],
+            paired_at: chrono::Utc::now(),
+        };
+
+        let json = serde_json::to_string(&client).unwrap();
+        let deserialized: PairedClient = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(client.hostname, deserialized.hostname);
+        assert_eq!(client.public_key, deserialized.public_key);
+        assert_eq!(client.csk, deserialized.csk);
+        assert_eq!(client.allowed_users, deserialized.allowed_users);
+    }
 }

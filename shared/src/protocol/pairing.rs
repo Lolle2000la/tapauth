@@ -485,4 +485,109 @@ mod tests {
         // Verify CSK matches
         assert_eq!(server_csk.as_bytes(), client_csk.as_bytes());
     }
+
+    #[tokio::test]
+    async fn test_pairing_device_names() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server_keypair = Ed25519KeyPair::generate();
+            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
+
+            let (_, _, client_device_name, _) = session
+                .complete_pairing(stream, "MyAndroidPhone")
+                .await
+                .unwrap();
+            client_device_name
+        });
+
+        let client_task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client_keypair = Ed25519KeyPair::generate();
+            let csk = ClientSymmetricKey::generate();
+            let mut session = ClientPairingSession::new(client_keypair);
+
+            let (stream, _, server_device_name, _) = session
+                .initiate_pairing(stream, "LinuxDesktop")
+                .await
+                .unwrap();
+
+            session
+                .finish_pairing(stream, &csk, "testuser")
+                .await
+                .unwrap();
+
+            server_device_name
+        });
+
+        let (server_result, client_result) = tokio::join!(server_task, client_task);
+        let client_device_name = server_result.unwrap();
+        let server_device_name = client_result.unwrap();
+
+        // Verify device names were exchanged correctly
+        assert_eq!(client_device_name, "LinuxDesktop");
+        assert_eq!(server_device_name, "MyAndroidPhone");
+    }
+
+    #[tokio::test]
+    async fn test_pairing_with_empty_device_names() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server_keypair = Ed25519KeyPair::generate();
+            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
+
+            session.complete_pairing(stream, "").await
+        });
+
+        let client_task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client_keypair = Ed25519KeyPair::generate();
+            let csk = ClientSymmetricKey::generate();
+            let mut session = ClientPairingSession::new(client_keypair);
+
+            let result = session.initiate_pairing(stream, "").await;
+            if let Ok((stream, _, _, _)) = result {
+                session.finish_pairing(stream, &csk, "testuser").await
+            } else {
+                result.map(|_| ())
+            }
+        });
+
+        let (server_result, client_result) = tokio::join!(server_task, client_task);
+
+        // Empty device names should still work (they're just display names)
+        assert!(server_result.is_ok());
+        assert!(client_result.is_ok());
+    }
+
+    #[test]
+    fn test_client_session_public_keys() {
+        let keypair = Ed25519KeyPair::generate();
+        let session = ClientPairingSession::new(keypair.clone());
+
+        // X25519 public key should be 32 bytes
+        assert_eq!(session.x25519_public_key().len(), 32);
+
+        // Ed25519 public key should match the input keypair
+        assert_eq!(
+            session.ed25519_public_key(),
+            keypair.verifying_key_bytes()
+        );
+    }
+
+    #[test]
+    fn test_server_session_creation() {
+        let ed25519_public = [42u8; 32];
+        let session = ServerPairingSession::new(ed25519_public);
+
+        // Should store the provided public key
+        assert_eq!(session.ed25519_public_key, ed25519_public);
+    }
 }

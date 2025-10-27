@@ -75,4 +75,25 @@ mod tests {
     fn test_session_timeout() {
         assert_eq!(get_session_timeout(), Duration::from_secs(120));
     }
+
+    #[test]
+    fn test_retry_interval_max_backoff() {
+        // After 5 attempts, backoff should cap at 6400ms
+        assert_eq!(get_client_retry_interval(5), Duration::from_millis(6400));
+
+        // Further attempts should stay at max
+        assert_eq!(get_client_retry_interval(6), Duration::from_millis(6400));
+        assert_eq!(get_client_retry_interval(10), Duration::from_millis(6400));
+        assert_eq!(get_client_retry_interval(100), Duration::from_millis(6400));
+    }
+
+    #[test]
+    fn test_retry_interval_exponential_growth() {
+        // Verify exponential backoff sequence
+        assert_eq!(get_client_retry_interval(0), Duration::from_millis(200)); // 200 * 2^0
+        assert_eq!(get_client_retry_interval(1), Duration::from_millis(400)); // 200 * 2^1
+        assert_eq!(get_client_retry_interval(2), Duration::from_millis(800)); // 200 * 2^2
+        assert_eq!(get_client_retry_interval(3), Duration::from_millis(1600)); // 200 * 2^3
+        assert_eq!(get_client_retry_interval(4), Duration::from_millis(3200)); // 200 * 2^4
+    }
 }

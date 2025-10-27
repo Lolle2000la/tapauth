@@ -353,4 +353,93 @@ mod tests {
         request.timestamp_unix_seconds = 1000;
         assert!(!is_request_timestamp_valid(&request));
     }
+
+    #[test]
+    fn test_auth_denial_creation_and_verification() {
+        let keypair = Ed25519KeyPair::generate();
+        let challenge = [5u8; 32];
+
+        let denial = create_auth_denial(&keypair, &challenge).unwrap();
+
+        assert_eq!(denial.challenge.len(), 32);
+        assert!(!denial.signature.is_empty());
+
+        // Verification should succeed
+        verify_auth_denial(&denial, &keypair.verifying_key_bytes()).unwrap();
+
+        // Verification should fail with wrong key
+        let other_keypair = Ed25519KeyPair::generate();
+        assert!(verify_auth_denial(&denial, &other_keypair.verifying_key_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_grant_confirmation_creation_and_verification() {
+        let keypair = Ed25519KeyPair::generate();
+        let challenge = [7u8; 32];
+
+        let confirmation = create_grant_confirmation(&keypair, &challenge).unwrap();
+
+        assert_eq!(confirmation.challenge.len(), 32);
+        assert!(!confirmation.signature.is_empty());
+
+        // Verification should succeed
+        verify_grant_confirmation(&confirmation, &keypair.verifying_key_bytes()).unwrap();
+
+        // Verification should fail with wrong key
+        let other_keypair = Ed25519KeyPair::generate();
+        assert!(
+            verify_grant_confirmation(&confirmation, &other_keypair.verifying_key_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_auth_cancel_creation_and_verification() {
+        let keypair = Ed25519KeyPair::generate();
+        let challenge = [9u8; 32];
+
+        let cancel = create_auth_cancel(&keypair, &challenge).unwrap();
+
+        assert_eq!(cancel.challenge.len(), 32);
+        assert!(!cancel.signature.is_empty());
+
+        // Verification should succeed
+        verify_auth_cancel(&cancel, &keypair.verifying_key_bytes()).unwrap();
+
+        // Verification should fail with wrong key
+        let other_keypair = Ed25519KeyPair::generate();
+        assert!(verify_auth_cancel(&cancel, &other_keypair.verifying_key_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_invalid_challenge_length() {
+        let keypair = Ed25519KeyPair::generate();
+
+        // Too short
+        let short_challenge = [1u8; 16];
+        assert!(create_auth_grant(&keypair, &short_challenge).is_err());
+        assert!(create_auth_denial(&keypair, &short_challenge).is_err());
+        assert!(create_grant_confirmation(&keypair, &short_challenge).is_err());
+        assert!(create_auth_cancel(&keypair, &short_challenge).is_err());
+
+        // Too long
+        let long_challenge = [1u8; 64];
+        assert!(create_auth_grant(&keypair, &long_challenge).is_err());
+    }
+
+    #[test]
+    fn test_tampered_signature_detection() {
+        let keypair = Ed25519KeyPair::generate();
+        let challenge = [3u8; 32];
+
+        let mut grant = create_auth_grant(&keypair, &challenge).unwrap();
+
+        // Tamper with signature
+        if !grant.signature.is_empty() {
+            grant.signature[0] ^= 0xFF;
+        }
+
+        // Verification should fail
+        assert!(verify_auth_grant(&grant, &challenge, &keypair.verifying_key_bytes()).is_err());
+    }
 }

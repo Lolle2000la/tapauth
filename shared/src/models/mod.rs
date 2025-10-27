@@ -115,4 +115,57 @@ mod tests {
         assert_eq!(info.port, 12345);
         assert!(info.ipv4.is_some());
     }
+
+    #[test]
+    fn test_pairing_url_missing_required_fields() {
+        // Missing public key
+        let url1 = "tapauth://pair?v=1&p=12345";
+        assert!(pairing::PairingInfo::parse(url1).is_err());
+
+        // Missing port
+        let url2 = "tapauth://pair?v=1&pk=aabbccdd";
+        assert!(pairing::PairingInfo::parse(url2).is_err());
+
+        // Missing version
+        let url3 = "tapauth://pair?pk=aabbccdd&p=12345";
+        assert!(pairing::PairingInfo::parse(url3).is_err());
+    }
+
+    #[test]
+    fn test_pairing_url_with_ipv6() {
+        use std::net::Ipv6Addr;
+
+        let url = pairing::generate_pairing_url(
+            "test123",
+            8080,
+            None,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        );
+
+        assert!(url.contains("pk=test123"));
+        assert!(url.contains("p=8080"));
+        assert!(url.contains("ip6="));
+    }
+
+    #[test]
+    fn test_pairing_url_round_trip() {
+        use std::net::Ipv4Addr;
+
+        let original_key = "fedcba9876543210";
+        let original_port = 9999;
+        let original_ip = Ipv4Addr::new(10, 0, 0, 1);
+
+        let url = pairing::generate_pairing_url(original_key, original_port, Some(original_ip), None);
+        let parsed = pairing::PairingInfo::parse(&url).unwrap();
+
+        assert_eq!(parsed.public_key_hex, original_key);
+        assert_eq!(parsed.port, original_port);
+        assert_eq!(parsed.ipv4, Some(original_ip));
+    }
+
+    #[test]
+    fn test_pairing_url_invalid_scheme() {
+        let url = "http://pair?v=1&pk=aabbccdd&p=12345";
+        assert!(pairing::PairingInfo::parse(url).is_err());
+    }
 }
