@@ -378,6 +378,15 @@ impl AuthenticationClient {
                         }
                         Ok(false) => {
                             // Authentication denied
+                            // Per spec: must send GrantConfirmation to halt retransmissions
+                            tracing::info!("Processing denial response");
+                            if !confirmation_sent {
+                                tracing::debug!(
+                                    "Sending confirmation to server to halt retransmissions"
+                                );
+                                self.send_confirmation(&socket, port).await?;
+                                confirmation_sent = true;
+                            }
                             return Err(AuthError::Denied);
                         }
                         Err(e) => {
