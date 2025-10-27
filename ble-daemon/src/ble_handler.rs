@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 pub struct BleAuthHandler {
-    session: Session,
+    #[allow(dead_code)]
+    session: Session, // should persist for lifetime of the handler
     adapter: Adapter,
 }
 
