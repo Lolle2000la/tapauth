@@ -133,10 +133,42 @@ pub fn is_ipv6_available() -> bool {
 }
 
 /// Create a UDP socket for broadcasting/multicasting (async)
+/// Uses dual-stack (IPv6 with IPv4-mapped addresses) to receive responses from both protocols
 pub async fn create_broadcast_socket() -> Result<UdpSocket, NetworkError> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.set_broadcast(true)?;
-    Ok(socket)
+    // Try to create dual-stack socket (IPv6 that also handles IPv4)
+    // This allows receiving responses regardless of which protocol the server uses
+    match UdpSocket::bind("[::]:0").await {
+        Ok(socket) => {
+            // Try to enable dual-stack mode (accept IPv4-mapped IPv6 addresses)
+            // This may fail on some systems, but is best effort
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let raw_fd = socket.as_raw_fd();
+                unsafe {
+                    let optval: libc::c_int = 0; // 0 = enable dual-stack
+                    libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_V6ONLY,
+                        &optval as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+            }
+
+            // Enable broadcast for IPv4-mapped addresses
+            socket.set_broadcast(true)?;
+            Ok(socket)
+        }
+        Err(_) => {
+            // Fallback to IPv4-only if IPv6 not available
+            tracing::debug!("IPv6 socket creation failed, falling back to IPv4-only");
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.set_broadcast(true)?;
+            Ok(socket)
+        }
+    }
 }
 
 /// Create a UDP socket for listening on a specific port (async)
