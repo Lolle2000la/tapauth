@@ -163,7 +163,7 @@ pub fn verify_auth_grant(
                 [..std::cmp::min(16, hex::encode(&grant.signature).len())],
             grant.signature.len()
         );
-        return Err(ProtocolError::Crypto(e.into()));
+        return Err(ProtocolError::Crypto(e));
     }
 
     // Second check: signed_challenge is a signature over the original challenge
@@ -181,7 +181,7 @@ pub fn verify_auth_grant(
                 [..std::cmp::min(16, hex::encode(&grant.signed_challenge).len())],
             grant.signed_challenge.len()
         );
-        return Err(ProtocolError::Crypto(e.into()));
+        return Err(ProtocolError::Crypto(e));
     }
 
     Ok(())

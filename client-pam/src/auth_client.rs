@@ -165,7 +165,7 @@ impl AuthenticationClient {
         // Clone data for the BLE task
         let self_ble = self.clone();
         let packet_ble = packet.clone();
-        let temporal_id_ble = temporal_id.clone();
+        let temporal_id_ble = temporal_id;
 
         let mut ble_handle = tokio::spawn(async move {
             self_ble

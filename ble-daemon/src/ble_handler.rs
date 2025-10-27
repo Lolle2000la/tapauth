@@ -346,7 +346,7 @@ impl BleAuthHandler {
         use shared::protocol::pb::{wrapper_message, EncryptedPacket};
 
         // Parse encrypted packet
-        let encrypted_packet = match EncryptedPacket::decode(&response_bytes[..]) {
+        let encrypted_packet = match EncryptedPacket::decode(response_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to decode response: {}", e);
@@ -405,7 +405,7 @@ impl BleAuthHandler {
         use shared::protocol::pb::EncryptedPacket;
 
         // Decode the original request to extract the challenge
-        let request_encrypted_packet = EncryptedPacket::decode(&request_packet[..])
+        let request_encrypted_packet = EncryptedPacket::decode(request_packet)
             .map_err(|e| format!("Failed to decode request packet: {}", e))?;
 
         // We need to decrypt it to get the challenge

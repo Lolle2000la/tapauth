@@ -12,7 +12,7 @@ use shared::{
     models::pairing::generate_pairing_url,
     protocol::ClientPairingSession,
 };
-use std::sync::Arc;
+use std::rc::Rc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
@@ -33,7 +33,7 @@ struct PairingSessionState {
 #[derive(Debug, Clone)]
 pub enum PairingState {
     Loading,
-    ShowingQRCode { url: String, qr_data: Arc<QrData> },
+    ShowingQRCode { url: String, qr_data: Rc<QrData> },
     VerifyingSAS { sas: String, port: u16 },
     CompletingPairing,
     Success { device_id: String },
@@ -70,7 +70,7 @@ impl PairingScreen {
                 if data.starts_with("tapauth://") {
                     // This is the QR code URL - create QR data here in UI thread
                     let qr_data = match QrData::new(&data) {
-                        Ok(qr) => Arc::new(qr),
+                        Ok(qr) => std::rc::Rc::new(qr),
                         Err(_) => {
                             return Task::done(ScreenMessage::PairingFailed(
                                 "Failed to generate QR code".to_string(),
@@ -170,7 +170,7 @@ impl PairingScreen {
     fn view_qr_code<'a>(
         &self,
         url: &'a str,
-        qr_data: &'a Arc<QrData>,
+        qr_data: &'a Rc<QrData>,
     ) -> Element<'a, ScreenMessage> {
         let back_button = button(text("Cancel").size(16))
             .padding(10)

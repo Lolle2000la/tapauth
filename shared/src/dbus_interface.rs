@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 /// This module defines the D-Bus API contract between the PAM module and the BLE daemon.
 /// The daemon runs as a system service and handles BLE advertising and authentication,
 /// while the PAM module communicates with it via synchronous D-Bus calls.
-
 #[cfg(feature = "dbus")]
 use zbus::zvariant::Type;
 

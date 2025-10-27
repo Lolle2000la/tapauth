@@ -1,7 +1,6 @@
 use crate::auth_client::AuthenticationClient;
 use crate::pam_sys;
 use std::os::raw::c_int;
-use tracing_subscriber;
 
 /// Initialize logging for PAM module
 fn init_logging() {
