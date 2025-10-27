@@ -62,8 +62,49 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("D-Bus service registered at {}", DBUS_OBJECT_PATH);
     tracing::info!("TapAuth BLE Daemon ready");
 
-    // Keep the daemon running
-    std::future::pending::<()>().await;
+    // Keep the daemon running until a shutdown signal is received
+    // This ensures proper cleanup when the service is stopped
+    shutdown_signal().await;
+
+    tracing::info!("TapAuth BLE Daemon shutting down...");
+
+    // Note: When this function exits, Rust's drop handlers will run:
+    // - The D-Bus connection will be dropped, unregistering the service
+    // - Any active BLE advertisements will be unregistered
+    // - The tokio runtime will shut down all spawned tasks
+    // This prevents "zombie" advertisements in bluetoothd
 
     Ok(())
+}
+
+/// Wait for a shutdown signal (SIGTERM, SIGINT, or Ctrl+C)
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    // Set up signal handlers
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl+C)");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM");
+        },
+    }
 }

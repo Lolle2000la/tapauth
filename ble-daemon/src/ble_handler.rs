@@ -67,16 +67,79 @@ impl BleAuthHandler {
             ..Default::default()
         };
 
-        let adv_handle = match self.adapter.advertise(advertisement).await {
-            Ok(h) => {
-                tracing::info!("BLE advertising started");
-                h
+        // Retry advertising up to 5 times with increasing delays
+        // This handles the "Busy" error that can occur when the adapter hasn't
+        // fully released previous advertisements or bluetoothd is temporarily busy
+        let mut adv_handle = None;
+        const MAX_ATTEMPTS: u32 = 5;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.adapter.advertise(advertisement.clone()).await {
+                Ok(h) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            "BLE advertising started (succeeded on attempt {})",
+                            attempt
+                        );
+                    } else {
+                        tracing::info!("BLE advertising started");
+                    }
+                    adv_handle = Some(h);
+                    break;
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    let is_busy = error_msg.contains("Busy") || error_msg.contains("0x0a");
+
+                    if attempt < MAX_ATTEMPTS {
+                        if is_busy {
+                            tracing::warn!(
+                                "BLE advertising is busy, retrying in 1s (attempt {}/{})",
+                                attempt,
+                                MAX_ATTEMPTS
+                            );
+                            // Use longer delay for "Busy" errors to allow bluetoothd to clean up
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else {
+                            tracing::warn!(
+                                "Failed to start BLE advertising (attempt {}): {}. Retrying...",
+                                attempt,
+                                e
+                            );
+                            // Use shorter delay for other errors
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    } else {
+                        tracing::error!(
+                            "Failed to start BLE advertising after {} attempts: {}",
+                            attempt,
+                            e
+                        );
+                        if is_busy {
+                            tracing::error!(
+                                "Bluetooth advertising slots are full or not releasing properly."
+                            );
+                            tracing::error!("This usually means:");
+                            tracing::error!(
+                                "  1. Another application is using all advertising slots"
+                            );
+                            tracing::error!(
+                                "  2. Previous daemon instances didn't shut down cleanly"
+                            );
+                            tracing::error!("  3. bluetoothd needs to be restarted");
+                            tracing::error!("Try: sudo systemctl restart bluetooth");
+                        } else {
+                            tracing::error!(
+                                "Check if other applications are using Bluetooth advertising"
+                            );
+                        }
+                        return AuthResult::Error;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to start BLE advertising: {}", e);
-                return AuthResult::Error;
-            }
-        };
+        }
+
+        let adv_handle = adv_handle.expect("adv_handle should be set if loop succeeded");
 
         // Set up GATT server
         let result = self
@@ -225,7 +288,7 @@ impl BleAuthHandler {
 
     /// Process the BLE response from server
     async fn process_response(&self, response_bytes: &[u8]) -> AuthResult {
-        use shared::protocol::pb::{wrapper_message, EncryptedPacket};
+        use shared::protocol::pb::EncryptedPacket;
 
         // Parse encrypted packet
         let encrypted_packet = match EncryptedPacket::decode(&response_bytes[..]) {
