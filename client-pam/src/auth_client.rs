@@ -147,7 +147,10 @@ impl AuthenticationClient {
         {
             // BLE not compiled, fall back to UDP only
             tracing::info!("BLE not available, using UDP only");
-            self.try_udp_authentication(&packet).await
+            // Create a dummy cancellation channel that will never be triggered
+            let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            self.try_udp_authentication_with_cancellation(&packet, cancel_rx)
+                .await
         }
     }
 
@@ -167,6 +170,10 @@ impl AuthenticationClient {
             BleClient::new().await.ok(), // Wrap in Option - if BLE client creation fails, we'll just use UDP
         ));
 
+        // Create cancellation channels for both tasks
+        let (ble_cancel_tx, ble_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (udp_cancel_tx, udp_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Clone data for the BLE task
         let self_ble = self.clone();
         let packet_ble = packet.clone();
@@ -175,10 +182,11 @@ impl AuthenticationClient {
 
         let mut ble_handle = tokio::spawn(async move {
             self_ble
-                .try_ble_authentication_with_client(
+                .try_ble_authentication_with_cancellation(
                     &packet_ble,
                     &temporal_id_ble,
                     ble_client_for_auth,
+                    ble_cancel_rx,
                 )
                 .await
         });
@@ -187,8 +195,11 @@ impl AuthenticationClient {
         let self_udp = self.clone();
         let packet_udp = packet.clone();
 
-        let mut udp_handle =
-            tokio::spawn(async move { self_udp.try_udp_authentication(&packet_udp).await });
+        let mut udp_handle = tokio::spawn(async move {
+            self_udp
+                .try_udp_authentication_with_cancellation(&packet_udp, udp_cancel_rx)
+                .await
+        });
 
         let mut ble_completed = false;
         let mut udp_completed = false;
@@ -207,23 +218,21 @@ impl AuthenticationClient {
                         // Task succeeded with Ok(())
                         Ok(Ok(())) => {
                             tracing::info!("BLE authentication granted");
-                            udp_handle.abort(); // Cancel UDP task
-                            // Wait for UDP task to finish cleanup only if it hasn't completed
-                            if !udp_completed {
-                                let _ = udp_handle.await;
-                                tracing::debug!("UDP task cleanup completed");
-                            }
+                            // Send cancellation signal to UDP task
+                            let _ = udp_cancel_tx.send(());
+                            // Abort UDP task and don't wait
+                            udp_handle.abort();
+                            tracing::debug!("UDP task cancelled and aborted");
                             return Ok(());
                         }
                         // Task succeeded with Err(Denied)
                         Ok(Err(AuthError::Denied)) => {
                             tracing::warn!("BLE authentication explicitly denied");
-                            udp_handle.abort(); // Cancel UDP task
-                            // Wait for UDP task to finish cleanup only if it hasn't completed
-                            if !udp_completed {
-                                let _ = udp_handle.await;
-                                tracing::debug!("UDP task cleanup completed");
-                            }
+                            // Send cancellation signal to UDP task
+                            let _ = udp_cancel_tx.send(());
+                            // Abort UDP task and don't wait
+                            udp_handle.abort();
+                            tracing::debug!("UDP task cancelled and aborted");
                             return Err(AuthError::Denied);
                         }
                         // Task succeeded with a different error
@@ -248,20 +257,22 @@ impl AuthenticationClient {
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication granted");
 
-                            // Cancel BLE authentication to stop advertising
+                            // Send cancellation signal to BLE task FIRST (doesn't need lock)
+                            let _ = ble_cancel_tx.send(());
+
+                            // Now cancel BLE authentication to stop advertising (needs lock)
+                            // The BLE task will have received the signal and should exit soon,
+                            // releasing its lock, so this should not deadlock
                             if let Some(ref client) = *ble_client.lock().await {
-                                tracing::info!("Cancelling BLE authentication");
+                                tracing::info!("Cancelling BLE authentication via D-Bus");
                                 if let Err(e) = client.cancel().await {
                                     tracing::warn!("Failed to cancel BLE authentication: {}", e);
                                 }
                             }
 
-                            ble_handle.abort(); // Cancel BLE task
-                            // Wait for BLE task to finish cleanup only if it hasn't completed
-                            if !ble_completed {
-                                let _ = ble_handle.await;
-                                tracing::debug!("BLE task cleanup completed");
-                            }
+                            // Abort the BLE task - don't wait since it might be blocked
+                            ble_handle.abort();
+                            tracing::debug!("BLE task cancelled and aborted");
                             return Ok(());
                         }
                         // Task succeeded with an error
@@ -291,47 +302,81 @@ impl AuthenticationClient {
     }
 
     #[cfg(feature = "ble")]
-    /// Try authentication over BLE via the daemon with an existing client
-    async fn try_ble_authentication_with_client(
+    /// Try authentication over BLE via the daemon with cancellation support
+    async fn try_ble_authentication_with_cancellation(
         &self,
         packet: &EncryptedPacket,
         temporal_id: &[u8; 10],
         ble_client: std::sync::Arc<tokio::sync::Mutex<Option<BleClient>>>,
+        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), AuthError> {
-        tracing::info!("Starting BLE authentication via daemon");
+        use tokio::select;
 
-        // Get the client from the Arc
-        let client_guard = ble_client.lock().await;
-        let client = match client_guard.as_ref() {
-            Some(c) => c,
-            None => {
-                return Err(AuthError::BleError("BLE client not available".to_string()));
+        tracing::info!("Starting BLE authentication via daemon with cancellation support");
+
+        // Get the client from the Arc - we'll acquire and release the lock quickly
+        // to avoid holding it during the long authentication operation
+        let (packet_bytes, timeout_secs) = {
+            let client_guard = ble_client.lock().await;
+            let client = match client_guard.as_ref() {
+                Some(c) => c,
+                None => {
+                    return Err(AuthError::BleError("BLE client not available".to_string()));
+                }
+            };
+
+            // Check if daemon is available
+            if !client.is_daemon_available().await {
+                return Err(AuthError::BleError(
+                    "BLE daemon is not available".to_string(),
+                ));
+            }
+
+            // Encode the packet
+            let mut packet_bytes = Vec::new();
+            packet
+                .encode(&mut packet_bytes)
+                .map_err(|e| AuthError::BleError(format!("Failed to encode packet: {}", e)))?;
+
+            let timeout_secs = get_session_timeout().as_secs();
+
+            // Release the lock here before the long authentication call
+            (packet_bytes, timeout_secs)
+        };
+
+        // Now do the authentication WITHOUT holding the lock
+        // This allows UDP to call cancel() if it succeeds first
+        let ble_client_clone = ble_client.clone();
+
+        let auth_future = async {
+            let client_guard = ble_client_clone.lock().await;
+            let client = client_guard
+                .as_ref()
+                .ok_or_else(|| "BLE client not available".to_string())?;
+            client
+                .authenticate(packet_bytes, temporal_id.to_vec(), timeout_secs)
+                .await
+        };
+
+        // Race the authentication against cancellation
+        let result = select! {
+            auth_result = auth_future => {
+                auth_result.map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?
+            }
+            _ = &mut cancel_rx => {
+                tracing::info!("BLE authentication cancelled by signal - sending cancel to daemon");
+                // Send cancel to daemon to stop the ongoing authentication
+                // This acquires the lock, but that's OK because we're not holding it above
+                if let Some(ref client) = *ble_client.lock().await {
+                    if let Err(e) = client.cancel().await {
+                        tracing::warn!("Failed to send cancel to daemon: {}", e);
+                    }
+                }
+                return Err(AuthError::BleError("Cancelled".to_string()));
             }
         };
 
-        // Check if daemon is available
-        if !client.is_daemon_available().await {
-            return Err(AuthError::BleError(
-                "BLE daemon is not available".to_string(),
-            ));
-        }
-
-        // Encode the packet
-        let mut packet_bytes = Vec::new();
-        packet
-            .encode(&mut packet_bytes)
-            .map_err(|e| AuthError::BleError(format!("Failed to encode packet: {}", e)))?;
-
-        // Call the daemon
-        let timeout_secs = get_session_timeout().as_secs();
-        let result = client
-            .authenticate(packet_bytes, temporal_id.to_vec(), timeout_secs)
-            .await
-            .map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?;
-
-        // Drop the lock guard to release the client
-        drop(client_guard);
-        tracing::debug!("BLE client lock released");
+        tracing::debug!("BLE authentication completed");
 
         // Convert result to authentication outcome
         match result {
@@ -354,9 +399,13 @@ impl AuthenticationClient {
         }
     }
 
-    /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast)
+    /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast) with cancellation support
     #[allow(unused_assignments)]
-    async fn try_udp_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn try_udp_authentication_with_cancellation(
+        &self,
+        packet: &EncryptedPacket,
+        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), AuthError> {
         let config = self.config_manager.load_config()?;
         let port = config.udp_port;
 
@@ -370,6 +419,12 @@ impl AuthenticationClient {
         let mut final_result: Option<Result<(), AuthError>> = None;
 
         let auth_result = loop {
+            // Check for cancellation
+            if cancel_rx.try_recv().is_ok() {
+                tracing::info!("UDP authentication cancelled by signal");
+                break Err(AuthError::BleError("Cancelled".to_string()));
+            }
+
             if start.elapsed() >= timeout {
                 break Err(AuthError::Timeout);
             }
