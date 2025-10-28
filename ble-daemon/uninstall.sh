@@ -72,6 +72,22 @@ else
     echo "ℹ️  D-Bus policy not found: $DBUS_POLICY"
 fi
 
+# Remove D-Bus service activation file
+DBUS_SERVICE="/usr/share/dbus-1/system-services/dev.rourunisen.tapauth.BLE.service"
+if [ -f "$DBUS_SERVICE" ]; then
+    echo "==> Removing D-Bus service activation file..."
+    rm -f "$DBUS_SERVICE"
+    echo "✅ D-Bus service activation file removed: $DBUS_SERVICE"
+else
+    echo "ℹ️  D-Bus service activation file not found: $DBUS_SERVICE"
+fi
+
+# Reload D-Bus if any D-Bus files were removed
+if [ ! -f "$DBUS_POLICY" ] || [ ! -f "$DBUS_SERVICE" ]; then
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig || true
+    echo "✅ D-Bus configuration reloaded"
+fi
+
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  ✅ TapAuth BLE Daemon uninstalled successfully              ║"

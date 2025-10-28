@@ -41,9 +41,15 @@ echo "==> Installing D-Bus policy..."
 echo "    Installing D-Bus policy to /etc/dbus-1/system.d/"
 sudo cp dev.rourunisen.tapauth.BLE.conf /etc/dbus-1/system.d/
 sudo chmod 644 /etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf
+
+echo "==> Installing D-Bus service activation file..."
+echo "    Installing D-Bus service activation to /usr/share/dbus-1/system-services/"
+sudo cp dev.rourunisen.tapauth.BLE.service /usr/share/dbus-1/system-services/
+sudo chmod 644 /usr/share/dbus-1/system-services/dev.rourunisen.tapauth.BLE.service
+
 # Reload D-Bus configuration WITHOUT restarting the entire service
 sudo dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig
-echo "✅ D-Bus policy installed and configuration reloaded"
+echo "✅ D-Bus policy and service activation installed and configuration reloaded"
 
 echo "==> Installing systemd service..."
 

@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=dev.rourunisen.tapauth.BLE
+Exec=/bin/false
+User=root
+SystemdService=tapauth-ble-daemon.service
