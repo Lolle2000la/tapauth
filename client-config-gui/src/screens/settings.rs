@@ -1,6 +1,6 @@
 use super::ScreenMessage;
 use iced::{
-    widget::{button, column, container, text, text_input, Space},
+    widget::{button, column, container, scrollable, text, text_input, Space},
     Element, Length, Task,
 };
 use shared::config::{ClientConfig, ClientConfigManager};
@@ -144,11 +144,7 @@ impl SettingsScreen {
             text("").size(14)
         };
 
-        let content = column![
-            back_button,
-            Space::with_height(Length::Fixed(20.0)),
-            title,
-            Space::with_height(Length::Fixed(40.0)),
+        let scrollable_content = column![
             config_title,
             Space::with_height(Length::Fixed(20.0)),
             hostname_label,
@@ -167,10 +163,20 @@ impl SettingsScreen {
             Space::with_height(Length::Fixed(20.0)),
             status_text,
         ]
-        .padding(20)
         .spacing(10)
         .width(Length::Fill)
         .align_x(iced::Alignment::Center);
+
+        let content = column![
+            back_button,
+            Space::with_height(Length::Fixed(20.0)),
+            title,
+            Space::with_height(Length::Fixed(20.0)),
+            scrollable(scrollable_content),
+        ]
+        .padding(20)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         container(content)
             .width(Length::Fill)

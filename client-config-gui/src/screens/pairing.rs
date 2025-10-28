@@ -2,8 +2,8 @@ use super::ScreenMessage;
 use crate::utils::{get_local_ipv4, get_local_ipv6};
 use iced::widget::qr_code::Data as QrData;
 use iced::{
-    widget::{button, column, container, text, QRCode, Space},
-    Element, Length, Task,
+    widget::{button, column, container, row, scrollable, text, QRCode, Space},
+    Color, Element, Length, Task,
 };
 use lazy_static::lazy_static;
 use shared::{
@@ -149,10 +149,15 @@ impl PairingScreen {
             PairingState::Error { message } => self.view_error(message),
         };
 
-        container(content)
+        // Wrap content in a container with padding to center it vertically
+        let centered_content = container(content)
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .padding(40);
+
+        container(scrollable(centered_content))
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
     }
@@ -233,7 +238,12 @@ impl PairingScreen {
             .on_press(ScreenMessage::NavigateToMainMenu);
 
         column![
-            text("✓ Pairing Successful!").size(32),
+            row![
+                text("✓").size(48).color(Color::from_rgb(0.0, 0.7, 0.0)),
+                Space::with_width(Length::Fixed(15.0)),
+                text("Pairing Successful!").size(32),
+            ]
+            .align_y(iced::Alignment::Center),
             Space::with_height(Length::Fixed(20.0)),
             text(format!("Device ID: {}", device_id)).size(14),
             Space::with_height(Length::Fixed(40.0)),
@@ -249,7 +259,12 @@ impl PairingScreen {
             .on_press(ScreenMessage::NavigateToMainMenu);
 
         column![
-            text("✗ Pairing Failed").size(32),
+            row![
+                text("✗").size(48).color(Color::from_rgb(0.8, 0.0, 0.0)),
+                Space::with_width(Length::Fixed(15.0)),
+                text("Pairing Failed").size(32),
+            ]
+            .align_y(iced::Alignment::Center),
             Space::with_height(Length::Fixed(20.0)),
             text(message).size(14),
             Space::with_height(Length::Fixed(40.0)),
