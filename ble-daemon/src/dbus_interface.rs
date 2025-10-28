@@ -1,7 +1,7 @@
 //! D-Bus interface for TapAuth BLE Daemon
 //!
-//! This module defines the D-Bus interface exposed by the BLE daemon
-//! for communication with PAM modules and other clients.
+//! This module implements the server-side D-Bus interface for the BLE daemon.
+//! The interface definition is shared with clients via shared::BleService trait.
 
 use shared::AuthResult;
 use zbus::interface;
@@ -17,22 +17,27 @@ pub struct AuthRequest {
     pub timeout_secs: u64,
 }
 
-/// BLE Daemon D-Bus interface implementation
-pub struct BleService {
+/// BLE Daemon D-Bus service implementation
+///
+/// This struct implements the shared::BleService trait to expose D-Bus methods.
+pub struct BleServiceImpl {
     /// Channel to send authentication requests to the BLE handler
     auth_tx: tokio::sync::mpsc::Sender<(AuthRequest, tokio::sync::oneshot::Sender<AuthResult>)>,
+    /// Channel to signal cancellation of current authentication
+    cancel_tx: tokio::sync::broadcast::Sender<()>,
 }
 
-impl BleService {
+impl BleServiceImpl {
     pub fn new(
         auth_tx: tokio::sync::mpsc::Sender<(AuthRequest, tokio::sync::oneshot::Sender<AuthResult>)>,
+        cancel_tx: tokio::sync::broadcast::Sender<()>,
     ) -> Self {
-        Self { auth_tx }
+        Self { auth_tx, cancel_tx }
     }
 }
 
 #[interface(name = "dev.rourunisen.tapauth.BLE")]
-impl BleService {
+impl BleServiceImpl {
     /// Start BLE authentication session
     ///
     /// # Arguments
@@ -103,5 +108,13 @@ impl BleService {
     /// Get daemon version
     async fn get_version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Cancel ongoing authentication
+    /// This stops BLE advertising and returns immediately
+    async fn cancel(&self) {
+        tracing::info!("D-Bus: Received cancel request");
+        // Send cancellation signal to all subscribers
+        let _ = self.cancel_tx.send(());
     }
 }

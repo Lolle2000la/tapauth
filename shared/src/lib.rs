@@ -19,4 +19,6 @@ pub use network::NetworkError;
 pub use protocol::pb;
 
 #[cfg(feature = "dbus")]
-pub use dbus_interface::{AuthRequest, AuthResult, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
+pub use dbus_interface::{
+    AuthRequest, AuthResult, BleServiceProxy, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME,
+};

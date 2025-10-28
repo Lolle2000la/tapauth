@@ -67,3 +67,63 @@ impl AuthRequest {
         }
     }
 }
+
+/// D-Bus interface for the BLE daemon
+///
+/// This trait defines both the client proxy (via #[zbus::proxy]) and can be
+/// implemented by the server (via #[zbus::interface]). This ensures the client
+/// and server always have matching method signatures.
+///
+/// # Client Usage
+/// ```rust,ignore
+/// use shared::BleServiceProxy;
+///
+/// let connection = zbus::Connection::system().await?;
+/// let proxy = BleServiceProxy::new(&connection).await?;
+/// let result = proxy.authenticate(packet, temporal_id, timeout).await?;
+/// ```
+///
+/// # Server Implementation
+/// The daemon implements this trait and uses `#[zbus::interface]` to expose it:
+/// ```rust,ignore
+/// #[zbus::interface(name = "dev.rourunisen.tapauth.BLE")]
+/// impl BleService for MyService {
+///     async fn authenticate(...) -> u32 { ... }
+/// }
+/// ```
+#[cfg(feature = "dbus")]
+#[zbus::proxy(
+    interface = "dev.rourunisen.tapauth.BLE",
+    default_service = "dev.rourunisen.tapauth.BLE",
+    default_path = "/dev/rourunisen/tapauth/BLE"
+)]
+pub trait BleService {
+    /// Start BLE authentication session
+    ///
+    /// # Arguments
+    /// * `encrypted_packet` - Serialized EncryptedPacket containing auth request
+    /// * `temporal_id` - 10-byte temporal identifier for advertising
+    /// * `timeout_secs` - Maximum time to wait for authentication
+    ///
+    /// # Returns
+    /// * `0` - Authentication granted
+    /// * `1` - Authentication denied
+    /// * `2` - Timeout
+    /// * Other - Error code
+    async fn authenticate(
+        &self,
+        encrypted_packet: Vec<u8>,
+        temporal_id: Vec<u8>,
+        timeout_secs: u64,
+    ) -> zbus::Result<u32>;
+
+    /// Get daemon status
+    async fn get_status(&self) -> zbus::Result<String>;
+
+    /// Get daemon version
+    async fn get_version(&self) -> zbus::Result<String>;
+
+    /// Cancel ongoing authentication
+    /// This stops BLE advertising and returns immediately
+    async fn cancel(&self) -> zbus::Result<()>;
+}

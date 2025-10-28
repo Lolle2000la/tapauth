@@ -162,14 +162,24 @@ impl AuthenticationClient {
         tracing::info!("Starting parallel discovery over UDP and BLE");
         tracing::debug!("==> About to spawn UDP and BLE tasks");
 
+        // Create BLE client once for both authentication and cancellation
+        let ble_client = std::sync::Arc::new(tokio::sync::Mutex::new(
+            BleClient::new().await.ok(), // Wrap in Option - if BLE client creation fails, we'll just use UDP
+        ));
+
         // Clone data for the BLE task
         let self_ble = self.clone();
         let packet_ble = packet.clone();
         let temporal_id_ble = temporal_id;
+        let ble_client_for_auth = ble_client.clone();
 
         let mut ble_handle = tokio::spawn(async move {
             self_ble
-                .try_ble_authentication(&packet_ble, &temporal_id_ble)
+                .try_ble_authentication_with_client(
+                    &packet_ble,
+                    &temporal_id_ble,
+                    ble_client_for_auth,
+                )
                 .await
         });
 
@@ -237,6 +247,15 @@ impl AuthenticationClient {
                         // Task succeeded with Ok(())
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication granted");
+
+                            // Cancel BLE authentication to stop advertising
+                            if let Some(ref client) = *ble_client.lock().await {
+                                tracing::info!("Cancelling BLE authentication");
+                                if let Err(e) = client.cancel().await {
+                                    tracing::warn!("Failed to cancel BLE authentication: {}", e);
+                                }
+                            }
+
                             ble_handle.abort(); // Cancel BLE task
                             // Wait for BLE task to finish cleanup only if it hasn't completed
                             if !ble_completed {
@@ -272,18 +291,23 @@ impl AuthenticationClient {
     }
 
     #[cfg(feature = "ble")]
-    /// Try authentication over BLE via the daemon
-    async fn try_ble_authentication(
+    /// Try authentication over BLE via the daemon with an existing client
+    async fn try_ble_authentication_with_client(
         &self,
         packet: &EncryptedPacket,
         temporal_id: &[u8; 10],
+        ble_client: std::sync::Arc<tokio::sync::Mutex<Option<BleClient>>>,
     ) -> Result<(), AuthError> {
         tracing::info!("Starting BLE authentication via daemon");
 
-        // Create BLE client
-        let client = BleClient::new()
-            .await
-            .map_err(|e| AuthError::BleError(format!("Failed to create BLE client: {}", e)))?;
+        // Get the client from the Arc
+        let client_guard = ble_client.lock().await;
+        let client = match client_guard.as_ref() {
+            Some(c) => c,
+            None => {
+                return Err(AuthError::BleError("BLE client not available".to_string()));
+            }
+        };
 
         // Check if daemon is available
         if !client.is_daemon_available().await {
@@ -305,10 +329,9 @@ impl AuthenticationClient {
             .await
             .map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?;
 
-        // Explicitly drop the BLE client to close D-Bus connection before returning
-        // PAM modules may be unloaded immediately after return
-        drop(client);
-        tracing::debug!("BLE D-Bus connection explicitly closed");
+        // Drop the lock guard to release the client
+        drop(client_guard);
+        tracing::debug!("BLE client lock released");
 
         // Convert result to authentication outcome
         match result {

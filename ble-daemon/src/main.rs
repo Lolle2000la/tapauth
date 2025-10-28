@@ -8,7 +8,7 @@ mod ble_handler;
 mod dbus_interface;
 
 use ble_handler::BleAuthHandler;
-use dbus_interface::{AuthRequest, BleService};
+use dbus_interface::{AuthRequest, BleServiceImpl};
 use shared::{AuthResult, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +34,10 @@ async fn main() -> anyhow::Result<()> {
     let (auth_tx, mut auth_rx) =
         mpsc::channel::<(AuthRequest, tokio::sync::oneshot::Sender<AuthResult>)>(10);
 
+    // Create broadcast channel for cancellation
+    let (cancel_tx, _cancel_rx) = tokio::sync::broadcast::channel::<()>(10);
+    let cancel_tx_clone = cancel_tx.clone();
+
     // Spawn BLE authentication handler task
     let ble_handler = std::sync::Arc::new(ble_handler);
     let ble_handler_clone = ble_handler.clone();
@@ -41,9 +45,37 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("BLE authentication handler task started");
         while let Some((request, response_tx)) = auth_rx.recv().await {
             tracing::info!("Processing authentication request");
-            let result = ble_handler_clone.handle_authentication(request).await;
-            if response_tx.send(result).is_err() {
-                tracing::error!("Failed to send authentication result (receiver dropped)");
+
+            // Subscribe to cancellation for this request
+            let mut cancel_rx = cancel_tx_clone.subscribe();
+
+            // Clone handler for the task
+            let handler = ble_handler_clone.clone();
+
+            // Spawn a task for this authentication
+            let auth_task =
+                tokio::spawn(async move { handler.handle_authentication(request).await });
+
+            // Wait for either completion or cancellation
+            tokio::select! {
+                result = auth_task => {
+                    match result {
+                        Ok(auth_result) => {
+                            if response_tx.send(auth_result).is_err() {
+                                tracing::error!("Failed to send authentication result (receiver dropped)");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Authentication task panicked: {}", e);
+                            let _ = response_tx.send(AuthResult::Error);
+                        }
+                    }
+                }
+                _ = cancel_rx.recv() => {
+                    tracing::info!("Authentication cancelled");
+                    // The response channel will be dropped, causing the D-Bus call to return with error
+                    // This is acceptable - the PAM module will interpret it as cancellation
+                }
             }
         }
         tracing::warn!("BLE authentication handler task ending");
@@ -51,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up D-Bus service
     tracing::info!("Registering D-Bus service: {}", DBUS_SERVICE_NAME);
-    let service = BleService::new(auth_tx);
+    let service = BleServiceImpl::new(auth_tx, cancel_tx);
 
     let _connection = connection::Builder::system()?
         .name(DBUS_SERVICE_NAME)?

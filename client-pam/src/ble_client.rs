@@ -1,12 +1,13 @@
 /// BLE authentication client that communicates with the BLE daemon via D-Bus
 ///
 /// This module provides an async interface to the BLE daemon using zbus.
-use shared::{AuthResult, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME};
+use shared::{AuthResult, BleServiceProxy};
+use std::time::Duration;
 use zbus::Connection;
 
 /// BLE client that communicates with the BLE daemon via D-Bus (async)
 pub struct BleClient {
-    connection: Connection,
+    proxy: BleServiceProxy<'static>,
 }
 
 impl BleClient {
@@ -18,7 +19,13 @@ impl BleClient {
             .map_err(|e| format!("Failed to connect to system bus: {}", e))?;
 
         tracing::info!("Connected to D-Bus system bus");
-        Ok(Self { connection })
+
+        // Create the proxy using the shared interface definition
+        let proxy = BleServiceProxy::new(&connection)
+            .await
+            .map_err(|e| format!("Failed to create proxy: {}", e))?;
+
+        Ok(Self { proxy })
     }
 
     /// Check if the BLE daemon is available
@@ -39,27 +46,18 @@ impl BleClient {
 
     /// Get the daemon status
     async fn get_status(&self) -> Result<String, String> {
-        let proxy = zbus::Proxy::new(
-            &self.connection,
-            DBUS_SERVICE_NAME,
-            DBUS_OBJECT_PATH,
-            "dev.rourunisen.tapauth.BLE",
-        )
-        .await
-        .map_err(|e| format!("Failed to create proxy: {}", e))?;
-
-        let status: String = proxy
-            .call_method("GetStatus", &())
+        self.proxy
+            .get_status()
             .await
-            .map_err(|e| format!("GetStatus call failed: {}", e))?
-            .body()
-            .deserialize()
-            .map_err(|e| format!("Failed to parse status: {}", e))?;
-
-        Ok(status)
+            .map_err(|e| format!("GetStatus call failed: {}", e))
     }
 
     /// Authenticate via BLE using the daemon
+    ///
+    /// # Timeout
+    /// This call has a timeout of `timeout_secs + 5` seconds to account for
+    /// D-Bus overhead and daemon processing time. If the daemon doesn't respond
+    /// within this time, the call will be cancelled.
     pub async fn authenticate(
         &self,
         encrypted_packet: Vec<u8>,
@@ -73,26 +71,34 @@ impl BleClient {
             timeout_secs
         );
 
-        let proxy = zbus::Proxy::new(
-            &self.connection,
-            DBUS_SERVICE_NAME,
-            DBUS_OBJECT_PATH,
-            "dev.rourunisen.tapauth.BLE",
+        // Add extra time for D-Bus overhead and daemon processing
+        let call_timeout = Duration::from_secs(timeout_secs + 5);
+
+        // Use tokio timeout to ensure we don't hang forever
+        let result = tokio::time::timeout(
+            call_timeout,
+            self.proxy
+                .authenticate(encrypted_packet, temporal_id, timeout_secs),
         )
         .await
-        .map_err(|e| format!("Failed to create proxy: {}", e))?;
+        .map_err(|_| format!("D-Bus call timed out after {}s", call_timeout.as_secs()))?
+        .map_err(|e| format!("Authenticate call failed: {}", e))?;
 
-        let result_code: u32 = proxy
-            .call_method(
-                "Authenticate",
-                &(encrypted_packet, temporal_id, timeout_secs),
-            )
+        Ok(AuthResult::from_u32(result))
+    }
+
+    /// Cancel ongoing BLE authentication
+    /// This stops BLE advertising and makes the daemon available for new requests
+    pub async fn cancel(&self) -> Result<(), String> {
+        tracing::debug!("Cancelling BLE authentication via D-Bus");
+
+        // Cancel should be fast, use a short timeout
+        tokio::time::timeout(Duration::from_secs(2), self.proxy.cancel())
             .await
-            .map_err(|e| format!("Authenticate call failed: {}", e))?
-            .body()
-            .deserialize()
-            .map_err(|e| format!("Failed to parse result: {}", e))?;
+            .map_err(|_| "Cancel call timed out after 2s".to_string())?
+            .map_err(|e| format!("Cancel call failed: {}", e))?;
 
-        Ok(AuthResult::from_u32(result_code))
+        tracing::info!("BLE authentication cancelled");
+        Ok(())
     }
 }
