@@ -251,8 +251,30 @@ class BleGattService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate() called, starting foreground immediately.")
+
+        // Start as foreground immediately to prevent ForegroundServiceDidNotStartInTimeException
+        // This is critical because subsequent checks might stop the service.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    Log.e(TAG, "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.")
+                    // We can't show a notification, so we can't satisfy the foreground service requirements.
+                    // Stop the service gracefully. The app should handle requesting this permission.
+                    stopSelf()
+                    return
+                }
+            }
+            startForeground(NOTIFICATION_ID, createNotification())
+            Log.i(TAG, "Service is now in the foreground.")
+        } catch (e: Exception) {
+            Log.e(TAG, "FATAL: Failed to start foreground for BLE service: ${e.message}", e)
+            // If this fails, the service cannot run as intended.
+            stopSelf()
+            return
+        }
+
         Log.wtf(TAG, "=== BLE GATT SERVICE STARTING ===")
-        Log.i(TAG, "onCreate() called")
 
         deviceRepository = DeviceRepository(this)
         keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
@@ -282,16 +304,11 @@ class BleGattService : Service() {
             return
         }
 
-        // Start as foreground so the system keeps the service alive in background
+        // Update config now that we know the service is likely to run
         try {
-            startForeground(NOTIFICATION_ID, createNotification())
-            try {
-                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
-                config.bleLastStartMillis = System.currentTimeMillis()
-            } catch (_: Exception) {}
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to start foreground for BLE service: ${e.message}")
-        }
+            val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
+            config.bleLastStartMillis = System.currentTimeMillis()
+        } catch (_: Exception) {}
 
         startTemporalIdCache()
 
