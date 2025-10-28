@@ -149,8 +149,8 @@ object TapAuthCrypto {
     /**
      * Extract temporal_identifier from EncryptedPacket protobuf bytes.
      *
-     * This is used for DoS mitigation: allows checking the temporal_identifier
-     * before performing expensive decryption operations.
+     * This is used for DoS mitigation: allows checking the temporal_identifier before performing
+     * expensive decryption operations.
      *
      * @param packetBytes Serialized EncryptedPacket protobuf
      * @return 16-byte temporal_identifier
@@ -164,8 +164,8 @@ object TapAuthCrypto {
      * Returns a string indicating which oneof payload field is set.
      *
      * @param wrapperMessageBytes Serialized WrapperMessage protobuf
-     * @return "AUTH_REQUEST", "AUTH_GRANT", "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL",
-     *   or "UNKNOWN"
+     * @return "AUTH_REQUEST", "AUTH_GRANT", "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL", or
+     *   "UNKNOWN"
      * @throws IOException if the message cannot be parsed
      */
     external fun determineMessageType(wrapperMessageBytes: ByteArray): String

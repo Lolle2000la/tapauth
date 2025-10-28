@@ -102,7 +102,8 @@ class BleGattService : Service() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 super.onScanResult(callbackType, result)
 
-                // Thanks to hardware filtering, we only receive advertisements with TapAuth service
+                // Thanks to hardware filtering, we only receive advertisements with TapAuth
+                // service
                 // data
                 val scanRecord = result.scanRecord ?: return
 
@@ -257,10 +258,20 @@ class BleGattService : Service() {
         // This is critical because subsequent checks might stop the service.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                    Log.e(TAG, "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.")
-                    // We can't show a notification, so we can't satisfy the foreground service requirements.
-                    // Stop the service gracefully. The app should handle requesting this permission.
+                if (
+                    ActivityCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.e(
+                        TAG,
+                        "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
+                    )
+                    // We can't show a notification, so we can't satisfy the foreground service
+                    // requirements.
+                    // Stop the service gracefully. The app should handle requesting this
+                    // permission.
                     stopSelf()
                     return
                 }
@@ -868,8 +879,7 @@ class BleGattService : Service() {
                         BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
                     ) == BluetoothStatusCodes.SUCCESS
                 } else {
-                    @Suppress("DEPRECATION")
-                    responseChar.value = response
+                    @Suppress("DEPRECATION") responseChar.value = response
                     @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
                 }
 
@@ -954,8 +964,7 @@ class BleGattService : Service() {
                             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
                         ) == BluetoothStatusCodes.SUCCESS
                     } else {
-                        @Suppress("DEPRECATION")
-                        responseChar.value = response
+                        @Suppress("DEPRECATION") responseChar.value = response
                         @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
                     }
 

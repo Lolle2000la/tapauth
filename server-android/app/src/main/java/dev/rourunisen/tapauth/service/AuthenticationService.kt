@@ -339,8 +339,8 @@ class AuthenticationService : Service() {
     /**
      * Extract temporal_identifier from EncryptedPacket without full deserialization.
      *
-     * Uses the Rust prost library via JNI for robust protobuf parsing.
-     * This allows DoS mitigation by checking the temporal_identifier before expensive decryption.
+     * Uses the Rust prost library via JNI for robust protobuf parsing. This allows DoS mitigation
+     * by checking the temporal_identifier before expensive decryption.
      */
     private fun extractTemporalIdFromPacket(data: ByteArray): ByteArray? {
         return try {
