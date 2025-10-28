@@ -198,18 +198,22 @@ impl AuthenticationClient {
                         Ok(Ok(())) => {
                             tracing::info!("BLE authentication granted");
                             udp_handle.abort(); // Cancel UDP task
-                            // Wait for UDP task to finish cleanup
-                            let _ = udp_handle.await;
-                            tracing::debug!("UDP task cleanup completed");
+                            // Wait for UDP task to finish cleanup only if it hasn't completed
+                            if !udp_completed {
+                                let _ = udp_handle.await;
+                                tracing::debug!("UDP task cleanup completed");
+                            }
                             return Ok(());
                         }
                         // Task succeeded with Err(Denied)
                         Ok(Err(AuthError::Denied)) => {
                             tracing::warn!("BLE authentication explicitly denied");
                             udp_handle.abort(); // Cancel UDP task
-                            // Wait for UDP task to finish cleanup
-                            let _ = udp_handle.await;
-                            tracing::debug!("UDP task cleanup completed");
+                            // Wait for UDP task to finish cleanup only if it hasn't completed
+                            if !udp_completed {
+                                let _ = udp_handle.await;
+                                tracing::debug!("UDP task cleanup completed");
+                            }
                             return Err(AuthError::Denied);
                         }
                         // Task succeeded with a different error
@@ -234,9 +238,11 @@ impl AuthenticationClient {
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication granted");
                             ble_handle.abort(); // Cancel BLE task
-                            // Wait for BLE task to finish cleanup
-                            let _ = ble_handle.await;
-                            tracing::debug!("BLE task cleanup completed");
+                            // Wait for BLE task to finish cleanup only if it hasn't completed
+                            if !ble_completed {
+                                let _ = ble_handle.await;
+                                tracing::debug!("BLE task cleanup completed");
+                            }
                             return Ok(());
                         }
                         // Task succeeded with an error
