@@ -21,9 +21,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -132,13 +136,16 @@ class MainActivity : FragmentActivity() {
                         Log.e(TAG, "Biometric authentication error: $errString (code: $errorCode)")
                         // Handle current auth request
                         currentAuthRequest?.let { authRequest ->
-                            // Only ERROR_NEGATIVE_BUTTON is an explicit denial (user clicked
+                            // Only ERROR_NEGATIVE_BUTTON is an explicit denial (user
+                            // clicked
                             // "Deny")
-                            // All other errors are either dismissals, system errors, or temporary
+                            // All other errors are either dismissals, system errors, or
+                            // temporary
                             // conditions
                             when (errorCode) {
                                 BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
-                                    // User explicitly clicked "Deny" button - send denial response
+                                    // User explicitly clicked "Deny" button - send denial
+                                    // response
                                     Log.d(TAG, "User explicitly denied authentication")
                                     handleAuthResponse(
                                         authRequest.requestId,
@@ -149,7 +156,8 @@ class MainActivity : FragmentActivity() {
                                     currentAuthRequest = null
                                 }
                                 BiometricPrompt.ERROR_USER_CANCELED -> {
-                                    // User dismissed prompt (back button, tapped outside) - just
+                                    // User dismissed prompt (back button, tapped outside) -
+                                    // just
                                     // clear, don't send denial
                                     Log.d(
                                         TAG,
@@ -158,7 +166,8 @@ class MainActivity : FragmentActivity() {
                                     currentAuthRequest = null
                                 }
                                 BiometricPrompt.ERROR_CANCELED -> {
-                                    // System canceled (e.g., another biometric prompt) - keep
+                                    // System canceled (e.g., another biometric prompt) -
+                                    // keep
                                     // request active
                                     Log.d(
                                         TAG,
@@ -166,14 +175,16 @@ class MainActivity : FragmentActivity() {
                                     )
                                 }
                                 BiometricPrompt.ERROR_TIMEOUT -> {
-                                    // Biometric timeout - user can still retry, keep request active
+                                    // Biometric timeout - user can still retry, keep
+                                    // request active
                                     Log.d(
                                         TAG,
                                         "Biometric timeout, keeping request active for retry",
                                     )
                                 }
                                 BiometricPrompt.ERROR_LOCKOUT -> {
-                                    // Too many attempts - temporary lockout, keep request active
+                                    // Too many attempts - temporary lockout, keep request
+                                    // active
                                     Log.d(
                                         TAG,
                                         "Biometric lockout (temporary), keeping request active",
@@ -184,7 +195,8 @@ class MainActivity : FragmentActivity() {
                                 BiometricPrompt.ERROR_HW_UNAVAILABLE,
                                 BiometricPrompt.ERROR_NO_BIOMETRICS,
                                 BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> {
-                                    // Permanent errors - clear request without sending denial (not
+                                    // Permanent errors - clear request without sending
+                                    // denial (not
                                     // user's fault)
                                     Log.w(
                                         TAG,
@@ -663,10 +675,11 @@ fun PermissionButton(label: String, description: String, isGranted: Boolean, onC
             }
 
             if (isGranted) {
-                Text(
-                    text = "✓",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Granted",
+                    modifier = Modifier.size(32.dp),
+                    tint = MaterialTheme.colorScheme.primary,
                 )
             } else {
                 Button(onClick = onClick) { Text("Grant") }

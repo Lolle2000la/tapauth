@@ -4,6 +4,8 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -239,11 +241,11 @@ private fun SuccessView(onDone: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        Text(
-            text = "✓",
-            style = MaterialTheme.typography.displayLarge,
-            fontSize = 72.sp,
-            color = MaterialTheme.colorScheme.primary,
+        Icon(
+            imageVector = Icons.Default.CheckCircle,
+            contentDescription = "Success",
+            modifier = Modifier.size(72.dp),
+            tint = MaterialTheme.colorScheme.primary,
         )
 
         Text(
@@ -271,11 +273,11 @@ private fun FailedView(message: String, onRetry: () -> Unit, onBack: () -> Unit)
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        Text(
-            text = "✗",
-            style = MaterialTheme.typography.displayLarge,
-            fontSize = 72.sp,
-            color = MaterialTheme.colorScheme.error,
+        Icon(
+            imageVector = Icons.Default.Close,
+            contentDescription = "Error",
+            modifier = Modifier.size(72.dp),
+            tint = MaterialTheme.colorScheme.error,
         )
 
         Text(

@@ -6,6 +6,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -84,11 +87,21 @@ fun DeviceListScreen(onBack: () -> Unit) {
             text = {
                 Column {
                     if (multipleUsers) {
-                        Text(
-                            "⚠️ WARNING: This pairing is used by ${device.allowedUsers.size} users!",
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.error,
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Warning",
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                            Text(
+                                "WARNING: This pairing is used by ${device.allowedUsers.size} users!",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
                         Text("Users: ${device.allowedUsers.joinToString(", ")}")
                         Spacer(modifier = Modifier.height(8.dp))
@@ -231,13 +244,20 @@ private fun DeviceCard(
                 Column(horizontalAlignment = Alignment.End) {
                     // Remove entire device button
                     IconButton(onClick = onRemoveDevice) {
-                        Text(text = "🗑️", style = MaterialTheme.typography.titleLarge)
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Remove device",
+                            tint = MaterialTheme.colorScheme.error,
+                        )
                     }
 
                     // Manage users button (only show if multiple users)
                     if (device.allowedUsers.size > 1) {
                         IconButton(onClick = { showUserMenu = !showUserMenu }) {
-                            Text(text = "👥", style = MaterialTheme.typography.titleMedium)
+                            Icon(
+                                imageVector = Icons.Default.Person,
+                                contentDescription = "Manage users",
+                            )
                         }
                     }
                 }
