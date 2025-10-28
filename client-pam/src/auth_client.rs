@@ -59,33 +59,6 @@ pub struct AuthenticationClient {
     challenge: [u8; 32],
 }
 
-/// Check if an IP address belongs to one of this machine's network interfaces
-fn is_local_address(ip: &std::net::IpAddr) -> bool {
-    use if_addrs::get_if_addrs;
-
-    // Check if it's loopback
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Get all network interface addresses
-    match get_if_addrs() {
-        Ok(interfaces) => {
-            for iface in interfaces {
-                if iface.ip() == *ip {
-                    return true;
-                }
-            }
-            false
-        }
-        Err(_) => {
-            // If we can't get interface addresses, be conservative and don't filter
-            // (better to process a loopback than to miss a real server response)
-            false
-        }
-    }
-}
-
 impl AuthenticationClient {
     /// Create a new authentication client
     pub fn new(username: String) -> Result<Self, AuthError> {
@@ -426,7 +399,7 @@ impl AuthenticationClient {
                 match try_receive_udp_packet(&socket, retry_interval).await? {
                     Some((response_packet, server_addr)) => {
                         // Filter out packets from our own IP address (loopback from broadcasts)
-                        if is_local_address(&server_addr.ip()) {
+                        if shared::network::is_local_ip(&server_addr.ip()) {
                             tracing::debug!(
                                 "Ignoring packet from local address {} (own broadcast echo)",
                                 server_addr

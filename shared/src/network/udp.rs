@@ -1,7 +1,9 @@
 use prost::Message;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 use super::NetworkError;
@@ -10,6 +12,14 @@ use crate::protocol::pb::EncryptedPacket;
 // Track whether IPv6 is available (cached after first check)
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static IPV6_CHECKED: AtomicBool = AtomicBool::new(false);
+
+const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(5);
+static INTERFACE_ADDR_CACHE: OnceLock<RwLock<InterfaceCache>> = OnceLock::new();
+
+struct InterfaceCache {
+    addresses: Vec<IpAddr>,
+    last_refresh: Instant,
+}
 
 /// Represents a network interface suitable for IPv6 multicast
 #[derive(Debug, Clone)]
@@ -86,6 +96,56 @@ pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
     interfaces
 }
 
+/// Return true if the provided IP address belongs to a local interface on this host.
+pub fn is_local_ip(addr: &IpAddr) -> bool {
+    if addr.is_loopback() {
+        return true;
+    }
+
+    let cache = INTERFACE_ADDR_CACHE.get_or_init(|| {
+        let initial = InterfaceCache {
+            addresses: Vec::new(),
+            last_refresh: Instant::now() - INTERFACE_CACHE_TTL,
+        };
+        RwLock::new(initial)
+    });
+
+    if let Ok(guard) = cache.read() {
+        if guard.last_refresh.elapsed() < INTERFACE_CACHE_TTL && !guard.addresses.is_empty() {
+            return guard.addresses.iter().any(|ip| ip == addr);
+        }
+    }
+
+    let mut guard = match cache.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if guard.last_refresh.elapsed() >= INTERFACE_CACHE_TTL || guard.addresses.is_empty() {
+        match if_addrs::get_if_addrs() {
+            Ok(addrs) => {
+                let mut addresses = Vec::new();
+                for iface in addrs {
+                    let ip = match iface.addr {
+                        if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
+                        if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
+                    };
+                    if !addresses.contains(&ip) {
+                        addresses.push(ip);
+                    }
+                }
+                guard.addresses = addresses;
+                guard.last_refresh = Instant::now();
+            }
+            Err(_) => {
+                guard.last_refresh = Instant::now();
+            }
+        }
+    }
+
+    guard.addresses.iter().any(|ip| ip == addr)
+}
+
 /// Get the interface index for a given interface name
 /// This is needed for IPv6 multicast scope specification
 #[cfg(unix)]
@@ -135,10 +195,8 @@ pub fn is_ipv6_available() -> bool {
 /// Create a UDP socket for broadcasting/multicasting (async)
 /// Binds to the configured UDP port to receive responses on that port
 pub async fn create_broadcast_socket(port: u16) -> Result<UdpSocket, NetworkError> {
-    // Bind to the configured port for receiving responses
-    // Server will respond to this port, not to an ephemeral port
-    let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
-    socket.set_broadcast(true)?;
+    let std_socket = bind_dual_stack_socket(port, true)?;
+    let socket = UdpSocket::from_std(std_socket)?;
 
     let local_addr = socket.local_addr()?;
     tracing::info!(
@@ -151,7 +209,8 @@ pub async fn create_broadcast_socket(port: u16) -> Result<UdpSocket, NetworkErro
 
 /// Create a UDP socket for listening on a specific port (async)
 pub async fn create_listen_socket(port: u16) -> Result<UdpSocket, NetworkError> {
-    let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
+    let std_socket = bind_dual_stack_socket(port, false)?;
+    let socket = UdpSocket::from_std(std_socket)?;
     Ok(socket)
 }
 
@@ -165,6 +224,30 @@ pub async fn send_udp_broadcast(
     let addr = SocketAddr::from((Ipv4Addr::BROADCAST, port));
     socket.send_to(&data, addr).await?;
     Ok(())
+}
+
+fn bind_dual_stack_socket(
+    port: u16,
+    enable_broadcast: bool,
+) -> Result<std::net::UdpSocket, std::io::Error> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Allow the socket to accept both IPv4 and IPv6 traffic
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    if enable_broadcast {
+        socket.set_broadcast(true)?;
+    }
+
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    socket.bind(&SockAddr::from(addr))?;
+    socket.set_nonblocking(true)?;
+
+    Ok(socket.into())
 }
 
 /// Send an encrypted packet via UDP multicast on all available IPv6 interfaces
@@ -215,6 +298,16 @@ pub async fn send_udp_multicast_all_interfaces(
         if let Err(e) = socket.bind(&socket_addr.into()) {
             tracing::debug!("Failed to bind IPv6 socket for {}: {}", iface.name, e);
             continue;
+        }
+
+        // Disable loopback of multicast packets so we don't receive our own sends
+        if let Err(e) = socket.set_multicast_loop_v6(false) {
+            tracing::trace!(
+                "Failed to disable IPv6 multicast loop for {}: {}",
+                iface.name,
+                e
+            );
+            // Not fatal; continue
         }
 
         // Set the multicast interface to this specific interface
@@ -272,17 +365,42 @@ pub async fn receive_udp_packet(
     socket: &UdpSocket,
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
     let mut buf = [0u8; 65536];
-    let (len, addr) = socket.recv_from(&mut buf).await?;
 
-    tracing::trace!(
-        "Received UDP packet from {} ({} bytes, protocol: {})",
-        addr,
-        len,
-        if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-    );
+    loop {
+        let (len, addr) = socket.recv_from(&mut buf).await?;
 
-    let packet = EncryptedPacket::decode(&buf[..len])?;
-    Ok((packet, addr))
+        // Normalize IP for comparison
+        let src_ip = match addr.ip() {
+            std::net::IpAddr::V6(v6) => {
+                // Map IPv4-mapped IPv6 addresses to IPv4 for local comparison
+                if let Some(mapped) = v6.to_ipv4() {
+                    IpAddr::V4(mapped)
+                } else {
+                    IpAddr::V6(v6)
+                }
+            }
+            v4 => IpAddr::V4(match v4 {
+                std::net::IpAddr::V4(a) => a,
+                _ => unreachable!(),
+            }),
+        };
+
+        if is_local_ip(&src_ip) {
+            tracing::debug!("Ignored self-sent UDP packet from {}", addr);
+            // drop and continue waiting for next packet
+            continue;
+        }
+
+        tracing::trace!(
+            "Received UDP packet from {} ({} bytes, protocol: {})",
+            addr,
+            len,
+            if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+        );
+
+        let packet = EncryptedPacket::decode(&buf[..len])?;
+        return Ok((packet, addr));
+    }
 }
 
 /// Try to receive an encrypted packet with timeout - async
