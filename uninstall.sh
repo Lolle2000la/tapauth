@@ -14,7 +14,6 @@ NC='\033[0m' # No Color
 # Default values
 INTERACTIVE=true
 REMOVE_PAM=true
-REMOVE_BLE_DAEMON=true
 REMOVE_CONFIG_GUI=true
 REMOVE_PAM_CONFIG_LOGIN=false
 REMOVE_PAM_CONFIG_SUDO=false
@@ -26,11 +25,6 @@ DRY_RUN=false
 PAM_MODULE_DIR=""  # Will be detected based on distribution
 PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
-BLE_DAEMON_DIR="/usr/lib/tapauth"
-BLE_DAEMON_PATH="$BLE_DAEMON_DIR/tapauth-ble-daemon"
-BLE_SERVICE_PATH="/etc/systemd/system/tapauth-ble-daemon.service"
-BLE_DBUS_CONF_PATH="/etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf"
-BLE_DBUS_SERVICE_PATH="/usr/share/dbus-1/system-services/dev.rourunisen.tapauth.BLE.service"
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
@@ -116,7 +110,6 @@ OPTIONS:
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-pam                Don't remove PAM module
-    --no-ble                Don't remove BLE daemon
     --no-gui                Don't remove configuration GUI
     --remove-pam-login      Remove PAM login configuration
     --remove-pam-sudo       Remove PAM sudo configuration
@@ -131,8 +124,8 @@ EXAMPLES:
     # Non-interactive removal of everything including configs
     sudo $0 --yes --remove-pam-login --remove-pam-sudo --remove-user-data
 
-    # Remove only BLE daemon
-    sudo $0 --no-pam --no-gui
+    # Remove only PAM module
+    sudo $0 --no-gui
 
     # Dry run to see what would be removed
     sudo $0 --dry-run --yes
@@ -155,7 +148,6 @@ parse_args() {
             -y|--yes)
                 INTERACTIVE=false
                 REMOVE_PAM=true
-                REMOVE_BLE_DAEMON=true
                 REMOVE_CONFIG_GUI=true
                 REMOVE_PAM_CONFIG_LOGIN=true
                 REMOVE_PAM_CONFIG_SUDO=true
@@ -165,10 +157,6 @@ parse_args() {
                 ;;
             --no-pam)
                 REMOVE_PAM=false
-                shift
-                ;;
-            --no-ble)
-                REMOVE_BLE_DAEMON=false
                 shift
                 ;;
             --no-gui)
@@ -210,9 +198,6 @@ prompt_components() {
     
     read -p "Remove PAM module? [Y/n]: " response
     [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM=true || REMOVE_PAM=false
-    
-    read -p "Remove BLE daemon? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_BLE_DAEMON=true || REMOVE_BLE_DAEMON=false
     
     read -p "Remove configuration GUI? [Y/n]: " response
     [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_CONFIG_GUI=true || REMOVE_CONFIG_GUI=false
@@ -474,81 +459,6 @@ remove_pam() {
     fi
 }
 
-# Remove BLE daemon
-remove_ble_daemon() {
-    if [[ "$REMOVE_BLE_DAEMON" == false ]]; then
-        return
-    fi
-    
-    print_header "Removing BLE Daemon"
-    
-    if [[ "$DRY_RUN" == true ]]; then
-        print_info "[DRY RUN] Would remove BLE daemon"
-        echo ""
-        
-        if systemctl is-active --quiet tapauth-ble-daemon.service 2>/dev/null; then
-            show_command "systemctl stop tapauth-ble-daemon.service" "Stop BLE daemon"
-        fi
-        
-        if systemctl is-enabled --quiet tapauth-ble-daemon.service 2>/dev/null; then
-            show_command "systemctl disable tapauth-ble-daemon.service" "Disable service on boot"
-        fi
-        
-        show_file_removal "$BLE_SERVICE_PATH" "systemd service file"
-        show_command "systemctl daemon-reload" "Reload systemd"
-        show_file_removal "$BLE_DBUS_CONF_PATH" "D-Bus configuration"
-        show_file_removal "$BLE_DBUS_SERVICE_PATH" "D-Bus service activation file"
-        show_command "systemctl reload dbus" "Reload D-Bus"
-        show_file_removal "$BLE_DAEMON_PATH" "BLE daemon binary"
-        show_file_removal "$BLE_DAEMON_DIR" "BLE daemon directory (if empty)"
-        return
-    fi
-    
-    # Stop and disable service
-    if systemctl is-active --quiet tapauth-ble-daemon.service 2>/dev/null; then
-        print_info "Stopping BLE daemon service"
-        systemctl stop tapauth-ble-daemon.service
-    fi
-    
-    if systemctl is-enabled --quiet tapauth-ble-daemon.service 2>/dev/null; then
-        print_info "Disabling BLE daemon service"
-        systemctl disable tapauth-ble-daemon.service
-    fi
-    
-    # Remove service file
-    if [[ -f "$BLE_SERVICE_PATH" ]]; then
-        print_info "Removing systemd service file"
-        rm -f "$BLE_SERVICE_PATH"
-        systemctl daemon-reload
-    fi
-    
-    # Remove D-Bus configuration
-    if [[ -f "$BLE_DBUS_CONF_PATH" ]]; then
-        print_info "Removing D-Bus configuration"
-        rm -f "$BLE_DBUS_CONF_PATH"
-    fi
-    
-    # Remove D-Bus service activation file
-    if [[ -f "$BLE_DBUS_SERVICE_PATH" ]]; then
-        print_info "Removing D-Bus service activation file"
-        rm -f "$BLE_DBUS_SERVICE_PATH"
-    fi
-    
-    # Reload D-Bus if any D-Bus files were removed
-    if [[ ! -f "$BLE_DBUS_CONF_PATH" ]] || [[ ! -f "$BLE_DBUS_SERVICE_PATH" ]]; then
-        systemctl reload dbus || true
-    fi
-    
-    # Remove daemon binary
-    if [[ -f "$BLE_DAEMON_PATH" ]]; then
-        print_info "Removing BLE daemon binary"
-        rm -f "$BLE_DAEMON_PATH"
-        rmdir "$BLE_DAEMON_DIR" 2>/dev/null || true
-    fi
-    
-    print_success "BLE daemon removed"
-}
-
 # Remove configuration GUI
 remove_config_gui() {
     if [[ "$REMOVE_CONFIG_GUI" == false ]]; then
@@ -639,7 +549,6 @@ create_summary() {
     
     echo "Components removed:"
     [[ "$REMOVE_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module"
-    [[ "$REMOVE_BLE_DAEMON" == true ]] && echo "  ✓ BLE daemon" || echo "  ✗ BLE daemon"
     [[ "$REMOVE_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI"
     
     echo ""
@@ -689,7 +598,6 @@ main() {
     # Remove in reverse order of installation
     remove_pam_config
     remove_config_gui
-    remove_ble_daemon
     remove_pam
     remove_user_data
     
@@ -700,7 +608,6 @@ main() {
         echo ""
         echo "Components to remove:"
         [[ "$REMOVE_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module (kept)"
-        [[ "$REMOVE_BLE_DAEMON" == true ]] && echo "  ✓ BLE daemon" || echo "  ✗ BLE daemon (kept)"
         [[ "$REMOVE_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI (kept)"
         
         echo ""

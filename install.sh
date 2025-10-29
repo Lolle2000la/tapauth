@@ -14,12 +14,12 @@ NC='\033[0m' # No Color
 # Default values
 INTERACTIVE=true
 INSTALL_PAM=true
-INSTALL_BLE_DAEMON=true
 INSTALL_CONFIG_GUI=true
 CONFIGURE_PAM_LOGIN=false
 CONFIGURE_PAM_SUDO=false
 CONFIGURE_PAM_POLKIT=false
 USE_TPM=false
+USE_BLE=true
 BUILD_ONLY=false
 DRY_RUN=false
 
@@ -27,11 +27,6 @@ DRY_RUN=false
 PAM_MODULE_DIR=""  # Will be detected based on distribution
 PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
-BLE_DAEMON_DIR="/usr/lib/tapauth"
-BLE_DAEMON_PATH="$BLE_DAEMON_DIR/tapauth-ble-daemon"
-BLE_SERVICE_PATH="/etc/systemd/system/tapauth-ble-daemon.service"
-BLE_DBUS_CONF_PATH="/etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf"
-BLE_DBUS_SERVICE_PATH="/usr/share/dbus-1/system-services/dev.rourunisen.tapauth.BLE.service"
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
@@ -170,7 +165,7 @@ OPTIONS:
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-pam                Don't install PAM module
-    --no-ble                Don't install BLE daemon
+    --no-ble                Build without Bluetooth support (UDP only)
     --no-gui                Don't install configuration GUI
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
@@ -186,8 +181,8 @@ EXAMPLES:
     # Non-interactive with all components
     sudo $0 --non-interactive --configure-login --configure-sudo
 
-    # Install only PAM and BLE daemon
-    sudo $0 --no-gui --configure-login
+    # Install PAM module without Bluetooth support
+    sudo $0 --no-ble --configure-login
 
     # Build only without installing
     $0 --build-only
@@ -210,11 +205,11 @@ parse_args() {
             -y|--yes)
                 INTERACTIVE=false
                 INSTALL_PAM=true
-                INSTALL_BLE_DAEMON=true
                 INSTALL_CONFIG_GUI=true
                 CONFIGURE_PAM_LOGIN=true
                 CONFIGURE_PAM_SUDO=true
                 CONFIGURE_PAM_POLKIT=true
+                USE_BLE=true
                 shift
                 ;;
             --no-pam)
@@ -222,7 +217,7 @@ parse_args() {
                 shift
                 ;;
             --no-ble)
-                INSTALL_BLE_DAEMON=false
+                USE_BLE=false
                 shift
                 ;;
             --no-gui)
@@ -269,8 +264,8 @@ prompt_components() {
     read -p "Install PAM module? [Y/n]: " response
     [[ ! "$response" =~ ^[Nn]$ ]] && INSTALL_PAM=true || INSTALL_PAM=false
     
-    read -p "Install BLE daemon? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && INSTALL_BLE_DAEMON=true || INSTALL_BLE_DAEMON=false
+    read -p "Enable Bluetooth support? [Y/n]: " response
+    [[ ! "$response" =~ ^[Nn]$ ]] && USE_BLE=true || USE_BLE=false
     
     read -p "Install configuration GUI? [Y/n]: " response
     [[ ! "$response" =~ ^[Nn]$ ]] && INSTALL_CONFIG_GUI=true || INSTALL_CONFIG_GUI=false
@@ -387,10 +382,6 @@ check_prerequisites() {
         missing_deps+=("rustc (Rust compiler)")
     fi
     
-    if [[ "$INSTALL_BLE_DAEMON" == true ]] && ! command -v systemctl &> /dev/null; then
-        missing_deps+=("systemctl (systemd)")
-    fi
-    
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         print_error "Missing required dependencies:"
         for dep in "${missing_deps[@]}"; do
@@ -414,11 +405,32 @@ build_components() {
     local build_flags="--release"
     local rustflags="-Ctarget-cpu=native -Copt-level=3"
     
+    # Determine features to build with
+    local pam_features=""
+    if [[ "$USE_BLE" == true ]]; then
+        pam_features="--features ble"
+        print_info "Building with Bluetooth support (direct BlueZ access)"
+    else
+        pam_features="--no-default-features"
+        print_info "Building without Bluetooth support (UDP only)"
+    fi
+    
+    if [[ "$USE_TPM" == true ]]; then
+        if [[ "$USE_BLE" == true ]]; then
+            pam_features="--features ble,tpm"
+        else
+            pam_features="--features tpm"
+        fi
+        print_info "Building with TPM support"
+    fi
+    
     print_info "Building with maximum optimizations for host architecture"
     print_info "RUSTFLAGS: $rustflags"
     
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would build components"
+        echo ""
+        print_info "PAM module build flags: $pam_features"
         
         # Show which user would be used for building
         if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
@@ -462,16 +474,9 @@ build_components() {
     
     # Build PAM module
     if [[ "$INSTALL_PAM" == true ]]; then
-        print_info "Building PAM module..."
-        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam
+        print_info "Building PAM module with features: $pam_features"
+        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam $pam_features
         print_success "PAM module built"
-    fi
-    
-    # Build BLE daemon
-    if [[ "$INSTALL_BLE_DAEMON" == true ]]; then
-        print_info "Building BLE daemon..."
-        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p ble-daemon
-        print_success "BLE daemon built"
     fi
     
     # Build configuration GUI
@@ -645,76 +650,6 @@ configure_pam() {
     fi
 }
 
-# Install BLE daemon
-install_ble_daemon() {
-    if [[ "$INSTALL_BLE_DAEMON" == false ]]; then
-        return
-    fi
-    
-    print_header "Installing BLE Daemon"
-    
-    if [[ "$DRY_RUN" == true ]]; then
-        print_info "[DRY RUN] Would install BLE daemon"
-        echo ""
-        show_file_creation "$BLE_DAEMON_DIR" "BLE daemon directory"
-        show_file_copy "target/release/tapauth-ble-daemon" "$BLE_DAEMON_PATH"
-        show_command "chmod 755 $BLE_DAEMON_PATH" "Set daemon executable permissions"
-        show_file_copy "ble-daemon/dev.rourunisen.tapauth.BLE.conf" "$BLE_DBUS_CONF_PATH"
-        show_command "chmod 644 $BLE_DBUS_CONF_PATH" "Set D-Bus config permissions"
-        show_file_copy "ble-daemon/dev.rourunisen.tapauth.BLE.service" "$BLE_DBUS_SERVICE_PATH"
-        show_command "chmod 644 $BLE_DBUS_SERVICE_PATH" "Set D-Bus service activation permissions"
-        echo ""
-        echo -e "${YELLOW}[CREATE]${NC} $BLE_SERVICE_PATH (with path substitution)"
-        echo "  Source: ble-daemon/tapauth-ble-daemon.service"
-        echo "  ExecStart path: /usr/local/bin/tapauth-ble-daemon → $BLE_DAEMON_PATH"
-        show_command "systemctl daemon-reload" "Reload systemd"
-        show_command "systemctl reload dbus" "Reload D-Bus"
-        show_command "systemctl enable tapauth-ble-daemon.service" "Enable service on boot"
-        show_command "systemctl start tapauth-ble-daemon.service" "Start service"
-        return
-    fi
-    
-    # Create directory
-    mkdir -p "$BLE_DAEMON_DIR"
-    
-    # Copy daemon
-    print_info "Installing BLE daemon to $BLE_DAEMON_PATH"
-    cp target/release/tapauth-ble-daemon "$BLE_DAEMON_PATH"
-    chmod 755 "$BLE_DAEMON_PATH"
-    
-    # Install D-Bus configuration
-    print_info "Installing D-Bus configuration"
-    cp ble-daemon/dev.rourunisen.tapauth.BLE.conf "$BLE_DBUS_CONF_PATH"
-    chmod 644 "$BLE_DBUS_CONF_PATH"
-    
-    # Install D-Bus service activation file
-    print_info "Installing D-Bus service activation file"
-    cp ble-daemon/dev.rourunisen.tapauth.BLE.service "$BLE_DBUS_SERVICE_PATH"
-    chmod 644 "$BLE_DBUS_SERVICE_PATH"
-    
-    # Install systemd service
-    print_info "Installing systemd service"
-    # Create service file with correct daemon path
-    sed "s|/usr/local/bin/tapauth-ble-daemon|$BLE_DAEMON_PATH|g" \
-        ble-daemon/tapauth-ble-daemon.service > "$BLE_SERVICE_PATH"
-    chmod 644 "$BLE_SERVICE_PATH"
-    
-    # Reload systemd and D-Bus
-    systemctl daemon-reload
-    systemctl reload dbus || true
-    
-    # Enable and start service
-    print_info "Enabling and starting BLE daemon service"
-    systemctl enable tapauth-ble-daemon.service
-    systemctl start tapauth-ble-daemon.service
-    
-    if systemctl is-active --quiet tapauth-ble-daemon.service; then
-        print_success "BLE daemon installed and running"
-    else
-        print_warning "BLE daemon installed but not running. Check 'systemctl status tapauth-ble-daemon.service'"
-    fi
-}
-
 # Install configuration GUI
 install_config_gui() {
     if [[ "$INSTALL_CONFIG_GUI" == false ]]; then
@@ -773,7 +708,6 @@ create_summary() {
     
     echo "Components installed:"
     [[ "$INSTALL_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module"
-    [[ "$INSTALL_BLE_DAEMON" == true ]] && echo "  ✓ BLE daemon" || echo "  ✗ BLE daemon"
     [[ "$INSTALL_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI"
     
     echo ""
@@ -783,16 +717,14 @@ create_summary() {
     [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
     
     echo ""
-    echo "Additional settings:"
-    [[ "$USE_TPM" == true ]] && echo "  ✓ TPM enabled" || echo "  ✗ TPM disabled"
+    echo "Features enabled:"
+    [[ "$USE_BLE" == true ]] && echo "  ✓ Bluetooth (direct BlueZ)" || echo "  ✗ Bluetooth (UDP only)"
+    [[ "$USE_TPM" == true ]] && echo "  ✓ TPM support" || echo "  ✗ TPM support"
     
     echo ""
     print_info "Installation locations:"
     if [[ "$INSTALL_PAM" == true ]]; then
         echo "  - PAM module: $PAM_SO_PATH"
-    fi
-    if [[ "$INSTALL_BLE_DAEMON" == true ]]; then
-        echo "  - BLE daemon: $BLE_DAEMON_PATH"
     fi
     if [[ "$INSTALL_CONFIG_GUI" == true ]]; then
         echo "  - Config GUI: $CONFIG_GUI_PATH"
@@ -864,7 +796,6 @@ main() {
     
     install_pam
     configure_pam
-    install_ble_daemon
     install_config_gui
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -874,7 +805,6 @@ main() {
         echo ""
         echo "Components to install:"
         [[ "$INSTALL_PAM" == true ]] && echo "  ✓ PAM module → $PAM_SO_PATH" || echo "  ✗ PAM module (skipped)"
-        [[ "$INSTALL_BLE_DAEMON" == true ]] && echo "  ✓ BLE daemon → $BLE_DAEMON_PATH" || echo "  ✗ BLE daemon (skipped)"
         [[ "$INSTALL_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI → $CONFIG_GUI_PATH" || echo "  ✗ Configuration GUI (skipped)"
         
         echo ""
@@ -887,6 +817,11 @@ main() {
         echo "Configuration:"
         echo "  • Distribution: $DISTRO_NAME"
         echo "  • PAM directory: $PAM_MODULE_DIR"
+        if [[ "$USE_BLE" == true ]]; then
+            echo "  • Bluetooth support: enabled (direct BlueZ)"
+        else
+            echo "  • Bluetooth support: disabled (UDP only)"
+        fi
         if [[ "$USE_TPM" == true ]]; then
             echo "  • TPM support: enabled"
         else
