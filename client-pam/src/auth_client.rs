@@ -1,14 +1,9 @@
-use prost::Message;
 use shared::{
     config::ClientConfigManager,
     crypto::{
         generate_current_temporal_identifier_ble, ClientSymmetricKey, CryptoError, Ed25519KeyPair,
     },
-    network::{
-        create_broadcast_socket, get_client_retry_interval, get_session_timeout, is_ipv6_available,
-        send_udp_broadcast, send_udp_multicast_all_interfaces, try_receive_udp_packet,
-        IPV6_MULTICAST_ADDR,
-    },
+    network::get_session_timeout,
     protocol::{
         messages::*,
         packet::*,
@@ -17,15 +12,10 @@ use shared::{
     },
 };
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "ble")]
-use crate::ble_client::BleClient;
-
-// Track whether we've warned about IPv6 unavailability
-static IPV6_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+use crate::transport::{BleTransport, ReceiveResult, Transport, UdpTransport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -106,21 +96,16 @@ impl AuthenticationClient {
 
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
-            tracing::warn!(
-                "Total paired servers: {}, but none allow this user",
-                paired_servers.len()
-            );
             return Err(AuthError::NoPairedDevices);
         }
 
         tracing::info!(
-            "{} server(s) authorized for user {} (out of {} total)",
+            "{} server(s) authorized for user {}",
             allowed_servers.len(),
-            self.username,
-            paired_servers.len()
+            self.username
         );
 
-        // Create the authentication request using the challenge we generated
+        // Create the authentication request
         let request = create_auth_request_with_challenge(
             &self.keypair,
             &self.username,
@@ -128,289 +113,145 @@ impl AuthenticationClient {
             &self.challenge,
         )?;
         let wrapper = wrap_auth_request(request);
-
-        // Create encrypted packet
-        // Note: For authentication, we use a static nonce derived from CSK only,
-        // since the challenge is INSIDE the encrypted message and can't be used
-        // to derive the decryption nonce (chicken-egg problem).
         let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
-        // Start parallel discovery: UDP + BLE
-        // According to spec, we race both transports and use whichever responds first
+        // Try authentication with available transports
         #[cfg(feature = "ble")]
         {
-            // Try both UDP and BLE in parallel
             self.try_parallel_authentication(&packet).await
         }
 
         #[cfg(not(feature = "ble"))]
         {
-            // BLE not compiled, fall back to UDP only
-            tracing::info!("BLE not available, using UDP only");
-            // Create a dummy cancellation channel that will never be triggered
-            let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            self.try_udp_authentication_with_cancellation(&packet, cancel_rx)
+            let config = self.config_manager.load_config()?;
+            let mut transport = UdpTransport::new(config.udp_port).await?;
+            self.authenticate_with_transport(&mut transport, &packet)
                 .await
         }
     }
 
     #[cfg(feature = "ble")]
-    /// Try authentication over both UDP and BLE in parallel (spec-compliant)
     async fn try_parallel_authentication(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use tokio::select;
 
-        tracing::debug!("==> try_parallel_authentication called");
-
         let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
+        let timeout_secs = get_session_timeout().as_secs();
+
         tracing::info!("Starting parallel discovery over UDP and BLE");
-        tracing::debug!("==> About to spawn UDP and BLE tasks");
 
-        // Create BLE client once for both authentication and cancellation
-        let ble_client = std::sync::Arc::new(tokio::sync::Mutex::new(
-            BleClient::new().await.ok(), // Wrap in Option - if BLE client creation fails, we'll just use UDP
-        ));
-
-        // Create cancellation channels for both tasks
-        let (ble_cancel_tx, ble_cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let (udp_cancel_tx, udp_cancel_rx) = tokio::sync::oneshot::channel::<()>();
-
-        // Clone data for the BLE task
+        // Spawn BLE task
         let self_ble = self.clone();
         let packet_ble = packet.clone();
-        let temporal_id_ble = temporal_id;
-        let ble_client_for_auth = ble_client.clone();
-
         let mut ble_handle = tokio::spawn(async move {
-            self_ble
-                .try_ble_authentication_with_cancellation(
-                    &packet_ble,
-                    &temporal_id_ble,
-                    ble_client_for_auth,
-                    ble_cancel_rx,
-                )
-                .await
+            match BleTransport::new(temporal_id, timeout_secs).await {
+                Ok(mut transport) => {
+                    self_ble
+                        .authenticate_with_ble_transport(&mut transport, &packet_ble)
+                        .await
+                }
+                Err(e) => Err(e),
+            }
         });
 
-        // Clone data for the UDP task
+        // Spawn UDP task
         let self_udp = self.clone();
         let packet_udp = packet.clone();
-
         let mut udp_handle = tokio::spawn(async move {
-            self_udp
-                .try_udp_authentication_with_cancellation(&packet_udp, udp_cancel_rx)
-                .await
+            let config = self_udp.config_manager.load_config().unwrap();
+            match UdpTransport::new(config.udp_port).await {
+                Ok(mut transport) => {
+                    self_udp
+                        .authenticate_with_transport(&mut transport, &packet_udp)
+                        .await
+                }
+                Err(e) => Err(e),
+            }
         });
 
         let mut ble_completed = false;
         let mut udp_completed = false;
         let mut udp_result: Option<Result<(), AuthError>> = None;
 
-        tracing::debug!("==> Tasks spawned, entering select loop");
-
         loop {
             select! {
-                // Poll the BLE JoinHandle
                 result = &mut ble_handle, if !ble_completed => {
-                    tracing::info!("BLE task completed"); // Log from the task handle
                     ble_completed = true;
-
                     match result {
-                        // Task succeeded with Ok(())
                         Ok(Ok(())) => {
-                            tracing::info!("BLE authentication granted");
-                            // Send cancellation signal to UDP task
-                            let _ = udp_cancel_tx.send(());
-                            // Abort UDP task and don't wait
+                            tracing::info!("BLE authentication succeeded");
                             udp_handle.abort();
-                            tracing::debug!("UDP task cancelled and aborted");
                             return Ok(());
                         }
-                        // Task succeeded with Err(Denied)
                         Ok(Err(AuthError::Denied)) => {
-                            tracing::warn!("BLE authentication explicitly denied");
-                            // Send cancellation signal to UDP task
-                            let _ = udp_cancel_tx.send(());
-                            // Abort UDP task and don't wait
-                            udp_handle.abort();
-                            tracing::debug!("UDP task cancelled and aborted");
-                            return Err(AuthError::Denied);
+                            tracing::warn!("BLE authentication denied");
+                            if udp_completed {
+                                return udp_result.unwrap_or(Err(AuthError::Denied));
+                            }
                         }
-                        // Task succeeded with a different error
-                        Ok(Err(ref e)) => {
-                            // THIS IS THE CRITICAL LOGIC:
-                            // We log and continue, waiting for UDP. We do NOT return.
-                            tracing::warn!("BLE failed: {}, waiting for UDP", e);
+                        Ok(Err(e)) => {
+                            tracing::debug!("BLE authentication failed: {}", e);
                         }
-                        // Task panicked or was cancelled
-                        Err(join_err) => {
-                            tracing::error!("BLE task failed to execute: {}", join_err);
+                        Err(e) => {
+                            tracing::debug!("BLE task panicked: {}", e);
                         }
                     }
                 }
-                // Poll the UDP JoinHandle
                 result = &mut udp_handle, if !udp_completed => {
-                    tracing::info!("UDP task completed");
                     udp_completed = true;
-
                     match result {
-                        // Task succeeded with Ok(())
                         Ok(Ok(())) => {
-                            tracing::info!("UDP authentication granted");
-
-                            // Send cancellation signal to BLE task FIRST (doesn't need lock)
-                            let _ = ble_cancel_tx.send(());
-
-                            // Now cancel BLE authentication to stop advertising (needs lock)
-                            // The BLE task will have received the signal and should exit soon,
-                            // releasing its lock, so this should not deadlock
-                            if let Some(ref client) = *ble_client.lock().await {
-                                tracing::info!("Cancelling BLE authentication via D-Bus");
-                                if let Err(e) = client.cancel().await {
-                                    tracing::warn!("Failed to cancel BLE authentication: {}", e);
-                                }
-                            }
-
-                            // Abort the BLE task - don't wait since it might be blocked
+                            tracing::info!("UDP authentication succeeded");
                             ble_handle.abort();
-                            tracing::debug!("BLE task cancelled and aborted");
                             return Ok(());
                         }
-                        // Task succeeded with an error
                         Ok(Err(e)) => {
-                            tracing::warn!("UDP authentication failed: {}", e);
-                            udp_result = Some(Err(e)); // Store the UDP error
+                            udp_result = Some(Err(e));
                         }
-                        // Task panicked or was cancelled
-                        Err(join_err) => {
-                            tracing::error!("UDP task failed to execute: {}", join_err);
-                            udp_result = Some(Err(AuthError::InitError(format!("UDP task failed: {}", join_err))));
+                        Err(e) => {
+                            tracing::debug!("UDP task panicked: {}", e);
+                            udp_result = Some(Err(AuthError::Network(
+                                shared::network::NetworkError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("UDP task failed: {}", e),
+                                )),
+                            )));
                         }
                     }
                 }
             }
 
-            // Check if *both* have completed
             if ble_completed && udp_completed {
                 tracing::warn!("Both BLE and UDP authentication failed");
-                // Both failed. We return the stored UDP result.
-                // If UDP was OK but BLE failed, udp_result is None,
-                // but our logic above would have returned Ok(()) from the UDP branch.
-                // Therefore, if we reach this point, udp_result *must* contain an error.
-                return udp_result.unwrap();
+                return udp_result.unwrap_or(Err(AuthError::Timeout));
             }
         }
     }
 
+    /// Authenticate using BLE transport (handles full flow internally)
     #[cfg(feature = "ble")]
-    /// Try authentication over BLE via the daemon with cancellation support
-    async fn try_ble_authentication_with_cancellation(
+    async fn authenticate_with_ble_transport(
         &self,
+        transport: &mut BleTransport,
         packet: &EncryptedPacket,
-        temporal_id: &[u8; 10],
-        ble_client: std::sync::Arc<tokio::sync::Mutex<Option<BleClient>>>,
-        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), AuthError> {
-        use tokio::select;
+        tracing::info!("Starting BLE authentication via daemon");
 
-        tracing::info!("Starting BLE authentication via daemon with cancellation support");
+        // BLE daemon handles the entire send/receive/verify flow
+        // send_request will block until the daemon gets a response or times out
+        transport.send_request(packet).await?;
 
-        // Get the client from the Arc - we'll acquire and release the lock quickly
-        // to avoid holding it during the long authentication operation
-        let (packet_bytes, timeout_secs) = {
-            let client_guard = ble_client.lock().await;
-            let client = match client_guard.as_ref() {
-                Some(c) => c,
-                None => {
-                    return Err(AuthError::BleError("BLE client not available".to_string()));
-                }
-            };
-
-            // Check if daemon is available
-            if !client.is_daemon_available().await {
-                return Err(AuthError::BleError(
-                    "BLE daemon is not available".to_string(),
-                ));
-            }
-
-            // Encode the packet
-            let mut packet_bytes = Vec::new();
-            packet
-                .encode(&mut packet_bytes)
-                .map_err(|e| AuthError::BleError(format!("Failed to encode packet: {}", e)))?;
-
-            let timeout_secs = get_session_timeout().as_secs();
-
-            // Release the lock here before the long authentication call
-            (packet_bytes, timeout_secs)
-        };
-
-        // Now do the authentication WITHOUT holding the lock
-        // This allows UDP to call cancel() if it succeeds first
-        let ble_client_clone = ble_client.clone();
-
-        let auth_future = async {
-            let client_guard = ble_client_clone.lock().await;
-            let client = client_guard
-                .as_ref()
-                .ok_or_else(|| "BLE client not available".to_string())?;
-            client
-                .authenticate(packet_bytes, temporal_id.to_vec(), timeout_secs)
-                .await
-        };
-
-        // Race the authentication against cancellation
-        let result = select! {
-            auth_result = auth_future => {
-                auth_result.map_err(|e| AuthError::BleError(format!("D-Bus call failed: {}", e)))?
-            }
-            _ = &mut cancel_rx => {
-                tracing::info!("BLE authentication cancelled by signal - sending cancel to daemon");
-                // Send cancel to daemon to stop the ongoing authentication
-                // This acquires the lock, but that's OK because we're not holding it above
-                if let Some(ref client) = *ble_client.lock().await {
-                    if let Err(e) = client.cancel().await {
-                        tracing::warn!("Failed to send cancel to daemon: {}", e);
-                    }
-                }
-                return Err(AuthError::BleError("Cancelled".to_string()));
-            }
-        };
-
-        tracing::debug!("BLE authentication completed");
-
-        // Convert result to authentication outcome
-        match result {
-            shared::AuthResult::Granted => {
-                tracing::info!("BLE authentication granted by daemon");
-                Ok(())
-            }
-            shared::AuthResult::Denied => {
-                tracing::warn!("BLE authentication denied by daemon");
-                Err(AuthError::Denied)
-            }
-            shared::AuthResult::Timeout => {
-                tracing::warn!("BLE authentication timed out");
-                Err(AuthError::Timeout)
-            }
-            shared::AuthResult::Error => {
-                tracing::error!("BLE authentication error from daemon");
-                Err(AuthError::BleError("Daemon returned error".to_string()))
-            }
-        }
+        // If we get here, authentication was granted
+        tracing::info!("BLE authentication granted");
+        Ok(())
     }
 
-    /// Try authentication over UDP (IPv4 broadcast + IPv6 multicast) with cancellation support
-    #[allow(unused_assignments)]
-    async fn try_udp_authentication_with_cancellation(
+    /// Authenticate using a generic transport (request/response pattern)
+    async fn authenticate_with_transport(
         &self,
+        transport: &mut impl Transport,
         packet: &EncryptedPacket,
-        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), AuthError> {
-        let config = self.config_manager.load_config()?;
-        let port = config.udp_port;
-
-        // Bind to the configured UDP port to receive responses
-        let socket = create_broadcast_socket(port).await?;
+        tracing::info!("Starting authentication via {}", transport.name());
 
         let start = Instant::now();
         let timeout = get_session_timeout();
@@ -418,143 +259,87 @@ impl AuthenticationClient {
         let mut confirmation_sent = false;
         let mut final_result: Option<Result<(), AuthError>> = None;
 
-        let auth_result = loop {
-            // Check for cancellation
-            if cancel_rx.try_recv().is_ok() {
-                tracing::info!("UDP authentication cancelled by signal");
-                break Err(AuthError::BleError("Cancelled".to_string()));
-            }
-
+        loop {
             if start.elapsed() >= timeout {
-                break Err(AuthError::Timeout);
+                return final_result.unwrap_or(Err(AuthError::Timeout));
             }
 
-            // If we've already determined the result, drain remaining packets and return
+            // If we already have a result, drain remaining packets briefly then return
             if final_result.is_some() {
-                // Drain any remaining packets with a short timeout to clear the buffer
                 match tokio::time::timeout(
                     Duration::from_millis(100),
-                    socket.recv_from(&mut [0u8; 65536]),
+                    transport.receive_response(Duration::from_millis(50)),
                 )
                 .await
                 {
-                    Ok(_) => {
-                        tracing::trace!("Draining additional packet from socket buffer");
-                        continue; // Keep draining
+                    Ok(Ok(ReceiveResult::Response(_, _))) => {
+                        tracing::trace!("Draining additional packet");
+                        continue;
                     }
-                    Err(_) => {
-                        // Timeout - no more packets, safe to return
-                        tracing::debug!("Socket buffer drained, returning final result");
-                        // Unwrap is safe here because we checked is_some() above
-                        break final_result.unwrap();
+                    _ => {
+                        tracing::debug!("No more packets, returning result");
+                        return final_result.unwrap();
                     }
                 }
             }
 
-            // Send broadcast on IPv4
-            if let Err(e) = send_udp_broadcast(&socket, port, packet).await {
-                tracing::warn!("Failed to send IPv4 broadcast: {}", e);
-            }
-
-            // Send multicast on IPv6 (on all available interfaces)
-            if is_ipv6_available() {
-                match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, packet).await {
-                    Ok(count) if count > 0 => {
-                        tracing::trace!("Sent IPv6 multicast on {} interface(s)", count);
-                    }
-                    Ok(_) => {
-                        if !IPV6_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
-                            tracing::info!("No suitable IPv6 interfaces found for multicast");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to send IPv6 multicast: {}", e);
-                    }
-                }
-            } else if !IPV6_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
-                // Only warn once about IPv6 being unavailable
-                tracing::info!("IPv6 not available, using IPv4 broadcast only");
-            }
+            // Send request
+            transport.send_request(packet).await?;
 
             // Wait for response with exponential backoff
-            let retry_interval = get_client_retry_interval(attempt);
+            let retry_interval = shared::network::get_client_retry_interval(attempt);
 
             loop {
-                match try_receive_udp_packet(&socket, retry_interval).await? {
-                    Some((response_packet, server_addr)) => {
-                        // Filter out packets from our own IP address (loopback from broadcasts)
-                        if shared::network::is_local_ip(&server_addr.ip()) {
-                            tracing::debug!(
-                                "Ignoring packet from local address {} (own broadcast echo)",
-                                server_addr
-                            );
-                            // Continue receiving packets without resending broadcast
-                            continue;
-                        }
-
-                        // Try to decrypt and process response
+                match transport.receive_response(retry_interval).await? {
+                    ReceiveResult::Response(response_packet, server_addr) => {
+                        // Process response
                         match self.process_response(&response_packet, server_addr).await {
                             Ok(true) => {
                                 // Authentication granted
-                                tracing::info!("Processing successful grant response");
                                 if !confirmation_sent {
-                                    tracing::debug!("Sending confirmation to server");
-                                    self.send_confirmation(&socket, port).await?;
+                                    let confirmation =
+                                        create_grant_confirmation(&self.keypair, &self.challenge)?;
+                                    let wrapper = wrap_grant_confirmation(confirmation);
+                                    let conf_packet = create_encrypted_packet_with_csk_nonce(
+                                        &self.csk, &wrapper,
+                                    )?;
+
+                                    transport.send_confirmation(&conf_packet).await?;
                                     confirmation_sent = true;
-                                    tracing::debug!("Confirmation sent successfully");
                                 }
-
-                                // Send cancel to other servers
-                                tracing::debug!("Sending cancel broadcast to other servers");
-                                self.send_cancel_broadcast(&socket, port).await?;
-                                tracing::info!("UDP authentication completed successfully");
-
-                                // Store result and break out of receive loop
                                 final_result = Some(Ok(()));
+                                // Continue loop to drain packets
                                 break;
                             }
                             Ok(false) => {
                                 // Authentication denied
-                                // Per spec: must send GrantConfirmation to halt retransmissions
-                                tracing::info!("Processing denial response");
                                 if !confirmation_sent {
-                                    tracing::debug!(
-                                        "Sending confirmation to server to halt retransmissions"
-                                    );
-                                    self.send_confirmation(&socket, port).await?;
+                                    let confirmation =
+                                        create_grant_confirmation(&self.keypair, &self.challenge)?;
+                                    let wrapper = wrap_grant_confirmation(confirmation);
+                                    let conf_packet = create_encrypted_packet_with_csk_nonce(
+                                        &self.csk, &wrapper,
+                                    )?;
+
+                                    transport.send_confirmation(&conf_packet).await?;
                                     confirmation_sent = true;
                                 }
-
-                                // Store result and break out of receive loop
                                 final_result = Some(Err(AuthError::Denied));
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to process response from {}: {}",
-                                    server_addr,
-                                    e
-                                );
-                                // Continue trying - might be from wrong server or corrupted
-                                continue;
+                                tracing::warn!("Failed to process response: {}", e);
+                                // Continue waiting for valid response
                             }
                         }
                     }
-                    None => {
-                        // Timeout waiting for response, break out to send next broadcast
+                    ReceiveResult::Timeout => {
                         attempt += 1;
                         break;
                     }
                 }
             }
-        };
-
-        // Explicitly drop the socket to ensure it's closed before returning to PAM
-        // PAM modules may be unloaded immediately after return
-        drop(socket);
-        tracing::debug!("UDP socket explicitly closed");
-
-        auth_result
+        }
     }
 
     /// Process a response packet from a server
@@ -563,7 +348,7 @@ impl AuthenticationClient {
         packet: &EncryptedPacket,
         server_addr: SocketAddr,
     ) -> Result<bool, AuthError> {
-        // Decrypt the packet using CSK-derived nonce (same as authentication request)
+        // Decrypt the packet
         let wrapper = decrypt_encrypted_packet_with_csk_nonce(&self.csk, packet)?;
 
         tracing::info!(
@@ -572,89 +357,34 @@ impl AuthenticationClient {
             match &wrapper.payload {
                 Some(wrapper_message::Payload::AuthGrant(_)) => "AuthGrant",
                 Some(wrapper_message::Payload::AuthDenial(_)) => "AuthDenial",
-                Some(wrapper_message::Payload::AuthRequest(_)) => "AuthRequest",
                 _ => "Unknown",
             }
         );
 
-        // Check what kind of response we got
         match wrapper.payload {
             Some(wrapper_message::Payload::AuthGrant(grant)) => {
-                // Verify the grant
-                // We need to find which server sent this by checking signatures
                 let paired_servers = self.config_manager.load_paired_servers()?;
-
-                tracing::info!(
-                    "Trying to verify grant against {} paired servers",
-                    paired_servers.len()
-                );
-                tracing::info!(
-                    "Grant signature length: {}, signed_challenge length: {}",
-                    grant.signature.len(),
-                    grant.signed_challenge.len()
-                );
-                // Sensitive values: log only truncated fingerprint and length
-                tracing::debug!(
-                    "Challenge (trunc): {}… (len={})",
-                    hex::encode(&self.challenge[..std::cmp::min(8, self.challenge.len())]),
-                    self.challenge.len()
-                );
 
                 for (_id, server) in paired_servers.iter() {
                     let pub_key_bytes = hex::decode(&server.public_key)
                         .map_err(|_| AuthError::Protocol(ProtocolError::InvalidMessageFormat))?;
 
                     if pub_key_bytes.len() != 32 {
-                        tracing::warn!(
-                            "Server {} has invalid public key length: {}",
-                            server.name,
-                            pub_key_bytes.len()
-                        );
                         continue;
                     }
 
                     let mut pub_key = [0u8; 32];
                     pub_key.copy_from_slice(&pub_key_bytes);
 
-                    tracing::info!(
-                        "Trying server: {} with public key: {}",
-                        server.name,
-                        server.public_key
-                    );
-                    tracing::debug!(
-                        "Grant signature (trunc): {}… (len={})",
-                        hex::encode(&grant.signature[..std::cmp::min(8, grant.signature.len())]),
-                        grant.signature.len()
-                    );
-                    tracing::debug!(
-                        "Signed challenge (trunc): {}… (len={})",
-                        hex::encode(
-                            &grant.signed_challenge
-                                [..std::cmp::min(8, grant.signed_challenge.len())]
-                        ),
-                        grant.signed_challenge.len()
-                    );
-
-                    match verify_auth_grant(&grant, &self.challenge, &pub_key) {
-                        Ok(_) => {
-                            tracing::info!("Authentication granted by server: {}", server.name);
-                            return Ok(true);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Verification failed for server {}: {:?}",
-                                server.name,
-                                e
-                            );
-                        }
+                    if verify_auth_grant(&grant, &self.challenge, &pub_key).is_ok() {
+                        tracing::info!("Authentication granted by server: {}", server.name);
+                        return Ok(true);
                     }
                 }
 
-                tracing::error!("No server matched the grant signature");
                 Err(AuthError::Protocol(ProtocolError::InvalidSignature))
             }
             Some(wrapper_message::Payload::AuthDenial(denial)) => {
-                // Verify the denial
                 let paired_servers = self.config_manager.load_paired_servers()?;
 
                 for (_id, server) in paired_servers.iter() {
@@ -679,44 +409,6 @@ impl AuthenticationClient {
             _ => Err(AuthError::Protocol(ProtocolError::InvalidMessageFormat)),
         }
     }
-
-    /// Send confirmation to server
-    async fn send_confirmation(
-        &self,
-        socket: &tokio::net::UdpSocket,
-        port: u16,
-    ) -> Result<(), AuthError> {
-        let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)?;
-        let wrapper = wrap_grant_confirmation(confirmation);
-        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
-
-        // Send on both IPv4 and IPv6 (if available)
-        send_udp_broadcast(socket, port, &packet).await?;
-        if is_ipv6_available() {
-            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, &packet).await;
-        }
-
-        Ok(())
-    }
-
-    /// Send cancel broadcast to all servers
-    async fn send_cancel_broadcast(
-        &self,
-        socket: &tokio::net::UdpSocket,
-        port: u16,
-    ) -> Result<(), AuthError> {
-        let cancel = create_auth_cancel(&self.keypair, &self.challenge)?;
-        let wrapper = wrap_auth_cancel(cancel);
-        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
-
-        // Send on both IPv4 and IPv6 (if available)
-        send_udp_broadcast(socket, port, &packet).await?;
-        if is_ipv6_available() {
-            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, port, &packet).await;
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -725,9 +417,7 @@ mod tests {
 
     #[test]
     fn test_auth_client_creation_fails_without_config() {
-        // This should fail if not running as root or if keys don't exist
         let result = AuthenticationClient::new("testuser".to_string());
-        // We expect this to fail in test environment
         assert!(result.is_err());
     }
 }
