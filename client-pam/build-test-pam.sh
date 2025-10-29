@@ -221,7 +221,7 @@ echo ""
 # Run pamtester with verbose output, targeting the specified user
 # Requires running the script with sudo
 set +e
-sudo pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
+sudo RUST_LOG="debug" pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
 PAMTESTER_EXIT_CODE=$?
 set -e # Re-enable exit on error
 
