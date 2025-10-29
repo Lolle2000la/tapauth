@@ -1,7 +1,6 @@
 use crate::auth_client::AuthenticationClient;
 use crate::pam_sys;
 use once_cell::sync::Lazy;
-use std::io::{self, BufRead};
 use std::os::raw::c_int;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -93,52 +92,152 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     };
 
     // Notify user that TapAuth is waiting for phone tap
-    pam_conv.try_info("TapAuth: Waiting for phone tap (press Enter to skip)...");
+    // Detect if we're in a terminal context or GUI context
+    // We need to actually try to OPEN /dev/tty, not just check if it exists
+    let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
-    // Create a channel for skip signal from stdin
+    if has_terminal {
+        pam_conv.try_info("TapAuth: Waiting for phone tap (press Enter to skip)...");
+    } else {
+        // GUI context (e.g., Polkit dialog) - no terminal available
+        pam_conv.try_info("TapAuth: Waiting for phone tap...");
+    }
+
+    // Create a channel for skip signal from /dev/tty
     let (skip_tx, skip_rx) = oneshot::channel();
 
-    // Spawn a thread to read from stdin for skip signal
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut handle = stdin.lock();
-        let mut buffer = String::new();
+    // Create a channel to signal the stdin thread to stop
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
 
-        // Wait for any input (Enter key)
-        if handle.read_line(&mut buffer).is_ok() {
-            tracing::info!("User pressed Enter to skip TapAuth");
-            let _ = skip_tx.send(());
-        }
-    });
+    // Only spawn the skip detection thread if we have a terminal
+    let skip_thread_handle = if has_terminal {
+        // Spawn a thread to read from /dev/tty for skip signal
+        // Using /dev/tty instead of stdin is important for PAM modules
+        Some(std::thread::spawn(move || {
+            use std::fs::File;
+            use std::io::Read;
 
-    // Run the authentication flow with skip detection
-    let auth_future = client.authenticate();
-    let skip_future = async {
-        skip_rx.await.ok();
-    };
+            // Try to open /dev/tty (the controlling terminal)
+            let mut tty = match File::open("/dev/tty") {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!("Could not open /dev/tty: {}, skip unavailable", e);
+                    return;
+                }
+            };
 
-    let result = RUNTIME.block_on(async {
-        tokio::select! {
-            auth_result = auth_future => {
-                match auth_result {
-                    Ok(()) => {
-                        tracing::info!("Authentication successful for user: {}", username);
-                        Some(pam_sys::PAM_SUCCESS)
+            // Read one byte at a time
+            // We'll check the stop_rx channel periodically using try_recv
+            let mut buffer = [0u8; 1024];
+            loop {
+                // Check if we should stop before attempting to read
+                match stop_rx.try_recv() {
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        tracing::debug!("Skip reader thread received stop signal");
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Continue to read
+                    }
+                }
+
+                // Read with a small buffer to detect any input
+                // Note: This will block until input arrives, so we check stop signal first
+                // The key is that File::read on /dev/tty will return quickly when data arrives
+                match tty.read(&mut buffer) {
+                    Ok(n) if n > 0 => {
+                        // Got input - check if stop signal was sent while we were blocked
+                        if stop_rx.try_recv().is_ok() {
+                            tracing::debug!("Skip reader thread received stop signal (after read)");
+                            break;
+                        }
+                        // User pressed a key
+                        tracing::debug!("User pressed key to skip TapAuth");
+                        let _ = skip_tx.send(());
+                        break;
+                    }
+                    Ok(_) => {
+                        // EOF or no data - shouldn't happen with /dev/tty
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(e) => {
-                        tracing::error!("Authentication failed: {}", e);
-                        None
+                        tracing::debug!("Error reading from /dev/tty: {}", e);
+                        break;
                     }
                 }
             }
-            _ = skip_future => {
-                tracing::info!("User skipped TapAuth via Enter key");
-                // Send cancellation to dismiss server notifications
-                let _ = client.send_cancellation().await;
-                None
+            tracing::debug!("Skip reader thread exiting");
+        }))
+    } else {
+        tracing::info!("Running in GUI context (no /dev/tty), skip feature disabled");
+        None
+    };
+
+    // Run the authentication flow with skip detection
+    let auth_future = client.authenticate();
+
+    let result = if has_terminal {
+        // Terminal context - support skip detection
+        let skip_future = async {
+            skip_rx.await.ok();
+        };
+
+        RUNTIME.block_on(async {
+            tokio::select! {
+                auth_result = auth_future => {
+                    match auth_result {
+                        Ok(()) => {
+                            tracing::info!("Authentication successful for user: {}", username);
+                            Some(pam_sys::PAM_SUCCESS)
+                        }
+                        Err(e) => {
+                            tracing::error!("Authentication failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                _ = skip_future => {
+                    tracing::info!("User skipped TapAuth via Enter key");
+                    // Send cancellation to dismiss server notifications
+                    let _ = client.send_cancellation().await;
+                    None
+                }
             }
+        })
+    } else {
+        // GUI context - no skip detection, just run authentication
+        RUNTIME.block_on(async {
+            match auth_future.await {
+                Ok(()) => {
+                    tracing::info!("Authentication successful for user: {}", username);
+                    Some(pam_sys::PAM_SUCCESS)
+                }
+                Err(e) => {
+                    tracing::error!("Authentication failed: {}", e);
+                    None
+                }
+            }
+        })
+    };
+
+    // Signal the skip reader thread to stop
+    let _ = stop_tx.send(());
+
+    // Only wait for the thread if authentication didn't succeed
+    // If it succeeded, the thread is probably still blocked on read() and we don't want to wait
+    if result.is_none() {
+        // Authentication failed or was skipped - wait for thread to clean up
+        if let Some(handle) = skip_thread_handle {
+            // Give it a short time to exit gracefully
+            let _ = handle.join();
         }
-    });
+    } else {
+        // Authentication succeeded - don't wait for the thread
+        // It will exit when the user presses a key or the process ends
+        if skip_thread_handle.is_some() {
+            tracing::debug!("Authentication succeeded, not waiting for skip thread");
+        }
+    }
 
     // If authentication succeeded, return success
     if let Some(code) = result {
