@@ -31,7 +31,6 @@ tracing-subscriber.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 once_cell.workspace = true
-enum_dispatch.workspace = true
 
 [features]
 default = ["ble"]

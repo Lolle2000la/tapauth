@@ -7,7 +7,6 @@
 /// This module provides a trait-based abstraction for different transport mechanisms
 /// (UDP broadcast/multicast, BLE via direct BlueZ, etc.) to enable code reuse, testability,
 /// and easy extension with new transport types.
-use enum_dispatch::enum_dispatch;
 use shared::protocol::pb::EncryptedPacket;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -31,7 +30,6 @@ pub enum ReceiveResult {
 ///
 /// Implementors provide methods to send authentication requests, receive responses,
 /// send confirmations, and cancel ongoing operations.
-#[enum_dispatch]
 pub trait Transport {
     /// Send an authentication request packet
     ///
@@ -73,14 +71,6 @@ pub trait Transport {
 
     /// Get a human-readable name for this transport (for logging)
     fn name(&self) -> &'static str;
-}
-
-/// Transport enum using enum_dispatch for zero-cost abstraction
-#[enum_dispatch(Transport)]
-pub enum AuthTransport {
-    Udp(UdpTransport),
-    #[cfg(feature = "ble")]
-    Ble(BleTransport),
 }
 
 /// UDP transport using broadcast (IPv4) and multicast (IPv6)
@@ -528,10 +518,7 @@ impl Transport for BleTransport {
                     };
 
                     // Load CSK from config manager
-                    let csk = self
-                        .config_manager
-                        .load_csk()
-                        .map_err(|e| AuthError::Config(e))?;
+                    let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
 
                     // Decrypt response
                     let decrypted_message =
@@ -612,10 +599,7 @@ impl BleTransport {
         use shared::protocol::packet::wrap_grant_confirmation;
 
         // Load CSK
-        let csk = self
-            .config_manager
-            .load_csk()
-            .map_err(|e| AuthError::Config(e))?;
+        let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
 
         // Create GrantConfirmation with challenge signature
         let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)

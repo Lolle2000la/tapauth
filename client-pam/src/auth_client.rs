@@ -218,8 +218,7 @@ impl AuthenticationClient {
                         Err(e) => {
                             tracing::debug!("UDP task panicked: {}", e);
                             udp_result = Some(Err(AuthError::Network(
-                                shared::network::NetworkError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
+                                shared::network::NetworkError::Io(std::io::Error::other(
                                     format!("UDP task failed: {}", e),
                                 )),
                             )));
@@ -260,7 +259,7 @@ impl AuthenticationClient {
             }
 
             // If we already have a result, drain remaining packets briefly then return
-            if final_result.is_some() {
+            if let Some(result) = final_result.take() {
                 match tokio::time::timeout(
                     Duration::from_millis(100),
                     transport.receive_response(Duration::from_millis(50)),
@@ -269,11 +268,12 @@ impl AuthenticationClient {
                 {
                     Ok(Ok(ReceiveResult::Response(_, _))) => {
                         tracing::trace!("Draining additional packet");
+                        final_result = Some(result);
                         continue;
                     }
                     _ => {
                         tracing::debug!("No more packets, returning result");
-                        return final_result.unwrap();
+                        return result;
                     }
                 }
             }
