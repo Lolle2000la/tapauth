@@ -4,7 +4,9 @@ use sha2::Sha256;
 use super::{CryptoError, PairingSymmetricKey};
 
 /// Derive PSK from X25519 shared secret
-pub fn derive_psk_from_x25519(shared_secret: &[u8; 32]) -> Result<PairingSymmetricKey, CryptoError> {
+pub fn derive_psk_from_x25519(
+    shared_secret: &[u8; 32],
+) -> Result<PairingSymmetricKey, CryptoError> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut psk = [0u8; 32];
     hk.expand(b"tapauth-pairing-key", &mut psk)
@@ -54,7 +56,7 @@ mod tests {
     fn test_psk_derivation() {
         let shared_secret = [1u8; 32];
         let psk = derive_psk_from_x25519(&shared_secret).unwrap();
-        
+
         // Should be deterministic
         let psk2 = derive_psk_from_x25519(&shared_secret).unwrap();
         assert_eq!(psk.as_bytes(), psk2.as_bytes());
@@ -67,7 +69,7 @@ mod tests {
         let server_pub = [4u8; 32];
 
         let sas = derive_sas(&psk, &client_pub, &server_pub).unwrap();
-        
+
         // Should be 6 digits
         assert_eq!(sas.len(), 6);
         assert!(sas.chars().all(|c| c.is_ascii_digit()));

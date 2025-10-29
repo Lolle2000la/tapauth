@@ -14,13 +14,13 @@ pub fn verify_ed25519(
     data: &[u8],
     signature: &[u8],
 ) -> Result<(), CryptoError> {
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|_| CryptoError::InvalidSignature)?;
-    
+    let verifying_key =
+        VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidSignature)?;
+
     if signature.len() != 64 {
         return Err(CryptoError::InvalidSignature);
     }
-    
+
     let mut sig_bytes = [0u8; 64];
     sig_bytes.copy_from_slice(signature);
     let signature = Signature::from_bytes(&sig_bytes);
@@ -40,7 +40,7 @@ mod tests {
         let message = b"Test message for signing";
 
         let signature = sign_ed25519(&keypair, message);
-        
+
         // Verify with correct key should succeed
         assert!(verify_ed25519(&keypair.verifying_key_bytes(), message, &signature).is_ok());
 
