@@ -10,8 +10,10 @@
 use enum_dispatch::enum_dispatch;
 use shared::protocol::pb::EncryptedPacket;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "ble")]
+use std::sync::Arc;
 
 use crate::AuthError;
 

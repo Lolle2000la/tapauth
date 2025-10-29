@@ -1,8 +1,6 @@
 use shared::{
     config::ClientConfigManager,
-    crypto::{
-        generate_current_temporal_identifier_ble, ClientSymmetricKey, CryptoError, Ed25519KeyPair,
-    },
+    crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
     network::get_session_timeout,
     protocol::{
         messages::*,
@@ -15,7 +13,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::transport::{BleTransport, ReceiveResult, Transport, UdpTransport};
+use crate::transport::{ReceiveResult, Transport, UdpTransport};
+
+#[cfg(feature = "ble")]
+use crate::transport::BleTransport;
+
+#[cfg(feature = "ble")]
+use shared::crypto::generate_current_temporal_identifier_ble;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
