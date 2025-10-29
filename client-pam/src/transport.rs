@@ -230,11 +230,13 @@ impl BleTransport {
             .adapter(adapter_name)
             .map_err(|e| AuthError::BleError(format!("Failed to get adapter: {}", e)))?;
 
-        // Ensure adapter is powered on
-        adapter
-            .set_powered(true)
-            .await
-            .map_err(|e| AuthError::BleError(format!("Failed to power on adapter: {}", e)))?;
+        // Check if already powered - only power on if needed
+        if !adapter.is_powered().await.unwrap_or(false) {
+            adapter
+                .set_powered(true)
+                .await
+                .map_err(|e| AuthError::BleError(format!("Failed to power on adapter: {}", e)))?;
+        }
 
         Ok(Self {
             adapter,
@@ -314,18 +316,18 @@ impl Transport for BleTransport {
                     if attempt < MAX_ATTEMPTS {
                         if is_busy {
                             tracing::warn!(
-                                "BLE advertising is busy, retrying in 1s (attempt {}/{})",
+                                "BLE advertising is busy, retrying in 150ms (attempt {}/{})",
                                 attempt,
                                 MAX_ATTEMPTS
                             );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(Duration::from_millis(150)).await;
                         } else {
                             tracing::warn!(
                                 "Failed to start BLE advertising (attempt {}): {}. Retrying...",
                                 attempt,
                                 e
                             );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     } else {
                         return Err(AuthError::BleError(format!(
@@ -529,7 +531,7 @@ impl Transport for BleTransport {
                     };
 
                     // Wait briefly for server to read confirmation
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
 
                     // Return success - the encrypted response will be verified by auth_client
                     // We use a dummy SocketAddr since BLE doesn't have IP addresses
@@ -541,7 +543,7 @@ impl Transport for BleTransport {
             }
 
             // Sleep briefly before checking again
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
