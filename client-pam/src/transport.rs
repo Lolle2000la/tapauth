@@ -304,10 +304,19 @@ impl Transport for BleTransport {
             .collect(),
             discoverable: Some(true),
             local_name: Some("".to_string()),
-            // Aggressive advertising for fast discovery
-            // BlueZ uses Duration for intervals (20-40ms range for fast discovery)
-            min_interval: Some(Duration::from_millis(20)),
-            max_interval: Some(Duration::from_millis(40)),
+            // Balanced advertising: faster than default, but not battery-killing
+            // Default BlueZ: ~1000ms intervals (1 per second)
+            // Low latency: 20-40ms (30 per second) - very fast but drains battery
+            // Balanced (below): 100-200ms (5-10 per second) - good compromise
+            //
+            // With SCAN_MODE_BALANCED on Android (50% duty cycle), phone scans
+            // every ~2 seconds, so advertising every 100-200ms gives good discovery
+            // time (1-5 seconds) without excessive battery drain.
+            //
+            // For ultra-low latency (<500ms), use 20-40ms intervals, but beware
+            // of battery impact on desktop (especially laptops on battery).
+            min_interval: Some(Duration::from_millis(100)),
+            max_interval: Some(Duration::from_millis(200)),
             ..Default::default()
         };
 

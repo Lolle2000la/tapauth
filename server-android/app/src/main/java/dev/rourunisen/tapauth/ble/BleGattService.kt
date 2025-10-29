@@ -47,9 +47,9 @@ class BleGattService : Service() {
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
         val CLIENT_COMMAND_CHAR_UUID: UUID = UUID.fromString("caf54438-9d78-4697-8886-0a4cfa87ba8d")
         val SERVER_RESPONSE_CHAR_UUID: UUID =
-            UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
+                UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
         val CLIENT_CONFIRMATION_CHAR_UUID: UUID =
-            UUID.fromString("ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf")
+                UUID.fromString("ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf")
 
         fun start(context: Context) {
             val intent = Intent(context, BleGattService::class.java)
@@ -71,9 +71,9 @@ class BleGattService : Service() {
                 val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
                 config.bleRunning = false
                 val b =
-                    Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
-                        putExtra("ble_running", false)
-                    }
+                        Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
+                            putExtra("ble_running", false)
+                        }
                 context.sendBroadcast(b)
             } catch (_: Exception) {}
         }
@@ -96,159 +96,173 @@ class BleGattService : Service() {
     private val temporalIdCache = mutableMapOf<String, String>()
     private var cacheUpdateJob: Job? = null
 
+    // Track scan start time for latency measurement
+    private var scanStartTimeMillis: Long = 0
+
     // Scan callback to discover client advertisements
     private val scanCallback =
-        object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                super.onScanResult(callbackType, result)
+            object : ScanCallback() {
+                override fun onScanResult(callbackType: Int, result: ScanResult) {
+                    super.onScanResult(callbackType, result)
 
-                // Thanks to hardware filtering, we only receive advertisements with TapAuth
-                // service
-                // data
-                val scanRecord = result.scanRecord ?: return
+                    val discoveryLatencyMs =
+                            if (scanStartTimeMillis > 0) {
+                                System.currentTimeMillis() - scanStartTimeMillis
+                            } else {
+                                -1L
+                            }
 
-                // Extract the 10-byte temporal identifier from service data
-                val serviceData = scanRecord.getServiceData(ParcelUuid(SERVICE_UUID))
-                if (serviceData == null || serviceData.size != 10) {
-                    Log.w(
-                        TAG,
-                        "Received filtered result but service data is invalid (size: ${serviceData?.size})",
+                    // Thanks to hardware filtering, we only receive advertisements with TapAuth
+                    // service
+                    // data
+                    val scanRecord = result.scanRecord ?: return
+
+                    // Extract the 10-byte temporal identifier from service data
+                    val serviceData = scanRecord.getServiceData(ParcelUuid(SERVICE_UUID))
+                    if (serviceData == null || serviceData.size != 10) {
+                        Log.w(
+                                TAG,
+                                "Received filtered result but service data is invalid (size: ${serviceData?.size})",
+                        )
+                        return
+                    }
+
+                    val temporalIdHex = serviceData.toHex()
+                    Log.i(
+                            TAG,
+                            "Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}... (discovery latency: ${discoveryLatencyMs}ms, RSSI: ${result.rssi}dBm)",
                     )
-                    return
-                }
 
-                val temporalIdHex = serviceData.toHex()
-                Log.i(
-                    TAG,
-                    "Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}...",
-                )
-
-                // Check if this temporal ID matches any of our paired devices (from cache)
-                serviceScope.launch {
-                    val matchedCsk = temporalIdCache[temporalIdHex]
-                    if (matchedCsk != null) {
-                        Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                        connectToClient(result.device, matchedCsk)
-                    } else {
-                        Log.d(TAG, "Temporal ID does not match any paired device")
+                    // Check if this temporal ID matches any of our paired devices (from cache)
+                    serviceScope.launch {
+                        val matchedCsk = temporalIdCache[temporalIdHex]
+                        if (matchedCsk != null) {
+                            Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                            connectToClient(result.device, matchedCsk)
+                        } else {
+                            Log.d(TAG, "Temporal ID does not match any paired device")
+                        }
                     }
                 }
-            }
 
-            override fun onScanFailed(errorCode: Int) {
-                super.onScanFailed(errorCode)
-                Log.e(TAG, "BLE scan failed with error: $errorCode")
-                dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning(
-                    { this@BleGattService },
-                    false,
-                )
-                stopSelf()
+                override fun onScanFailed(errorCode: Int) {
+                    super.onScanFailed(errorCode)
+                    Log.e(TAG, "BLE scan failed with error: $errorCode")
+                    dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning(
+                            { this@BleGattService },
+                            false,
+                    )
+                    stopSelf()
+                }
             }
-        }
 
     // GATT client callback for connecting to client's GATT server
     private val gattCallback =
-        object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                when (newState) {
-                    BluetoothProfile.STATE_CONNECTED -> {
-                        Log.i(TAG, "Connected to client GATT server: ${gatt.device.address}")
-                        if (
-                            ActivityCompat.checkSelfPermission(
-                                this@BleGattService,
-                                Manifest.permission.BLUETOOTH_CONNECT,
-                            ) == PackageManager.PERMISSION_GRANTED
-                        ) {
-                            gatt.discoverServices()
+            object : BluetoothGattCallback() {
+                override fun onConnectionStateChange(
+                        gatt: BluetoothGatt,
+                        status: Int,
+                        newState: Int
+                ) {
+                    when (newState) {
+                        BluetoothProfile.STATE_CONNECTED -> {
+                            Log.i(TAG, "Connected to client GATT server: ${gatt.device.address}")
+                            if (ActivityCompat.checkSelfPermission(
+                                            this@BleGattService,
+                                            Manifest.permission.BLUETOOTH_CONNECT,
+                                    ) == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                gatt.discoverServices()
+                            }
+                        }
+                        BluetoothProfile.STATE_DISCONNECTED -> {
+                            Log.i(
+                                    TAG,
+                                    "Disconnected from client GATT server: ${gatt.device.address}"
+                            )
+                            gatt.close()
                         }
                     }
-                    BluetoothProfile.STATE_DISCONNECTED -> {
-                        Log.i(TAG, "Disconnected from client GATT server: ${gatt.device.address}")
-                        gatt.close()
-                    }
                 }
-            }
 
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "Services discovered on client GATT server")
+                override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        Log.d(TAG, "Services discovered on client GATT server")
 
-                    // Find the TapAuth service
-                    val service = gatt.getService(SERVICE_UUID)
-                    if (service != null) {
-                        val clientCommandChar = service.getCharacteristic(CLIENT_COMMAND_CHAR_UUID)
-                        val serverResponseChar =
-                            service.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
+                        // Find the TapAuth service
+                        val service = gatt.getService(SERVICE_UUID)
+                        if (service != null) {
+                            val clientCommandChar =
+                                    service.getCharacteristic(CLIENT_COMMAND_CHAR_UUID)
+                            val serverResponseChar =
+                                    service.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
 
-                        if (clientCommandChar != null && serverResponseChar != null) {
-                            Log.i(
-                                TAG,
-                                "Found TapAuth characteristics, reading authentication request",
-                            )
+                            if (clientCommandChar != null && serverResponseChar != null) {
+                                Log.i(
+                                        TAG,
+                                        "Found TapAuth characteristics, reading authentication request",
+                                )
 
-                            // Read the authentication request from the client command
-                            // characteristic
-                            if (
-                                ActivityCompat.checkSelfPermission(
-                                    this@BleGattService,
-                                    Manifest.permission.BLUETOOTH_CONNECT,
-                                ) == PackageManager.PERMISSION_GRANTED
-                            ) {
-                                gatt.readCharacteristic(clientCommandChar)
+                                // Read the authentication request from the client command
+                                // characteristic
+                                if (ActivityCompat.checkSelfPermission(
+                                                this@BleGattService,
+                                                Manifest.permission.BLUETOOTH_CONNECT,
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    gatt.readCharacteristic(clientCommandChar)
+                                }
+                            } else {
+                                Log.e(TAG, "TapAuth characteristics not found")
+                                gatt.disconnect()
                             }
                         } else {
-                            Log.e(TAG, "TapAuth characteristics not found")
+                            Log.e(TAG, "TapAuth service not found")
                             gatt.disconnect()
                         }
                     } else {
-                        Log.e(TAG, "TapAuth service not found")
+                        Log.e(TAG, "Service discovery failed with status: $status")
                         gatt.disconnect()
                     }
-                } else {
-                    Log.e(TAG, "Service discovery failed with status: $status")
-                    gatt.disconnect()
                 }
-            }
 
-            override fun onCharacteristicRead(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                value: ByteArray,
-                status: Int,
-            ) {
-                if (
-                    status == BluetoothGatt.GATT_SUCCESS &&
-                        characteristic.uuid == CLIENT_COMMAND_CHAR_UUID
+                override fun onCharacteristicRead(
+                        gatt: BluetoothGatt,
+                        characteristic: BluetoothGattCharacteristic,
+                        value: ByteArray,
+                        status: Int,
                 ) {
-                    Log.d(TAG, "Read authentication request from client: ${value.size} bytes")
+                    if (status == BluetoothGatt.GATT_SUCCESS &&
+                                    characteristic.uuid == CLIENT_COMMAND_CHAR_UUID
+                    ) {
+                        Log.d(TAG, "Read authentication request from client: ${value.size} bytes")
 
-                    // Handle the authentication request
-                    serviceScope.launch { handleAuthenticationRequest(gatt, value) }
-                }
-            }
-
-            override fun onCharacteristicWrite(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                status: Int,
-            ) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "Successfully wrote response to client")
-                } else {
-                    Log.e(TAG, "Failed to write response to client, status: $status")
+                        // Handle the authentication request
+                        serviceScope.launch { handleAuthenticationRequest(gatt, value) }
+                    }
                 }
 
-                // Disconnect after writing response
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                override fun onCharacteristicWrite(
+                        gatt: BluetoothGatt,
+                        characteristic: BluetoothGattCharacteristic,
+                        status: Int,
                 ) {
-                    gatt.disconnect()
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        Log.d(TAG, "Successfully wrote response to client")
+                    } else {
+                        Log.e(TAG, "Failed to write response to client, status: $status")
+                    }
+
+                    // Disconnect after writing response
+                    if (ActivityCompat.checkSelfPermission(
+                                    this@BleGattService,
+                                    Manifest.permission.BLUETOOTH_CONNECT,
+                            ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        gatt.disconnect()
+                    }
                 }
             }
-        }
 
     override fun onCreate() {
         super.onCreate()
@@ -258,15 +272,14 @@ class BleGattService : Service() {
         // This is critical because subsequent checks might stop the service.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.POST_NOTIFICATIONS,
-                    ) != PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this,
+                                Manifest.permission.POST_NOTIFICATIONS,
+                        ) != PackageManager.PERMISSION_GRANTED
                 ) {
                     Log.e(
-                        TAG,
-                        "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
+                            TAG,
+                            "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
                     )
                     // We can't show a notification, so we can't satisfy the foreground service
                     // requirements.
@@ -335,35 +348,35 @@ class BleGattService : Service() {
     private fun createNotification(): Notification {
         val notificationIntent = Intent(this, dev.rourunisen.tapauth.MainActivity::class.java)
         val pendingIntent =
-            PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
+                PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return androidx.core.app.NotificationCompat.Builder(
-                this,
-                dev.rourunisen.tapauth.TapAuthApplication.CHANNEL_ID,
-            )
-            .setContentTitle("TapAuth BLE")
-            .setContentText("BLE scanner active, listening for paired clients")
-            .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
+                        this,
+                        dev.rourunisen.tapauth.TapAuthApplication.CHANNEL_ID,
+                )
+                .setContentTitle("TapAuth BLE")
+                .setContentText("BLE scanner active, listening for paired clients")
+                .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .build()
     }
 
     private fun startTemporalIdCache() {
         // Build cache of valid temporal IDs for all paired devices
         cacheUpdateJob?.cancel()
         cacheUpdateJob =
-            serviceScope.launch {
-                while (isActive) {
-                    updateTemporalIdCache()
+                serviceScope.launch {
+                    while (isActive) {
+                        updateTemporalIdCache()
 
-                    // Wait until next 60-second boundary to update cache
-                    val now = System.currentTimeMillis()
-                    val nextBoundary = ((now / 60_000) + 1) * 60_000
-                    val delayMs = nextBoundary - now
-                    delay(delayMs)
+                        // Wait until next 60-second boundary to update cache
+                        val now = System.currentTimeMillis()
+                        val nextBoundary = ((now / 60_000) + 1) * 60_000
+                        val delayMs = nextBoundary - now
+                        delay(delayMs)
+                    }
                 }
-            }
     }
 
     private suspend fun updateTemporalIdCache() {
@@ -377,15 +390,15 @@ class BleGattService : Service() {
             try {
                 // Generate both current and previous temporal IDs (10 bytes for BLE)
                 val currentId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        currentTimestampSeconds,
-                    )
+                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                device.csk,
+                                currentTimestampSeconds,
+                        )
                 val previousId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        previousTimestampSeconds,
-                    )
+                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                device.csk,
+                                previousTimestampSeconds,
+                        )
 
                 // Store CSK as hex string for later retrieval
                 val cskHex = device.csk.toHex()
@@ -399,17 +412,16 @@ class BleGattService : Service() {
         }
 
         Log.i(
-            TAG,
-            "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
+                TAG,
+                "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
         )
     }
 
     private fun startScanning() {
         Log.i(TAG, "startScanning() called")
 
-        if (
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) !=
-                PackageManager.PERMISSION_GRANTED
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) !=
+                        PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "BLUETOOTH_SCAN permission not granted")
             return
@@ -428,28 +440,49 @@ class BleGattService : Service() {
         val filterMask = ByteArray(10) { 0x00 } // All zeros = wildcard (don't care about value)
 
         val scanFilter =
-            ScanFilter.Builder()
-                .setServiceData(ParcelUuid(SERVICE_UUID), filterData, filterMask)
-                .build()
+                ScanFilter.Builder()
+                        .setServiceData(ParcelUuid(SERVICE_UUID), filterData, filterMask)
+                        .build()
 
         val scanFilters = listOf(scanFilter)
 
+        // Balanced scan settings for battery efficiency with reasonable discovery speed
+        // - SCAN_MODE_BALANCED: Good balance between battery and latency (~50% duty cycle)
+        //   Discovery time: 1-5 seconds (vs <500ms with LOW_LATENCY, but uses ~50% less battery)
+        // - CALLBACK_TYPE_ALL_MATCHES: Report every advertisement immediately
+        // - MATCH_MODE_AGGRESSIVE: Report after few sightings (faster)
+        // - MATCH_NUM_MAX_ADVERTISEMENT: Deliver maximum callbacks per filter match
+        // - setReportDelay(0L): No batching - immediate reporting
+        //
+        // For truly low latency (<500ms), use SCAN_MODE_LOW_LATENCY, but be aware:
+        // - It uses ~100% BLE radio duty cycle = significant battery drain
+        // - Only recommended if battery life is not a concern or scan is brief
         val scanSettings =
-            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+                ScanSettings.Builder()
+                        .setScanMode(
+                                ScanSettings.SCAN_MODE_BALANCED
+                        ) // Better battery, 1-5s discovery
+                        .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                        .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                        .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                        .setReportDelay(0L) // Report immediately, no batching
+                        .build()
 
         Log.i(TAG, "Scanner object: $bluetoothLeScanner")
         Log.i(TAG, "Callback object: $scanCallback")
         Log.i(TAG, "Starting BLE scanning with service data filter (UUID: $SERVICE_UUID)")
 
+        // Track scan start time for discovery latency measurement
+        scanStartTimeMillis = System.currentTimeMillis()
+
         // Start scan with hardware-level filter
         bluetoothLeScanner?.startScan(scanFilters, scanSettings, scanCallback)
-        Log.i(TAG, "BLE scanning started with hardware filter")
+        Log.i(TAG, "BLE scanning started with hardware filter at ${scanStartTimeMillis}ms")
     }
 
     private fun stopScanning() {
-        if (
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) ==
-                PackageManager.PERMISSION_GRANTED
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) ==
+                        PackageManager.PERMISSION_GRANTED
         ) {
             bluetoothLeScanner?.stopScan(scanCallback)
             Log.i(TAG, "BLE scanning stopped")
@@ -458,9 +491,8 @@ class BleGattService : Service() {
     }
 
     private fun connectToClient(device: BluetoothDevice, csk: String) {
-        if (
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
-                PackageManager.PERMISSION_GRANTED
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
+                        PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "BLUETOOTH_CONNECT permission not granted")
             return
@@ -473,41 +505,43 @@ class BleGattService : Service() {
     private suspend fun handleAuthenticationRequest(gatt: BluetoothGatt, data: ByteArray) {
         try {
             Log.d(
-                TAG,
-                "Handling BLE authentication request: ${data.size} bytes from ${gatt.device.address}",
+                    TAG,
+                    "Handling BLE authentication request: ${data.size} bytes from ${gatt.device.address}",
             )
 
             // Step 1: Parse the EncryptedPacket
             val encryptedPacket =
-                try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
-                    // Silently disconnect on parse error - don't send invalid response
-                    if (
-                        ActivityCompat.checkSelfPermission(
-                            this@BleGattService,
-                            Manifest.permission.BLUETOOTH_CONNECT,
-                        ) == PackageManager.PERMISSION_GRANTED
-                    ) {
-                        gatt.disconnect()
+                    try {
+                        dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
+                        // Silently disconnect on parse error - don't send invalid response
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
+                        return
                     }
-                    return
-                }
 
             Log.d(
-                TAG,
-                "Parsed EncryptedPacket: temporal_id=${encryptedPacket.temporalIdentifier.take(20)}..., ciphertext=${encryptedPacket.ciphertext.take(20)}...",
+                    TAG,
+                    "Parsed EncryptedPacket: temporal_id=${encryptedPacket.temporalIdentifier.take(20)}..., ciphertext=${encryptedPacket.ciphertext.take(20)}...",
             )
 
             // Decode Base64 fields to ByteArrays
             val temporalIdBytes =
-                android.util.Base64.decode(
-                    encryptedPacket.temporalIdentifier,
-                    android.util.Base64.NO_WRAP,
-                )
+                    android.util.Base64.decode(
+                            encryptedPacket.temporalIdentifier,
+                            android.util.Base64.NO_WRAP,
+                    )
             val ciphertextBytes =
-                android.util.Base64.decode(encryptedPacket.ciphertext, android.util.Base64.NO_WRAP)
+                    android.util.Base64.decode(
+                            encryptedPacket.ciphertext,
+                            android.util.Base64.NO_WRAP
+                    )
 
             // Step 2: Find the CSK by matching temporal ID
             val pairedDevices = deviceRepository.getAllPairedDevices()
@@ -515,11 +549,10 @@ class BleGattService : Service() {
             if (pairedDevices.isEmpty()) {
                 Log.w(TAG, "No paired devices found, rejecting BLE request")
                 // Silently disconnect - no valid response possible without CSK
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -537,12 +570,15 @@ class BleGattService : Service() {
                 // Use standard generateTemporalId (16 bytes) for EncryptedPacket
                 val currentTimestamp = System.currentTimeMillis() / 1000
                 val currentId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp)
+                        dev.rourunisen.tapauth.crypto.generateTemporalId(
+                                device.csk,
+                                currentTimestamp
+                        )
                 val previousId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalId(
-                        device.csk,
-                        currentTimestamp - 60,
-                    )
+                        dev.rourunisen.tapauth.crypto.generateTemporalId(
+                                device.csk,
+                                currentTimestamp - 60,
+                        )
 
                 if (temporalIdHex == currentId.toHex() || temporalIdHex == previousId.toHex()) {
                     matchedDevice = device
@@ -554,11 +590,10 @@ class BleGattService : Service() {
             if (matchedDevice == null) {
                 Log.w(TAG, "No device matched the temporal ID")
                 // Silently disconnect - no valid response possible without CSK
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -567,45 +602,46 @@ class BleGattService : Service() {
 
             // Step 3: Decrypt the EncryptedPacket to get the WrapperMessage
             val wrapperMessageBytes =
-                try {
-                    dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(matchedDevice.csk, data)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
-                    // Silently disconnect on decryption error
-                    if (
-                        ActivityCompat.checkSelfPermission(
-                            this@BleGattService,
-                            Manifest.permission.BLUETOOTH_CONNECT,
-                        ) == PackageManager.PERMISSION_GRANTED
-                    ) {
-                        gatt.disconnect()
+                    try {
+                        dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(
+                                matchedDevice.csk,
+                                data
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
+                        // Silently disconnect on decryption error
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
+                        return
                     }
-                    return
-                }
 
             // Step 4: Parse the AuthenticationRequest from the WrapperMessage
             val authRequest =
-                try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(
-                        wrapperMessageBytes
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
-                    // Silently disconnect on parse error
-                    if (
-                        ActivityCompat.checkSelfPermission(
-                            this@BleGattService,
-                            Manifest.permission.BLUETOOTH_CONNECT,
-                        ) == PackageManager.PERMISSION_GRANTED
-                    ) {
-                        gatt.disconnect()
+                    try {
+                        dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(
+                                wrapperMessageBytes
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
+                        // Silently disconnect on parse error
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
+                        return
                     }
-                    return
-                }
 
             Log.d(
-                TAG,
-                "Parsed BLE request: username=${authRequest.username}, hostname=${authRequest.hostname}",
+                    TAG,
+                    "Parsed BLE request: username=${authRequest.username}, hostname=${authRequest.hostname}",
             )
 
             // CHECK: Verify this pairing is allowed to authenticate this user
@@ -614,11 +650,10 @@ class BleGattService : Service() {
                 Log.w(TAG, "  Device: ${matchedDevice.displayName}")
                 Log.w(TAG, "  Allowed users: ${matchedDevice.allowedUsers}")
                 // Silently disconnect - this device shouldn't handle this user
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -629,24 +664,22 @@ class BleGattService : Service() {
 
             // Decode Base64 strings to ByteArrays
             val challengeBytes =
-                android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
+                    android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
             val signatureBytes =
-                android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
+                    android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
 
             // Step 5: Transport lock - ensure only one channel handles this request
-            if (
-                !transportLockManager.tryClaimTransport(
-                    challengeBytes,
-                    dev.rourunisen.tapauth.data.TransportType.BLE,
-                )
+            if (!transportLockManager.tryClaimTransport(
+                            challengeBytes,
+                            dev.rourunisen.tapauth.data.TransportType.BLE,
+                    )
             ) {
                 Log.i(TAG, "BLE request ignored - challenge already claimed by another transport")
                 // Silently disconnect - UDP is handling this
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -657,11 +690,10 @@ class BleGattService : Service() {
             if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
                 Log.w(TAG, "BLE replay attack detected, rejecting request")
                 // Silently disconnect - don't help attacker with denial message
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -675,50 +707,50 @@ class BleGattService : Service() {
             val gson = com.google.gson.Gson()
             val requestJson = gson.toJson(authRequest)
             val messageForVerification =
-                try {
-                    dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(requestJson)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to serialize BLE request for verification", e)
-                    // Disconnect on serialization error
-                    if (
-                        ActivityCompat.checkSelfPermission(
-                            this@BleGattService,
-                            Manifest.permission.BLUETOOTH_CONNECT,
-                        ) == PackageManager.PERMISSION_GRANTED
-                    ) {
-                        gatt.disconnect()
+                    try {
+                        dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
+                                requestJson
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to serialize BLE request for verification", e)
+                        // Disconnect on serialization error
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            gatt.disconnect()
+                        }
+                        return
                     }
-                    return
-                }
 
             // Verify signature with the matched device
             val isValid =
-                try {
-                    dev.rourunisen.tapauth.crypto.verifySignature(
-                        matchedDevice.publicKey,
-                        messageForVerification,
-                        signatureBytes,
-                    )
-                } catch (e: Exception) {
-                    Log.w(
-                        TAG,
-                        "Failed to verify BLE signature for device ${matchedDevice.deviceId}",
-                        e,
-                    )
-                    false
-                }
+                    try {
+                        dev.rourunisen.tapauth.crypto.verifySignature(
+                                matchedDevice.publicKey,
+                                messageForVerification,
+                                signatureBytes,
+                        )
+                    } catch (e: Exception) {
+                        Log.w(
+                                TAG,
+                                "Failed to verify BLE signature for device ${matchedDevice.deviceId}",
+                                e,
+                        )
+                        false
+                    }
 
             if (!isValid) {
                 Log.w(
-                    TAG,
-                    "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request",
+                        TAG,
+                        "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request",
                 )
                 // Silently disconnect - likely attack or corrupted data
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
                 ) {
                     gatt.disconnect()
                 }
@@ -726,21 +758,21 @@ class BleGattService : Service() {
             }
 
             Log.d(
-                TAG,
-                "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})",
+                    TAG,
+                    "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})",
             )
 
             // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
-                context = this,
-                deviceId = matchedDevice.deviceId,
-                deviceName = matchedDevice.displayName,
-                username = authRequest.username,
-                hostname = authRequest.hostname,
-                challenge = challengeBytes,
-                timestamp = authRequest.timestampUnixSeconds,
-                transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
+                    context = this,
+                    deviceId = matchedDevice.deviceId,
+                    deviceName = matchedDevice.displayName,
+                    username = authRequest.username,
+                    hostname = authRequest.hostname,
+                    challenge = challengeBytes,
+                    timestamp = authRequest.timestampUnixSeconds,
+                    transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
             ) { approved, signedChallenge, explicitDenial ->
                 // Create and send encrypted grant/denial
                 if (approved && signedChallenge != null) {
@@ -751,17 +783,17 @@ class BleGattService : Service() {
 
                         // Create WrapperMessage containing AuthenticationGrant
                         val wrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
-                                signedChallenge,
-                                privateKey,
-                            )
+                                dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
+                                        signedChallenge,
+                                        privateKey,
+                                )
 
                         // Create proper EncryptedPacket per specification
                         val encryptedPacket =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
-                                matchedDevice.csk,
-                                wrapperMessage,
-                            )
+                                dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                                        matchedDevice.csk,
+                                        wrapperMessage,
+                                )
 
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
@@ -771,11 +803,10 @@ class BleGattService : Service() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
                         // Just disconnect on error - can't send valid response
-                        if (
-                            ActivityCompat.checkSelfPermission(
-                                this@BleGattService,
-                                Manifest.permission.BLUETOOTH_CONNECT,
-                            ) == PackageManager.PERMISSION_GRANTED
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
                         ) {
                             gatt.disconnect()
                         }
@@ -789,17 +820,17 @@ class BleGattService : Service() {
 
                         // Create WrapperMessage containing AuthenticationDenial
                         val wrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
-                                challengeBytes,
-                                privateKey,
-                            )
+                                dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
+                                        challengeBytes,
+                                        privateKey,
+                                )
 
                         // Create proper EncryptedPacket per specification
                         val encryptedPacket =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
-                                matchedDevice.csk,
-                                wrapperMessage,
-                            )
+                                dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                                        matchedDevice.csk,
+                                        wrapperMessage,
+                                )
 
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes)
                         Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
@@ -809,11 +840,10 @@ class BleGattService : Service() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
                         // Just disconnect on error - can't send valid response
-                        if (
-                            ActivityCompat.checkSelfPermission(
-                                this@BleGattService,
-                                Manifest.permission.BLUETOOTH_CONNECT,
-                            ) == PackageManager.PERMISSION_GRANTED
+                        if (ActivityCompat.checkSelfPermission(
+                                        this@BleGattService,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                ) == PackageManager.PERMISSION_GRANTED
                         ) {
                             gatt.disconnect()
                         }
@@ -821,11 +851,10 @@ class BleGattService : Service() {
                 } else {
                     // Timeout or error - silently disconnect, don't send denial
                     Log.d(TAG, "BLE auth request timed out or failed - disconnecting silently")
-                    if (
-                        ActivityCompat.checkSelfPermission(
-                            this@BleGattService,
-                            Manifest.permission.BLUETOOTH_CONNECT,
-                        ) == PackageManager.PERMISSION_GRANTED
+                    if (ActivityCompat.checkSelfPermission(
+                                    this@BleGattService,
+                                    Manifest.permission.BLUETOOTH_CONNECT,
+                            ) == PackageManager.PERMISSION_GRANTED
                     ) {
                         gatt.disconnect()
                     }
@@ -836,11 +865,10 @@ class BleGattService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Error handling BLE authentication request", e)
             // Just disconnect on unexpected error
-            if (
-                ActivityCompat.checkSelfPermission(
-                    this@BleGattService,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                ) == PackageManager.PERMISSION_GRANTED
+            if (ActivityCompat.checkSelfPermission(
+                            this@BleGattService,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                    ) == PackageManager.PERMISSION_GRANTED
             ) {
                 gatt.disconnect()
             }
@@ -852,13 +880,12 @@ class BleGattService : Service() {
      * provided, will retransmit until GrantConfirmation is received
      */
     private fun sendResponseToClient(
-        gatt: BluetoothGatt,
-        response: ByteArray,
-        challenge: ByteArray?,
+            gatt: BluetoothGatt,
+            response: ByteArray,
+            challenge: ByteArray?,
     ) {
-        if (
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
-                PackageManager.PERMISSION_GRANTED
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
+                        PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "BLUETOOTH_CONNECT permission not granted")
             return
@@ -872,16 +899,16 @@ class BleGattService : Service() {
         if (responseChar != null) {
             // Use new API for Android 13+ (API 33+), fallback to deprecated API for older versions
             val writeSuccess =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeCharacteristic(
-                        responseChar,
-                        response,
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                    ) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    @Suppress("DEPRECATION") responseChar.value = response
-                    @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
-                }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(
+                                responseChar,
+                                response,
+                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        ) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION") responseChar.value = response
+                        @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
+                    }
 
             if (writeSuccess) {
                 Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
@@ -893,11 +920,11 @@ class BleGattService : Service() {
             if (challenge != null && confirmationChar != null) {
                 serviceScope.launch {
                     retransmitWithConfirmationCheck(
-                        gatt,
-                        responseChar,
-                        confirmationChar,
-                        response,
-                        challenge,
+                            gatt,
+                            responseChar,
+                            confirmationChar,
+                            response,
+                            challenge,
                     )
                 }
             }
@@ -909,11 +936,11 @@ class BleGattService : Service() {
 
     /** Retransmit response every 500ms until confirmation received or timeout */
     private suspend fun retransmitWithConfirmationCheck(
-        gatt: BluetoothGatt,
-        responseChar: BluetoothGattCharacteristic,
-        confirmationChar: BluetoothGattCharacteristic,
-        response: ByteArray,
-        challenge: ByteArray,
+            gatt: BluetoothGatt,
+            responseChar: BluetoothGattCharacteristic,
+            confirmationChar: BluetoothGattCharacteristic,
+            response: ByteArray,
+            challenge: ByteArray,
     ) {
         val startTime = System.currentTimeMillis()
         val maxDuration = 10_000L // 10 seconds max retransmission
@@ -925,11 +952,10 @@ class BleGattService : Service() {
                 attempt++
 
                 // Try to read confirmation characteristic
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) != PackageManager.PERMISSION_GRANTED
+                if (ActivityCompat.checkSelfPermission(
+                                this@BleGattService,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                        ) != PackageManager.PERMISSION_GRANTED
                 ) {
                     break
                 }
@@ -941,13 +967,13 @@ class BleGattService : Service() {
 
                     // Use new API for Android 13+ (API 33+), fallback to deprecated API
                     val confirmationBytes =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            // For API 33+, value is read via onCharacteristicRead callback
-                            // We'll check in the callback, so read current cached value here
-                            @Suppress("DEPRECATION") confirmationChar.value
-                        } else {
-                            @Suppress("DEPRECATION") confirmationChar.value
-                        }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                // For API 33+, value is read via onCharacteristicRead callback
+                                // We'll check in the callback, so read current cached value here
+                                @Suppress("DEPRECATION") confirmationChar.value
+                            } else {
+                                @Suppress("DEPRECATION") confirmationChar.value
+                            }
 
                     if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
                         Log.d(TAG, "Received confirmation, stopping retransmission")
@@ -957,16 +983,16 @@ class BleGattService : Service() {
 
                 // Retransmit using new API for Android 13+ (API 33+)
                 val retransmitSuccess =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(
-                            responseChar,
-                            response,
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                        ) == BluetoothStatusCodes.SUCCESS
-                    } else {
-                        @Suppress("DEPRECATION") responseChar.value = response
-                        @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
-                    }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(
+                                    responseChar,
+                                    response,
+                                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                            ) == BluetoothStatusCodes.SUCCESS
+                        } else {
+                            @Suppress("DEPRECATION") responseChar.value = response
+                            @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
+                        }
 
                 if (retransmitSuccess) {
                     Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
@@ -991,9 +1017,8 @@ class BleGattService : Service() {
         super.onDestroy()
         stopScanning()
 
-        if (
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
-                PackageManager.PERMISSION_GRANTED
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
+                        PackageManager.PERMISSION_GRANTED
         ) {
             bluetoothGatt?.close()
         }
