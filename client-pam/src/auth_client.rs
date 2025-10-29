@@ -244,6 +244,11 @@ impl AuthenticationClient {
         tracing::info!("Starting authentication via {}", transport.name());
 
         let start = Instant::now();
+        tracing::trace!(
+            "authenticate_with_transport started for {} at {:?}",
+            transport.name(),
+            start
+        );
         let timeout = get_session_timeout();
         let mut attempt = 0u32;
         let mut confirmation_sent = false;
@@ -274,17 +279,41 @@ impl AuthenticationClient {
             }
 
             // Send request
+            let send_start = Instant::now();
+            tracing::trace!(
+                "Calling transport.send_request (transport={})",
+                transport.name()
+            );
             transport.send_request(packet).await?;
+            tracing::trace!(
+                "transport.send_request completed, elapsed={:?}",
+                send_start.elapsed()
+            );
 
             // Wait for response with exponential backoff
             let retry_interval = shared::network::get_client_retry_interval(attempt);
 
             loop {
+                let recv_start = Instant::now();
+                tracing::trace!(
+                    "Calling transport.receive_response (transport={}, timeout={:?})",
+                    transport.name(),
+                    retry_interval
+                );
                 match transport.receive_response(retry_interval).await? {
                     ReceiveResult::Response(response_packet, server_addr) => {
+                        tracing::trace!(
+                            "transport.receive_response returned Response, elapsed={:?}",
+                            recv_start.elapsed()
+                        );
                         // Process response
+                        let proc_start = Instant::now();
                         match self.process_response(&response_packet, server_addr).await {
                             Ok(true) => {
+                                tracing::trace!(
+                                    "process_response accepted, elapsed={:?}",
+                                    proc_start.elapsed()
+                                );
                                 // Authentication granted
                                 if !confirmation_sent {
                                     let confirmation =
@@ -302,6 +331,10 @@ impl AuthenticationClient {
                                 break;
                             }
                             Ok(false) => {
+                                tracing::trace!(
+                                    "process_response denied, elapsed={:?}",
+                                    proc_start.elapsed()
+                                );
                                 // Authentication denied
                                 if !confirmation_sent {
                                     let confirmation =

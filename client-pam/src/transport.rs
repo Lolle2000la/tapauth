@@ -11,6 +11,7 @@ use enum_dispatch::enum_dispatch;
 use shared::protocol::pb::EncryptedPacket;
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(feature = "ble")]
 use std::sync::Arc;
@@ -212,6 +213,7 @@ impl BleTransport {
         keypair: Arc<shared::crypto::Ed25519KeyPair>,
         challenge: [u8; 32],
     ) -> Result<Self, AuthError> {
+        tracing::trace!("BleTransport::new - initializing BlueZ session");
         // Initialize BlueZ session and get adapter
         let session = bluer::Session::new()
             .await
@@ -232,12 +234,15 @@ impl BleTransport {
 
         // Check if already powered - only power on if needed
         if !adapter.is_powered().await.unwrap_or(false) {
+            tracing::trace!("Adapter not powered, powering on");
             adapter
                 .set_powered(true)
                 .await
                 .map_err(|e| AuthError::BleError(format!("Failed to power on adapter: {}", e)))?;
+            tracing::trace!("Adapter powered on");
+        } else {
+            tracing::trace!("Adapter already powered");
         }
-
         Ok(Self {
             adapter,
             temporal_id,
@@ -273,6 +278,9 @@ impl Transport for BleTransport {
             return Ok(());
         }
 
+        let send_start = Instant::now();
+        tracing::trace!("send_request started");
+
         // Store the packet for later use in receive_response
         self.request_packet = Some(packet.clone());
 
@@ -296,6 +304,10 @@ impl Transport for BleTransport {
             .collect(),
             discoverable: Some(true),
             local_name: Some("".to_string()),
+            // Aggressive advertising for fast discovery
+            // BlueZ uses Duration for intervals (20-40ms range for fast discovery)
+            min_interval: Some(Duration::from_millis(20)),
+            max_interval: Some(Duration::from_millis(40)),
             ..Default::default()
         };
 
@@ -305,7 +317,11 @@ impl Transport for BleTransport {
         for attempt in 1..=MAX_ATTEMPTS {
             match self.adapter.advertise(advertisement.clone()).await {
                 Ok(handle) => {
-                    tracing::info!("BLE advertising started (attempt {})", attempt);
+                    tracing::trace!(
+                        "BLE advertising started (attempt {}), elapsed={:?}",
+                        attempt,
+                        send_start.elapsed()
+                    );
                     self.adv_handle = Some(handle);
                     break;
                 }
@@ -449,7 +465,11 @@ impl Transport for BleTransport {
         // Store handle to keep GATT server alive
         self.gatt_handle = Some(app_handle);
 
-        tracing::info!("GATT server registered and ready");
+        tracing::trace!(
+            "GATT server registered and ready, total send_request elapsed={:?}",
+            send_start.elapsed()
+        );
+        tracing::trace!("send_request completed in {:?}", send_start.elapsed());
         Ok(())
     }
 
@@ -470,6 +490,7 @@ impl Transport for BleTransport {
 
         // Wait for response with timeout
         let start = std::time::Instant::now();
+        tracing::trace!("receive_response started, timeout={:?}", timeout);
         loop {
             if start.elapsed() >= timeout {
                 return Ok(ReceiveResult::Timeout);
@@ -479,7 +500,10 @@ impl Transport for BleTransport {
             {
                 let mut response_lock = self.response_data.lock().await;
                 if let Some(ref response_bytes) = *response_lock {
-                    tracing::info!("Processing received BLE response");
+                    tracing::trace!(
+                        "Processing received BLE response, elapsed={:?}",
+                        start.elapsed()
+                    );
 
                     // Parse and decrypt response
                     let encrypted_response = match EncryptedPacket::decode(&response_bytes[..]) {
@@ -520,7 +544,10 @@ impl Transport for BleTransport {
                             // Create GrantConfirmation
                             if let Ok(confirmation) = self.create_confirmation(&request_packet) {
                                 *self.confirmation_data.lock().await = Some(confirmation);
-                                tracing::debug!("Stored confirmation for server to read");
+                                tracing::trace!(
+                                    "Stored confirmation for server to read, elapsed={:?}",
+                                    start.elapsed()
+                                );
                             }
                         }
                         _ => {
@@ -535,6 +562,10 @@ impl Transport for BleTransport {
 
                     // Return success - the encrypted response will be verified by auth_client
                     // We use a dummy SocketAddr since BLE doesn't have IP addresses
+                    tracing::trace!(
+                        "receive_response returning Response, total elapsed={:?}",
+                        start.elapsed()
+                    );
                     return Ok(ReceiveResult::Response(
                         encrypted_response,
                         "0.0.0.0:0".parse().unwrap(),
