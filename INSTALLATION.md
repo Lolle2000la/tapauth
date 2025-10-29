@@ -48,7 +48,8 @@ This installs everything with default settings (including PAM configuration for 
 
 - **Privilege Separation**: Builds run as the original user (via `$SUDO_USER`) even when script is run with `sudo`, preventing root-owned files in cargo cache
 - **Optimized Build**: Builds all components in release mode with `-C target-cpu=native -C opt-level=3`
-- **Component Selection**: Choose which components to install (PAM module, BLE daemon, Config GUI)
+- **Component Selection**: Choose which components to install (PAM module, Config GUI)
+- **Bluetooth Support**: Optional - can build with or without Bluetooth (BLE) support
 - **PAM Configuration**: Optionally configure PAM for login, sudo, and polkit
 - **TPM Support**: Optional TPM integration for secure key storage
 - **Interactive Mode**: User-friendly prompts for all options
@@ -63,9 +64,9 @@ Usage: ./install.sh [OPTIONS]
 OPTIONS:
     -h, --help              Show help message
     -n, --non-interactive   Run in non-interactive mode
-    -y, --yes               Answer yes to all prompts
+    -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-pam                Don't install PAM module
-    --no-ble                Don't install BLE daemon
+    --no-ble                Build without Bluetooth support (UDP only)
     --no-gui                Don't install configuration GUI
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
@@ -87,9 +88,9 @@ sudo ./install.sh
 sudo ./install.sh --non-interactive --configure-login --configure-sudo
 ```
 
-#### Install Only PAM Module and BLE Daemon
+#### Install PAM Module Without Bluetooth
 ```bash
-sudo ./install.sh --no-gui --configure-login
+sudo ./install.sh --no-ble --configure-login
 ```
 
 #### Build Without Installing
@@ -122,12 +123,9 @@ Installation paths are automatically detected based on your distribution:
 | Component | Typical Location |
 |-----------|----------|
 | PAM Module | `/lib64/security/pam_tapauth.so` (Fedora/RHEL)<br>`/usr/lib/security/pam_tapauth.so` (Arch)<br>`/lib/x86_64-linux-gnu/security/pam_tapauth.so` (Ubuntu/Debian) |
-| BLE Daemon | `/usr/lib/tapauth/tapauth-ble-daemon` |
 | Config GUI | `/usr/bin/tapauth-config` |
 | Configuration | `/etc/tapauth/` |
 | Desktop Entry | `/usr/share/applications/tapauth-config.desktop` |
-| systemd Service | `/etc/systemd/system/tapauth-ble-daemon.service` |
-| D-Bus Config | `/etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf` |
 | Polkit Policy | `/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy` |
 
 **Note**: The PAM module location is automatically detected during installation based on your distribution's standard PAM directory.
@@ -150,14 +148,13 @@ Usage: ./uninstall.sh [OPTIONS]
 OPTIONS:
     -h, --help              Show help message
     -n, --non-interactive   Run in non-interactive mode
-    -y, --yes               Answer yes to all prompts
+    -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-pam                Don't remove PAM module
-    --no-ble                Don't remove BLE daemon
     --no-gui                Don't remove configuration GUI
     --remove-pam-login      Remove PAM login configuration
     --remove-pam-sudo       Remove PAM sudo configuration
     --remove-pam-polkit     Remove PAM polkit configuration
-    --remove-user-data      Remove user configuration data
+    --remove-user-data      Remove user configuration data (keys, pairings)
     --dry-run               Show what would be done without doing it
 ```
 
@@ -173,9 +170,9 @@ sudo ./uninstall.sh
 sudo ./uninstall.sh --yes --remove-user-data
 ```
 
-#### Remove Only BLE Daemon
+#### Remove Only PAM Module
 ```bash
-sudo ./uninstall.sh --no-pam --no-gui
+sudo ./uninstall.sh --no-gui
 ```
 
 #### Preview Uninstallation (Dry Run)
@@ -217,8 +214,8 @@ auth    required      pam_deny.so         ← EXISTING: Deny if all methods fail
 
 This is a **safe, non-disruptive** configuration. Your system remains accessible even if:
 - Your phone is off or out of range
-- The BLE daemon crashes
 - TapAuth is uninstalled (just remove the line from PAM config)
+- Network connectivity is unavailable
 
 **For detailed information about PAM integration, security, and troubleshooting, see [PAM_INTEGRATION.md](PAM_INTEGRATION.md).**
 
@@ -260,15 +257,7 @@ sudo -k && sudo echo "Authentication test"
 # Try logging in with your paired device
 ```
 
-### 3. Verify BLE Daemon
-
-Check that the BLE daemon is running:
-
-```bash
-systemctl status tapauth-ble-daemon
-```
-
-### 4. Keep a Backup Session
+### 3. Keep a Backup Session
 
 When first setting up PAM authentication:
 - Keep a root terminal session open
@@ -306,7 +295,7 @@ Then run the install script normally with `sudo ./install.sh` - it will now buil
 
 #### Ubuntu/Debian
 - Ensure `libpam0g-dev` is installed for PAM development
-- AppArmor profiles may need adjustment for the BLE daemon
+- Ensure BlueZ is installed and running for BLE support: `sudo apt install bluez`
 
 #### Arch Linux
 - Ensure `pam` package is installed
@@ -320,17 +309,27 @@ If you get locked out:
 3. Remove lines containing `pam_tapauth.so`
 4. Reboot
 
-### BLE Daemon Not Starting
+### Bluetooth Issues
 
-Check the service status:
+If BLE authentication is not working:
+
 ```bash
-journalctl -u tapauth-ble-daemon -f
+# Check Bluetooth service is running
+sudo systemctl status bluetooth
+
+# Check for Bluetooth adapters
+bluetoothctl list
+
+# Enable Bluetooth adapter
+bluetoothctl power on
 ```
 
 Common issues:
 - Bluetooth not enabled: `sudo systemctl start bluetooth`
-- Missing permissions: Check D-Bus configuration
-- Bluetooth adapter not available
+- Bluetooth adapter not available or powered off
+- Bluetooth device conflicts (close other BLE applications)
+
+For detailed Bluetooth diagnostics, see `scripts/bluetooth-check.sh`.
 
 ### Permission Issues
 
@@ -338,23 +337,21 @@ If you see permission errors:
 ```bash
 # Check file ownership
 ls -la /etc/tapauth/
-ls -la /usr/lib/pam_tapauth/
+ls -la $(find /lib* /usr/lib* -name pam_tapauth.so 2>/dev/null | head -1)
 
 # Fix if needed
 sudo chmod 700 /etc/tapauth
-sudo chmod 644 /usr/lib/pam_tapauth/pam_tapauth.so
 ```
 
 ## Advanced Usage
 
 ### Custom Installation Directory
 
-To use a custom installation directory, modify the paths at the top of `install.sh`:
+The PAM module directory is automatically detected. To override, set `PAM_MODULE_DIR` before running:
 
 ```bash
-PAM_MODULE_DIR="/custom/path/pam_tapauth"
-BLE_DAEMON_DIR="/custom/path/tapauth"
-# ... etc
+export PAM_MODULE_DIR="/custom/path/security"
+sudo -E ./install.sh
 ```
 
 ### Building for a Different Architecture
@@ -430,7 +427,7 @@ sudo ./uninstall.sh --yes --remove-user-data
 If you encounter issues:
 1. Check the troubleshooting section above
 2. Review system logs: `journalctl -xe`
-3. Check service status: `systemctl status tapauth-ble-daemon`
+3. For BLE issues, run: `./scripts/bluetooth-check.sh`
 4. Verify PAM configuration: `cat /etc/pam.d/login | grep tapauth`
 
 ## License
