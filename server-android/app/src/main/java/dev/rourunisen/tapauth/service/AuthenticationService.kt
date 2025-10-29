@@ -40,6 +40,12 @@ class AuthenticationService : Service() {
         private const val TAG = "AuthenticationService"
         private const val NOTIFICATION_ID = 1
 
+        // Broadcast actions for BLE communication
+        const val ACTION_CANCEL_BLE_CONNECTION =
+            "dev.rourunisen.tapauth.ACTION_CANCEL_BLE_CONNECTION"
+        const val EXTRA_CHALLENGE = "challenge"
+        const val EXTRA_DEVICE_ID = "device_id"
+
         fun start(context: Context) {
             val intent = Intent(context, AuthenticationService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -439,13 +445,26 @@ class AuthenticationService : Service() {
             // Reset rate limiter for this device
             requestRateLimiter.resetClient(device.publicKey.toHex())
 
-            // Note: We don't automatically dismiss the auth request UI here
-            // because the user may still want to see and approve it.
-            // The timeout will handle cleanup if needed.
+            // Cancel any pending authentication requests for this challenge and dismiss
+            // notifications
+            val authRequestManager = AuthRequestManager.getInstance()
+            val dismissed = authRequestManager.cancelRequestsByChallenge(challengeBytes)
+
+            if (dismissed) {
+                Log.d(TAG, "Dismissed pending authentication request(s) for cancelled challenge")
+            }
+
+            // Notify BLE service to disconnect any active connections for this challenge
+            val intent =
+                Intent(ACTION_CANCEL_BLE_CONNECTION).apply {
+                    putExtra(EXTRA_CHALLENGE, challengeBytes)
+                    putExtra(EXTRA_DEVICE_ID, device.deviceId)
+                }
+            sendBroadcast(intent)
 
             Log.d(
                 TAG,
-                "Stopped retransmission and reset rate limiter for device: ${device.displayName}",
+                "Stopped retransmission, dismissed notifications, and notified BLE for device: ${device.displayName}",
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to handle AuthenticationCancel", e)

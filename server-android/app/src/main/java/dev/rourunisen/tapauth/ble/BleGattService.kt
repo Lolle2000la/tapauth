@@ -19,6 +19,7 @@ import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.biometric.BiometricHelper
+import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import dev.rourunisen.tapauth.service.TransportLockManager
@@ -91,6 +92,33 @@ class BleGattService : Service() {
     private val transportLockManager = TransportLockManager.getInstance()
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Track active GATT connections by challenge for cancellation
+    private val activeConnectionsByChallenge =
+        java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
+
+    // BroadcastReceiver for handling cancellation requests
+    private val cancelReceiver =
+        object : android.content.BroadcastReceiver() {
+            override fun onReceive(
+                context: android.content.Context?,
+                intent: android.content.Intent?,
+            ) {
+                if (
+                    intent?.action ==
+                        dev.rourunisen.tapauth.service.AuthenticationService
+                            .ACTION_CANCEL_BLE_CONNECTION
+                ) {
+                    val challengeBytes =
+                        intent.getByteArrayExtra(
+                            dev.rourunisen.tapauth.service.AuthenticationService.EXTRA_CHALLENGE
+                        )
+                    if (challengeBytes != null) {
+                        handleCancelConnection(challengeBytes)
+                    }
+                }
+            }
+        }
 
     // Map of temporal IDs to device CSKs for quick lookup
     private val temporalIdCache = mutableMapOf<String, String>()
@@ -232,8 +260,8 @@ class BleGattService : Service() {
                 ) {
                     Log.d(TAG, "Read authentication request from client: ${value.size} bytes")
 
-                    // Handle the authentication request
-                    serviceScope.launch { handleAuthenticationRequest(gatt, value) }
+                    // Handle the incoming message (could be AuthRequest or AuthCancel)
+                    serviceScope.launch { handleIncomingBleMessage(gatt, value) }
                 }
             }
 
@@ -300,6 +328,14 @@ class BleGattService : Service() {
         deviceRepository = DeviceRepository(this)
         keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
         biometricHelper = BiometricHelper(this)
+
+        // Register broadcast receiver for cancellation requests
+        val filter =
+            android.content.IntentFilter(
+                dev.rourunisen.tapauth.service.AuthenticationService.ACTION_CANCEL_BLE_CONNECTION
+            )
+        registerReceiver(cancelReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
+        Log.d(TAG, "Registered cancel broadcast receiver")
 
         bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
@@ -500,12 +536,9 @@ class BleGattService : Service() {
         bluetoothGatt = device.connectGatt(this, false, gattCallback)
     }
 
-    private suspend fun handleAuthenticationRequest(gatt: BluetoothGatt, data: ByteArray) {
+    private suspend fun handleIncomingBleMessage(gatt: BluetoothGatt, data: ByteArray) {
         try {
-            Log.d(
-                TAG,
-                "Handling BLE authentication request: ${data.size} bytes from ${gatt.device.address}",
-            )
+            Log.d(TAG, "Handling BLE message: ${data.size} bytes from ${gatt.device.address}")
 
             // Step 1: Parse the EncryptedPacket
             val encryptedPacket =
@@ -613,7 +646,109 @@ class BleGattService : Service() {
                     return
                 }
 
-            // Step 4: Parse the AuthenticationRequest from the WrapperMessage
+            // Step 4: Determine message type and route accordingly
+            val messageType =
+                try {
+                    TapAuthCrypto.determineMessageType(wrapperMessageBytes)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to determine BLE message type", e)
+                    gatt.disconnect()
+                    return
+                }
+
+            Log.d(TAG, "BLE message type: $messageType")
+
+            when (messageType) {
+                "AUTH_REQUEST" -> handleAuthRequest(gatt, wrapperMessageBytes, matchedDevice, data)
+                "AUTH_CANCEL" -> handleAuthCancelBle(gatt, wrapperMessageBytes, matchedDevice)
+                else -> {
+                    Log.w(TAG, "Unknown BLE message type: $messageType, disconnecting")
+                    gatt.disconnect()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling BLE message", e)
+            if (
+                ActivityCompat.checkSelfPermission(
+                    this@BleGattService,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                gatt.disconnect()
+            }
+        }
+    }
+
+    private suspend fun handleAuthCancelBle(
+        gatt: BluetoothGatt,
+        wrapperMessageBytes: ByteArray,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+    ) {
+        try {
+            Log.d(TAG, "Handling AuthenticationCancel via BLE from device: ${device.displayName}")
+
+            // Parse the cancel message
+            val cancel =
+                try {
+                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(
+                        wrapperMessageBytes
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to parse AuthenticationCancel via BLE", e)
+                    gatt.disconnect()
+                    return
+                }
+
+            Log.d(TAG, "BLE AuthenticationCancel received for challenge: ${cancel.challenge}")
+
+            // Decode Base64 challenge to ByteArray
+            val challengeBytes =
+                android.util.Base64.decode(cancel.challenge, android.util.Base64.NO_WRAP)
+            val challengeKey = challengeBytes.toHex()
+
+            // Remove from active connections
+            activeConnectionsByChallenge.remove(challengeKey)
+
+            // Cancel pending auth requests
+            val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
+            authRequestManager.cancelRequestsByChallenge(challengeBytes)
+
+            // Stop any retransmission
+            val retransmissionManager =
+                dev.rourunisen.tapauth.service.RetransmissionManager.getInstance()
+            retransmissionManager.stopRetransmission(challengeBytes)
+
+            // Release transport lock
+            val transportLockManager =
+                dev.rourunisen.tapauth.service.TransportLockManager.getInstance()
+            transportLockManager.releaseLock(challengeBytes)
+
+            Log.d(
+                TAG,
+                "BLE: Cancelled auth request and dismissing notification for challenge: $challengeKey",
+            )
+
+            // Disconnect the BLE connection
+            if (
+                ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
+                    PackageManager.PERMISSION_GRANTED
+            ) {
+                gatt.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling BLE AuthenticationCancel", e)
+            gatt.disconnect()
+        }
+    }
+
+    private suspend fun handleAuthRequest(
+        gatt: BluetoothGatt,
+        wrapperMessageBytes: ByteArray,
+        matchedDevice: dev.rourunisen.tapauth.data.PairedDevice,
+        data: ByteArray,
+    ) {
+        try {
+            // Parse the AuthenticationRequest from the WrapperMessage
             val authRequest =
                 try {
                     dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(
@@ -682,6 +817,11 @@ class BleGattService : Service() {
                 }
                 return
             }
+
+            // Track this connection by challenge for potential cancellation
+            val challengeKey = challengeBytes.toHex()
+            activeConnectionsByChallenge[challengeKey] = gatt
+            Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
 
             // Step 6: Replay attack mitigation
             if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
@@ -886,6 +1026,13 @@ class BleGattService : Service() {
         response: ByteArray,
         challenge: ByteArray?,
     ) {
+        // Remove from active connections tracking since we're responding
+        if (challenge != null) {
+            val challengeKey = challenge.toHex()
+            activeConnectionsByChallenge.remove(challengeKey)
+            Log.d(TAG, "Removed BLE connection from tracking for challenge: $challengeKey")
+        }
+
         if (
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED
@@ -1019,6 +1166,15 @@ class BleGattService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // Unregister broadcast receiver
+        try {
+            unregisterReceiver(cancelReceiver)
+            Log.d(TAG, "Unregistered cancel broadcast receiver")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister cancel receiver: ${e.message}")
+        }
+
         stopScanning()
 
         if (
@@ -1028,11 +1184,52 @@ class BleGattService : Service() {
             bluetoothGatt?.close()
         }
 
+        // Disconnect all active connections
+        activeConnectionsByChallenge.values.forEach { gatt ->
+            try {
+                if (
+                    ActivityCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to disconnect GATT: ${e.message}")
+            }
+        }
+        activeConnectionsByChallenge.clear()
+
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
         } catch (_: Exception) {}
         serviceScope.cancel()
         Log.i(TAG, "BLE GATT Service destroyed")
+    }
+
+    /** Handle cancellation request by disconnecting GATT connection for the given challenge */
+    private fun handleCancelConnection(challengeBytes: ByteArray) {
+        val challengeKey = challengeBytes.toHex()
+        val gatt = activeConnectionsByChallenge.remove(challengeKey)
+
+        if (gatt != null) {
+            Log.d(TAG, "Disconnecting BLE connection for cancelled challenge: $challengeKey")
+            try {
+                if (
+                    ActivityCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    gatt.disconnect()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to disconnect GATT for challenge $challengeKey: ${e.message}")
+            }
+        } else {
+            Log.d(TAG, "No active BLE connection found for challenge: $challengeKey")
+        }
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

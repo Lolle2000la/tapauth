@@ -211,6 +211,44 @@ class AuthRequestManager private constructor() {
     /** Get count of pending requests */
     fun getPendingCount(): Int = pendingRequests.size
 
+    /**
+     * Cancel all pending requests that match the given challenge This is used when an
+     * AuthenticationCancel message is received
+     *
+     * @param challenge The challenge bytes to match against
+     * @return true if any requests were cancelled
+     */
+    fun cancelRequestsByChallenge(challenge: ByteArray): Boolean {
+        var cancelledAny = false
+
+        // Find all requests with matching challenge
+        val matchingRequests =
+            pendingRequests.filter { (_, pending) ->
+                pending.authRequest.challenge.contentEquals(challenge)
+            }
+
+        // Cancel each matching request
+        matchingRequests.forEach { (requestId, pending) ->
+            pendingRequests.remove(requestId)
+            Log.d(TAG, "Cancelled auth request $requestId due to AuthenticationCancel")
+
+            // Invoke callback with cancelled status (not explicit denial)
+            scope.launch { pending.callback(false, null, false) }
+
+            // Dismiss the notification
+            try {
+                NotificationManagerCompat.from(pending.appContext).cancel(requestId.hashCode())
+                Log.d(TAG, "Dismissed notification for cancelled request $requestId")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
+            }
+
+            cancelledAny = true
+        }
+
+        return cancelledAny
+    }
+
     companion object {
         private const val TAG = "AuthRequestManager"
 
