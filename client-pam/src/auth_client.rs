@@ -12,6 +12,7 @@ use shared::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::transport::{ReceiveResult, Transport, UdpTransport};
 
@@ -51,6 +52,10 @@ pub struct AuthenticationClient {
     username: String,
     hostname: String,
     challenge: [u8; 32],
+    // Store active transports for reuse (e.g., for cancellation)
+    #[cfg(feature = "ble")]
+    ble_transport: Arc<Mutex<Option<Arc<Mutex<BleTransport>>>>>,
+    udp_transport: Arc<Mutex<Option<Arc<Mutex<UdpTransport>>>>>,
 }
 
 impl AuthenticationClient {
@@ -81,6 +86,9 @@ impl AuthenticationClient {
             username,
             hostname,
             challenge,
+            #[cfg(feature = "ble")]
+            ble_transport: Arc::new(Mutex::new(None)),
+            udp_transport: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -143,37 +151,44 @@ impl AuthenticationClient {
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
-        // Spawn BLE task
-        let self_ble = self.clone();
-        let packet_ble = packet.clone();
+        // Create transports upfront
+        let config = self.config_manager.load_config()?;
+        let udp_transport = UdpTransport::new(config.udp_port).await?;
+
         let config_manager = self.config_manager.clone();
         let keypair = Arc::new(self.keypair.clone());
         let challenge = self.challenge;
+        let ble_transport =
+            BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await?;
+
+        // Store transports in Arc<Mutex> for reuse
+        let ble_transport_shared = Arc::new(Mutex::new(ble_transport));
+        let udp_transport_shared = Arc::new(Mutex::new(udp_transport));
+
+        // Save references for later use (e.g., cancellation)
+        *self.ble_transport.lock().await = Some(ble_transport_shared.clone());
+        *self.udp_transport.lock().await = Some(udp_transport_shared.clone());
+
+        // Spawn BLE task
+        let self_ble = self.clone();
+        let packet_ble = packet.clone();
+        let ble_transport_task = ble_transport_shared.clone();
         let mut ble_handle = tokio::spawn(async move {
-            match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await
-            {
-                Ok(mut transport) => {
-                    self_ble
-                        .authenticate_with_transport(&mut transport, &packet_ble)
-                        .await
-                }
-                Err(e) => Err(e),
-            }
+            let mut transport = ble_transport_task.lock().await;
+            self_ble
+                .authenticate_with_transport(&mut *transport, &packet_ble)
+                .await
         });
 
         // Spawn UDP task
         let self_udp = self.clone();
         let packet_udp = packet.clone();
+        let udp_transport_task = udp_transport_shared.clone();
         let mut udp_handle = tokio::spawn(async move {
-            let config = self_udp.config_manager.load_config().unwrap();
-            match UdpTransport::new(config.udp_port).await {
-                Ok(mut transport) => {
-                    self_udp
-                        .authenticate_with_transport(&mut transport, &packet_udp)
-                        .await
-                }
-                Err(e) => Err(e),
-            }
+            let mut transport = udp_transport_task.lock().await;
+            self_udp
+                .authenticate_with_transport(&mut *transport, &packet_udp)
+                .await
         });
 
         let mut ble_completed = false;
@@ -431,6 +446,93 @@ impl AuthenticationClient {
             }
             _ => Err(AuthError::Protocol(ProtocolError::InvalidMessageFormat)),
         }
+    }
+
+    /// Send cancellation to all transports to dismiss notifications
+    pub async fn send_cancellation(&self) -> Result<(), AuthError> {
+        use shared::protocol::messages::create_auth_cancel;
+        use shared::protocol::packet::{create_encrypted_packet_with_csk_nonce, wrap_auth_cancel};
+
+        tracing::info!("Sending authentication cancellation to dismiss server notifications");
+
+        // Create the cancellation message
+        let cancel = create_auth_cancel(&self.keypair, &self.challenge)?;
+        let wrapper = wrap_auth_cancel(cancel);
+        let packet = create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
+
+        // Try to send cancellation via available transports
+        #[cfg(feature = "ble")]
+        {
+            self.send_cancel_parallel(&packet).await
+        }
+
+        #[cfg(not(feature = "ble"))]
+        {
+            let config = self.config_manager.load_config()?;
+            if let Ok(mut transport) = UdpTransport::new(config.udp_port).await {
+                let _ = transport.send_cancel(&packet).await;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn send_cancel_parallel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+        tracing::debug!("Sending cancellation via UDP and BLE");
+
+        // Try to use stored transports if available, otherwise create new ones
+
+        // UDP cancellation (quick)
+        if let Some(udp_transport) = self.udp_transport.lock().await.clone() {
+            let packet_clone = packet.clone();
+            tokio::spawn(async move {
+                let mut transport = udp_transport.lock().await;
+                let _ = transport.send_cancel(&packet_clone).await;
+            });
+        } else {
+            // Fallback: create new UDP transport
+            let config = self.config_manager.load_config()?;
+            if let Ok(mut transport) = UdpTransport::new(config.udp_port).await {
+                let _ = transport.send_cancel(packet).await;
+            }
+        }
+
+        // BLE cancellation (fire and forget)
+        if let Some(ble_transport) = self.ble_transport.lock().await.clone() {
+            let packet_clone = packet.clone();
+            tokio::spawn(async move {
+                let mut transport = ble_transport.lock().await;
+                let _ = transport.send_cancel(&packet_clone).await;
+            });
+        } else {
+            // Fallback: create new BLE transport with timeout
+            use tokio::time::{timeout, Duration};
+
+            let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
+            let config_manager = self.config_manager.clone();
+            let keypair = Arc::new(self.keypair.clone());
+            let challenge = self.challenge;
+            let packet_clone = packet.clone();
+
+            tokio::spawn(async move {
+                if let Ok(Ok(mut transport)) = timeout(
+                    Duration::from_millis(500),
+                    BleTransport::new(
+                        temporal_id,
+                        Duration::from_secs(1),
+                        config_manager,
+                        keypair,
+                        challenge,
+                    ),
+                )
+                .await
+                {
+                    let _ = transport.send_cancel(&packet_clone).await;
+                }
+            });
+        }
+
+        Ok(())
     }
 }
 

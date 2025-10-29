@@ -126,13 +126,15 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         Some(pam_sys::PAM_SUCCESS)
                     }
                     Err(e) => {
-                        tracing::error!("Authentication failed for user {}: {}", username, e);
+                        tracing::error!("Authentication failed: {}", e);
                         None
                     }
                 }
             }
             _ = skip_future => {
                 tracing::info!("User skipped TapAuth via Enter key");
+                // Send cancellation to dismiss server notifications
+                let _ = client.send_cancellation().await;
                 None
             }
         }
