@@ -3,14 +3,8 @@ mod pam_logic;
 mod pam_sys;
 mod transport;
 
-#[cfg(feature = "ble")]
-mod ble_client;
-
 pub use auth_client::*;
 pub use transport::*;
-
-#[cfg(feature = "ble")]
-pub use ble_client::*;
 
 use std::os::raw::c_int;
 

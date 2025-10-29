@@ -7,10 +7,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-shared = { workspace = true, features = ["dbus"] }
+shared = { workspace = true }
 
-# BLE support via daemon (using async zbus)
-zbus = { workspace = true, optional = true, features = ["tokio"] }
+# BLE support via direct BlueZ access
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 
 # Protocol buffers
 prost.workspace = true
@@ -35,5 +35,5 @@ enum_dispatch.workspace = true
 
 [features]
 default = ["ble"]
-ble = ["zbus"]
+ble = ["bluer"]
 tpm = ["tss-esapi"]

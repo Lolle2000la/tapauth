@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["shared", "client-pam", "client-config-gui", "ble-daemon"]
+members = ["shared", "client-pam", "client-config-gui"]
 
 [workspace.dependencies]
 # Shared library (used by all consuming crates)
@@ -17,16 +17,11 @@ tokio = { version = "1.41", features = ["full"] }
 socket2 = "0.6"
 if-addrs = "0.14"
 
-# D-Bus for IPC
-zbus = { version = "5.0", default-features = false }
-
 # Utilities
 hex = "0.4"
 thiserror = "2.0"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3", features = [
-    "env-filter",
-] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 getrandom = "0.3"
 libc = "0.2"
 chrono = "0.4"

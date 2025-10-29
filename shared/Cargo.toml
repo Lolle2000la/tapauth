@@ -49,16 +49,12 @@ socket2.workspace = true
 # JNI support (optional)
 jni = { version = "0.21", optional = true }
 
-# D-Bus support for BLE daemon (optional)
-zbus = { workspace = true, optional = true, features = ["tokio"] }
-
 [build-dependencies]
 prost-build.workspace = true
 
 [features]
 default = []
 jni = ["dep:jni"]
-dbus = ["dep:zbus"]
 
 [dev-dependencies]
 tokio-test.workspace = true

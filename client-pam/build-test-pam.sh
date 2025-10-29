@@ -15,6 +15,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "Usage: sudo $0 [username]"
     echo ""
     echo "Build and test the TapAuth PAM module for a specific user."
+    echo "The module now uses direct BlueZ access - no daemon required!"
     echo ""
     echo "Arguments:"
     echo "  username    Optional. The user to test authentication for."
@@ -29,6 +30,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "  - This script requires root privileges (use sudo)"
     echo "  - The test user must have paired devices in /etc/tapauth/"
     echo "  - User-specific pairing: only users in allowed_users list can authenticate"
+    echo "  - BLE functionality requires BlueZ (org.bluez) to be running"
     echo ""
     cd "$ORIGINAL_DIR"
     exit 0
@@ -36,6 +38,7 @@ fi
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║         TapAuth PAM Module - Build and Test                   ║"
+echo "║         (Direct BlueZ Access - No Daemon Required)            ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -47,8 +50,6 @@ TEMP_INSTALL_NAME="pam_tapauth_test.so"
 # TEMP_INSTALL_PATH will be detected below
 PAM_SERVICE_NAME="tapauth-test-local"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
-BLE_DAEMON_SERVICE="tapauth-ble-daemon"
-BLE_DAEMON_DIR="${PROJECT_ROOT}/ble-daemon"
 
 # --- Determine test user ---
 # Default to the user who invoked sudo, or current user if not using sudo
@@ -77,10 +78,6 @@ if ! id "$TEST_USER" &>/dev/null; then
 fi
 
 # --- End Configuration ---
-
-# --- Track daemon state for cleanup ---
-DAEMON_WAS_RUNNING=false
-DAEMON_WAS_INSTALLED=false
 
 # Check for pamtester dependency
 if ! command -v pamtester &> /dev/null; then
@@ -170,98 +167,6 @@ if [ ! -f "$BUILD_OUTPUT_FULL_PATH" ]; then
 fi
 echo "✅ Build successful: $BUILD_OUTPUT_FULL_PATH"
 
-# --- Check and manage daemon state ---
-echo ""
-echo "==> Checking BLE daemon status..."
-
-# Check if daemon is already installed (production version)
-if systemctl list-unit-files | grep -q "^${BLE_DAEMON_SERVICE}.service"; then
-    DAEMON_WAS_INSTALLED=true
-    echo "ℹ️  Production daemon detected"
-    
-    # Check if it's running
-    if systemctl is-active --quiet "$BLE_DAEMON_SERVICE"; then
-        DAEMON_WAS_RUNNING=true
-        echo "    Production daemon is running - stopping it temporarily..."
-        sudo systemctl stop "$BLE_DAEMON_SERVICE"
-        echo "✅ Production daemon stopped (will be restored on exit)"
-    else
-        echo "    Production daemon is installed but not running"
-    fi
-else
-    echo "ℹ️  No production daemon found - will install test version"
-fi
-
-# --- Build and install test daemon ---
-echo ""
-echo "==> Building and installing test BLE daemon..."
-cd "$BLE_DAEMON_DIR"
-
-# Build the daemon
-if [ -n "$SUDO_USER" ]; then
-    ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
-    CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
-    if [ ! -x "$CARGO_PATH" ]; then
-        echo "❌ Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
-        cd "$ORIGINAL_DIR"
-        exit 1
-    fi
-    echo "    Building daemon as user $SUDO_USER..."
-    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release
-else
-    if ! command -v cargo &> /dev/null; then
-        echo "❌ cargo command not found in PATH."
-        cd "$ORIGINAL_DIR"
-        exit 1
-    fi
-    echo "    Building daemon as current user..."
-    cargo build --release
-fi
-
-# Install the test daemon
-echo "    Installing test daemon binary..."
-# With workspace, build output is at root target directory
-sudo cp ../target/release/tapauth-ble-daemon /usr/local/bin/tapauth-ble-daemon
-sudo chmod 755 /usr/local/bin/tapauth-ble-daemon
-
-# Install D-Bus policy
-echo "    Installing D-Bus policy..."
-sudo cp dev.rourunisen.tapauth.BLE.conf /etc/dbus-1/system.d/
-sudo chmod 644 /etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf
-# Reload D-Bus configuration WITHOUT restarting the entire service
-sudo dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig
-
-# Install systemd service if not already present
-if [ "$DAEMON_WAS_INSTALLED" = false ]; then
-    echo "    Installing systemd service..."
-    sudo cp tapauth-ble-daemon.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable "$BLE_DAEMON_SERVICE"
-fi
-
-# Start the daemon
-echo "    Starting test daemon..."
-sudo systemctl start "$BLE_DAEMON_SERVICE"
-
-# Wait a moment for daemon to initialize
-sleep 2
-
-# Check daemon status
-if systemctl is-active --quiet "$BLE_DAEMON_SERVICE"; then
-    echo "✅ Test daemon is running"
-    # Show last few log lines
-    echo "    Recent daemon logs:"
-    sudo journalctl -u "$BLE_DAEMON_SERVICE" -n 5 --no-pager | sed 's/^/      /'
-else
-    echo "❌ Test daemon failed to start"
-    echo "    Error logs:"
-    sudo journalctl -u "$BLE_DAEMON_SERVICE" -n 10 --no-pager | sed 's/^/      /'
-    cd "$ORIGINAL_DIR"
-    exit 1
-fi
-
-# Already at project root
-
 # --- Cleanup function ---
 # Ensures temporary files are removed even if the script exits unexpectedly
 cleanup() {
@@ -270,32 +175,6 @@ cleanup() {
     # Use detected path for cleanup
     sudo rm -f "$PAM_CONFIG_PATH" "$TEMP_INSTALL_PATH"
     echo "✅ Cleanup complete."
-    
-    # Restore daemon state if needed
-    if [ "$DAEMON_WAS_INSTALLED" = true ]; then
-        echo ""
-        echo "==> Restoring daemon state..."
-        if [ "$DAEMON_WAS_RUNNING" = true ]; then
-            echo "    Starting production daemon..."
-            sudo systemctl start "$BLE_DAEMON_SERVICE"
-            echo "✅ Production daemon restored"
-        fi
-    else
-        # Stop and remove test daemon
-        echo ""
-        echo "==> Removing test daemon..."
-        if systemctl is-active --quiet "$BLE_DAEMON_SERVICE" 2>/dev/null; then
-            sudo systemctl stop "$BLE_DAEMON_SERVICE"
-        fi
-        if [ -f "/etc/systemd/system/${BLE_DAEMON_SERVICE}.service" ]; then
-            sudo systemctl disable "$BLE_DAEMON_SERVICE" 2>/dev/null || true
-            sudo rm -f "/etc/systemd/system/${BLE_DAEMON_SERVICE}.service"
-            sudo rm -f "/usr/local/bin/tapauth-ble-daemon"
-            sudo rm -f "/etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf"
-            sudo systemctl daemon-reload
-            echo "✅ Test daemon removed"
-        fi
-    fi
     
     # Restore original working directory on cleanup
     cd "$ORIGINAL_DIR"
@@ -329,11 +208,13 @@ echo ""
 echo "==> Running pamtester..."
 echo "    Service: $PAM_SERVICE_NAME"
 echo "    User:    $TEST_USER"
+echo "    Note:    PAM module uses direct BlueZ access (no daemon)"
 echo ""
 echo "---------------------------------------------------------------------"
 echo "  Attempting authentication for user: $TEST_USER"
+echo "  The module will directly communicate with BlueZ for BLE advertising."
 echo "  Watch for BLE/UDP activity."
-echo "  Use your paired Android device if prompted."
+echo "  Use your paired Android device to approve the authentication."
 echo "---------------------------------------------------------------------"
 echo ""
 

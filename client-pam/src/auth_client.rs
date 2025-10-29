@@ -135,18 +135,22 @@ impl AuthenticationClient {
         use tokio::select;
 
         let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
-        let timeout_secs = get_session_timeout().as_secs();
+        let timeout = get_session_timeout();
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
         // Spawn BLE task
         let self_ble = self.clone();
         let packet_ble = packet.clone();
+        let config_manager = self.config_manager.clone();
+        let keypair = Arc::new(self.keypair.clone());
+        let challenge = self.challenge;
         let mut ble_handle = tokio::spawn(async move {
-            match BleTransport::new(temporal_id, timeout_secs).await {
+            match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await
+            {
                 Ok(mut transport) => {
                     self_ble
-                        .authenticate_with_ble_transport(&mut transport, &packet_ble)
+                        .authenticate_with_transport(&mut transport, &packet_ble)
                         .await
                 }
                 Err(e) => Err(e),
@@ -225,24 +229,6 @@ impl AuthenticationClient {
                 return udp_result.unwrap_or(Err(AuthError::Timeout));
             }
         }
-    }
-
-    /// Authenticate using BLE transport (handles full flow internally)
-    #[cfg(feature = "ble")]
-    async fn authenticate_with_ble_transport(
-        &self,
-        transport: &mut BleTransport,
-        packet: &EncryptedPacket,
-    ) -> Result<(), AuthError> {
-        tracing::info!("Starting BLE authentication via daemon");
-
-        // BLE daemon handles the entire send/receive/verify flow
-        // send_request will block until the daemon gets a response or times out
-        transport.send_request(packet).await?;
-
-        // If we get here, authentication was granted
-        tracing::info!("BLE authentication granted");
-        Ok(())
     }
 
     /// Authenticate using a generic transport (request/response pattern)
