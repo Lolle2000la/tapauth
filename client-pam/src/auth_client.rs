@@ -279,37 +279,10 @@ impl AuthenticationClient {
         );
         let timeout = get_session_timeout();
         let mut attempt = 0u32;
-        let mut confirmation_sent = false;
-        let mut final_result: Option<Result<(), AuthError>> = None;
 
         loop {
             if start.elapsed() >= timeout {
-                return final_result.unwrap_or(Err(AuthError::Timeout));
-            }
-
-            // If we already have a result, drain remaining packets briefly then return
-            if let Some(result) = final_result.take() {
-                let drain_result = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    // Lock for this operation
-                    transport_arc
-                        .lock()
-                        .await
-                        .receive_response(Duration::from_millis(50)),
-                )
-                .await;
-
-                match drain_result {
-                    Ok(Ok(ReceiveResult::Response(_, _))) => {
-                        tracing::trace!("Draining additional packet");
-                        final_result = Some(result);
-                        continue;
-                    }
-                    _ => {
-                        tracing::debug!("No more packets, returning result");
-                        return result;
-                    }
-                }
+                return Err(AuthError::Timeout);
             }
 
             // Send request
@@ -356,24 +329,19 @@ impl AuthenticationClient {
                                     proc_start.elapsed()
                                 );
                                 // Authentication granted
-                                if !confirmation_sent {
-                                    let confirmation =
-                                        create_grant_confirmation(&self.keypair, &self.challenge)?;
-                                    let wrapper = wrap_grant_confirmation(confirmation);
-                                    let conf_packet = create_encrypted_packet_with_csk_nonce(
-                                        &self.csk, &wrapper,
-                                    )?;
+                                let confirmation =
+                                    create_grant_confirmation(&self.keypair, &self.challenge)?;
+                                let wrapper = wrap_grant_confirmation(confirmation);
+                                let conf_packet =
+                                    create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
-                                    transport_arc
-                                        .lock()
-                                        .await
-                                        .send_confirmation(&conf_packet)
-                                        .await?;
-                                    confirmation_sent = true;
-                                }
-                                final_result = Some(Ok(()));
-                                // Continue loop to drain packets
-                                break;
+                                transport_arc
+                                    .lock()
+                                    .await
+                                    .send_confirmation(&conf_packet)
+                                    .await?;
+
+                                return Ok(());
                             }
                             Ok(false) => {
                                 tracing::trace!(
@@ -381,23 +349,18 @@ impl AuthenticationClient {
                                     proc_start.elapsed()
                                 );
                                 // Authentication denied
-                                if !confirmation_sent {
-                                    let confirmation =
-                                        create_grant_confirmation(&self.keypair, &self.challenge)?;
-                                    let wrapper = wrap_grant_confirmation(confirmation);
-                                    let conf_packet = create_encrypted_packet_with_csk_nonce(
-                                        &self.csk, &wrapper,
-                                    )?;
+                                let confirmation =
+                                    create_grant_confirmation(&self.keypair, &self.challenge)?;
+                                let wrapper = wrap_grant_confirmation(confirmation);
+                                let conf_packet =
+                                    create_encrypted_packet_with_csk_nonce(&self.csk, &wrapper)?;
 
-                                    transport_arc
-                                        .lock()
-                                        .await
-                                        .send_confirmation(&conf_packet)
-                                        .await?;
-                                    confirmation_sent = true;
-                                }
-                                final_result = Some(Err(AuthError::Denied));
-                                break;
+                                transport_arc
+                                    .lock()
+                                    .await
+                                    .send_confirmation(&conf_packet)
+                                    .await?;
+                                return Err(AuthError::Denied);
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to process response: {}", e);
