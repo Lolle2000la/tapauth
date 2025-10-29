@@ -56,6 +56,10 @@ pub struct AuthenticationClient {
     #[cfg(feature = "ble")]
     ble_transport: Arc<Mutex<Option<Arc<Mutex<BleTransport>>>>>,
     udp_transport: Arc<Mutex<Option<Arc<Mutex<UdpTransport>>>>>,
+    // Store task abort handles to allow aborting authentication tasks from anywhere
+    #[cfg(feature = "ble")]
+    ble_task_abort_handle: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    udp_task_abort_handle: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl AuthenticationClient {
@@ -89,6 +93,9 @@ impl AuthenticationClient {
             #[cfg(feature = "ble")]
             ble_transport: Arc::new(Mutex::new(None)),
             udp_transport: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "ble")]
+            ble_task_abort_handle: Arc::new(Mutex::new(None)),
+            udp_task_abort_handle: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -136,8 +143,9 @@ impl AuthenticationClient {
         #[cfg(not(feature = "ble"))]
         {
             let config = self.config_manager.load_config()?;
-            let mut transport = UdpTransport::new(config.udp_port).await?;
-            self.authenticate_with_transport(&mut transport, &packet)
+            let transport = UdpTransport::new(config.udp_port).await?;
+            let transport_shared = Arc::new(Mutex::new(transport));
+            self.authenticate_with_transport(transport_shared, &packet)
                 .await
         }
     }
@@ -174,9 +182,8 @@ impl AuthenticationClient {
         let packet_ble = packet.clone();
         let ble_transport_task = ble_transport_shared.clone();
         let mut ble_handle = tokio::spawn(async move {
-            let mut transport = ble_transport_task.lock().await;
             self_ble
-                .authenticate_with_transport(&mut *transport, &packet_ble)
+                .authenticate_with_transport(ble_transport_task, &packet_ble)
                 .await
         });
 
@@ -185,11 +192,14 @@ impl AuthenticationClient {
         let packet_udp = packet.clone();
         let udp_transport_task = udp_transport_shared.clone();
         let mut udp_handle = tokio::spawn(async move {
-            let mut transport = udp_transport_task.lock().await;
             self_udp
-                .authenticate_with_transport(&mut *transport, &packet_udp)
+                .authenticate_with_transport(udp_transport_task, &packet_udp)
                 .await
         });
+
+        // Store abort handles for cancellation (can be used even while select! is running)
+        *self.ble_task_abort_handle.lock().await = Some(ble_handle.abort_handle());
+        *self.udp_task_abort_handle.lock().await = Some(udp_handle.abort_handle());
 
         let mut ble_completed = false;
         let mut udp_completed = false;
@@ -250,17 +260,21 @@ impl AuthenticationClient {
     }
 
     /// Authenticate using a generic transport (request/response pattern)
-    async fn authenticate_with_transport(
+    async fn authenticate_with_transport<T>(
         &self,
-        transport: &mut impl Transport,
+        transport_arc: Arc<Mutex<T>>,
         packet: &EncryptedPacket,
-    ) -> Result<(), AuthError> {
-        tracing::info!("Starting authentication via {}", transport.name());
+    ) -> Result<(), AuthError>
+    where
+        T: Transport + Send,
+    {
+        let transport_name = transport_arc.lock().await.name();
+        tracing::info!("Starting authentication via {}", transport_name);
 
         let start = Instant::now();
         tracing::trace!(
             "authenticate_with_transport started for {} at {:?}",
-            transport.name(),
+            transport_name,
             start
         );
         let timeout = get_session_timeout();
@@ -275,12 +289,17 @@ impl AuthenticationClient {
 
             // If we already have a result, drain remaining packets briefly then return
             if let Some(result) = final_result.take() {
-                match tokio::time::timeout(
+                let drain_result = tokio::time::timeout(
                     Duration::from_millis(100),
-                    transport.receive_response(Duration::from_millis(50)),
+                    // Lock for this operation
+                    transport_arc
+                        .lock()
+                        .await
+                        .receive_response(Duration::from_millis(50)),
                 )
-                .await
-                {
+                .await;
+
+                match drain_result {
                     Ok(Ok(ReceiveResult::Response(_, _))) => {
                         tracing::trace!("Draining additional packet");
                         final_result = Some(result);
@@ -294,33 +313,40 @@ impl AuthenticationClient {
             }
 
             // Send request
-            let send_start = Instant::now();
-            tracing::trace!(
-                "Calling transport.send_request (transport={})",
-                transport.name()
-            );
-            transport.send_request(packet).await?;
-            tracing::trace!(
-                "transport.send_request completed, elapsed={:?}",
-                send_start.elapsed()
-            );
+            {
+                let send_start = Instant::now();
+                tracing::trace!(
+                    "Calling transport.send_request (transport={})",
+                    transport_name
+                );
+                transport_arc.lock().await.send_request(packet).await?;
+                tracing::trace!(
+                    "transport.send_request completed, elapsed={:?}",
+                    send_start.elapsed()
+                );
+            }
 
             // Wait for response with exponential backoff
             let retry_interval = shared::network::get_client_retry_interval(attempt);
 
             loop {
-                let recv_start = Instant::now();
-                tracing::trace!(
-                    "Calling transport.receive_response (transport={}, timeout={:?})",
-                    transport.name(),
-                    retry_interval
-                );
-                match transport.receive_response(retry_interval).await? {
+                let recv_result = {
+                    let recv_start = Instant::now();
+                    tracing::trace!(
+                        "Calling transport.receive_response (transport={}, timeout={:?})",
+                        transport_name,
+                        retry_interval
+                    );
+                    transport_arc
+                        .lock()
+                        .await
+                        .receive_response(retry_interval)
+                        .await
+                };
+
+                match recv_result? {
                     ReceiveResult::Response(response_packet, server_addr) => {
-                        tracing::trace!(
-                            "transport.receive_response returned Response, elapsed={:?}",
-                            recv_start.elapsed()
-                        );
+                        tracing::trace!("transport.receive_response returned Response");
                         // Process response
                         let proc_start = Instant::now();
                         match self.process_response(&response_packet, server_addr).await {
@@ -338,7 +364,11 @@ impl AuthenticationClient {
                                         &self.csk, &wrapper,
                                     )?;
 
-                                    transport.send_confirmation(&conf_packet).await?;
+                                    transport_arc
+                                        .lock()
+                                        .await
+                                        .send_confirmation(&conf_packet)
+                                        .await?;
                                     confirmation_sent = true;
                                 }
                                 final_result = Some(Ok(()));
@@ -359,7 +389,11 @@ impl AuthenticationClient {
                                         &self.csk, &wrapper,
                                     )?;
 
-                                    transport.send_confirmation(&conf_packet).await?;
+                                    transport_arc
+                                        .lock()
+                                        .await
+                                        .send_confirmation(&conf_packet)
+                                        .await?;
                                     confirmation_sent = true;
                                 }
                                 final_result = Some(Err(AuthError::Denied));
@@ -478,7 +512,7 @@ impl AuthenticationClient {
 
     #[cfg(feature = "ble")]
     async fn send_cancel_parallel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        tracing::info!("Sending cancellation via UDP and BLE");
+        tracing::info!("Sending cancellation via UDP and aborting authentication tasks");
 
         // Always send via UDP (most reliable for cancellation)
         let config = self.config_manager.load_config()?;
@@ -497,16 +531,38 @@ impl AuthenticationClient {
             }
         }
 
-        // Also try BLE cancellation (fire and forget - less critical)
-        if let Some(ble_transport) = self.ble_transport.lock().await.clone() {
-            let packet_clone = packet.clone();
-            tokio::spawn(async move {
-                let mut transport = ble_transport.lock().await;
-                match transport.send_cancel(&packet_clone).await {
-                    Ok(_) => tracing::debug!("BLE cancellation sent"),
-                    Err(e) => tracing::debug!("BLE cancellation failed: {}", e),
-                }
-            });
+        // We clone the Arc from the Option, so we don't hold the outer lock.
+        if let Some(transport_arc) = self.ble_transport.lock().await.clone() {
+            tracing::debug!("Attempting to send explicit BLE cancellation/disconnect");
+            // Now lock the transport itself to call the method
+            let mut transport = transport_arc.lock().await;
+            if let Err(e) = transport.send_cancel(packet).await {
+                // Log the error but continue to abort
+                tracing::warn!("Failed to send BLE cancellation: {}", e);
+            } else {
+                tracing::info!("BLE cancellation/disconnect sent successfully.");
+            }
+        } else {
+            tracing::debug!("No BLE transport available, task may not have started.");
+        }
+
+        // Abort BLE authentication task if running
+        // This is now just a secondary cleanup
+        #[cfg(feature = "ble")]
+        if let Some(abort_handle) = self.ble_task_abort_handle.lock().await.take() {
+            tracing::debug!("Aborting BLE authentication task");
+            abort_handle.abort();
+            tracing::info!("BLE authentication task aborted.");
+        } else {
+            tracing::debug!("No BLE task running or already aborted");
+        }
+
+        // Also abort UDP task if still running
+        if let Some(abort_handle) = self.udp_task_abort_handle.lock().await.take() {
+            tracing::debug!("Aborting UDP authentication task");
+            abort_handle.abort();
+        } else {
+            tracing::debug!("No UDP task running or already completed");
         }
 
         Ok(())

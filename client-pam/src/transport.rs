@@ -13,6 +13,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(feature = "ble")]
+use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "ble")]
 use std::sync::Arc;
 
 use crate::AuthError;
@@ -182,8 +184,11 @@ pub struct BleTransport {
     adv_handle: Option<bluer::adv::AdvertisementHandle>,
     gatt_handle: Option<bluer::gatt::local::ApplicationHandle>,
     // Shared state for GATT server callbacks
-    response_data: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
     confirmation_data: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+    // Store all connected devices to disconnect them on cancel
+    connected_devices: Arc<tokio::sync::Mutex<HashMap<bluer::Address, bluer::Device>>>,
+    // Queue of responses from potentially multiple devices
+    response_queue: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
 }
 
 #[cfg(feature = "ble")]
@@ -243,8 +248,9 @@ impl BleTransport {
             challenge,
             adv_handle: None,
             gatt_handle: None,
-            response_data: Arc::new(tokio::sync::Mutex::new(None)),
             confirmation_data: Arc::new(tokio::sync::Mutex::new(None)),
+            connected_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            response_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
         })
     }
 }
@@ -295,16 +301,6 @@ impl Transport for BleTransport {
             discoverable: Some(true),
             local_name: Some("".to_string()),
             // Balanced advertising: faster than default, but not battery-killing
-            // Default BlueZ: ~1000ms intervals (1 per second)
-            // Low latency: 20-40ms (30 per second) - very fast but drains battery
-            // Balanced (below): 100-200ms (5-10 per second) - good compromise
-            //
-            // With SCAN_MODE_BALANCED on Android (50% duty cycle), phone scans
-            // every ~2 seconds, so advertising every 100-200ms gives good discovery
-            // time (1-5 seconds) without excessive battery drain.
-            //
-            // For ultra-low latency (<500ms), use 20-40ms intervals, but beware
-            // of battery impact on desktop (especially laptops on battery).
             min_interval: Some(Duration::from_millis(100)),
             max_interval: Some(Duration::from_millis(200)),
             ..Default::default()
@@ -368,16 +364,36 @@ impl Transport for BleTransport {
             .parse()
             .map_err(|e| AuthError::BleError(format!("Invalid characteristic UUID: {}", e)))?;
 
+        let adapter = self.adapter.clone();
+
         // Client Command Characteristic - Server reads auth request
         let request_data_for_read = request_data.clone();
+        let connected_devices_read = self.connected_devices.clone();
+        let adapter_read = adapter.clone();
         let client_cmd_char = Characteristic {
             uuid: client_cmd_uuid,
             read: Some(CharacteristicRead {
                 read: true,
-                fun: Box::new(move |_req| {
+                fun: Box::new(move |req| {
                     let data = request_data_for_read.clone();
+                    let connected_devices = connected_devices_read.clone();
+                    let adapter = adapter_read.clone();
                     Box::pin(async move {
-                        tracing::debug!("GATT: Server reading auth request ({} bytes)", data.len());
+                        let addr = req.device_address;
+                        tracing::debug!(
+                            "GATT: Device {} reading auth request ({} bytes)",
+                            addr,
+                            data.len()
+                        );
+                        
+                        match adapter.device(addr) {
+                            Ok(device) => {
+                                connected_devices.lock().await.insert(addr, device);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to get device object for {}: {}", addr, e);
+                            }
+                        }
                         Ok((*data).clone())
                     })
                 }),
@@ -387,21 +403,38 @@ impl Transport for BleTransport {
         };
 
         // Server Response Characteristic - Server writes response
-        let response_data = self.response_data.clone();
+        let response_queue = self.response_queue.clone();
+        let connected_devices_write = self.connected_devices.clone();
+        let adapter_write = adapter.clone();
         let server_resp_char = Characteristic {
             uuid: server_resp_uuid,
             write: Some(CharacteristicWrite {
                 write: true,
                 write_without_response: true,
                 method: bluer::gatt::local::CharacteristicWriteMethod::Fun(Box::new(
-                    move |new_value, _req| {
-                        let response_data = response_data.clone();
+                    move |new_value, req| {
+                        let response_queue = response_queue.clone();
+                        let connected_devices = connected_devices_write.clone();
+                        let adapter = adapter_write.clone();
                         Box::pin(async move {
+                            let addr = req.device_address;
                             tracing::info!(
-                                "GATT: Received server response ({} bytes)",
-                                new_value.len()
+                                "GATT: Received server response ({} bytes) from device {}",
+                                new_value.len(),
+                                addr
                             );
-                            *response_data.lock().await = Some(new_value);
+
+                            match adapter.device(addr) {
+                                Ok(device) => {
+                                    connected_devices.lock().await.insert(addr, device);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to get device object for {}: {}", addr, e);
+                                }
+                            }
+
+                            // Enqueue the response bytes
+                            response_queue.lock().await.push_back(new_value);
                             Ok(())
                         })
                     },
@@ -487,6 +520,8 @@ impl Transport for BleTransport {
             })?
             .clone();
 
+        let response_queue = self.response_queue.clone();
+
         // Wait for response with timeout
         let start = std::time::Instant::now();
         tracing::trace!("receive_response started, timeout={:?}", timeout);
@@ -496,77 +531,78 @@ impl Transport for BleTransport {
             }
 
             // Check if we received a response from GATT callback
+            let response_bytes;
             {
-                let mut response_lock = self.response_data.lock().await;
-                if let Some(ref response_bytes) = *response_lock {
-                    tracing::trace!(
-                        "Processing received BLE response, elapsed={:?}",
-                        start.elapsed()
-                    );
+                // Lock, pop, and unlock quickly
+                response_bytes = response_queue.lock().await.pop_front();
+            }
 
-                    // Parse and decrypt response
-                    let encrypted_response = match EncryptedPacket::decode(&response_bytes[..]) {
-                        Ok(p) => p,
+            if let Some(response_bytes) = response_bytes {
+                tracing::trace!(
+                    "Processing received BLE response ({} bytes), elapsed={:?}",
+                    response_bytes.len(),
+                    start.elapsed()
+                );
+
+                // Parse and decrypt response
+                let encrypted_response = match EncryptedPacket::decode(&response_bytes[..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to decode response: {}, waiting for other devices",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                // Load CSK from config manager
+                let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
+
+                // Decrypt response
+                let decrypted_message =
+                    match decrypt_encrypted_packet_with_csk_nonce(&csk, &encrypted_response) {
+                        Ok(m) => m,
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to decode response: {}, waiting for other devices",
+                                "Failed to decrypt response: {}, waiting for other devices",
                                 e
                             );
-                            *response_lock = None;
                             continue;
                         }
                     };
 
-                    // Load CSK from config manager
-                    let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
-
-                    // Decrypt response
-                    let decrypted_message =
-                        match decrypt_encrypted_packet_with_csk_nonce(&csk, &encrypted_response) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to decrypt response: {}, waiting for other devices",
-                                    e
-                                );
-                                *response_lock = None;
-                                continue;
-                            }
-                        };
-
-                    // Check message type and store confirmation
-                    match decrypted_message.payload {
-                        Some(wrapper_message::Payload::AuthGrant(_)) => {
-                            // Create GrantConfirmation
-                            if let Ok(confirmation) = self.create_confirmation(&request_packet) {
-                                *self.confirmation_data.lock().await = Some(confirmation);
-                                tracing::trace!(
-                                    "Stored confirmation for server to read, elapsed={:?}",
-                                    start.elapsed()
-                                );
-                            }
+                // Check message type and store confirmation
+                match decrypted_message.payload {
+                    Some(wrapper_message::Payload::AuthGrant(_)) => {
+                        // Create GrantConfirmation
+                        if let Ok(confirmation) = self.create_confirmation(&request_packet) {
+                            *self.confirmation_data.lock().await = Some(confirmation);
+                            tracing::trace!(
+                                "Stored confirmation for server to read, elapsed={:?}",
+                                start.elapsed()
+                            );
                         }
-                        _ => {
-                            tracing::warn!("Unexpected message type, waiting for other devices");
-                            *response_lock = None;
-                            continue;
-                        }
-                    };
+                    }
+                    _ => {
+                        tracing::warn!("Unexpected message type, waiting for other devices");
+                        continue;
+                    }
+                };
 
-                    // Wait briefly for server to read confirmation
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                // Wait briefly for server to read confirmation
+                tokio::time::sleep(Duration::from_millis(100)).await;
 
-                    // Return success - the encrypted response will be verified by auth_client
-                    // We use a dummy SocketAddr since BLE doesn't have IP addresses
-                    tracing::trace!(
-                        "receive_response returning Response, total elapsed={:?}",
-                        start.elapsed()
-                    );
-                    return Ok(ReceiveResult::Response(
-                        encrypted_response,
-                        "0.0.0.0:0".parse().unwrap(),
-                    ));
-                }
+                // Return success - the encrypted response will be verified by auth_client
+                // We use a dummy SocketAddr since BLE doesn't have IP addresses
+                tracing::trace!(
+                    "receive_response returning Response, total elapsed={:?}",
+                    start.elapsed()
+                );
+                return Ok(ReceiveResult::Response(
+                    encrypted_response,
+                    "0.0.0.0:0".parse().unwrap(),
+                ));
             }
 
             // Sleep briefly before checking again
@@ -580,7 +616,56 @@ impl Transport for BleTransport {
     }
 
     async fn send_cancel(&mut self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
-        // Advertising will be stopped when BleTransport is dropped
+        tracing::debug!("BLE transport: send_cancel called, disconnecting clients and stopping services.");
+
+        // **Step 1 - Disconnect all connected BLE devices**
+        let mut disconnected_count = 0;
+        let devices_to_disconnect = self.connected_devices.lock().await;
+        
+        // Clone adapter to use inside the loop
+        let adapter = self.adapter.clone();
+
+        for (addr, _device_in_map) in devices_to_disconnect.iter() {
+            tracing::debug!("Attempting to explicitly disconnect device {}", addr);
+
+            // Re-fetch the device object to ensure we have a fresh handle
+            match adapter.device(*addr) {
+                Ok(device) => {
+                    if let Err(e) = device.disconnect().await {
+                        tracing::warn!("Failed to explicitly disconnect device {}: {}", addr, e);
+                    } else {
+                        tracing::info!("Successfully disconnected device {}", addr);
+                        disconnected_count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to re-fetch device {} for disconnect: {}", addr, e);
+                }
+            }
+        }
+
+        if disconnected_count > 0 {
+            tracing::debug!("Disconnected {} BLE device(s).", disconnected_count);
+        } else if !devices_to_disconnect.is_empty() {
+            tracing::warn!("Failed to disconnect any connected BLE devices.");
+        } else {
+            tracing::trace!("No connected BLE devices to disconnect.");
+        }
+
+        // **Step 2 - Stop advertising to prevent new connections**
+        if self.adv_handle.take().is_some() {
+            tracing::trace!("BLE advertising stopped.");
+        } else {
+            tracing::trace!("BLE advertising was not active or already stopped.");
+        }
+
+        // **Step 3 - Unregister GATT server to remove services**
+        if self.gatt_handle.take().is_some() {
+            tracing::trace!("BLE GATT server unregistered.");
+        } else {
+            tracing::trace!("BLE GATT server was not active or already stopped.");
+        }
+
         Ok(())
     }
 
@@ -640,6 +725,28 @@ impl Drop for UdpTransport {
 #[cfg(feature = "ble")]
 impl Drop for BleTransport {
     fn drop(&mut self) {
-        tracing::debug!("BLE transport explicitly closed");
+        // Note: The handles (adv_handle, gatt_handle) will be dropped here
+        // automatically by Rust, which cleans up the adv/GATT server.
+        tracing::debug!("BLE transport explicitly closed, cleaning up resources.");
+
+        if let Some(mutex) = Arc::get_mut(&mut self.connected_devices) {
+            let map = mutex.get_mut();
+            let device_count = map.len();
+
+            if device_count > 0 {
+                tracing::warn!(
+                    "BleTransport dropped with {} connected device(s) still tracked. \
+                     Call send_cancel() for explicit cleanup.",
+                    device_count
+                );
+            }
+        } else {
+            // Devices are still shared, meaning a task might still be running.
+            // We can't easily clean up here without a more complex shutdown mechanism.
+            tracing::trace!(
+                "BleTransport dropped. Handles will be released. \
+                Cannot check for connected devices as Arc is still shared."
+            );
+        }
     }
 }
