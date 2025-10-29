@@ -23,11 +23,15 @@ class AuthRequestManager private constructor() {
     private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
     private val scope = CoroutineScope(Dispatchers.IO)
 
+    // Track BLE device addresses to request IDs for disconnection handling
+    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
+
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
         val callback:
             (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
         val appContext: android.content.Context,
+        val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
 
     /** Submit an authentication request for user approval Returns a request ID */
@@ -40,6 +44,7 @@ class AuthRequestManager private constructor() {
         challenge: ByteArray,
         timestamp: Long,
         transportType: TransportType,
+        bleDeviceAddress: String? = null, // Optional: BLE MAC address for tracking disconnections
         callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         val requestId = UUID.randomUUID().toString()
@@ -58,7 +63,12 @@ class AuthRequestManager private constructor() {
 
         // Store the pending request
         pendingRequests[requestId] =
-            PendingAuthRequest(authRequest, callback, context.applicationContext)
+            PendingAuthRequest(authRequest, callback, context.applicationContext, bleDeviceAddress)
+
+        // If this is a BLE request, track it by device address
+        if (bleDeviceAddress != null) {
+            bleDeviceRequests.getOrPut(bleDeviceAddress) { mutableSetOf() }.add(requestId)
+        }
 
         // Broadcast to MainActivity
         val intent =
@@ -131,6 +141,13 @@ class AuthRequestManager private constructor() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
 
+            // Calculate timeout: session timeout minus time already elapsed since request timestamp
+            val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+            val sessionTimeoutMs = config.sessionTimeoutSeconds * 1000
+            val currentTime = System.currentTimeMillis()
+            val timeElapsed = currentTime - timestamp
+            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
+
             val notification =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
@@ -150,6 +167,7 @@ class AuthRequestManager private constructor() {
                     .setOngoing(true)
                     .setAutoCancel(false)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setTimeoutAfter(remainingTimeout)
                     .build()
 
             NotificationManagerCompat.from(context).notify(requestId.hashCode(), notification)
@@ -179,6 +197,15 @@ class AuthRequestManager private constructor() {
                 TAG,
                 "Auth request $requestId ${if (approved) "approved" else if (explicitDenial) "explicitly denied" else "timed out/cancelled"}",
             )
+
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
+                }
+            }
+
             // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
             scope.launch { pending.callback(approved, signedChallenge, explicitDenial) }
             // Cancel the persistent notification
@@ -198,6 +225,15 @@ class AuthRequestManager private constructor() {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
             Log.d(TAG, "Cancelled auth request $requestId (timeout)")
+
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
+                }
+            }
+
             // Launch callback on IO dispatcher - explicitDenial = false
             scope.launch { pending.callback(false, null, false) }
         }
@@ -247,6 +283,41 @@ class AuthRequestManager private constructor() {
         }
 
         return cancelledAny
+    }
+
+    /**
+     * Cancel all pending requests associated with a BLE device that disconnected
+     *
+     * @param bleDeviceAddress The BLE MAC address of the disconnected device
+     * @return true if any requests were cancelled
+     */
+    fun cancelRequestsByBleDisconnection(bleDeviceAddress: String): Boolean {
+        val requestIds = bleDeviceRequests.remove(bleDeviceAddress) ?: return false
+
+        if (requestIds.isEmpty()) return false
+
+        Log.d(
+            TAG,
+            "BLE device $bleDeviceAddress disconnected, cancelling ${requestIds.size} pending requests",
+        )
+
+        requestIds.forEach { requestId ->
+            val pending = pendingRequests.remove(requestId)
+            if (pending != null) {
+                // Invoke callback with cancelled status (not explicit denial)
+                scope.launch { pending.callback(false, null, false) }
+
+                // Dismiss the notification
+                try {
+                    NotificationManagerCompat.from(pending.appContext).cancel(requestId.hashCode())
+                    Log.d(TAG, "Dismissed notification for disconnected BLE request $requestId")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
+                }
+            }
+        }
+
+        return true
     }
 
     companion object {

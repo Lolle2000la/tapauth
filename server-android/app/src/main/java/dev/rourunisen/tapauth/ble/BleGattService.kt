@@ -201,7 +201,19 @@ class BleGattService : Service() {
                         }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        Log.i(TAG, "Disconnected from client GATT server: ${gatt.device.address}")
+                        val deviceAddress = gatt.device.address
+                        Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
+
+                        // Cancel any pending authentication requests from this device
+                        val authRequestManager =
+                            dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
+                        if (authRequestManager.cancelRequestsByBleDisconnection(deviceAddress)) {
+                            Log.d(
+                                TAG,
+                                "Cancelled pending requests for disconnected device $deviceAddress",
+                            )
+                        }
+
                         gatt.close()
                     }
                 }
@@ -902,6 +914,7 @@ class BleGattService : Service() {
 
             // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
+            val bleDeviceAddress = gatt.device.address // Get BLE MAC address for tracking
             authRequestManager.submitRequest(
                 context = this,
                 deviceId = matchedDevice.deviceId,
@@ -911,6 +924,7 @@ class BleGattService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
+                bleDeviceAddress = bleDeviceAddress, // Track by BLE address
             ) { approved, signedChallenge, explicitDenial ->
                 // Create and send encrypted grant/denial
                 if (approved && signedChallenge != null) {
