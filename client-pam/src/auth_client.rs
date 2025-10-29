@@ -478,56 +478,33 @@ impl AuthenticationClient {
 
     #[cfg(feature = "ble")]
     async fn send_cancel_parallel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        tracing::debug!("Sending cancellation via UDP and BLE");
+        tracing::info!("Sending cancellation via UDP and BLE");
 
-        // Try to use stored transports if available, otherwise create new ones
+        // Always send via UDP (most reliable for cancellation)
+        let config = self.config_manager.load_config()?;
+        let port = config.udp_port;
 
-        // UDP cancellation (quick)
-        if let Some(udp_transport) = self.udp_transport.lock().await.clone() {
-            let packet_clone = packet.clone();
-            tokio::spawn(async move {
-                let mut transport = udp_transport.lock().await;
-                let _ = transport.send_cancel(&packet_clone).await;
-            });
-        } else {
-            // Fallback: create new UDP transport
-            let config = self.config_manager.load_config()?;
-            if let Ok(mut transport) = UdpTransport::new(config.udp_port).await {
-                let _ = transport.send_cancel(packet).await;
+        tracing::debug!("Sending UDP cancellation to port {}", port);
+
+        // Create a new socket for cancellation to ensure it works
+        match UdpTransport::new(port).await {
+            Ok(mut transport) => match transport.send_cancel(packet).await {
+                Ok(_) => tracing::info!("UDP cancellation sent successfully"),
+                Err(e) => tracing::warn!("Failed to send UDP cancellation: {}", e),
+            },
+            Err(e) => {
+                tracing::warn!("Failed to create UDP transport for cancellation: {}", e);
             }
         }
 
-        // BLE cancellation (fire and forget)
+        // Also try BLE cancellation (fire and forget - less critical)
         if let Some(ble_transport) = self.ble_transport.lock().await.clone() {
             let packet_clone = packet.clone();
             tokio::spawn(async move {
                 let mut transport = ble_transport.lock().await;
-                let _ = transport.send_cancel(&packet_clone).await;
-            });
-        } else {
-            // Fallback: create new BLE transport with timeout
-            use tokio::time::{timeout, Duration};
-
-            let temporal_id = generate_current_temporal_identifier_ble(&self.csk)?;
-            let config_manager = self.config_manager.clone();
-            let keypair = Arc::new(self.keypair.clone());
-            let challenge = self.challenge;
-            let packet_clone = packet.clone();
-
-            tokio::spawn(async move {
-                if let Ok(Ok(mut transport)) = timeout(
-                    Duration::from_millis(500),
-                    BleTransport::new(
-                        temporal_id,
-                        Duration::from_secs(1),
-                        config_manager,
-                        keypair,
-                        challenge,
-                    ),
-                )
-                .await
-                {
-                    let _ = transport.send_cancel(&packet_clone).await;
+                match transport.send_cancel(&packet_clone).await {
+                    Ok(_) => tracing::debug!("BLE cancellation sent"),
+                    Err(e) => tracing::debug!("BLE cancellation failed: {}", e),
                 }
             });
         }
