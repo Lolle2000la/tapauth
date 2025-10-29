@@ -103,31 +103,17 @@ fi
 echo ""
 
 # Check D-Bus configuration
-echo "==> Checking TapAuth D-Bus configuration..."
-if [ -f "/etc/dbus-1/system.d/dev.rourunisen.tapauth.BLE.conf" ]; then
-    echo "✅ TapAuth D-Bus policy found"
-else
-    echo "❌ TapAuth D-Bus policy not found"
-    echo "   Install it with the BLE daemon installer"
-fi
-echo ""
-
-# Check for TapAuth daemon
-echo "==> Checking TapAuth BLE daemon..."
-if systemctl list-unit-files | grep -q "tapauth-ble-daemon.service"; then
-    if systemctl is-active --quiet tapauth-ble-daemon; then
-        echo "✅ TapAuth BLE daemon is running"
-        
-        # Show recent logs
-        echo ""
-        echo "   Recent daemon logs:"
-        journalctl -u tapauth-ble-daemon.service -n 10 --no-pager | sed 's/^/      /'
+echo "==> Checking TapAuth Bluetooth access..."
+if command -v dbus-send &> /dev/null; then
+    if dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null | grep -q "interface"; then
+        echo "✅ BlueZ service accessible via D-Bus"
+        echo "   TapAuth can communicate with Bluetooth directly"
     else
-        echo "⚠️  TapAuth BLE daemon is installed but not running"
-        echo "   Start it with: sudo systemctl start tapauth-ble-daemon"
+        echo "❌ Cannot access BlueZ via D-Bus"
+        echo "   TapAuth requires BlueZ to be accessible"
     fi
 else
-    echo "⚠️  TapAuth BLE daemon is not installed"
+    echo "⚠️  dbus-send not found, cannot check D-Bus access"
 fi
 echo ""
 
@@ -140,11 +126,11 @@ echo "If you're experiencing 'Busy' errors:"
 echo "  1. Close any bluetoothctl sessions"
 echo "  2. Restart the Bluetooth service:"
 echo "     sudo systemctl restart bluetooth"
-echo "  3. Restart the TapAuth daemon:"
-echo "     sudo systemctl restart tapauth-ble-daemon"
-echo "  4. Check for other BLE applications (e.g., bluetooth managers)"
+echo "  3. Check for other BLE applications (e.g., bluetooth managers)"
+echo "  4. Try the TapAuth authentication again"
 echo ""
 echo "For persistent issues:"
 echo "  - Reboot the system to fully reset Bluetooth state"
 echo "  - Check kernel logs: dmesg | grep -i bluetooth"
+echo "  - Ensure BlueZ is up to date: bluetoothd --version"
 echo ""
