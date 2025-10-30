@@ -385,7 +385,7 @@ impl Transport for BleTransport {
                             addr,
                             data.len()
                         );
-                        
+
                         match adapter.device(addr) {
                             Ok(device) => {
                                 connected_devices.lock().await.insert(addr, device);
@@ -429,7 +429,11 @@ impl Transport for BleTransport {
                                     connected_devices.lock().await.insert(addr, device);
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to get device object for {}: {}", addr, e);
+                                    tracing::warn!(
+                                        "Failed to get device object for {}: {}",
+                                        addr,
+                                        e
+                                    );
                                 }
                             }
 
@@ -616,12 +620,14 @@ impl Transport for BleTransport {
     }
 
     async fn send_cancel(&mut self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
-        tracing::debug!("BLE transport: send_cancel called, disconnecting clients and stopping services.");
+        tracing::debug!(
+            "BLE transport: send_cancel called, disconnecting clients and stopping services."
+        );
 
         // **Step 1 - Disconnect all connected BLE devices**
         let mut disconnected_count = 0;
         let devices_to_disconnect = self.connected_devices.lock().await;
-        
+
         // Clone adapter to use inside the loop
         let adapter = self.adapter.clone();
 

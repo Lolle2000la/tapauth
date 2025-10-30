@@ -11,7 +11,7 @@ use shared::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::transport::{ReceiveResult, Transport, UdpTransport};
@@ -304,7 +304,6 @@ impl AuthenticationClient {
 
             loop {
                 let recv_result = {
-                    let recv_start = Instant::now();
                     tracing::trace!(
                         "Calling transport.receive_response (transport={}, timeout={:?})",
                         transport_name,
