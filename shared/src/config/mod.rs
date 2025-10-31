@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
@@ -63,7 +63,8 @@ pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
 /// The function has no preconditions and does not modify any state.
 /// The returned UID is a snapshot and may change if the process drops privileges.
 pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    // Use nix to query effective UID without unsafe
+    nix::unistd::geteuid().as_raw() == 0
 }
 
 /// Ensure directory exists with root-only permissions (700)
