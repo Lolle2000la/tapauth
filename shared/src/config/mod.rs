@@ -111,6 +111,13 @@ pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
     // Verify file permissions
     let metadata = fs::metadata(path)?;
     let permissions = metadata.permissions();
+
+    // Check ownership
+    if metadata.uid() != 0 {
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    // Check group/other permissions
     let mode = permissions.mode() & 0o777;
 
     if mode != 0o600 && mode != 0o400 {
