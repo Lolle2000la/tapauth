@@ -62,24 +62,6 @@ cp ../target/x86_64-linux-android/release/libshared.so ../server-android/app/src
 cp ../target/i686-linux-android/release/libshared.so ../server-android/app/src/main/jniLibs/x86/
 ```
 
-## JNI Functions Available
-
-The `TapAuthCrypto` Kotlin class provides access to these native functions:
-
-- `generateKeypair()`: Generate Ed25519 keypair
-- `keyExchange(ourPrivate, theirPublic)`: X25519 Diffie-Hellman
-- `getSas(sharedSecret)`: Generate 6-digit Short Authentication String
-
-## Development Without Native Library
-
-During development, you can comment out the calls to native functions and use placeholder implementations. The app will print an error when trying to load the library, but won't crash.
-
-To use placeholder implementations:
-
-1. Comment out the `System.loadLibrary("shared")` call in `TapAuthCrypto.kt`
-2. Implement the `external` functions with dummy Kotlin implementations
-3. Remember to build the native library before production builds!
-
 ## Troubleshooting
 
 ### "library "shared" not found"
