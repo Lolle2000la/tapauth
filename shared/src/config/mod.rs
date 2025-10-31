@@ -1,3 +1,17 @@
+//! Configuration management for TapAuth client and server.
+//!
+//! Provides secure file I/O for configuration, paired client/server data,
+//! and cryptographic keys. All operations require root privileges and enforce
+//! strict file permissions (700 for directories, 600 for files) to protect
+//! sensitive cryptographic material.
+//!
+//! ## Security
+//!
+//! - Configuration files are stored in `/etc/tapauth` with root-only access
+//! - All file operations verify root privileges before proceeding
+//! - File permissions are enforced on every write operation
+//! - Reading files validates permissions to detect tampering
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -37,7 +51,17 @@ pub const CLIENT_KEY_FILE: &str = "client_key";
 /// Client symmetric key file
 pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
 
-/// Check if running as root
+/// Check if the current process is running as root.
+///
+/// ## Returns
+///
+/// `true` if the effective user ID is 0 (root), `false` otherwise.
+///
+/// ## Safety
+///
+/// Calls `libc::geteuid()` which is safe to call from any context.
+/// The function has no preconditions and does not modify any state.
+/// The returned UID is a snapshot and may change if the process drops privileges.
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }

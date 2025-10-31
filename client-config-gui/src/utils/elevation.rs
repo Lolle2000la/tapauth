@@ -1,7 +1,21 @@
+//! Privilege elevation utilities for the TapAuth configuration GUI.
+//!
+//! Provides root privilege checking and elevation via `pkexec` or `sudo`,
+//! preserving environment variables needed for GUI display (Wayland/X11).
+
 use std::env;
 use std::process::Command;
 
-/// Check if the current process is running as root
+/// Check if the current process is running as root.
+///
+/// ## Returns
+///
+/// `true` if the effective user ID is 0 (root), `false` otherwise.
+///
+/// ## Safety
+///
+/// Calls `libc::geteuid()` which is safe to call from any context.
+/// The function has no preconditions and does not modify any state.
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -37,7 +51,18 @@ pub fn get_username() -> String {
     get_original_user()
 }
 
-/// Get username from UID using libc
+/// Get username from UID using libc.
+///
+/// ## Safety
+///
+/// Calls `libc::getpwuid()` which:
+/// - Returns a pointer to a static `passwd` struct or NULL on failure
+/// - The returned pointer is valid until the next NSS call (not thread-safe)
+/// - The `pw_name` field points to a null-terminated C string
+/// - Must not be freed by the caller
+///
+/// This function immediately copies the username string, so the transient
+/// pointer lifetime is safe.
 fn get_username_from_uid(uid: u32) -> Result<String, ()> {
     unsafe {
         let passwd = libc::getpwuid(uid);
@@ -55,15 +80,20 @@ fn get_username_from_uid(uid: u32) -> Result<String, ()> {
     }
 }
 
-/// Attempt to elevate privileges using pkexec, preserving the original username
-/// This function does not return if elevation succeeds - it exec's the new process
+/// Attempt to elevate privileges using pkexec or sudo.
+///
+/// Preserves environment variables needed for GUI display (X11/Wayland).
+/// This function does not return if elevation succeeds.
+///
+/// ## Panics
+///
+/// Never panics. Exits the process with status code 1 if elevation fails.
 pub fn attempt_privilege_elevation(original_user: &str) -> ! {
     tracing::info!(
         "Attempting privilege escalation for user: {}",
         original_user
     );
 
-    // Get current executable path
     let current_exe = match env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -73,10 +103,8 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
         }
     };
 
-    // Collect environment variables needed for GUI display
     let mut env_vars = vec![("TAPAUTH_ORIGINAL_USER", original_user.to_string())];
 
-    // Preserve display-related environment variables
     if let Ok(display) = env::var("DISPLAY") {
         env_vars.push(("DISPLAY", display));
     }
@@ -96,18 +124,15 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
         env_vars.push(("DBUS_SESSION_BUS_ADDRESS", dbus_session));
     }
 
-    // Try pkexec first (polkit) - most user-friendly on modern Linux
     tracing::debug!("Trying pkexec elevation...");
     let mut pkexec_cmd = Command::new("pkexec");
 
-    // Add environment variables to pkexec command
     for (key, value) in &env_vars {
         pkexec_cmd.env(key, value);
     }
 
     let pkexec_result = pkexec_cmd
         .arg("env")
-        // Pass environment variables as arguments to env command
         .args(env_vars.iter().map(|(k, v)| format!("{}={}", k, v)))
         .arg(&current_exe)
         .args(env::args().skip(1))
@@ -115,7 +140,6 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
 
     match pkexec_result {
         Ok(status) => {
-            // pkexec ran and returned - exit with its status code
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(e) => {
@@ -123,11 +147,8 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
         }
     }
 
-    // Try sudo as fallback
     tracing::debug!("Trying sudo elevation...");
     let mut sudo_cmd = Command::new("sudo");
-
-    // sudo -E preserves environment, but we'll also explicitly set variables
     sudo_cmd.arg("-E");
 
     for (key, value) in &env_vars {
@@ -148,7 +169,6 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
         }
     }
 
-    // Both failed - show error message
     eprintln!("\n╔════════════════════════════════════════════════════════════╗");
     eprintln!("║  ERROR: This application requires root privileges         ║");
     eprintln!("╚════════════════════════════════════════════════════════════╝");

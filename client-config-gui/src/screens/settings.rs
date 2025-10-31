@@ -96,7 +96,6 @@ impl SettingsScreen {
 
         let title = text("Settings").size(32);
 
-        // Configuration section
         let config_title = text("Configuration").size(24);
 
         let hostname_label = text("Hostname:").size(16);
@@ -116,7 +115,6 @@ impl SettingsScreen {
             .width(Length::Fixed(400.0))
             .on_press(ScreenMessage::SaveConfig);
 
-        // Security section
         let security_title = text("Security").size(24);
 
         let rotate_button = if self.rotating_csk {

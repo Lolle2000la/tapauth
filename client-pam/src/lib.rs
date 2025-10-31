@@ -1,3 +1,26 @@
+//! TapAuth PAM module.
+//!
+//! Linux PAM authentication module that enables phone-tap-based authentication.
+//! Integrates with the system authentication stack to provide passwordless login
+//! via paired Android devices.
+//!
+//! ## PAM Integration
+//!
+//! Provides all required PAM entry points:
+//! - `pam_sm_authenticate`: Core authentication via BLE/UDP to paired devices
+//! - `pam_sm_acct_mgmt`: Account management (no-op, returns success)
+//! - `pam_sm_open_session`/`pam_sm_close_session`: Session management (no-ops)
+//! - `pam_sm_chauthtok`: Password change (no-op)
+//!
+//! ## Behavior
+//!
+//! Returns `PAM_IGNORE` (not `PAM_AUTH_ERR`) on failure to allow password fallback.
+//! Only returns `PAM_SUCCESS` when phone tap authentication succeeds.
+//!
+//! ## Requirements
+//!
+//! Must run as root to access `/etc/tapauth` configuration files.
+
 mod auth_client;
 mod pam_logic;
 mod pam_sys;

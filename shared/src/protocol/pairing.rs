@@ -1,3 +1,48 @@
+//! Two-phase pairing protocol for TapAuth.
+//!
+//! Establishes trust between client and server through ephemeral X25519 key exchange
+//! and out-of-band SAS (Short Authentication String) verification.
+//!
+//! ## Protocol Flow
+//!
+//! ### Phase 1: Key Exchange and SAS Generation
+//!
+//! **Client:**
+//! 1. Connect to server TCP socket
+//! 2. Receive `PairingHello` (server's X25519/Ed25519 public keys, device name)
+//! 3. Perform X25519 Diffie-Hellman → derive PSK via HKDF
+//! 4. Derive 6-digit SAS from PSK + public keys
+//! 5. Send `PairingResponse` (client's X25519/Ed25519 public keys)
+//!
+//! **Server:**
+//! 1. Send `PairingHello`
+//! 2. Receive `PairingResponse`
+//! 3. Perform X25519 Diffie-Hellman → derive PSK via HKDF
+//! 4. Derive 6-digit SAS from PSK + public keys
+//!
+//! Both sides now have identical SAS values to compare out-of-band.
+//!
+//! ### Phase 2: CSK Transfer (after SAS confirmation)
+//!
+//! **Client:**
+//! 1. Generate CSK (Client Symmetric Key)
+//! 2. Encrypt CSK with PSK
+//! 3. Send `PairingCskMessage` (encrypted CSK + username)
+//! 4. Receive `PairingComplete` acknowledgment
+//!
+//! **Server:**
+//! 1. Receive `PairingCskMessage`
+//! 2. Decrypt CSK with PSK
+//! 3. Store CSK + client Ed25519 public key + username
+//! 4. Send `PairingComplete`
+//!
+//! ## Security
+//!
+//! - SAS verification prevents MitM attacks during key exchange
+//! - Ephemeral X25519 keys provide forward secrecy for the pairing session
+//! - PSK is discarded after CSK transfer; only CSK and Ed25519 keys are persisted
+//! - All messages after SAS are authenticated via PSK encryption
+
 use prost::Message as ProstMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -68,11 +113,8 @@ impl ClientPairingSession {
         mut stream: TcpStream,
         client_device_name: &str,
     ) -> Result<(TcpStream, [u8; 32], String, String), ProtocolError> {
-        // Step 1: Client receives PairingHello from server
         let hello = self.receive_pairing_hello(&mut stream).await?;
         let server_device_name = hello.device_name;
-
-        // Step 2: Derive PSK from X25519 key exchange
         self.server_x25519_public = Some(
             hello
                 .x25519_public_key
@@ -114,7 +156,6 @@ impl ClientPairingSession {
 
         self.psk = Some(psk);
 
-        // Step 3: Derive and store SAS
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
         let server_x25519_pub = self.server_x25519_public.unwrap();
         let sas = derive_sas(
@@ -124,7 +165,6 @@ impl ClientPairingSession {
         )?;
         self.sas = Some(sas.clone());
 
-        // Step 4: Send PairingResponse with our X25519 public key
         self.send_pairing_response(&mut stream, client_device_name)
             .await?;
 
@@ -148,10 +188,7 @@ impl ClientPairingSession {
         csk: &ClientSymmetricKey,
         username: &str,
     ) -> Result<(), ProtocolError> {
-        // Step 6: Send CSK encrypted with PSK to server along with username
         self.send_csk_message(&mut stream, csk, username).await?;
-
-        // Step 7: Receive PairingComplete acknowledgment from server
         self.receive_pairing_complete(&mut stream).await?;
 
         Ok(())
@@ -278,17 +315,13 @@ impl ServerPairingSession {
         mut stream: TcpStream,
         server_device_name: &str,
     ) -> Result<(ClientSymmetricKey, [u8; 32], String, String), ProtocolError> {
-        // Step 1: Send PairingHello with our X25519 public key
         self.send_pairing_hello(&mut stream, server_device_name)
             .await?;
 
-        // Step 2: Receive client's PairingResponse
         let response = self.receive_pairing_response(&mut stream).await?;
 
-        // Extract client device name
         let client_device_name = response.device_name.clone();
 
-        // Step 3: Derive PSK from X25519 key exchange
         self.client_x25519_public = Some(
             response
                 .x25519_public_key
@@ -303,7 +336,6 @@ impl ServerPairingSession {
         let psk = derive_psk_from_x25519(&shared_secret)?;
         self.psk = Some(psk);
 
-        // Step 4: Derive and store SAS (note: client is first, server is second)
         let client_x25519_pub = self.client_x25519_public.unwrap();
         let server_x25519_pub = self.x25519_keypair.public_key_bytes();
         let sas = derive_sas(
@@ -313,12 +345,7 @@ impl ServerPairingSession {
         )?;
         self.sas = Some(sas.clone());
 
-        // Step 5: Wait for user SAS confirmation (done outside this function)
-
-        // Step 6: Receive CSK encrypted with PSK from client
         let csk = self.receive_csk_message(&mut stream).await?;
-
-        // Step 7: Send PairingComplete acknowledgment
         self.send_pairing_complete(&mut stream).await?;
 
         let client_ed25519_public: [u8; 32] = response

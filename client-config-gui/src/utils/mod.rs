@@ -1,4 +1,7 @@
-/// Utility functions for the GUI application
+//! Utility functions for the TapAuth configuration GUI.
+//!
+//! Provides privilege elevation helpers and network interface enumeration.
+
 pub mod elevation;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

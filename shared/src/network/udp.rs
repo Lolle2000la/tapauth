@@ -1,3 +1,15 @@
+//! UDP networking for TapAuth discovery and communication.
+//!
+//! Provides dual-stack (IPv4/IPv6) UDP socket creation with multicast support
+//! for device discovery. Handles interface enumeration, multicast group joining,
+//! and encrypted packet transmission.
+//!
+//! ## IPv6 Multicast
+//!
+//! IPv6 multicast requires explicit interface scope specification. This module
+//! automatically discovers suitable network interfaces and caches interface
+//! addresses to avoid repeated system calls.
+
 use prost::Message;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -146,8 +158,19 @@ pub fn is_local_ip(addr: &IpAddr) -> bool {
     guard.addresses.iter().any(|ip| ip == addr)
 }
 
-/// Get the interface index for a given interface name
-/// This is needed for IPv6 multicast scope specification
+/// Get the interface index for a given interface name.
+///
+/// This is required for IPv6 multicast scope specification.
+///
+/// ## Safety
+///
+/// Calls `libc::if_nametoindex()` which:
+/// - Accepts a null-terminated C string pointer
+/// - Returns 0 on error (invalid name or interface not found)
+/// - Is thread-safe per POSIX specification
+/// - Does not modify the input string
+///
+/// The `CString` ensures proper null termination and lifetime for the FFI call.
 #[cfg(unix)]
 fn get_interface_index(name: &str) -> Result<u32, std::io::Error> {
     use std::ffi::CString;
@@ -156,7 +179,6 @@ fn get_interface_index(name: &str) -> Result<u32, std::io::Error> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
     })?;
 
-    // SAFETY: if_nametoindex is a standard POSIX function
     let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
 
     if index == 0 {
