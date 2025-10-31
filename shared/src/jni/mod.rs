@@ -28,9 +28,11 @@
 pub mod arrays;
 pub mod conversions;
 pub mod exceptions;
+pub mod objects;
 pub mod protobuf;
 
 pub use arrays::*;
 pub use conversions::*;
 pub use exceptions::*;
+pub use objects::*;
 pub use protobuf::*;

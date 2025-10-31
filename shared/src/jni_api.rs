@@ -137,7 +137,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_keyExcha
         None => return std::ptr::null_mut(),
     };
 
-    let their_key_array = match jbytearray_to_fixed::<32>(&mut env, their_public_key, "public key") {
+    let their_key_array = match jbytearray_to_fixed::<32>(&mut env, their_public_key, "public key")
+    {
         Some(key) => key,
         None => return std::ptr::null_mut(),
     };
@@ -197,12 +198,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
         None => return std::ptr::null_mut(),
     };
 
-    let client_pub_array = match jbytearray_to_fixed::<32>(&mut env, client_public, "client_public") {
+    let client_pub_array = match jbytearray_to_fixed::<32>(&mut env, client_public, "client_public")
+    {
         Some(key) => key,
         None => return std::ptr::null_mut(),
     };
 
-    let server_pub_array = match jbytearray_to_fixed::<32>(&mut env, server_public, "server_public") {
+    let server_pub_array = match jbytearray_to_fixed::<32>(&mut env, server_public, "server_public")
+    {
         Some(key) => key,
         None => return std::ptr::null_mut(),
     };
@@ -337,8 +340,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
     _class: JClass,
     data: JByteArray,
 ) -> jstring {
-    use sha2::{Digest, Sha256};
     use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
+    use sha2::{Digest, Sha256};
 
     let data_bytes = match jbytearray_to_vec(&mut env, data, "data") {
         Some(b) => b,
@@ -357,21 +360,21 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
 /// Parse AuthenticationRequest from WrapperMessage protobuf.
 ///
 /// @param requestBytes Serialized WrapperMessage containing AuthenticationRequest
-/// @return JSON string with challenge, username, hostname, timestamp, signature fields (byte fields base64-encoded)
+/// @return AuthRequest object with strongly-typed fields
 /// @throws IllegalArgumentException if request bytes cannot be read
 /// @throws IOException if protobuf decoding fails or payload is not AuthenticationRequest
-/// @throws OutOfMemoryError if result string allocation fails
+/// @throws OutOfMemoryError if result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAuthRequest(
     mut env: JNIEnv,
     _class: JClass,
     request_bytes: JByteArray,
-) -> jstring {
-    use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-    use super::jni::protobuf::decode_message;
+) -> jni::sys::jobject {
+    use super::jni::conversions::jbytearray_to_vec;
     use super::jni::exceptions::throw_io_exception;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use super::jni::objects::create_auth_request;
+    use super::jni::protobuf::decode_message;
+    use crate::protocol::pb;
 
     let data = match jbytearray_to_vec(&mut env, request_bytes, "request_bytes") {
         Some(b) => b,
@@ -386,30 +389,24 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     let auth_request = match wrapper.payload {
         Some(pb::wrapper_message::Payload::AuthRequest(req)) => req,
         _ => {
-            throw_io_exception(&mut env, "WrapperMessage does not contain AuthenticationRequest");
+            throw_io_exception(
+                &mut env,
+                "WrapperMessage does not contain AuthenticationRequest",
+            );
             return std::ptr::null_mut();
         }
     };
 
-    let json_result = serde_json::json!({
-        "challenge": BASE64.encode(&auth_request.challenge),
-        "username": auth_request.username,
-        "hostname": auth_request.hostname,
-        "timestamp_unix_seconds": auth_request.timestamp_unix_seconds,
-        "signature_algorithm": auth_request.signature_algorithm,
-        "signature": BASE64.encode(&auth_request.signature),
-    });
-
-    let json_string = match serde_json::to_string(&json_result) {
-        Ok(json) => json,
-        Err(err) => {
-            throw_io_exception(&mut env, &format!("failed to serialize to JSON: {err}"));
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_string) {
-        Some(s) => s,
+    match create_auth_request(
+        &mut env,
+        &auth_request.challenge,
+        &auth_request.username,
+        &auth_request.hostname,
+        auth_request.timestamp_unix_seconds as i64,
+        auth_request.signature_algorithm,
+        &auth_request.signature,
+    ) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -429,14 +426,15 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createAu
     _class: JClass,
     signed_challenge: JByteArray,
 ) -> jbyteArray {
-    use crate::protocol::pb;
     use super::jni::conversions::{jbytearray_to_vec, vec_to_jbytearray};
     use super::jni::protobuf::encode_message;
+    use crate::protocol::pb;
 
-    let signed_challenge_bytes = match jbytearray_to_vec(&mut env, signed_challenge, "signed_challenge") {
-        Some(b) => b,
-        None => return std::ptr::null_mut(),
-    };
+    let signed_challenge_bytes =
+        match jbytearray_to_vec(&mut env, signed_challenge, "signed_challenge") {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
 
     let grant = pb::AuthenticationGrant {
         signed_challenge: signed_challenge_bytes,
@@ -458,21 +456,20 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createAu
 /// Parse EncryptedPacket structure without performing decryption.
 ///
 /// @param packetBytes Serialized EncryptedPacket protobuf
-/// @return JSON string with temporal_identifier, encryption_algorithm, ciphertext fields (byte fields base64-encoded)
+/// @return EncryptedPacketInfo object with strongly-typed fields
 /// @throws IllegalArgumentException if packet bytes cannot be read
-/// @throws IOException if protobuf decoding or JSON serialization fails
-/// @throws OutOfMemoryError if result string allocation fails
+/// @throws IOException if protobuf decoding fails
+/// @throws OutOfMemoryError if result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEncryptedPacketStructure(
     mut env: JNIEnv,
     _class: JClass,
     packet_bytes: JByteArray,
-) -> jstring {
-    use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
+) -> jni::sys::jobject {
+    use super::jni::conversions::jbytearray_to_vec;
+    use super::jni::objects::create_encrypted_packet_info;
     use super::jni::protobuf::decode_message;
-    use super::jni::exceptions::throw_io_exception;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use crate::protocol::pb;
 
     let data = match jbytearray_to_vec(&mut env, packet_bytes, "packet_bytes") {
         Some(b) => b,
@@ -484,22 +481,13 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEnc
         None => return std::ptr::null_mut(),
     };
 
-    let json_result = serde_json::json!({
-        "temporal_identifier": BASE64.encode(&encrypted_packet.temporal_identifier),
-        "encryption_algorithm": encrypted_packet.encryption_algorithm,
-        "ciphertext": BASE64.encode(&encrypted_packet.ciphertext),
-    });
-
-    let json_str = match serde_json::to_string(&json_result) {
-        Ok(s) => s,
-        Err(err) => {
-            throw_io_exception(&mut env, &format!("failed to serialize to JSON: {err}"));
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_str) {
-        Some(s) => s,
+    match create_encrypted_packet_info(
+        &mut env,
+        &encrypted_packet.temporal_identifier,
+        encrypted_packet.encryption_algorithm,
+        &encrypted_packet.ciphertext,
+    ) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -520,10 +508,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
     _class: JClass,
     packet_bytes: JByteArray,
 ) -> jbyteArray {
-    use crate::protocol::pb;
     use super::jni::conversions::{jbytearray_to_vec, vec_to_jbytearray};
-    use super::jni::protobuf::decode_message;
     use super::jni::exceptions::throw_io_exception;
+    use super::jni::protobuf::decode_message;
+    use crate::protocol::pb;
 
     let data = match jbytearray_to_vec(&mut env, packet_bytes, "packet_bytes") {
         Some(b) => b,
@@ -565,9 +553,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_determin
     _class: JClass,
     wrapper_message_bytes: JByteArray,
 ) -> jstring {
-    use crate::protocol::pb;
     use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
     use super::jni::protobuf::decode_message;
+    use crate::protocol::pb;
 
     let data = match jbytearray_to_vec(&mut env, wrapper_message_bytes, "wrapper_message_bytes") {
         Some(b) => b,
@@ -688,7 +676,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
     id: JByteArray,
     csk: JByteArray,
 ) -> jboolean {
-    use super::jni::conversions::{jbytearray_to_vec, jbytearray_to_fixed};
+    use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec};
     use super::jni::exceptions::{throw_illegal_argument, throw_security_exception};
 
     let id_bytes = match jbytearray_to_vec(&mut env, id, "id") {
@@ -713,7 +701,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
             crypto::temporal::verify_temporal_identifier_ble(&csk, &id_array)
         }
         len => {
-            throw_illegal_argument(&mut env, &format!("temporal ID must be 10 or 16 bytes, got {}", len));
+            throw_illegal_argument(
+                &mut env,
+                &format!("temporal ID must be 10 or 16 bytes, got {}", len),
+            );
             return false as jboolean;
         }
     };
@@ -749,7 +740,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptW
     context: JString,
     plaintext: JByteArray,
 ) -> jbyteArray {
-    use super::jni::conversions::{jbytearray_to_fixed, jstring_to_rust, jbytearray_to_vec, vec_to_jbytearray};
+    use super::jni::conversions::{
+        jbytearray_to_fixed, jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray,
+    };
     use super::jni::exceptions::throw_security_exception;
 
     let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
@@ -815,7 +808,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
     context: JString,
     ciphertext: JByteArray,
 ) -> jbyteArray {
-    use super::jni::conversions::{jbytearray_to_fixed, jstring_to_rust, jbytearray_to_vec, vec_to_jbytearray};
+    use super::jni::conversions::{
+        jbytearray_to_fixed, jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray,
+    };
     use super::jni::exceptions::throw_aead_bad_tag;
 
     let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
@@ -875,9 +870,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifySi
     message: JByteArray,
     signature: JByteArray,
 ) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec};
     use super::jni::exceptions::throw_invalid_key;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let public_key_array = match jbytearray_to_fixed::<32>(&mut env, public_key, "public_key") {
         Some(arr) => arr,
@@ -920,8 +915,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_signData
     private_key: JByteArray,
     message: JByteArray,
 ) -> jbyteArray {
-    use ed25519_dalek::{Signer, SigningKey};
     use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec, vec_to_jbytearray};
+    use ed25519_dalek::{Signer, SigningKey};
 
     let private_key_array = match jbytearray_to_fixed::<32>(&mut env, private_key, "private_key") {
         Some(arr) => arr,
@@ -958,10 +953,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
     _class: JClass,
     request_json: JString,
 ) -> jbyteArray {
-    use crate::protocol::pb;
     use super::jni::conversions::{jstring_to_rust, vec_to_jbytearray};
-    use super::jni::protobuf::encode_message;
     use super::jni::exceptions::throw_io_exception;
+    use super::jni::protobuf::encode_message;
+    use crate::protocol::pb;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
     let json_str = match jstring_to_rust(&mut env, request_json, "request_json") {
@@ -1009,21 +1004,21 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
 /// Parse GrantConfirmation from WrapperMessage protobuf.
 ///
 /// @param confirmationBytes Serialized WrapperMessage containing GrantConfirmation
-/// @return JSON string with challenge, signature_algorithm, signature fields (byte fields base64-encoded)
+/// @return GrantConfirmation object with strongly-typed fields
 /// @throws IllegalArgumentException if confirmationBytes cannot be read
-/// @throws IOException if protobuf decoding fails, payload is not GrantConfirmation, or JSON serialization fails
-/// @throws OutOfMemoryError if result string allocation fails
+/// @throws IOException if protobuf decoding fails or payload is not GrantConfirmation
+/// @throws OutOfMemoryError if result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGrantConfirmation(
     mut env: JNIEnv,
     _class: JClass,
     confirmation_bytes: JByteArray,
-) -> jstring {
-    use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-    use super::jni::protobuf::decode_message;
+) -> jni::sys::jobject {
+    use super::jni::conversions::jbytearray_to_vec;
     use super::jni::exceptions::throw_io_exception;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use super::jni::objects::create_grant_confirmation;
+    use super::jni::protobuf::decode_message;
+    use crate::protocol::pb;
 
     let bytes = match jbytearray_to_vec(&mut env, confirmation_bytes, "confirmation_bytes") {
         Some(b) => b,
@@ -1038,27 +1033,21 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
     let confirmation = match wrapper.payload {
         Some(pb::wrapper_message::Payload::GrantConfirmation(conf)) => conf,
         _ => {
-            throw_io_exception(&mut env, "WrapperMessage does not contain GrantConfirmation");
+            throw_io_exception(
+                &mut env,
+                "WrapperMessage does not contain GrantConfirmation",
+            );
             return std::ptr::null_mut();
         }
     };
 
-    let json_result = serde_json::json!({
-        "challenge": BASE64.encode(&confirmation.challenge),
-        "signature_algorithm": confirmation.signature_algorithm,
-        "signature": BASE64.encode(&confirmation.signature),
-    });
-
-    let json_str = match serde_json::to_string(&json_result) {
-        Ok(s) => s,
-        Err(err) => {
-            throw_io_exception(&mut env, &format!("failed to serialize to JSON: {err}"));
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_str) {
-        Some(s) => s,
+    match create_grant_confirmation(
+        &mut env,
+        &confirmation.challenge,
+        confirmation.signature_algorithm,
+        &confirmation.signature,
+    ) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -1075,12 +1064,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     mut env: JNIEnv,
     _class: JClass,
     cancel_bytes: JByteArray,
-) -> jstring {
-    use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-    use super::jni::protobuf::decode_message;
+) -> jni::sys::jobject {
+    use super::jni::conversions::jbytearray_to_vec;
     use super::jni::exceptions::throw_io_exception;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use super::jni::objects::create_authentication_cancel;
+    use super::jni::protobuf::decode_message;
+    use crate::protocol::pb;
 
     let bytes = match jbytearray_to_vec(&mut env, cancel_bytes, "cancel_bytes") {
         Some(b) => b,
@@ -1095,27 +1084,21 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     let cancel = match wrapper.payload {
         Some(pb::wrapper_message::Payload::AuthCancel(c)) => c,
         _ => {
-            throw_io_exception(&mut env, "WrapperMessage does not contain AuthenticationCancel");
+            throw_io_exception(
+                &mut env,
+                "WrapperMessage does not contain AuthenticationCancel",
+            );
             return std::ptr::null_mut();
         }
     };
 
-    let json_result = serde_json::json!({
-        "challenge": BASE64.encode(&cancel.challenge),
-        "signature_algorithm": cancel.signature_algorithm,
-        "signature": BASE64.encode(&cancel.signature),
-    });
-
-    let json_str = match serde_json::to_string(&json_result) {
-        Ok(s) => s,
-        Err(err) => {
-            throw_io_exception(&mut env, &format!("failed to serialize to JSON: {err}"));
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_str) {
-        Some(s) => s,
+    match create_authentication_cancel(
+        &mut env,
+        &cancel.challenge,
+        cancel.signature_algorithm,
+        &cancel.signature,
+    ) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -1135,16 +1118,19 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
     signed_challenge: JByteArray,
     private_key: JByteArray,
 ) -> jbyteArray {
+    use super::jni::conversions::{
+        jbytearray_to_ed25519_keypair, jbytearray_to_vec, vec_to_jbytearray,
+    };
+    use super::jni::protobuf::encode_message;
     use crate::crypto::signing::sign_ed25519;
     use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_vec, jbytearray_to_ed25519_keypair, vec_to_jbytearray};
-    use super::jni::protobuf::encode_message;
     use prost::Message;
 
-    let signed_challenge_bytes = match jbytearray_to_vec(&mut env, signed_challenge, "signed_challenge") {
-        Some(b) => b,
-        None => return std::ptr::null_mut(),
-    };
+    let signed_challenge_bytes =
+        match jbytearray_to_vec(&mut env, signed_challenge, "signed_challenge") {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
 
     let keypair = match jbytearray_to_ed25519_keypair(&mut env, private_key, "private_key") {
         Some(kp) => kp,
@@ -1191,10 +1177,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createDe
     challenge: JByteArray,
     private_key: JByteArray,
 ) -> jbyteArray {
+    use super::jni::conversions::{
+        jbytearray_to_ed25519_keypair, jbytearray_to_fixed, vec_to_jbytearray,
+    };
+    use super::jni::protobuf::encode_message;
     use crate::crypto::signing::sign_ed25519;
     use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_ed25519_keypair, vec_to_jbytearray};
-    use super::jni::protobuf::encode_message;
     use prost::Message;
 
     let challenge_bytes = match jbytearray_to_fixed::<32>(&mut env, challenge, "challenge") {
@@ -1251,11 +1239,11 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     csk: JByteArray,
     wrapper_message_bytes: JByteArray,
 ) -> jbyteArray {
+    use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec, vec_to_jbytearray};
+    use super::jni::exceptions::throw_security_exception;
+    use super::jni::protobuf::encode_message;
     use crate::crypto;
     use crate::protocol::pb;
-    use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec, vec_to_jbytearray};
-    use super::jni::protobuf::encode_message;
-    use super::jni::exceptions::throw_security_exception;
     use rand::{rngs::OsRng, TryRngCore};
 
     let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
@@ -1263,7 +1251,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
         None => return std::ptr::null_mut(),
     };
 
-    let payload = match jbytearray_to_vec(&mut env, wrapper_message_bytes, "wrapper_message_bytes") {
+    let payload = match jbytearray_to_vec(&mut env, wrapper_message_bytes, "wrapper_message_bytes")
+    {
         Some(b) => b,
         None => return std::ptr::null_mut(),
     };
@@ -1276,13 +1265,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
         return std::ptr::null_mut();
     }
 
-    let ciphertext_with_nonce = match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
-        Ok(ct) => ct,
-        Err(err) => {
-            throw_security_exception(&mut env, &format!("encryption failed: {err}"));
-            return std::ptr::null_mut();
-        }
-    };
+    let ciphertext_with_nonce =
+        match crypto::encryption::encrypt_aes_gcm(csk.as_bytes(), &nonce, &payload, &[]) {
+            Ok(ct) => ct,
+            Err(err) => {
+                throw_security_exception(&mut env, &format!("encryption failed: {err}"));
+                return std::ptr::null_mut();
+            }
+        };
 
     let mut ciphertext = Vec::with_capacity(12 + ciphertext_with_nonce.len());
     ciphertext.extend_from_slice(&nonce);
@@ -1337,10 +1327,11 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
     };
     let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
 
-    let packet_bytes = match jbytearray_to_vec(&mut env, encrypted_packet_bytes, "encrypted_packet_bytes") {
-        Some(b) => b,
-        None => return std::ptr::null_mut(),
-    };
+    let packet_bytes =
+        match jbytearray_to_vec(&mut env, encrypted_packet_bytes, "encrypted_packet_bytes") {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
 
     let encrypted_packet: pb::EncryptedPacket = match decode_message(&mut env, &packet_bytes) {
         Some(pkt) => pkt,
@@ -1355,13 +1346,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
     let nonce: [u8; 12] = encrypted_packet.ciphertext[..12].try_into().unwrap();
     let actual_ciphertext = &encrypted_packet.ciphertext[12..];
 
-    let wrapper_bytes = match crypto::encryption::decrypt_aes_gcm(csk.as_bytes(), &nonce, actual_ciphertext, &[]) {
-        Ok(plaintext) => plaintext,
-        Err(_) => {
-            throw_security_exception(&mut env, "decryption failed");
-            return std::ptr::null_mut();
-        }
-    };
+    let wrapper_bytes =
+        match crypto::encryption::decrypt_aes_gcm(csk.as_bytes(), &nonce, actual_ciphertext, &[]) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                throw_security_exception(&mut env, "decryption failed");
+                return std::ptr::null_mut();
+            }
+        };
 
     match vec_to_jbytearray(&mut env, &wrapper_bytes) {
         Some(arr) => arr.into_raw(),
@@ -1396,7 +1388,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
         None => return std::ptr::null_mut(),
     };
 
-    let ed25519_bytes = match jbytearray_to_vec(&mut env, ed25519_public_key, "ed25519_public_key") {
+    let ed25519_bytes = match jbytearray_to_vec(&mut env, ed25519_public_key, "ed25519_public_key")
+    {
         Some(b) => b,
         None => return std::ptr::null_mut(),
     };
@@ -1427,17 +1420,17 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
 /// JNI wrapper for parsing a PairingResponse message from protobuf bytes.
 ///
 /// @param response_bytes Serialized PairingResponse protobuf
-/// @return JSON string: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key": "base64...", "device_name": "..."}
+/// @return PairingResponse object with strongly-typed fields
 /// @throws IllegalArgumentException if input is invalid
-/// @throws IOException if protobuf decoding or JSON serialization fails
+/// @throws IOException if protobuf decoding fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingResponse(
     mut env: JNIEnv,
     _class: JClass,
     response_bytes: JByteArray,
-) -> jstring {
+) -> jni::sys::jobject {
+    use super::jni::objects::create_pairing_response;
     use crate::protocol::pb;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
     let data = match jbytearray_to_vec(&mut env, response_bytes, "response_bytes") {
         Some(b) => b,
@@ -1449,23 +1442,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
         None => return std::ptr::null_mut(),
     };
 
-    let json_result = serde_json::json!({
-        "version": response.version,
-        "x25519_public_key": BASE64.encode(&response.x25519_public_key),
-        "ed25519_public_key": BASE64.encode(&response.ed25519_public_key),
-        "device_name": response.device_name,
-    });
-
-    let json_str = match serde_json::to_string(&json_result) {
-        Ok(s) => s,
-        Err(_) => {
-            throw_io_exception(&mut env, "failed to serialize to JSON");
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_str) {
-        Some(s) => s,
+    match create_pairing_response(
+        &mut env,
+        response.version as i32,
+        &response.x25519_public_key,
+        &response.ed25519_public_key,
+        &response.device_name,
+    ) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -1573,15 +1557,16 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
 /// JNI wrapper for parsing a PairingComplete message from protobuf bytes.
 ///
 /// @param complete_bytes Serialized PairingComplete protobuf
-/// @return JSON string: {"success": true/false}
+/// @return PairingComplete object with strongly-typed field
 /// @throws IllegalArgumentException if input is invalid
-/// @throws IOException if protobuf decoding or JSON serialization fails
+/// @throws IOException if protobuf decoding fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePairingComplete(
     mut env: JNIEnv,
     _class: JClass,
     complete_bytes: JByteArray,
-) -> jstring {
+) -> jni::sys::jobject {
+    use super::jni::objects::create_pairing_complete;
     use crate::protocol::pb;
 
     let data = match jbytearray_to_vec(&mut env, complete_bytes, "complete_bytes") {
@@ -1594,20 +1579,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
         None => return std::ptr::null_mut(),
     };
 
-    let json_result = serde_json::json!({
-        "success": complete.success,
-    });
-
-    let json_str = match serde_json::to_string(&json_result) {
-        Ok(s) => s,
-        Err(_) => {
-            throw_io_exception(&mut env, "failed to serialize to JSON");
-            return std::ptr::null_mut();
-        }
-    };
-
-    match string_to_jstring(&mut env, &json_str) {
-        Some(s) => s,
+    match create_pairing_complete(&mut env, complete.success) {
+        Some(obj) => obj.into_raw(),
         None => std::ptr::null_mut(),
     }
 }

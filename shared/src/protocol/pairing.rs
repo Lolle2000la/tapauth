@@ -140,9 +140,7 @@ impl ClientPairingSession {
                 [..std::cmp::min(16, hex::encode(server_x25519_pub).len())]
         );
 
-        let shared_secret = self
-            .x25519_keypair
-            .diffie_hellman(&server_x25519_pub)?;
+        let shared_secret = self.x25519_keypair.diffie_hellman(&server_x25519_pub)?;
 
         tracing::debug!(
             "Shared secret (sha256): {}",
@@ -337,9 +335,7 @@ impl ServerPairingSession {
         let client_x25519_pub = self
             .client_x25519_public
             .ok_or(ProtocolError::MissingField("client_x25519_public"))?;
-        let shared_secret = self
-            .x25519_keypair
-            .diffie_hellman(&client_x25519_pub)?;
+        let shared_secret = self.x25519_keypair.diffie_hellman(&client_x25519_pub)?;
         let psk = derive_psk_from_x25519(&shared_secret)?;
         self.psk = Some(psk);
 

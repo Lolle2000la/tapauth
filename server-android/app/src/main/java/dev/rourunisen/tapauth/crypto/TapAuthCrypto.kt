@@ -78,9 +78,9 @@ object TapAuthCrypto {
      * Parse AuthenticationRequest from protobuf bytes
      *
      * @param requestBytes Protobuf-encoded request
-     * @return JSON string with request contents
+     * @return AuthRequest object with request contents
      */
-    external fun parseAuthRequest(requestBytes: ByteArray): String
+    external fun parseAuthRequest(requestBytes: ByteArray): AuthRequest
 
     /**
      * Create and serialize an AuthenticationGrant
@@ -125,26 +125,26 @@ object TapAuthCrypto {
      * Parse GrantConfirmation from protobuf bytes
      *
      * @param confirmationBytes Protobuf-encoded confirmation
-     * @return JSON string with confirmation contents
+     * @return GrantConfirmation object with confirmation contents
      */
-    external fun parseGrantConfirmation(confirmationBytes: ByteArray): String
+    external fun parseGrantConfirmation(confirmationBytes: ByteArray): GrantConfirmation
 
     /**
      * Parse AuthenticationCancel from protobuf bytes
      *
      * @param cancelBytes Protobuf-encoded cancel message
-     * @return JSON string with cancel contents
+     * @return AuthenticationCancel object with cancel contents
      */
-    external fun parseAuthenticationCancel(cancelBytes: ByteArray): String
+    external fun parseAuthenticationCancel(cancelBytes: ByteArray): AuthenticationCancel
 
     /**
      * Parse EncryptedPacket structure from protobuf bytes (without decryption)
      *
      * @param packetBytes Protobuf-encoded EncryptedPacket
-     * @return JSON string with packet structure (temporal_identifier, encryption_algorithm,
-     *   ciphertext)
+     * @return EncryptedPacketInfo object with packet structure (temporal_identifier,
+     *   encryption_algorithm, ciphertext)
      */
-    external fun parseEncryptedPacketStructure(packetBytes: ByteArray): String
+    external fun parseEncryptedPacketStructure(packetBytes: ByteArray): EncryptedPacketInfo
 
     /**
      * Extract temporal_identifier from EncryptedPacket protobuf bytes.
@@ -290,10 +290,10 @@ object TapAuthCrypto {
      * Parse a PairingResponse message (protobuf)
      *
      * @param responseBytes Protobuf-encoded PairingResponse
-     * @return JSON string: {"version": 1, "x25519_public_key": "base64...", "ed25519_public_key":
-     *   "base64..."}
+     * @return PairingResponse object with version, x25519_public_key, ed25519_public_key, and
+     *   device_name
      */
-    external fun parsePairingResponse(responseBytes: ByteArray): String
+    external fun parsePairingResponse(responseBytes: ByteArray): PairingResponse
 
     /**
      * Create a PairingCskMessage (protobuf) Note: Not used by Android server (only by clients),
@@ -325,9 +325,9 @@ object TapAuthCrypto {
      * Parse a PairingComplete message (protobuf)
      *
      * @param completeBytes Protobuf-encoded PairingComplete
-     * @return JSON string: {"success": true/false}
+     * @return PairingComplete object with success status
      */
-    external fun parsePairingComplete(completeBytes: ByteArray): String
+    external fun parsePairingComplete(completeBytes: ByteArray): PairingComplete
 }
 
 /** Kotlin wrapper for Ed25519 keypair */
@@ -545,21 +545,13 @@ fun createPairingHello(
  * @return Quadruple of (version, x25519PublicKey, ed25519PublicKey, deviceName)
  */
 fun parsePairingResponse(responseBytes: ByteArray): Quadruple<Int, ByteArray, ByteArray, String> {
-    val json = TapAuthCrypto.parsePairingResponse(responseBytes)
-    val jsonObj = org.json.JSONObject(json)
-    val version = jsonObj.getInt("version")
-    val x25519Key =
-        android.util.Base64.decode(
-            jsonObj.getString("x25519_public_key"),
-            android.util.Base64.DEFAULT,
-        )
-    val ed25519Key =
-        android.util.Base64.decode(
-            jsonObj.getString("ed25519_public_key"),
-            android.util.Base64.DEFAULT,
-        )
-    val deviceName = jsonObj.getString("device_name")
-    return Quadruple(version, x25519Key, ed25519Key, deviceName)
+    val response = TapAuthCrypto.parsePairingResponse(responseBytes)
+    return Quadruple(
+        response.version,
+        response.x25519PublicKey,
+        response.ed25519PublicKey,
+        response.deviceName,
+    )
 }
 
 /** Create a PairingCskMessage Note: Not used by Android server, kept for API completeness */
@@ -588,9 +580,8 @@ fun createPairingComplete(success: Boolean): ByteArray {
  * @return true if pairing was successful
  */
 fun parsePairingComplete(completeBytes: ByteArray): Boolean {
-    val json = TapAuthCrypto.parsePairingComplete(completeBytes)
-    val jsonObj = org.json.JSONObject(json)
-    return jsonObj.getBoolean("success")
+    val complete = TapAuthCrypto.parsePairingComplete(completeBytes)
+    return complete.success
 }
 
 private fun hexToBytes(hex: String): ByteArray {

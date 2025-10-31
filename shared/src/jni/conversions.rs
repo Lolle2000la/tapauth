@@ -84,7 +84,10 @@ pub fn jstring_to_rust(env: &mut JNIEnv, string: JString, name: &str) -> Option<
 /// ## Errors
 ///
 /// Throws `OutOfMemoryError` and returns `None` if the array cannot be allocated.
-pub fn vec_to_jbytearray<'local>(env: &mut JNIEnv<'local>, bytes: &[u8]) -> Option<JByteArray<'local>> {
+pub fn vec_to_jbytearray<'local>(
+    env: &mut JNIEnv<'local>,
+    bytes: &[u8],
+) -> Option<JByteArray<'local>> {
     match env.byte_array_from_slice(bytes) {
         Ok(array) => Some(array),
         Err(err) => {
@@ -134,9 +137,9 @@ pub fn jbytearray_to_ed25519_keypair(
     name: &str,
 ) -> Option<crate::crypto::Ed25519KeyPair> {
     use crate::crypto::Ed25519KeyPair;
-    
+
     let bytes = jbytearray_to_vec(env, array, name)?;
-    
+
     let signing_key = match bytes.len() {
         64 => {
             let mut key = [0u8; 32];
@@ -156,7 +159,7 @@ pub fn jbytearray_to_ed25519_keypair(
             return None;
         }
     };
-    
+
     match Ed25519KeyPair::from_signing_key_bytes(&signing_key) {
         Ok(kp) => Some(kp),
         Err(err) => {

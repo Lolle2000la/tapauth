@@ -1,6 +1,5 @@
 package dev.rourunisen.tapauth.protocol
 
-import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 
 /**
@@ -42,19 +41,35 @@ data class AuthenticationCancel(
 
 /** Helper object for parsing protobuf messages via JNI */
 object ProtobufParser {
-    private val gson = Gson()
-
     /** Parse an EncryptedPacket structure from raw protobuf bytes (without decryption) */
     fun parseEncryptedPacket(packetBytes: ByteArray): EncryptedPacket {
-        val json =
+        val info =
             dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseEncryptedPacketStructure(packetBytes)
-        return gson.fromJson(json, EncryptedPacket::class.java)
+        return EncryptedPacket(
+            temporalIdentifier =
+                android.util.Base64.encodeToString(
+                    info.temporalIdentifier,
+                    android.util.Base64.NO_WRAP,
+                ),
+            encryptionAlgorithm = info.encryptionAlgorithm,
+            ciphertext =
+                android.util.Base64.encodeToString(info.ciphertext, android.util.Base64.NO_WRAP),
+        )
     }
 
     /** Parse an AuthenticationRequest from protobuf bytes */
     fun parseAuthRequest(requestBytes: ByteArray): AuthenticationRequest {
-        val json = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthRequest(requestBytes)
-        return gson.fromJson(json, AuthenticationRequest::class.java)
+        val req = dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthRequest(requestBytes)
+        return AuthenticationRequest(
+            challenge =
+                android.util.Base64.encodeToString(req.challenge, android.util.Base64.NO_WRAP),
+            username = req.username,
+            hostname = req.hostname,
+            timestampUnixSeconds = req.timestampUnixSeconds,
+            signatureAlgorithm = req.signatureAlgorithm,
+            signature =
+                android.util.Base64.encodeToString(req.signature, android.util.Base64.NO_WRAP),
+        )
     }
 
     /** Create an AuthenticationGrant protobuf message */
@@ -64,20 +79,28 @@ object ProtobufParser {
 
     /** Parse GrantConfirmation from protobuf bytes */
     fun parseGrantConfirmation(confirmationBytes: ByteArray): GrantConfirmation {
-        val json =
+        val conf =
             dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseGrantConfirmation(confirmationBytes)
-        return gson.fromJson(json, GrantConfirmation::class.java)
+        return GrantConfirmation(
+            challenge =
+                android.util.Base64.encodeToString(conf.challenge, android.util.Base64.NO_WRAP),
+            signatureAlgorithm = conf.signatureAlgorithm,
+            signature =
+                android.util.Base64.encodeToString(conf.signature, android.util.Base64.NO_WRAP),
+        )
     }
 
     /** Parse AuthenticationCancel from protobuf bytes */
     fun parseAuthenticationCancel(cancelBytes: ByteArray): AuthenticationCancel {
-        val json =
+        val cancel =
             dev.rourunisen.tapauth.crypto.TapAuthCrypto.parseAuthenticationCancel(cancelBytes)
-        return gson.fromJson(json, AuthenticationCancel::class.java)
-    }
-
-    private fun bytesToHex(bytes: ByteArray): String {
-        return bytes.joinToString("") { "%02x".format(it) }
+        return AuthenticationCancel(
+            challenge =
+                android.util.Base64.encodeToString(cancel.challenge, android.util.Base64.NO_WRAP),
+            signatureAlgorithm = cancel.signatureAlgorithm,
+            signature =
+                android.util.Base64.encodeToString(cancel.signature, android.util.Base64.NO_WRAP),
+        )
     }
 }
 
