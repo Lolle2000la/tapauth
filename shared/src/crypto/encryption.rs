@@ -77,83 +77,78 @@ pub fn decrypt_with_csk(
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
 
-/// Encrypt with CSK using random nonce
+/// Encrypt with CSK using a random nonce (prepended to ciphertext)
 /// This is used for authentication messages where the challenge is inside
 /// the encrypted payload and cannot be used for nonce derivation.
-/// The random nonce is prepended to the ciphertext.
-pub fn encrypt_with_csk_static_nonce(
+pub fn encrypt_with_csk_and_random_nonce(
     csk: &ClientSymmetricKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // Generate a cryptographically secure random 12-byte nonce using OS RNG
     use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
     OsRng
         .try_fill_bytes(&mut nonce)
         .map_err(|_| CryptoError::RandomGenerationFailed)?;
 
-    // Encrypt the plaintext
     let ciphertext = encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])?;
 
-    // Prepend the nonce to the ciphertext (nonce is not secret)
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&ciphertext);
-
     Ok(result)
 }
 
-/// Decrypt with CSK using random nonce
+/// Decrypt with CSK where the random nonce is prepended to ciphertext
 /// This is used for authentication messages where the challenge is inside
 /// the encrypted payload and cannot be used for nonce derivation.
 /// The nonce is extracted from the first 12 bytes of the input.
-pub fn decrypt_with_csk_static_nonce(
+pub fn decrypt_with_csk_and_prepended_nonce(
     csk: &ClientSymmetricKey,
     ciphertext_with_nonce: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // Ensure we have at least a nonce
     if ciphertext_with_nonce.len() < 12 {
         return Err(CryptoError::DecryptionFailed);
     }
-
-    // Extract the nonce from the first 12 bytes
     let nonce: [u8; 12] = ciphertext_with_nonce[..12]
         .try_into()
         .map_err(|_| CryptoError::DecryptionFailed)?;
-
-    // Extract the actual ciphertext
     let ciphertext = &ciphertext_with_nonce[12..];
-
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
 
-/// Encrypt with PSK using derived nonce
+/// Encrypt with PSK using a random nonce (prepended to ciphertext)
 pub fn encrypt_with_psk(
     psk: &PairingSymmetricKey,
-    context: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // For PSK, we derive a nonce from the key itself and context
-    let hk = Hkdf::<Sha256>::new(None, psk.as_bytes());
+    // Use a random nonce, prepend it to the ciphertext to avoid nonce reuse.
+    use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
-    hk.expand(context, &mut nonce)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| CryptoError::RandomGenerationFailed)?;
 
-    encrypt_aes_gcm(psk.as_bytes(), &nonce, plaintext, &[])
+    let ciphertext = encrypt_aes_gcm(psk.as_bytes(), &nonce, plaintext, &[])?;
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }
 
-/// Decrypt with PSK using derived nonce
+/// Decrypt with PSK where the random nonce is prepended to ciphertext
 pub fn decrypt_with_psk(
     psk: &PairingSymmetricKey,
-    context: &[u8],
-    ciphertext: &[u8],
+    ciphertext_with_nonce: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // For PSK, we derive a nonce from the key itself and context
-    let hk = Hkdf::<Sha256>::new(None, psk.as_bytes());
-    let mut nonce = [0u8; 12];
-    hk.expand(context, &mut nonce)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
-
+    // Expect the first 12 bytes to be the random nonce.
+    if ciphertext_with_nonce.len() < 12 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let nonce: [u8; 12] = ciphertext_with_nonce[..12]
+        .try_into()
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let ciphertext = &ciphertext_with_nonce[12..];
     decrypt_aes_gcm(psk.as_bytes(), &nonce, ciphertext, &[])
 }
 
@@ -276,5 +271,26 @@ mod tests {
         let decrypted = decrypt_with_csk(&csk, &challenge, context, &ciphertext).unwrap();
 
         assert_eq!(plaintext, decrypted);
+    }
+
+    #[test]
+    fn test_psk_random_nonce_uniqueness_and_roundtrip() {
+        // Create a random PSK
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        let psk = PairingSymmetricKey::from_bytes(bytes);
+
+        let plaintext = b"hello psk";
+
+        // Encrypt twice with same inputs; ciphertexts should differ due to random nonce
+        let c1 = encrypt_with_psk(&psk, plaintext).unwrap();
+        let c2 = encrypt_with_psk(&psk, plaintext).unwrap();
+        assert_ne!(c1, c2);
+
+        // Both should decrypt correctly
+        let p1 = decrypt_with_psk(&psk, &c1).unwrap();
+        let p2 = decrypt_with_psk(&psk, &c2).unwrap();
+        assert_eq!(p1, plaintext);
+        assert_eq!(p2, plaintext);
     }
 }

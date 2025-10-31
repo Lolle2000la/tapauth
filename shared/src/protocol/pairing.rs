@@ -125,7 +125,9 @@ impl ClientPairingSession {
 
         let _client_x25519_priv = self.x25519_keypair.secret_key_bytes();
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let server_x25519_pub = self.server_x25519_public.unwrap();
+        let server_x25519_pub = self
+            .server_x25519_public
+            .ok_or(ProtocolError::MissingField("server_x25519_public"))?;
 
         tracing::debug!(
             "Client X25519 public key (trunc): {}…",
@@ -140,7 +142,7 @@ impl ClientPairingSession {
 
         let shared_secret = self
             .x25519_keypair
-            .diffie_hellman(&self.server_x25519_public.unwrap())?;
+            .diffie_hellman(&server_x25519_pub)?;
 
         tracing::debug!(
             "Shared secret (sha256): {}",
@@ -157,12 +159,11 @@ impl ClientPairingSession {
         self.psk = Some(psk);
 
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let server_x25519_pub = self.server_x25519_public.unwrap();
-        let sas = derive_sas(
-            self.psk.as_ref().unwrap(),
-            &client_x25519_pub,
-            &server_x25519_pub,
-        )?;
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
+        let sas = derive_sas(psk, &client_x25519_pub, &server_x25519_pub)?;
         self.sas = Some(sas.clone());
 
         self.send_pairing_response(&mut stream, client_device_name)
@@ -242,7 +243,10 @@ impl ClientPairingSession {
         username: &str,
     ) -> Result<(), ProtocolError> {
         // Encrypt CSK with PSK
-        let psk = self.psk.as_ref().unwrap();
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
         tracing::debug!(
             "PSK for encryption (sha256): {}",
             crate::protocol::messages::sha256_hex(psk.as_bytes())
@@ -252,7 +256,7 @@ impl ClientPairingSession {
             crate::protocol::messages::sha256_hex(csk.as_bytes())
         );
 
-        let encrypted_csk = encrypt_with_psk(psk, b"csk_exchange", csk.as_bytes())?;
+        let encrypted_csk = encrypt_with_psk(psk, csk.as_bytes())?;
 
         tracing::debug!(
             "Encrypted CSK (sha256): {}",
@@ -330,19 +334,21 @@ impl ServerPairingSession {
                 .map_err(|_| ProtocolError::InvalidMessageFormat)?,
         );
 
+        let client_x25519_pub = self
+            .client_x25519_public
+            .ok_or(ProtocolError::MissingField("client_x25519_public"))?;
         let shared_secret = self
             .x25519_keypair
-            .diffie_hellman(&self.client_x25519_public.unwrap())?;
+            .diffie_hellman(&client_x25519_pub)?;
         let psk = derive_psk_from_x25519(&shared_secret)?;
         self.psk = Some(psk);
 
-        let client_x25519_pub = self.client_x25519_public.unwrap();
         let server_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let sas = derive_sas(
-            self.psk.as_ref().unwrap(),
-            &client_x25519_pub,
-            &server_x25519_pub,
-        )?;
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
+        let sas = derive_sas(psk, &client_x25519_pub, &server_x25519_pub)?;
         self.sas = Some(sas.clone());
 
         let csk = self.receive_csk_message(&mut stream).await?;
@@ -418,13 +424,16 @@ impl ServerPairingSession {
         );
 
         // Decrypt CSK with PSK
-        let psk = self.psk.as_ref().unwrap();
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
         tracing::debug!(
             "PSK for decryption (sha256): {}",
             sha256_hex(psk.as_bytes())
         );
 
-        let plaintext = decrypt_with_psk(psk, b"csk_exchange", &encrypted_msg.encrypted_csk)?;
+        let plaintext = decrypt_with_psk(psk, &encrypted_msg.encrypted_csk)?;
 
         tracing::debug!("Decrypted CSK (sha256): {}", sha256_hex(&plaintext));
 

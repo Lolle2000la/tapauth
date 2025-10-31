@@ -225,13 +225,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
 
 /// Decrypt data with PSK using AES-256-GCM.
 ///
-/// Used during pairing to decrypt the CSK.
+/// Used during pairing to decrypt the CSK. Uses a random nonce prepended to the ciphertext.
 ///
 /// ## Arguments
 ///
 /// * `psk` - 32-byte Pairing Symmetric Key
-/// * `context` - Context string for key derivation
-/// * `ciphertext` - Encrypted data
+/// * `ciphertext` - Encrypted data with prepended 12-byte nonce
 ///
 /// ## Returns
 ///
@@ -239,7 +238,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
 ///
 /// ## Errors
 ///
-/// - `IllegalArgumentException`: PSK reading fails, PSK is not 32 bytes, or invalid UTF-8 in context
+/// - `IllegalArgumentException`: PSK reading fails or PSK is not 32 bytes
 /// - `BadPaddingException`: Decryption or authentication fails
 /// - `OutOfMemoryError`: Result allocation fails
 #[no_mangle]
@@ -247,7 +246,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
     mut env: JNIEnv,
     _class: JClass,
     psk: JByteArray,
-    context: JString,
     ciphertext: JByteArray,
 ) -> jbyteArray {
     let psk_array = match jbytearray_to_fixed::<32>(&mut env, psk, "PSK") {
@@ -257,18 +255,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
 
     let psk = crypto::PairingSymmetricKey::from_bytes(psk_array);
 
-    let context_str = match jstring_to_rust(&mut env, context, "context") {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
-
     let ciphertext_bytes = match jbytearray_to_vec(&mut env, ciphertext, "ciphertext") {
         Some(bytes) => bytes,
         None => return std::ptr::null_mut(),
     };
 
-    let plaintext = match crypto::decrypt_with_psk(&psk, context_str.as_bytes(), &ciphertext_bytes)
-    {
+    let plaintext = match crypto::decrypt_with_psk(&psk, &ciphertext_bytes) {
         Ok(data) => data,
         Err(err) => {
             throw_bad_padding(&mut env, format!("decryption failed: {err}"));
@@ -284,21 +276,20 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
 
 /// Encrypt data with PSK using AES-256-GCM.
 ///
-/// Used during pairing to encrypt confirmation hashes.
+/// Used during pairing to encrypt confirmation hashes. Uses a random nonce prepended to the ciphertext.
 ///
 /// ## Arguments
 ///
 /// * `psk` - 32-byte Pairing Symmetric Key
-/// * `context` - Context string for key derivation
 /// * `plaintext` - Data to encrypt
 ///
 /// ## Returns
 ///
-/// Encrypted ciphertext bytes, or `null` on error.
+/// Encrypted ciphertext bytes with prepended 12-byte nonce, or `null` on error.
 ///
 /// ## Errors
 ///
-/// - `IllegalArgumentException`: PSK reading fails, PSK is not 32 bytes, or invalid UTF-8 in context
+/// - `IllegalArgumentException`: PSK reading fails or PSK is not 32 bytes
 /// - `GeneralSecurityException`: Encryption fails
 /// - `OutOfMemoryError`: Result allocation fails
 #[no_mangle]
@@ -306,7 +297,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptW
     mut env: JNIEnv,
     _class: JClass,
     psk: JByteArray,
-    context: JString,
     plaintext: JByteArray,
 ) -> jbyteArray {
     let psk_array = match jbytearray_to_fixed::<32>(&mut env, psk, "PSK") {
@@ -316,18 +306,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptW
 
     let psk = crypto::PairingSymmetricKey::from_bytes(psk_array);
 
-    let context_str = match jstring_to_rust(&mut env, context, "context") {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
-
     let plaintext_bytes = match jbytearray_to_vec(&mut env, plaintext, "plaintext") {
         Some(bytes) => bytes,
         None => return std::ptr::null_mut(),
     };
 
-    let ciphertext = match crypto::encrypt_with_psk(&psk, context_str.as_bytes(), &plaintext_bytes)
-    {
+    let ciphertext = match crypto::encrypt_with_psk(&psk, &plaintext_bytes) {
         Ok(data) => data,
         Err(err) => {
             throw_security_exception(&mut env, format!("encryption failed: {err}"));

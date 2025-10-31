@@ -685,7 +685,7 @@ impl BleTransport {
     /// Create a GrantConfirmation message
     fn create_confirmation(&self, request_packet: &EncryptedPacket) -> Result<Vec<u8>, AuthError> {
         use prost::Message;
-        use shared::crypto::encrypt_with_csk_static_nonce;
+        use shared::crypto::encrypt_with_csk_and_random_nonce;
         use shared::protocol::messages::create_grant_confirmation;
         use shared::protocol::packet::wrap_grant_confirmation;
 
@@ -702,8 +702,8 @@ impl BleTransport {
         // Serialize wrapper
         let plaintext = wrapper.encode_to_vec();
 
-        // Encrypt using CSK static nonce (same as request packet)
-        let ciphertext = encrypt_with_csk_static_nonce(&csk, &plaintext)
+        // Encrypt using CSK with a random, prepended nonce
+        let ciphertext = encrypt_with_csk_and_random_nonce(&csk, &plaintext)
             .map_err(|e| AuthError::BleError(format!("Failed to encrypt confirmation: {}", e)))?;
 
         // Create encrypted packet with same temporal identifier as request

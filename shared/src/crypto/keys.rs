@@ -14,8 +14,10 @@ pub struct Ed25519KeyPair {
 impl Ed25519KeyPair {
     /// Generate a new Ed25519 key pair
     pub fn generate() -> Self {
-        let mut rng = OsRng.unwrap_err(); // Create an INSTANCE
-        let signing_key = SigningKey::generate(&mut rng); // Use the INSTANCE
+        // Use OS CSPRNG to generate 32 bytes and construct the signing key
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("getrandom failed");
+        let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         Self {
             signing_key,
@@ -44,12 +46,6 @@ impl Ed25519KeyPair {
     }
 }
 
-impl Drop for Ed25519KeyPair {
-    fn drop(&mut self) {
-        // Zeroize happens automatically for SigningKey
-    }
-}
-
 /// X25519 key pair for key exchange
 #[derive(Clone)]
 pub struct X25519KeyPair {
@@ -60,8 +56,10 @@ pub struct X25519KeyPair {
 impl X25519KeyPair {
     /// Generate a new X25519 key pair
     pub fn generate() -> Self {
-        let mut rng = OsRng.unwrap_err(); // Create an INSTANCE
-        let secret = X25519StaticSecret::random_from_rng(&mut rng); // Use the INSTANCE
+        // Use OS CSPRNG to fill 32 random bytes for the static secret
+        let mut sk = [0u8; 32];
+        getrandom::fill(&mut sk).expect("getrandom failed");
+        let secret = X25519StaticSecret::from(sk);
         let public = X25519PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -137,21 +135,7 @@ impl PairingSymmetricKey {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CryptoError {
-    #[error("Invalid key length")]
-    InvalidKeyLength,
-    #[error("Invalid signature")]
-    InvalidSignature,
-    #[error("Encryption failed")]
-    EncryptionFailed,
-    #[error("Decryption failed")]
-    DecryptionFailed,
-    #[error("Key derivation failed")]
-    KeyDerivationFailed,
-    #[error("Random number generation failed")]
-    RandomGenerationFailed,
-}
+use super::CryptoError;
 
 #[cfg(test)]
 mod tests {

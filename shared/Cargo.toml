@@ -45,6 +45,7 @@ chrono = { workspace = true, features = ["serde"] }
 if-addrs.workspace = true
 hostname = "0.4"
 socket2.workspace = true
+nix.workspace = true
 
 # JNI support (optional)
 jni = { version = "0.21", optional = true }
