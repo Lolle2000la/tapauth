@@ -18,7 +18,6 @@
 //! runtime per authentication attempt. A separate thread monitors `/dev/tty`
 //! for skip signals in terminal contexts.
 
-use crate::auth_client::AuthenticationClient;
 use crate::ipc_client::IpcClient;
 use crate::pam_sys;
 use once_cell::sync::Lazy;
@@ -88,22 +87,6 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // No explicit root check here; shared config enforces file ownership/permissions.
 
-    let client = match AuthenticationClient::new(username.to_string()) {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!("Failed to create authentication client: {}", e);
-            let error_msg = match e {
-                crate::auth_client::AuthError::NoPairedDevices => {
-                    "No paired devices found. Use tapauth-config to pair a device."
-                }
-                _ => "Failed to initialize TapAuth",
-            };
-
-            pam_conv.try_error(error_msg);
-            return pam_sys::PAM_IGNORE;
-        }
-    };
-
     let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {
@@ -115,6 +98,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let (skip_tx, skip_rx) = oneshot::channel();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
 
+    // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
+    let mut rid_bytes = [0u8; 16];
+    getrandom::fill(&mut rid_bytes).ok();
+    let request_id = hex::encode(rid_bytes);
+
     let skip_thread_handle = if has_terminal {
         Some(spawn_skip_reader(skip_tx, stop_rx))
     } else {
@@ -124,6 +112,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // Build an auth future that talks to tapauthd via IPC (thin client)
     let ipc_username = username.to_string();
+    let req_id_for_auth = request_id.clone();
     let ipc_auth_future = async move {
         let timeout_secs = {
             let dur = shared::network::get_session_timeout();
@@ -131,17 +120,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             if secs > u64::from(u32::MAX) { u32::MAX } else { secs as u32 }
         };
         let tty_flag = has_terminal;
-        // Generate a per-request id to correlate cancellation
-        let mut rid_bytes = [0u8; 16];
-        getrandom::fill(&mut rid_bytes).ok();
-        let request_id = hex::encode(rid_bytes);
-        let rid_clone = request_id.clone();
         // Use spawn_blocking to avoid blocking the async runtime with UnixStream I/O
         match tokio::task::spawn_blocking(move || {
             let mut ipc = IpcClient::connect()?;
-            ipc.send_authenticate(&ipc_username, tty_flag, timeout_secs, &request_id)
+            ipc.send_authenticate(&ipc_username, tty_flag, timeout_secs, &req_id_for_auth)
         }).await {
-            Ok(Ok(resp)) => Ok((resp, rid_clone)),
+            Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(e),
             Err(join_err) => Err(crate::ipc_client::IpcError::Io(std::io::Error::other(format!(
                 "IPC auth task failed: {}", join_err
@@ -158,7 +142,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             tokio::select! {
                 auth_resp = ipc_auth_future => {
                     match auth_resp {
-                        Ok((resp, _rid)) => {
+                        Ok(resp) => {
                             // Map daemon outcome to PAM code
                             match resp.outcome() {
                                 shared::ipc::pb::PamOutcome::Success => {
@@ -180,19 +164,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 _ = skip_future => {
                     tracing::info!("User skipped TapAuth via Enter key");
                     
-                    // Best-effort IPC cancel to daemon (so connected devices can dismiss notifications)
+                    // Send IPC cancel to daemon (daemon will broadcast cancel over UDP/BLE)
                     if let Ok(mut ipc) = IpcClient::connect() {
-                        tracing::debug!("Sending IPC cancel to tapauthd");
-                        // Reuse the same request_id if still available; otherwise send empty-id cancel
-                        // Note: in this simplified flow, if the auth task already returned, cancel is a no-op
-                        let rid = ""; // best effort: daemon will ignore empty/unknown IDs
-                        let _ = ipc.send_cancel("tty-skip", rid);
+                        tracing::debug!("Sending IPC cancel to tapauthd with request_id");
+                        let _ = ipc.send_cancel("tty-skip", &request_id);
                     } else {
                         tracing::debug!("Could not connect to tapauthd for IPC cancel (daemon may not be running)");
                     }
-                    
-                    // Also send network cancel for backward compatibility
-                    let _ = client.send_cancellation().await;
                     None
                 }
             }
@@ -200,7 +178,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     } else {
         RUNTIME.block_on(async {
             match ipc_auth_future.await {
-                Ok((resp, _rid)) => {
+                Ok(resp) => {
                     match resp.outcome() {
                         shared::ipc::pb::PamOutcome::Success => {
                             tracing::info!("Authentication successful for user: {}", username);

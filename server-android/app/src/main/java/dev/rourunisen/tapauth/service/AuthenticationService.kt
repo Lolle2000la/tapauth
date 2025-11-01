@@ -6,7 +6,11 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import dev.rourunisen.tapauth.MainActivity
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.TapAuthApplication
@@ -102,6 +106,22 @@ class AuthenticationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!isRunning) {
+            // For Android 13+, ensure POST_NOTIFICATIONS is granted before starting foreground
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (
+                    ActivityCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.e(
+                        TAG,
+                        "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
+                    )
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+            }
             startForeground(NOTIFICATION_ID, createNotification())
             startListening()
             isRunning = true
@@ -241,6 +261,7 @@ class AuthenticationService : Service() {
     }
 
     /** Handle incoming packet and route to appropriate handler based on message type */
+    @Suppress("UNUSED_PARAMETER")
     private suspend fun handleIncomingPacket(
         data: ByteArray,
         senderAddress: InetAddress,
@@ -376,6 +397,11 @@ class AuthenticationService : Service() {
         return joinToString("") { "%02x".format(it) }
     }
 
+    private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
+        val take = kotlin.math.min(this.size, maxBytes)
+        return this.take(take).joinToString("") { "%02x".format(it) } + if (this.size > take) "…" else ""
+    }
+
     private suspend fun handleGrantConfirmation(
         wrapperMessage: ByteArray,
         device: dev.rourunisen.tapauth.data.PairedDevice,
@@ -438,6 +464,7 @@ class AuthenticationService : Service() {
             // Decode Base64 challenge to ByteArray for retransmission manager
             val challengeBytes =
                 android.util.Base64.decode(cancel.challenge, android.util.Base64.NO_WRAP)
+            Log.d(TAG, "Processing AuthenticationCancel for challenge")
 
             // Stop retransmission for this challenge
             retransmissionManager.stopRetransmission(challengeBytes)
@@ -459,6 +486,7 @@ class AuthenticationService : Service() {
                 Intent(ACTION_CANCEL_BLE_CONNECTION).apply {
                     putExtra(EXTRA_CHALLENGE, challengeBytes)
                     putExtra(EXTRA_DEVICE_ID, device.deviceId)
+                    setPackage(packageName)
                 }
             sendBroadcast(intent)
 
@@ -592,7 +620,7 @@ class AuthenticationService : Service() {
 
                         // Create WrapperMessage containing AuthenticationGrant (now properly
                         // signed)
-                        val wrapperMessage =
+                        val grantWrapperMessage =
                             dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
                                 signedChallenge,
                                 privateKey,
@@ -602,7 +630,7 @@ class AuthenticationService : Service() {
                         val encryptedPacketBytes =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 device.csk,
-                                wrapperMessage,
+                                grantWrapperMessage,
                             )
 
                         // Send initial response
@@ -650,7 +678,7 @@ class AuthenticationService : Service() {
                         val privateKey = keypairRepository.getPrivateKey()
 
                         // Create WrapperMessage containing AuthenticationDenial
-                        val wrapperMessage =
+                        val denialWrapperMessage =
                             dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
                                 challengeBytes,
                                 privateKey,
@@ -660,7 +688,7 @@ class AuthenticationService : Service() {
                         val encryptedPacketBytes =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 device.csk,
-                                wrapperMessage,
+                                denialWrapperMessage,
                             )
 
                         // Send initial denial response

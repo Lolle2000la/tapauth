@@ -115,6 +115,7 @@ impl AuthSession {
             return Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Denied as i32,
                 detail: "No paired devices".to_string(),
+                challenge: self.challenge.to_vec(),
             });
         }
         
@@ -129,6 +130,7 @@ impl AuthSession {
             return Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Denied as i32,
                 detail: format!("No servers authorized for user {}", self.username),
+                challenge: self.challenge.to_vec(),
             });
         }
         
@@ -161,12 +163,14 @@ impl AuthSession {
             Ok(Ok(())) => Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Success as i32,
                 detail: format!("Authenticated user {} successfully", self.username),
+                challenge: self.challenge.to_vec(),
             }),
             Ok(Err(e)) => {
                 tracing::error!("Authentication failed: {}", e);
                 Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Denied as i32,
                     detail: format!("Authentication failed: {}", e),
+                    challenge: self.challenge.to_vec(),
                 })
             }
             Err(_) => {
@@ -174,6 +178,7 @@ impl AuthSession {
                 Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Timeout as i32,
                     detail: "Authentication timeout".to_string(),
+                    challenge: self.challenge.to_vec(),
                 })
             }
         }
@@ -226,6 +231,10 @@ impl AuthSession {
             let wrapper = wrap_auth_cancel(msg);
             create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?
         };
+        
+        // Create dedicated socket for cancel broadcasting (avoids mutex contention with receive socket)
+        let config = self.state.config_manager.load_config()?;
+        let cancel_socket = shared::network::create_broadcast_socket(config.udp_port).await?;
         
         // Spawn BLE task if available
         let mut ble_handle = if let Some(ble_transport_task) = ble_transport_shared.clone() {
@@ -342,15 +351,40 @@ impl AuthSession {
                 }
             }
             _ = &mut cancel_rx => {
-                tracing::info!("Authentication cancelled");
-                // Broadcast cancel before aborting
+                let rid = self.request_id.as_deref().unwrap_or("-");
+                tracing::info!("Authentication cancelled (user={}, id={})", self.username, rid);
+                
+                // Broadcast cancel using dedicated socket (no mutex contention)
+                tracing::info!("Broadcasting AuthenticationCancel over UDP");
+                let port = self.state.config_manager.load_config().map(|c| c.udp_port).unwrap_or(36692);
+                
+                if let Err(e) = shared::network::send_udp_broadcast(&cancel_socket, port, &cancel_packet).await {
+                    tracing::warn!("UDP cancel broadcast failed: {}", e);
+                } else {
+                    tracing::debug!("UDP cancel broadcast sent");
+                }
+                
+                if shared::network::is_ipv6_available() {
+                    let _ = shared::network::send_udp_multicast_all_interfaces(
+                        shared::network::IPV6_MULTICAST_ADDR,
+                        port,
+                        &cancel_packet
+                    ).await;
+                }
+                
+                // Disconnect BLE clients explicitly
                 if let Some(ble_shared) = &ble_transport_shared {
-                    let _ = ble_shared.lock().await.send_cancel(&cancel_packet).await;
+                    tracing::debug!("Disconnecting BLE clients");
                     let _ = ble_shared.lock().await.finalize().await;
                 }
-                let _ = udp_transport_shared.lock().await.send_cancel(&cancel_packet).await;
+                
+                // Give network stack time to transmit packets
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                
+                // Now abort the tasks
                 ble_abort.abort();
                 udp_abort.abort();
+                
                 Err(AuthHandlerError::Denied)
             }
         }

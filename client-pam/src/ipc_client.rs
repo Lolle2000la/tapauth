@@ -82,14 +82,15 @@ impl IpcClient {
 
     fn send_message<M: Message>(&mut self, msg: &M) -> Result<(), IpcError> {
         let mut buf = BytesMut::with_capacity(256);
-        buf.put_u32(0); // Placeholder for length
-        let start_len = buf.len();
         
-        msg.encode(&mut buf)?;
+        // Encode message to get length first
+        let msg_bytes = msg.encode_to_vec();
+        let msg_len = msg_bytes.len() as u32;
         
-        let msg_len = (buf.len() - start_len) as u32;
-        // Overwrite length prefix
-        (&mut buf[..4]).put_u32(msg_len);
+        // Write length prefix (u32 BE)
+        buf.put_u32(msg_len);
+        // Write message
+        buf.extend_from_slice(&msg_bytes);
         
         self.stream.write_all(&buf)?;
         Ok(())

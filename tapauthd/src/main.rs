@@ -213,6 +213,7 @@ async fn handle_conn(
                     ipc::PamAuthenticateResponse {
                         outcome: ipc::PamOutcome::Error as i32,
                         detail: format!("Internal error: {}", e),
+                        challenge: Vec::new(), // Error case, no challenge
                     }
                 }
             }
@@ -229,11 +230,13 @@ async fn handle_conn(
                     ipc::PamAuthenticateResponse {
                         outcome: ipc::PamOutcome::Ignore as i32,
                         detail: "Cancel forwarded".to_string(),
+                        challenge: Vec::new(), // Cancel doesn't need challenge
                     }
                 } else {
                     ipc::PamAuthenticateResponse {
                         outcome: ipc::PamOutcome::Ignore as i32,
                         detail: "No matching request to cancel".to_string(),
+                        challenge: Vec::new(),
                     }
                 }
             } else {
@@ -241,6 +244,7 @@ async fn handle_conn(
                 ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Error as i32,
                     detail: "Unknown IPC message".to_string(),
+                    challenge: Vec::new(),
                 }
             }
         }

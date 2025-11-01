@@ -4,9 +4,20 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import androidx.core.app.NotificationManagerCompat
 import dev.rourunisen.tapauth.service.AuthenticationService
 
 class TapAuthApplication : Application() {
+
+    companion object {
+        const val CHANNEL_ID = "tapauth_service_channel"
+        const val AUTH_CHANNEL_ID = "tapauth_auth_channel"
+
+        // Bump this when notification ID/tag scheme changes to force a one-time cleanup
+        private const val NOTIFICATION_SCHEME_VERSION = 2
+        private const val PREFS_NAME = "tapauth_prefs"
+        private const val KEY_NOTIF_SCHEME_VER = "notification_scheme_version"
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -38,6 +49,23 @@ class TapAuthApplication : Application() {
             notificationManager.createNotificationChannel(authChannel)
         }
 
+        // One-time migration: clear any legacy notifications that used a different ID scheme
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            val current = prefs.getInt(KEY_NOTIF_SCHEME_VER, 0)
+            if (current < NOTIFICATION_SCHEME_VERSION) {
+                // This runs once after upgrade; safe to clear to avoid undismissable legacy items
+                NotificationManagerCompat.from(this).cancelAll()
+                android.util.Log.i(
+                    "TapAuthApplication",
+                    "Cleared legacy notifications (scheme $current -> $NOTIFICATION_SCHEME_VERSION)",
+                )
+                prefs.edit().putInt(KEY_NOTIF_SCHEME_VER, NOTIFICATION_SCHEME_VERSION).apply()
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("TapAuthApplication", "Failed to run notification migration: ${e.message}")
+        }
+
         // Start core background services so UDP listener and BLE GATT are active
         // even when the app UI is not open. Services are idempotent and safe to
         // call repeatedly.
@@ -63,8 +91,4 @@ class TapAuthApplication : Application() {
         }
     }
 
-    companion object {
-        const val CHANNEL_ID = "tapauth_service_channel"
-        const val AUTH_CHANNEL_ID = "tapauth_auth_channel"
-    }
 }

@@ -18,6 +18,7 @@ import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import dev.rourunisen.tapauth.biometric.BiometricHelper
 import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
@@ -346,7 +347,12 @@ class BleGattService : Service() {
             android.content.IntentFilter(
                 dev.rourunisen.tapauth.service.AuthenticationService.ACTION_CANCEL_BLE_CONNECTION
             )
-        registerReceiver(cancelReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            cancelReceiver,
+            filter,
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         Log.d(TAG, "Registered cancel broadcast receiver")
 
         bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
@@ -711,7 +717,7 @@ class BleGattService : Service() {
                     return
                 }
 
-            Log.d(TAG, "BLE AuthenticationCancel received for challenge: ${cancel.challenge}")
+            Log.d(TAG, "BLE AuthenticationCancel received")
 
             // Decode Base64 challenge to ByteArray
             val challengeBytes =
@@ -735,10 +741,7 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.service.TransportLockManager.getInstance()
             transportLockManager.releaseLock(challengeBytes)
 
-            Log.d(
-                TAG,
-                "BLE: Cancelled auth request and dismissing notification for challenge: $challengeKey",
-            )
+            Log.d(TAG, "BLE: Cancelled auth request and dismissed notification")
 
             // Disconnect the BLE connection
             if (
@@ -1247,4 +1250,9 @@ class BleGattService : Service() {
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
+        val take = kotlin.math.min(this.size, maxBytes)
+        return this.take(take).joinToString("") { "%02x".format(it) } + if (this.size > take) "…" else ""
+    }
 }
