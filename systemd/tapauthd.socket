@@ -1,0 +1,15 @@
+# TapAuth daemon socket activation
+[Unit]
+Description=TapAuth daemon IPC socket
+PartOf=tapauthd.service
+
+[Socket]
+ListenStream=/run/tapauthd/tapauthd.sock
+SocketUser=root
+SocketGroup=tapauthd-clients
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

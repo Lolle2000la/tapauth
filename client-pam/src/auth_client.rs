@@ -166,26 +166,40 @@ impl AuthenticationClient {
         let config_manager = self.config_manager.clone();
         let keypair = Arc::new(self.keypair.clone());
         let challenge = self.challenge;
-        let ble_transport =
-            BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await?;
+        // Try to initialize BLE; if it fails, fall back to UDP-only
+        let ble_attempt =
+            BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await;
 
-        // Store transports in Arc<Mutex> for reuse
-        let ble_transport_shared = Arc::new(Mutex::new(ble_transport));
         let udp_transport_shared = Arc::new(Mutex::new(udp_transport));
+        let ble_transport_shared: Option<Arc<Mutex<BleTransport>>> = match ble_attempt {
+            Ok(ble) => Some(Arc::new(Mutex::new(ble))),
+            Err(e) => {
+                tracing::warn!("BLE initialization failed ({}). Falling back to UDP-only.", e);
+                None
+            }
+        };
 
         // Save references for later use (e.g., cancellation)
-        *self.ble_transport.lock().await = Some(ble_transport_shared.clone());
         *self.udp_transport.lock().await = Some(udp_transport_shared.clone());
+        if let Some(ref ble_shared) = ble_transport_shared {
+            *self.ble_transport.lock().await = Some(ble_shared.clone());
+        }
 
-        // Spawn BLE task
-        let self_ble = self.clone();
-        let packet_ble = packet.clone();
-        let ble_transport_task = ble_transport_shared.clone();
-        let mut ble_handle = tokio::spawn(async move {
-            self_ble
-                .authenticate_with_transport(ble_transport_task, &packet_ble)
-                .await
-        });
+        // Optionally spawn BLE task
+        let mut ble_handle = {
+            if let Some(ble_transport_task) = ble_transport_shared.clone() {
+                let self_ble = self.clone();
+                let packet_ble = packet.clone();
+                tokio::spawn(async move {
+                    self_ble
+                        .authenticate_with_transport(ble_transport_task, &packet_ble)
+                        .await
+                })
+            } else {
+                // Spawn a completed task placeholder that will immediately error
+                tokio::spawn(async { Err(AuthError::BleError("BLE disabled".into())) })
+            }
+        };
 
         // Spawn UDP task
         let self_udp = self.clone();

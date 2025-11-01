@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "ble")]
 use std::sync::Arc;
 
-use crate::AuthError;
+use crate::auth_handler::AuthHandlerError as AuthError;
 
 /// Result of attempting to receive an authentication response
 #[derive(Debug)]
@@ -73,6 +73,14 @@ pub trait Transport {
 
     /// Get a human-readable name for this transport (for logging)
     fn name(&self) -> &'static str;
+
+    /// Finalize and tear down any transport-specific state
+    ///
+    /// Default is a no-op. Transports with long-lived connections (e.g., BLE)
+    /// should override this to explicitly disconnect and release resources.
+    async fn finalize(&mut self) -> Result<(), AuthError> {
+        Ok(())
+    }
 }
 
 /// UDP transport using broadcast (IPv4) and multicast (IPv6)
@@ -227,16 +235,39 @@ impl BleTransport {
             .adapter(adapter_name)
             .map_err(|e| AuthError::BleError(format!("Failed to get adapter: {}", e)))?;
 
-        // Do not attempt to power the adapter; just warn and let callers fall back to UDP
-        if !adapter.is_powered().await.unwrap_or(false) {
-            tracing::warn!(
-                "Bluetooth adapter is not powered; skipping BLE transport initialization"
-            );
-            return Err(AuthError::BleError(
-                "Bluetooth adapter not powered".to_string(),
-            ));
+        // Ensure adapter is powered on; attempt to power it if not.
+        match adapter.is_powered().await {
+            Ok(true) => tracing::trace!("Adapter already powered"),
+            Ok(false) => {
+                tracing::info!("Bluetooth adapter is off; attempting to power it on");
+                if let Err(e) = adapter.set_powered(true).await {
+                    tracing::warn!(
+                        "Failed to power on Bluetooth adapter ({}); falling back to UDP",
+                        e
+                    );
+                    return Err(AuthError::BleError(
+                        "Bluetooth adapter not powered".to_string(),
+                    ));
+                } else {
+                    tracing::info!("Bluetooth adapter powered on successfully");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to query adapter power state ({}); attempting to power on",
+                    e
+                );
+                if let Err(e2) = adapter.set_powered(true).await {
+                    tracing::warn!(
+                        "Failed to power on Bluetooth adapter after query error ({}); falling back to UDP",
+                        e2
+                    );
+                    return Err(AuthError::BleError(
+                        "Bluetooth adapter not powered".to_string(),
+                    ));
+                }
+            }
         }
-        tracing::trace!("Adapter already powered");
         Ok(Self {
             adapter,
             temporal_id,
@@ -622,60 +653,16 @@ impl Transport for BleTransport {
         tracing::debug!(
             "BLE transport: send_cancel called, disconnecting clients and stopping services."
         );
-
-        // **Step 1 - Disconnect all connected BLE devices**
-        let mut disconnected_count = 0;
-        let devices_to_disconnect = self.connected_devices.lock().await;
-
-        // Clone adapter to use inside the loop
-        let adapter = self.adapter.clone();
-
-        for (addr, _device_in_map) in devices_to_disconnect.iter() {
-            tracing::debug!("Attempting to explicitly disconnect device {}", addr);
-
-            // Re-fetch the device object to ensure we have a fresh handle
-            match adapter.device(*addr) {
-                Ok(device) => {
-                    if let Err(e) = device.disconnect().await {
-                        tracing::warn!("Failed to explicitly disconnect device {}: {}", addr, e);
-                    } else {
-                        tracing::info!("Successfully disconnected device {}", addr);
-                        disconnected_count += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to re-fetch device {} for disconnect: {}", addr, e);
-                }
-            }
-        }
-
-        if disconnected_count > 0 {
-            tracing::debug!("Disconnected {} BLE device(s).", disconnected_count);
-        } else if !devices_to_disconnect.is_empty() {
-            tracing::warn!("Failed to disconnect any connected BLE devices.");
-        } else {
-            tracing::trace!("No connected BLE devices to disconnect.");
-        }
-
-        // **Step 2 - Stop advertising to prevent new connections**
-        if self.adv_handle.take().is_some() {
-            tracing::trace!("BLE advertising stopped.");
-        } else {
-            tracing::trace!("BLE advertising was not active or already stopped.");
-        }
-
-        // **Step 3 - Unregister GATT server to remove services**
-        if self.gatt_handle.take().is_some() {
-            tracing::trace!("BLE GATT server unregistered.");
-        } else {
-            tracing::trace!("BLE GATT server was not active or already stopped.");
-        }
-
-        Ok(())
+        self.shutdown_impl().await
     }
 
     fn name(&self) -> &'static str {
         "BLE"
+    }
+
+    async fn finalize(&mut self) -> Result<(), AuthError> {
+        tracing::debug!("BLE transport: finalize called");
+        self.shutdown_impl().await
     }
 }
 
@@ -718,6 +705,57 @@ impl BleTransport {
             .map_err(|e| AuthError::BleError(format!("Failed to encode confirmation: {}", e)))?;
 
         Ok(bytes)
+    }
+
+    /// Internal shutdown routine shared by send_cancel and finalize
+    async fn shutdown_impl(&mut self) -> Result<(), AuthError> {
+        // Step 1 - Disconnect all connected BLE devices
+        let mut disconnected_count = 0;
+        let devices_to_disconnect = self.connected_devices.lock().await;
+
+        let adapter = self.adapter.clone();
+
+        for (addr, _device_in_map) in devices_to_disconnect.iter() {
+            tracing::debug!("Attempting to explicitly disconnect device {}", addr);
+
+            match adapter.device(*addr) {
+                Ok(device) => {
+                    if let Err(e) = device.disconnect().await {
+                        tracing::warn!("Failed to explicitly disconnect device {}: {}", addr, e);
+                    } else {
+                        tracing::info!("Successfully disconnected device {}", addr);
+                        disconnected_count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to re-fetch device {} for disconnect: {}", addr, e);
+                }
+            }
+        }
+
+        if disconnected_count > 0 {
+            tracing::debug!("Disconnected {} BLE device(s).", disconnected_count);
+        } else if !devices_to_disconnect.is_empty() {
+            tracing::warn!("Failed to disconnect any connected BLE devices.");
+        } else {
+            tracing::trace!("No connected BLE devices to disconnect.");
+        }
+
+        // Step 2 - Stop advertising to prevent new connections
+        if self.adv_handle.take().is_some() {
+            tracing::trace!("BLE advertising stopped.");
+        } else {
+            tracing::trace!("BLE advertising was not active or already stopped.");
+        }
+
+        // Step 3 - Unregister GATT server to remove services
+        if self.gatt_handle.take().is_some() {
+            tracing::trace!("BLE GATT server unregistered.");
+        } else {
+            tracing::trace!("BLE GATT server was not active or already stopped.");
+        }
+
+        Ok(())
     }
 }
 

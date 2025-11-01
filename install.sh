@@ -32,6 +32,10 @@ CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
 CONFIG_DIR="/etc/tapauth"
 KEY_PATH="$CONFIG_DIR/client_key"
+SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
+SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
+SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
+SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
 
 # Print functions
 print_info() {
@@ -398,6 +402,67 @@ check_prerequisites() {
     print_success "All prerequisites met"
 }
 
+# Create system users and groups for tapauthd and IPC clients
+create_system_users() {
+    print_header "Creating System Users/Groups"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would create system user 'tapauthd' and group 'tapauthd-clients'"
+        echo "  • useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd"
+        echo "  • groupadd --system tapauthd-clients"
+        echo "  • gpasswd -d tapauthd tapauthd-clients (ensure daemon not in client group)"
+        echo "  • mkdir -p $CONFIG_DIR && chown -R tapauthd:tapauthd $CONFIG_DIR && chmod 700 $CONFIG_DIR"
+        return
+    fi
+
+    if ! id -u tapauthd >/dev/null 2>&1; then
+        print_info "Creating system user 'tapauthd'"
+        useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd || true
+    else
+        print_info "System user 'tapauthd' already exists"
+    fi
+
+    if ! getent group tapauthd-clients >/dev/null 2>&1; then
+        print_info "Creating group 'tapauthd-clients'"
+        groupadd --system tapauthd-clients || true
+    else
+        print_info "Group 'tapauthd-clients' already exists"
+    fi
+
+    # Ensure daemon user is not in the client group by policy
+    gpasswd -d tapauthd tapauthd-clients >/dev/null 2>&1 || true
+
+    # Ensure configuration directory ownership and permissions
+    mkdir -p "$CONFIG_DIR"
+    chown -R tapauthd:tapauthd "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+}
+
+# Install and enable systemd socket/service units for tapauthd
+install_systemd_units() {
+    print_header "Installing systemd Units"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would install tapauthd.socket and tapauthd.service"
+        show_service_diff "$SOCKET_UNIT_DEST" "$SOCKET_UNIT_SOURCE"
+        show_service_diff "$SERVICE_UNIT_DEST" "$SERVICE_UNIT_SOURCE"
+        show_command "systemctl daemon-reload" "Reload systemd units"
+        show_command "systemctl enable --now tapauthd.socket" "Enable socket activation"
+        return
+    fi
+
+    if [[ ! -f "$SOCKET_UNIT_SOURCE" || ! -f "$SERVICE_UNIT_SOURCE" ]]; then
+        print_warning "Systemd unit files not found in repo; skipping unit installation"
+        return
+    fi
+
+    install -m 644 "$SOCKET_UNIT_SOURCE" "$SOCKET_UNIT_DEST"
+    install -m 644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_DEST"
+    systemctl daemon-reload
+    systemctl enable --now tapauthd.socket
+    print_success "Systemd units installed and socket activated"
+}
+
 # Build components
 build_components() {
     print_header "Building TapAuth Components"
@@ -730,6 +795,7 @@ create_summary() {
         echo "  - Config GUI: $CONFIG_GUI_PATH"
     fi
     echo "  - Configuration: $CONFIG_DIR"
+    echo "  - Daemon socket: /run/tapauthd/tapauthd.sock (root:tapauthd-clients, 0660)"
     echo ""
     echo "Distribution: $DISTRO_NAME"
     
@@ -794,9 +860,11 @@ main() {
         exit 0
     fi
     
+    create_system_users
     install_pam
     configure_pam
     install_config_gui
+    install_systemd_units
     
     if [[ "$DRY_RUN" == true ]]; then
         echo ""

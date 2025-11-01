@@ -631,6 +631,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "local-ip-address",
+ "nix 0.30.1",
  "qrcode 0.14.1",
  "shared",
  "sudo",
@@ -646,6 +647,7 @@ name = "client-pam"
 version = "0.1.0"
 dependencies = [
  "bluer",
+ "bytes",
  "getrandom 0.3.4",
  "hex",
  "once_cell",
@@ -4233,6 +4235,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "tapauthd"
+version = "0.1.0"
+dependencies = [
+ "bluer",
+ "bytes",
+ "getrandom 0.3.4",
+ "hex",
+ "nix 0.30.1",
+ "prost",
+ "shared",
+ "socket2",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

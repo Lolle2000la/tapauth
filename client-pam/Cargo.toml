@@ -14,6 +14,7 @@ bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 
 # Protocol buffers
 prost.workspace = true
+bytes.workspace = true
 
 # TPM support
 tss-esapi = { version = "8.0.0-alpha.1", optional = true }

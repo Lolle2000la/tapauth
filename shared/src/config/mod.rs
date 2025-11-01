@@ -1,16 +1,16 @@
 //! Configuration management for TapAuth client and server.
 //!
 //! Provides secure file I/O for configuration, paired client/server data,
-//! and cryptographic keys. All operations require root privileges and enforce
-//! strict file permissions (700 for directories, 600 for files) to protect
-//! sensitive cryptographic material.
+//! and cryptographic keys. Operations enforce strict file permissions (700 for
+//! directories, 600 for files) to protect sensitive cryptographic material.
 //!
 //! ## Security
 //!
-//! - Configuration files are stored in `/etc/tapauth` with root-only access
-//! - All file operations verify root privileges before proceeding
-//! - File permissions are enforced on every write operation
-//! - Reading files validates permissions to detect tampering
+//! - Configuration files are stored in `/etc/tapauth`
+//! - Ownership is expected to be `tapauthd:tapauthd`; files must be mode 0600 (or 0400)
+//! - Root may read for diagnostics and legacy compatibility, but writes are restricted
+//!   to the `tapauthd` user
+//! - File permissions are enforced on every write operation and validated on reads
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,6 +19,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
+use nix::unistd::{geteuid, User};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -28,8 +29,6 @@ pub enum ConfigError {
     Serialization(#[from] serde_json::Error),
     #[error("Insufficient permissions")]
     InsufficientPermissions,
-    #[error("Not running as root")]
-    NotRoot,
     #[error("Invalid configuration")]
     InvalidConfig,
     #[error("Crypto error: {0}")]
@@ -67,10 +66,26 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().as_raw() == 0
 }
 
-/// Ensure directory exists with root-only permissions (700)
+/// Resolve the system user "tapauthd" to its UID (cached best-effort).
+fn tapauthd_uid() -> Option<u32> {
+    // If NSS lookup fails or user does not exist yet (during install), we return None
+    // and default to accepting only root-owned files. Callers must handle None.
+    User::from_name("tapauthd").ok().flatten().map(|u| u.uid.as_raw())
+}
+
+/// Whether the effective UID is the tapauthd user.
+fn is_euid_tapauthd() -> bool {
+    match tapauthd_uid() {
+        Some(uid) => geteuid().as_raw() == uid,
+        None => false,
+    }
+}
+
+/// Ensure configuration directory exists with strict permissions (700)
 pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
-    if !is_root() {
-        return Err(ConfigError::NotRoot);
+    // Only the tapauthd service user is allowed to create/modify the directory
+    if !is_euid_tapauthd() {
+        return Err(ConfigError::InsufficientPermissions);
     }
 
     if !path.exists() {
@@ -86,10 +101,11 @@ pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Write data to a file with root-only permissions (600)
+/// Write data to a file with strict owner-only permissions (600)
 pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
-    if !is_root() {
-        return Err(ConfigError::NotRoot);
+    // Only the tapauthd service user is allowed to write configuration or key material
+    if !is_euid_tapauthd() {
+        return Err(ConfigError::InsufficientPermissions);
     }
 
     fs::write(path, data)?;
@@ -105,22 +121,22 @@ pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
 
 /// Read data from a secure file
 pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
-    if !is_root() {
-        return Err(ConfigError::NotRoot);
-    }
-
     // Verify file permissions
     let metadata = fs::metadata(path)?;
     let permissions = metadata.permissions();
 
-    // Check ownership
-    if metadata.uid() != 0 {
+    // Check ownership: accept either root:root or tapauthd:tapauthd
+    let owner_uid = metadata.uid();
+    let tap_uid = tapauthd_uid();
+    let owner_ok = owner_uid == 0 || tap_uid.map(|u| owner_uid == u).unwrap_or(false);
+    if !owner_ok {
         return Err(ConfigError::InsufficientPermissions);
     }
 
     // Check group/other permissions
     let mode = permissions.mode() & 0o777;
 
+    // For simplicity and safety, enforce 0600 or 0400 for all files (keys and config)
     if mode != 0o600 && mode != 0o400 {
         return Err(ConfigError::InsufficientPermissions);
     }

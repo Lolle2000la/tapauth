@@ -12,9 +12,17 @@ fn main() -> iced::Result {
         utils::elevation::attempt_privilege_elevation(&original_user);
     }
 
-    // At this point, we're running as root
+    // At this point, we should be running as root (via pkexec/sudo)
     // Store the original username in environment for app to use
     std::env::set_var("TAPAUTH_ORIGINAL_USER", &original_user);
+
+    // Drop privileges to the tapauthd service user for safe config access/ownership
+    if let Err(()) = utils::elevation::drop_privileges_to_user("tapauthd") {
+        eprintln!(
+            "ERROR: Failed to switch to 'tapauthd' user. Ensure the user exists and try reinstalling."
+        );
+        std::process::exit(1);
+    }
 
     // Initialize logging
     tracing_subscriber::fmt()
@@ -32,7 +40,7 @@ fn main() -> iced::Result {
         .init();
 
     tracing::info!("Starting TapAuth Configuration GUI");
-    tracing::info!("Running as root for user: {}", original_user);
+    tracing::info!("Running as tapauthd for user: {}", original_user);
 
     // Run the application
     iced::application(
