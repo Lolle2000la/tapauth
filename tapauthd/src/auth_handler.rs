@@ -233,8 +233,8 @@ impl AuthSession {
         };
         
         // Create dedicated socket for cancel broadcasting (avoids mutex contention with receive socket)
-        let config = self.state.config_manager.load_config()?;
-        let cancel_socket = shared::network::create_broadcast_socket(config.udp_port).await?;
+        // Use port 0 to get ephemeral port - we only send, not receive on this socket
+        let cancel_socket = shared::network::create_broadcast_socket(0).await?;
         
         // Spawn BLE task if available
         let mut ble_handle = if let Some(ble_transport_task) = ble_transport_shared.clone() {
