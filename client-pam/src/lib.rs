@@ -21,15 +21,11 @@
 //!
 //! Must run as root to access `/etc/tapauth` configuration files.
 
-mod auth_client;
 mod ipc_client;
 mod pam_logic;
 mod pam_sys;
-mod transport;
 
-pub use auth_client::*;
 pub use ipc_client::*;
-pub use transport::*;
 
 use std::os::raw::c_int;
 

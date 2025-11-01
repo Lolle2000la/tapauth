@@ -20,20 +20,16 @@
 
 use crate::ipc_client::IpcClient;
 use crate::pam_sys;
-use once_cell::sync::Lazy;
 use std::os::raw::c_int;
-use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
+use std::os::unix::io::AsRawFd;
+use std::os::fd::BorrowedFd;
+use std::time::{Duration, Instant};
+use std::{io::Read};
+use nix::poll::{poll, PollFd, PollFlags};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
-/// Shared Tokio runtime for all PAM authentication attempts.
-///
-/// Creating a runtime is expensive (~100ms), so we reuse a single instance.
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime for PAM module")
-});
+// No async runtime: PAM modules should avoid multithreading. We use a single-threaded
+// polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
 
 /// Initialize logging for the PAM module.
 fn init_logging() {
@@ -95,125 +91,140 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         pam_conv.try_info("TapAuth: Waiting for phone tap...");
     }
 
-    let (skip_tx, skip_rx) = oneshot::channel();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-
     // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
     let mut rid_bytes = [0u8; 16];
     getrandom::fill(&mut rid_bytes).ok();
     let request_id = hex::encode(rid_bytes);
-
-    let skip_thread_handle = if has_terminal {
-        Some(spawn_skip_reader(skip_tx, stop_rx))
-    } else {
-        tracing::info!("Running in GUI context (no /dev/tty), skip feature disabled");
-        None
+    // Session timeout used for both daemon and local bound
+    let timeout_secs = {
+        let dur = shared::network::get_session_timeout();
+        let secs = dur.as_secs();
+        if secs > u64::from(u32::MAX) { u32::MAX } else { secs as u32 }
     };
 
-    // Build an auth future that talks to tapauthd via IPC (thin client)
-    let ipc_username = username.to_string();
-    let req_id_for_auth = request_id.clone();
-    let ipc_auth_future = async move {
-        let timeout_secs = {
-            let dur = shared::network::get_session_timeout();
-            let secs = dur.as_secs();
-            if secs > u64::from(u32::MAX) { u32::MAX } else { secs as u32 }
-        };
-        let tty_flag = has_terminal;
-        // Use spawn_blocking to avoid blocking the async runtime with UnixStream I/O
-        match tokio::task::spawn_blocking(move || {
-            let mut ipc = IpcClient::connect()?;
-            ipc.send_authenticate(&ipc_username, tty_flag, timeout_secs, &req_id_for_auth)
-        }).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(e),
-            Err(join_err) => Err(crate::ipc_client::IpcError::Io(std::io::Error::other(format!(
-                "IPC auth task failed: {}", join_err
-            )))),
+    // Establish nonblocking IPC connection and send authenticate request
+    let mut ipc = match IpcClient::connect_nonblocking() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to connect to tapauthd: {}", e);
+            return pam_sys::PAM_IGNORE;
         }
     };
+    if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id) {
+        tracing::error!("Failed to send authenticate request: {}", e);
+        return pam_sys::PAM_IGNORE;
+    }
 
-    let result = if has_terminal {
-        let skip_future = async {
-            skip_rx.await.ok();
-        };
+    // GUI (no TTY): poll only the socket until response or timeout
+    if !has_terminal {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+        loop {
+            let now = Instant::now();
+            if now >= deadline { break; }
+            let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+            let mut fds = [PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN)];
+            match poll(&mut fds, remain_ms_u16) {
+                Ok(0) => continue,
+                Ok(_) => {
+                    if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
+                        match ipc.try_read_response_nonblocking() {
+                            Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
+                            Ok(None) => continue,
+                            Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
+                        }
+                    }}
+                }
+                Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
+            }
+        }
+        pam_conv.try_info("TapAuth: Timed out, trying password...");
+        return pam_sys::PAM_IGNORE;
+    }
 
-        RUNTIME.block_on(async {
-            tokio::select! {
-                auth_resp = ipc_auth_future => {
-                    match auth_resp {
-                        Ok(resp) => {
-                            // Map daemon outcome to PAM code
-                            match resp.outcome() {
-                                shared::ipc::pb::PamOutcome::Success => {
-                                    tracing::info!("Authentication successful for user: {}", username);
-                                    Some(pam_sys::PAM_SUCCESS)
-                                }
-                                other => {
-                                    tracing::warn!("Daemon returned outcome {:?}: {}", other, resp.detail);
-                                    None
-                                }
+    // Terminal: poll socket and /dev/tty; skip only on Enter
+    let mut tty = match std::fs::File::open("/dev/tty") {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("Could not open /dev/tty: {}, falling back to socket-only", e);
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+            loop {
+                let now = Instant::now(); if now >= deadline { break; }
+                let mut fds = [PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN)];
+                let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+                match poll(&mut fds, remain_ms_u16) {
+                    Ok(0) => continue,
+                    Ok(_) => {
+                        if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
+                            match ipc.try_read_response_nonblocking() {
+                                Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
+                                Ok(None) => continue,
+                                Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!("IPC authentication failed: {}", e);
-                            None
-                        }
+                        }}
                     }
-                }
-                _ = skip_future => {
-                    tracing::info!("User skipped TapAuth via Enter key");
-                    
-                    // Send IPC cancel to daemon (daemon will broadcast cancel over UDP/BLE)
-                    if let Ok(mut ipc) = IpcClient::connect() {
-                        tracing::debug!("Sending IPC cancel to tapauthd with request_id");
-                        let _ = ipc.send_cancel("tty-skip", &request_id);
-                    } else {
-                        tracing::debug!("Could not connect to tapauthd for IPC cancel (daemon may not be running)");
-                    }
-                    None
+                    Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
                 }
             }
-        })
-    } else {
-        RUNTIME.block_on(async {
-            match ipc_auth_future.await {
-                Ok(resp) => {
-                    match resp.outcome() {
-                        shared::ipc::pb::PamOutcome::Success => {
-                            tracing::info!("Authentication successful for user: {}", username);
-                            Some(pam_sys::PAM_SUCCESS)
-                        }
-                        other => {
-                            tracing::warn!("Daemon returned outcome {:?}: {}", other, resp.detail);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("IPC authentication failed: {}", e);
-                    None
-                }
-            }
-        })
+            pam_conv.try_info("TapAuth: Timed out, trying password...");
+            return pam_sys::PAM_IGNORE;
+        }
     };
 
-    let _ = stop_tx.send(());
-
-    if result.is_none() {
-        if let Some(handle) = skip_thread_handle {
-            let _ = handle.join();
+    // Set tty nonblocking to avoid read(1) blocking unexpectedly
+    {
+        let fd = tty.as_raw_fd();
+        if let Ok(cur) = fcntl(fd, FcntlArg::F_GETFL) {
+            let mut flags = OFlag::from_bits_truncate(cur);
+            flags.insert(OFlag::O_NONBLOCK);
+            let _ = fcntl(fd, FcntlArg::F_SETFL(flags));
         }
-    } else if skip_thread_handle.is_some() {
-        tracing::debug!("Authentication succeeded, not waiting for skip thread");
     }
 
-    if let Some(code) = result {
-        pam_conv.try_info("TapAuth: Authentication successful!");
-        return code;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+    let mut kb = [0u8; 4];
+    loop {
+        let now = Instant::now();
+        if now >= deadline { break; }
+        let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+        let mut fds = [
+            PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN),
+            PollFd::new(unsafe { BorrowedFd::borrow_raw(tty.as_raw_fd()) }, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, remain_ms_u16) {
+            Ok(0) => {}
+            Ok(_) => {
+                // IPC
+                if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
+                    match ipc.try_read_response_nonblocking() {
+                        Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
+                        Ok(None) => {}
+                        Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
+                    }
+                }}
+                // TTY - peek for Enter; don't consume other keys
+                if let Some(rev) = fds[1].revents() { if rev.contains(PollFlags::POLLIN) {
+                    // Peek at the byte without consuming unless it's Enter
+                    match tty.read(&mut kb[..1]) {
+                        Ok(1) => {
+                            let b = kb[0];
+                            if b == b'\n' || b == b'\r' {
+                                tracing::info!("User pressed Enter to skip");
+                                // Best-effort cancel uses a fresh blocking connection
+                                if let Ok(mut c) = IpcClient::connect() { let _ = c.send_cancel("tty-skip", &request_id); }
+                                pam_conv.try_info("TapAuth: Skipped, trying password...");
+                                return pam_sys::PAM_IGNORE;
+                            }
+                            // Non-Enter key: consume and ignore (could be user typing password early)
+                        }
+                        _ => {}
+                    }
+                }}
+            }
+            Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
+        }
     }
 
-    pam_conv.try_info("TapAuth: Skipped or timed out, trying password...");
+    pam_conv.try_info("TapAuth: Timed out, trying password...");
     pam_sys::PAM_IGNORE
 }
 
@@ -222,53 +233,34 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 /// Reads from the controlling terminal and signals via `skip_tx` when any key
 /// is pressed. Uses `/dev/tty` instead of stdin to work correctly in PAM contexts
 /// where stdin may not be connected to the terminal.
-fn spawn_skip_reader(
-    skip_tx: oneshot::Sender<()>,
-    stop_rx: std::sync::mpsc::Receiver<()>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        use std::fs::File;
-        use std::io::Read;
-
-        let mut tty = match File::open("/dev/tty") {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::debug!("Could not open /dev/tty: {}, skip unavailable", e);
-                return;
-            }
-        };
-
-        let mut buffer = [0u8; 1024];
-        loop {
-            match stop_rx.try_recv() {
-                Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    tracing::debug!("Skip reader thread received stop signal");
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-
-            match tty.read(&mut buffer) {
-                Ok(n) if n > 0 => {
-                    if stop_rx.try_recv().is_ok() {
-                        tracing::debug!("Skip reader thread received stop signal (after read)");
-                        break;
-                    }
-                    tracing::debug!("User pressed key to skip TapAuth");
-                    let _ = skip_tx.send(());
-                    break;
-                }
-                Ok(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => {
-                    tracing::debug!("Error reading from /dev/tty: {}", e);
-                    break;
-                }
-            }
+fn map_pam_outcome(
+    resp: &shared::ipc::pb::PamAuthenticateResponse,
+    username: &str,
+    pam_conv: &pam_sys::PamConversation,
+) -> c_int {
+    match resp.outcome() {
+        shared::ipc::pb::PamOutcome::Success => {
+            tracing::info!("Authentication successful for user: {}", username);
+            pam_conv.try_info("TapAuth: Authentication successful!");
+            pam_sys::PAM_SUCCESS
         }
-        tracing::debug!("Skip reader thread exiting");
-    })
+        shared::ipc::pb::PamOutcome::Denied => {
+            tracing::info!("Authentication denied for user: {}", username);
+            pam_sys::PAM_IGNORE
+        }
+        shared::ipc::pb::PamOutcome::Timeout => {
+            tracing::info!("Authentication timed out for user: {}", username);
+            pam_sys::PAM_IGNORE
+        }
+        shared::ipc::pb::PamOutcome::Ignore => {
+            tracing::info!("Daemon indicated IGNORE for user: {}", username);
+            pam_sys::PAM_IGNORE
+        }
+        shared::ipc::pb::PamOutcome::Error => {
+            tracing::error!("Daemon reported error for user {}: {}", username, resp.detail);
+            pam_sys::PAM_IGNORE
+        }
+    }
 }
 
 #[cfg(test)]
