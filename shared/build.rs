@@ -8,7 +8,7 @@ fn main() -> Result<()> {
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_protos(
             &["../proto/auth_protocol.proto", "../proto/ipc.proto"],
-            &["../proto/"]
+            &["../proto/"],
         )?;
 
     Ok(())

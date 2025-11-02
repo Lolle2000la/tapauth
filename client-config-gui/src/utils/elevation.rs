@@ -3,9 +3,9 @@
 //! Provides root privilege checking and elevation via `pkexec` or `sudo`,
 //! preserving environment variables needed for GUI display (Wayland/X11).
 
+use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use std::env;
 use std::process::Command;
-use nix::unistd::{setgid, setuid, Gid, Uid, User};
 
 /// Check if the current process is running as root.
 ///
@@ -203,11 +203,21 @@ pub fn drop_privileges_to_user(target_user: &str) -> Result<(), ()> {
 
     // Set group first, then user
     setgid(target_gid).map_err(|e| {
-        tracing::error!("Failed to setgid to {} (gid {}): {}", target_user, target_gid.as_raw(), e);
+        tracing::error!(
+            "Failed to setgid to {} (gid {}): {}",
+            target_user,
+            target_gid.as_raw(),
+            e
+        );
         ()
     })?;
     setuid(target_uid).map_err(|e| {
-        tracing::error!("Failed to setuid to {} (uid {}): {}", target_user, target_uid.as_raw(), e);
+        tracing::error!(
+            "Failed to setuid to {} (uid {}): {}",
+            target_user,
+            target_uid.as_raw(),
+            e
+        );
         ()
     })?;
 

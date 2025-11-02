@@ -3,6 +3,7 @@ package dev.rourunisen.tapauth.service
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -15,9 +16,8 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Mac
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
-import android.util.Base64
+import kotlinx.coroutines.launch
 
 /** Manages pending authentication requests and coordinates between services and UI */
 class AuthRequestManager private constructor() {
@@ -83,7 +83,10 @@ class AuthRequestManager private constructor() {
         // If this challenge was already cancelled (cancel may arrive before request), drop it
         if (isChallengeCancelled(challenge)) {
             val droppedId = UUID.randomUUID().toString()
-            Log.d(TAG, "Dropping submitRequest for already-cancelled challenge; no notification will be posted")
+            Log.d(
+                TAG,
+                "Dropping submitRequest for already-cancelled challenge; no notification will be posted",
+            )
             // Invoke callback as cancelled (not explicit denial)
             scope.launch { callback(false, null, false) }
             return droppedId
@@ -109,11 +112,12 @@ class AuthRequestManager private constructor() {
 
         // Index by challenge for fast cancellation
         runCatching {
-            val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-            challengeIndex.getOrPut(key) { mutableSetOf() }.add(requestId)
-        }.onFailure { e ->
-            Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
-        }
+                val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
+                challengeIndex.getOrPut(key) { mutableSetOf() }.add(requestId)
+            }
+            .onFailure { e ->
+                Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
+            }
 
         // If this is a BLE request, track it by device address
         if (bleDeviceAddress != null) {
@@ -223,7 +227,10 @@ class AuthRequestManager private constructor() {
                     .build()
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
-            Log.d(TAG, "Posting auth notification (id=$notificationId) for $deviceName @ $username@$hostname, challenge=${challengeHex.take(16)}...")
+            Log.d(
+                TAG,
+                "Posting auth notification (id=$notificationId) for $deviceName @ $username@$hostname, challenge=${challengeHex.take(16)}...",
+            )
 
             val nm = NotificationManagerCompat.from(context)
             try {
@@ -340,7 +347,10 @@ class AuthRequestManager private constructor() {
             // Cancel the notification and remove from registry
             try {
                 val notificationId = notificationIdFor(pending.authRequest.challenge)
-                Log.d(TAG, "Cancelling notification for timed-out request $requestId (id=$notificationId)")
+                Log.d(
+                    TAG,
+                    "Cancelling notification for timed-out request $requestId (id=$notificationId)",
+                )
                 NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
             } catch (_: Exception) {}
 
@@ -377,14 +387,18 @@ class AuthRequestManager private constructor() {
             Log.d(TAG, "Cancelling ${requestIds.size} request(s) by challenge index")
         }
 
-        val idsToCancel: List<String> = if (requestIds.isNotEmpty()) {
-            requestIds
-        } else {
-            // Fallback: scan map (in case index missed older entries)
-            pendingRequests.filter { (_, pending) ->
-                pending.authRequest.challenge.contentEquals(challenge)
-            }.keys.toList()
-        }
+        val idsToCancel: List<String> =
+            if (requestIds.isNotEmpty()) {
+                requestIds
+            } else {
+                // Fallback: scan map (in case index missed older entries)
+                pendingRequests
+                    .filter { (_, pending) ->
+                        pending.authRequest.challenge.contentEquals(challenge)
+                    }
+                    .keys
+                    .toList()
+            }
 
         idsToCancel.forEach { requestId ->
             val pending = pendingRequests.remove(requestId)
@@ -397,7 +411,10 @@ class AuthRequestManager private constructor() {
                 // Dismiss the notification
                 try {
                     val notificationId = notificationIdFor(pending.authRequest.challenge)
-                    Log.d(TAG, "Dismissing notification for cancelled request $requestId (id=$notificationId)")
+                    Log.d(
+                        TAG,
+                        "Dismissing notification for cancelled request $requestId (id=$notificationId)",
+                    )
                     NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
@@ -438,7 +455,10 @@ class AuthRequestManager private constructor() {
                 // Dismiss the notification
                 try {
                     val notificationId = notificationIdFor(pending.authRequest.challenge)
-                    Log.d(TAG, "Dismissing notification for BLE-disconnected request $requestId (id=$notificationId)")
+                    Log.d(
+                        TAG,
+                        "Dismissing notification for BLE-disconnected request $requestId (id=$notificationId)",
+                    )
                     NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
@@ -479,8 +499,8 @@ class AuthRequestManager private constructor() {
         }
 
         /**
-         * Compute a stable, deterministic notification ID from challenge bytes.
-         * Uses SHA-256 and maps the first 4 bytes to a non-negative Int.
+         * Compute a stable, deterministic notification ID from challenge bytes. Uses SHA-256 and
+         * maps the first 4 bytes to a non-negative Int.
          */
         fun notificationIdFor(challenge: ByteArray): Int {
             return try {
@@ -492,7 +512,10 @@ class AuthRequestManager private constructor() {
                 val b3 = (digest[3].toInt() and 0xFF)
                 val raw = (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3
                 val notificationId = raw and 0x7FFFFFFF // ensure non-negative
-                Log.d(TAG, "notificationIdFor: challenge=${challengeHex.take(16)}... → id=$notificationId")
+                Log.d(
+                    TAG,
+                    "notificationIdFor: challenge=${challengeHex.take(16)}... → id=$notificationId",
+                )
                 notificationId
             } catch (_: Exception) {
                 // Fallback: use Kotlin contentHashCode masked to positive
@@ -506,5 +529,6 @@ class AuthRequestManager private constructor() {
 
 private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
     val take = kotlin.math.min(this.size, maxBytes)
-    return this.take(take).joinToString("") { "%02x".format(it) } + if (this.size > take) "…" else ""
+    return this.take(take).joinToString("") { "%02x".format(it) } +
+        if (this.size > take) "…" else ""
 }

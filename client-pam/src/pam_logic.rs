@@ -20,13 +20,13 @@
 
 use crate::ipc_client::IpcClient;
 use crate::pam_sys;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags};
+use std::io::Read;
+use std::os::fd::BorrowedFd;
 use std::os::raw::c_int;
 use std::os::unix::io::AsRawFd;
-use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
-use std::{io::Read};
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 // No async runtime: PAM modules should avoid multithreading. We use a single-threaded
 // polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
@@ -99,7 +99,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let timeout_secs = {
         let dur = shared::network::get_session_timeout();
         let secs = dur.as_secs();
-        if secs > u64::from(u32::MAX) { u32::MAX } else { secs as u32 }
+        if secs > u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            secs as u32
+        }
     };
 
     // Establish nonblocking IPC connection and send authenticate request
@@ -110,7 +114,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             return pam_sys::PAM_IGNORE;
         }
     };
-    if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id) {
+    if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
+    {
         tracing::error!("Failed to send authenticate request: {}", e);
         return pam_sys::PAM_IGNORE;
     }
@@ -120,21 +125,37 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
         loop {
             let now = Instant::now();
-            if now >= deadline { break; }
+            if now >= deadline {
+                break;
+            }
             let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
-            let mut fds = [PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN)];
+            let mut fds = [PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+                PollFlags::POLLIN,
+            )];
             match poll(&mut fds, remain_ms_u16) {
                 Ok(0) => continue,
                 Ok(_) => {
-                    if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
-                        match ipc.try_read_response_nonblocking() {
-                            Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
-                            Ok(None) => continue,
-                            Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
+                    if let Some(rev) = fds[0].revents() {
+                        if rev.contains(PollFlags::POLLIN) {
+                            match ipc.try_read_response_nonblocking() {
+                                Ok(Some(resp)) => {
+                                    return map_pam_outcome(&resp, &username, &pam_conv)
+                                }
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    tracing::error!("IPC read failed: {}", e);
+                                    break;
+                                }
+                            }
                         }
-                    }}
+                    }
                 }
-                Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
+                Err(e) => {
+                    if e != nix::errno::Errno::EINTR {
+                        tracing::warn!("poll error: {}", e);
+                    }
+                }
             }
         }
         pam_conv.try_info("TapAuth: Timed out, trying password...");
@@ -145,24 +166,45 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut tty = match std::fs::File::open("/dev/tty") {
         Ok(f) => f,
         Err(e) => {
-            tracing::debug!("Could not open /dev/tty: {}, falling back to socket-only", e);
+            tracing::debug!(
+                "Could not open /dev/tty: {}, falling back to socket-only",
+                e
+            );
             let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
             loop {
-                let now = Instant::now(); if now >= deadline { break; }
-                let mut fds = [PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN)];
-                let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let mut fds = [PollFd::new(
+                    unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+                    PollFlags::POLLIN,
+                )];
+                let remain_ms_u16 =
+                    ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
                 match poll(&mut fds, remain_ms_u16) {
                     Ok(0) => continue,
                     Ok(_) => {
-                        if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
-                            match ipc.try_read_response_nonblocking() {
-                                Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
-                                Ok(None) => continue,
-                                Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
+                        if let Some(rev) = fds[0].revents() {
+                            if rev.contains(PollFlags::POLLIN) {
+                                match ipc.try_read_response_nonblocking() {
+                                    Ok(Some(resp)) => {
+                                        return map_pam_outcome(&resp, &username, &pam_conv)
+                                    }
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        tracing::error!("IPC read failed: {}", e);
+                                        break;
+                                    }
+                                }
                             }
-                        }}
+                        }
                     }
-                    Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
+                    Err(e) => {
+                        if e != nix::errno::Errno::EINTR {
+                            tracing::warn!("poll error: {}", e);
+                        }
+                    }
                 }
             }
             pam_conv.try_info("TapAuth: Timed out, trying password...");
@@ -184,43 +226,64 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut kb = [0u8; 4];
     loop {
         let now = Instant::now();
-        if now >= deadline { break; }
+        if now >= deadline {
+            break;
+        }
         let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
         let mut fds = [
-            PollFd::new(unsafe { BorrowedFd::borrow_raw(ipc.fd()) }, PollFlags::POLLIN),
-            PollFd::new(unsafe { BorrowedFd::borrow_raw(tty.as_raw_fd()) }, PollFlags::POLLIN),
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+                PollFlags::POLLIN,
+            ),
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(tty.as_raw_fd()) },
+                PollFlags::POLLIN,
+            ),
         ];
         match poll(&mut fds, remain_ms_u16) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
-                if let Some(rev) = fds[0].revents() { if rev.contains(PollFlags::POLLIN) {
-                    match ipc.try_read_response_nonblocking() {
-                        Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
-                        Ok(None) => {}
-                        Err(e) => { tracing::error!("IPC read failed: {}", e); break; }
-                    }
-                }}
-                // TTY - peek for Enter; don't consume other keys
-                if let Some(rev) = fds[1].revents() { if rev.contains(PollFlags::POLLIN) {
-                    // Peek at the byte without consuming unless it's Enter
-                    match tty.read(&mut kb[..1]) {
-                        Ok(1) => {
-                            let b = kb[0];
-                            if b == b'\n' || b == b'\r' {
-                                tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a fresh blocking connection
-                                if let Ok(mut c) = IpcClient::connect() { let _ = c.send_cancel("tty-skip", &request_id); }
-                                pam_conv.try_info("TapAuth: Skipped, trying password...");
-                                return pam_sys::PAM_IGNORE;
+                if let Some(rev) = fds[0].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        match ipc.try_read_response_nonblocking() {
+                            Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!("IPC read failed: {}", e);
+                                break;
                             }
-                            // Non-Enter key: consume and ignore (could be user typing password early)
                         }
-                        _ => {}
                     }
-                }}
+                }
+                // TTY - peek for Enter; don't consume other keys
+                if let Some(rev) = fds[1].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        // Peek at the byte without consuming unless it's Enter
+                        match tty.read(&mut kb[..1]) {
+                            Ok(1) => {
+                                let b = kb[0];
+                                if b == b'\n' || b == b'\r' {
+                                    tracing::info!("User pressed Enter to skip");
+                                    // Best-effort cancel uses a fresh blocking connection
+                                    if let Ok(mut c) = IpcClient::connect() {
+                                        let _ = c.send_cancel("tty-skip", &request_id);
+                                    }
+                                    pam_conv.try_info("TapAuth: Skipped, trying password...");
+                                    return pam_sys::PAM_IGNORE;
+                                }
+                                // Non-Enter key: consume and ignore (could be user typing password early)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
-            Err(e) => { if e != nix::errno::Errno::EINTR { tracing::warn!("poll error: {}", e); } }
+            Err(e) => {
+                if e != nix::errno::Errno::EINTR {
+                    tracing::warn!("poll error: {}", e);
+                }
+            }
         }
     }
 
@@ -258,7 +321,11 @@ fn map_pam_outcome(
             pam_sys::PAM_IGNORE
         }
         shared::ipc::pb::PamOutcome::Error => {
-            tracing::error!("Daemon reported error for user {}: {}", username, resp.detail);
+            tracing::error!(
+                "Daemon reported error for user {}: {}",
+                username,
+                resp.detail
+            );
             pam_sys::PAM_IGNORE
         }
     }

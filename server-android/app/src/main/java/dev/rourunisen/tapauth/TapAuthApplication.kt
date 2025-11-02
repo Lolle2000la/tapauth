@@ -63,7 +63,10 @@ class TapAuthApplication : Application() {
                 prefs.edit().putInt(KEY_NOTIF_SCHEME_VER, NOTIFICATION_SCHEME_VERSION).apply()
             }
         } catch (e: Exception) {
-            android.util.Log.w("TapAuthApplication", "Failed to run notification migration: ${e.message}")
+            android.util.Log.w(
+                "TapAuthApplication",
+                "Failed to run notification migration: ${e.message}",
+            )
         }
 
         // Start core background services so UDP listener and BLE GATT are active
@@ -90,5 +93,4 @@ class TapAuthApplication : Application() {
             )
         }
     }
-
 }

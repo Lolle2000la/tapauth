@@ -108,7 +108,7 @@ impl Transport for UdpTransport {
 
         // Send on both IPv4 and IPv6
         send_udp_broadcast(&self.socket, self.port, packet).await?;
-        
+
         if is_ipv6_available() {
             let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
         }

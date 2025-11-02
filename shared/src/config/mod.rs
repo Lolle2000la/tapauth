@@ -70,7 +70,10 @@ pub fn is_root() -> bool {
 fn tapauthd_uid() -> Option<u32> {
     // If NSS lookup fails or user does not exist yet (during install), we return None
     // and default to accepting only root-owned files. Callers must handle None.
-    User::from_name("tapauthd").ok().flatten().map(|u| u.uid.as_raw())
+    User::from_name("tapauthd")
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw())
 }
 
 /// Whether the effective UID is the tapauthd user.

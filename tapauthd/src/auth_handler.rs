@@ -5,12 +5,7 @@ use shared::{
     config::ClientConfigManager,
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
     network::get_session_timeout,
-    protocol::{
-        messages::*,
-        packet::*,
-        pb::EncryptedPacket,
-        ProtocolError,
-    },
+    protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,18 +54,18 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn new(udp_socket: tokio::net::UdpSocket) -> Result<Self, AuthHandlerError> {
         let config_manager = ClientConfigManager::new();
-        
+
         let keypair = config_manager
             .load_keypair()
-            .map_err(|e| AuthHandlerError::Config(e))?;
-        
+            .map_err(AuthHandlerError::Config)?;
+
         let csk = config_manager
             .load_csk()
-            .map_err(|e| AuthHandlerError::Config(e))?;
-        
+            .map_err(AuthHandlerError::Config)?;
+
         let config = config_manager.load_config()?;
         let hostname = config.hostname;
-        
+
         Ok(Self {
             config_manager,
             keypair,
@@ -81,6 +76,12 @@ impl DaemonState {
     }
 }
 
+#[cfg(feature = "ble")]
+type CancelRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
+
+#[cfg(not(feature = "ble"))]
+type CancelRegistry = Arc<HashMap<String, oneshot::Sender<()>>>;
+
 /// Per-request authentication session
 pub struct AuthSession {
     state: Arc<DaemonState>,
@@ -88,10 +89,7 @@ pub struct AuthSession {
     challenge: [u8; 32],
     #[allow(dead_code)] // Used in select! macro via cancel_rx local variable
     cancel_rx: Option<oneshot::Receiver<()>>,
-    #[cfg(feature = "ble")]
-    cancel_registry: Option<Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>>,
-    #[cfg(not(feature = "ble"))]
-    cancel_registry: Option<Arc<HashMap<String, oneshot::Sender<()>>>>,
+    cancel_registry: Option<CancelRegistry>,
     request_id: Option<String>,
 }
 
@@ -99,7 +97,7 @@ impl AuthSession {
     pub fn new(state: Arc<DaemonState>, username: String) -> Self {
         let mut challenge = [0u8; 32];
         getrandom::fill(&mut challenge).expect("Failed to generate challenge");
-        
+
         Self {
             state,
             username,
@@ -109,16 +107,14 @@ impl AuthSession {
             request_id: None,
         }
     }
-    
+
     /// Handle PamAuthenticateRequest - creates transports on-demand, runs auth flow
     pub async fn handle_authenticate(
         mut self,
         timeout_seconds: Option<u32>,
         request_id: Option<String>,
-        #[cfg(feature = "ble")]
-        cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-        #[cfg(not(feature = "ble"))]
-        cancel_registry: Arc<HashMap<String, oneshot::Sender<()>>>,
+        #[cfg(feature = "ble")] cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+        #[cfg(not(feature = "ble"))] cancel_registry: Arc<HashMap<String, oneshot::Sender<()>>>,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
@@ -132,13 +128,13 @@ impl AuthSession {
                 challenge: self.challenge.to_vec(),
             });
         }
-        
+
         // Filter servers that are allowed to authenticate this user
         let allowed_servers: Vec<_> = paired_servers
             .iter()
             .filter(|(_, server)| server.is_user_allowed(&self.username))
             .collect();
-        
+
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
             return Ok(ipc::PamAuthenticateResponse {
@@ -147,13 +143,13 @@ impl AuthSession {
                 challenge: self.challenge.to_vec(),
             });
         }
-        
+
         tracing::info!(
             "{} server(s) authorized for user {}",
             allowed_servers.len(),
             self.username
         );
-        
+
         // Create the authentication request
         let request = create_auth_request_with_challenge(
             &self.state.keypair,
@@ -163,16 +159,13 @@ impl AuthSession {
         )?;
         let wrapper = wrap_auth_request(request);
         let packet = create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?;
-        
+
         // Run authentication with timeout
         let timeout_duration = Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
-        
-        let auth_result = tokio::time::timeout(
-            timeout_duration,
-            self.try_parallel_authentication(&packet),
-        )
-        .await;
-        
+
+        let auth_result =
+            tokio::time::timeout(timeout_duration, self.try_parallel_authentication(&packet)).await;
+
         match auth_result {
             Ok(Ok(())) => Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Success as i32,
@@ -180,7 +173,10 @@ impl AuthSession {
                 challenge: self.challenge.to_vec(),
             }),
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                tracing::warn!("Authentication explicitly denied by user for: {}", self.username);
+                tracing::warn!(
+                    "Authentication explicitly denied by user for: {}",
+                    self.username
+                );
                 Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Denied as i32,
                     detail: "Authentication explicitly denied by user".to_string(),
@@ -205,40 +201,47 @@ impl AuthSession {
             }
         }
     }
-    
+
     #[cfg(feature = "ble")]
-    async fn try_parallel_authentication(&mut self, packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+    async fn try_parallel_authentication(
+        &mut self,
+        packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
         use tokio::select;
-        
+
         // Import transport implementations (we'll create them on-demand)
         use crate::transport::{BleTransport, UdpTransport};
-        
+
         let temporal_id = generate_current_temporal_identifier_ble(&self.state.csk)?;
         let timeout = get_session_timeout();
-        
+
         tracing::info!("Starting parallel discovery over UDP and BLE");
-        
+
         // Use global UDP socket
         let config = self.state.config_manager.load_config()?;
-        let udp_transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
-        
+        let udp_transport =
+            UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
+
         let config_manager = Arc::new(ClientConfigManager::new());
         let keypair = Arc::new(self.state.keypair.clone());
         let challenge = self.challenge;
-        
+
         // Try to initialize BLE; if it fails, fall back to UDP-only
         let ble_attempt =
             BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await;
-        
+
         let udp_transport_shared = Arc::new(udp_transport);
         let ble_transport_shared: Option<Arc<BleTransport>> = match ble_attempt {
             Ok(ble) => Some(Arc::new(ble)),
             Err(e) => {
-                tracing::warn!("BLE initialization failed ({}). Falling back to UDP-only.", e);
+                tracing::warn!(
+                    "BLE initialization failed ({}). Falling back to UDP-only.",
+                    e
+                );
                 None
             }
         };
-        
+
         // Create cancel channel
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
 
@@ -253,7 +256,7 @@ impl AuthSession {
             let wrapper = wrap_auth_cancel(msg);
             create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?
         };
-        
+
         // Spawn BLE task if available
         let mut ble_handle = if let Some(ble_transport_task) = ble_transport_shared.clone() {
             let packet_ble = packet.clone();
@@ -262,12 +265,20 @@ impl AuthSession {
             let challenge = self.challenge;
             let cfg = Arc::new(ClientConfigManager::new());
             tokio::spawn(async move {
-                Self::authenticate_with_transport(ble_transport_task, &packet_ble, &csk, &keypair_clone, &challenge, cfg).await
+                Self::authenticate_with_transport(
+                    ble_transport_task,
+                    &packet_ble,
+                    &csk,
+                    &keypair_clone,
+                    &challenge,
+                    cfg,
+                )
+                .await
             })
         } else {
             tokio::spawn(async { Err(AuthHandlerError::BleError("BLE disabled".into())) })
         };
-        
+
         // Spawn UDP task
         let packet_udp = packet.clone();
         let csk_udp = self.state.csk.clone();
@@ -276,11 +287,19 @@ impl AuthSession {
         let cfg = Arc::new(ClientConfigManager::new());
         let udp_transport_for_task = udp_transport_shared.clone();
         let mut udp_handle = tokio::spawn(async move {
-            Self::authenticate_with_transport(udp_transport_for_task, &packet_udp, &csk_udp, &keypair_udp, &challenge_udp, cfg).await
+            Self::authenticate_with_transport(
+                udp_transport_for_task,
+                &packet_udp,
+                &csk_udp,
+                &keypair_udp,
+                &challenge_udp,
+                cfg,
+            )
+            .await
         });
         let ble_abort = ble_handle.abort_handle();
         let udp_abort = udp_handle.abort_handle();
-        
+
         // Wait for first success or both failures or cancellation
         select! {
             result = &mut ble_handle => {
@@ -303,9 +322,9 @@ impl AuthSession {
                         if let Some(ble_shared) = &ble_transport_shared {
                             let _ = ble_shared.finalize().await;
                         }
-                        
+
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                        
+
                         Err(AuthHandlerError::ExplicitDenial)
                     }
                     Ok(Err(e)) => {
@@ -326,9 +345,9 @@ impl AuthSession {
                                 if let Some(ble_shared) = &ble_transport_shared {
                                     let _ = ble_shared.finalize().await;
                                 }
-                                
+
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                                
+
                                 Err(AuthHandlerError::ExplicitDenial)
                             }
                             Ok(Err(e)) => {
@@ -368,9 +387,9 @@ impl AuthSession {
                         if let Some(ble_shared) = &ble_transport_shared {
                             let _ = ble_shared.finalize().await;
                         }
-                        
+
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                        
+
                         Err(AuthHandlerError::ExplicitDenial)
                     }
                     Ok(Err(e)) => {
@@ -391,9 +410,9 @@ impl AuthSession {
                                 if let Some(ble_shared) = &ble_transport_shared {
                                     let _ = ble_shared.finalize().await;
                                 }
-                                
+
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                                
+
                                 Err(AuthHandlerError::ExplicitDenial)
                             }
                             Ok(Err(e)) => {
@@ -415,45 +434,56 @@ impl AuthSession {
             _ = &mut cancel_rx => {
                 let rid = self.request_id.as_deref().unwrap_or("-");
                 tracing::info!("Authentication cancelled (user={}, id={})", self.username, rid);
-                
+
                 // Broadcast cancel using UDP transport
                 tracing::info!("Broadcasting AuthenticationCancel over UDP");
-                
+
                 if let Err(e) = udp_transport_shared.send_cancel(&cancel_packet).await {
                     tracing::warn!("UDP cancel broadcast failed: {}", e);
                 } else {
                     tracing::debug!("UDP cancel broadcast sent");
                 }
-                
+
                 // Disconnect BLE clients explicitly
                 if let Some(ble_shared) = &ble_transport_shared {
                     tracing::debug!("Disconnecting BLE clients");
                     let _ = ble_shared.finalize().await;
                 }
-                
+
                 // Give network stack time to transmit packets
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                
+
                 // Now abort the tasks
                 ble_abort.abort();
                 udp_abort.abort();
-                
+
                 Err(AuthHandlerError::Denied)
             }
         }
     }
-    
+
     #[cfg(not(feature = "ble"))]
-    async fn try_parallel_authentication(&mut self, packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+    async fn try_parallel_authentication(
+        &mut self,
+        packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
         use crate::transport::{Transport, UdpTransport};
-        
+
         let config = self.state.config_manager.load_config()?;
         let transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
         let transport_arc = Arc::new(transport);
         let cfg = Arc::new(ClientConfigManager::new());
-        Self::authenticate_with_transport(transport_arc, packet, &self.state.csk, &self.state.keypair, &self.challenge, cfg).await
+        Self::authenticate_with_transport(
+            transport_arc,
+            packet,
+            &self.state.csk,
+            &self.state.keypair,
+            &self.challenge,
+            cfg,
+        )
+        .await
     }
-    
+
     /// Authenticate using any Transport
     async fn authenticate_with_transport<T: Transport + Send + Sync + 'static>(
         transport: Arc<T>,
@@ -466,23 +496,23 @@ impl AuthSession {
         let timeout = get_session_timeout();
         let start = Instant::now();
         let mut attempt = 0u32;
-        
+
         loop {
             if start.elapsed() >= timeout {
                 // Ensure transport is finalized before returning timeout
                 let _ = transport.finalize().await;
                 return Err(AuthHandlerError::Timeout);
             }
-            
+
             // Send request
             if let Err(e) = transport.send_request(packet).await {
                 let _ = transport.finalize().await;
                 return Err(e);
             }
-            
+
             // Wait for response with retry interval
             let retry_interval = shared::network::get_client_retry_interval(attempt);
-            
+
             loop {
                 match transport.receive_response(retry_interval).await {
                     Err(e) => {
@@ -491,12 +521,15 @@ impl AuthSession {
                     }
                     Ok(ReceiveResult::Response(response_packet, server_addr)) => {
                         // Decrypt the packet
-                        let wrapper = decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
-                        
+                        let wrapper =
+                            decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
+
                         tracing::debug!("Received message from {}", server_addr);
-                        
+
                         match wrapper.payload {
-                            Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(grant)) => {
+                            Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(
+                                grant,
+                            )) => {
                                 // Verify against any paired server key
                                 let paired_servers = config_manager.load_paired_servers()?;
                                 let mut valid = false;
@@ -505,7 +538,9 @@ impl AuthSession {
                                         if pub_key_bytes.len() == 32 {
                                             let mut pub_key = [0u8; 32];
                                             pub_key.copy_from_slice(&pub_key_bytes);
-                                            if verify_auth_grant(&grant, challenge, &pub_key).is_ok() {
+                                            if verify_auth_grant(&grant, challenge, &pub_key)
+                                                .is_ok()
+                                            {
                                                 valid = true;
                                                 break;
                                             }
@@ -513,11 +548,16 @@ impl AuthSession {
                                     }
                                 }
                                 if valid {
-                                    tracing::info!("Authentication granted by server: {}", server_addr);
+                                    tracing::info!(
+                                        "Authentication granted by server: {}",
+                                        server_addr
+                                    );
                                     // Send confirmation
-                                    let confirmation = create_grant_confirmation(keypair, challenge)?;
+                                    let confirmation =
+                                        create_grant_confirmation(keypair, challenge)?;
                                     let wrapper = wrap_grant_confirmation(confirmation);
-                                    let conf_packet = create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
+                                    let conf_packet =
+                                        create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
                                     transport.send_confirmation(&conf_packet).await?;
                                     // Finalize transport on success
                                     let _ = transport.finalize().await;
@@ -527,20 +567,26 @@ impl AuthSession {
                                 }
                             }
                             Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
-                                tracing::warn!("Authentication explicitly denied by server: {}", server_addr);
-                                
+                                tracing::warn!(
+                                    "Authentication explicitly denied by server: {}",
+                                    server_addr
+                                );
+
                                 // Send confirmation even for denial
                                 let confirmation = create_grant_confirmation(keypair, challenge)?;
                                 let wrapper = wrap_grant_confirmation(confirmation);
-                                let conf_packet = create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
-                                
+                                let conf_packet =
+                                    create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
+
                                 transport.send_confirmation(&conf_packet).await?;
                                 // Finalize transport before returning explicit denial
                                 let _ = transport.finalize().await;
                                 return Err(AuthHandlerError::ExplicitDenial);
                             }
                             _ => {
-                                tracing::debug!("Unexpected message type, waiting for valid response");
+                                tracing::debug!(
+                                    "Unexpected message type, waiting for valid response"
+                                );
                             }
                         }
                     }
@@ -552,7 +598,4 @@ impl AuthSession {
             }
         }
     }
-    
-    
 }
-

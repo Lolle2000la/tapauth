@@ -1,16 +1,15 @@
 package dev.rourunisen.tapauth.service
 
+import android.Manifest
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import android.Manifest
-import android.content.pm.PackageManager
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
 import dev.rourunisen.tapauth.MainActivity
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.TapAuthApplication
@@ -399,7 +398,8 @@ class AuthenticationService : Service() {
 
     private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
         val take = kotlin.math.min(this.size, maxBytes)
-        return this.take(take).joinToString("") { "%02x".format(it) } + if (this.size > take) "…" else ""
+        return this.take(take).joinToString("") { "%02x".format(it) } +
+            if (this.size > take) "…" else ""
     }
 
     private suspend fun handleGrantConfirmation(

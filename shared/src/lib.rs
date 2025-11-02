@@ -21,10 +21,10 @@
 
 pub mod config;
 pub mod crypto;
+pub mod ipc;
 pub mod models;
 pub mod network;
 pub mod protocol;
-pub mod ipc;
 
 #[cfg(feature = "jni")]
 pub mod jni;

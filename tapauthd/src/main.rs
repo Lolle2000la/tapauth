@@ -39,7 +39,9 @@ struct ServerState {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -49,9 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_manager = shared::config::ClientConfigManager::new();
     let config = config_manager.load_config().map_err(|e| {
         tracing::error!("Failed to load configuration: {}", e);
-        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        std::io::Error::other(e.to_string())
     })?;
-    
+
     // Create global UDP socket for the daemon's lifetime
     let udp_socket = shared::network::create_broadcast_socket(config.udp_port).await?;
     tracing::info!("Created global UDP socket on port {}", config.udp_port);
@@ -77,7 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             // Bind socket as root (before privilege drop)
-            let sock_path = std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+            let sock_path =
+                std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
             // Clean up stale path if we own it
             if Path::new(&sock_path).exists() {
@@ -91,7 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[allow(unused_imports)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660)) {
+                if let Err(e) =
+                    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660))
+                {
                     tracing::warn!("Failed to set socket permissions on {}: {}", sock_path, e);
                 }
             }
@@ -159,14 +164,19 @@ fn adopt_systemd_socket() -> Result<Option<UnixListener>, Box<dyn std::error::Er
         Some(n) if n > 0 => n,
         _ => return Ok(None),
     };
-    let listen_pid: i32 = env::var("LISTEN_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let listen_pid: i32 = env::var("LISTEN_PID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let pid = std::process::id() as i32;
     if listen_pid != pid {
         return Ok(None);
     }
     // Use only the first FD (3)
     if listen_fds >= 1 {
-        let std_listener = unsafe { <std::os::unix::net::UnixListener as std::os::unix::io::FromRawFd>::from_raw_fd(3) };
+        let std_listener = unsafe {
+            <std::os::unix::net::UnixListener as std::os::unix::io::FromRawFd>::from_raw_fd(3)
+        };
         std_listener.set_nonblocking(true)?;
         let tokio_listener = UnixListener::from_std(std_listener)?;
         return Ok(Some(tokio_listener));
@@ -209,14 +219,18 @@ async fn handle_conn(
     let response = match auth_req {
         Ok(req) => {
             tracing::info!("Handling PamAuthenticateRequest for user: {}", req.username);
-            
+
             // Run authentication
             let timeout = Some(req.timeout_seconds);
             let sess = AuthSession::new(server_state.daemon.clone(), req.username.clone());
             let result = sess
-                .handle_authenticate(timeout, Some(req.request_id.clone()), server_state.cancel_registry.clone())
+                .handle_authenticate(
+                    timeout,
+                    Some(req.request_id.clone()),
+                    server_state.cancel_registry.clone(),
+                )
                 .await;
-            
+
             match result {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -233,7 +247,11 @@ async fn handle_conn(
             // Try PamCancelRequest
             let cancel_req = ipc::PamCancelRequest::decode(&mut &req_bytes[..]);
             if let Ok(req) = cancel_req {
-                tracing::info!("Handling PamCancelRequest (id={}): {}", req.request_id, req.reason);
+                tracing::info!(
+                    "Handling PamCancelRequest (id={}): {}",
+                    req.request_id,
+                    req.reason
+                );
                 // Look up in-flight session by request_id and notify cancel
                 let mut reg = server_state.cancel_registry.lock().await;
                 if let Some(tx) = reg.remove(&req.request_id) {
@@ -282,32 +300,32 @@ async fn handle_conn(
 
 async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {
     let mut buf = BytesMut::with_capacity(256);
-    
+
     // Encode message to temporary buffer first to get length
     let msg_bytes = msg.encode_to_vec();
     let len = msg_bytes.len() as u32;
-    
+
     // Write length prefix (u32 BE)
     buf.put_u32(len);
     // Write message
     buf.extend_from_slice(&msg_bytes);
-    
+
     stream.write_all(&buf).await?;
     Ok(())
 }
 
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     use tokio::io::AsyncReadExt;
-    
+
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    
+
     if len > (10 * 1024 * 1024) {
         // 10 MiB sanity limit
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large").into());
     }
-    
+
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)

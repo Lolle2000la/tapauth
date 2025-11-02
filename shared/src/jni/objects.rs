@@ -28,10 +28,7 @@ fn create_object<'local>(
     let class = match env.find_class(class_name) {
         Ok(cls) => cls,
         Err(err) => {
-            throw_illegal_state(
-                env,
-                format!("failed to find class {}: {}", class_name, err),
-            );
+            throw_illegal_state(env, format!("failed to find class {}: {}", class_name, err));
             return None;
         }
     };
