@@ -71,9 +71,6 @@ pub trait Transport {
     /// Ok(()) if the send was successful, Err otherwise
     async fn send_cancel(&self, packet: &EncryptedPacket) -> Result<(), AuthError>;
 
-    /// Get a human-readable name for this transport (for logging)
-    fn name(&self) -> &'static str;
-
     /// Finalize and tear down any transport-specific state
     ///
     /// Default is a no-op. Transports with long-lived connections (e.g., BLE)
@@ -171,10 +168,6 @@ impl Transport for UdpTransport {
         }
 
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "UDP"
     }
 }
 
@@ -657,10 +650,6 @@ impl Transport for BleTransport {
             "BLE transport: send_cancel called, disconnecting clients and stopping services."
         );
         self.shutdown_impl().await
-    }
-
-    fn name(&self) -> &'static str {
-        "BLE"
     }
 
     async fn finalize(&self) -> Result<(), AuthError> {
