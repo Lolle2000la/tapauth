@@ -53,10 +53,11 @@ pub struct DaemonState {
     pub keypair: Ed25519KeyPair,
     pub csk: ClientSymmetricKey,
     pub hostname: String,
+    pub udp_socket: Arc<tokio::net::UdpSocket>,
 }
 
 impl DaemonState {
-    pub fn new() -> Result<Self, AuthHandlerError> {
+    pub fn new(udp_socket: tokio::net::UdpSocket) -> Result<Self, AuthHandlerError> {
         let config_manager = ClientConfigManager::new();
         
         let keypair = config_manager
@@ -75,6 +76,7 @@ impl DaemonState {
             keypair,
             csk,
             hostname,
+            udp_socket: Arc::new(udp_socket),
         })
     }
 }
@@ -216,9 +218,9 @@ impl AuthSession {
         
         tracing::info!("Starting parallel discovery over UDP and BLE");
         
-        // Create transports on-demand
+        // Use global UDP socket
         let config = self.state.config_manager.load_config()?;
-        let udp_transport = UdpTransport::new(config.udp_port).await?;
+        let udp_transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
         
         let config_manager = Arc::new(ClientConfigManager::new());
         let keypair = Arc::new(self.state.keypair.clone());
@@ -446,7 +448,7 @@ impl AuthSession {
         use crate::transport::{Transport, UdpTransport};
         
         let config = self.state.config_manager.load_config()?;
-        let transport = UdpTransport::new(config.udp_port).await?;
+        let transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
         let transport_arc = Arc::new(transport);
         let cfg = Arc::new(ClientConfigManager::new());
         Self::authenticate_with_transport(transport_arc, packet, &self.state.csk, &self.state.keypair, &self.challenge, cfg).await

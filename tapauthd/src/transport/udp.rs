@@ -5,20 +5,41 @@ use crate::auth_handler::AuthHandlerError as AuthError;
 use shared::protocol::pb::EncryptedPacket;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 /// UDP transport using broadcast (IPv4) and multicast (IPv6)
 pub struct UdpTransport {
-    socket: tokio::net::UdpSocket,
+    socket: Arc<tokio::net::UdpSocket>,
     port: u16,
+    owned: bool,
 }
 
 impl UdpTransport {
-    /// Create a new UDP transport
+    /// Create a new UDP transport with its own socket
     ///
     /// # Arguments
     /// * `port` - The UDP port to bind and send to
+    #[allow(dead_code)] // Used in tests
     pub async fn new(port: u16) -> Result<Self, AuthError> {
         let socket = shared::network::create_broadcast_socket(port).await?;
-        Ok(Self { socket, port })
+        Ok(Self {
+            socket: Arc::new(socket),
+            port,
+            owned: true,
+        })
+    }
+
+    /// Create a UDP transport from an existing shared socket
+    ///
+    /// # Arguments
+    /// * `socket` - Shared reference to an existing UDP socket
+    /// * `port` - The UDP port the socket is bound to
+    pub fn from_socket(socket: Arc<tokio::net::UdpSocket>, port: u16) -> Self {
+        Self {
+            socket,
+            port,
+            owned: false,
+        }
     }
 }
 
@@ -98,6 +119,9 @@ impl Transport for UdpTransport {
 
 impl Drop for UdpTransport {
     fn drop(&mut self) {
-        tracing::debug!("UDP transport explicitly closed");
+        if self.owned {
+            tracing::debug!("UDP transport (owned) explicitly closed");
+        }
+        // Shared sockets are not closed here - they're managed by DaemonState
     }
 }

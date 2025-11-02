@@ -45,8 +45,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("tapauthd starting...");
 
+    // Load configuration to get UDP port
+    let config_manager = shared::config::ClientConfigManager::new();
+    let config = config_manager.load_config().map_err(|e| {
+        tracing::error!("Failed to load configuration: {}", e);
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    })?;
+    
+    // Create global UDP socket for the daemon's lifetime
+    let udp_socket = shared::network::create_broadcast_socket(config.udp_port).await?;
+    tracing::info!("Created global UDP socket on port {}", config.udp_port);
+
     // Load daemon state (config, keys, etc.)
-    let daemon_state = match DaemonState::new() {
+    let daemon_state = match DaemonState::new(udp_socket) {
         Ok(state) => Arc::new(state),
         Err(e) => {
             tracing::error!("Failed to initialize daemon state: {}", e);
