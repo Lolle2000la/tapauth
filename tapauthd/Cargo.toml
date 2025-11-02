@@ -22,4 +22,5 @@ bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
 [features]
 default = ["ble"]
 ble = ["bluer"]
+fallback-socket = []  # Enable manual socket binding for development/testing (production uses systemd socket activation)
 

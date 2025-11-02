@@ -7,7 +7,6 @@ use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
 use shared::ipc::pb as ipc;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -69,38 +68,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Loaded config and keys successfully");
 
-    // Attempt to adopt systemd socket (FD#3) if provided; else bind our own
-    let mut using_systemd_socket = false;
-    let listener = match adopt_systemd_socket()? {
+    // Attempt to adopt systemd socket (FD#3) - this is the production mode
+    let (listener, using_systemd_socket) = match adopt_systemd_socket()? {
         Some(l) => {
-            using_systemd_socket = true;
             tracing::info!("Adopted systemd socket (FD#3)");
-            l
+            (l, true)
         }
         None => {
-            // Bind socket as root (before privilege drop)
-            let sock_path =
-                std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
-
-            // Clean up stale path if we own it
-            if Path::new(&sock_path).exists() {
-                let _ = tokio::fs::remove_file(&sock_path).await;
-            }
-
-            let listener = UnixListener::bind(&sock_path)?;
-            tracing::info!("Bound socket at {}", sock_path);
-
-            // Set permissions to 0660 for manual (non-systemd) runs
-            #[allow(unused_imports)]
+            #[cfg(feature = "fallback-socket")]
             {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660))
-                {
-                    tracing::warn!("Failed to set socket permissions on {}: {}", sock_path, e);
+                // Development/testing fallback: bind socket manually
+                // Production deployments should use systemd socket activation (see systemd/tapauthd.socket)
+                tracing::warn!("fallback-socket feature enabled - binding socket manually for development/testing");
+
+                use std::path::Path;
+                let sock_path = std::env::var("TAPAUTHD_SOCK")
+                    .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+                // Clean up stale path if we own it
+                if Path::new(&sock_path).exists() {
+                    let _ = tokio::fs::remove_file(&sock_path).await;
                 }
+
+                let listener = UnixListener::bind(&sock_path)?;
+                tracing::info!("Bound socket at {}", sock_path);
+
+                // Set permissions to 0660 for manual (non-systemd) runs
+                #[allow(unused_imports)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660))
+                    {
+                        tracing::warn!("Failed to set socket permissions on {}: {}", sock_path, e);
+                    }
+                }
+                (listener, false)
             }
-            listener
+            #[cfg(not(feature = "fallback-socket"))]
+            {
+                // Production mode: require systemd socket activation
+                tracing::error!("No systemd socket provided (LISTEN_FDS not set)");
+                tracing::error!("Production builds require systemd socket activation.");
+                tracing::error!("Please ensure tapauthd.socket is enabled and started:");
+                tracing::error!("  sudo systemctl enable --now tapauthd.socket");
+                tracing::error!("For development/testing, rebuild with --features fallback-socket");
+                return Err(
+                    "Systemd socket activation required - see systemd/tapauthd.socket".into(),
+                );
+            }
         }
     };
 
@@ -210,8 +226,19 @@ async fn handle_conn(
     mut stream: UnixStream,
     server_state: Arc<ServerState>,
 ) -> Result<(), DaemonError> {
-    // Read a length-prefixed request (u32 BE) then message
-    let req_bytes = read_framed(&mut stream).await?;
+    // Read a length-prefixed request (u32 BE) then message with 3-second timeout
+    // to prevent malicious clients from holding connections without sending data
+    let req_bytes =
+        match tokio::time::timeout(std::time::Duration::from_secs(3), read_framed(&mut stream))
+            .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                tracing::warn!("IPC read timeout - client failed to send request within 3 seconds");
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC read timeout").into());
+            }
+        };
 
     // Try to parse as PamAuthenticateRequest first
     let auth_req = ipc::PamAuthenticateRequest::decode(&mut &req_bytes[..]);

@@ -54,7 +54,7 @@ trap cleanup EXIT
 
 # Build the daemon and tests
 echo "==> Building daemon and integration tests..."
-cargo build --release -p tapauthd || { echo "❌ Daemon build failed"; exit 1; }
+cargo build --release -p tapauthd --features fallback-socket || { echo "❌ Daemon build failed"; exit 1; }
 cargo test --test integration_test --no-run || { echo "❌ Test build failed"; exit 1; }
 echo "✅ Build successful"
 
