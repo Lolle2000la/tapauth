@@ -11,27 +11,80 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# Check for help flag
+# Parse args (optional --no-ble flag, then optional username)
+NO_BLE=0
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            echo "Usage: sudo $0 [--no-ble] [username]"
+            echo ""
+            echo "Build and test the TapAuth PAM module for a specific user."
+            echo "This starts the tapauthd daemon (via a temporary systemd socket if available) and runs pamtester."
+            echo ""
+            echo "Options:"
+            echo "  --no-ble     Build tapauthd without BLE support (matches install.sh flag)"
+            echo ""
+            echo "Arguments:"
+            echo "  username     Optional. The user to test authentication for."
+            echo "               Defaults to the user who invoked sudo (currently: ${SUDO_USER:-$(whoami)})"
+            echo ""
+            echo "Examples:"
+            echo "  sudo $0                     # Test as current user (${SUDO_USER:-$(whoami)})"
+            echo "  sudo $0 alice               # Test as user 'alice'"
+            echo "  sudo $0 --no-ble            # Disable BLE in daemon for the test"
+            echo "  sudo $0 --no-ble alice      # Disable BLE and test as 'alice'"
+            echo ""
+            echo "Notes:"
+            echo "  - This script requires root privileges (use sudo)"
+            echo "  - The test user must have pairings in /var/lib/tapauth/ (per-user allowed_users applies)"
+            echo "  - BLE (when enabled) is handled by the daemon via BlueZ/DBus; the PAM module only speaks IPC"
+            echo "  - The temporary test socket is root:tapauthd-clients with mode 0660; the 'tapauthd-clients' group must exist"
+            cd "$ORIGINAL_DIR"
+            exit 0
+            ;;
+        --no-ble)
+            NO_BLE=1
+            shift
+            ;;
+        --)
+            shift; break
+            ;;
+        -*)
+            echo "Unknown option: $1"; echo "Try --help"; cd "$ORIGINAL_DIR"; exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1"); shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: sudo $0 [username]"
+    echo "Usage: sudo $0 [--no-ble] [username]"
     echo ""
     echo "Build and test the TapAuth PAM module for a specific user."
-    echo "This now uses the tapauthd daemon via IPC (Unix socket). The script will start it for you."
+    echo "This uses the tapauthd daemon via IPC (Unix socket). The script will start it for you."
+    echo ""
+    echo "Options:"
+    echo "  --no-ble     Build tapauthd without BLE support (matches install.sh flag)"
     echo ""
     echo "Arguments:"
-    echo "  username    Optional. The user to test authentication for."
-    echo "              Defaults to the user who invoked sudo (currently: ${SUDO_USER:-$(whoami)})"
+    echo "  username     Optional. The user to test authentication for."
+    echo "               Defaults to the user who invoked sudo (currently: ${SUDO_USER:-$(whoami)})"
     echo ""
     echo "Examples:"
-    echo "  sudo $0           # Test as current user (${SUDO_USER:-$(whoami)})"
-    echo "  sudo $0 alice     # Test as user 'alice'"
-    echo "  sudo $0 root      # Test as root user"
+    echo "  sudo $0                     # Test as current user (${SUDO_USER:-$(whoami)})"
+    echo "  sudo $0 alice               # Test as user 'alice'"
+    echo "  sudo $0 --no-ble            # Disable BLE in daemon for the test"
+    echo "  sudo $0 --no-ble root       # Disable BLE and test as root"
     echo ""
-    echo "Note:"
+    echo "Notes:"
     echo "  - This script requires root privileges (use sudo)"
-    echo "  - The test user must have paired devices in /etc/tapauth/"
+    echo "  - The test user must have pairings in /var/lib/tapauth/"
     echo "  - User-specific pairing: only users in allowed_users list can authenticate"
-    echo "  - BLE functionality requires BlueZ (org.bluez) to be running"
+    echo "  - BLE (when enabled) is handled by the daemon via BlueZ (org.bluez)"
+    echo "  - Temporary socket: root:tapauthd-clients 0660 (group must exist)"
     echo ""
     cd "$ORIGINAL_DIR"
     exit 0
@@ -51,6 +104,12 @@ TAPAUTHD_SOCK_DIR="/run/tapauthd"
 TAPAUTHD_DEFAULT_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd.sock"
 # Test-specific socket (for temporary systemd units)
 TAPAUTHD_TEST_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd-test.sock"
+# Persistent state dir (FHS-compliant)
+CONFIG_DIR="/var/lib/tapauth"
+CLIENT_KEY_FILE="${CONFIG_DIR}/client_key"
+CLIENT_CSK_FILE="${CONFIG_DIR}/client_symmetric_key"
+PAIRED_SERVERS_FILE="${CONFIG_DIR}/paired_servers.json"
+LEGACY_CONFIG_DIR="/etc/tapauth"
 # Will be set based on activation mode below
 TAPAUTHD_SOCK_PATH="$TAPAUTHD_DEFAULT_SOCK_PATH"
 # Temporary directory for runtime systemd unit files
@@ -139,29 +198,37 @@ echo ""
 echo "==> Building PAM Module and Daemon (Release)..."
 cd "$PAM_CRATE_DIR"
 
-# --- MODIFIED: Use full path to cargo when using sudo ---
+# --- MODIFIED: Build client-pam and tapauthd separately; BLE flag applies to daemon only ---
 if [ -n "$SUDO_USER" ]; then
     ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
     CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
-    # Check if cargo exists at the expected path
     if [ ! -x "$CARGO_PATH" ]; then
         echo "❌ Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
         echo "   Ensure Rust is installed correctly for the user who ran sudo."
-        cd "$ORIGINAL_DIR"
-        exit 1
+        cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Running build as user $SUDO_USER using $CARGO_PATH..."
-    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release --features ble -p client-pam -p tapauthd || { echo "❌ Build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $SUDO_USER..."
+    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building tapauthd as $SUDO_USER (NO_BLE=$NO_BLE)..."
+    if [ "$NO_BLE" -eq 1 ]; then
+        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    else
+        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    fi
 else
-    # Check if cargo is in the current user's path
     if ! command -v cargo &> /dev/null; then
         echo "❌ cargo command not found in PATH."
         echo "   Ensure Rust is installed correctly."
-        cd "$ORIGINAL_DIR"
-        exit 1
+        cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Running build as current user ($(whoami))..."
-    cargo build --release --features ble -p client-pam -p tapauthd || { echo "❌ Build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $(whoami)..."
+    cargo build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building tapauthd as $(whoami) (NO_BLE=$NO_BLE)..."
+    if [ "$NO_BLE" -eq 1 ]; then
+        cargo build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    else
+        cargo build --release -p tapauthd || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    fi
 fi
 # --- END MODIFICATION ---
 
@@ -263,8 +330,51 @@ echo "✅ Temporary setup complete."
 echo ""
 echo "==> Preparing tapauthd IPC socket"
 
+# Ensure tapauthd system user exists (daemon drops privileges to this user)
+if ! id tapauthd >/dev/null 2>&1; then
+    echo "    Creating system user 'tapauthd'"
+    sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd || true
+fi
+
+# Ensure tapauth persistent state directory exists (owned by tapauthd)
+echo "    Ensuring persistent state directory at ${CONFIG_DIR}"
+sudo mkdir -p "$CONFIG_DIR"
+sudo chown tapauthd:tapauthd "$CONFIG_DIR" || true
+sudo chmod 0700 "$CONFIG_DIR" || true
+
+# Attempt one-time migration from legacy /etc/tapauth if present and new files are missing
+if [ -d "$LEGACY_CONFIG_DIR" ]; then
+    if [ ! -f "$CLIENT_KEY_FILE" ] && [ -f "${LEGACY_CONFIG_DIR}/client_key" ]; then
+        echo "    Migrating client_key from ${LEGACY_CONFIG_DIR}"
+        sudo cp -f "${LEGACY_CONFIG_DIR}/client_key" "$CLIENT_KEY_FILE"
+        sudo chown tapauthd:tapauthd "$CLIENT_KEY_FILE" || true
+        sudo chmod 0600 "$CLIENT_KEY_FILE" || true
+    fi
+    if [ ! -f "$CLIENT_CSK_FILE" ] && [ -f "${LEGACY_CONFIG_DIR}/client_symmetric_key" ]; then
+        echo "    Migrating client_symmetric_key from ${LEGACY_CONFIG_DIR}"
+        sudo cp -f "${LEGACY_CONFIG_DIR}/client_symmetric_key" "$CLIENT_CSK_FILE"
+        sudo chown tapauthd:tapauthd "$CLIENT_CSK_FILE" || true
+        sudo chmod 0600 "$CLIENT_CSK_FILE" || true
+    fi
+    if [ ! -f "$PAIRED_SERVERS_FILE" ] && [ -f "${LEGACY_CONFIG_DIR}/paired_servers.json" ]; then
+        echo "    Migrating paired_servers.json from ${LEGACY_CONFIG_DIR}"
+        sudo cp -f "${LEGACY_CONFIG_DIR}/paired_servers.json" "$PAIRED_SERVERS_FILE"
+        sudo chown tapauthd:tapauthd "$PAIRED_SERVERS_FILE" || true
+        sudo chmod 0600 "$PAIRED_SERVERS_FILE" || true
+    fi
+fi
+
 ACTIVATION_MODE="manual"
 LOG_FILE="/tmp/tapauthd-test.log"
+
+# Detect whether TapAuth is configured (keys exist and are correct size)
+UNCONFIGURED=0
+if [ ! -f "$CLIENT_KEY_FILE" ] || [ "$(stat -c%s "$CLIENT_KEY_FILE" 2>/dev/null || echo 0)" -ne 32 ]; then
+    UNCONFIGURED=1
+fi
+if [ ! -f "$CLIENT_CSK_FILE" ] || [ "$(stat -c%s "$CLIENT_CSK_FILE" 2>/dev/null || echo 0)" -ne 32 ]; then
+    UNCONFIGURED=1
+fi
 
 if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
     if sudo systemctl is-active --quiet tapauthd.socket; then
@@ -277,22 +387,26 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         TAPAUTHD_SOCK_PATH="$TAPAUTHD_TEST_SOCK_PATH"
         echo "    Creating temporary systemd units for testing..."
 
-        # Ensure 'tapauthd' user exists (daemon may drop privileges)
-        if ! id tapauthd >/dev/null 2>&1; then
-            echo "    Creating system user 'tapauthd'"
-            sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd || true
-        fi
-
         # Create temporary directory for unit files
         TEMP_UNIT_DIR=$(mktemp -d -t tapauthd-test-units.XXXXXX)
         echo "    Temporary units directory: $TEMP_UNIT_DIR"
 
         # Prepare executable in an executable temp location (avoid noexec mounts like /home or /tmp)
-        # Use /run (tmpfs) which is typically mounted with exec and friendlier to SELinux/AppArmor policies
-        TEMP_BIN_DIR=$(mktemp -d -p /run tapauthd-test-bin.XXXXXX)
+        # Use /run (tmpfs). Creating under /run requires root; capture the created path.
+        TEMP_BIN_DIR=$(sudo mktemp -d -p /run tapauthd-test-bin.XXXXXX 2>/dev/null)
+        if [ -z "$TEMP_BIN_DIR" ] || [ ! -d "$TEMP_BIN_DIR" ]; then
+            echo "❌ Failed to create temporary binary directory under /run"
+            exit 1
+        fi
         sudo install -m 0755 "$TAPAUTHD_BIN" "$TEMP_BIN_DIR/tapauthd"
 
-        # Write temporary socket unit
+        # Ensure 'tapauthd-clients' group exists for socket ownership
+        if ! getent group tapauthd-clients >/dev/null 2>&1; then
+            echo "    Creating system group 'tapauthd-clients'"
+            sudo groupadd --system tapauthd-clients || true
+        fi
+
+        # Write temporary socket unit (root:tapauthd-clients 0660)
         cat > "$TEMP_UNIT_DIR/tapauthd-test.socket" << EOF
 [Unit]
 Description=TapAuth daemon IPC test socket
@@ -301,9 +415,9 @@ PartOf=tapauthd-test.service
 [Socket]
 ListenStream=$TAPAUTHD_TEST_SOCK_PATH
 SocketUser=root
-SocketGroup=root
-SocketMode=0666
-DirectoryMode=0755
+    SocketGroup=tapauthd-clients
+    SocketMode=0660
+    DirectoryMode=0750
 RemoveOnStop=yes
 
 [Install]
@@ -315,7 +429,8 @@ EOF
 [Unit]
 Description=TapAuth authentication daemon (test)
 Requires=tapauthd-test.socket
-After=network.target bluetooth.target
+    Wants=bluetooth.target
+    After=dbus.service bluetooth.target network.target
 
 [Service]
 Type=simple
@@ -355,7 +470,11 @@ else
     echo "    systemd not available; starting daemon manually"
     echo "    Ensuring runtime directory at $TAPAUTHD_SOCK_DIR"
     sudo mkdir -p "$TAPAUTHD_SOCK_DIR" || true
-    sudo chmod 0755 "$TAPAUTHD_SOCK_DIR" || true
+    # Prefer root:tapauthd-clients 0750 when group exists
+    if getent group tapauthd-clients >/dev/null 2>&1; then
+        sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
+    fi
+    sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
 
     # Ensure 'tapauthd' user exists (daemon drops privileges to this user)
     if ! id tapauthd >/dev/null 2>&1; then
@@ -388,9 +507,10 @@ if [ ! -S "$TAPAUTHD_SOCK_PATH" ]; then
     exit 1
 fi
 
-# Health check: connect and send empty frame (length=0), expect daemon to handle and stay alive
-echo "    Performing daemon health check..."
-python3 - << PY || { echo "❌ Health check failed"; exit 1; }
+# Health check: only if configured. Otherwise skip to avoid failing on unconfigured hosts.
+if [ "$UNCONFIGURED" -eq 0 ]; then
+    echo "    Performing daemon health check..."
+    sudo python3 - << PY || { echo "❌ Health check failed"; exit 1; }
 import socket, struct
 path = "$TAPAUTHD_SOCK_PATH"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -401,7 +521,10 @@ s.sendall(struct.pack('>I', 0))
 s.close()
 print("OK")
 PY
-echo "✅ Daemon health check passed"
+    echo "✅ Daemon health check passed"
+else
+    echo "    Skipping daemon health check (TapAuth not configured: missing keys)"
+fi
 if [ "$ACTIVATION_MODE" = "manual" ]; then
     echo "    ➤ View daemon logs with: tail -f $LOG_FILE"
 else
@@ -415,12 +538,12 @@ echo ""
 echo "==> Running pamtester..."
 echo "    Service: $PAM_SERVICE_NAME"
 echo "    User:    $TEST_USER"
-echo "    Note:    PAM module talks to tapauthd over IPC"
+echo "    Note:    PAM module talks to tapauthd over IPC; daemon handles BLE via BlueZ when enabled"
 echo ""
 echo "---------------------------------------------------------------------"
 echo "  Attempting authentication for user: $TEST_USER"
-echo "  The module will directly communicate with BlueZ for BLE advertising."
-echo "  Watch for BLE/UDP activity."
+echo "  The daemon is responsible for BLE advertising/scan (when built with BLE)."
+echo "  Watch daemon logs for BLE/UDP activity."
 echo "  Use your paired Android device to approve the authentication."
 echo "---------------------------------------------------------------------"
 echo ""

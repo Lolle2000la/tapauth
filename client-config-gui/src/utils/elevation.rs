@@ -3,7 +3,6 @@
 //! Provides root privilege checking and elevation via `pkexec` or `sudo`,
 //! preserving environment variables needed for GUI display (Wayland/X11).
 
-use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use std::env;
 use std::process::Command;
 
@@ -185,39 +184,6 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Drop privileges from root to the specified target system user.
-///
-/// Returns Ok(()) if privilege drop succeeded or if already running as the target user.
-/// Returns Err(()) if the target user cannot be resolved or setuid/setgid fails.
-pub fn drop_privileges_to_user(target_user: &str) -> Result<(), ()> {
-    // If we're not root, do nothing
-    let euid = unsafe { libc::geteuid() };
-    if euid != 0 {
-        return Ok(());
-    }
-
-    // Resolve target user via NSS
-    let user = User::from_name(target_user).map_err(|_| ())?.ok_or(())?;
-    let target_uid = Uid::from_raw(user.uid.as_raw());
-    let target_gid = Gid::from_raw(user.gid.as_raw());
-
-    // Set group first, then user
-    setgid(target_gid).map_err(|e| {
-        tracing::error!(
-            "Failed to setgid to {} (gid {}): {}",
-            target_user,
-            target_gid.as_raw(),
-            e
-        );
-    })?;
-    setuid(target_uid).map_err(|e| {
-        tracing::error!(
-            "Failed to setuid to {} (uid {}): {}",
-            target_user,
-            target_uid.as_raw(),
-            e
-        );
-    })?;
-
-    Ok(())
-}
+// Note: We intentionally keep the GUI running with elevated privileges to
+// avoid display/session issues on some Wayland setups. Secure write paths are
+// handled in shared config by chowning root-written files to the tapauthd user.

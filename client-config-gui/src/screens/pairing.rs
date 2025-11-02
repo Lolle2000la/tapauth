@@ -415,10 +415,10 @@ impl PairingScreen {
 
         tracing::debug!("Pairing handshake complete");
 
-        // Store CSK
+        // Store CSK (post-handshake). If saving fails, it's a local config issue — pairing on phone likely succeeded.
         config
             .save_csk(&csk)
-            .map_err(|e| format!("Failed to save CSK: {}", e))?;
+            .map_err(|e| format!("Paired on phone, but saving local key failed: {}. Ensure tapauthd is installed and the 'tapauthd' user and group exist, then retry pairing.", e))?;
 
         // Store paired server with current user in allowed_users list
         let server_hex = hex::encode(server_public_key);

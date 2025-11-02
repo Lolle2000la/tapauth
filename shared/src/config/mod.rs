@@ -6,15 +6,17 @@
 //!
 //! ## Security
 //!
-//! - Configuration files are stored in `/etc/tapauth`
-//! - Ownership is expected to be `tapauthd:tapauthd`; files must be mode 0600 (or 0400)
-//! - Root may read for diagnostics and legacy compatibility, but writes are restricted
-//!   to the `tapauthd` user
+//! - Persistent state is stored in `/var/lib/tapauth`
+//! - Ownership is `tapauthd:tapauthd`; files are mode 0600 (or 0400)
+//! - Reads are allowed when owned by root or tapauthd
+//! - Writes are allowed when running as tapauthd; when running as root, files/dirs are
+//!   safely created then chowned to `tapauthd:tapauthd` to keep strict ownership
 //! - File permissions are enforced on every write operation and validated on reads
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -35,8 +37,8 @@ pub enum ConfigError {
     Crypto(#[from] crate::crypto::CryptoError),
 }
 
-/// Well-known configuration directory
-pub const CONFIG_DIR: &str = "/etc/tapauth";
+/// Well-known configuration directory (FHS-compliant persistent state)
+pub const CONFIG_DIR: &str = "/var/lib/tapauth";
 
 /// Client configuration file
 pub const CLIENT_CONFIG_FILE: &str = "client_config.json";
@@ -84,10 +86,43 @@ fn is_euid_tapauthd() -> bool {
     }
 }
 
+/// Whether the effective UID is privileged for writes (tapauthd or root)
+fn is_euid_privileged_for_writes() -> bool {
+    is_euid_tapauthd() || nix::unistd::geteuid().as_raw() == 0
+}
+
+/// Chown a path to tapauthd:tapauthd when running as root
+/// If tapauthd user doesn't exist (e.g., during development), skip chown silently
+fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
+    // Only attempt when running as root
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Ok(());
+    }
+    let user = match User::from_name("tapauthd").ok().flatten() {
+        Some(u) => u,
+        None => {
+            // tapauthd user doesn't exist (development mode or pre-install) - skip chown
+            tracing::debug!("tapauthd user not found, skipping chown (development mode)");
+            return Ok(());
+        }
+    };
+    let uid = user.uid.as_raw();
+    let gid = user.gid.as_raw();
+    use std::ffi::CString;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
 /// Ensure configuration directory exists with strict permissions (700)
 pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
-    // Only the tapauthd service user is allowed to create/modify the directory
-    if !is_euid_tapauthd() {
+    // Only tapauthd or root may create/modify; if root, we will chown to tapauthd
+    if !is_euid_privileged_for_writes() {
         return Err(ConfigError::InsufficientPermissions);
     }
 
@@ -101,23 +136,43 @@ pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)?;
 
+    // Ensure ownership is tapauthd:tapauthd when invoked as root
+    if !is_euid_tapauthd() {
+        chown_to_tapauthd(path)?;
+    }
+
     Ok(())
 }
 
 /// Write data to a file with strict owner-only permissions (600)
 pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
-    // Only the tapauthd service user is allowed to write configuration or key material
-    if !is_euid_tapauthd() {
+    // Only tapauthd or root may write; if root, we will chown to tapauthd
+    if !is_euid_privileged_for_writes() {
+        tracing::error!("write_secure_file: insufficient permissions");
         return Err(ConfigError::InsufficientPermissions);
     }
 
+    tracing::debug!(
+        "write_secure_file: writing {} bytes to {:?}",
+        data.len(),
+        path
+    );
     fs::write(path, data)?;
+    tracing::debug!("write_secure_file: write complete");
 
     // Set permissions to 600 (rw for owner only)
     let metadata = fs::metadata(path)?;
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o600);
     fs::set_permissions(path, permissions)?;
+    tracing::debug!("write_secure_file: permissions set to 0600");
+
+    // Ensure ownership is tapauthd:tapauthd when invoked as root
+    if !is_euid_tapauthd() {
+        tracing::debug!("write_secure_file: attempting chown to tapauthd");
+        chown_to_tapauthd(path)?;
+        tracing::debug!("write_secure_file: chown complete");
+    }
 
     Ok(())
 }
@@ -361,10 +416,15 @@ impl ClientConfigManager {
         &self,
         servers: &HashMap<String, PairedServer>,
     ) -> Result<(), ConfigError> {
+        tracing::debug!("save_paired_servers: starting");
         self.init()?;
+        tracing::debug!("save_paired_servers: init complete");
         let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+        tracing::debug!("save_paired_servers: path = {:?}", servers_path);
         let data = serde_json::to_vec_pretty(servers)?;
+        tracing::debug!("save_paired_servers: serialized {} bytes", data.len());
         write_secure_file(&servers_path, &data)?;
+        tracing::debug!("save_paired_servers: write complete");
         Ok(())
     }
 

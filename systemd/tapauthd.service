@@ -2,7 +2,8 @@
 [Unit]
 Description=TapAuth authentication daemon
 Requires=tapauthd.socket
-After=network.target bluetooth.target
+After=dbus.service bluetooth.target network.target
+Wants=bluetooth.target
 
 [Service]
 Type=simple
@@ -12,6 +13,8 @@ Group=tapauthd
 Sockets=tapauthd.socket
 ExecStart=/usr/bin/tapauthd
 Restart=on-failure
+RuntimeDirectory=tapauthd
+StateDirectory=tapauth
 
 # Hardening (adjust as needed if daemon requires more access)
 NoNewPrivileges=yes

@@ -28,7 +28,10 @@ PAM_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
-CONFIG_DIR="/etc/tapauth"
+CONFIG_DIR="/var/lib/tapauth"
+DAEMON_PATH="/usr/bin/tapauthd"
+SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
+SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
 
 # Print functions
 print_info() {
@@ -131,6 +134,50 @@ EXAMPLES:
     sudo $0 --dry-run --yes
 
 EOF
+}
+
+# Stop and disable systemd units, then remove unit files and daemon
+remove_systemd_units_and_daemon() {
+    print_header "Removing Daemon and Systemd Units"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would stop and disable systemd units"
+        show_command "systemctl stop tapauthd.socket tapauthd.service" "Stop daemon and socket"
+        show_command "systemctl disable tapauthd.socket tapauthd.service" "Disable units"
+        show_file_removal "$SOCKET_UNIT_DEST" "Socket unit file"
+        show_file_removal "$SERVICE_UNIT_DEST" "Service unit file"
+        show_command "systemctl daemon-reload" "Reload systemd units"
+        show_file_removal "$DAEMON_PATH" "TapAuth daemon binary"
+        show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
+        return
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop tapauthd.socket tapauthd.service >/dev/null 2>&1 || true
+        systemctl disable tapauthd.socket tapauthd.service >/dev/null 2>&1 || true
+    fi
+
+    # Remove unit files if present
+    [[ -f "$SOCKET_UNIT_DEST" ]] && rm -f "$SOCKET_UNIT_DEST"
+    [[ -f "$SERVICE_UNIT_DEST" ]] && rm -f "$SERVICE_UNIT_DEST"
+
+    # Reload systemd to pick up removals
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    # Remove daemon binary
+    if [[ -f "$DAEMON_PATH" ]]; then
+        print_info "Removing daemon binary at $DAEMON_PATH"
+        rm -f "$DAEMON_PATH"
+    fi
+
+    # Clean up stale socket if any
+    if [[ -S "/run/tapauthd/tapauthd.sock" ]]; then
+        rm -f /run/tapauthd/tapauthd.sock || true
+    fi
+
+    print_success "Daemon and systemd units removed (if present)"
 }
 
 # Parse command line arguments
@@ -596,6 +643,7 @@ main() {
     check_root
     
     # Remove in reverse order of installation
+    remove_systemd_units_and_daemon
     remove_pam_config
     remove_config_gui
     remove_pam
@@ -609,6 +657,7 @@ main() {
         echo "Components to remove:"
         [[ "$REMOVE_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module (kept)"
         [[ "$REMOVE_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI (kept)"
+        echo "  ✓ Daemon and systemd units (tapauthd, tapauthd.socket/service)"
         
         echo ""
         echo "PAM configuration to remove:"

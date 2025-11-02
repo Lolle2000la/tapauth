@@ -66,13 +66,13 @@ if [ -n "$SUDO_USER" ]; then
         echo "❌ Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
         exit 1
     fi
-    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release --features ble
+    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release
 else
     if ! command -v cargo &> /dev/null; then
         echo "❌ cargo command not found in PATH."
         exit 1
     fi
-    cargo build --release --features ble
+    cargo build --release
 fi
 cd .. # Return to project root
 

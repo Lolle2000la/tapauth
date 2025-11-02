@@ -71,6 +71,27 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     tracing::info!("TapAuth: Authenticating user: {}", username);
 
+    // Preflight: if no configuration/keys are present, ignore to allow fallback
+    {
+        let cfg = shared::config::ClientConfigManager::new();
+        // If keys are missing or unreadable, treat as unconfigured
+        match (cfg.load_keypair(), cfg.load_csk()) {
+            (Ok(_), Ok(_)) => {
+                // Keys present, optionally check for any pairings for fast IGNORE
+                if let Ok(servers) = cfg.load_paired_servers() {
+                    if servers.is_empty() {
+                        tracing::info!("No paired devices configured; ignoring");
+                        return pam_sys::PAM_IGNORE;
+                    }
+                }
+            }
+            _ => {
+                tracing::info!("TapAuth not configured (missing keys); ignoring");
+                return pam_sys::PAM_IGNORE;
+            }
+        }
+    }
+
     let pam_conv = unsafe {
         match pam_sys::PamConversation::new(pamh) {
             Ok(conv) => conv,

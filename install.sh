@@ -30,7 +30,7 @@ PAM_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
-CONFIG_DIR="/etc/tapauth"
+CONFIG_DIR="/var/lib/tapauth"
 KEY_PATH="$CONFIG_DIR/client_key"
 SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
 SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
@@ -410,7 +410,6 @@ create_system_users() {
         print_info "[DRY RUN] Would create system user 'tapauthd' and group 'tapauthd-clients'"
         echo "  • useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd"
         echo "  • groupadd --system tapauthd-clients"
-        echo "  • gpasswd -d tapauthd tapauthd-clients (ensure daemon not in client group)"
         echo "  • mkdir -p $CONFIG_DIR && chown -R tapauthd:tapauthd $CONFIG_DIR && chmod 700 $CONFIG_DIR"
         return
     fi
@@ -428,9 +427,6 @@ create_system_users() {
     else
         print_info "Group 'tapauthd-clients' already exists"
     fi
-
-    # Ensure daemon user is not in the client group by policy
-    gpasswd -d tapauthd tapauthd-clients >/dev/null 2>&1 || true
 
     # Ensure configuration directory ownership and permissions
     mkdir -p "$CONFIG_DIR"
@@ -463,6 +459,30 @@ install_systemd_units() {
     print_success "Systemd units installed and socket activated"
 }
 
+# Install the daemon binary
+install_daemon() {
+    print_header "Installing Daemon"
+
+    local daemon_src="target/release/tapauthd"
+    local daemon_dest="/usr/bin/tapauthd"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would install daemon binary"
+        show_file_copy "$daemon_src" "$daemon_dest"
+        show_command "chmod 755 $daemon_dest" "Set daemon executable permissions"
+        return
+    fi
+
+    if [[ ! -f "$daemon_src" ]]; then
+        print_error "Daemon not built: $daemon_src not found"
+        print_info "Run the build step before installing"
+        exit 1
+    fi
+
+    print_info "Installing daemon to $daemon_dest"
+    install -m 755 "$daemon_src" "$daemon_dest"
+}
+
 # Build components
 build_components() {
     print_header "Building TapAuth Components"
@@ -470,23 +490,14 @@ build_components() {
     local build_flags="--release"
     local rustflags="-Ctarget-cpu=native -Copt-level=3"
     
-    # Determine features to build with
-    local pam_features=""
+    # Determine daemon features to build with
+    local daemon_features=""
     if [[ "$USE_BLE" == true ]]; then
-        pam_features="--features ble"
-        print_info "Building with Bluetooth support (direct BlueZ access)"
+        daemon_features="--features ble"
+        print_info "Building daemon with Bluetooth support (via BlueZ/DBus)"
     else
-        pam_features="--no-default-features"
-        print_info "Building without Bluetooth support (UDP only)"
-    fi
-    
-    if [[ "$USE_TPM" == true ]]; then
-        if [[ "$USE_BLE" == true ]]; then
-            pam_features="--features ble,tpm"
-        else
-            pam_features="--features tpm"
-        fi
-        print_info "Building with TPM support"
+        daemon_features="--no-default-features"
+        print_info "Building daemon without Bluetooth support (UDP only)"
     fi
     
     print_info "Building with maximum optimizations for host architecture"
@@ -495,7 +506,7 @@ build_components() {
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would build components"
         echo ""
-        print_info "PAM module build flags: $pam_features"
+        print_info "Daemon build flags: $daemon_features"
         
         # Show which user would be used for building
         if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
@@ -537,10 +548,15 @@ build_components() {
     
     export RUSTFLAGS="$rustflags"
     
+    # Build daemon first
+    print_info "Building daemon with features: $daemon_features"
+    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p tapauthd $daemon_features
+    print_success "Daemon built"
+
     # Build PAM module
     if [[ "$INSTALL_PAM" == true ]]; then
-        print_info "Building PAM module with features: $pam_features"
-        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam $pam_features
+        print_info "Building PAM module"
+        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam
         print_success "PAM module built"
     fi
     
@@ -794,6 +810,7 @@ create_summary() {
     if [[ "$INSTALL_CONFIG_GUI" == true ]]; then
         echo "  - Config GUI: $CONFIG_GUI_PATH"
     fi
+    echo "  - Daemon: /usr/bin/tapauthd"
     echo "  - Configuration: $CONFIG_DIR"
     echo "  - Daemon socket: /run/tapauthd/tapauthd.sock (root:tapauthd-clients, 0660)"
     echo ""
@@ -861,10 +878,19 @@ main() {
     fi
     
     create_system_users
+    install_daemon
     install_pam
     configure_pam
     install_config_gui
     install_systemd_units
+    
+    # Restore SELinux contexts if available
+    if command -v restorecon &> /dev/null; then
+        print_info "Restoring SELinux contexts"
+        restorecon -RF /var/lib/tapauth || true
+        restorecon -RF /run/tapauthd || true
+        restorecon /run/tapauthd/tapauthd.sock || true
+    fi
     
     if [[ "$DRY_RUN" == true ]]; then
         echo ""

@@ -122,9 +122,10 @@ impl AuthSession {
         // Check if we have any paired devices
         let paired_servers = self.state.config_manager.load_paired_servers()?;
         if paired_servers.is_empty() {
+            // No configuration/pairings yet: do not block other PAM methods
             return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Denied as i32,
-                detail: "No paired devices".to_string(),
+                outcome: ipc::PamOutcome::Ignore as i32,
+                detail: "No paired devices configured".to_string(),
                 challenge: self.challenge.to_vec(),
             });
         }
@@ -138,7 +139,7 @@ impl AuthSession {
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
             return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Denied as i32,
+                outcome: ipc::PamOutcome::Ignore as i32,
                 detail: format!("No servers authorized for user {}", self.username),
                 challenge: self.challenge.to_vec(),
             });

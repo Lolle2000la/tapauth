@@ -35,11 +35,7 @@ class PairingClient(private val context: Context) {
      * Initiate pairing with desktop client Returns intermediate state with socket and SAS for user
      * verification
      */
-    suspend fun initiatePairing(
-        ipAddress: String,
-        port: Int,
-        clientPublicKeyHex: String,
-    ): PairingInitResult =
+    suspend fun initiatePairing(ipAddress: String, port: Int): PairingInitResult =
         withContext(Dispatchers.IO) {
             var socket: Socket? = null
 
@@ -123,7 +119,6 @@ class PairingClient(private val context: Context) {
                 PairingInitResult.AwaitingSASVerification(
                     socket = socket,
                     psk = psk,
-                    clientPublicKey = clientPublicKey,
                     clientEd25519Key = clientEd25519Key,
                     clientDeviceName = clientDeviceName,
                     sas = sas,
@@ -142,7 +137,6 @@ class PairingClient(private val context: Context) {
     suspend fun completePairing(
         socket: Socket,
         psk: ByteArray,
-        clientPublicKey: ByteArray,
         clientEd25519Key: ByteArray,
         clientDeviceName: String,
         sasConfirmed: Boolean,
@@ -181,7 +175,6 @@ class PairingClient(private val context: Context) {
                 val csk =
                     dev.rourunisen.tapauth.crypto.decryptWithPsk(
                         psk = psk,
-                        context = "csk_exchange",
                         ciphertext = encryptedCsk,
                     )
 
@@ -274,7 +267,6 @@ sealed class PairingInitResult {
     data class AwaitingSASVerification(
         val socket: Socket,
         val psk: ByteArray,
-        val clientPublicKey: ByteArray,
         val clientEd25519Key: ByteArray,
         val clientDeviceName: String,
         val sas: String,

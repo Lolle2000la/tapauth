@@ -50,21 +50,19 @@ object TapAuthCrypto {
      * Decrypt data with PSK (used during pairing)
      *
      * @param psk Pairing Symmetric Key (32 bytes)
-     * @param context Context string for nonce derivation
      * @param ciphertext Encrypted data
      * @return Decrypted plaintext
      */
-    external fun decryptWithPsk(psk: ByteArray, context: String, ciphertext: ByteArray): ByteArray
+    external fun decryptWithPsk(psk: ByteArray, ciphertext: ByteArray): ByteArray
 
     /**
      * Encrypt data with PSK (used during pairing)
      *
      * @param psk Pairing Symmetric Key (32 bytes)
-     * @param context Context string for nonce derivation
      * @param plaintext Data to encrypt
      * @return Encrypted ciphertext
      */
-    external fun encryptWithPsk(psk: ByteArray, context: String, plaintext: ByteArray): ByteArray
+    external fun encryptWithPsk(psk: ByteArray, plaintext: ByteArray): ByteArray
 
     /**
      * Compute SHA-256 hash
@@ -415,13 +413,13 @@ fun generateSAS(sharedSecret: ByteArray, clientPublic: ByteArray, serverPublic: 
 }
 
 /** Decrypt data with PSK */
-fun decryptWithPsk(psk: ByteArray, context: String, ciphertext: ByteArray): ByteArray {
-    return TapAuthCrypto.decryptWithPsk(psk, context, ciphertext)
+fun decryptWithPsk(psk: ByteArray, ciphertext: ByteArray): ByteArray {
+    return TapAuthCrypto.decryptWithPsk(psk, ciphertext)
 }
 
 /** Encrypt data with PSK */
-fun encryptWithPsk(psk: ByteArray, context: String, plaintext: ByteArray): ByteArray {
-    return TapAuthCrypto.encryptWithPsk(psk, context, plaintext)
+fun encryptWithPsk(psk: ByteArray, plaintext: ByteArray): ByteArray {
+    return TapAuthCrypto.encryptWithPsk(psk, plaintext)
 }
 
 /** Compute SHA-256 hash and return as hex string */

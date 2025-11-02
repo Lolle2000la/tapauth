@@ -50,8 +50,7 @@ fun PairingScreen(
                     }
 
             // Phase 1: Initiate pairing and get SAS for verification
-            val initResult =
-                pairingClient.initiatePairing(ipAddress, pairingUrl.port, pairingUrl.publicKey)
+            val initResult = pairingClient.initiatePairing(ipAddress, pairingUrl.port)
 
             when (initResult) {
                 is dev.rourunisen.tapauth.network.PairingInitResult.AwaitingSASVerification -> {
@@ -60,7 +59,6 @@ fun PairingScreen(
                             sas = initResult.sas,
                             socket = initResult.socket,
                             psk = initResult.psk,
-                            clientPublicKey = initResult.clientPublicKey,
                             clientEd25519Key = initResult.clientEd25519Key,
                             clientDeviceName = initResult.clientDeviceName,
                         )
@@ -106,7 +104,6 @@ fun PairingScreen(
                                     pairingClient.completePairing(
                                         socket = state.socket,
                                         psk = state.psk,
-                                        clientPublicKey = state.clientPublicKey,
                                         clientEd25519Key = state.clientEd25519Key,
                                         clientDeviceName = state.clientDeviceName,
                                         sasConfirmed = true,
@@ -313,7 +310,6 @@ private sealed class PairingState {
         val sas: String,
         val socket: java.net.Socket,
         val psk: ByteArray,
-        val clientPublicKey: ByteArray,
         val clientEd25519Key: ByteArray,
         val clientDeviceName: String,
     ) : PairingState()

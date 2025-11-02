@@ -49,7 +49,7 @@ This installs everything with default settings (including PAM configuration for 
 - **Privilege Separation**: Builds run as the original user (via `$SUDO_USER`) even when script is run with `sudo`, preventing root-owned files in cargo cache
 - **Optimized Build**: Builds all components in release mode with `-C target-cpu=native -C opt-level=3`
 - **Component Selection**: Choose which components to install (PAM module, Config GUI)
-- **Bluetooth Support**: Optional - can build with or without Bluetooth (BLE) support
+- **Bluetooth Support (daemon)**: Optional - build the daemon with or without Bluetooth (BLE) support
 - **PAM Configuration**: Optionally configure PAM for login, sudo, and polkit
 - **TPM Support**: Optional TPM integration for secure key storage
 - **Interactive Mode**: User-friendly prompts for all options
@@ -66,7 +66,7 @@ OPTIONS:
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-pam                Don't install PAM module
-    --no-ble                Build without Bluetooth support (UDP only)
+    --no-ble                Build daemon without Bluetooth support (UDP only)
     --no-gui                Don't install configuration GUI
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
@@ -88,7 +88,7 @@ sudo ./install.sh
 sudo ./install.sh --non-interactive --configure-login --configure-sudo
 ```
 
-#### Install PAM Module Without Bluetooth
+#### Install Without BLE (daemon only)
 ```bash
 sudo ./install.sh --no-ble --configure-login
 ```
@@ -123,8 +123,10 @@ Installation paths are automatically detected based on your distribution:
 | Component | Typical Location |
 |-----------|----------|
 | PAM Module | `/lib64/security/pam_tapauth.so` (Fedora/RHEL)<br>`/usr/lib/security/pam_tapauth.so` (Arch)<br>`/lib/x86_64-linux-gnu/security/pam_tapauth.so` (Ubuntu/Debian) |
+| Daemon | `/usr/bin/tapauthd` |
+| Socket | `/run/tapauthd/tapauthd.sock` (root:tapauthd-clients, 0660) |
 | Config GUI | `/usr/bin/tapauth-config` |
-| Configuration | `/etc/tapauth/` |
+| Configuration | `/var/lib/tapauth/` |
 | Desktop Entry | `/usr/share/applications/tapauth-config.desktop` |
 | Polkit Policy | `/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy` |
 
@@ -290,8 +292,7 @@ Then run the install script normally with `sudo ./install.sh` - it will now buil
 ### Distribution-Specific Notes
 
 #### Fedora/RHEL/CentOS
-- SELinux may need to be configured to allow PAM modules
-- Check: `sudo setenforce 0` (temporary) or configure SELinux policies
+- SELinux: No custom policy is shipped. The installer restores default labels on `/var/lib/tapauth` and `/run/tapauthd` (via `restorecon` if available).
 
 #### Ubuntu/Debian
 - Ensure `libpam0g-dev` is installed for PAM development
@@ -336,11 +337,11 @@ For detailed Bluetooth diagnostics, see `scripts/bluetooth-check.sh`.
 If you see permission errors:
 ```bash
 # Check file ownership
-ls -la /etc/tapauth/
+ls -la /var/lib/tapauth/
 ls -la $(find /lib* /usr/lib* -name pam_tapauth.so 2>/dev/null | head -1)
 
 # Fix if needed
-sudo chmod 700 /etc/tapauth
+sudo chmod 700 /var/lib/tapauth
 ```
 
 ## Advanced Usage
@@ -376,9 +377,9 @@ If you enabled TPM support, ensure:
 ### Multiple Users
 
 When multiple users need to use TapAuth:
-1. Each user should run `tapauth-config` to pair their own devices
-2. User-specific pairings are stored in `/etc/tapauth/` with appropriate permissions
-3. Each user's paired devices are isolated from others
+1. Each user runs `tapauth-config` (it can elevate via polkit when needed) to pair their device.
+2. Pairings and keys are stored system-wide under `/var/lib/tapauth/` and managed by the daemon user `tapauthd`.
+3. Access is constrained by each pairing’s `allowed_users` list; each user’s username must be added during pairing.
 
 ## Security Considerations
 
@@ -391,9 +392,9 @@ The install script adds TapAuth as a `sufficient` module, which means:
 
 ### Key Storage
 
-- Keys are stored in `/etc/tapauth/` with mode `700` (root only)
-- If TPM is enabled, keys are sealed to the TPM
-- Without TPM, keys are protected by filesystem permissions
+- Keys and config are stored in `/var/lib/tapauth/` with directory mode `700` and files `600`, owned by `tapauthd`.
+- If TPM is enabled during configuration, TPM settings are recorded in config (implementation may be limited in this version).
+- Without TPM, keys are protected by filesystem permissions.
 
 ### First-Time Setup
 
@@ -413,7 +414,7 @@ The install script adds TapAuth as a `sufficient` module, which means:
 ### What Gets Preserved
 
 By default, the uninstall script preserves:
-- User encryption keys in `/etc/tapauth/`
+- User encryption keys in `/var/lib/tapauth/`
 - User-specific configuration in `~/.config/tapauth/`
 - PAM configuration (unless explicitly requested to remove)
 
@@ -429,6 +430,12 @@ If you encounter issues:
 2. Review system logs: `journalctl -xe`
 3. For BLE issues, run: `./scripts/bluetooth-check.sh`
 4. Verify PAM configuration: `cat /etc/pam.d/login | grep tapauth`
+
+### Socket access policy
+
+The IPC socket `/run/tapauthd/tapauthd.sock` is created as `root:tapauthd-clients` with mode `0660`.
+- The installer creates the group `tapauthd-clients` but does not add any users to it by default.
+- System services with dedicated users can be added to this group manually if they need non-root access to the socket.
 
 ## License
 
