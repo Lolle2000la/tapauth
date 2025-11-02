@@ -300,6 +300,7 @@ impl<'a> PamConversation<'a> {
     }
 
     /// Send an error message to the user
+    #[allow(dead_code)]
     pub fn error(&self, message: &str) -> Result<(), c_int> {
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
     }
@@ -330,6 +331,7 @@ impl<'a> PamConversation<'a> {
     ///
     /// This is a convenience method that won't fail if the message can't be sent.
     /// Useful for non-critical user feedback.
+    #[allow(dead_code)]
     pub fn try_error(&self, message: &str) {
         if let Err(e) = self.error(message) {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
