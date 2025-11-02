@@ -245,8 +245,9 @@ fn map_pam_outcome(
             pam_sys::PAM_SUCCESS
         }
         shared::ipc::pb::PamOutcome::Denied => {
-            tracing::info!("Authentication denied for user: {}", username);
-            pam_sys::PAM_IGNORE
+            tracing::info!("Authentication explicitly denied for user: {}", username);
+            pam_conv.try_info("TapAuth: Authentication denied by server");
+            pam_sys::PAM_PERM_DENIED
         }
         shared::ipc::pb::PamOutcome::Timeout => {
             tracing::info!("Authentication timed out for user: {}", username);
