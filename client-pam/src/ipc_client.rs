@@ -11,7 +11,6 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
-const IO_TIMEOUT_MS: u64 = 2000; // write and short reads
 
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
@@ -46,7 +45,7 @@ impl IpcClient {
     /// Connect and set nonblocking immediately (for poll/select driven loops)
     pub fn connect_nonblocking() -> Result<Self, IpcError> {
         let mut cli = Self::connect()?;
-        cli.stream.set_nonblocking(true)?;
+        cli.set_nonblocking(true)?;
         Ok(cli)
     }
 
