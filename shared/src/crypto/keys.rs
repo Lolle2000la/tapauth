@@ -1,13 +1,12 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{rngs::OsRng, TryRngCore};
+use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::ZeroizeOnDrop;
 
 /// Ed25519 key pair for signing
-#[derive(Clone)]
 pub struct Ed25519KeyPair {
-    pub signing_key: SigningKey,
+    signing_key_bytes: SecretBox<[u8; 32]>,
     pub verifying_key: VerifyingKey,
 }
 
@@ -20,7 +19,7 @@ impl Ed25519KeyPair {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         Self {
-            signing_key,
+            signing_key_bytes: SecretBox::new(Box::new(seed)),
             verifying_key,
         }
     }
@@ -30,26 +29,41 @@ impl Ed25519KeyPair {
         let signing_key = SigningKey::from_bytes(bytes);
         let verifying_key = signing_key.verifying_key();
         Ok(Self {
-            signing_key,
+            signing_key_bytes: SecretBox::new(Box::new(*bytes)),
             verifying_key,
         })
     }
 
     /// Get signing key bytes
     pub fn signing_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+        *self.signing_key_bytes.expose_secret()
     }
-
+    /// Sign arbitrary data using the signing key
+    pub fn sign(&self, data: &[u8]) -> ed25519_dalek::Signature {
+        use ed25519_dalek::Signer;
+        let sk = SigningKey::from_bytes(self.signing_key_bytes.expose_secret());
+        sk.sign(data)
+    }
     /// Get verifying key bytes
     pub fn verifying_key_bytes(&self) -> [u8; 32] {
         self.verifying_key.to_bytes()
     }
 }
+impl Clone for Ed25519KeyPair {
+    fn clone(&self) -> Self {
+        let bytes = *self.signing_key_bytes.expose_secret();
+        let signing_key = SigningKey::from_bytes(&bytes);
+        let verifying_key = signing_key.verifying_key();
+        Ed25519KeyPair {
+            signing_key_bytes: SecretBox::new(Box::new(bytes)),
+            verifying_key,
+        }
+    }
+}
 
 /// X25519 key pair for key exchange
-#[derive(Clone)]
 pub struct X25519KeyPair {
-    secret: X25519StaticSecret,
+    secret_bytes: SecretBox<[u8; 32]>,
     public: X25519PublicKey,
 }
 
@@ -61,14 +75,20 @@ impl X25519KeyPair {
         getrandom::fill(&mut sk).expect("getrandom failed");
         let secret = X25519StaticSecret::from(sk);
         let public = X25519PublicKey::from(&secret);
-        Self { secret, public }
+        Self {
+            secret_bytes: SecretBox::new(Box::new(sk)),
+            public,
+        }
     }
 
     /// Create from secret key bytes
     pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
         let secret = X25519StaticSecret::from(bytes);
         let public = X25519PublicKey::from(&secret);
-        Self { secret, public }
+        Self {
+            secret_bytes: SecretBox::new(Box::new(bytes)),
+            public,
+        }
     }
 
     /// Get public key bytes
@@ -78,20 +98,20 @@ impl X25519KeyPair {
 
     /// Get secret key bytes (use with caution!)
     pub fn secret_key_bytes(&self) -> [u8; 32] {
-        self.secret.to_bytes()
+        *self.secret_bytes.expose_secret()
     }
 
     /// Perform Diffie-Hellman key exchange
     pub fn diffie_hellman(&self, their_public: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
         let their_public_key = X25519PublicKey::from(*their_public);
-        let shared_secret = self.secret.diffie_hellman(&their_public_key);
+        let secret = X25519StaticSecret::from(*self.secret_bytes.expose_secret());
+        let shared_secret = secret.diffie_hellman(&their_public_key);
         Ok(shared_secret.to_bytes())
     }
 }
 
 /// Client Symmetric Key (CSK) - 32 bytes for AES-256
-#[derive(Clone, Serialize, Deserialize, ZeroizeOnDrop)]
-pub struct ClientSymmetricKey([u8; 32]);
+pub struct ClientSymmetricKey(SecretBox<[u8; 32]>);
 
 impl ClientSymmetricKey {
     /// Generate a new random CSK
@@ -100,38 +120,64 @@ impl ClientSymmetricKey {
         let mut rng = OsRng;
         rng.try_fill_bytes(&mut key)
             .map_err(|_| CryptoError::RandomGenerationFailed)?;
-        Ok(Self(key))
+        Ok(Self(SecretBox::new(Box::new(key))))
     }
 
     /// Create from bytes
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self(SecretBox::new(Box::new(bytes)))
     }
 
-    /// Get key bytes
+    /// Get key bytes (exposes secret for cryptographic operations)
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        self.0.expose_secret()
     }
 
-    /// Convert to bytes (consuming self)
+    /// Convert to bytes (consuming self, exposes secret)
     pub fn to_bytes(self) -> [u8; 32] {
-        self.0
+        *self.0.expose_secret()
+    }
+}
+
+impl Clone for ClientSymmetricKey {
+    fn clone(&self) -> Self {
+        let bytes = *self.0.expose_secret();
+        ClientSymmetricKey(SecretBox::new(Box::new(bytes)))
+    }
+}
+
+// Manual Serialize/Deserialize for ClientSymmetricKey since Secret doesn't implement those traits by default
+impl Serialize for ClientSymmetricKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientSymmetricKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(Self::from_bytes(bytes))
     }
 }
 
 /// Pairing Symmetric Key (PSK) - ephemeral key for pairing only
-#[derive(Clone, ZeroizeOnDrop)]
-pub struct PairingSymmetricKey([u8; 32]);
+pub struct PairingSymmetricKey(SecretBox<[u8; 32]>);
 
 impl PairingSymmetricKey {
     /// Create from derived key material
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self(SecretBox::new(Box::new(bytes)))
     }
 
-    /// Get key bytes
+    /// Get key bytes (exposes secret for cryptographic operations)
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        self.0.expose_secret()
     }
 }
 

@@ -75,8 +75,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     _class: JClass,
 ) -> jobjectArray {
     let keypair = crypto::Ed25519KeyPair::generate();
-    let private_bytes = keypair.signing_key.to_bytes();
-    let public_bytes = keypair.verifying_key.to_bytes();
+    let private_bytes = keypair.signing_key_bytes();
+    let public_bytes = keypair.verifying_key_bytes();
 
     match make_keypair_array(&mut env, &private_bytes, &public_bytes) {
         Some(array) => array,

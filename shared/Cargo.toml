@@ -25,6 +25,7 @@ sha2 = "0.10"
 hmac = "0.12"
 rand = "0.9"
 zeroize = { version = "1.8", features = ["derive"] }
+secrecy.workspace = true
 
 # Serialization
 prost.workspace = true

@@ -1,10 +1,10 @@
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use super::{CryptoError, Ed25519KeyPair};
 
 /// Sign data using Ed25519
 pub fn sign_ed25519(keypair: &Ed25519KeyPair, data: &[u8]) -> Vec<u8> {
-    let signature = keypair.signing_key.sign(data);
+    let signature = keypair.sign(data);
     signature.to_bytes().to_vec()
 }
 
