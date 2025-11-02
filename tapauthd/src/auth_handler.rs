@@ -39,6 +39,8 @@ pub enum AuthHandlerError {
     Timeout,
     #[error("Authentication denied")]
     Denied,
+    #[error("Authentication explicitly denied by user")]
+    ExplicitDenial,
     #[error("No paired devices")]
     NoPairedDevices,
     #[error("BLE error: {0}")]
@@ -82,6 +84,7 @@ pub struct AuthSession {
     state: Arc<DaemonState>,
     username: String,
     challenge: [u8; 32],
+    #[allow(dead_code)] // Used in select! macro via cancel_rx local variable
     cancel_rx: Option<oneshot::Receiver<()>>,
     #[cfg(feature = "ble")]
     cancel_registry: Option<Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>>,
@@ -174,6 +177,14 @@ impl AuthSession {
                 detail: format!("Authenticated user {} successfully", self.username),
                 challenge: self.challenge.to_vec(),
             }),
+            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                tracing::warn!("Authentication explicitly denied by user for: {}", self.username);
+                Ok(ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Denied as i32,
+                    detail: "Authentication explicitly denied by user".to_string(),
+                    challenge: self.challenge.to_vec(),
+                })
+            }
             Ok(Err(e)) => {
                 tracing::error!("Authentication failed: {}", e);
                 Ok(ipc::PamAuthenticateResponse {
@@ -287,6 +298,26 @@ impl AuthSession {
                         udp_abort.abort();
                         Ok(())
                     }
+                    Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                        tracing::warn!("BLE authentication explicitly denied by user");
+                        // Broadcast cancellation to other devices
+                        udp_abort.abort();
+                        if let Some(ble_shared) = &ble_transport_shared {
+                            let _ = ble_shared.finalize().await;
+                        }
+                        
+                        let port = self.state.config_manager.load_config().map(|c| c.udp_port).unwrap_or(36692);
+                        let _ = shared::network::send_udp_broadcast(&cancel_socket, port, &cancel_packet).await;
+                        if shared::network::is_ipv6_available() {
+                            let _ = shared::network::send_udp_multicast_all_interfaces(
+                                shared::network::IPV6_MULTICAST_ADDR,
+                                port,
+                                &cancel_packet
+                            ).await;
+                        }
+                        
+                        Err(AuthHandlerError::ExplicitDenial)
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!("BLE authentication failed: {}", e);
                         // Wait for UDP
@@ -299,6 +330,24 @@ impl AuthSession {
                                 }
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
+                            }
+                            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                                // UDP also got explicit denial, broadcast cancellation
+                                if let Some(ble_shared) = &ble_transport_shared {
+                                    let _ = ble_shared.finalize().await;
+                                }
+                                
+                                let port = self.state.config_manager.load_config().map(|c| c.udp_port).unwrap_or(36692);
+                                let _ = shared::network::send_udp_broadcast(&cancel_socket, port, &cancel_packet).await;
+                                if shared::network::is_ipv6_available() {
+                                    let _ = shared::network::send_udp_multicast_all_interfaces(
+                                        shared::network::IPV6_MULTICAST_ADDR,
+                                        port,
+                                        &cancel_packet
+                                    ).await;
+                                }
+                                
+                                Err(AuthHandlerError::ExplicitDenial)
                             }
                             Ok(Err(e)) => {
                                 tracing::error!("UDP authentication also failed: {}", e);
@@ -330,6 +379,26 @@ impl AuthSession {
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                         Ok(())
                     }
+                    Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                        tracing::warn!("UDP authentication explicitly denied by user");
+                        // Broadcast cancellation to other devices
+                        ble_abort.abort();
+                        if let Some(ble_shared) = &ble_transport_shared {
+                            let _ = ble_shared.finalize().await;
+                        }
+                        
+                        let port = self.state.config_manager.load_config().map(|c| c.udp_port).unwrap_or(36692);
+                        let _ = shared::network::send_udp_broadcast(&cancel_socket, port, &cancel_packet).await;
+                        if shared::network::is_ipv6_available() {
+                            let _ = shared::network::send_udp_multicast_all_interfaces(
+                                shared::network::IPV6_MULTICAST_ADDR,
+                                port,
+                                &cancel_packet
+                            ).await;
+                        }
+                        
+                        Err(AuthHandlerError::ExplicitDenial)
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!("UDP authentication failed: {}", e);
                         // Wait for BLE
@@ -342,6 +411,24 @@ impl AuthSession {
                                 }
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
+                            }
+                            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                                // BLE also got explicit denial, broadcast cancellation
+                                if let Some(ble_shared) = &ble_transport_shared {
+                                    let _ = ble_shared.finalize().await;
+                                }
+                                
+                                let port = self.state.config_manager.load_config().map(|c| c.udp_port).unwrap_or(36692);
+                                let _ = shared::network::send_udp_broadcast(&cancel_socket, port, &cancel_packet).await;
+                                if shared::network::is_ipv6_available() {
+                                    let _ = shared::network::send_udp_multicast_all_interfaces(
+                                        shared::network::IPV6_MULTICAST_ADDR,
+                                        port,
+                                        &cancel_packet
+                                    ).await;
+                                }
+                                
+                                Err(AuthHandlerError::ExplicitDenial)
                             }
                             Ok(Err(e)) => {
                                 tracing::error!("BLE authentication also failed: {}", e);
@@ -483,7 +570,7 @@ impl AuthSession {
                                 }
                             }
                             Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
-                                tracing::warn!("Authentication denied by server: {}", server_addr);
+                                tracing::warn!("Authentication explicitly denied by server: {}", server_addr);
                                 
                                 // Send confirmation even for denial
                                 let confirmation = create_grant_confirmation(keypair, challenge)?;
@@ -491,9 +578,9 @@ impl AuthSession {
                                 let conf_packet = create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
                                 
                                 transport.send_confirmation(&conf_packet).await?;
-                                // Finalize transport before returning denial
+                                // Finalize transport before returning explicit denial
                                 let _ = transport.finalize().await;
-                                return Err(AuthHandlerError::Denied);
+                                return Err(AuthHandlerError::ExplicitDenial);
                             }
                             _ => {
                                 tracing::debug!("Unexpected message type, waiting for valid response");
