@@ -15,7 +15,10 @@ use shared::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
+
+#[cfg(feature = "ble")]
+use tokio::sync::Mutex;
 
 #[cfg(feature = "ble")]
 use shared::crypto::generate_current_temporal_identifier_ble;
@@ -80,7 +83,10 @@ pub struct AuthSession {
     username: String,
     challenge: [u8; 32],
     cancel_rx: Option<oneshot::Receiver<()>>,
+    #[cfg(feature = "ble")]
     cancel_registry: Option<Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>>,
+    #[cfg(not(feature = "ble"))]
+    cancel_registry: Option<Arc<HashMap<String, oneshot::Sender<()>>>>,
     request_id: Option<String>,
 }
 
@@ -104,7 +110,10 @@ impl AuthSession {
         mut self,
         timeout_seconds: Option<u32>,
         request_id: Option<String>,
+        #[cfg(feature = "ble")]
         cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+        #[cfg(not(feature = "ble"))]
+        cancel_registry: Arc<HashMap<String, oneshot::Sender<()>>>,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
@@ -208,9 +217,9 @@ impl AuthSession {
         let ble_attempt =
             BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await;
         
-        let udp_transport_shared = Arc::new(Mutex::new(udp_transport));
-        let ble_transport_shared: Option<Arc<Mutex<BleTransport>>> = match ble_attempt {
-            Ok(ble) => Some(Arc::new(Mutex::new(ble))),
+        let udp_transport_shared = Arc::new(udp_transport);
+        let ble_transport_shared: Option<Arc<BleTransport>> = match ble_attempt {
+            Ok(ble) => Some(Arc::new(ble)),
             Err(e) => {
                 tracing::warn!("BLE initialization failed ({}). Falling back to UDP-only.", e);
                 None
@@ -271,10 +280,10 @@ impl AuthSession {
                         tracing::info!("BLE authentication succeeded");
                         // Notify other devices via cancel and finalize resources
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.lock().await.send_cancel(&cancel_packet).await;
-                            let _ = ble_shared.lock().await.finalize().await;
+                            let _ = ble_shared.send_cancel(&cancel_packet).await;
+                            let _ = ble_shared.finalize().await;
                         }
-                        let _ = udp_transport_shared.lock().await.send_cancel(&cancel_packet).await;
+                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                         udp_abort.abort();
                         Ok(())
                     }
@@ -285,10 +294,10 @@ impl AuthSession {
                             Ok(Ok(())) => {
                                 tracing::info!("UDP authentication succeeded");
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.lock().await.send_cancel(&cancel_packet).await;
-                                    let _ = ble_shared.lock().await.finalize().await;
+                                    let _ = ble_shared.send_cancel(&cancel_packet).await;
+                                    let _ = ble_shared.finalize().await;
                                 }
-                                let _ = udp_transport_shared.lock().await.send_cancel(&cancel_packet).await;
+                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
                             }
                             Ok(Err(e)) => {
@@ -315,10 +324,10 @@ impl AuthSession {
                         ble_abort.abort();
                         // Notify via cancel and finalize BLE if initialized
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.lock().await.send_cancel(&cancel_packet).await;
-                            let _ = ble_shared.lock().await.finalize().await;
+                            let _ = ble_shared.send_cancel(&cancel_packet).await;
+                            let _ = ble_shared.finalize().await;
                         }
-                        let _ = udp_transport_shared.lock().await.send_cancel(&cancel_packet).await;
+                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                         Ok(())
                     }
                     Ok(Err(e)) => {
@@ -328,10 +337,10 @@ impl AuthSession {
                             Ok(Ok(())) => {
                                 tracing::info!("BLE authentication succeeded");
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.lock().await.send_cancel(&cancel_packet).await;
-                                    let _ = ble_shared.lock().await.finalize().await;
+                                    let _ = ble_shared.send_cancel(&cancel_packet).await;
+                                    let _ = ble_shared.finalize().await;
                                 }
-                                let _ = udp_transport_shared.lock().await.send_cancel(&cancel_packet).await;
+                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
                             }
                             Ok(Err(e)) => {
@@ -375,7 +384,7 @@ impl AuthSession {
                 // Disconnect BLE clients explicitly
                 if let Some(ble_shared) = &ble_transport_shared {
                     tracing::debug!("Disconnecting BLE clients");
-                    let _ = ble_shared.lock().await.finalize().await;
+                    let _ = ble_shared.finalize().await;
                 }
                 
                 // Give network stack time to transmit packets
@@ -396,13 +405,14 @@ impl AuthSession {
         
         let config = self.state.config_manager.load_config()?;
         let transport = UdpTransport::new(config.udp_port).await?;
-        let transport_shared = Arc::new(Mutex::new(transport));
+        let transport_arc = Arc::new(transport);
         let cfg = Arc::new(ClientConfigManager::new());
-        Self::authenticate_with_transport(transport_shared, packet, &self.state.csk, &self.state.keypair, &self.challenge, cfg).await
+        Self::authenticate_with_transport(transport_arc, packet, &self.state.csk, &self.state.keypair, &self.challenge, cfg).await
     }
     
-    async fn authenticate_with_transport<T: Transport + Send + 'static>(
-        transport: Arc<Mutex<T>>,
+    /// Authenticate using any Transport
+    async fn authenticate_with_transport<T: Transport + Send + Sync + 'static>(
+        transport: Arc<T>,
         packet: &EncryptedPacket,
         csk: &ClientSymmetricKey,
         keypair: &Ed25519KeyPair,
@@ -416,30 +426,23 @@ impl AuthSession {
         loop {
             if start.elapsed() >= timeout {
                 // Ensure transport is finalized before returning timeout
-                let _ = transport.lock().await.finalize().await;
+                let _ = transport.finalize().await;
                 return Err(AuthHandlerError::Timeout);
             }
             
             // Send request
-            {
-                let send_res = transport.lock().await.send_request(packet).await;
-                if let Err(e) = send_res {
-                    let _ = transport.lock().await.finalize().await;
-                    return Err(e);
-                }
+            if let Err(e) = transport.send_request(packet).await {
+                let _ = transport.finalize().await;
+                return Err(e);
             }
             
             // Wait for response with retry interval
             let retry_interval = shared::network::get_client_retry_interval(attempt);
             
             loop {
-                let recv_result = {
-                    transport.lock().await.receive_response(retry_interval).await
-                };
-                
-                match recv_result {
+                match transport.receive_response(retry_interval).await {
                     Err(e) => {
-                        let _ = transport.lock().await.finalize().await;
+                        let _ = transport.finalize().await;
                         return Err(e);
                     }
                     Ok(ReceiveResult::Response(response_packet, server_addr)) => {
@@ -471,9 +474,9 @@ impl AuthSession {
                                     let confirmation = create_grant_confirmation(keypair, challenge)?;
                                     let wrapper = wrap_grant_confirmation(confirmation);
                                     let conf_packet = create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
-                                    transport.lock().await.send_confirmation(&conf_packet).await?;
+                                    transport.send_confirmation(&conf_packet).await?;
                                     // Finalize transport on success
-                                    let _ = transport.lock().await.finalize().await;
+                                    let _ = transport.finalize().await;
                                     return Ok(());
                                 } else {
                                     tracing::warn!("Grant verification failed; continuing to wait for valid response");
@@ -487,9 +490,9 @@ impl AuthSession {
                                 let wrapper = wrap_grant_confirmation(confirmation);
                                 let conf_packet = create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
                                 
-                                transport.lock().await.send_confirmation(&conf_packet).await?;
+                                transport.send_confirmation(&conf_packet).await?;
                                 // Finalize transport before returning denial
-                                let _ = transport.lock().await.finalize().await;
+                                let _ = transport.finalize().await;
                                 return Err(AuthHandlerError::Denied);
                             }
                             _ => {
@@ -508,3 +511,4 @@ impl AuthSession {
     
     
 }
+

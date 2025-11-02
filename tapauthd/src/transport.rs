@@ -40,7 +40,7 @@ pub trait Transport {
     ///
     /// # Returns
     /// Ok(()) if the send was successful, Err otherwise
-    async fn send_request(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError>;
+    async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError>;
 
     /// Try to receive a response packet with timeout
     ///
@@ -51,7 +51,7 @@ pub trait Transport {
     /// * `ReceiveResult::Response` with packet and address if response received
     /// * `ReceiveResult::Timeout` if no response within timeout
     /// * `Err` on error
-    async fn receive_response(&mut self, timeout: Duration) -> Result<ReceiveResult, AuthError>;
+    async fn receive_response(&self, timeout: Duration) -> Result<ReceiveResult, AuthError>;
 
     /// Send a confirmation packet (GrantConfirmation)
     ///
@@ -60,7 +60,7 @@ pub trait Transport {
     ///
     /// # Returns
     /// Ok(()) if the send was successful, Err otherwise
-    async fn send_confirmation(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError>;
+    async fn send_confirmation(&self, packet: &EncryptedPacket) -> Result<(), AuthError>;
 
     /// Send a cancel packet (AuthenticationCancel)
     ///
@@ -69,7 +69,7 @@ pub trait Transport {
     ///
     /// # Returns
     /// Ok(()) if the send was successful, Err otherwise
-    async fn send_cancel(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError>;
+    async fn send_cancel(&self, packet: &EncryptedPacket) -> Result<(), AuthError>;
 
     /// Get a human-readable name for this transport (for logging)
     fn name(&self) -> &'static str;
@@ -78,7 +78,7 @@ pub trait Transport {
     ///
     /// Default is a no-op. Transports with long-lived connections (e.g., BLE)
     /// should override this to explicitly disconnect and release resources.
-    async fn finalize(&mut self) -> Result<(), AuthError> {
+    async fn finalize(&self) -> Result<(), AuthError> {
         Ok(())
     }
 }
@@ -101,7 +101,7 @@ impl UdpTransport {
 }
 
 impl Transport for UdpTransport {
-    async fn send_request(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use shared::network::{
             is_ipv6_available, send_udp_broadcast, send_udp_multicast_all_interfaces,
             IPV6_MULTICAST_ADDR,
@@ -130,7 +130,7 @@ impl Transport for UdpTransport {
         Ok(())
     }
 
-    async fn receive_response(&mut self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
+    async fn receive_response(&self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
         use shared::network::try_receive_udp_packet;
 
         match try_receive_udp_packet(&self.socket, timeout).await? {
@@ -142,7 +142,7 @@ impl Transport for UdpTransport {
         }
     }
 
-    async fn send_confirmation(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_confirmation(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use shared::network::{
             is_ipv6_available, send_udp_broadcast, send_udp_multicast_all_interfaces,
             IPV6_MULTICAST_ADDR,
@@ -157,7 +157,7 @@ impl Transport for UdpTransport {
         Ok(())
     }
 
-    async fn send_cancel(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_cancel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use shared::network::{
             is_ipv6_available, send_udp_broadcast, send_udp_multicast_all_interfaces,
             IPV6_MULTICAST_ADDR,
@@ -185,13 +185,13 @@ pub struct BleTransport {
     adapter: bluer::Adapter,
     temporal_id: [u8; 10],
     timeout: Duration,
-    request_packet: Option<EncryptedPacket>,
+    request_packet: Arc<tokio::sync::Mutex<Option<EncryptedPacket>>>,
     config_manager: Arc<shared::config::ClientConfigManager>,
     keypair: Arc<shared::crypto::Ed25519KeyPair>,
     challenge: [u8; 32],
     // Keep advertisement and GATT server alive
-    adv_handle: Option<bluer::adv::AdvertisementHandle>,
-    gatt_handle: Option<bluer::gatt::local::ApplicationHandle>,
+    adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
+    gatt_handle: Arc<tokio::sync::Mutex<Option<bluer::gatt::local::ApplicationHandle>>>,
     // Shared state for GATT server callbacks
     confirmation_data: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
     // Store all connected devices to disconnect them on cancel
@@ -273,12 +273,12 @@ impl BleTransport {
             adapter,
             temporal_id,
             timeout,
-            request_packet: None,
+            request_packet: Arc::new(tokio::sync::Mutex::new(None)),
             config_manager,
             keypair,
             challenge,
-            adv_handle: None,
-            gatt_handle: None,
+            adv_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            gatt_handle: Arc::new(tokio::sync::Mutex::new(None)),
             confirmation_data: Arc::new(tokio::sync::Mutex::new(None)),
             connected_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             response_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
@@ -288,7 +288,7 @@ impl BleTransport {
 
 #[cfg(feature = "ble")]
 impl Transport for BleTransport {
-    async fn send_request(&mut self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         use bluer::adv::Advertisement;
         use bluer::gatt::local::{
             Application, Characteristic, CharacteristicRead, CharacteristicWrite, Service,
@@ -300,7 +300,7 @@ impl Transport for BleTransport {
         };
 
         // Only set up once (on first call)
-        if self.adv_handle.is_some() {
+        if self.adv_handle.lock().await.is_some() {
             // Already set up, nothing to do
             return Ok(());
         }
@@ -309,7 +309,7 @@ impl Transport for BleTransport {
         tracing::trace!("send_request started");
 
         // Store the packet for later use in receive_response
-        self.request_packet = Some(packet.clone());
+        *self.request_packet.lock().await = Some(packet.clone());
 
         // Encode request packet for GATT characteristic
         let mut request_bytes = Vec::new();
@@ -348,7 +348,7 @@ impl Transport for BleTransport {
                         attempt,
                         send_start.elapsed()
                     );
-                    self.adv_handle = Some(handle);
+                    *self.adv_handle.lock().await = Some(handle);
                     break;
                 }
                 Err(e) => {
@@ -530,7 +530,7 @@ impl Transport for BleTransport {
             .map_err(|e| AuthError::BleError(format!("Failed to register GATT server: {}", e)))?;
 
         // Store handle to keep GATT server alive
-        self.gatt_handle = Some(app_handle);
+        *self.gatt_handle.lock().await = Some(app_handle);
 
         tracing::trace!(
             "GATT server registered and ready, total send_request elapsed={:?}",
@@ -540,13 +540,15 @@ impl Transport for BleTransport {
         Ok(())
     }
 
-    async fn receive_response(&mut self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
+    async fn receive_response(&self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
         use prost::Message;
         use shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce;
         use shared::protocol::pb::wrapper_message;
 
         let request_packet = self
             .request_packet
+            .lock()
+            .await
             .as_ref()
             .ok_or_else(|| {
                 AuthError::BleError(
@@ -645,12 +647,12 @@ impl Transport for BleTransport {
         }
     }
 
-    async fn send_confirmation(&mut self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_confirmation(&self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
         // Confirmation is handled in receive_response
         Ok(())
     }
 
-    async fn send_cancel(&mut self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
         tracing::debug!(
             "BLE transport: send_cancel called, disconnecting clients and stopping services."
         );
@@ -661,7 +663,7 @@ impl Transport for BleTransport {
         "BLE"
     }
 
-    async fn finalize(&mut self) -> Result<(), AuthError> {
+    async fn finalize(&self) -> Result<(), AuthError> {
         tracing::debug!("BLE transport: finalize called");
         self.shutdown_impl().await
     }
@@ -709,7 +711,7 @@ impl BleTransport {
     }
 
     /// Internal shutdown routine shared by send_cancel and finalize
-    async fn shutdown_impl(&mut self) -> Result<(), AuthError> {
+    async fn shutdown_impl(&self) -> Result<(), AuthError> {
         // Step 1 - Disconnect all connected BLE devices
         let mut disconnected_count = 0;
         let devices_to_disconnect = self.connected_devices.lock().await;
@@ -743,14 +745,14 @@ impl BleTransport {
         }
 
         // Step 2 - Stop advertising to prevent new connections
-        if self.adv_handle.take().is_some() {
+        if self.adv_handle.lock().await.take().is_some() {
             tracing::trace!("BLE advertising stopped.");
         } else {
             tracing::trace!("BLE advertising was not active or already stopped.");
         }
 
         // Step 3 - Unregister GATT server to remove services
-        if self.gatt_handle.take().is_some() {
+        if self.gatt_handle.lock().await.take().is_some() {
             tracing::trace!("BLE GATT server unregistered.");
         } else {
             tracing::trace!("BLE GATT server was not active or already stopped.");
