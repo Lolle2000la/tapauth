@@ -573,15 +573,23 @@ impl AuthSession {
                                         "Authentication granted by server: {}",
                                         server_addr
                                     );
-                                    // Send confirmation
+                                    // Send confirmation in background and finalize without blocking PAM
                                     let confirmation =
                                         create_grant_confirmation(keypair, challenge)?;
                                     let wrapper = wrap_grant_confirmation(confirmation);
                                     let conf_packet =
                                         create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
-                                    transport.send_confirmation(&conf_packet).await?;
-                                    // Finalize transport on success
-                                    let _ = transport.finalize().await;
+
+                                    let t = transport.clone();
+                                    tokio::spawn(async move {
+                                        // Best-effort: up to 3 sends within ~450ms total
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        let _ = t.finalize().await;
+                                    });
                                     return Ok(());
                                 } else {
                                     tracing::warn!("Grant verification failed; continuing to wait for valid response");
@@ -593,15 +601,21 @@ impl AuthSession {
                                     server_addr
                                 );
 
-                                // Send confirmation even for denial
+                                // Send confirmation even for denial in background and finalize
                                 let confirmation = create_grant_confirmation(keypair, challenge)?;
                                 let wrapper = wrap_grant_confirmation(confirmation);
                                 let conf_packet =
                                     create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
 
-                                transport.send_confirmation(&conf_packet).await?;
-                                // Finalize transport before returning explicit denial
-                                let _ = transport.finalize().await;
+                                let t = transport.clone();
+                                tokio::spawn(async move {
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    let _ = t.finalize().await;
+                                });
                                 return Err(AuthHandlerError::ExplicitDenial);
                             }
                             _ => {

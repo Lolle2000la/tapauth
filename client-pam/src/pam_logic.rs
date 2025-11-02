@@ -122,7 +122,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // GUI (no TTY): poll only the socket until response or timeout
     if !has_terminal {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -170,7 +170,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 "Could not open /dev/tty: {}, falling back to socket-only",
                 e
             );
-            let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
             loop {
                 let now = Instant::now();
                 if now >= deadline {
@@ -222,7 +222,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64 + 5);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
     let mut kb = [0u8; 4];
     loop {
         let now = Instant::now();

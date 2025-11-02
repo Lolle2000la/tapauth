@@ -631,6 +631,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "hex",
+ "libc",
  "nix 0.29.0",
  "prost",
  "shared",

@@ -194,7 +194,10 @@ impl BleTransport {
         if disconnected_count > 0 {
             tracing::debug!("Disconnected {} BLE device(s).", disconnected_count);
         } else if tracked > 0 {
-            tracing::warn!("Failed to disconnect any of the {} connected BLE device(s).", tracked);
+            tracing::warn!(
+                "Failed to disconnect any of the {} connected BLE device(s).",
+                tracked
+            );
         } else {
             tracing::trace!("No connected BLE devices to disconnect.");
         }
@@ -603,13 +606,9 @@ impl Transport for BleTransport {
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(grace_ms)).await;
-                if let Err(e) = BleTransport::do_shutdown(
-                    adapter,
-                    adv_handle,
-                    gatt_handle,
-                    connected_devices,
-                )
-                .await
+                if let Err(e) =
+                    BleTransport::do_shutdown(adapter, adv_handle, gatt_handle, connected_devices)
+                        .await
                 {
                     tracing::warn!("BLE delayed shutdown failed: {}", e);
                 } else {
@@ -632,13 +631,9 @@ impl Transport for BleTransport {
             let gatt_handle = self.gatt_handle.clone();
             let connected_devices = self.connected_devices.clone();
             tokio::spawn(async move {
-                if let Err(e) = BleTransport::do_shutdown(
-                    adapter,
-                    adv_handle,
-                    gatt_handle,
-                    connected_devices,
-                )
-                .await
+                if let Err(e) =
+                    BleTransport::do_shutdown(adapter, adv_handle, gatt_handle, connected_devices)
+                        .await
                 {
                     tracing::warn!("BLE finalize shutdown failed: {}", e);
                 } else {

@@ -97,10 +97,9 @@ impl IpcClient {
         };
 
         self.send_message(&req)?;
-        // Allow the daemon enough time to complete the auth flow. Add a small buffer.
-        let total = (timeout_seconds as u64).saturating_add(5);
+        // Align with spec: wait exactly the session timeout
         self.stream
-            .set_read_timeout(Some(Duration::from_secs(total)))?;
+            .set_read_timeout(Some(Duration::from_secs(timeout_seconds as u64)))?;
         self.recv_response()
     }
 
@@ -148,7 +147,7 @@ impl IpcClient {
                     self.read_buf[2],
                     self.read_buf[3],
                 ]) as usize;
-                if len > 10 * 1024 * 1024 {
+                if len > 1 * 1024 * 1024 {
                     return Err(IpcError::FrameTooLarge(len as u32));
                 }
                 self.expected_total = Some(4 + len);
@@ -190,7 +189,7 @@ impl IpcClient {
         self.stream.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf);
 
-        if len > 10 * 1024 * 1024 {
+        if len > 1 * 1024 * 1024 {
             return Err(IpcError::FrameTooLarge(len));
         }
 
@@ -198,5 +197,69 @@ impl IpcClient {
         self.stream.read_exact(&mut data)?;
 
         Ok(ipc::PamAuthenticateResponse::decode(&data[..])?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use std::io::Write as _;
+
+    // Helper to build an IpcClient around an existing UnixStream (test-only)
+    fn client_from_stream(stream: UnixStream) -> IpcClient {
+        IpcClient {
+            stream,
+            read_buf: BytesMut::with_capacity(4096),
+            expected_total: None,
+        }
+    }
+
+    #[test]
+    fn frame_too_large_blocking() {
+        let (mut a, b) = match UnixStream::pair() {
+            Ok(v) => v,
+            Err(e) => panic!("pair failed: {e}"),
+        };
+        let mut cli = client_from_stream(b);
+
+        // Write BE length > 1 MiB; no payload needed as recv_response rejects on len alone
+        let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
+        let len_be = too_big.to_be_bytes();
+        if let Err(e) = a.write_all(&len_be) {
+            panic!("write_all failed: {e}");
+        }
+
+        let err = cli.recv_response().unwrap_err();
+        match err {
+            IpcError::FrameTooLarge(n) => assert!(n as usize > 1024 * 1024),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_too_large_nonblocking() {
+        let (mut a, b) = match UnixStream::pair() {
+            Ok(v) => v,
+            Err(e) => panic!("pair failed: {e}"),
+        };
+        // Set client nonblocking and wrap
+        if let Err(e) = b.set_nonblocking(true) {
+            panic!("set_nonblocking failed: {e}");
+        }
+        let mut cli = client_from_stream(b);
+
+        let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
+        if let Err(e) = a.write_all(&too_big.to_be_bytes()) {
+            panic!("write_all failed: {e}");
+        }
+
+        let err = cli
+            .try_read_response_nonblocking()
+            .expect_err("expected FrameTooLarge");
+        match err {
+            IpcError::FrameTooLarge(n) => assert!(n as usize > 1024 * 1024),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

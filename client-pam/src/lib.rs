@@ -1,4 +1,5 @@
 //! TapAuth PAM module.
+#![cfg_attr(clippy, deny(clippy::unwrap_used, clippy::expect_used))]
 //!
 //! Linux PAM authentication module that enables phone-tap-based authentication.
 //! Integrates with the system authentication stack to provide passwordless login
@@ -28,6 +29,24 @@ mod pam_sys;
 pub use ipc_client::*;
 
 use std::os::raw::c_int;
+use std::panic::catch_unwind;
+// Internal panic guard: returns PAM_IGNORE if the inner closure panics.
+fn guard<F>(f: F) -> c_int
+where
+    F: FnOnce() -> c_int + std::panic::UnwindSafe,
+{
+    match catch_unwind(|| f()) {
+        Ok(code) => code,
+        Err(_) => {
+            let _ = catch_unwind(|| {
+                tracing::error!(
+                    "TapAuth PAM: panic caught in guarded section; returning PAM_IGNORE"
+                );
+            });
+            pam_sys::PAM_IGNORE
+        }
+    }
+}
 
 /// PAM service module entry point for authentication
 #[no_mangle]
@@ -37,7 +56,19 @@ pub extern "C" fn pam_sm_authenticate(
     _argc: c_int,
     _argv: *const *const std::os::raw::c_char,
 ) -> c_int {
-    pam_logic::authenticate(pamh)
+    // Guard against panics: PAM modules must never unwind into the host process
+    guard(|| pam_logic::authenticate(pamh))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_returns_ignore_on_panic() {
+        let code = guard(|| panic!("boom"));
+        assert_eq!(code, crate::pam_sys::PAM_IGNORE);
+    }
 }
 
 /// PAM service module entry point for account management

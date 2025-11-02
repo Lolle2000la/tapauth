@@ -171,12 +171,16 @@ pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) ->
         conv.appdata_ptr,
     );
 
-    // Free response if allocated - PAM library expects us to free this
+    // Free response if allocated - PAM library expects us to free via libc::free
+    // Linux-PAM allocates pam_response and resp strings with malloc; use libc::free
     if !resp.is_null() {
-        let response = Box::from_raw(resp);
-        if !response.resp.is_null() {
-            // Free the string - it was allocated by the conversation function
-            drop(CString::from_raw(response.resp));
+        unsafe {
+            let response_ref: &mut PamResponse = &mut *resp;
+            if !response_ref.resp.is_null() {
+                libc::free(response_ref.resp as *mut c_void);
+                response_ref.resp = std::ptr::null_mut();
+            }
+            libc::free(resp as *mut c_void);
         }
     }
 
@@ -226,17 +230,21 @@ pub unsafe fn prompt_user(
         return Err(ret);
     }
 
-    // Get response if provided
+    // Get response if provided (num_msg=1); free using libc::free afterwards
     let result = if !resp.is_null() {
-        let response = Box::from_raw(resp);
-        if !response.resp.is_null() {
-            let resp_cstr = CStr::from_ptr(response.resp);
-            let response_str = resp_cstr.to_str().ok().map(|s| s.to_string());
-            // Free the string that was allocated by the conversation function
-            drop(CString::from_raw(response.resp));
-            response_str
-        } else {
-            None
+        unsafe {
+            let response_ref: &mut PamResponse = &mut *resp;
+            let out = if !response_ref.resp.is_null() {
+                let resp_cstr = CStr::from_ptr(response_ref.resp);
+                let s = resp_cstr.to_str().ok().map(|s| s.to_string());
+                libc::free(response_ref.resp as *mut c_void);
+                response_ref.resp = std::ptr::null_mut();
+                s
+            } else {
+                None
+            };
+            libc::free(resp as *mut c_void);
+            out
         }
     } else {
         None
