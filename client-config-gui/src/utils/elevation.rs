@@ -209,7 +209,6 @@ pub fn drop_privileges_to_user(target_user: &str) -> Result<(), ()> {
             target_gid.as_raw(),
             e
         );
-        ()
     })?;
     setuid(target_uid).map_err(|e| {
         tracing::error!(
@@ -218,7 +217,6 @@ pub fn drop_privileges_to_user(target_user: &str) -> Result<(), ()> {
             target_uid.as_raw(),
             e
         );
-        ()
     })?;
 
     Ok(())

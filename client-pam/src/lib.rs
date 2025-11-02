@@ -1,5 +1,5 @@
 //! TapAuth PAM module.
-#![cfg_attr(clippy, deny(clippy::unwrap_used, clippy::expect_used))]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 //!
 //! Linux PAM authentication module that enables phone-tap-based authentication.
 //! Integrates with the system authentication stack to provide passwordless login
@@ -35,7 +35,7 @@ fn guard<F>(f: F) -> c_int
 where
     F: FnOnce() -> c_int + std::panic::UnwindSafe,
 {
-    match catch_unwind(|| f()) {
+    match catch_unwind(f) {
         Ok(code) => code,
         Err(_) => {
             let _ = catch_unwind(|| {

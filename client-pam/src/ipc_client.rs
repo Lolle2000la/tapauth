@@ -147,7 +147,7 @@ impl IpcClient {
                     self.read_buf[2],
                     self.read_buf[3],
                 ]) as usize;
-                if len > 1 * 1024 * 1024 {
+                if len > 1024 * 1024 {
                     return Err(IpcError::FrameTooLarge(len as u32));
                 }
                 self.expected_total = Some(4 + len);
@@ -189,7 +189,7 @@ impl IpcClient {
         self.stream.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf);
 
-        if len > 1 * 1024 * 1024 {
+        if len > 1024 * 1024 {
             return Err(IpcError::FrameTooLarge(len));
         }
 

@@ -260,21 +260,18 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 if let Some(rev) = fds[1].revents() {
                     if rev.contains(PollFlags::POLLIN) {
                         // Peek at the byte without consuming unless it's Enter
-                        match tty.read(&mut kb[..1]) {
-                            Ok(1) => {
-                                let b = kb[0];
-                                if b == b'\n' || b == b'\r' {
-                                    tracing::info!("User pressed Enter to skip");
-                                    // Best-effort cancel uses a fresh blocking connection
-                                    if let Ok(mut c) = IpcClient::connect() {
-                                        let _ = c.send_cancel("tty-skip", &request_id);
-                                    }
-                                    pam_conv.try_info("TapAuth: Skipped, trying password...");
-                                    return pam_sys::PAM_IGNORE;
+                        if let Ok(1) = tty.read(&mut kb[..1]) {
+                            let b = kb[0];
+                            if b == b'\n' || b == b'\r' {
+                                tracing::info!("User pressed Enter to skip");
+                                // Best-effort cancel uses a fresh blocking connection
+                                if let Ok(mut c) = IpcClient::connect() {
+                                    let _ = c.send_cancel("tty-skip", &request_id);
                                 }
-                                // Non-Enter key: consume and ignore (could be user typing password early)
+                                pam_conv.try_info("TapAuth: Skipped, trying password...");
+                                return pam_sys::PAM_IGNORE;
                             }
-                            _ => {}
+                            // Non-Enter key: consume and ignore (could be user typing password early)
                         }
                     }
                 }
