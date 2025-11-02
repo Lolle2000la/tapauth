@@ -9,9 +9,6 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
-import dev.rourunisen.tapauth.MainActivity
-import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
@@ -41,7 +38,8 @@ class AuthenticationService : Service() {
 
     companion object {
         private const val TAG = "AuthenticationService"
-        private const val NOTIFICATION_ID = 1
+        // Use the global shared notification ID to avoid duplicate notifications
+        private const val NOTIFICATION_ID = TapAuthApplication.FOREGROUND_NOTIFICATION_ID
 
         // Broadcast actions for BLE communication
         const val ACTION_CANCEL_BLE_CONNECTION =
@@ -187,6 +185,7 @@ class AuthenticationService : Service() {
                         { applicationContext },
                         true,
                     )
+                    updateNotification()
                 } catch (_: Exception) {}
 
                 val buffer = ByteArray(1024)
@@ -739,16 +738,13 @@ class AuthenticationService : Service() {
     }
 
     private fun createNotification(): Notification {
-        val notificationIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent =
-            PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
+        return TapAuthApplication.buildUnifiedNotification(this)
+    }
 
-        return NotificationCompat.Builder(this, TapAuthApplication.CHANNEL_ID)
-            .setContentTitle("TapAuth")
-            .setContentText("Authentication service is running")
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
+    private fun updateNotification() {
+        // Refresh the shared notification with the latest service states
+        val notification = TapAuthApplication.buildUnifiedNotification(this)
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(TapAuthApplication.FOREGROUND_NOTIFICATION_ID, notification)
     }
 }

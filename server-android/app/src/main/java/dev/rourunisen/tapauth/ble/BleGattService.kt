@@ -2,7 +2,6 @@ package dev.rourunisen.tapauth.ble
 
 import android.Manifest
 import android.app.Notification
-import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.*
 import android.bluetooth.le.BluetoothLeScanner
@@ -41,7 +40,9 @@ class BleGattService : Service() {
 
     companion object {
         private const val TAG = "BleGattService"
-        private const val NOTIFICATION_ID = 2
+        // Use the global shared notification ID to avoid duplicate notifications
+        private const val NOTIFICATION_ID =
+            dev.rourunisen.tapauth.TapAuthApplication.FOREGROUND_NOTIFICATION_ID
 
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
@@ -180,6 +181,7 @@ class BleGattService : Service() {
                     { this@BleGattService },
                     false,
                 )
+                updateNotification()
                 stopSelf()
             }
         }
@@ -364,6 +366,7 @@ class BleGattService : Service() {
         if (bluetoothAdapter == null || bluetoothLeScanner == null) {
             Log.e(TAG, "Bluetooth or BLE scanning not supported on this device")
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
+            updateNotification()
             stopSelf()
             return
         }
@@ -374,6 +377,7 @@ class BleGattService : Service() {
         if (isEnabled != true) {
             Log.e(TAG, "Bluetooth is disabled")
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
+            updateNotification()
             stopSelf()
             return
         }
@@ -392,24 +396,24 @@ class BleGattService : Service() {
 
         // Mark service as running after successful initialization
         dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, true)
+        updateNotification()
         Log.i(TAG, "=== BLE GATT SERVICE STARTED SUCCESSFULLY ===")
     }
 
-    private fun createNotification(): Notification {
-        val notificationIntent = Intent(this, dev.rourunisen.tapauth.MainActivity::class.java)
-        val pendingIntent =
-            PendingIntent.getActivity(this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
+    private fun createNotification(): android.app.Notification {
+        return dev.rourunisen.tapauth.TapAuthApplication.buildUnifiedNotification(this)
+    }
 
-        return androidx.core.app.NotificationCompat.Builder(
-                this,
-                dev.rourunisen.tapauth.TapAuthApplication.CHANNEL_ID,
-            )
-            .setContentTitle("TapAuth BLE")
-            .setContentText("BLE scanner active, listening for paired clients")
-            .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
+    private fun updateNotification() {
+        // Refresh the shared notification with the latest service states
+        val notification = dev.rourunisen.tapauth.TapAuthApplication.buildUnifiedNotification(this)
+        val notificationManager =
+            getSystemService(android.content.Context.NOTIFICATION_SERVICE)
+                as android.app.NotificationManager
+        notificationManager.notify(
+            dev.rourunisen.tapauth.TapAuthApplication.FOREGROUND_NOTIFICATION_ID,
+            notification,
+        )
     }
 
     private fun startTemporalIdCache() {
@@ -1219,6 +1223,7 @@ class BleGattService : Service() {
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
+            updateNotification()
         } catch (_: Exception) {}
         serviceScope.cancel()
         Log.i(TAG, "BLE GATT Service destroyed")

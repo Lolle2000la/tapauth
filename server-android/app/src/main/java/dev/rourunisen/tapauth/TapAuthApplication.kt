@@ -12,6 +12,44 @@ class TapAuthApplication : Application() {
     companion object {
         const val CHANNEL_ID = "tapauth_service_channel"
         const val AUTH_CHANNEL_ID = "tapauth_auth_channel"
+        // Shared notification ID for all foreground services to reduce duplicates in the shade
+        const val FOREGROUND_NOTIFICATION_ID = 1001
+
+        /**
+         * Build a unified foreground notification that reflects the current state of both UDP and
+         * BLE services. Call this from any service when updating its status.
+         */
+        fun buildUnifiedNotification(context: android.content.Context): android.app.Notification {
+            val udpRunning = dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.value
+            val bleRunning = dev.rourunisen.tapauth.service.ServiceStatusManager.bleRunning.value
+
+            val statusParts = mutableListOf<String>()
+            if (udpRunning) statusParts.add("UDP")
+            if (bleRunning) statusParts.add("BLE")
+
+            val statusText =
+                when {
+                    statusParts.isNotEmpty() -> "${statusParts.joinToString("/")} active"
+                    else -> "Service running"
+                }
+
+            val notificationIntent = android.content.Intent(context, MainActivity::class.java)
+            val pendingIntent =
+                android.app.PendingIntent.getActivity(
+                    context,
+                    0,
+                    notificationIntent,
+                    android.app.PendingIntent.FLAG_IMMUTABLE,
+                )
+
+            return androidx.core.app.NotificationCompat.Builder(context, CHANNEL_ID)
+                .setContentTitle("TapAuth")
+                .setContentText(statusText)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .build()
+        }
 
         // Bump this when notification ID/tag scheme changes to force a one-time cleanup
         private const val NOTIFICATION_SCHEME_VERSION = 2
