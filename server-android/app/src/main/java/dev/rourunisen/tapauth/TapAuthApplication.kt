@@ -110,17 +110,42 @@ class TapAuthApplication : Application() {
         // Start core background services so UDP listener and BLE GATT are active
         // even when the app UI is not open. Services are idempotent and safe to
         // call repeatedly.
+        // Only start if we have notification permission (required for foreground services on
+        // Android 13+)
         try {
-            AuthenticationService.start(this)
+            // Check for POST_NOTIFICATIONS permission on Android 13+
+            val hasNotificationPermission =
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    androidx.core.app.ActivityCompat.checkSelfPermission(
+                        this,
+                        android.Manifest.permission.POST_NOTIFICATIONS,
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                } else {
+                    // Not required on older versions
+                    true
+                }
 
-            // Start BLE GATT service as a foreground service (service will
-            // call startForeground itself). Use startForegroundService on O+.
-            val bleIntent =
-                android.content.Intent(this, dev.rourunisen.tapauth.ble.BleGattService::class.java)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                startForegroundService(bleIntent)
+            if (hasNotificationPermission) {
+                AuthenticationService.start(this)
+
+                // Start BLE GATT service as a foreground service (service will
+                // call startForeground itself). Use startForegroundService on O+.
+                val bleIntent =
+                    android.content.Intent(
+                        this,
+                        dev.rourunisen.tapauth.ble.BleGattService::class.java,
+                    )
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    startForegroundService(bleIntent)
+                } else {
+                    startService(bleIntent)
+                }
+                android.util.Log.i("TapAuthApplication", "Background services started")
             } else {
-                startService(bleIntent)
+                android.util.Log.w(
+                    "TapAuthApplication",
+                    "Skipping service start - POST_NOTIFICATIONS permission not granted. Services will start after permission is granted.",
+                )
             }
         } catch (e: Exception) {
             // Don't crash the app if services can't be started (e.g., missing

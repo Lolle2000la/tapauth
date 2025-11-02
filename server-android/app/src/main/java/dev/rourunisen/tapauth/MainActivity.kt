@@ -460,6 +460,26 @@ class MainActivity : FragmentActivity() {
                 notificationGranted.value =
                     grantResults.isNotEmpty() &&
                         grantResults[0] == PackageManager.PERMISSION_GRANTED
+
+                // If notification permission was just granted, start the background services
+                if (notificationGranted.value) {
+                    try {
+                        dev.rourunisen.tapauth.service.AuthenticationService.start(this)
+                        val bleIntent =
+                            Intent(this, dev.rourunisen.tapauth.ble.BleGattService::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(bleIntent)
+                        } else {
+                            startService(bleIntent)
+                        }
+                        android.util.Log.i(
+                            "MainActivity",
+                            "Started services after notification permission granted",
+                        )
+                    } catch (e: Exception) {
+                        android.util.Log.e("MainActivity", "Failed to start services: ${e.message}")
+                    }
+                }
             }
         }
 

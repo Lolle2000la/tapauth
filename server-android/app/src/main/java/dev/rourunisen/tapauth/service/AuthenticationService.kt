@@ -84,10 +84,41 @@ class AuthenticationService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "onCreate() called, starting foreground immediately.")
+
+        // Initialize repositories first so onDestroy() can safely access them
         deviceRepository = DeviceRepository(this)
         keypairRepository = dev.rourunisen.tapauth.data.KeypairRepository(this)
         appConfig = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)
         temporalIdCache = TemporalIdCache(deviceRepository, serviceScope)
+
+        // Start as foreground immediately to prevent ForegroundServiceDidNotStartInTimeException
+        // This is critical on Android 12+ when started via startForegroundService()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (
+                    ActivityCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.e(
+                        TAG,
+                        "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
+                    )
+                    stopSelf()
+                    return
+                }
+            }
+            startForeground(NOTIFICATION_ID, createNotification())
+            Log.d(TAG, "Service is now in the foreground.")
+        } catch (e: Exception) {
+            Log.e(TAG, "FATAL: Failed to start foreground: ${e.message}", e)
+            stopSelf()
+            return
+        }
+
+        // Start the temporal ID cache after successful foreground start
         temporalIdCache.start()
 
         // Start periodic cleanup of rate limiter
@@ -103,23 +134,8 @@ class AuthenticationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!isRunning) {
-            // For Android 13+, ensure POST_NOTIFICATIONS is granted before starting foreground
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.POST_NOTIFICATIONS,
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    Log.e(
-                        TAG,
-                        "POST_NOTIFICATIONS permission not granted. Cannot start foreground service.",
-                    )
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-            }
-            startForeground(NOTIFICATION_ID, createNotification())
+            // Foreground notification already started in onCreate()
+            // Just start the UDP listener
             startListening()
             isRunning = true
             Log.d(TAG, "Authentication service started")
@@ -133,7 +149,10 @@ class AuthenticationService : Service() {
         super.onDestroy()
         stopListening()
         retransmissionManager.stopAll()
-        temporalIdCache.stop()
+        // Check if initialized before accessing
+        if (::temporalIdCache.isInitialized) {
+            temporalIdCache.stop()
+        }
         serviceScope.cancel()
         Log.d(TAG, "Authentication service destroyed")
     }
@@ -211,7 +230,8 @@ class AuthenticationService : Service() {
                         // Process authentication request
                         launch { handleIncomingPacket(data, senderAddress, senderPort) }
                     } catch (e: Exception) {
-                        if (isActive) {
+                        // Ignore "Socket closed" exception when service is stopping
+                        if (isActive && isRunning) {
                             Log.e(TAG, "Error receiving packet", e)
                         }
                     }
