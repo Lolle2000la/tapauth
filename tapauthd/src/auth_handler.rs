@@ -306,10 +306,14 @@ impl AuthSession {
                 match result {
                     Ok(Ok(())) => {
                         tracing::info!("BLE authentication succeeded");
-                        // Notify other devices via cancel and finalize resources
+                        // Notify other devices via cancel and finalize resources (non-blocking for BLE)
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.send_cancel(&cancel_packet).await;
-                            let _ = ble_shared.finalize().await;
+                            let ble = ble_shared.clone();
+                            let cancel_clone = cancel_packet.clone();
+                            tokio::spawn(async move {
+                                let _ = ble.send_cancel(&cancel_clone).await;
+                                let _ = ble.finalize().await;
+                            });
                         }
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                         udp_abort.abort();
@@ -320,7 +324,8 @@ impl AuthSession {
                         // Broadcast cancellation to other devices
                         udp_abort.abort();
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.finalize().await;
+                            let ble = ble_shared.clone();
+                            tokio::spawn(async move { let _ = ble.finalize().await; });
                         }
 
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
@@ -334,8 +339,12 @@ impl AuthSession {
                             Ok(Ok(())) => {
                                 tracing::info!("UDP authentication succeeded");
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.send_cancel(&cancel_packet).await;
-                                    let _ = ble_shared.finalize().await;
+                                    let ble = ble_shared.clone();
+                                    let cancel_clone = cancel_packet.clone();
+                                    tokio::spawn(async move {
+                                        let _ = ble.send_cancel(&cancel_clone).await;
+                                        let _ = ble.finalize().await;
+                                    });
                                 }
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
@@ -343,7 +352,8 @@ impl AuthSession {
                             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                                 // UDP also got explicit denial, broadcast cancellation
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.finalize().await;
+                                    let ble = ble_shared.clone();
+                                    tokio::spawn(async move { let _ = ble.finalize().await; });
                                 }
 
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
@@ -372,10 +382,14 @@ impl AuthSession {
                     Ok(Ok(())) => {
                         tracing::info!("UDP authentication succeeded");
                         ble_abort.abort();
-                        // Notify via cancel and finalize BLE if initialized
+                        // Notify via cancel and finalize BLE if initialized (non-blocking)
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.send_cancel(&cancel_packet).await;
-                            let _ = ble_shared.finalize().await;
+                            let ble = ble_shared.clone();
+                            let cancel_clone = cancel_packet.clone();
+                            tokio::spawn(async move {
+                                let _ = ble.send_cancel(&cancel_clone).await;
+                                let _ = ble.finalize().await;
+                            });
                         }
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                         Ok(())
@@ -385,7 +399,8 @@ impl AuthSession {
                         // Broadcast cancellation to other devices
                         ble_abort.abort();
                         if let Some(ble_shared) = &ble_transport_shared {
-                            let _ = ble_shared.finalize().await;
+                            let ble = ble_shared.clone();
+                            tokio::spawn(async move { let _ = ble.finalize().await; });
                         }
 
                         let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
@@ -399,8 +414,12 @@ impl AuthSession {
                             Ok(Ok(())) => {
                                 tracing::info!("BLE authentication succeeded");
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.send_cancel(&cancel_packet).await;
-                                    let _ = ble_shared.finalize().await;
+                                    let ble = ble_shared.clone();
+                                    let cancel_clone = cancel_packet.clone();
+                                    tokio::spawn(async move {
+                                        let _ = ble.send_cancel(&cancel_clone).await;
+                                        let _ = ble.finalize().await;
+                                    });
                                 }
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
                                 Ok(())
@@ -408,7 +427,8 @@ impl AuthSession {
                             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                                 // BLE also got explicit denial, broadcast cancellation
                                 if let Some(ble_shared) = &ble_transport_shared {
-                                    let _ = ble_shared.finalize().await;
+                                    let ble = ble_shared.clone();
+                                    tokio::spawn(async move { let _ = ble.finalize().await; });
                                 }
 
                                 let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
@@ -444,10 +464,11 @@ impl AuthSession {
                     tracing::debug!("UDP cancel broadcast sent");
                 }
 
-                // Disconnect BLE clients explicitly
+                // Disconnect BLE clients explicitly (non-blocking)
                 if let Some(ble_shared) = &ble_transport_shared {
-                    tracing::debug!("Disconnecting BLE clients");
-                    let _ = ble_shared.finalize().await;
+                    tracing::debug!("Disconnecting BLE clients (background)");
+                    let ble = ble_shared.clone();
+                    tokio::spawn(async move { let _ = ble.finalize().await; });
                 }
 
                 // Give network stack time to transmit packets

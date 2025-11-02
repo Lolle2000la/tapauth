@@ -188,6 +188,17 @@ echo "✅ Build successful: $TAPAUTHD_BIN"
 cleanup() {
     echo ""
     echo "==> Cleaning up temporary files..."
+    # Allow the daemon a short grace period to finish background cleanup (BLE disconnects, etc.)
+    # Default: 1s; override with TAPAUTHD_GRACE_MS (ms) or TAPAUTHD_GRACE_SECONDS (s)
+    local GRACE_SECONDS="1"
+    if [ -n "$TAPAUTHD_GRACE_MS" ]; then
+        # Convert ms to seconds with 3 decimal places; GNU sleep supports fractional seconds
+        GRACE_SECONDS=$(awk -v ms="$TAPAUTHD_GRACE_MS" 'BEGIN{ printf "%.3f", ms/1000 }')
+    elif [ -n "$TAPAUTHD_GRACE_SECONDS" ]; then
+        GRACE_SECONDS="$TAPAUTHD_GRACE_SECONDS"
+    fi
+    echo "    Granting daemon grace period: ${GRACE_SECONDS}s before teardown"
+    sleep "$GRACE_SECONDS"
     case "$ACTIVATION_MODE" in
         systemd-temp)
             echo "    Stopping temporary systemd units..."

@@ -4,6 +4,7 @@ use super::{ReceiveResult, Transport};
 use crate::auth_handler::AuthHandlerError as AuthError;
 use shared::protocol::pb::EncryptedPacket;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ pub struct BleTransport {
     connected_devices: Arc<tokio::sync::Mutex<HashMap<bluer::Address, bluer::Device>>>,
     // Queue of responses from potentially multiple devices
     response_queue: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
+    // Idempotent shutdown flag
+    shutdown_started: AtomicBool,
 }
 
 impl BleTransport {
@@ -109,6 +112,7 @@ impl BleTransport {
             confirmation_data: Arc::new(tokio::sync::Mutex::new(None)),
             connected_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             response_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            shutdown_started: AtomicBool::new(false),
         })
     }
 
@@ -151,18 +155,23 @@ impl BleTransport {
         Ok(bytes)
     }
 
-    /// Internal shutdown routine shared by send_cancel and finalize
-    async fn shutdown_impl(&self) -> Result<(), AuthError> {
+    /// Static shutdown implementation operating on cloned handles
+    async fn do_shutdown(
+        adapter: bluer::Adapter,
+        adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
+        gatt_handle: Arc<tokio::sync::Mutex<Option<bluer::gatt::local::ApplicationHandle>>>,
+        connected_devices: Arc<tokio::sync::Mutex<HashMap<bluer::Address, bluer::Device>>>,
+    ) -> Result<(), AuthError> {
         // Step 1 - Disconnect all connected BLE devices
         let mut disconnected_count = 0;
-        let devices_to_disconnect = self.connected_devices.lock().await;
+        let mut devices_to_disconnect = connected_devices.lock().await;
 
-        let adapter = self.adapter.clone();
+        let adapter_clone = adapter.clone();
 
         for (addr, _device_in_map) in devices_to_disconnect.iter() {
             tracing::debug!("Attempting to explicitly disconnect device {}", addr);
 
-            match adapter.device(*addr) {
+            match adapter_clone.device(*addr) {
                 Ok(device) => {
                     if let Err(e) = device.disconnect().await {
                         tracing::warn!("Failed to explicitly disconnect device {}: {}", addr, e);
@@ -177,23 +186,28 @@ impl BleTransport {
             }
         }
 
+        // Clear tracked devices to avoid retaining stale references
+        let tracked = devices_to_disconnect.len();
+        devices_to_disconnect.clear();
+        drop(devices_to_disconnect);
+
         if disconnected_count > 0 {
             tracing::debug!("Disconnected {} BLE device(s).", disconnected_count);
-        } else if !devices_to_disconnect.is_empty() {
-            tracing::warn!("Failed to disconnect any connected BLE devices.");
+        } else if tracked > 0 {
+            tracing::warn!("Failed to disconnect any of the {} connected BLE device(s).", tracked);
         } else {
             tracing::trace!("No connected BLE devices to disconnect.");
         }
 
         // Step 2 - Stop advertising to prevent new connections
-        if self.adv_handle.lock().await.take().is_some() {
+        if adv_handle.lock().await.take().is_some() {
             tracing::trace!("BLE advertising stopped.");
         } else {
             tracing::trace!("BLE advertising was not active or already stopped.");
         }
 
         // Step 3 - Unregister GATT server to remove services
-        if self.gatt_handle.lock().await.take().is_some() {
+        if gatt_handle.lock().await.take().is_some() {
             tracing::trace!("BLE GATT server unregistered.");
         } else {
             tracing::trace!("BLE GATT server was not active or already stopped.");
@@ -569,15 +583,72 @@ impl Transport for BleTransport {
     }
 
     async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthError> {
-        tracing::debug!(
-            "BLE transport: send_cancel called, disconnecting clients and stopping services."
-        );
-        self.shutdown_impl().await
+        // Ensure idempotent scheduling
+        if !self.shutdown_started.swap(true, Ordering::SeqCst) {
+            // Determine grace window from env or default 300ms
+            let grace_ms: u64 = std::env::var("TAPAUTH_BLE_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(300);
+
+            tracing::debug!(
+                "BLE transport: send_cancel called, scheduling cleanup in {} ms",
+                grace_ms
+            );
+
+            let adapter = self.adapter.clone();
+            let adv_handle = self.adv_handle.clone();
+            let gatt_handle = self.gatt_handle.clone();
+            let connected_devices = self.connected_devices.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+                if let Err(e) = BleTransport::do_shutdown(
+                    adapter,
+                    adv_handle,
+                    gatt_handle,
+                    connected_devices,
+                )
+                .await
+                {
+                    tracing::warn!("BLE delayed shutdown failed: {}", e);
+                } else {
+                    tracing::debug!("BLE delayed shutdown completed");
+                }
+            });
+        } else {
+            tracing::trace!("BLE transport: send_cancel called, but shutdown already scheduled");
+        }
+
+        Ok(())
     }
 
     async fn finalize(&self) -> Result<(), AuthError> {
-        tracing::debug!("BLE transport: finalize called");
-        self.shutdown_impl().await
+        // Trigger immediate background shutdown if not yet started
+        if !self.shutdown_started.swap(true, Ordering::SeqCst) {
+            tracing::debug!("BLE transport: finalize called, scheduling immediate cleanup");
+            let adapter = self.adapter.clone();
+            let adv_handle = self.adv_handle.clone();
+            let gatt_handle = self.gatt_handle.clone();
+            let connected_devices = self.connected_devices.clone();
+            tokio::spawn(async move {
+                if let Err(e) = BleTransport::do_shutdown(
+                    adapter,
+                    adv_handle,
+                    gatt_handle,
+                    connected_devices,
+                )
+                .await
+                {
+                    tracing::warn!("BLE finalize shutdown failed: {}", e);
+                } else {
+                    tracing::trace!("BLE finalize shutdown completed");
+                }
+            });
+        } else {
+            tracing::trace!("BLE transport: finalize called, but shutdown already scheduled");
+        }
+        Ok(())
     }
 }
 
