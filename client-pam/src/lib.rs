@@ -9,6 +9,7 @@
 //!
 //! Provides all required PAM entry points:
 //! - `pam_sm_authenticate`: Core authentication via BLE/UDP to paired devices
+//! - `pam_sm_setcred`: Credential management (no-op, returns success)
 //! - `pam_sm_acct_mgmt`: Account management (no-op, returns success)
 //! - `pam_sm_open_session`/`pam_sm_close_session`: Session management (no-ops)
 //! - `pam_sm_chauthtok`: Password change (no-op)
@@ -58,6 +59,19 @@ pub extern "C" fn pam_sm_authenticate(
 ) -> c_int {
     // Guard against panics: PAM modules must never unwind into the host process
     guard(|| pam_logic::authenticate(pamh))
+}
+
+/// PAM service module entry point for establishing/deleting user credentials
+/// Required by PAM specification for authentication modules.
+/// We don't manage credentials ourselves, so this is a no-op.
+#[no_mangle]
+pub extern "C" fn pam_sm_setcred(
+    _pamh: *mut pam_sys::PamHandle,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *const *const std::os::raw::c_char,
+) -> c_int {
+    pam_sys::PAM_SUCCESS
 }
 
 #[cfg(test)]
