@@ -17,15 +17,8 @@ INTERACTIVE=true
 REMOVE_PAM=true
 REMOVE_CONFIG_GUI=true
 REMOVE_DAEMON=true
-# Only PAM configuration locations and user data are configurable
-REMOVE_PAM_CONFIG_LOGIN=false
-REMOVE_PAM_CONFIG_SUDO=false
-REMOVE_PAM_CONFIG_POLKIT=false
-REMOVE_PAM_CONFIG_SYSTEM_AUTH=false
-REMOVE_PAM_CONFIG_GDM=false
-REMOVE_PAM_CONFIG_SDDM=false
-REMOVE_PAM_CONFIG_LIGHTDM=false
-REMOVE_PAM_CONFIG_KDE=false
+# PAM configurations are always removed to prevent inconsistent state
+# Only user data removal is configurable
 REMOVE_USER_DATA=false
 DRY_RUN=false
 
@@ -120,20 +113,18 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --remove-pam-login      Remove PAM login configuration
-    --remove-pam-sudo       Remove PAM sudo configuration
-    --remove-pam-polkit     Remove PAM polkit configuration
-    --remove-pam-system-auth Remove PAM system-auth configuration
-    --remove-pam-gdm        Remove PAM GDM configuration
-    --remove-pam-sddm       Remove PAM SDDM configuration
-    --remove-pam-lightdm    Remove PAM LightDM configuration
-    --remove-pam-kde        Remove PAM KDE configuration
     --remove-user-data      Remove user configuration data (keys, pairings)
     --dry-run               Show what would be done without doing it
 
 NOTES:
-    All components (daemon, PAM module, configuration GUI) are always removed.
-    Only PAM configuration locations and user data removal are configurable.
+    All components are always removed during uninstallation:
+    - Daemon (tapauthd binary, systemd units)
+    - PAM module (pam_tapauth.so)
+    - PAM configurations (all modified PAM files)
+    - Configuration GUI
+    - System users and groups (tapauthd, tapauthd-clients)
+    
+    Only user data removal is optional (keys, pairings).
 
 EXAMPLES:
     # Interactive uninstallation (default)
@@ -206,47 +197,7 @@ parse_args() {
                 ;;
             -y|--yes)
                 INTERACTIVE=false
-                REMOVE_PAM_CONFIG_LOGIN=true
-                REMOVE_PAM_CONFIG_SUDO=true
-                REMOVE_PAM_CONFIG_POLKIT=true
-                REMOVE_PAM_CONFIG_SYSTEM_AUTH=true
-                REMOVE_PAM_CONFIG_GDM=true
-                REMOVE_PAM_CONFIG_SDDM=true
-                REMOVE_PAM_CONFIG_LIGHTDM=true
-                REMOVE_PAM_CONFIG_KDE=true
                 REMOVE_USER_DATA=true
-                shift
-                ;;
-            --remove-pam-login)
-                REMOVE_PAM_CONFIG_LOGIN=true
-                shift
-                ;;
-            --remove-pam-sudo)
-                REMOVE_PAM_CONFIG_SUDO=true
-                shift
-                ;;
-            --remove-pam-polkit)
-                REMOVE_PAM_CONFIG_POLKIT=true
-                shift
-                ;;
-            --remove-pam-system-auth)
-                REMOVE_PAM_CONFIG_SYSTEM_AUTH=true
-                shift
-                ;;
-            --remove-pam-gdm)
-                REMOVE_PAM_CONFIG_GDM=true
-                shift
-                ;;
-            --remove-pam-sddm)
-                REMOVE_PAM_CONFIG_SDDM=true
-                shift
-                ;;
-            --remove-pam-lightdm)
-                REMOVE_PAM_CONFIG_LIGHTDM=true
-                shift
-                ;;
-            --remove-pam-kde)
-                REMOVE_PAM_CONFIG_KDE=true
                 shift
                 ;;
             --remove-user-data)
@@ -267,106 +218,6 @@ parse_args() {
 }
 
 # Interactive prompts
-prompt_pam_configuration() {
-    print_header "PAM Configuration Removal"
-    
-    print_info "All components (daemon, PAM module, configuration GUI) will be removed."
-    echo ""
-    
-    # Check which PAM files have TapAuth configured
-    local has_login=false
-    local has_sudo=false
-    local has_polkit=false
-    local has_system_auth=false
-    local has_gdm=false
-    local has_sddm=false
-    local has_lightdm=false
-    local has_kde=false
-    
-    if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-        has_login=true
-    fi
-    
-    if [[ -f /etc/pam.d/sudo ]] && grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-        has_sudo=true
-    fi
-    
-    # Check both /etc/pam.d and /usr/lib/pam.d for polkit config
-    if ([[ -f /etc/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /etc/pam.d/polkit-1 2>/dev/null) || \
-       ([[ -f /usr/lib/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /usr/lib/pam.d/polkit-1 2>/dev/null); then
-        has_polkit=true
-    fi
-    
-    # Check for system-auth
-    if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
-        has_system_auth=true
-    fi
-    
-    # Check for GDM
-    if ([[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null) || \
-       ([[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null); then
-        has_gdm=true
-    fi
-    
-    # Check for SDDM (uses /etc/pam.d/sddm for user authentication)
-    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-        has_sddm=true
-    fi
-    
-    # Check for LightDM
-    if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
-        has_lightdm=true
-    fi
-    
-    # Check for KDE (multiple PAM files)
-    if ([[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null) || \
-       ([[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null) || \
-       ([[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null) || \
-       ([[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null); then
-        has_kde=true
-    fi
-    
-    if [[ "$has_login" == true ]]; then
-        read -p "Remove TapAuth from login PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_LOGIN=true || REMOVE_PAM_CONFIG_LOGIN=false
-    fi
-    
-    if [[ "$has_sudo" == true ]]; then
-        read -p "Remove TapAuth from sudo PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_SUDO=true || REMOVE_PAM_CONFIG_SUDO=false
-    fi
-    
-    if [[ "$has_polkit" == true ]]; then
-        read -p "Remove TapAuth from polkit PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_POLKIT=true || REMOVE_PAM_CONFIG_POLKIT=false
-    fi
-    
-    if [[ "$has_system_auth" == true ]]; then
-        read -p "Remove TapAuth from system-auth PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_SYSTEM_AUTH=true || REMOVE_PAM_CONFIG_SYSTEM_AUTH=false
-    fi
-    
-    if [[ "$has_gdm" == true ]]; then
-        read -p "Remove TapAuth from GDM PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_GDM=true || REMOVE_PAM_CONFIG_GDM=false
-    fi
-    
-    if [[ "$has_sddm" == true ]]; then
-        read -p "Remove TapAuth from SDDM PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_SDDM=true || REMOVE_PAM_CONFIG_SDDM=false
-    fi
-    
-    if [[ "$has_lightdm" == true ]]; then
-        read -p "Remove TapAuth from LightDM PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_LIGHTDM=true || REMOVE_PAM_CONFIG_LIGHTDM=false
-    fi
-    
-    if [[ "$has_kde" == true ]]; then
-        read -p "Remove TapAuth from KDE PAM configuration? [Y/n]: " response
-        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_KDE=true || REMOVE_PAM_CONFIG_KDE=false
-    fi
-}
-
 prompt_user_data() {
     print_header "User Data Removal"
     
@@ -433,205 +284,133 @@ check_root() {
 
 # Remove PAM configuration
 remove_pam_config() {
-    if [[ "$REMOVE_PAM_CONFIG_LOGIN" == false && "$REMOVE_PAM_CONFIG_SUDO" == false && "$REMOVE_PAM_CONFIG_POLKIT" == false && \
-          "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == false && "$REMOVE_PAM_CONFIG_GDM" == false && "$REMOVE_PAM_CONFIG_SDDM" == false && \
-          "$REMOVE_PAM_CONFIG_LIGHTDM" == false && "$REMOVE_PAM_CONFIG_KDE" == false ]]; then
-        return
-    fi
-    
     print_header "Removing PAM Configuration"
+    print_info "Cleaning up all TapAuth PAM configurations..."
     
     if [[ "$DRY_RUN" == true ]]; then
-        print_info "[DRY RUN] Would remove PAM configuration"
+        print_info "[DRY RUN] Would remove TapAuth from all PAM configurations"
         echo ""
         
-        if [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]]; then
-            show_pam_restore_diff "/etc/pam.d/login"
+        show_pam_restore_diff "/etc/pam.d/login"
+        show_pam_restore_diff "/etc/pam.d/sudo"
+        
+        # Check both possible polkit locations
+        if [[ -f /etc/pam.d/polkit-1 ]]; then
+            show_pam_restore_diff "/etc/pam.d/polkit-1"
+        elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
+            show_pam_restore_diff "/usr/lib/pam.d/polkit-1"
         fi
         
-        if [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]]; then
-            show_pam_restore_diff "/etc/pam.d/sudo"
+        if [[ -f /etc/pam.d/system-auth ]]; then
+            show_pam_restore_diff "/etc/pam.d/system-auth"
         fi
         
-        if [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]]; then
-            # Check both possible polkit locations
-            if [[ -f /etc/pam.d/polkit-1 ]]; then
-                show_pam_restore_diff "/etc/pam.d/polkit-1"
-            elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-                show_pam_restore_diff "/usr/lib/pam.d/polkit-1"
-            fi
+        if [[ -f /etc/pam.d/gdm-password ]]; then
+            show_pam_restore_diff "/etc/pam.d/gdm-password"
+        elif [[ -f /etc/pam.d/gdm ]]; then
+            show_pam_restore_diff "/etc/pam.d/gdm"
         fi
         
-        if [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]]; then
-            if [[ -f /etc/pam.d/system-auth ]]; then
-                show_pam_restore_diff "/etc/pam.d/system-auth"
-            fi
+        if [[ -f /etc/pam.d/sddm ]]; then
+            show_pam_restore_diff "/etc/pam.d/sddm"
         fi
         
-        if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
-            if [[ -f /etc/pam.d/gdm-password ]]; then
-                show_pam_restore_diff "/etc/pam.d/gdm-password"
-            elif [[ -f /etc/pam.d/gdm ]]; then
-                show_pam_restore_diff "/etc/pam.d/gdm"
-            fi
+        if [[ -f /etc/pam.d/lightdm ]]; then
+            show_pam_restore_diff "/etc/pam.d/lightdm"
         fi
         
-        if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-            # SDDM uses /etc/pam.d/sddm for user authentication
-            if [[ -f /etc/pam.d/sddm ]]; then
-                show_pam_restore_diff "/etc/pam.d/sddm"
-            fi
+        # KDE uses multiple PAM files
+        if [[ -f /etc/pam.d/kde ]]; then
+            show_pam_restore_diff "/etc/pam.d/kde"
         fi
-        
-        if [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]]; then
-            if [[ -f /etc/pam.d/lightdm ]]; then
-                show_pam_restore_diff "/etc/pam.d/lightdm"
-            fi
+        if [[ -f /etc/pam.d/kscreenlocker ]]; then
+            show_pam_restore_diff "/etc/pam.d/kscreenlocker"
         fi
-        
-        if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
-            # KDE uses multiple PAM files
-            if [[ -f /etc/pam.d/kde ]]; then
-                show_pam_restore_diff "/etc/pam.d/kde"
-            fi
-            if [[ -f /etc/pam.d/kscreenlocker ]]; then
-                show_pam_restore_diff "/etc/pam.d/kscreenlocker"
-            fi
-            if [[ -f /etc/pam.d/kde-fingerprint ]]; then
-                show_pam_restore_diff "/etc/pam.d/kde-fingerprint"
-            fi
-            if [[ -f /etc/pam.d/kde-smartcard ]]; then
-                show_pam_restore_diff "/etc/pam.d/kde-smartcard"
-            fi
+        if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+            show_pam_restore_diff "/etc/pam.d/kde-fingerprint"
+        fi
+        if [[ -f /etc/pam.d/kde-smartcard ]]; then
+            show_pam_restore_diff "/etc/pam.d/kde-smartcard"
         fi
         return
     fi
     
+    # Always remove from all PAM files to prevent inconsistent state
+    
     # Remove from login
-    if [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]]; then
-        if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-            print_info "Removing TapAuth from login PAM configuration"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
-            print_success "Removed from login"
-        fi
+    if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
+        print_info "Removing TapAuth from login PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
     fi
     
     # Remove from sudo
-    if [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]]; then
-        if [[ -f /etc/pam.d/sudo ]] && grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-            print_info "Removing TapAuth from sudo PAM configuration"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/sudo
-            print_success "Removed from sudo"
-        fi
+    if [[ -f /etc/pam.d/sudo ]] && grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
+        print_info "Removing TapAuth from sudo PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sudo
     fi
     
-    # Remove from polkit
-    if [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]]; then
-        # Check both /etc/pam.d and /usr/lib/pam.d for polkit config
-        local polkit_removed=false
-        
-        if [[ -f /etc/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /etc/pam.d/polkit-1 2>/dev/null; then
-            print_info "Removing TapAuth from polkit PAM configuration (/etc/pam.d/polkit-1)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/polkit-1
-            polkit_removed=true
-        fi
-        
-        if [[ -f /usr/lib/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /usr/lib/pam.d/polkit-1 2>/dev/null; then
-            print_info "Removing TapAuth from polkit PAM configuration (/usr/lib/pam.d/polkit-1)"
-            sed -i '/pam_tapauth\.so/d' /usr/lib/pam.d/polkit-1
-            polkit_removed=true
-        fi
-        
-        if [[ "$polkit_removed" == true ]]; then
-            print_success "Removed from polkit"
-        fi
+    # Remove from polkit (check both locations)
+    if [[ -f /etc/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /etc/pam.d/polkit-1 2>/dev/null; then
+        print_info "Removing TapAuth from polkit PAM configuration (/etc/pam.d/polkit-1)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/polkit-1
+    fi
+    
+    if [[ -f /usr/lib/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /usr/lib/pam.d/polkit-1 2>/dev/null; then
+        print_info "Removing TapAuth from polkit PAM configuration (/usr/lib/pam.d/polkit-1)"
+        sed -i '/pam_tapauth\.so/d' /usr/lib/pam.d/polkit-1
     fi
     
     # Remove from system-auth
-    if [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]]; then
-        if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
-            print_info "Removing TapAuth from system-auth PAM configuration"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/system-auth
-            print_success "Removed from system-auth"
-        fi
+    if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
+        print_info "Removing TapAuth from system-auth PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/system-auth
     fi
     
     # Remove from GDM
-    if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
-        local gdm_removed=false
-        
-        if [[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null; then
-            print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm-password)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-password
-            gdm_removed=true
-        fi
-        
-        if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
-            print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
-            gdm_removed=true
-        fi
-        
-        if [[ "$gdm_removed" == true ]]; then
-            print_success "Removed from GDM"
-        fi
+    if [[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null; then
+        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm-password)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-password
+    fi
+    
+    if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
+        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
     fi
     
     # Remove from SDDM
-    if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-        # SDDM uses /etc/pam.d/sddm for user authentication
-        if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-            print_info "Removing TapAuth from SDDM PAM configuration"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
-            print_success "Removed from SDDM"
-        fi
+    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
+        print_info "Removing TapAuth from SDDM PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
     fi
     
     # Remove from LightDM
-    if [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]]; then
-        if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
-            print_info "Removing TapAuth from LightDM PAM configuration"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
-            print_success "Removed from LightDM"
-        fi
+    if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
+        print_info "Removing TapAuth from LightDM PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
     fi
     
     # Remove from KDE (multiple PAM files)
-    if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
-        local kde_removed=false
-        
-        # Remove from /etc/pam.d/kde
-        if [[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null; then
-            print_info "Removing TapAuth from KDE PAM configuration (/etc/pam.d/kde)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde
-            kde_removed=true
-        fi
-        
-        # Remove from /etc/pam.d/kscreenlocker
-        if [[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null; then
-            print_info "Removing TapAuth from KDE screen locker PAM configuration (/etc/pam.d/kscreenlocker)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
-            kde_removed=true
-        fi
-        
-        # Remove from /etc/pam.d/kde-fingerprint
-        if [[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
-            print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
-            kde_removed=true
-        fi
-        
-        # Remove from /etc/pam.d/kde-smartcard
-        if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
-            print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
-            kde_removed=true
-        fi
-        
-        if [[ "$kde_removed" == true ]]; then
-            print_success "Removed from KDE"
-        fi
+    if [[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null; then
+        print_info "Removing TapAuth from KDE PAM configuration (/etc/pam.d/kde)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde
     fi
+    
+    if [[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null; then
+        print_info "Removing TapAuth from KDE screen locker PAM configuration (/etc/pam.d/kscreenlocker)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
+    fi
+    
+    if [[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+        print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
+    fi
+    
+    if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
+        print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
+    fi
+    
+    print_success "PAM configurations cleaned up"
 }
 
 # Remove PAM module
@@ -842,17 +621,7 @@ create_summary() {
     echo "  ✓ PAM module"
     echo "  ✓ Configuration GUI"
     echo "  ✓ System users and groups"
-    
-    echo ""
-    echo "PAM configuration removed:"
-    [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
-    [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
-    [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
-    [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth" || echo "  ✗ System-auth"
-    [[ "$REMOVE_PAM_CONFIG_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
-    [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
-    [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
-    [[ "$REMOVE_PAM_CONFIG_KDE" == true ]] && echo "  ✓ KDE" || echo "  ✗ KDE"
+    echo "  ✓ All PAM configurations"
     
     echo ""
     echo "User data:"
@@ -879,9 +648,9 @@ main() {
     
     if [[ "$INTERACTIVE" == true ]]; then
         print_warning "This will remove all TapAuth components from your system"
+        print_info "All PAM configurations will be cleaned up automatically"
         echo ""
         
-        prompt_pam_configuration
         prompt_user_data
         
         echo ""
@@ -914,58 +683,8 @@ main() {
         echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"
         
         echo ""
-        echo "PAM configuration to remove:"
-        [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]] && echo "  ✓ Login (/etc/pam.d/login)" || echo "  ✗ Login (kept)"
-        [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (kept)"
-        if [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]]; then
-            if [[ -f /etc/pam.d/polkit-1 ]]; then
-                echo "  ✓ Polkit (/etc/pam.d/polkit-1)"
-            elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-                echo "  ✓ Polkit (/usr/lib/pam.d/polkit-1)"
-            else
-                echo "  ✓ Polkit (config file not found)"
-            fi
-        else
-            echo "  ✗ Polkit (kept)"
-        fi
-        [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (kept)"
-        if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
-            if [[ -f /etc/pam.d/gdm-password ]]; then
-                echo "  ✓ GDM (/etc/pam.d/gdm-password)"
-            elif [[ -f /etc/pam.d/gdm ]]; then
-                echo "  ✓ GDM (/etc/pam.d/gdm)"
-            else
-                echo "  ✓ GDM (config file not found)"
-            fi
-        else
-            echo "  ✗ GDM (kept)"
-        fi
-        if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-            if [[ -f /etc/pam.d/sddm ]]; then
-                echo "  ✓ SDDM (/etc/pam.d/sddm)"
-            else
-                echo "  ✓ SDDM (config file not found)"
-            fi
-        else
-            echo "  ✗ SDDM (kept)"
-        fi
-        [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (kept)"
-        
-        if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
-            local kde_files=""
-            [[ -f /etc/pam.d/kde ]] && kde_files="kde"
-            [[ -f /etc/pam.d/kscreenlocker ]] && kde_files="${kde_files:+$kde_files, }kscreenlocker"
-            [[ -f /etc/pam.d/kde-fingerprint ]] && kde_files="${kde_files:+$kde_files, }kde-fingerprint"
-            [[ -f /etc/pam.d/kde-smartcard ]] && kde_files="${kde_files:+$kde_files, }kde-smartcard"
-            
-            if [[ -n "$kde_files" ]]; then
-                echo "  ✓ KDE ($kde_files)"
-            else
-                echo "  ✓ KDE (config files not found)"
-            fi
-        else
-            echo "  ✗ KDE (kept)"
-        fi
+        echo "PAM configurations:"
+        echo "  ✓ All PAM files will be cleaned (login, sudo, polkit, system-auth, display managers, etc.)"
         
         echo ""
         echo "User data:"
