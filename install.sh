@@ -25,6 +25,7 @@ CONFIGURE_PAM_SYSTEM_AUTH=false
 CONFIGURE_PAM_GDM=false
 CONFIGURE_PAM_SDDM=false
 CONFIGURE_PAM_LIGHTDM=false
+CONFIGURE_PAM_KDE=false
 USE_TPM=false
 USE_BLE=true
 BUILD_ONLY=false
@@ -184,6 +185,7 @@ OPTIONS:
     --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
     --configure-sddm        Configure PAM for SDDM (Simple Desktop Display Manager)
     --configure-lightdm     Configure PAM for LightDM
+    --configure-kde         Configure PAM for KDE (kde, kscreenlocker)
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
 
@@ -267,6 +269,10 @@ parse_args() {
                 CONFIGURE_PAM_LIGHTDM=true
                 shift
                 ;;
+            --configure-kde)
+                CONFIGURE_PAM_KDE=true
+                shift
+                ;;
             --use-tpm)
                 USE_TPM=true
                 shift
@@ -324,18 +330,24 @@ prompt_pam_configuration() {
     local has_gdm=false
     local has_sddm=false
     local has_lightdm=false
+    local has_kde=false
     
     if [[ -f /etc/pam.d/gdm-password ]] || [[ -f /etc/pam.d/gdm ]]; then
         has_gdm=true
     fi
     
-    # SDDM uses sddm-greeter for authentication (not just sddm)
-    if [[ -f /etc/pam.d/sddm-greeter ]] || [[ -f /etc/pam.d/sddm ]]; then
+    # SDDM uses /etc/pam.d/sddm for user authentication
+    if [[ -f /etc/pam.d/sddm ]]; then
         has_sddm=true
     fi
     
     if [[ -f /etc/pam.d/lightdm ]]; then
         has_lightdm=true
+    fi
+    
+    # KDE uses multiple PAM files
+    if [[ -f /etc/pam.d/kde ]] || [[ -f /etc/pam.d/kscreenlocker ]]; then
+        has_kde=true
     fi
     
     # Inform about system-auth if present
@@ -374,6 +386,11 @@ prompt_pam_configuration() {
     if [[ "$has_lightdm" == true ]]; then
         read -p "Configure TapAuth for LightDM? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LIGHTDM=true || CONFIGURE_PAM_LIGHTDM=false
+    fi
+    
+    if [[ "$has_kde" == true ]]; then
+        read -p "Configure TapAuth for KDE (kde, kscreenlocker)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_KDE=true || CONFIGURE_PAM_KDE=false
     fi
 }
 
@@ -679,7 +696,7 @@ install_pam() {
 configure_pam() {
     if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
           "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
-          "$CONFIGURE_PAM_LIGHTDM" == false ]]; then
+          "$CONFIGURE_PAM_LIGHTDM" == false && "$CONFIGURE_PAM_KDE" == false ]]; then
         print_info "No PAM services selected for configuration"
         return
     fi
@@ -737,15 +754,13 @@ configure_pam() {
         fi
         
         if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
-            # SDDM uses sddm-greeter for authentication
-            if [[ -f /etc/pam.d/sddm-greeter ]]; then
-                show_pam_diff "/etc/pam.d/sddm-greeter" "$pam_line" ""
-            elif [[ -f /etc/pam.d/sddm ]]; then
+            # SDDM uses /etc/pam.d/sddm for user authentication
+            if [[ -f /etc/pam.d/sddm ]]; then
                 show_pam_diff "/etc/pam.d/sddm" "$pam_line" ""
             else
                 echo ""
                 echo -e "${YELLOW}[SKIP]${NC} SDDM PAM configuration"
-                echo "  → Not found at /etc/pam.d/sddm-greeter or /etc/pam.d/sddm"
+                echo "  → Not found at /etc/pam.d/sddm"
             fi
         fi
         
@@ -756,6 +771,32 @@ configure_pam() {
                 echo ""
                 echo -e "${YELLOW}[SKIP]${NC} LightDM PAM configuration"
                 echo "  → Not found at /etc/pam.d/lightdm"
+            fi
+        fi
+        
+        if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
+            # KDE uses multiple PAM files
+            local kde_found=false
+            if [[ -f /etc/pam.d/kde ]]; then
+                show_pam_diff "/etc/pam.d/kde" "$pam_line" ""
+                kde_found=true
+            fi
+            if [[ -f /etc/pam.d/kscreenlocker ]]; then
+                show_pam_diff "/etc/pam.d/kscreenlocker" "$pam_line" ""
+                kde_found=true
+            fi
+            if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+                show_pam_diff "/etc/pam.d/kde-fingerprint" "$pam_line" ""
+                kde_found=true
+            fi
+            if [[ -f /etc/pam.d/kde-smartcard ]]; then
+                show_pam_diff "/etc/pam.d/kde-smartcard" "$pam_line" ""
+                kde_found=true
+            fi
+            if [[ "$kde_found" == false ]]; then
+                echo ""
+                echo -e "${YELLOW}[SKIP]${NC} KDE PAM configuration"
+                echo "  → No KDE PAM files found (/etc/pam.d/kde, kscreenlocker, etc.)"
             fi
         fi
         return
@@ -865,29 +906,17 @@ configure_pam() {
     if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
         print_info "Configuring PAM for SDDM..."
         
-        # SDDM uses sddm-greeter for authentication (primary config)
-        local sddm_configured=false
-        if [[ -f /etc/pam.d/sddm-greeter ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter; then
-                sed -i "1i $pam_line" /etc/pam.d/sddm-greeter
-                print_success "Configured PAM for SDDM (sddm-greeter)"
-                sddm_configured=true
-            else
-                print_warning "PAM SDDM already configured (sddm-greeter)"
-                sddm_configured=true
-            fi
-        fi
-        
-        # Fallback to sddm if sddm-greeter doesn't exist
-        if [[ -f /etc/pam.d/sddm ]] && [[ "$sddm_configured" == false ]]; then
+        # SDDM uses /etc/pam.d/sddm for user authentication
+        # Note: sddm-greeter is for the greeter UI process itself, not user auth
+        if [[ -f /etc/pam.d/sddm ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
                 sed -i "1i $pam_line" /etc/pam.d/sddm
                 print_success "Configured PAM for SDDM"
             else
                 print_warning "PAM SDDM already configured"
             fi
-        elif [[ "$sddm_configured" == false ]]; then
-            print_warning "SDDM PAM configuration not found (checked /etc/pam.d/sddm-greeter and /etc/pam.d/sddm)"
+        else
+            print_warning "SDDM PAM configuration not found at /etc/pam.d/sddm"
         fi
     fi
     
@@ -907,10 +936,67 @@ configure_pam() {
         fi
     fi
     
+    # Configure KDE (multiple PAM files)
+    if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
+        print_info "Configuring PAM for KDE..."
+        
+        local kde_configured=false
+        
+        # Configure /etc/pam.d/kde
+        if [[ -f /etc/pam.d/kde ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde; then
+                sed -i "1i $pam_line" /etc/pam.d/kde
+                print_success "Configured PAM for KDE (kde)"
+                kde_configured=true
+            else
+                print_warning "PAM KDE already configured (kde)"
+                kde_configured=true
+            fi
+        fi
+        
+        # Configure /etc/pam.d/kscreenlocker
+        if [[ -f /etc/pam.d/kscreenlocker ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker; then
+                sed -i "1i $pam_line" /etc/pam.d/kscreenlocker
+                print_success "Configured PAM for KDE screen locker (kscreenlocker)"
+                kde_configured=true
+            else
+                print_warning "PAM KDE screen locker already configured (kscreenlocker)"
+                kde_configured=true
+            fi
+        fi
+        
+        # Configure /etc/pam.d/kde-fingerprint (if it exists)
+        if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
+                sed -i "1i $pam_line" /etc/pam.d/kde-fingerprint
+                print_success "Configured PAM for KDE fingerprint (kde-fingerprint)"
+                kde_configured=true
+            else
+                print_warning "PAM KDE fingerprint already configured (kde-fingerprint)"
+            fi
+        fi
+        
+        # Configure /etc/pam.d/kde-smartcard (if it exists)
+        if [[ -f /etc/pam.d/kde-smartcard ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard; then
+                sed -i "1i $pam_line" /etc/pam.d/kde-smartcard
+                print_success "Configured PAM for KDE smartcard (kde-smartcard)"
+                kde_configured=true
+            else
+                print_warning "PAM KDE smartcard already configured (kde-smartcard)"
+            fi
+        fi
+        
+        if [[ "$kde_configured" == false ]]; then
+            print_warning "No KDE PAM configuration files found (checked /etc/pam.d/kde, kscreenlocker, kde-fingerprint, kde-smartcard)"
+        fi
+    fi
+    
     # Inform about when changes take effect
     if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true || \
           "$CONFIGURE_PAM_SYSTEM_AUTH" == true || "$CONFIGURE_PAM_GDM" == true || "$CONFIGURE_PAM_SDDM" == true || \
-          "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
+          "$CONFIGURE_PAM_LIGHTDM" == true || "$CONFIGURE_PAM_KDE" == true ]]; then
         echo ""
         print_info "PAM configuration updated"
         print_info "Changes take effect:"
@@ -934,6 +1020,9 @@ configure_pam() {
         fi
         if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
             echo "  • LightDM: On next login session (logout/login required)"
+        fi
+        if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
+            echo "  • KDE: On next login session or screen lock (logout/login required)"
         fi
     fi
 }
@@ -1004,6 +1093,7 @@ create_summary() {
     [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
     [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
     [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
+    [[ "$CONFIGURE_PAM_KDE" == true ]] && echo "  ✓ KDE" || echo "  ✗ KDE"
     
     echo ""
     echo "Features enabled:"

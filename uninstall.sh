@@ -25,6 +25,7 @@ REMOVE_PAM_CONFIG_SYSTEM_AUTH=false
 REMOVE_PAM_CONFIG_GDM=false
 REMOVE_PAM_CONFIG_SDDM=false
 REMOVE_PAM_CONFIG_LIGHTDM=false
+REMOVE_PAM_CONFIG_KDE=false
 REMOVE_USER_DATA=false
 DRY_RUN=false
 
@@ -126,6 +127,7 @@ OPTIONS:
     --remove-pam-gdm        Remove PAM GDM configuration
     --remove-pam-sddm       Remove PAM SDDM configuration
     --remove-pam-lightdm    Remove PAM LightDM configuration
+    --remove-pam-kde        Remove PAM KDE configuration
     --remove-user-data      Remove user configuration data (keys, pairings)
     --dry-run               Show what would be done without doing it
 
@@ -211,6 +213,7 @@ parse_args() {
                 REMOVE_PAM_CONFIG_GDM=true
                 REMOVE_PAM_CONFIG_SDDM=true
                 REMOVE_PAM_CONFIG_LIGHTDM=true
+                REMOVE_PAM_CONFIG_KDE=true
                 REMOVE_USER_DATA=true
                 shift
                 ;;
@@ -240,6 +243,10 @@ parse_args() {
                 ;;
             --remove-pam-lightdm)
                 REMOVE_PAM_CONFIG_LIGHTDM=true
+                shift
+                ;;
+            --remove-pam-kde)
+                REMOVE_PAM_CONFIG_KDE=true
                 shift
                 ;;
             --remove-user-data)
@@ -274,6 +281,7 @@ prompt_pam_configuration() {
     local has_gdm=false
     local has_sddm=false
     local has_lightdm=false
+    local has_kde=false
     
     if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
         has_login=true
@@ -300,15 +308,22 @@ prompt_pam_configuration() {
         has_gdm=true
     fi
     
-    # Check for SDDM (uses sddm-greeter primarily)
-    if ([[ -f /etc/pam.d/sddm-greeter ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter 2>/dev/null) || \
-       ([[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null); then
+    # Check for SDDM (uses /etc/pam.d/sddm for user authentication)
+    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
         has_sddm=true
     fi
     
     # Check for LightDM
     if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
         has_lightdm=true
+    fi
+    
+    # Check for KDE (multiple PAM files)
+    if ([[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null) || \
+       ([[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null) || \
+       ([[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null) || \
+       ([[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null); then
+        has_kde=true
     fi
     
     if [[ "$has_login" == true ]]; then
@@ -344,6 +359,11 @@ prompt_pam_configuration() {
     if [[ "$has_lightdm" == true ]]; then
         read -p "Remove TapAuth from LightDM PAM configuration? [Y/n]: " response
         [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_LIGHTDM=true || REMOVE_PAM_CONFIG_LIGHTDM=false
+    fi
+    
+    if [[ "$has_kde" == true ]]; then
+        read -p "Remove TapAuth from KDE PAM configuration? [Y/n]: " response
+        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_KDE=true || REMOVE_PAM_CONFIG_KDE=false
     fi
 }
 
@@ -415,7 +435,7 @@ check_root() {
 remove_pam_config() {
     if [[ "$REMOVE_PAM_CONFIG_LOGIN" == false && "$REMOVE_PAM_CONFIG_SUDO" == false && "$REMOVE_PAM_CONFIG_POLKIT" == false && \
           "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == false && "$REMOVE_PAM_CONFIG_GDM" == false && "$REMOVE_PAM_CONFIG_SDDM" == false && \
-          "$REMOVE_PAM_CONFIG_LIGHTDM" == false ]]; then
+          "$REMOVE_PAM_CONFIG_LIGHTDM" == false && "$REMOVE_PAM_CONFIG_KDE" == false ]]; then
         return
     fi
     
@@ -457,10 +477,8 @@ remove_pam_config() {
         fi
         
         if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-            # SDDM uses sddm-greeter primarily
-            if [[ -f /etc/pam.d/sddm-greeter ]]; then
-                show_pam_restore_diff "/etc/pam.d/sddm-greeter"
-            elif [[ -f /etc/pam.d/sddm ]]; then
+            # SDDM uses /etc/pam.d/sddm for user authentication
+            if [[ -f /etc/pam.d/sddm ]]; then
                 show_pam_restore_diff "/etc/pam.d/sddm"
             fi
         fi
@@ -468,6 +486,22 @@ remove_pam_config() {
         if [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]]; then
             if [[ -f /etc/pam.d/lightdm ]]; then
                 show_pam_restore_diff "/etc/pam.d/lightdm"
+            fi
+        fi
+        
+        if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
+            # KDE uses multiple PAM files
+            if [[ -f /etc/pam.d/kde ]]; then
+                show_pam_restore_diff "/etc/pam.d/kde"
+            fi
+            if [[ -f /etc/pam.d/kscreenlocker ]]; then
+                show_pam_restore_diff "/etc/pam.d/kscreenlocker"
+            fi
+            if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+                show_pam_restore_diff "/etc/pam.d/kde-fingerprint"
+            fi
+            if [[ -f /etc/pam.d/kde-smartcard ]]; then
+                show_pam_restore_diff "/etc/pam.d/kde-smartcard"
             fi
         fi
         return
@@ -545,23 +579,10 @@ remove_pam_config() {
     
     # Remove from SDDM
     if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-        local sddm_removed=false
-        
-        # SDDM uses sddm-greeter for authentication (primary config)
-        if [[ -f /etc/pam.d/sddm-greeter ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter 2>/dev/null; then
-            print_info "Removing TapAuth from SDDM PAM configuration (/etc/pam.d/sddm-greeter)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm-greeter
-            sddm_removed=true
-        fi
-        
-        # Also check fallback location
+        # SDDM uses /etc/pam.d/sddm for user authentication
         if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-            print_info "Removing TapAuth from SDDM PAM configuration (/etc/pam.d/sddm)"
+            print_info "Removing TapAuth from SDDM PAM configuration"
             sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
-            sddm_removed=true
-        fi
-        
-        if [[ "$sddm_removed" == true ]]; then
             print_success "Removed from SDDM"
         fi
     fi
@@ -572,6 +593,43 @@ remove_pam_config() {
             print_info "Removing TapAuth from LightDM PAM configuration"
             sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
             print_success "Removed from LightDM"
+        fi
+    fi
+    
+    # Remove from KDE (multiple PAM files)
+    if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
+        local kde_removed=false
+        
+        # Remove from /etc/pam.d/kde
+        if [[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null; then
+            print_info "Removing TapAuth from KDE PAM configuration (/etc/pam.d/kde)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde
+            kde_removed=true
+        fi
+        
+        # Remove from /etc/pam.d/kscreenlocker
+        if [[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null; then
+            print_info "Removing TapAuth from KDE screen locker PAM configuration (/etc/pam.d/kscreenlocker)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
+            kde_removed=true
+        fi
+        
+        # Remove from /etc/pam.d/kde-fingerprint
+        if [[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+            print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
+            kde_removed=true
+        fi
+        
+        # Remove from /etc/pam.d/kde-smartcard
+        if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
+            print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
+            kde_removed=true
+        fi
+        
+        if [[ "$kde_removed" == true ]]; then
+            print_success "Removed from KDE"
         fi
     fi
 }
@@ -742,6 +800,7 @@ create_summary() {
     [[ "$REMOVE_PAM_CONFIG_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
     [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
     [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
+    [[ "$REMOVE_PAM_CONFIG_KDE" == true ]] && echo "  ✓ KDE" || echo "  ✗ KDE"
     
     echo ""
     echo "User data:"
@@ -825,9 +884,7 @@ main() {
             echo "  ✗ GDM (kept)"
         fi
         if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-            if [[ -f /etc/pam.d/sddm-greeter ]]; then
-                echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)"
-            elif [[ -f /etc/pam.d/sddm ]]; then
+            if [[ -f /etc/pam.d/sddm ]]; then
                 echo "  ✓ SDDM (/etc/pam.d/sddm)"
             else
                 echo "  ✓ SDDM (config file not found)"
@@ -836,6 +893,22 @@ main() {
             echo "  ✗ SDDM (kept)"
         fi
         [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (kept)"
+        
+        if [[ "$REMOVE_PAM_CONFIG_KDE" == true ]]; then
+            local kde_files=""
+            [[ -f /etc/pam.d/kde ]] && kde_files="kde"
+            [[ -f /etc/pam.d/kscreenlocker ]] && kde_files="${kde_files:+$kde_files, }kscreenlocker"
+            [[ -f /etc/pam.d/kde-fingerprint ]] && kde_files="${kde_files:+$kde_files, }kde-fingerprint"
+            [[ -f /etc/pam.d/kde-smartcard ]] && kde_files="${kde_files:+$kde_files, }kde-smartcard"
+            
+            if [[ -n "$kde_files" ]]; then
+                echo "  ✓ KDE ($kde_files)"
+            else
+                echo "  ✓ KDE (config files not found)"
+            fi
+        else
+            echo "  ✗ KDE (kept)"
+        fi
         
         echo ""
         echo "User data:"
