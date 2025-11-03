@@ -27,12 +27,20 @@ pub enum DaemonError {
 }
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
 
-/// Server shared state (daemon runtime + cancel registry)
+/// Tracks recent authentication requests to prevent duplicates
+#[derive(Clone)]
+struct RecentAuthRequest {
+    timestamp: Instant,
+}
+
+/// Server shared state (daemon runtime + cancel registry + deduplication)
 struct ServerState {
     daemon: Arc<DaemonState>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
 }
 
 #[tokio::main]
@@ -127,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_state = Arc::new(ServerState {
         daemon: daemon_state.clone(),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
+        recent_requests: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let server = {
@@ -247,25 +256,66 @@ async fn handle_conn(
         Ok(req) => {
             tracing::info!("Handling PamAuthenticateRequest for user: {}", req.username);
 
-            // Run authentication
-            let timeout = Some(req.timeout_seconds);
-            let sess = AuthSession::new(server_state.daemon.clone(), req.username.clone());
-            let result = sess
-                .handle_authenticate(
-                    timeout,
-                    Some(req.request_id.clone()),
-                    server_state.cancel_registry.clone(),
-                )
-                .await;
+            // Check for duplicate requests (within 1 second)
+            const DEDUP_WINDOW: Duration = Duration::from_secs(1);
+            let now = Instant::now();
+            let mut recent_requests = server_state.recent_requests.lock().await;
 
-            match result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::error!("Authentication handler error: {}", e);
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Error as i32,
-                        detail: format!("Internal error: {}", e),
-                        challenge: Vec::new(), // Error case, no challenge
+            // Clean up old entries (older than 2 seconds)
+            recent_requests
+                .retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
+
+            // Check if we have a recent request for this user
+            let is_duplicate = if let Some(recent) = recent_requests.get(&req.username) {
+                now.duration_since(recent.timestamp) < DEDUP_WINDOW
+            } else {
+                false
+            };
+
+            if is_duplicate {
+                let elapsed_ms = recent_requests
+                    .get(&req.username)
+                    .map(|r| now.duration_since(r.timestamp).as_millis())
+                    .unwrap_or(0);
+
+                tracing::warn!(
+                    "Duplicate authentication request for user '{}' within {}ms - ignoring",
+                    req.username,
+                    elapsed_ms
+                );
+                drop(recent_requests); // Release lock before responding
+
+                // Return IGNORE to let this PAM session fall through to password
+                ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Ignore as i32,
+                    detail: "Duplicate request - another authentication is in progress".to_string(),
+                    challenge: Vec::new(),
+                }
+            } else {
+                // Record/update timestamp for this user
+                recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
+                drop(recent_requests); // Release lock
+
+                // Run authentication
+                let timeout = Some(req.timeout_seconds);
+                let sess = AuthSession::new(server_state.daemon.clone(), req.username.clone());
+                let result = sess
+                    .handle_authenticate(
+                        timeout,
+                        Some(req.request_id.clone()),
+                        server_state.cancel_registry.clone(),
+                    )
+                    .await;
+
+                match result {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::error!("Authentication handler error: {}", e);
+                        ipc::PamAuthenticateResponse {
+                            outcome: ipc::PamOutcome::Error as i32,
+                            detail: format!("Internal error: {}", e),
+                            challenge: Vec::new(), // Error case, no challenge
+                        }
                     }
                 }
             }
