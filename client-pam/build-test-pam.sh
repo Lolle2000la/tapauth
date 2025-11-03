@@ -386,6 +386,14 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         ACTIVATION_MODE="systemd-temp"
         TAPAUTHD_SOCK_PATH="$TAPAUTHD_TEST_SOCK_PATH"
         echo "    Creating temporary systemd units for testing..."
+        
+        # Ensure socket directory exists before systemd tries to create the socket
+        echo "    Ensuring runtime directory at $TAPAUTHD_SOCK_DIR"
+        sudo mkdir -p "$TAPAUTHD_SOCK_DIR" || true
+        if getent group tapauthd-clients >/dev/null 2>&1; then
+            sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
+        fi
+        sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
 
         # Create temporary directory for unit files
         TEMP_UNIT_DIR=$(mktemp -d -t tapauthd-test-units.XXXXXX)
@@ -398,6 +406,7 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
             echo "❌ Failed to create temporary binary directory under /run"
             exit 1
         fi
+        sudo chmod 0755 "$TEMP_BIN_DIR"  # Allow tapauthd user to traverse
         sudo install -m 0755 "$TAPAUTHD_BIN" "$TEMP_BIN_DIR/tapauthd"
 
         # Ensure 'tapauthd-clients' group exists for socket ownership
@@ -415,9 +424,9 @@ PartOf=tapauthd-test.service
 [Socket]
 ListenStream=$TAPAUTHD_TEST_SOCK_PATH
 SocketUser=root
-    SocketGroup=tapauthd-clients
-    SocketMode=0660
-    DirectoryMode=0750
+SocketGroup=tapauthd-clients
+SocketMode=0660
+DirectoryMode=0750
 RemoveOnStop=yes
 
 [Install]
@@ -429,13 +438,13 @@ EOF
 [Unit]
 Description=TapAuth authentication daemon (test)
 Requires=tapauthd-test.socket
-    Wants=bluetooth.target
-    After=dbus.service bluetooth.target network.target
+Wants=bluetooth.target
+After=dbus.service bluetooth.target network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=tapauthd
+Group=tapauthd
 Sockets=tapauthd-test.socket
 ExecStart=$TEMP_BIN_DIR/tapauthd
 Restart=on-failure
@@ -492,10 +501,10 @@ fi
 # Wait for socket readiness (up to ~5s)
 echo -n "    Waiting for socket to appear"
 for i in {1..50}; do
-    if [ -S "$TAPAUTHD_SOCK_PATH" ]; then echo ""; echo "✅ Socket ready: $TAPAUTHD_SOCK_PATH"; break; fi
+    if sudo test -S "$TAPAUTHD_SOCK_PATH"; then echo ""; echo "✅ Socket ready: $TAPAUTHD_SOCK_PATH"; break; fi
     echo -n "."; sleep 0.1
 done
-if [ ! -S "$TAPAUTHD_SOCK_PATH" ]; then
+if ! sudo test -S "$TAPAUTHD_SOCK_PATH"; then
     echo ""; echo "❌ Socket did not appear at $TAPAUTHD_SOCK_PATH";
     if [ "$ACTIVATION_MODE" = "manual" ]; then
         echo "   ➤ Check daemon logs: tail -n +1 -f $LOG_FILE"
