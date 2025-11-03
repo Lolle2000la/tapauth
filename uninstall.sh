@@ -782,6 +782,57 @@ remove_user_data() {
     fi
 }
 
+# Remove system users and groups
+remove_system_users() {
+    print_header "Removing System Users and Groups"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would remove system user and groups"
+        echo ""
+        
+        # Check if any users are in tapauthd-clients group
+        if getent group tapauthd-clients >/dev/null 2>&1; then
+            local members=$(getent group tapauthd-clients | cut -d: -f4)
+            if [[ -n "$members" ]]; then
+                show_command "Remove users from tapauthd-clients group: $members"
+            fi
+            show_command "groupdel tapauthd-clients" "Delete tapauthd-clients group"
+        fi
+        
+        if id -u tapauthd >/dev/null 2>&1; then
+            show_command "userdel tapauthd" "Delete tapauthd system user"
+        fi
+        return
+    fi
+    
+    # Remove users from tapauthd-clients group first
+    if getent group tapauthd-clients >/dev/null 2>&1; then
+        local members=$(getent group tapauthd-clients | cut -d: -f4)
+        if [[ -n "$members" ]]; then
+            print_info "Removing users from tapauthd-clients group: $members"
+            IFS=',' read -ra user_array <<< "$members"
+            for user in "${user_array[@]}"; do
+                user=$(echo "$user" | xargs)  # trim whitespace
+                if id "$user" >/dev/null 2>&1; then
+                    gpasswd -d "$user" tapauthd-clients >/dev/null 2>&1 || true
+                    print_info "Removed user '$user' from tapauthd-clients group"
+                fi
+            done
+        fi
+        
+        print_info "Deleting group 'tapauthd-clients'"
+        groupdel tapauthd-clients >/dev/null 2>&1 || true
+    fi
+    
+    # Remove tapauthd system user
+    if id -u tapauthd >/dev/null 2>&1; then
+        print_info "Deleting system user 'tapauthd'"
+        userdel tapauthd >/dev/null 2>&1 || true
+    fi
+    
+    print_success "System users and groups removed"
+}
+
 # Create uninstallation summary
 create_summary() {
     print_header "Uninstallation Summary"
@@ -790,6 +841,7 @@ create_summary() {
     echo "  ✓ Daemon"
     echo "  ✓ PAM module"
     echo "  ✓ Configuration GUI"
+    echo "  ✓ System users and groups"
     
     echo ""
     echo "PAM configuration removed:"
@@ -808,6 +860,9 @@ create_summary() {
     
     echo ""
     print_success "Uninstallation complete!"
+    
+    echo ""
+    print_warning "You may need to log out and back in for group membership changes to take effect"
     
     if [[ "$REMOVE_USER_DATA" == false && -d "$CONFIG_DIR" ]]; then
         echo ""
@@ -845,6 +900,7 @@ main() {
     remove_config_gui
     remove_pam
     remove_user_data
+    remove_system_users
     
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
@@ -855,6 +911,7 @@ main() {
         echo "  ✓ Daemon (tapauthd, tapauthd.socket/service)"
         echo "  ✓ PAM module"
         echo "  ✓ Configuration GUI"
+        echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"
         
         echo ""
         echo "PAM configuration to remove:"

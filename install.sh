@@ -490,6 +490,18 @@ create_system_users() {
         print_info "[DRY RUN] Would create system user 'tapauthd' and group 'tapauthd-clients'"
         echo "  • useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd"
         echo "  • groupadd --system tapauthd-clients"
+        
+        local install_user=""
+        if [[ -n "$SUDO_USER" ]]; then
+            install_user="$SUDO_USER"
+        elif [[ -n "$USER" && "$USER" != "root" ]]; then
+            install_user="$USER"
+        fi
+        
+        if [[ -n "$install_user" ]]; then
+            echo "  • usermod -aG tapauthd-clients $install_user"
+        fi
+        
         echo "  • mkdir -p $CONFIG_DIR && chown -R tapauthd:tapauthd $CONFIG_DIR && chmod 700 $CONFIG_DIR"
         return
     fi
@@ -506,6 +518,28 @@ create_system_users() {
         groupadd --system tapauthd-clients || true
     else
         print_info "Group 'tapauthd-clients' already exists"
+    fi
+
+    # Add the installing user to tapauthd-clients group (needed for screen locker access)
+    # This allows user-level processes (like kscreenlocker, gnome-screensaver, etc.) to access the daemon socket
+    local install_user=""
+    if [[ -n "$SUDO_USER" ]]; then
+        install_user="$SUDO_USER"
+    elif [[ -n "$USER" && "$USER" != "root" ]]; then
+        install_user="$USER"
+    fi
+
+    if [[ -n "$install_user" ]]; then
+        if ! groups "$install_user" | grep -q tapauthd-clients; then
+            print_info "Adding user '$install_user' to group 'tapauthd-clients'"
+            usermod -aG tapauthd-clients "$install_user"
+            print_warning "You will need to log out and back in for group membership to take effect"
+        else
+            print_info "User '$install_user' is already a member of 'tapauthd-clients'"
+        fi
+    else
+        print_warning "Could not determine installing user - you may need to manually add your user to the tapauthd-clients group:"
+        print_warning "  sudo usermod -aG tapauthd-clients \$USER"
     fi
 
     # Ensure configuration directory ownership and permissions
@@ -1115,9 +1149,19 @@ create_summary() {
     
     echo ""
     print_info "Next steps:"
-    echo "  1. Run 'tapauth-config' to pair with your phone"
-    echo "  2. Test authentication in a separate terminal"
-    echo "  3. Keep a root shell open until you verify it works"
+    echo "  1. Log out and back in (or run 'newgrp tapauthd-clients') for group membership to take effect"
+    echo "  2. Run 'tapauth-config' to pair with your phone"
+    echo "  3. Test authentication in a separate terminal"
+    echo "  4. Keep a root shell open until you verify it works"
+    
+    # Check if SELinux is enabled and provide guidance
+    if command -v getenforce &> /dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+        echo ""
+        print_warning "SELinux is enabled in Enforcing mode"
+        print_info "If you're using SDDM or other display managers, you may need to configure SELinux:"
+        echo "  • See docs/SELINUX.md for detailed instructions"
+        echo "  • Quick fix: sudo ausearch -m avc -ts recent | grep tapauthd | audit2allow -M tapauth_sddm && sudo semodule -i tapauth_sddm.pp"
+    fi
     
     if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true ]]; then
         echo ""
