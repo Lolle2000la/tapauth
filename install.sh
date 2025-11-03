@@ -350,47 +350,100 @@ prompt_pam_configuration() {
         has_kde=true
     fi
     
-    # Inform about system-auth if present
+    # Check system-auth FIRST - it's mutually exclusive with login/sudo/polkit
     if [[ "$has_system_auth" == true ]]; then
         echo ""
-        print_info "Detected /etc/pam.d/system-auth on your system."
-        echo "This is a common authentication stack used by display managers (SDDM, etc.)"
-        echo "and lock screens. Configuring system-auth may cover multiple services at once."
+        print_info "═══ RECOMMENDED: system-auth ═══"
+        echo ""
+        echo "Detected /etc/pam.d/system-auth on your system."
+        echo "This is a centralized authentication stack that covers:"
+        echo "  • Login (console and display manager)"
+        echo "  • Sudo"
+        echo "  • Polkit"
+        echo ""
+        echo "Configuring system-auth is usually better than configuring"
+        echo "individual services (login, sudo, polkit) separately."
+        echo ""
+        print_warning "Note: Lock screens often need separate configuration (see below)"
+        echo ""
+        read -p "Configure TapAuth for system-auth? [Y/n]: " response
+        if [[ ! "$response" =~ ^[Nn]$ ]]; then
+            CONFIGURE_PAM_SYSTEM_AUTH=true
+            print_success "system-auth selected (covers login, sudo, polkit)"
+            echo ""
+            print_info "Skipping individual login/sudo/polkit configuration (covered by system-auth)"
+            CONFIGURE_PAM_LOGIN=false
+            CONFIGURE_PAM_SUDO=false
+            CONFIGURE_PAM_POLKIT=false
+        else
+            CONFIGURE_PAM_SYSTEM_AUTH=false
+            echo ""
+            print_info "You can configure individual services instead:"
+            echo ""
+            
+            read -p "Configure TapAuth for login (console/TTY login)? [y/N]: " response
+            [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
+            
+            read -p "Configure TapAuth for sudo? [y/N]: " response
+            [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SUDO=true || CONFIGURE_PAM_SUDO=false
+            
+            read -p "Configure TapAuth for polkit (GUI privilege elevation)? [y/N]: " response
+            [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_POLKIT=true || CONFIGURE_PAM_POLKIT=false
+        fi
+    else
+        # No system-auth, configure individually
+        print_info "No /etc/pam.d/system-auth found - configuring services individually"
+        echo ""
+        
+        read -p "Configure TapAuth for login (console/TTY login)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
+        
+        read -p "Configure TapAuth for sudo? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SUDO=true || CONFIGURE_PAM_SUDO=false
+        
+        read -p "Configure TapAuth for polkit (GUI privilege elevation)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_POLKIT=true || CONFIGURE_PAM_POLKIT=false
+        
+        CONFIGURE_PAM_SYSTEM_AUTH=false
+    fi
+    
+    echo ""
+    print_info "═══ Display Managers & Lock Screens ═══"
+    echo ""
+    
+    if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+        print_info "Even with system-auth configured, lock screens often need"
+        print_info "separate PAM configuration to work properly."
         echo ""
     fi
     
-    read -p "Configure TapAuth for login authentication? [y/N]: " response
-    [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
-    
-    read -p "Configure TapAuth for sudo authentication? [y/N]: " response
-    [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SUDO=true || CONFIGURE_PAM_SUDO=false
-    
-    read -p "Configure TapAuth for polkit authentication? [y/N]: " response
-    [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_POLKIT=true || CONFIGURE_PAM_POLKIT=false
-    
-    if [[ "$has_system_auth" == true ]]; then
-        read -p "Configure TapAuth for system-auth (display managers, lock screen)? [y/N]: " response
-        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SYSTEM_AUTH=true || CONFIGURE_PAM_SYSTEM_AUTH=false
+    if [[ "$has_kde" == true ]]; then
+        local kde_default="n"
+        if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+            kde_default="Y"
+            print_info "KDE lock screen recommended when using system-auth"
+        fi
+        read -p "Configure TapAuth for KDE (lock screen unlock)? [${kde_default}/$([ "$kde_default" = "Y" ] && echo "n" || echo "N")]: " response
+        if [[ "$kde_default" == "Y" ]]; then
+            [[ ! "$response" =~ ^[Nn]$ ]] && CONFIGURE_PAM_KDE=true || CONFIGURE_PAM_KDE=false
+        else
+            [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_KDE=true || CONFIGURE_PAM_KDE=false
+        fi
     fi
     
     if [[ "$has_gdm" == true ]]; then
-        read -p "Configure TapAuth for GDM (GNOME Display Manager)? [y/N]: " response
+        read -p "Configure TapAuth for GDM (GNOME Display Manager - first login)? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_GDM=true || CONFIGURE_PAM_GDM=false
     fi
     
     if [[ "$has_sddm" == true ]]; then
-        read -p "Configure TapAuth for SDDM (Simple Desktop Display Manager)? [y/N]: " response
+        read -p "Configure TapAuth for SDDM (KDE/LXQt Display Manager - first login)? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SDDM=true || CONFIGURE_PAM_SDDM=false
     fi
     
     if [[ "$has_lightdm" == true ]]; then
-        read -p "Configure TapAuth for LightDM? [y/N]: " response
+        read -p "Configure TapAuth for LightDM (first login)? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LIGHTDM=true || CONFIGURE_PAM_LIGHTDM=false
-    fi
-    
-    if [[ "$has_kde" == true ]]; then
-        read -p "Configure TapAuth for KDE (kde, kscreenlocker)? [y/N]: " response
-        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_KDE=true || CONFIGURE_PAM_KDE=false
     fi
 }
 
@@ -836,58 +889,6 @@ configure_pam() {
         return
     fi
     
-    # Configure login
-    if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
-        print_info "Configuring PAM for login..."
-        if ! grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-            # Insert after pam_env.so or at beginning of auth section
-            if grep -q "pam_env.so" /etc/pam.d/login; then
-                sed -i "/pam_env.so/a $pam_line" /etc/pam.d/login
-            else
-                sed -i "1i $pam_line" /etc/pam.d/login
-            fi
-            print_success "Configured PAM for login"
-        else
-            print_warning "PAM login already configured"
-        fi
-    fi
-    
-    # Configure sudo
-    if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
-        print_info "Configuring PAM for sudo..."
-        if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-            # Insert at beginning of auth section
-            sed -i "1i $pam_line" /etc/pam.d/sudo
-            print_success "Configured PAM for sudo"
-        else
-            print_warning "PAM sudo already configured"
-        fi
-    fi
-    
-    # Configure polkit
-    if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
-        print_info "Configuring PAM for polkit..."
-        
-        # Check both /etc/pam.d and /usr/lib/pam.d (Fedora uses the latter)
-        local polkit_pam_file=""
-        if [[ -f /etc/pam.d/polkit-1 ]]; then
-            polkit_pam_file="/etc/pam.d/polkit-1"
-        elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-            polkit_pam_file="/usr/lib/pam.d/polkit-1"
-        fi
-        
-        if [[ -n "$polkit_pam_file" ]]; then
-            if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
-                sed -i "1i $pam_line" "$polkit_pam_file"
-                print_success "Configured PAM for polkit at $polkit_pam_file"
-            else
-                print_warning "PAM polkit already configured at $polkit_pam_file"
-            fi
-        else
-            print_warning "polkit PAM configuration not found (checked /etc/pam.d/polkit-1 and /usr/lib/pam.d/polkit-1)"
-        fi
-    fi
-    
     # Configure system-auth (common on Arch-based systems, used by SDDM and lock screens)
     if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
         print_info "Configuring PAM for system-auth..."
@@ -897,7 +898,7 @@ configure_pam() {
                 # Insert at the beginning of the auth section
                 sed -i "1i $pam_line" /etc/pam.d/system-auth
                 print_success "Configured PAM for system-auth"
-                print_info "This affects: SDDM, lock screen, and other services using system-auth"
+                print_info "This covers: login, sudo, polkit, display managers, lock screens"
             else
                 print_warning "PAM system-auth already configured"
             fi
@@ -906,9 +907,64 @@ configure_pam() {
         fi
     fi
     
+    # Only configure individual services if system-auth was NOT configured
+    if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == false ]]; then
+        # Configure login
+        if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
+            print_info "Configuring PAM for login (console/TTY)..."
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
+                # Insert after pam_env.so or at beginning of auth section
+                if grep -q "pam_env.so" /etc/pam.d/login; then
+                    sed -i "/pam_env.so/a $pam_line" /etc/pam.d/login
+                else
+                    sed -i "1i $pam_line" /etc/pam.d/login
+                fi
+                print_success "Configured PAM for login"
+            else
+                print_warning "PAM login already configured"
+            fi
+        fi
+        
+        # Configure sudo
+        if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
+            print_info "Configuring PAM for sudo..."
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
+                # Insert at beginning of auth section
+                sed -i "1i $pam_line" /etc/pam.d/sudo
+                print_success "Configured PAM for sudo"
+            else
+                print_warning "PAM sudo already configured"
+            fi
+        fi
+        
+        # Configure polkit
+        if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
+            print_info "Configuring PAM for polkit (GUI privilege elevation)..."
+            
+            # Check both /etc/pam.d and /usr/lib/pam.d (Fedora uses the latter)
+            local polkit_pam_file=""
+            if [[ -f /etc/pam.d/polkit-1 ]]; then
+                polkit_pam_file="/etc/pam.d/polkit-1"
+            elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
+                polkit_pam_file="/usr/lib/pam.d/polkit-1"
+            fi
+            
+            if [[ -n "$polkit_pam_file" ]]; then
+                if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
+                    sed -i "1i $pam_line" "$polkit_pam_file"
+                    print_success "Configured PAM for polkit at $polkit_pam_file"
+                else
+                    print_warning "PAM polkit already configured at $polkit_pam_file"
+                fi
+            else
+                print_warning "polkit PAM configuration not found (checked /etc/pam.d/polkit-1 and /usr/lib/pam.d/polkit-1)"
+            fi
+        fi
+    fi
+    
     # Configure GDM (GNOME Display Manager)
     if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
-        print_info "Configuring PAM for GDM..."
+        print_info "Configuring PAM for GDM (GNOME - first login)..."
         
         # GDM typically uses gdm-password for authentication
         local gdm_configured=false
@@ -938,7 +994,7 @@ configure_pam() {
     
     # Configure SDDM (Simple Desktop Display Manager)
     if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
-        print_info "Configuring PAM for SDDM..."
+        print_info "Configuring PAM for SDDM (KDE/LXQt - first login)..."
         
         # SDDM uses /etc/pam.d/sddm for user authentication
         # Note: sddm-greeter is for the greeter UI process itself, not user auth
@@ -956,7 +1012,7 @@ configure_pam() {
     
     # Configure LightDM
     if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
-        print_info "Configuring PAM for LightDM..."
+        print_info "Configuring PAM for LightDM (first login)..."
         
         if [[ -f /etc/pam.d/lightdm ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/lightdm; then
@@ -972,7 +1028,7 @@ configure_pam() {
     
     # Configure KDE (multiple PAM files)
     if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
-        print_info "Configuring PAM for KDE..."
+        print_info "Configuring PAM for KDE (lock screen)..."
         
         local kde_configured=false
         
@@ -1034,17 +1090,18 @@ configure_pam() {
         echo ""
         print_info "PAM configuration updated"
         print_info "Changes take effect:"
-        if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
-            echo "  • sudo: Immediately (no restart needed)"
-        fi
-        if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
-            echo "  • polkit: Immediately (no restart needed)"
-        fi
-        if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
-            echo "  • login: On next login session (logout/login required)"
-        fi
         if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
-            echo "  • system-auth: On next login session (affects SDDM, lock screen, etc.)"
+            echo "  • system-auth: On next login session (covers login, sudo, polkit)"
+        else
+            if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
+                echo "  • sudo: Immediately (no restart needed)"
+            fi
+            if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
+                echo "  • polkit: Immediately (no restart needed)"
+            fi
+            if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
+                echo "  • login: On next login session (logout/login required)"
+            fi
         fi
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
             echo "  • GDM: On next login session (logout/login required)"
@@ -1056,7 +1113,7 @@ configure_pam() {
             echo "  • LightDM: On next login session (logout/login required)"
         fi
         if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
-            echo "  • KDE: On next login session or screen lock (logout/login required)"
+            echo "  • KDE: On next screen lock"
         fi
     fi
 }
@@ -1120,14 +1177,23 @@ create_summary() {
     
     echo ""
     echo "PAM configuration:"
-    [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
-    [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
-    [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
-    [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth" || echo "  ✗ System-auth"
-    [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
-    [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
-    [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
-    [[ "$CONFIGURE_PAM_KDE" == true ]] && echo "  ✓ KDE" || echo "  ✗ KDE"
+    if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+        echo "  ✓ System-auth (covers login, sudo, polkit)"
+        echo "  ○ Login (covered by system-auth)"
+        echo "  ○ Sudo (covered by system-auth)"
+        echo "  ○ Polkit (covered by system-auth)"
+    else
+        echo "  ✗ System-auth"
+        [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (console/TTY)" || echo "  ✗ Login"
+        [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
+        [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (GUI privilege elevation)" || echo "  ✗ Polkit"
+    fi
+    echo ""
+    echo "Display managers & lock screens:"
+    [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (GNOME - first login)" || echo "  ✗ GDM"
+    [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (KDE/LXQt - first login)" || echo "  ✗ SDDM"
+    [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM (first login)" || echo "  ✗ LightDM"
+    [[ "$CONFIGURE_PAM_KDE" == true ]] && echo "  ✓ KDE (lock screen)" || echo "  ✗ KDE"
     
     echo ""
     echo "Features enabled:"
