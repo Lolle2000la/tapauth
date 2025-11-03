@@ -80,45 +80,11 @@ class MainActivity : FragmentActivity() {
 
         setupBiometricPrompt()
         setupAuthRequestReceiver()
-        // If activity was launched via notification intent containing an auth request,
-        // process it now.
-        intent?.let { incoming ->
-            if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
-                val authRequest =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        incoming.getParcelableExtra(
-                            AuthRequestManager.EXTRA_AUTH_REQUEST,
-                            AuthRequest::class.java,
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        incoming.getParcelableExtra<AuthRequest>(
-                            AuthRequestManager.EXTRA_AUTH_REQUEST
-                        )
-                    }
-                authRequest?.let {
-                    val notifAction = incoming.getStringExtra("notification_action")
-                    when (notifAction) {
-                        "deny" -> {
-                            // Immediately deny without UI
-                            handleAuthResponse(
-                                it.requestId,
-                                approved = false,
-                                signedChallenge = null,
-                            )
-                        }
-                        "approve" -> {
-                            // Start the biometric approval flow
-                            handleAuthRequest(it)
-                        }
-                        else -> {
-                            // Default behavior: open approval UI
-                            handleAuthRequest(it)
-                        }
-                    }
-                }
-            }
-        }
+
+        // Note: We no longer handle auth requests via intent here in onCreate.
+        // The BiometricPromptActivity handles notification taps directly.
+        // This MainActivity only processes auth requests if it's already running
+        // (via the broadcast receiver).
 
         enableEdgeToEdge()
         setContent { TapAuthTheme { TapAuthApp() } }
@@ -500,35 +466,9 @@ class MainActivity : FragmentActivity() {
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        intent?.let { incoming ->
-            if (incoming.action == AuthRequestManager.ACTION_AUTH_REQUEST) {
-                val authRequest =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        incoming.getParcelableExtra(
-                            AuthRequestManager.EXTRA_AUTH_REQUEST,
-                            AuthRequest::class.java,
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        incoming.getParcelableExtra<AuthRequest>(
-                            AuthRequestManager.EXTRA_AUTH_REQUEST
-                        )
-                    }
-                authRequest?.let {
-                    val notifAction = incoming.getStringExtra("notification_action")
-                    when (notifAction) {
-                        "deny" ->
-                            handleAuthResponse(
-                                it.requestId,
-                                approved = false,
-                                signedChallenge = null,
-                            )
-                        "approve" -> handleAuthRequest(it)
-                        else -> handleAuthRequest(it)
-                    }
-                }
-            }
-        }
+        // Note: Auth request intents from notifications now go to BiometricPromptActivity
+        // This onNewIntent is kept for compatibility but shouldn't receive auth requests
+        // unless MainActivity is explicitly targeted (which it no longer is)
     }
 }
 

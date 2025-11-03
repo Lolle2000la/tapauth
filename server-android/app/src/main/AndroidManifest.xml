@@ -59,6 +59,18 @@
         <data android:scheme="tapauth" android:host="pair" />
       </intent-filter>
     </activity>
+    <!-- Transparent activity for biometric prompt (shown directly from notification) -->
+    <activity
+      android:name=".BiometricPromptActivity"
+      android:exported="false"
+      android:theme="@android:style/Theme.Translucent.NoTitleBar"
+      android:excludeFromRecents="true"
+      android:noHistory="true"
+      android:taskAffinity=""
+      android:launchMode="singleInstance"
+      android:showWhenLocked="true"
+      android:turnScreenOn="true"
+    />
     <!-- Authentication Service -->
     <service
       android:name=".service.AuthenticationService"

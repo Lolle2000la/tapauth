@@ -134,10 +134,15 @@ class AuthRequestManager private constructor() {
 
         // Also post a persistent notification so the user can tap to open the app and approve
         try {
-            val activityIntent =
-                Intent(context, dev.rourunisen.tapauth.MainActivity::class.java).apply {
+            // Tap on notification body -> show biometric prompt directly (transparent activity)
+            val biometricIntent =
+                Intent(context, dev.rourunisen.tapauth.BiometricPromptActivity::class.java).apply {
                     action = ACTION_AUTH_REQUEST
                     putExtra(EXTRA_AUTH_REQUEST, authRequest)
+                    flags =
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                            Intent.FLAG_ACTIVITY_NO_HISTORY
                 }
 
             // Use bytes-derived stable notification ID (already computed at function start)
@@ -146,16 +151,20 @@ class AuthRequestManager private constructor() {
                 PendingIntent.getActivity(
                     context,
                     notificationId,
-                    activityIntent,
+                    biometricIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
 
-            // Action: Approve -> open app and show biometric prompt
+            // Action: Approve -> show biometric prompt directly (same as tapping notification body)
             val approveIntent =
-                Intent(context, dev.rourunisen.tapauth.MainActivity::class.java).apply {
+                Intent(context, dev.rourunisen.tapauth.BiometricPromptActivity::class.java).apply {
                     action = ACTION_AUTH_REQUEST
                     putExtra(EXTRA_AUTH_REQUEST, authRequest)
                     putExtra("notification_action", "approve")
+                    flags =
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                            Intent.FLAG_ACTIVITY_NO_HISTORY
                 }
             val approvePending =
                 PendingIntent.getActivity(
