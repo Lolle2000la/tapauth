@@ -13,7 +13,6 @@ Group=tapauthd
 Sockets=tapauthd.socket
 ExecStart=/usr/bin/tapauthd
 Restart=on-failure
-RuntimeDirectory=tapauthd
 StateDirectory=tapauth
 
 # Hardening (adjust as needed if daemon requires more access)
