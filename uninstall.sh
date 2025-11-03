@@ -13,11 +13,17 @@ NC='\033[0m' # No Color
 
 # Default values
 INTERACTIVE=true
+# All components are always removed
 REMOVE_PAM=true
 REMOVE_CONFIG_GUI=true
+REMOVE_DAEMON=true
+# Only PAM configuration locations and user data are configurable
 REMOVE_PAM_CONFIG_LOGIN=false
 REMOVE_PAM_CONFIG_SUDO=false
 REMOVE_PAM_CONFIG_POLKIT=false
+REMOVE_PAM_CONFIG_GDM=false
+REMOVE_PAM_CONFIG_SDDM=false
+REMOVE_PAM_CONFIG_LIGHTDM=false
 REMOVE_USER_DATA=false
 DRY_RUN=false
 
@@ -112,23 +118,25 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --no-pam                Don't remove PAM module
-    --no-gui                Don't remove configuration GUI
     --remove-pam-login      Remove PAM login configuration
     --remove-pam-sudo       Remove PAM sudo configuration
     --remove-pam-polkit     Remove PAM polkit configuration
+    --remove-pam-gdm        Remove PAM GDM configuration
+    --remove-pam-sddm       Remove PAM SDDM configuration
+    --remove-pam-lightdm    Remove PAM LightDM configuration
     --remove-user-data      Remove user configuration data (keys, pairings)
     --dry-run               Show what would be done without doing it
+
+NOTES:
+    All components (daemon, PAM module, configuration GUI) are always removed.
+    Only PAM configuration locations and user data removal are configurable.
 
 EXAMPLES:
     # Interactive uninstallation (default)
     sudo $0
 
     # Non-interactive removal of everything including configs
-    sudo $0 --yes --remove-pam-login --remove-pam-sudo --remove-user-data
-
-    # Remove only PAM module
-    sudo $0 --no-gui
+    sudo $0 --yes
 
     # Dry run to see what would be removed
     sudo $0 --dry-run --yes
@@ -194,20 +202,13 @@ parse_args() {
                 ;;
             -y|--yes)
                 INTERACTIVE=false
-                REMOVE_PAM=true
-                REMOVE_CONFIG_GUI=true
                 REMOVE_PAM_CONFIG_LOGIN=true
                 REMOVE_PAM_CONFIG_SUDO=true
                 REMOVE_PAM_CONFIG_POLKIT=true
+                REMOVE_PAM_CONFIG_GDM=true
+                REMOVE_PAM_CONFIG_SDDM=true
+                REMOVE_PAM_CONFIG_LIGHTDM=true
                 REMOVE_USER_DATA=true
-                shift
-                ;;
-            --no-pam)
-                REMOVE_PAM=false
-                shift
-                ;;
-            --no-gui)
-                REMOVE_CONFIG_GUI=false
                 shift
                 ;;
             --remove-pam-login)
@@ -220,6 +221,18 @@ parse_args() {
                 ;;
             --remove-pam-polkit)
                 REMOVE_PAM_CONFIG_POLKIT=true
+                shift
+                ;;
+            --remove-pam-gdm)
+                REMOVE_PAM_CONFIG_GDM=true
+                shift
+                ;;
+            --remove-pam-sddm)
+                REMOVE_PAM_CONFIG_SDDM=true
+                shift
+                ;;
+            --remove-pam-lightdm)
+                REMOVE_PAM_CONFIG_LIGHTDM=true
                 shift
                 ;;
             --remove-user-data)
@@ -240,27 +253,19 @@ parse_args() {
 }
 
 # Interactive prompts
-prompt_components() {
-    print_header "Component Selection"
-    
-    read -p "Remove PAM module? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM=true || REMOVE_PAM=false
-    
-    read -p "Remove configuration GUI? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_CONFIG_GUI=true || REMOVE_CONFIG_GUI=false
-}
-
 prompt_pam_configuration() {
-    if [[ "$REMOVE_PAM" == false ]]; then
-        return
-    fi
-    
     print_header "PAM Configuration Removal"
+    
+    print_info "All components (daemon, PAM module, configuration GUI) will be removed."
+    echo ""
     
     # Check which PAM files have TapAuth configured
     local has_login=false
     local has_sudo=false
     local has_polkit=false
+    local has_gdm=false
+    local has_sddm=false
+    local has_lightdm=false
     
     if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
         has_login=true
@@ -276,6 +281,22 @@ prompt_pam_configuration() {
         has_polkit=true
     fi
     
+    # Check for GDM
+    if ([[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null) || \
+       ([[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null); then
+        has_gdm=true
+    fi
+    
+    # Check for SDDM
+    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
+        has_sddm=true
+    fi
+    
+    # Check for LightDM
+    if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
+        has_lightdm=true
+    fi
+    
     if [[ "$has_login" == true ]]; then
         read -p "Remove TapAuth from login PAM configuration? [Y/n]: " response
         [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_LOGIN=true || REMOVE_PAM_CONFIG_LOGIN=false
@@ -289,6 +310,21 @@ prompt_pam_configuration() {
     if [[ "$has_polkit" == true ]]; then
         read -p "Remove TapAuth from polkit PAM configuration? [Y/n]: " response
         [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_POLKIT=true || REMOVE_PAM_CONFIG_POLKIT=false
+    fi
+    
+    if [[ "$has_gdm" == true ]]; then
+        read -p "Remove TapAuth from GDM PAM configuration? [Y/n]: " response
+        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_GDM=true || REMOVE_PAM_CONFIG_GDM=false
+    fi
+    
+    if [[ "$has_sddm" == true ]]; then
+        read -p "Remove TapAuth from SDDM PAM configuration? [Y/n]: " response
+        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_SDDM=true || REMOVE_PAM_CONFIG_SDDM=false
+    fi
+    
+    if [[ "$has_lightdm" == true ]]; then
+        read -p "Remove TapAuth from LightDM PAM configuration? [Y/n]: " response
+        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_LIGHTDM=true || REMOVE_PAM_CONFIG_LIGHTDM=false
     fi
 }
 
@@ -307,10 +343,6 @@ prompt_user_data() {
 
 # Detect PAM module directory
 detect_pam_directory() {
-    if [[ "$REMOVE_PAM" == false ]]; then
-        return
-    fi
-    
     print_info "Detecting PAM module directory..."
     
     # Possible PAM module directories for different distributions
@@ -356,15 +388,14 @@ check_root() {
         exit 1
     fi
     
-    # Detect PAM directory if needed
-    if [[ "$REMOVE_PAM" == true ]]; then
-        detect_pam_directory
-    fi
+    # Always detect PAM directory
+    detect_pam_directory
 }
 
 # Remove PAM configuration
 remove_pam_config() {
-    if [[ "$REMOVE_PAM_CONFIG_LOGIN" == false && "$REMOVE_PAM_CONFIG_SUDO" == false && "$REMOVE_PAM_CONFIG_POLKIT" == false ]]; then
+    if [[ "$REMOVE_PAM_CONFIG_LOGIN" == false && "$REMOVE_PAM_CONFIG_SUDO" == false && "$REMOVE_PAM_CONFIG_POLKIT" == false && \
+          "$REMOVE_PAM_CONFIG_GDM" == false && "$REMOVE_PAM_CONFIG_SDDM" == false && "$REMOVE_PAM_CONFIG_LIGHTDM" == false ]]; then
         return
     fi
     
@@ -388,6 +419,26 @@ remove_pam_config() {
                 show_pam_restore_diff "/etc/pam.d/polkit-1"
             elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
                 show_pam_restore_diff "/usr/lib/pam.d/polkit-1"
+            fi
+        fi
+        
+        if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
+            if [[ -f /etc/pam.d/gdm-password ]]; then
+                show_pam_restore_diff "/etc/pam.d/gdm-password"
+            elif [[ -f /etc/pam.d/gdm ]]; then
+                show_pam_restore_diff "/etc/pam.d/gdm"
+            fi
+        fi
+        
+        if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
+            if [[ -f /etc/pam.d/sddm ]]; then
+                show_pam_restore_diff "/etc/pam.d/sddm"
+            fi
+        fi
+        
+        if [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]]; then
+            if [[ -f /etc/pam.d/lightdm ]]; then
+                show_pam_restore_diff "/etc/pam.d/lightdm"
             fi
         fi
         return
@@ -432,14 +483,49 @@ remove_pam_config() {
             print_success "Removed from polkit"
         fi
     fi
+    
+    # Remove from GDM
+    if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
+        local gdm_removed=false
+        
+        if [[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null; then
+            print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm-password)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-password
+            gdm_removed=true
+        fi
+        
+        if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
+            print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
+            gdm_removed=true
+        fi
+        
+        if [[ "$gdm_removed" == true ]]; then
+            print_success "Removed from GDM"
+        fi
+    fi
+    
+    # Remove from SDDM
+    if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
+        if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
+            print_info "Removing TapAuth from SDDM PAM configuration"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
+            print_success "Removed from SDDM"
+        fi
+    fi
+    
+    # Remove from LightDM
+    if [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]]; then
+        if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
+            print_info "Removing TapAuth from LightDM PAM configuration"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
+            print_success "Removed from LightDM"
+        fi
+    fi
 }
 
 # Remove PAM module
 remove_pam() {
-    if [[ "$REMOVE_PAM" == false ]]; then
-        return
-    fi
-    
     print_header "Removing PAM Module"
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -508,10 +594,6 @@ remove_pam() {
 
 # Remove configuration GUI
 remove_config_gui() {
-    if [[ "$REMOVE_CONFIG_GUI" == false ]]; then
-        return
-    fi
-    
     print_header "Removing Configuration GUI"
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -595,14 +677,18 @@ create_summary() {
     print_header "Uninstallation Summary"
     
     echo "Components removed:"
-    [[ "$REMOVE_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module"
-    [[ "$REMOVE_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI"
+    echo "  ✓ Daemon"
+    echo "  ✓ PAM module"
+    echo "  ✓ Configuration GUI"
     
     echo ""
     echo "PAM configuration removed:"
     [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
     [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
     [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
+    [[ "$REMOVE_PAM_CONFIG_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
+    [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
+    [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
     
     echo ""
     echo "User data:"
@@ -625,10 +711,9 @@ main() {
     parse_args "$@"
     
     if [[ "$INTERACTIVE" == true ]]; then
-        print_warning "This will remove TapAuth from your system"
+        print_warning "This will remove all TapAuth components from your system"
         echo ""
         
-        prompt_components
         prompt_pam_configuration
         prompt_user_data
         
@@ -655,9 +740,9 @@ main() {
         echo "The following changes would be made:"
         echo ""
         echo "Components to remove:"
-        [[ "$REMOVE_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module (kept)"
-        [[ "$REMOVE_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI (kept)"
-        echo "  ✓ Daemon and systemd units (tapauthd, tapauthd.socket/service)"
+        echo "  ✓ Daemon (tapauthd, tapauthd.socket/service)"
+        echo "  ✓ PAM module"
+        echo "  ✓ Configuration GUI"
         
         echo ""
         echo "PAM configuration to remove:"
@@ -674,6 +759,19 @@ main() {
         else
             echo "  ✗ Polkit (kept)"
         fi
+        if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
+            if [[ -f /etc/pam.d/gdm-password ]]; then
+                echo "  ✓ GDM (/etc/pam.d/gdm-password)"
+            elif [[ -f /etc/pam.d/gdm ]]; then
+                echo "  ✓ GDM (/etc/pam.d/gdm)"
+            else
+                echo "  ✓ GDM (config file not found)"
+            fi
+        else
+            echo "  ✗ GDM (kept)"
+        fi
+        [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm)" || echo "  ✗ SDDM (kept)"
+        [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (kept)"
         
         echo ""
         echo "User data:"

@@ -13,11 +13,17 @@ NC='\033[0m' # No Color
 
 # Default values
 INTERACTIVE=true
+# All components are always installed
 INSTALL_PAM=true
 INSTALL_CONFIG_GUI=true
+INSTALL_DAEMON=true
+# Only features and PAM configuration are configurable
 CONFIGURE_PAM_LOGIN=false
 CONFIGURE_PAM_SUDO=false
 CONFIGURE_PAM_POLKIT=false
+CONFIGURE_PAM_GDM=false
+CONFIGURE_PAM_SDDM=false
+CONFIGURE_PAM_LIGHTDM=false
 USE_TPM=false
 USE_BLE=true
 BUILD_ONLY=false
@@ -168,25 +174,30 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --no-pam                Don't install PAM module
     --no-ble                Build without Bluetooth support (UDP only)
-    --no-gui                Don't install configuration GUI
+    --use-tpm               Enable TPM support for key storage
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
     --configure-polkit      Configure PAM for polkit authentication
-    --use-tpm               Enable TPM support for key storage
+    --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
+    --configure-sddm        Configure PAM for SDDM (Simple Desktop Display Manager)
+    --configure-lightdm     Configure PAM for LightDM
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
+
+NOTES:
+    All components (PAM module, daemon, configuration GUI) are always installed.
+    Only feature flags (BLE, TPM) and PAM configuration locations are configurable.
 
 EXAMPLES:
     # Interactive installation (default)
     sudo $0
 
-    # Non-interactive with all components
-    sudo $0 --non-interactive --configure-login --configure-sudo
+    # Non-interactive with all PAM services configured
+    sudo $0 --yes
 
-    # Install PAM module without Bluetooth support
-    sudo $0 --no-ble --configure-login
+    # Install without Bluetooth support
+    sudo $0 --no-ble --configure-login --configure-sudo
 
     # Build only without installing
     $0 --build-only
@@ -208,24 +219,17 @@ parse_args() {
                 ;;
             -y|--yes)
                 INTERACTIVE=false
-                INSTALL_PAM=true
-                INSTALL_CONFIG_GUI=true
                 CONFIGURE_PAM_LOGIN=true
                 CONFIGURE_PAM_SUDO=true
                 CONFIGURE_PAM_POLKIT=true
+                CONFIGURE_PAM_GDM=true
+                CONFIGURE_PAM_SDDM=true
+                CONFIGURE_PAM_LIGHTDM=true
                 USE_BLE=true
-                shift
-                ;;
-            --no-pam)
-                INSTALL_PAM=false
                 shift
                 ;;
             --no-ble)
                 USE_BLE=false
-                shift
-                ;;
-            --no-gui)
-                INSTALL_CONFIG_GUI=false
                 shift
                 ;;
             --configure-login)
@@ -238,6 +242,18 @@ parse_args() {
                 ;;
             --configure-polkit)
                 CONFIGURE_PAM_POLKIT=true
+                shift
+                ;;
+            --configure-gdm)
+                CONFIGURE_PAM_GDM=true
+                shift
+                ;;
+            --configure-sddm)
+                CONFIGURE_PAM_SDDM=true
+                shift
+                ;;
+            --configure-lightdm)
+                CONFIGURE_PAM_LIGHTDM=true
                 shift
                 ;;
             --use-tpm)
@@ -262,28 +278,47 @@ parse_args() {
 }
 
 # Interactive prompts
-prompt_components() {
-    print_header "Component Selection"
+prompt_features() {
+    print_header "Feature Selection"
     
-    read -p "Install PAM module? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && INSTALL_PAM=true || INSTALL_PAM=false
+    print_info "All components (daemon, PAM module, configuration GUI) will be installed."
+    echo ""
     
     read -p "Enable Bluetooth support? [Y/n]: " response
     [[ ! "$response" =~ ^[Nn]$ ]] && USE_BLE=true || USE_BLE=false
     
-    read -p "Install configuration GUI? [Y/n]: " response
-    [[ ! "$response" =~ ^[Nn]$ ]] && INSTALL_CONFIG_GUI=true || INSTALL_CONFIG_GUI=false
+    if command -v tpm2_getrandom &> /dev/null; then
+        print_info "TPM tools detected on system"
+        read -p "Use TPM for key storage? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && USE_TPM=true || USE_TPM=false
+    else
+        print_info "TPM tools not detected. TPM support disabled."
+        USE_TPM=false
+    fi
 }
 
 prompt_pam_configuration() {
-    if [[ "$INSTALL_PAM" == false ]]; then
-        return
-    fi
-    
     print_header "PAM Configuration"
     print_warning "Configuring PAM incorrectly can lock you out of your system!"
     print_info "It's recommended to have a root shell open in another terminal."
     echo ""
+    
+    # Detect available display managers
+    local has_gdm=false
+    local has_sddm=false
+    local has_lightdm=false
+    
+    if [[ -f /etc/pam.d/gdm-password ]] || [[ -f /etc/pam.d/gdm ]]; then
+        has_gdm=true
+    fi
+    
+    if [[ -f /etc/pam.d/sddm ]]; then
+        has_sddm=true
+    fi
+    
+    if [[ -f /etc/pam.d/lightdm ]]; then
+        has_lightdm=true
+    fi
     
     read -p "Configure TapAuth for login authentication? [y/N]: " response
     [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
@@ -293,27 +328,25 @@ prompt_pam_configuration() {
     
     read -p "Configure TapAuth for polkit authentication? [y/N]: " response
     [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_POLKIT=true || CONFIGURE_PAM_POLKIT=false
-}
-
-prompt_tpm() {
-    print_header "TPM Configuration"
     
-    if command -v tpm2_getrandom &> /dev/null; then
-        print_info "TPM tools detected on system"
-        read -p "Use TPM for key storage? [y/N]: " response
-        [[ "$response" =~ ^[Yy]$ ]] && USE_TPM=true || USE_TPM=false
-    else
-        print_warning "TPM tools not detected. Skipping TPM configuration."
-        USE_TPM=false
+    if [[ "$has_gdm" == true ]]; then
+        read -p "Configure TapAuth for GDM (GNOME Display Manager)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_GDM=true || CONFIGURE_PAM_GDM=false
+    fi
+    
+    if [[ "$has_sddm" == true ]]; then
+        read -p "Configure TapAuth for SDDM (Simple Desktop Display Manager)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SDDM=true || CONFIGURE_PAM_SDDM=false
+    fi
+    
+    if [[ "$has_lightdm" == true ]]; then
+        read -p "Configure TapAuth for LightDM? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LIGHTDM=true || CONFIGURE_PAM_LIGHTDM=false
     fi
 }
 
 # Detect PAM module directory
 detect_pam_directory() {
-    if [[ "$INSTALL_PAM" == false ]]; then
-        return
-    fi
-    
     print_info "Detecting PAM module directory..."
     
     # Possible PAM module directories for different distributions
@@ -394,10 +427,8 @@ check_prerequisites() {
         exit 1
     fi
     
-    # Detect PAM directory if needed
-    if [[ "$INSTALL_PAM" == true ]]; then
-        detect_pam_directory
-    fi
+    # Always detect PAM directory
+    detect_pam_directory
     
     print_success "All prerequisites met"
 }
@@ -553,29 +584,21 @@ build_components() {
     $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p tapauthd $daemon_features
     print_success "Daemon built"
 
-    # Build PAM module
-    if [[ "$INSTALL_PAM" == true ]]; then
-        print_info "Building PAM module"
-        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam
-        print_success "PAM module built"
-    fi
+    # Build PAM module (always)
+    print_info "Building PAM module"
+    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam
+    print_success "PAM module built"
     
-    # Build configuration GUI
-    if [[ "$INSTALL_CONFIG_GUI" == true ]]; then
-        print_info "Building configuration GUI..."
-        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-config-gui
-        print_success "Configuration GUI built"
-    fi
+    # Build configuration GUI (always)
+    print_info "Building configuration GUI..."
+    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-config-gui
+    print_success "Configuration GUI built"
     
     unset RUSTFLAGS
 }
 
 # Install PAM module
 install_pam() {
-    if [[ "$INSTALL_PAM" == false ]]; then
-        return
-    fi
-    
     print_header "Installing PAM Module"
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -622,11 +645,8 @@ install_pam() {
 
 # Configure PAM
 configure_pam() {
-    if [[ "$INSTALL_PAM" == false ]]; then
-        return
-    fi
-    
-    if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false ]]; then
+    if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
+          "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && "$CONFIGURE_PAM_LIGHTDM" == false ]]; then
         print_info "No PAM services selected for configuration"
         return
     fi
@@ -657,6 +677,39 @@ configure_pam() {
                 echo ""
                 echo -e "${YELLOW}[SKIP]${NC} polkit PAM configuration"
                 echo "  → Not found at /etc/pam.d/polkit-1 or /usr/lib/pam.d/polkit-1"
+            fi
+        fi
+        
+        if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
+            # GDM typically uses gdm-password
+            if [[ -f /etc/pam.d/gdm-password ]]; then
+                show_pam_diff "/etc/pam.d/gdm-password" "$pam_line" ""
+            elif [[ -f /etc/pam.d/gdm ]]; then
+                show_pam_diff "/etc/pam.d/gdm" "$pam_line" ""
+            else
+                echo ""
+                echo -e "${YELLOW}[SKIP]${NC} GDM PAM configuration"
+                echo "  → Not found at /etc/pam.d/gdm-password or /etc/pam.d/gdm"
+            fi
+        fi
+        
+        if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
+            if [[ -f /etc/pam.d/sddm ]]; then
+                show_pam_diff "/etc/pam.d/sddm" "$pam_line" ""
+            else
+                echo ""
+                echo -e "${YELLOW}[SKIP]${NC} SDDM PAM configuration"
+                echo "  → Not found at /etc/pam.d/sddm"
+            fi
+        fi
+        
+        if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
+            if [[ -f /etc/pam.d/lightdm ]]; then
+                show_pam_diff "/etc/pam.d/lightdm" "$pam_line" ""
+            else
+                echo ""
+                echo -e "${YELLOW}[SKIP]${NC} LightDM PAM configuration"
+                echo "  → Not found at /etc/pam.d/lightdm"
             fi
         fi
         return
@@ -714,8 +767,71 @@ configure_pam() {
         fi
     fi
     
+    # Configure GDM (GNOME Display Manager)
+    if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
+        print_info "Configuring PAM for GDM..."
+        
+        # GDM typically uses gdm-password for authentication
+        local gdm_configured=false
+        if [[ -f /etc/pam.d/gdm-password ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm-password; then
+                sed -i "1i $pam_line" /etc/pam.d/gdm-password
+                print_success "Configured PAM for GDM (gdm-password)"
+                gdm_configured=true
+            else
+                print_warning "PAM GDM already configured (gdm-password)"
+                gdm_configured=true
+            fi
+        fi
+        
+        # Some systems might use just 'gdm'
+        if [[ -f /etc/pam.d/gdm ]] && [[ "$gdm_configured" == false ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm; then
+                sed -i "1i $pam_line" /etc/pam.d/gdm
+                print_success "Configured PAM for GDM"
+            else
+                print_warning "PAM GDM already configured"
+            fi
+        elif [[ "$gdm_configured" == false ]]; then
+            print_warning "GDM PAM configuration not found (checked /etc/pam.d/gdm-password and /etc/pam.d/gdm)"
+        fi
+    fi
+    
+    # Configure SDDM (Simple Desktop Display Manager)
+    if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
+        print_info "Configuring PAM for SDDM..."
+        
+        if [[ -f /etc/pam.d/sddm ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
+                sed -i "1i $pam_line" /etc/pam.d/sddm
+                print_success "Configured PAM for SDDM"
+            else
+                print_warning "PAM SDDM already configured"
+            fi
+        else
+            print_warning "SDDM PAM configuration not found at /etc/pam.d/sddm"
+        fi
+    fi
+    
+    # Configure LightDM
+    if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
+        print_info "Configuring PAM for LightDM..."
+        
+        if [[ -f /etc/pam.d/lightdm ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/lightdm; then
+                sed -i "1i $pam_line" /etc/pam.d/lightdm
+                print_success "Configured PAM for LightDM"
+            else
+                print_warning "PAM LightDM already configured"
+            fi
+        else
+            print_warning "LightDM PAM configuration not found at /etc/pam.d/lightdm"
+        fi
+    fi
+    
     # Inform about when changes take effect
-    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true ]]; then
+    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true || \
+          "$CONFIGURE_PAM_GDM" == true || "$CONFIGURE_PAM_SDDM" == true || "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
         echo ""
         print_info "PAM configuration updated"
         print_info "Changes take effect:"
@@ -728,15 +844,20 @@ configure_pam() {
         if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
             echo "  • login: On next login session (logout/login required)"
         fi
+        if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
+            echo "  • GDM: On next login session (logout/login required)"
+        fi
+        if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
+            echo "  • SDDM: On next login session (logout/login required)"
+        fi
+        if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
+            echo "  • LightDM: On next login session (logout/login required)"
+        fi
     fi
 }
 
 # Install configuration GUI
 install_config_gui() {
-    if [[ "$INSTALL_CONFIG_GUI" == false ]]; then
-        return
-    fi
-    
     print_header "Installing Configuration GUI"
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -788,14 +909,18 @@ create_summary() {
     print_header "Installation Summary"
     
     echo "Components installed:"
-    [[ "$INSTALL_PAM" == true ]] && echo "  ✓ PAM module" || echo "  ✗ PAM module"
-    [[ "$INSTALL_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI" || echo "  ✗ Configuration GUI"
+    echo "  ✓ Daemon"
+    echo "  ✓ PAM module"
+    echo "  ✓ Configuration GUI"
     
     echo ""
     echo "PAM configuration:"
     [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
     [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
     [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
+    [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
+    [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
+    [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
     
     echo ""
     echo "Features enabled:"
@@ -804,13 +929,9 @@ create_summary() {
     
     echo ""
     print_info "Installation locations:"
-    if [[ "$INSTALL_PAM" == true ]]; then
-        echo "  - PAM module: $PAM_SO_PATH"
-    fi
-    if [[ "$INSTALL_CONFIG_GUI" == true ]]; then
-        echo "  - Config GUI: $CONFIG_GUI_PATH"
-    fi
     echo "  - Daemon: /usr/bin/tapauthd"
+    echo "  - PAM module: $PAM_SO_PATH"
+    echo "  - Config GUI: $CONFIG_GUI_PATH"
     echo "  - Configuration: $CONFIG_DIR"
     echo "  - Daemon socket: /run/tapauthd/tapauthd.sock (root:tapauthd-clients, 0660)"
     echo ""
@@ -819,13 +940,11 @@ create_summary() {
     echo ""
     print_success "Installation complete!"
     
-    if [[ "$INSTALL_CONFIG_GUI" == true ]]; then
-        echo ""
-        print_info "Next steps:"
-        echo "  1. Run 'tapauth-config' to pair with your phone"
-        echo "  2. Test authentication in a separate terminal"
-        echo "  3. Keep a root shell open until you verify it works"
-    fi
+    echo ""
+    print_info "Next steps:"
+    echo "  1. Run 'tapauth-config' to pair with your phone"
+    echo "  2. Test authentication in a separate terminal"
+    echo "  3. Keep a root shell open until you verify it works"
     
     if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true ]]; then
         echo ""
@@ -857,9 +976,8 @@ main() {
     parse_args "$@"
     
     if [[ "$INTERACTIVE" == true ]]; then
-        prompt_components
+        prompt_features
         prompt_pam_configuration
-        prompt_tpm
         
         echo ""
         read -p "Proceed with installation? [y/N]: " response
@@ -898,14 +1016,18 @@ main() {
         echo "The following changes would be made:"
         echo ""
         echo "Components to install:"
-        [[ "$INSTALL_PAM" == true ]] && echo "  ✓ PAM module → $PAM_SO_PATH" || echo "  ✗ PAM module (skipped)"
-        [[ "$INSTALL_CONFIG_GUI" == true ]] && echo "  ✓ Configuration GUI → $CONFIG_GUI_PATH" || echo "  ✗ Configuration GUI (skipped)"
+        echo "  ✓ Daemon → /usr/bin/tapauthd"
+        echo "  ✓ PAM module → $PAM_SO_PATH"
+        echo "  ✓ Configuration GUI → $CONFIG_GUI_PATH"
         
         echo ""
         echo "PAM services to configure:"
         [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (/etc/pam.d/login)" || echo "  ✗ Login (skipped)"
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
         [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
+        [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
+        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm)" || echo "  ✗ SDDM (skipped)"
+        [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (skipped)"
         
         echo ""
         echo "Configuration:"
