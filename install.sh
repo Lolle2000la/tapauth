@@ -21,6 +21,7 @@ INSTALL_DAEMON=true
 CONFIGURE_PAM_LOGIN=false
 CONFIGURE_PAM_SUDO=false
 CONFIGURE_PAM_POLKIT=false
+CONFIGURE_PAM_SYSTEM_AUTH=false
 CONFIGURE_PAM_GDM=false
 CONFIGURE_PAM_SDDM=false
 CONFIGURE_PAM_LIGHTDM=false
@@ -179,6 +180,7 @@ OPTIONS:
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
     --configure-polkit      Configure PAM for polkit authentication
+    --configure-system-auth Configure PAM for system-auth (used by SDDM, lock screen, etc.)
     --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
     --configure-sddm        Configure PAM for SDDM (Simple Desktop Display Manager)
     --configure-lightdm     Configure PAM for LightDM
@@ -188,6 +190,10 @@ OPTIONS:
 NOTES:
     All components (PAM module, daemon, configuration GUI) are always installed.
     Only feature flags (BLE, TPM) and PAM configuration locations are configurable.
+    
+    system-auth is a common authentication stack used by many display managers
+    (especially on Arch-based systems) and lock screens. Configuring system-auth
+    may be preferable to configuring individual display managers.
 
 EXAMPLES:
     # Interactive installation (default)
@@ -222,6 +228,7 @@ parse_args() {
                 CONFIGURE_PAM_LOGIN=true
                 CONFIGURE_PAM_SUDO=true
                 CONFIGURE_PAM_POLKIT=true
+                CONFIGURE_PAM_SYSTEM_AUTH=true
                 CONFIGURE_PAM_GDM=true
                 CONFIGURE_PAM_SDDM=true
                 CONFIGURE_PAM_LIGHTDM=true
@@ -242,6 +249,10 @@ parse_args() {
                 ;;
             --configure-polkit)
                 CONFIGURE_PAM_POLKIT=true
+                shift
+                ;;
+            --configure-system-auth)
+                CONFIGURE_PAM_SYSTEM_AUTH=true
                 shift
                 ;;
             --configure-gdm)
@@ -303,6 +314,12 @@ prompt_pam_configuration() {
     print_info "It's recommended to have a root shell open in another terminal."
     echo ""
     
+    # Check for system-auth (common on Arch-based and some other systems)
+    local has_system_auth=false
+    if [[ -f /etc/pam.d/system-auth ]]; then
+        has_system_auth=true
+    fi
+    
     # Detect available display managers
     local has_gdm=false
     local has_sddm=false
@@ -312,12 +329,22 @@ prompt_pam_configuration() {
         has_gdm=true
     fi
     
-    if [[ -f /etc/pam.d/sddm ]]; then
+    # SDDM uses sddm-greeter for authentication (not just sddm)
+    if [[ -f /etc/pam.d/sddm-greeter ]] || [[ -f /etc/pam.d/sddm ]]; then
         has_sddm=true
     fi
     
     if [[ -f /etc/pam.d/lightdm ]]; then
         has_lightdm=true
+    fi
+    
+    # Inform about system-auth if present
+    if [[ "$has_system_auth" == true ]]; then
+        echo ""
+        print_info "Detected /etc/pam.d/system-auth on your system."
+        echo "This is a common authentication stack used by display managers (SDDM, etc.)"
+        echo "and lock screens. Configuring system-auth may cover multiple services at once."
+        echo ""
     fi
     
     read -p "Configure TapAuth for login authentication? [y/N]: " response
@@ -328,6 +355,11 @@ prompt_pam_configuration() {
     
     read -p "Configure TapAuth for polkit authentication? [y/N]: " response
     [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_POLKIT=true || CONFIGURE_PAM_POLKIT=false
+    
+    if [[ "$has_system_auth" == true ]]; then
+        read -p "Configure TapAuth for system-auth (display managers, lock screen)? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SYSTEM_AUTH=true || CONFIGURE_PAM_SYSTEM_AUTH=false
+    fi
     
     if [[ "$has_gdm" == true ]]; then
         read -p "Configure TapAuth for GDM (GNOME Display Manager)? [y/N]: " response
@@ -646,7 +678,8 @@ install_pam() {
 # Configure PAM
 configure_pam() {
     if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
-          "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && "$CONFIGURE_PAM_LIGHTDM" == false ]]; then
+          "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
+          "$CONFIGURE_PAM_LIGHTDM" == false ]]; then
         print_info "No PAM services selected for configuration"
         return
     fi
@@ -680,6 +713,16 @@ configure_pam() {
             fi
         fi
         
+        if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+            if [[ -f /etc/pam.d/system-auth ]]; then
+                show_pam_diff "/etc/pam.d/system-auth" "$pam_line" ""
+            else
+                echo ""
+                echo -e "${YELLOW}[SKIP]${NC} system-auth PAM configuration"
+                echo "  → Not found at /etc/pam.d/system-auth"
+            fi
+        fi
+        
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
             # GDM typically uses gdm-password
             if [[ -f /etc/pam.d/gdm-password ]]; then
@@ -694,12 +737,15 @@ configure_pam() {
         fi
         
         if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
-            if [[ -f /etc/pam.d/sddm ]]; then
+            # SDDM uses sddm-greeter for authentication
+            if [[ -f /etc/pam.d/sddm-greeter ]]; then
+                show_pam_diff "/etc/pam.d/sddm-greeter" "$pam_line" ""
+            elif [[ -f /etc/pam.d/sddm ]]; then
                 show_pam_diff "/etc/pam.d/sddm" "$pam_line" ""
             else
                 echo ""
                 echo -e "${YELLOW}[SKIP]${NC} SDDM PAM configuration"
-                echo "  → Not found at /etc/pam.d/sddm"
+                echo "  → Not found at /etc/pam.d/sddm-greeter or /etc/pam.d/sddm"
             fi
         fi
         
@@ -767,6 +813,24 @@ configure_pam() {
         fi
     fi
     
+    # Configure system-auth (common on Arch-based systems, used by SDDM and lock screens)
+    if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+        print_info "Configuring PAM for system-auth..."
+        
+        if [[ -f /etc/pam.d/system-auth ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
+                # Insert at the beginning of the auth section
+                sed -i "1i $pam_line" /etc/pam.d/system-auth
+                print_success "Configured PAM for system-auth"
+                print_info "This affects: SDDM, lock screen, and other services using system-auth"
+            else
+                print_warning "PAM system-auth already configured"
+            fi
+        else
+            print_warning "system-auth PAM configuration not found at /etc/pam.d/system-auth"
+        fi
+    fi
+    
     # Configure GDM (GNOME Display Manager)
     if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
         print_info "Configuring PAM for GDM..."
@@ -801,15 +865,29 @@ configure_pam() {
     if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
         print_info "Configuring PAM for SDDM..."
         
-        if [[ -f /etc/pam.d/sddm ]]; then
+        # SDDM uses sddm-greeter for authentication (primary config)
+        local sddm_configured=false
+        if [[ -f /etc/pam.d/sddm-greeter ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter; then
+                sed -i "1i $pam_line" /etc/pam.d/sddm-greeter
+                print_success "Configured PAM for SDDM (sddm-greeter)"
+                sddm_configured=true
+            else
+                print_warning "PAM SDDM already configured (sddm-greeter)"
+                sddm_configured=true
+            fi
+        fi
+        
+        # Fallback to sddm if sddm-greeter doesn't exist
+        if [[ -f /etc/pam.d/sddm ]] && [[ "$sddm_configured" == false ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
                 sed -i "1i $pam_line" /etc/pam.d/sddm
                 print_success "Configured PAM for SDDM"
             else
                 print_warning "PAM SDDM already configured"
             fi
-        else
-            print_warning "SDDM PAM configuration not found at /etc/pam.d/sddm"
+        elif [[ "$sddm_configured" == false ]]; then
+            print_warning "SDDM PAM configuration not found (checked /etc/pam.d/sddm-greeter and /etc/pam.d/sddm)"
         fi
     fi
     
@@ -831,7 +909,8 @@ configure_pam() {
     
     # Inform about when changes take effect
     if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true || \
-          "$CONFIGURE_PAM_GDM" == true || "$CONFIGURE_PAM_SDDM" == true || "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
+          "$CONFIGURE_PAM_SYSTEM_AUTH" == true || "$CONFIGURE_PAM_GDM" == true || "$CONFIGURE_PAM_SDDM" == true || \
+          "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
         echo ""
         print_info "PAM configuration updated"
         print_info "Changes take effect:"
@@ -843,6 +922,9 @@ configure_pam() {
         fi
         if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
             echo "  • login: On next login session (logout/login required)"
+        fi
+        if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
+            echo "  • system-auth: On next login session (affects SDDM, lock screen, etc.)"
         fi
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
             echo "  • GDM: On next login session (logout/login required)"
@@ -918,6 +1000,7 @@ create_summary() {
     [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
     [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
     [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
+    [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth" || echo "  ✗ System-auth"
     [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
     [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
     [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
@@ -1024,9 +1107,10 @@ main() {
         echo "PAM services to configure:"
         [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (/etc/pam.d/login)" || echo "  ✗ Login (skipped)"
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
-        [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
+        [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
+        [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (skipped)"
         [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
-        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm)" || echo "  ✗ SDDM (skipped)"
+        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)" || echo "  ✗ SDDM (skipped)"
         [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (skipped)"
         
         echo ""

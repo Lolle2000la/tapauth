@@ -21,6 +21,7 @@ REMOVE_DAEMON=true
 REMOVE_PAM_CONFIG_LOGIN=false
 REMOVE_PAM_CONFIG_SUDO=false
 REMOVE_PAM_CONFIG_POLKIT=false
+REMOVE_PAM_CONFIG_SYSTEM_AUTH=false
 REMOVE_PAM_CONFIG_GDM=false
 REMOVE_PAM_CONFIG_SDDM=false
 REMOVE_PAM_CONFIG_LIGHTDM=false
@@ -121,6 +122,7 @@ OPTIONS:
     --remove-pam-login      Remove PAM login configuration
     --remove-pam-sudo       Remove PAM sudo configuration
     --remove-pam-polkit     Remove PAM polkit configuration
+    --remove-pam-system-auth Remove PAM system-auth configuration
     --remove-pam-gdm        Remove PAM GDM configuration
     --remove-pam-sddm       Remove PAM SDDM configuration
     --remove-pam-lightdm    Remove PAM LightDM configuration
@@ -205,6 +207,7 @@ parse_args() {
                 REMOVE_PAM_CONFIG_LOGIN=true
                 REMOVE_PAM_CONFIG_SUDO=true
                 REMOVE_PAM_CONFIG_POLKIT=true
+                REMOVE_PAM_CONFIG_SYSTEM_AUTH=true
                 REMOVE_PAM_CONFIG_GDM=true
                 REMOVE_PAM_CONFIG_SDDM=true
                 REMOVE_PAM_CONFIG_LIGHTDM=true
@@ -221,6 +224,10 @@ parse_args() {
                 ;;
             --remove-pam-polkit)
                 REMOVE_PAM_CONFIG_POLKIT=true
+                shift
+                ;;
+            --remove-pam-system-auth)
+                REMOVE_PAM_CONFIG_SYSTEM_AUTH=true
                 shift
                 ;;
             --remove-pam-gdm)
@@ -263,6 +270,7 @@ prompt_pam_configuration() {
     local has_login=false
     local has_sudo=false
     local has_polkit=false
+    local has_system_auth=false
     local has_gdm=false
     local has_sddm=false
     local has_lightdm=false
@@ -281,14 +289,20 @@ prompt_pam_configuration() {
         has_polkit=true
     fi
     
+    # Check for system-auth
+    if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
+        has_system_auth=true
+    fi
+    
     # Check for GDM
     if ([[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null) || \
        ([[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null); then
         has_gdm=true
     fi
     
-    # Check for SDDM
-    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
+    # Check for SDDM (uses sddm-greeter primarily)
+    if ([[ -f /etc/pam.d/sddm-greeter ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter 2>/dev/null) || \
+       ([[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null); then
         has_sddm=true
     fi
     
@@ -310,6 +324,11 @@ prompt_pam_configuration() {
     if [[ "$has_polkit" == true ]]; then
         read -p "Remove TapAuth from polkit PAM configuration? [Y/n]: " response
         [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_POLKIT=true || REMOVE_PAM_CONFIG_POLKIT=false
+    fi
+    
+    if [[ "$has_system_auth" == true ]]; then
+        read -p "Remove TapAuth from system-auth PAM configuration? [Y/n]: " response
+        [[ ! "$response" =~ ^[Nn]$ ]] && REMOVE_PAM_CONFIG_SYSTEM_AUTH=true || REMOVE_PAM_CONFIG_SYSTEM_AUTH=false
     fi
     
     if [[ "$has_gdm" == true ]]; then
@@ -395,7 +414,8 @@ check_root() {
 # Remove PAM configuration
 remove_pam_config() {
     if [[ "$REMOVE_PAM_CONFIG_LOGIN" == false && "$REMOVE_PAM_CONFIG_SUDO" == false && "$REMOVE_PAM_CONFIG_POLKIT" == false && \
-          "$REMOVE_PAM_CONFIG_GDM" == false && "$REMOVE_PAM_CONFIG_SDDM" == false && "$REMOVE_PAM_CONFIG_LIGHTDM" == false ]]; then
+          "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == false && "$REMOVE_PAM_CONFIG_GDM" == false && "$REMOVE_PAM_CONFIG_SDDM" == false && \
+          "$REMOVE_PAM_CONFIG_LIGHTDM" == false ]]; then
         return
     fi
     
@@ -422,6 +442,12 @@ remove_pam_config() {
             fi
         fi
         
+        if [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]]; then
+            if [[ -f /etc/pam.d/system-auth ]]; then
+                show_pam_restore_diff "/etc/pam.d/system-auth"
+            fi
+        fi
+        
         if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
             if [[ -f /etc/pam.d/gdm-password ]]; then
                 show_pam_restore_diff "/etc/pam.d/gdm-password"
@@ -431,7 +457,10 @@ remove_pam_config() {
         fi
         
         if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
-            if [[ -f /etc/pam.d/sddm ]]; then
+            # SDDM uses sddm-greeter primarily
+            if [[ -f /etc/pam.d/sddm-greeter ]]; then
+                show_pam_restore_diff "/etc/pam.d/sddm-greeter"
+            elif [[ -f /etc/pam.d/sddm ]]; then
                 show_pam_restore_diff "/etc/pam.d/sddm"
             fi
         fi
@@ -484,6 +513,15 @@ remove_pam_config() {
         fi
     fi
     
+    # Remove from system-auth
+    if [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]]; then
+        if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
+            print_info "Removing TapAuth from system-auth PAM configuration"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/system-auth
+            print_success "Removed from system-auth"
+        fi
+    fi
+    
     # Remove from GDM
     if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
         local gdm_removed=false
@@ -507,9 +545,23 @@ remove_pam_config() {
     
     # Remove from SDDM
     if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
+        local sddm_removed=false
+        
+        # SDDM uses sddm-greeter for authentication (primary config)
+        if [[ -f /etc/pam.d/sddm-greeter ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm-greeter 2>/dev/null; then
+            print_info "Removing TapAuth from SDDM PAM configuration (/etc/pam.d/sddm-greeter)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm-greeter
+            sddm_removed=true
+        fi
+        
+        # Also check fallback location
         if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-            print_info "Removing TapAuth from SDDM PAM configuration"
+            print_info "Removing TapAuth from SDDM PAM configuration (/etc/pam.d/sddm)"
             sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
+            sddm_removed=true
+        fi
+        
+        if [[ "$sddm_removed" == true ]]; then
             print_success "Removed from SDDM"
         fi
     fi
@@ -686,6 +738,7 @@ create_summary() {
     [[ "$REMOVE_PAM_CONFIG_LOGIN" == true ]] && echo "  ✓ Login" || echo "  ✗ Login"
     [[ "$REMOVE_PAM_CONFIG_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
     [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit" || echo "  ✗ Polkit"
+    [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth" || echo "  ✗ System-auth"
     [[ "$REMOVE_PAM_CONFIG_GDM" == true ]] && echo "  ✓ GDM" || echo "  ✗ GDM"
     [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM" || echo "  ✗ SDDM"
     [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM" || echo "  ✗ LightDM"
@@ -759,6 +812,7 @@ main() {
         else
             echo "  ✗ Polkit (kept)"
         fi
+        [[ "$REMOVE_PAM_CONFIG_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (kept)"
         if [[ "$REMOVE_PAM_CONFIG_GDM" == true ]]; then
             if [[ -f /etc/pam.d/gdm-password ]]; then
                 echo "  ✓ GDM (/etc/pam.d/gdm-password)"
@@ -770,7 +824,17 @@ main() {
         else
             echo "  ✗ GDM (kept)"
         fi
-        [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm)" || echo "  ✗ SDDM (kept)"
+        if [[ "$REMOVE_PAM_CONFIG_SDDM" == true ]]; then
+            if [[ -f /etc/pam.d/sddm-greeter ]]; then
+                echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)"
+            elif [[ -f /etc/pam.d/sddm ]]; then
+                echo "  ✓ SDDM (/etc/pam.d/sddm)"
+            else
+                echo "  ✓ SDDM (config file not found)"
+            fi
+        else
+            echo "  ✗ SDDM (kept)"
+        fi
         [[ "$REMOVE_PAM_CONFIG_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (kept)"
         
         echo ""
