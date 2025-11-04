@@ -49,7 +49,7 @@ use tokio::net::TcpStream;
 
 use crate::crypto::{
     decrypt_with_psk, derive_psk_from_x25519, derive_sas, encrypt_with_psk, ClientSymmetricKey,
-    Ed25519KeyPair, PairingSymmetricKey, X25519KeyPair,
+    CryptoError, Ed25519KeyPair, PairingSymmetricKey, X25519KeyPair,
 };
 use crate::protocol::pb::*;
 use crate::protocol::ProtocolError;
@@ -86,14 +86,14 @@ pub struct ServerPairingSession {
 
 impl ClientPairingSession {
     /// Create a new client pairing session with ephemeral keypair
-    pub fn new(ed25519_keypair: Ed25519KeyPair) -> Self {
-        Self {
-            x25519_keypair: X25519KeyPair::generate(),
+    pub fn new(ed25519_keypair: Ed25519KeyPair) -> Result<Self, CryptoError> {
+        Ok(Self {
+            x25519_keypair: X25519KeyPair::generate()?,
             ed25519_keypair,
             server_x25519_public: None,
             psk: None,
             sas: None,
-        }
+        })
     }
 
     /// Get the X25519 public key to display in QR code
@@ -300,14 +300,14 @@ impl ClientPairingSession {
 
 impl ServerPairingSession {
     /// Create a new server pairing session
-    pub fn new(ed25519_public_key: [u8; 32]) -> Self {
-        Self {
-            x25519_keypair: X25519KeyPair::generate(),
+    pub fn new(ed25519_public_key: [u8; 32]) -> Result<Self, CryptoError> {
+        Ok(Self {
+            x25519_keypair: X25519KeyPair::generate()?,
             ed25519_public_key,
             client_x25519_public: None,
             psk: None,
             sas: None,
-        }
+        })
     }
 
     /// Complete the pairing handshake as server
@@ -474,8 +474,8 @@ mod tests {
         // Server task (Android - receives CSK)
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
+            let server_keypair = Ed25519KeyPair::generate().unwrap();
+            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             let (csk, _client_pub, _client_device_name, sas) = session
                 .complete_pairing(stream, "TestServer")
@@ -488,9 +488,9 @@ mod tests {
         let client_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate();
+            let client_keypair = Ed25519KeyPair::generate().unwrap();
             let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair);
+            let mut session = ClientPairingSession::new(client_keypair).unwrap();
 
             // Phase 1: Initiate pairing
             let (stream, _server_pub, _server_name, sas) = session
@@ -525,8 +525,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
+            let server_keypair = Ed25519KeyPair::generate().unwrap();
+            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             let (_, _, client_device_name, _) = session
                 .complete_pairing(stream, "MyAndroidPhone")
@@ -538,9 +538,9 @@ mod tests {
         let client_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate();
+            let client_keypair = Ed25519KeyPair::generate().unwrap();
             let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair);
+            let mut session = ClientPairingSession::new(client_keypair).unwrap();
 
             let (stream, _, server_device_name, _) = session
                 .initiate_pairing(stream, "LinuxDesktop")
@@ -571,8 +571,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes());
+            let server_keypair = Ed25519KeyPair::generate().unwrap();
+            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             session.complete_pairing(stream, "").await
         });
@@ -580,9 +580,9 @@ mod tests {
         let client_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate();
+            let client_keypair = Ed25519KeyPair::generate().unwrap();
             let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair);
+            let mut session = ClientPairingSession::new(client_keypair).unwrap();
 
             let result = session.initiate_pairing(stream, "").await;
             if let Ok((stream, _, _, _)) = result {
@@ -601,8 +601,8 @@ mod tests {
 
     #[test]
     fn test_client_session_public_keys() {
-        let keypair = Ed25519KeyPair::generate();
-        let session = ClientPairingSession::new(keypair.clone());
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let session = ClientPairingSession::new(keypair.clone()).unwrap();
 
         // X25519 public key should be 32 bytes
         assert_eq!(session.x25519_public_key().len(), 32);
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn test_server_session_creation() {
         let ed25519_public = [42u8; 32];
-        let session = ServerPairingSession::new(ed25519_public);
+        let session = ServerPairingSession::new(ed25519_public).unwrap();
 
         // Should store the provided public key
         assert_eq!(session.ed25519_public_key, ed25519_public);

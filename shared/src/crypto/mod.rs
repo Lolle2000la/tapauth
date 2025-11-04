@@ -18,6 +18,8 @@ pub enum CryptoError {
     KeyDerivationFailed,
     #[error("Random number generation failed")]
     RandomGenerationFailed,
+    #[error("System time error")]
+    SystemTimeError,
 }
 
 pub use encryption::*;

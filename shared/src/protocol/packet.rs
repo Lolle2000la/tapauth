@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn test_packet_encryption_decryption() {
         let csk = ClientSymmetricKey::generate().unwrap();
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [1u8; 32];
         let context = b"test_context";
 
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_extract_challenge() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let request = create_auth_request(&keypair, "user", "host").unwrap();
         let challenge = request.challenge.clone();
         let wrapper = wrap_auth_request(request);

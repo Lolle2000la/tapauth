@@ -303,7 +303,13 @@ pub async fn send_udp_multicast_all_interfaces(
     // Send on each interface by setting the multicast interface option
     for iface in interfaces {
         // Create a UDP socket for IPv6
-        let socket_addr = "[::]:0".parse::<std::net::SocketAddr>().unwrap();
+        let socket_addr = match "[::]:0".parse::<std::net::SocketAddr>() {
+            Ok(addr) => addr,
+            Err(_) => {
+                tracing::error!("Failed to parse IPv6 any address - this should never happen");
+                continue;
+            }
+        };
         let socket = match socket2::Socket::new(
             socket2::Domain::IPV6,
             socket2::Type::DGRAM,
@@ -420,7 +426,13 @@ pub async fn receive_udp_packet(
             if addr.is_ipv4() { "IPv4" } else { "IPv6" }
         );
 
-        let packet = EncryptedPacket::decode(&buf[..len])?;
+        let packet_bytes = buf.get(..len).ok_or_else(|| {
+            NetworkError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "buffer length mismatch",
+            ))
+        })?;
+        let packet = EncryptedPacket::decode(packet_bytes)?;
         return Ok((packet, addr));
     }
 }

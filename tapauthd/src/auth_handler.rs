@@ -94,18 +94,23 @@ pub struct AuthSession {
 }
 
 impl AuthSession {
-    pub fn new(state: Arc<DaemonState>, username: String) -> Self {
+    pub fn new(state: Arc<DaemonState>, username: String) -> Result<Self, std::io::Error> {
         let mut challenge = [0u8; 32];
-        getrandom::fill(&mut challenge).expect("Failed to generate challenge");
+        getrandom::fill(&mut challenge).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("random generation failed: {}", e),
+            )
+        })?;
 
-        Self {
+        Ok(Self {
             state,
             username,
             challenge,
             cancel_rx: None,
             cancel_registry: None,
             request_id: None,
-        }
+        })
     }
 
     /// Handle PamAuthenticateRequest - creates transports on-demand, runs auth flow

@@ -32,18 +32,20 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// Connect to tapauthd socket with a timeout for blocking operations.
-    /// Used for send_cancel which needs to be resilient to unresponsive daemons.
-    pub fn connect() -> Result<Self, IpcError> {
+    /// Connect to tapauthd socket with configurable timeout for blocking operations.
+    /// 
+    /// The timeout applies to connect, send, and receive operations to prevent
+    /// PAM module hangs if the daemon is unresponsive.
+    pub fn connect(timeout: Duration) -> Result<Self, IpcError> {
         let sock_path =
             std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
         let stream = UnixStream::connect(&sock_path)?;
 
-        // Set timeouts for blocking operations (send_cancel)
+        // Set timeouts for all blocking operations
         // This prevents hanging if daemon becomes unresponsive
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
 
         Ok(Self {
             stream,
@@ -70,7 +72,7 @@ impl IpcClient {
         })
     }
 
-    /// Send a cancel request to the daemon.
+    /// Send a cancel request to the daemon with a short timeout.
     pub fn send_cancel(
         &mut self,
         reason: &str,
@@ -145,7 +147,16 @@ impl IpcClient {
         loop {
             match self.stream.read(&mut tmp) {
                 Ok(0) => break, // EOF or no more data
-                Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    if let Some(slice) = tmp.get(..n) {
+                        self.read_buf.extend_from_slice(slice);
+                    } else {
+                        return Err(IpcError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid read length",
+                        )));
+                    }
+                }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::Interrupted =>
@@ -159,10 +170,22 @@ impl IpcClient {
         if self.expected_total.is_none() {
             if self.read_buf.len() >= 4 {
                 let len = u32::from_be_bytes([
-                    self.read_buf[0],
-                    self.read_buf[1],
-                    self.read_buf[2],
-                    self.read_buf[3],
+                    *self.read_buf.first().ok_or(IpcError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid frame header",
+                    )))?,
+                    *self.read_buf.get(1).ok_or(IpcError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid frame header",
+                    )))?,
+                    *self.read_buf.get(2).ok_or(IpcError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid frame header",
+                    )))?,
+                    *self.read_buf.get(3).ok_or(IpcError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid frame header",
+                    )))?,
                 ]) as usize;
                 if len > 1024 * 1024 {
                     return Err(IpcError::FrameTooLarge(len as u32));
@@ -177,7 +200,10 @@ impl IpcClient {
             if self.read_buf.len() >= total {
                 let frame = self.read_buf.split_to(total);
                 self.expected_total = None; // reset for next
-                let data = &frame[4..];
+                let data = frame.get(4..).ok_or(IpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too short",
+                )))?;
                 let resp = ipc::PamAuthenticateResponse::decode(data)?;
                 return Ok(Some(resp));
             }

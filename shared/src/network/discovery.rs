@@ -22,7 +22,7 @@ pub fn get_session_timeout() -> Duration {
 pub async fn retransmit_with_backoff<F, T, E>(
     mut send_fn: F,
     max_duration: Duration,
-) -> Result<T, E>
+) -> Result<Option<T>, E>
 where
     F: FnMut(u32) -> Result<Option<T>, E>,
 {
@@ -31,7 +31,7 @@ where
 
     loop {
         match send_fn(attempt)? {
-            Some(result) => return Ok(result),
+            Some(result) => return Ok(Some(result)),
             None => {
                 if start.elapsed() >= max_duration {
                     break;
@@ -44,10 +44,8 @@ where
         }
     }
 
-    // Return error after timeout
-    // This requires the error type to be constructible
-    // In practice, the caller should handle this
-    panic!("Retransmission timeout")
+    // Timed out without success
+    Ok(None)
 }
 
 #[cfg(test)]

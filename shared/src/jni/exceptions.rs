@@ -61,3 +61,23 @@ pub fn throw_bad_padding(env: &mut JNIEnv, message: impl Into<String>) {
 pub fn throw_invalid_key(env: &mut JNIEnv, message: impl Into<String>) {
     let _ = env.throw_new("java/security/InvalidKeyException", message.into());
 }
+
+/// Map a `TapAuthError` to the appropriate Java exception and throw it.
+///
+/// Exception mapping:
+/// - `InvalidInput` → `IllegalArgumentException`
+/// - `Io`, `ProtoDecode` → `IOException`
+/// - `AeadBadTag` → `AEADBadTagException`
+/// - `Crypto` → `GeneralSecurityException`
+/// - `State` → `IllegalStateException`
+pub fn throw_tapauth_error(env: &mut JNIEnv, err: &crate::error::TapAuthError) {
+    use crate::error::TapAuthError;
+    match err {
+        TapAuthError::InvalidInput(msg) => throw_illegal_argument(env, msg),
+        TapAuthError::Io(err) => throw_io_exception(env, err.to_string()),
+        TapAuthError::ProtoDecode(err) => throw_io_exception(env, err.to_string()),
+        TapAuthError::AeadBadTag => throw_aead_bad_tag(env, "AEAD tag verification failed"),
+        TapAuthError::Crypto(msg) => throw_security_exception(env, msg),
+        TapAuthError::State(msg) => throw_illegal_state(env, msg),
+    }
+}

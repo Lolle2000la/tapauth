@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
 mod auth_handler;
 mod transport;
 
@@ -298,23 +300,34 @@ async fn handle_conn(
 
                 // Run authentication
                 let timeout = Some(req.timeout_seconds);
-                let sess = AuthSession::new(server_state.daemon.clone(), req.username.clone());
-                let result = sess
-                    .handle_authenticate(
-                        timeout,
-                        Some(req.request_id.clone()),
-                        server_state.cancel_registry.clone(),
-                    )
-                    .await;
+                match AuthSession::new(server_state.daemon.clone(), req.username.clone()) {
+                    Ok(sess) => {
+                        let result = sess
+                            .handle_authenticate(
+                                timeout,
+                                Some(req.request_id.clone()),
+                                server_state.cancel_registry.clone(),
+                            )
+                            .await;
 
-                match result {
-                    Ok(resp) => resp,
+                        match result {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                tracing::error!("Authentication handler error: {}", e);
+                                ipc::PamAuthenticateResponse {
+                                    outcome: ipc::PamOutcome::Error as i32,
+                                    detail: format!("Internal error: {}", e),
+                                    challenge: Vec::new(), // Error case, no challenge
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
-                        tracing::error!("Authentication handler error: {}", e);
+                        tracing::error!("Failed to create auth session: {}", e);
                         ipc::PamAuthenticateResponse {
                             outcome: ipc::PamOutcome::Error as i32,
                             detail: format!("Internal error: {}", e),
-                            challenge: Vec::new(), // Error case, no challenge
+                            challenge: Vec::new(),
                         }
                     }
                 }

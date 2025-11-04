@@ -12,16 +12,16 @@ pub struct Ed25519KeyPair {
 
 impl Ed25519KeyPair {
     /// Generate a new Ed25519 key pair
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self, CryptoError> {
         // Use OS CSPRNG to generate 32 bytes and construct the signing key
         let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).expect("getrandom failed");
+        getrandom::fill(&mut seed).map_err(|_| CryptoError::RandomGenerationFailed)?;
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
-        Self {
+        Ok(Self {
             signing_key_bytes: SecretBox::new(Box::new(seed)),
             verifying_key,
-        }
+        })
     }
 
     /// Create from signing key bytes
@@ -69,16 +69,16 @@ pub struct X25519KeyPair {
 
 impl X25519KeyPair {
     /// Generate a new X25519 key pair
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self, CryptoError> {
         // Use OS CSPRNG to fill 32 random bytes for the static secret
         let mut sk = [0u8; 32];
-        getrandom::fill(&mut sk).expect("getrandom failed");
+        getrandom::fill(&mut sk).map_err(|_| CryptoError::RandomGenerationFailed)?;
         let secret = X25519StaticSecret::from(sk);
         let public = X25519PublicKey::from(&secret);
-        Self {
+        Ok(Self {
             secret_bytes: SecretBox::new(Box::new(sk)),
             public,
-        }
+        })
     }
 
     /// Create from secret key bytes
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_ed25519_key_generation() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let bytes = keypair.signing_key_bytes();
         let restored = Ed25519KeyPair::from_signing_key_bytes(&bytes).unwrap();
         assert_eq!(
@@ -200,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_x25519_key_exchange() {
-        let alice = X25519KeyPair::generate();
-        let bob = X25519KeyPair::generate();
+        let alice = X25519KeyPair::generate().unwrap();
+        let bob = X25519KeyPair::generate().unwrap();
 
         let alice_shared = alice.diffie_hellman(&bob.public_key_bytes()).unwrap();
         let bob_shared = bob.diffie_hellman(&alice.public_key_bytes()).unwrap();

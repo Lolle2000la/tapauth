@@ -56,6 +56,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
+    // Load configuration for timeouts
+    let config = crate::config::PamConfig::load();
+    tracing::debug!(
+        "PAM operation timeout: {}s",
+        config.pam_operation_timeout_secs
+    );
+
     let username = unsafe {
         match pam_sys::get_user(pamh) {
             Ok(user) => {
@@ -337,8 +344,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             let b = kb[0];
                             if b == b'\n' || b == b'\r' {
                                 tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a fresh blocking connection
-                                if let Ok(mut c) = IpcClient::connect() {
+                                // Best-effort cancel uses a fresh blocking connection with configured timeout
+                                if let Ok(mut c) = IpcClient::connect(config.operation_timeout()) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
                                 pam_conv.try_info("TapAuth: Skipped, trying password...");

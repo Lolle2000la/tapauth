@@ -109,10 +109,14 @@ pub fn decrypt_with_csk_and_prepended_nonce(
     if ciphertext_with_nonce.len() < 12 {
         return Err(CryptoError::DecryptionFailed);
     }
-    let nonce: [u8; 12] = ciphertext_with_nonce[..12]
+    let nonce: [u8; 12] = ciphertext_with_nonce
+        .get(..12)
+        .ok_or(CryptoError::DecryptionFailed)?
         .try_into()
         .map_err(|_| CryptoError::DecryptionFailed)?;
-    let ciphertext = &ciphertext_with_nonce[12..];
+    let ciphertext = ciphertext_with_nonce
+        .get(12..)
+        .ok_or(CryptoError::DecryptionFailed)?;
     decrypt_aes_gcm(csk.as_bytes(), &nonce, ciphertext, &[])
 }
 
@@ -145,10 +149,14 @@ pub fn decrypt_with_psk(
     if ciphertext_with_nonce.len() < 12 {
         return Err(CryptoError::DecryptionFailed);
     }
-    let nonce: [u8; 12] = ciphertext_with_nonce[..12]
+    let nonce: [u8; 12] = ciphertext_with_nonce
+        .get(..12)
+        .ok_or(CryptoError::DecryptionFailed)?
         .try_into()
         .map_err(|_| CryptoError::DecryptionFailed)?;
-    let ciphertext = &ciphertext_with_nonce[12..];
+    let ciphertext = ciphertext_with_nonce
+        .get(12..)
+        .ok_or(CryptoError::DecryptionFailed)?;
     decrypt_aes_gcm(psk.as_bytes(), &nonce, ciphertext, &[])
 }
 

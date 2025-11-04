@@ -143,7 +143,14 @@ pub fn jbytearray_to_ed25519_keypair(
     let signing_key = match bytes.len() {
         64 => {
             let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes[..32]);
+            // Already checked length is 64, so this slice is safe
+            if let Some(slice) = bytes.get(..32) {
+                key.copy_from_slice(slice);
+            } else {
+                // Should never happen, but be defensive
+                throw_illegal_argument(env, "invalid key buffer length");
+                return None;
+            }
             key
         }
         32 => {

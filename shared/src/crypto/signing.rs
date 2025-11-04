@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn test_signing_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let message = b"Test message for signing";
 
         let signature = sign_ed25519(&keypair, message);
@@ -49,7 +49,7 @@ mod tests {
         assert!(verify_ed25519(&keypair.verifying_key_bytes(), wrong_message, &signature).is_err());
 
         // Verify with wrong key should fail
-        let other_keypair = Ed25519KeyPair::generate();
+        let other_keypair = Ed25519KeyPair::generate().unwrap();
         assert!(verify_ed25519(&other_keypair.verifying_key_bytes(), message, &signature).is_err());
     }
 }

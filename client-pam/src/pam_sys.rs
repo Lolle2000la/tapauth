@@ -16,6 +16,7 @@ pub const PAM_PERM_DENIED: c_int = 6;
 pub const PAM_BUF_ERR: c_int = 5;
 pub const PAM_CONV_ERR: c_int = 19;
 pub const PAM_IGNORE: c_int = 25;
+pub const PAM_SYSTEM_ERR: c_int = 4;
 
 // PAM item types
 pub const PAM_USER: c_int = 2;

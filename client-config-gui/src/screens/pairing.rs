@@ -303,7 +303,8 @@ impl PairingScreen {
         tracing::debug!("TCP listener on port {}", port);
 
         // Generate pairing URL with X25519 public key
-        let session = ClientPairingSession::new(keypair.clone());
+        let session = ClientPairingSession::new(keypair.clone())
+            .map_err(|e| format!("Failed to create pairing session: {}", e))?;
         let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
 
         let url = generate_pairing_url(&x25519_pubkey_hex, port, Some(ipv4), Some(ipv6));
@@ -343,7 +344,8 @@ impl PairingScreen {
         };
 
         // Create pairing session
-        let mut session = ClientPairingSession::new(keypair.clone());
+        let mut session = ClientPairingSession::new(keypair.clone())
+            .map_err(|e| format!("Failed to create pairing session: {}", e))?;
 
         // Get client device name (hostname)
         let client_device_name =
@@ -358,7 +360,7 @@ impl PairingScreen {
         tracing::debug!(
             "Pairing initiated. Server: {}, SAS: {}",
             server_device_name,
-            sas
+            &sas
         );
 
         // Store session state globally for phase 2

@@ -9,11 +9,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub const TIME_WINDOW_SECONDS: u64 = 60;
 
 /// Calculate current time window
-pub fn current_time_window() -> u64 {
+pub fn current_time_window() -> Result<u64, CryptoError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("System time before UNIX epoch");
-    now.as_secs() / TIME_WINDOW_SECONDS
+        .map_err(|_| CryptoError::SystemTimeError)?;
+    Ok(now.as_secs() / TIME_WINDOW_SECONDS)
 }
 
 /// Generate temporal identifier for a given time window
@@ -31,7 +31,10 @@ pub fn generate_temporal_identifier(
     let bytes = result.into_bytes();
 
     let mut identifier = [0u8; 16];
-    identifier.copy_from_slice(&bytes[..16]);
+    let slice = bytes
+        .get(..16)
+        .ok_or(CryptoError::KeyDerivationFailed)?;
+    identifier.copy_from_slice(slice);
 
     Ok(identifier)
 }
@@ -50,7 +53,10 @@ pub fn generate_temporal_identifier_ble(
     let bytes = result.into_bytes();
 
     let mut identifier = [0u8; 10];
-    identifier.copy_from_slice(&bytes[..10]);
+    let slice = bytes
+        .get(..10)
+        .ok_or(CryptoError::KeyDerivationFailed)?;
+    identifier.copy_from_slice(slice);
 
     Ok(identifier)
 }
@@ -59,21 +65,21 @@ pub fn generate_temporal_identifier_ble(
 pub fn generate_current_temporal_identifier(
     csk: &ClientSymmetricKey,
 ) -> Result<[u8; 16], CryptoError> {
-    generate_temporal_identifier(csk, current_time_window())
+    generate_temporal_identifier(csk, current_time_window()?)
 }
 
 /// Generate temporal identifier for BLE advertisement (current window, 10 bytes)
 pub fn generate_current_temporal_identifier_ble(
     csk: &ClientSymmetricKey,
 ) -> Result<[u8; 10], CryptoError> {
-    generate_temporal_identifier_ble(csk, current_time_window())
+    generate_temporal_identifier_ble(csk, current_time_window()?)
 }
 
 /// Generate temporal identifier for previous time window
 pub fn generate_previous_temporal_identifier(
     csk: &ClientSymmetricKey,
 ) -> Result<[u8; 16], CryptoError> {
-    let window = current_time_window();
+    let window = current_time_window()?;
     if window == 0 {
         return Err(CryptoError::KeyDerivationFailed);
     }
@@ -84,7 +90,7 @@ pub fn generate_previous_temporal_identifier(
 pub fn generate_previous_temporal_identifier_ble(
     csk: &ClientSymmetricKey,
 ) -> Result<[u8; 10], CryptoError> {
-    let window = current_time_window();
+    let window = current_time_window()?;
     if window == 0 {
         return Err(CryptoError::KeyDerivationFailed);
     }
@@ -125,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_time_window_calculation() {
-        let window = current_time_window();
+        let window = current_time_window().unwrap();
         // Should be a reasonable number (assuming test runs after 2020)
         assert!(window > 26_000_000);
     }
@@ -133,7 +139,7 @@ mod tests {
     #[test]
     fn test_temporal_identifier_generation() {
         let csk = ClientSymmetricKey::generate().unwrap();
-        let window = current_time_window();
+        let window = current_time_window().unwrap();
 
         let id1 = generate_temporal_identifier(&csk, window).unwrap();
         let id2 = generate_temporal_identifier(&csk, window).unwrap();
@@ -164,7 +170,7 @@ mod tests {
         let csk = ClientSymmetricKey::generate().unwrap();
 
         // This test assumes we're not at time window 0
-        if current_time_window() > 0 {
+        if current_time_window().unwrap() > 0 {
             let previous_id = generate_previous_temporal_identifier(&csk).unwrap();
 
             // Previous identifier should also verify
@@ -176,7 +182,7 @@ mod tests {
     fn test_different_csk_produces_different_identifier() {
         let csk1 = ClientSymmetricKey::generate().unwrap();
         let csk2 = ClientSymmetricKey::generate().unwrap();
-        let window = current_time_window();
+        let window = current_time_window().unwrap();
 
         let id1 = generate_temporal_identifier(&csk1, window).unwrap();
         let id2 = generate_temporal_identifier(&csk2, window).unwrap();
@@ -208,7 +214,7 @@ mod tests {
     #[test]
     fn test_old_identifier_does_not_verify() {
         let csk = ClientSymmetricKey::generate().unwrap();
-        let current_window = current_time_window();
+        let current_window = current_time_window().unwrap();
 
         // Generate identifier from 2 windows ago
         if current_window > 1 {

@@ -349,7 +349,7 @@ impl ClientConfigManager {
 
     /// Generate and save a new keypair
     pub fn generate_and_save_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate()?;
         self.save_keypair(&keypair)?;
         Ok(keypair)
     }

@@ -11,6 +11,8 @@ shared = { path = "shared" }
 prost = "0.14"
 prost-build = "0.14"
 bytes = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
 
 # Async runtime
 tokio = { version = "1.41", features = ["full"] }

@@ -1,5 +1,5 @@
 //! TapAuth PAM module.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 //!
 //! Linux PAM authentication module that enables phone-tap-based authentication.
 //! Integrates with the system authentication stack to provide passwordless login
@@ -23,10 +23,13 @@
 //!
 //! Must run as root to access `/etc/tapauth` configuration files.
 
+mod config;
+mod error;
 mod ipc_client;
 mod pam_logic;
 mod pam_sys;
 
+pub use error::PamError;
 pub use ipc_client::*;
 
 use std::os::raw::c_int;

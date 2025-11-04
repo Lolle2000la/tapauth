@@ -40,7 +40,10 @@ pub fn create_auth_request(
     // existing callers working while allowing callers who already
     // track the challenge (e.g. client) to sign/verify the same nonce.
     let mut challenge = [0u8; 32];
-    getrandom::fill(&mut challenge).expect("getrandom failed");
+    getrandom::fill(&mut challenge).map_err(|_| {
+        use crate::crypto::CryptoError;
+        ProtocolError::Crypto(CryptoError::RandomGenerationFailed)
+    })?;
 
     create_auth_request_with_challenge(keypair, username, hostname, &challenge)
 }
@@ -58,7 +61,10 @@ pub fn create_auth_request_with_challenge(
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("System time before UNIX epoch")
+        .map_err(|_| {
+            use crate::crypto::CryptoError;
+            ProtocolError::Crypto(CryptoError::SystemTimeError)
+        })?
         .as_secs();
 
     let mut request = AuthenticationRequest {
@@ -97,10 +103,13 @@ pub fn verify_auth_request(
 
 /// Check if an authentication request is within the valid time window (60 seconds)
 pub fn is_request_timestamp_valid(request: &AuthenticationRequest) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("System time before UNIX epoch")
-        .as_secs();
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => {
+            // System time error - reject as invalid
+            return false;
+        }
+    };
 
     let age = now.saturating_sub(request.timestamp_unix_seconds);
     age <= 60
@@ -308,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_auth_request_creation_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let request = create_auth_request(&keypair, "testuser", "testhost").unwrap();
 
         assert_eq!(request.username, "testuser");
@@ -320,13 +329,13 @@ mod tests {
         verify_auth_request(&request, &keypair.verifying_key_bytes()).unwrap();
 
         // Verification should fail with wrong key
-        let other_keypair = Ed25519KeyPair::generate();
+        let other_keypair = Ed25519KeyPair::generate().unwrap();
         assert!(verify_auth_request(&request, &other_keypair.verifying_key_bytes()).is_err());
     }
 
     #[test]
     fn test_auth_grant_creation_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [1u8; 32];
 
         let grant = create_auth_grant(&keypair, &challenge).unwrap();
@@ -343,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let mut request = create_auth_request(&keypair, "user", "host").unwrap();
 
         // Current timestamp should be valid
@@ -356,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_auth_denial_creation_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [5u8; 32];
 
         let denial = create_auth_denial(&keypair, &challenge).unwrap();
@@ -368,13 +377,13 @@ mod tests {
         verify_auth_denial(&denial, &keypair.verifying_key_bytes()).unwrap();
 
         // Verification should fail with wrong key
-        let other_keypair = Ed25519KeyPair::generate();
+        let other_keypair = Ed25519KeyPair::generate().unwrap();
         assert!(verify_auth_denial(&denial, &other_keypair.verifying_key_bytes()).is_err());
     }
 
     #[test]
     fn test_grant_confirmation_creation_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [7u8; 32];
 
         let confirmation = create_grant_confirmation(&keypair, &challenge).unwrap();
@@ -386,7 +395,7 @@ mod tests {
         verify_grant_confirmation(&confirmation, &keypair.verifying_key_bytes()).unwrap();
 
         // Verification should fail with wrong key
-        let other_keypair = Ed25519KeyPair::generate();
+        let other_keypair = Ed25519KeyPair::generate().unwrap();
         assert!(
             verify_grant_confirmation(&confirmation, &other_keypair.verifying_key_bytes()).is_err()
         );
@@ -394,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_auth_cancel_creation_and_verification() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [9u8; 32];
 
         let cancel = create_auth_cancel(&keypair, &challenge).unwrap();
@@ -406,13 +415,13 @@ mod tests {
         verify_auth_cancel(&cancel, &keypair.verifying_key_bytes()).unwrap();
 
         // Verification should fail with wrong key
-        let other_keypair = Ed25519KeyPair::generate();
+        let other_keypair = Ed25519KeyPair::generate().unwrap();
         assert!(verify_auth_cancel(&cancel, &other_keypair.verifying_key_bytes()).is_err());
     }
 
     #[test]
     fn test_invalid_challenge_length() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
 
         // Too short
         let short_challenge = [1u8; 16];
@@ -428,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_tampered_signature_detection() {
-        let keypair = Ed25519KeyPair::generate();
+        let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [3u8; 32];
 
         let mut grant = create_auth_grant(&keypair, &challenge).unwrap();

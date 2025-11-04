@@ -569,10 +569,10 @@ impl Transport for BleTransport {
                     "receive_response returning Response, total elapsed={:?}",
                     start.elapsed()
                 );
-                return Ok(ReceiveResult::Response(
-                    encrypted_response,
-                    "0.0.0.0:0".parse().unwrap(),
-                ));
+                let dummy_addr = "0.0.0.0:0".parse().unwrap_or_else(|_| {
+                    std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+                });
+                return Ok(ReceiveResult::Response(encrypted_response, dummy_addr));
             }
 
             // Sleep briefly before checking again
