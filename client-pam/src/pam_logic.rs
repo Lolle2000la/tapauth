@@ -140,17 +140,42 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 Ok(0) => continue,
                 Ok(_) => {
                     if let Some(rev) = fds[0].revents() {
+                        // Read data first if available (POLLIN can be set with POLLHUP)
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
                                     return map_pam_outcome(&resp, &username, &pam_conv)
                                 }
-                                Ok(None) => continue,
+                                Ok(None) => {
+                                    // No complete frame yet, check for errors
+                                    if rev.contains(PollFlags::POLLHUP)
+                                        || rev.contains(PollFlags::POLLERR)
+                                    {
+                                        tracing::error!(
+                                            "Daemon closed connection before sending response"
+                                        );
+                                        pam_conv.try_info(
+                                            "TapAuth: Connection lost, trying password...",
+                                        );
+                                        return pam_sys::PAM_IGNORE;
+                                    }
+                                    continue;
+                                }
                                 Err(e) => {
                                     tracing::error!("IPC read failed: {}", e);
-                                    break;
+                                    pam_conv.try_info(
+                                        "TapAuth: Communication error, trying password...",
+                                    );
+                                    return pam_sys::PAM_IGNORE;
                                 }
                             }
+                        } else if rev.contains(PollFlags::POLLHUP)
+                            || rev.contains(PollFlags::POLLERR)
+                        {
+                            // Hangup/error without any data available
+                            tracing::error!("Daemon closed connection or error detected");
+                            pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                            return pam_sys::PAM_IGNORE;
                         }
                     }
                 }
@@ -189,17 +214,42 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     Ok(0) => continue,
                     Ok(_) => {
                         if let Some(rev) = fds[0].revents() {
+                            // Read data first if available (POLLIN can be set with POLLHUP)
                             if rev.contains(PollFlags::POLLIN) {
                                 match ipc.try_read_response_nonblocking() {
                                     Ok(Some(resp)) => {
                                         return map_pam_outcome(&resp, &username, &pam_conv)
                                     }
-                                    Ok(None) => continue,
+                                    Ok(None) => {
+                                        // No complete frame yet, check for errors
+                                        if rev.contains(PollFlags::POLLHUP)
+                                            || rev.contains(PollFlags::POLLERR)
+                                        {
+                                            tracing::error!(
+                                                "Daemon closed connection before sending response"
+                                            );
+                                            pam_conv.try_info(
+                                                "TapAuth: Connection lost, trying password...",
+                                            );
+                                            return pam_sys::PAM_IGNORE;
+                                        }
+                                        continue;
+                                    }
                                     Err(e) => {
                                         tracing::error!("IPC read failed: {}", e);
-                                        break;
+                                        pam_conv.try_info(
+                                            "TapAuth: Communication error, trying password...",
+                                        );
+                                        return pam_sys::PAM_IGNORE;
                                     }
                                 }
+                            } else if rev.contains(PollFlags::POLLHUP)
+                                || rev.contains(PollFlags::POLLERR)
+                            {
+                                // Hangup/error without any data available
+                                tracing::error!("Daemon closed connection or error detected");
+                                pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                                return pam_sys::PAM_IGNORE;
                             }
                         }
                     }
@@ -248,15 +298,35 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             Ok(_) => {
                 // IPC
                 if let Some(rev) = fds[0].revents() {
+                    // Read data first if available (POLLIN can be set with POLLHUP)
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
-                            Ok(None) => {}
+                            Ok(None) => {
+                                // No complete frame yet, check for errors
+                                if rev.contains(PollFlags::POLLHUP)
+                                    || rev.contains(PollFlags::POLLERR)
+                                {
+                                    tracing::error!(
+                                        "Daemon closed connection before sending response"
+                                    );
+                                    pam_conv
+                                        .try_info("TapAuth: Connection lost, trying password...");
+                                    return pam_sys::PAM_IGNORE;
+                                }
+                            }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {}", e);
-                                break;
+                                pam_conv
+                                    .try_info("TapAuth: Communication error, trying password...");
+                                return pam_sys::PAM_IGNORE;
                             }
                         }
+                    } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
+                        // Hangup/error without any data available
+                        tracing::error!("Daemon closed connection or error detected");
+                        pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                        return pam_sys::PAM_IGNORE;
                     }
                 }
                 // TTY - peek for Enter; don't consume other keys
