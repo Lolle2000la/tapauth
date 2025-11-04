@@ -1,5 +1,5 @@
 //! TapAuth PAM module.
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //!
 //! Linux PAM authentication module that enables phone-tap-based authentication.
 //! Integrates with the system authentication stack to provide passwordless login
@@ -75,6 +75,7 @@ pub extern "C" fn pam_sm_setcred(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

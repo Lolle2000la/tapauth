@@ -173,7 +173,8 @@ impl IpcClient {
 
         // Encode message to get length first
         let msg_bytes = msg.encode_to_vec();
-        let msg_len = msg_bytes.len() as u32;
+        let msg_len =
+            u32::try_from(msg_bytes.len()).map_err(|_| IpcError::FrameTooLarge(u32::MAX))?;
 
         // Write length prefix (u32 BE)
         buf.put_u32(msg_len);
@@ -201,6 +202,7 @@ impl IpcClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]
@@ -217,49 +219,38 @@ mod tests {
 
     #[test]
     fn frame_too_large_blocking() {
-        let (mut a, b) = match UnixStream::pair() {
-            Ok(v) => v,
-            Err(e) => panic!("pair failed: {e}"),
-        };
+        let (mut a, b) = UnixStream::pair().expect("failed to create socket pair");
         let mut cli = client_from_stream(b);
 
         // Write BE length > 1 MiB; no payload needed as recv_response rejects on len alone
         let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
         let len_be = too_big.to_be_bytes();
-        if let Err(e) = a.write_all(&len_be) {
-            panic!("write_all failed: {e}");
-        }
+        a.write_all(&len_be).expect("failed to write test data");
 
         let err = cli.recv_response().unwrap_err();
         match err {
             IpcError::FrameTooLarge(n) => assert!(n as usize > 1024 * 1024),
-            other => panic!("unexpected error: {other:?}"),
+            other => panic!("unexpected error type: {other:?}"),
         }
     }
 
     #[test]
     fn frame_too_large_nonblocking() {
-        let (mut a, b) = match UnixStream::pair() {
-            Ok(v) => v,
-            Err(e) => panic!("pair failed: {e}"),
-        };
+        let (mut a, b) = UnixStream::pair().expect("failed to create socket pair");
         // Set client nonblocking and wrap
-        if let Err(e) = b.set_nonblocking(true) {
-            panic!("set_nonblocking failed: {e}");
-        }
+        b.set_nonblocking(true).expect("failed to set nonblocking");
         let mut cli = client_from_stream(b);
 
         let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
-        if let Err(e) = a.write_all(&too_big.to_be_bytes()) {
-            panic!("write_all failed: {e}");
-        }
+        a.write_all(&too_big.to_be_bytes())
+            .expect("failed to write test data");
 
         let err = cli
             .try_read_response_nonblocking()
             .expect_err("expected FrameTooLarge");
         match err {
             IpcError::FrameTooLarge(n) => assert!(n as usize > 1024 * 1024),
-            other => panic!("unexpected error: {other:?}"),
+            other => panic!("unexpected error type: {other:?}"),
         }
     }
 }

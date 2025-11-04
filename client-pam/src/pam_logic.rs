@@ -19,7 +19,7 @@
 //! for skip signals in terminal contexts.
 
 use crate::ipc_client::IpcClient;
-use crate::pam_sys;
+use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
 use std::io::Read;
@@ -93,7 +93,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
     let mut rid_bytes = [0u8; 16];
-    getrandom::fill(&mut rid_bytes).ok();
+    if let Err(e) = getrandom::fill(&mut rid_bytes) {
+        tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
+        return PAM_IGNORE;
+    }
     let request_id = hex::encode(rid_bytes);
     // Session timeout used for both daemon and local bound
     let timeout_secs = {
@@ -329,6 +332,7 @@ fn map_pam_outcome(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
