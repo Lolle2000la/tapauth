@@ -97,8 +97,7 @@ impl AuthSession {
     pub fn new(state: Arc<DaemonState>, username: String) -> Result<Self, std::io::Error> {
         let mut challenge = [0u8; 32];
         getrandom::fill(&mut challenge).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("random generation failed: {}", e),
             )
         })?;
