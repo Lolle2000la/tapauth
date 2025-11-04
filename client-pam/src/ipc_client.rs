@@ -169,17 +169,16 @@ impl IpcClient {
     }
 
     fn send_message<M: Message>(&mut self, msg: &M) -> Result<(), IpcError> {
-        let mut buf = BytesMut::with_capacity(256);
+        let encoded_len = msg.encoded_len();
+        let msg_len = u32::try_from(encoded_len).map_err(|_| IpcError::FrameTooLarge(u32::MAX))?;
 
-        // Encode message to get length first
-        let msg_bytes = msg.encode_to_vec();
-        let msg_len =
-            u32::try_from(msg_bytes.len()).map_err(|_| IpcError::FrameTooLarge(u32::MAX))?;
+        // 4 bytes for length prefix + encoded message
+        let mut buf = BytesMut::with_capacity(4 + encoded_len);
 
-        // Write length prefix (u32 BE)
+        // Write length prefix
         buf.put_u32(msg_len);
-        // Write message
-        buf.extend_from_slice(&msg_bytes);
+
+        msg.encode(&mut buf)?;
 
         self.stream.write_all(&buf)?;
         Ok(())
