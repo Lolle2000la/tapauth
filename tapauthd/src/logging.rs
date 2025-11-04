@@ -1,7 +1,7 @@
 //! Logging configuration for tapauthd
 //!
 //! Logs are written to both stdout (for journalctl) and a rotating file.
-//! 
+//!
 //! Environment variables:
 //! - `TAPAUTH_LOG_LEVEL`: Controls stdout log level (default: info, can be overridden to debug, trace, etc.)
 //! - `TAPAUTH_FILE_LOG_LEVEL`: Controls file log level (default: info)
@@ -64,5 +64,8 @@ pub fn init_logging() {
     // Keep the guard alive for the lifetime of the program
     std::mem::forget(_guard);
 
-    tracing::info!("Logging initialized: stdout + file at {}/tapauthd.log", log_dir.display());
+    tracing::info!(
+        "Logging initialized: stdout + file at {}/tapauthd.log",
+        log_dir.display()
+    );
 }

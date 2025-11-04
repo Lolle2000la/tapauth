@@ -1,7 +1,7 @@
 //! Logging configuration for client-pam
 //!
 //! Logs are written to both stderr and a rotating file.
-//! 
+//!
 //! Environment variables:
 //! - `TAPAUTH_LOG_LEVEL`: Controls stderr log level (default: warn, only warnings and errors shown)
 //! - `TAPAUTH_FILE_LOG_LEVEL`: Controls file log level (default: info)
@@ -37,8 +37,7 @@ pub fn init_logging() {
     } else {
         // Running as regular user - use user-specific directory
         if let Ok(home) = std::env::var("HOME") {
-            let dir = std::path::PathBuf::from(home)
-                .join(".local/state/tapauth");
+            let dir = std::path::PathBuf::from(home).join(".local/state/tapauth");
             if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
                 dir
             } else {
@@ -93,5 +92,8 @@ pub fn init_logging() {
     // Keep the guard alive for the lifetime of the program
     std::mem::forget(_guard);
 
-    tracing::info!("PAM logging initialized: stderr (warn+) + file (info+) at {}/tapauth-pam.log", log_dir.display());
+    tracing::info!(
+        "PAM logging initialized: stderr (warn+) + file (info+) at {}/tapauth-pam.log",
+        log_dir.display()
+    );
 }
