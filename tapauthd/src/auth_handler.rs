@@ -601,28 +601,52 @@ impl AuthSession {
                                     tracing::warn!("Grant verification failed; continuing to wait for valid response");
                                 }
                             }
-                            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
-                                tracing::warn!(
-                                    "Authentication explicitly denied by server: {}",
-                                    server_addr
-                                );
+                            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(
+                                denial,
+                            )) => {
+                                // Verify denial signature against any paired server key
+                                let paired_servers = config_manager.load_paired_servers()?;
+                                let mut valid = false;
+                                for (_id, server) in paired_servers.iter() {
+                                    if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
+                                        if pub_key_bytes.len() == 32 {
+                                            let mut pub_key = [0u8; 32];
+                                            pub_key.copy_from_slice(&pub_key_bytes);
+                                            if verify_auth_denial(&denial, &pub_key).is_ok() {
+                                                valid = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if valid {
+                                    tracing::warn!(
+                                        "Authentication explicitly denied by server: {}",
+                                        server_addr
+                                    );
 
-                                // Send confirmation even for denial in background and finalize
-                                let confirmation = create_grant_confirmation(keypair, challenge)?;
-                                let wrapper = wrap_grant_confirmation(confirmation);
-                                let conf_packet =
-                                    create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
+                                    // Send confirmation even for denial in background and finalize
+                                    let confirmation =
+                                        create_grant_confirmation(keypair, challenge)?;
+                                    let wrapper = wrap_grant_confirmation(confirmation);
+                                    let conf_packet =
+                                        create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
 
-                                let t = transport.clone();
-                                tokio::spawn(async move {
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    tokio::time::sleep(Duration::from_millis(150)).await;
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    tokio::time::sleep(Duration::from_millis(150)).await;
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    let _ = t.finalize().await;
-                                });
-                                return Err(AuthHandlerError::ExplicitDenial);
+                                    let t = transport.clone();
+                                    tokio::spawn(async move {
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        let _ = t.send_confirmation(&conf_packet).await;
+                                        let _ = t.finalize().await;
+                                    });
+                                    return Err(AuthHandlerError::ExplicitDenial);
+                                } else {
+                                    tracing::warn!(
+                                        "Denial verification failed; continuing to wait for valid response"
+                                    );
+                                }
                             }
                             _ => {
                                 tracing::debug!(
