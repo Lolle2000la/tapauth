@@ -16,6 +16,19 @@ fn main() -> iced::Result {
     // Store the original username in environment for app to use
     std::env::set_var("TAPAUTH_ORIGINAL_USER", &original_user);
 
+    // Validate system prerequisites before continuing
+    if let Err(err) = utils::system_check::validate_tapauthd_user() {
+        // Show a native GUI error dialog since users typically launch from desktop
+        use native_dialog::{DialogBuilder, MessageLevel};
+        let _ = DialogBuilder::message()
+            .set_title(&err.title)
+            .set_text(&err.message)
+            .set_level(MessageLevel::Error)
+            .alert()
+            .show();
+        std::process::exit(1);
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_target(false)
