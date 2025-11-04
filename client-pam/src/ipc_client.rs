@@ -32,13 +32,19 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// Connect to tapauthd socket.
+    /// Connect to tapauthd socket with a timeout for blocking operations.
+    /// Used for send_cancel which needs to be resilient to unresponsive daemons.
     pub fn connect() -> Result<Self, IpcError> {
         let sock_path =
             std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
-        // Note: UnixStream::connect is blocking, but typically fast for local sockets
         let stream = UnixStream::connect(&sock_path)?;
+
+        // Set timeouts for blocking operations (send_cancel)
+        // This prevents hanging if daemon becomes unresponsive
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
         Ok(Self {
             stream,
             read_buf: BytesMut::with_capacity(4096),
@@ -46,11 +52,22 @@ impl IpcClient {
         })
     }
 
-    /// Connect and set nonblocking immediately (for poll/select driven loops)
+    /// Connect and set nonblocking immediately (for poll/select driven loops).
+    /// Does NOT set read/write timeouts since poll() handles all timing.
     pub fn connect_nonblocking() -> Result<Self, IpcError> {
-        let mut cli = Self::connect()?;
-        cli.set_nonblocking(true)?;
-        Ok(cli)
+        let sock_path =
+            std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+
+        // Connect and immediately set nonblocking for poll-based I/O
+        // No timeouts - poll() in pam_logic.rs handles all timing
+        let stream = UnixStream::connect(&sock_path)?;
+        stream.set_nonblocking(true)?;
+
+        Ok(Self {
+            stream,
+            read_buf: BytesMut::with_capacity(4096),
+            expected_total: None,
+        })
     }
 
     /// Send a cancel request to the daemon.
