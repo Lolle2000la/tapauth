@@ -40,6 +40,7 @@ CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
 CONFIG_DIR="/var/lib/tapauth"
 KEY_PATH="$CONFIG_DIR/client_key"
+DAEMON_PATH="/usr/bin/tapauthd"
 SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
 SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
 SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
@@ -234,7 +235,7 @@ parse_args() {
                 CONFIGURE_PAM_POLKIT=true
                 CONFIGURE_PAM_SYSTEM_AUTH=true
                 CONFIGURE_PAM_GDM=true
-                CONFIGURE_PAM_SDDM=true
+                CONFIGURE_PAM_SDDM=false
                 CONFIGURE_PAM_LIGHTDM=true
                 USE_BLE=true
                 shift
@@ -605,6 +606,7 @@ create_system_users() {
         fi
         
         echo "  • mkdir -p $CONFIG_DIR && chown -R tapauthd:tapauthd $CONFIG_DIR && chmod 700 $CONFIG_DIR"
+        echo "  • mkdir -p /var/log/tapauth && chown tapauthd:tapauthd /var/log/tapauth && chmod 755 /var/log/tapauth"
         return
     fi
 
@@ -648,6 +650,15 @@ create_system_users() {
     mkdir -p "$CONFIG_DIR"
     chown -R tapauthd:tapauthd "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
+    
+    # Create log directory for daemon
+    local log_dir="/var/log/tapauth"
+    if [[ ! -d "$log_dir" ]]; then
+        print_info "Creating log directory $log_dir"
+        mkdir -p "$log_dir"
+        chown tapauthd:tapauthd "$log_dir"
+        chmod 755 "$log_dir"
+    fi
 }
 
 # Install and enable systemd socket/service units for tapauthd
@@ -670,6 +681,12 @@ install_systemd_units() {
 
     install -m 644 "$SOCKET_UNIT_SOURCE" "$SOCKET_UNIT_DEST"
     install -m 644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_DEST"
+    
+    # Restore SELinux contexts if available
+    if command -v restorecon &> /dev/null; then
+        restorecon "$SOCKET_UNIT_DEST" "$SERVICE_UNIT_DEST" || true
+    fi
+    
     systemctl daemon-reload
     systemctl enable --now tapauthd.socket
     print_success "Systemd units installed and socket activated"
@@ -697,6 +714,11 @@ install_daemon() {
 
     print_info "Installing daemon to $daemon_dest"
     install -m 755 "$daemon_src" "$daemon_dest"
+    
+    # Restore SELinux context if available
+    if command -v restorecon &> /dev/null; then
+        restorecon "$daemon_dest" || true
+    fi
 }
 
 # Build components
@@ -814,6 +836,11 @@ install_pam() {
     
     cp target/release/libclient_pam.so "$PAM_SO_PATH"
     chmod 644 "$PAM_SO_PATH"
+    
+    # Restore SELinux context if available
+    if command -v restorecon &> /dev/null; then
+        restorecon "$PAM_SO_PATH" || true
+    fi
     
     # Create config directory and set permissions
     print_info "Creating configuration directory $CONFIG_DIR"
@@ -1198,6 +1225,11 @@ install_config_gui() {
     cp target/release/tapauth-config "$CONFIG_GUI_PATH"
     chmod 755 "$CONFIG_GUI_PATH"
     
+    # Restore SELinux context if available
+    if command -v restorecon &> /dev/null; then
+        restorecon "$CONFIG_GUI_PATH" || true
+    fi
+    
     # Install desktop entry
     if [[ -d /usr/share/applications ]]; then
         print_info "Installing desktop entry"
@@ -1374,8 +1406,13 @@ main() {
     if command -v restorecon &> /dev/null; then
         print_info "Restoring SELinux contexts"
         restorecon -RF /var/lib/tapauth || true
+        restorecon -RF /var/log/tapauth || true
         restorecon -RF /run/tapauthd || true
         restorecon /run/tapauthd/tapauthd.sock || true
+        # Also restore contexts for all installed binaries
+        restorecon "$DAEMON_PATH" || true
+        restorecon "$PAM_SO_PATH" || true
+        restorecon "$CONFIG_GUI_PATH" || true
     fi
     
     if [[ "$DRY_RUN" == true ]]; then

@@ -552,6 +552,13 @@ remove_user_data() {
         print_info "No user data found"
     fi
     
+    # Remove log directory
+    local log_dir="/var/log/tapauth"
+    if [[ -d "$log_dir" ]]; then
+        print_info "Removing log directory $log_dir"
+        rm -rf "$log_dir"
+    fi
+    
     # Also check for user-specific configs in home directories
     local user_configs_found=false
     for home_dir in /home/*; do
