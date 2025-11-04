@@ -212,281 +212,348 @@ impl AuthSession {
         &mut self,
         packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
-        use tokio::select;
-
-        // Import transport implementations (we'll create them on-demand)
-        use crate::transport::{BleTransport, UdpTransport};
-
         let temporal_id = generate_current_temporal_identifier_ble(&self.state.csk)?;
         let timeout = get_session_timeout();
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
-        // Use global UDP socket
+        // Initialize transports
+        let (udp_transport, ble_transport) = self.initialize_transports(temporal_id, timeout).await?;
+
+        // Setup cancellation mechanism
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.register_cancel_handler(cancel_tx);
+
+        // Pre-compute cancel packet
+        let cancel_packet = self.create_cancel_packet()?;
+
+        // Spawn authentication tasks
+        let (ble_handle, udp_handle) = self.spawn_auth_tasks(
+            &ble_transport,
+            &udp_transport,
+            packet,
+        );
+
+        let ble_abort = ble_handle.abort_handle();
+        let udp_abort = udp_handle.abort_handle();
+
+        // Wait for first success, both failures, or cancellation
+        self.await_auth_result(
+            ble_handle,
+            udp_handle,
+            cancel_rx,
+            ble_abort,
+            udp_abort,
+            &ble_transport,
+            &udp_transport,
+            &cancel_packet,
+        ).await
+    }
+
+    #[cfg(feature = "ble")]
+    async fn initialize_transports(
+        &self,
+        temporal_id: [u8; 10],
+        timeout: Duration,
+    ) -> Result<(Arc<crate::transport::UdpTransport>, Option<Arc<crate::transport::BleTransport>>), AuthHandlerError> {
+        use crate::transport::{BleTransport, UdpTransport};
+
         let config = self.state.config_manager.load_config()?;
-        let udp_transport =
-            UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
+        let udp_transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
 
         let config_manager = Arc::new(ClientConfigManager::new());
         let keypair = Arc::new(self.state.keypair.clone());
         let challenge = self.challenge;
 
-        // Try to initialize BLE; if it fails, fall back to UDP-only
-        let ble_attempt =
-            BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await;
-
-        let udp_transport_shared = Arc::new(udp_transport);
-        let ble_transport_shared: Option<Arc<BleTransport>> = match ble_attempt {
+        let ble_transport = match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await {
             Ok(ble) => Some(Arc::new(ble)),
             Err(e) => {
-                tracing::warn!(
-                    "BLE initialization failed ({}). Falling back to UDP-only.",
-                    e
-                );
+                tracing::warn!("BLE initialization failed ({}). Falling back to UDP-only.", e);
                 None
             }
         };
 
-        // Create cancel channel
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        Ok((Arc::new(udp_transport), ble_transport))
+    }
 
-        // Register cancel sender if we have a request_id
+    #[cfg(feature = "ble")]
+    fn register_cancel_handler(&mut self, cancel_tx: oneshot::Sender<()>) {
         if let (Some(reg), Some(id)) = (self.cancel_registry.as_ref(), self.request_id.as_ref()) {
-            reg.lock().await.insert(id.clone(), cancel_tx);
+            tokio::spawn({
+                let reg = reg.clone();
+                let id = id.clone();
+                async move {
+                    reg.lock().await.insert(id, cancel_tx);
+                }
+            });
         }
+    }
 
-        // Pre-compute cancel packet to dismiss notifications
-        let cancel_packet = {
-            let msg = create_auth_cancel(&self.challenge)?;
-            let mut wrapper = wrap_auth_cancel(msg);
-            sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
-            create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?
-        };
+    #[cfg(feature = "ble")]
+    fn create_cancel_packet(&self) -> Result<EncryptedPacket, AuthHandlerError> {
+        let msg = create_auth_cancel(&self.challenge)?;
+        let mut wrapper = wrap_auth_cancel(msg);
+        sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
+        Ok(create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?)
+    }
 
-        // Spawn BLE task if available
-        let mut ble_handle = if let Some(ble_transport_task) = ble_transport_shared.clone() {
-            let packet_ble = packet.clone();
+    #[cfg(feature = "ble")]
+    fn spawn_auth_tasks(
+        &self,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        packet: &EncryptedPacket,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+    ) {
+        let ble_handle = if let Some(ble) = ble_transport.clone() {
+            let packet = packet.clone();
             let csk = self.state.csk.clone();
-            let keypair_clone = self.state.keypair.clone();
+            let keypair = self.state.keypair.clone();
             let challenge = self.challenge;
             let cfg = Arc::new(ClientConfigManager::new());
             tokio::spawn(async move {
-                Self::authenticate_with_transport(
-                    ble_transport_task,
-                    &packet_ble,
-                    &csk,
-                    &keypair_clone,
-                    &challenge,
-                    cfg,
-                )
-                .await
+                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, cfg).await
             })
         } else {
             tokio::spawn(async { Err(AuthHandlerError::BleError("BLE disabled".into())) })
         };
 
-        // Spawn UDP task
-        let packet_udp = packet.clone();
-        let csk_udp = self.state.csk.clone();
-        let keypair_udp = self.state.keypair.clone();
-        let challenge_udp = self.challenge;
-        let cfg = Arc::new(ClientConfigManager::new());
-        let udp_transport_for_task = udp_transport_shared.clone();
-        let mut udp_handle = tokio::spawn(async move {
-            Self::authenticate_with_transport(
-                udp_transport_for_task,
-                &packet_udp,
-                &csk_udp,
-                &keypair_udp,
-                &challenge_udp,
-                cfg,
-            )
-            .await
-        });
-        let ble_abort = ble_handle.abort_handle();
-        let udp_abort = udp_handle.abort_handle();
+        let udp_handle = {
+            let packet = packet.clone();
+            let csk = self.state.csk.clone();
+            let keypair = self.state.keypair.clone();
+            let challenge = self.challenge;
+            let cfg = Arc::new(ClientConfigManager::new());
+            let udp = udp_transport.clone();
+            tokio::spawn(async move {
+                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, cfg).await
+            })
+        };
 
-        // Wait for first success or both failures or cancellation
+        (ble_handle, udp_handle)
+    }
+
+    #[cfg(feature = "ble")]
+    async fn await_auth_result(
+        &self,
+        mut ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        mut udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        mut cancel_rx: oneshot::Receiver<()>,
+        ble_abort: tokio::task::AbortHandle,
+        udp_abort: tokio::task::AbortHandle,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        use tokio::select;
+
         select! {
             result = &mut ble_handle => {
-                match result {
-                    Ok(Ok(())) => {
-                        tracing::info!("BLE authentication succeeded");
-                        // Notify other devices via cancel and finalize resources (non-blocking for BLE)
-                        if let Some(ble_shared) = &ble_transport_shared {
-                            let ble = ble_shared.clone();
-                            let cancel_clone = cancel_packet.clone();
-                            tokio::spawn(async move {
-                                let _ = ble.send_cancel(&cancel_clone).await;
-                                let _ = ble.finalize().await;
-                            });
-                        }
-                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                        udp_abort.abort();
-                        Ok(())
-                    }
-                    Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                        tracing::warn!("BLE authentication explicitly denied by user");
-                        // Broadcast cancellation to other devices
-                        udp_abort.abort();
-                        if let Some(ble_shared) = &ble_transport_shared {
-                            let ble = ble_shared.clone();
-                            tokio::spawn(async move { let _ = ble.finalize().await; });
-                        }
-
-                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-
-                        Err(AuthHandlerError::ExplicitDenial)
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!("BLE authentication failed: {}", e);
-                        // Wait for UDP
-                        match udp_handle.await {
-                            Ok(Ok(())) => {
-                                tracing::info!("UDP authentication succeeded");
-                                if let Some(ble_shared) = &ble_transport_shared {
-                                    let ble = ble_shared.clone();
-                                    let cancel_clone = cancel_packet.clone();
-                                    tokio::spawn(async move {
-                                        let _ = ble.send_cancel(&cancel_clone).await;
-                                        let _ = ble.finalize().await;
-                                    });
-                                }
-                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                                Ok(())
-                            }
-                            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                                // UDP also got explicit denial, broadcast cancellation
-                                if let Some(ble_shared) = &ble_transport_shared {
-                                    let ble = ble_shared.clone();
-                                    tokio::spawn(async move { let _ = ble.finalize().await; });
-                                }
-
-                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-
-                                Err(AuthHandlerError::ExplicitDenial)
-                            }
-                            Ok(Err(e)) => {
-                                tracing::error!("UDP authentication also failed: {}", e);
-                                Err(AuthHandlerError::Denied)
-                            }
-                            Err(_) => Err(AuthHandlerError::Denied),
-                        }
-                    }
-                    Err(_) => {
-                        // Task panicked
-                        tracing::error!("BLE task panicked");
-                        match udp_handle.await {
-                            Ok(Ok(())) => Ok(()),
-                            _ => Err(AuthHandlerError::Denied),
-                        }
-                    }
-                }
+                self.handle_ble_result(result, udp_handle, udp_abort, ble_transport, udp_transport, cancel_packet).await
             }
             result = &mut udp_handle => {
-                match result {
-                    Ok(Ok(())) => {
-                        tracing::info!("UDP authentication succeeded");
-                        ble_abort.abort();
-                        // Notify via cancel and finalize BLE if initialized (non-blocking)
-                        if let Some(ble_shared) = &ble_transport_shared {
-                            let ble = ble_shared.clone();
-                            let cancel_clone = cancel_packet.clone();
-                            tokio::spawn(async move {
-                                let _ = ble.send_cancel(&cancel_clone).await;
-                                let _ = ble.finalize().await;
-                            });
-                        }
-                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                        Ok(())
-                    }
-                    Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                        tracing::warn!("UDP authentication explicitly denied by user");
-                        // Broadcast cancellation to other devices
-                        ble_abort.abort();
-                        if let Some(ble_shared) = &ble_transport_shared {
-                            let ble = ble_shared.clone();
-                            tokio::spawn(async move { let _ = ble.finalize().await; });
-                        }
-
-                        let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-
-                        Err(AuthHandlerError::ExplicitDenial)
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!("UDP authentication failed: {}", e);
-                        // Wait for BLE
-                        match ble_handle.await {
-                            Ok(Ok(())) => {
-                                tracing::info!("BLE authentication succeeded");
-                                if let Some(ble_shared) = &ble_transport_shared {
-                                    let ble = ble_shared.clone();
-                                    let cancel_clone = cancel_packet.clone();
-                                    tokio::spawn(async move {
-                                        let _ = ble.send_cancel(&cancel_clone).await;
-                                        let _ = ble.finalize().await;
-                                    });
-                                }
-                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-                                Ok(())
-                            }
-                            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                                // BLE also got explicit denial, broadcast cancellation
-                                if let Some(ble_shared) = &ble_transport_shared {
-                                    let ble = ble_shared.clone();
-                                    tokio::spawn(async move { let _ = ble.finalize().await; });
-                                }
-
-                                let _ = udp_transport_shared.send_cancel(&cancel_packet).await;
-
-                                Err(AuthHandlerError::ExplicitDenial)
-                            }
-                            Ok(Err(e)) => {
-                                tracing::error!("BLE authentication also failed: {}", e);
-                                Err(AuthHandlerError::Denied)
-                            }
-                            Err(_) => Err(AuthHandlerError::Denied),
-                        }
-                    }
-                    Err(_) => {
-                        tracing::error!("UDP task panicked");
-                        match ble_handle.await {
-                            Ok(Ok(())) => Ok(()),
-                            _ => Err(AuthHandlerError::Denied),
-                        }
-                    }
-                }
+                self.handle_udp_result(result, ble_handle, ble_abort, ble_transport, udp_transport, cancel_packet).await
             }
             _ = &mut cancel_rx => {
-                let rid = self.request_id.as_deref().unwrap_or("-");
-                tracing::info!("Authentication cancelled (user={}, id={})", self.username, rid);
-
-                // Broadcast cancel using UDP transport
-                tracing::info!("Broadcasting AuthenticationCancel over UDP");
-
-                if let Err(e) = udp_transport_shared.send_cancel(&cancel_packet).await {
-                    tracing::warn!("UDP cancel broadcast failed: {}", e);
-                } else {
-                    tracing::debug!("UDP cancel broadcast sent");
-                }
-
-                // Disconnect BLE clients explicitly (non-blocking)
-                if let Some(ble_shared) = &ble_transport_shared {
-                    tracing::debug!("Disconnecting BLE clients (background)");
-                    let ble = ble_shared.clone();
-                    tokio::spawn(async move { let _ = ble.finalize().await; });
-                }
-
-                // Give network stack time to transmit packets
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                // Now abort the tasks
-                ble_abort.abort();
-                udp_abort.abort();
-
-                Err(AuthHandlerError::Denied)
+                self.handle_cancellation(ble_abort, udp_abort, ble_transport, udp_transport, cancel_packet).await
             }
         }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn handle_ble_result(
+        &self,
+        result: Result<Result<(), AuthHandlerError>, tokio::task::JoinError>,
+        udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        udp_abort: tokio::task::AbortHandle,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        match result {
+            Ok(Ok(())) => {
+                tracing::info!("BLE authentication succeeded");
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                udp_abort.abort();
+                Ok(())
+            }
+            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                tracing::warn!("BLE authentication explicitly denied by user");
+                udp_abort.abort();
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                Err(AuthHandlerError::ExplicitDenial)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("BLE authentication failed: {}", e);
+                self.handle_udp_fallback(udp_handle, ble_transport, udp_transport, cancel_packet).await
+            }
+            Err(_) => {
+                tracing::error!("BLE task panicked");
+                match udp_handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(AuthHandlerError::Denied),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn handle_udp_result(
+        &self,
+        result: Result<Result<(), AuthHandlerError>, tokio::task::JoinError>,
+        ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        ble_abort: tokio::task::AbortHandle,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        match result {
+            Ok(Ok(())) => {
+                tracing::info!("UDP authentication succeeded");
+                ble_abort.abort();
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                Ok(())
+            }
+            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                tracing::warn!("UDP authentication explicitly denied by user");
+                ble_abort.abort();
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                Err(AuthHandlerError::ExplicitDenial)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("UDP authentication failed: {}", e);
+                self.handle_ble_fallback(ble_handle, ble_transport, udp_transport, cancel_packet).await
+            }
+            Err(_) => {
+                tracing::error!("UDP task panicked");
+                match ble_handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(AuthHandlerError::Denied),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn handle_udp_fallback(
+        &self,
+        udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        match udp_handle.await {
+            Ok(Ok(())) => {
+                tracing::info!("UDP authentication succeeded");
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                Ok(())
+            }
+            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                Err(AuthHandlerError::ExplicitDenial)
+            }
+            Ok(Err(e)) => {
+                tracing::error!("UDP authentication also failed: {}", e);
+                Err(AuthHandlerError::Denied)
+            }
+            Err(_) => Err(AuthHandlerError::Denied),
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn handle_ble_fallback(
+        &self,
+        ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        match ble_handle.await {
+            Ok(Ok(())) => {
+                tracing::info!("BLE authentication succeeded");
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                Ok(())
+            }
+            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                Err(AuthHandlerError::ExplicitDenial)
+            }
+            Ok(Err(e)) => {
+                tracing::error!("BLE authentication also failed: {}", e);
+                Err(AuthHandlerError::Denied)
+            }
+            Err(_) => Err(AuthHandlerError::Denied),
+        }
+    }
+
+    #[cfg(feature = "ble")]
+    async fn broadcast_cancel_on_success(
+        &self,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) {
+        if let Some(ble) = ble_transport {
+            let ble = ble.clone();
+            let cancel = cancel_packet.clone();
+            tokio::spawn(async move {
+                let _ = ble.send_cancel(&cancel).await;
+                let _ = ble.finalize().await;
+            });
+        }
+        let _ = udp_transport.send_cancel(cancel_packet).await;
+    }
+
+    #[cfg(feature = "ble")]
+    async fn cleanup_transports(
+        &self,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) {
+        if let Some(ble) = ble_transport {
+            let ble = ble.clone();
+            tokio::spawn(async move { let _ = ble.finalize().await; });
+        }
+        let _ = udp_transport.send_cancel(cancel_packet).await;
+    }
+
+    #[cfg(feature = "ble")]
+    async fn handle_cancellation(
+        &self,
+        ble_abort: tokio::task::AbortHandle,
+        udp_abort: tokio::task::AbortHandle,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) -> Result<(), AuthHandlerError> {
+        let rid = self.request_id.as_deref().unwrap_or("-");
+        tracing::info!("Authentication cancelled (user={}, id={})", self.username, rid);
+
+        tracing::info!("Broadcasting AuthenticationCancel over UDP");
+        if let Err(e) = udp_transport.send_cancel(cancel_packet).await {
+            tracing::warn!("UDP cancel broadcast failed: {}", e);
+        } else {
+            tracing::debug!("UDP cancel broadcast sent");
+        }
+
+        // Disconnect BLE clients (non-blocking)
+        if let Some(ble) = ble_transport {
+            tracing::debug!("Disconnecting BLE clients (background)");
+            let ble = ble.clone();
+            tokio::spawn(async move { let _ = ble.finalize().await; });
+        }
+
+        // Give network stack time to transmit packets
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Abort the tasks
+        ble_abort.abort();
+        udp_abort.abort();
+
+        Err(AuthHandlerError::Denied)
     }
 
     #[cfg(not(feature = "ble"))]
@@ -526,145 +593,204 @@ impl AuthSession {
 
         loop {
             if start.elapsed() >= timeout {
-                // Ensure transport is finalized before returning timeout
                 let _ = transport.finalize().await;
                 return Err(AuthHandlerError::Timeout);
             }
 
-            // Send request
+            // Send authentication request
             if let Err(e) = transport.send_request(packet).await {
                 let _ = transport.finalize().await;
                 return Err(e);
             }
 
-            // Wait for response with retry interval
+            // Wait for response
             let retry_interval = shared::network::get_client_retry_interval(attempt);
-
-            loop {
-                match transport.receive_response(retry_interval).await {
-                    Err(e) => {
-                        let _ = transport.finalize().await;
-                        return Err(e);
-                    }
-                    Ok(ReceiveResult::Response(response_packet, server_addr)) => {
-                        // Decrypt the packet
-                        let wrapper =
-                            decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
-
-                        tracing::debug!("Received message from {}", server_addr);
-
-                        // Verify wrapper signature against any paired server key
-                        let paired_servers = config_manager.load_paired_servers()?;
-                        let mut signature_valid = false;
-                        for (_id, server) in paired_servers.iter() {
-                            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
-                                if pub_key_bytes.len() == 32 {
-                                    let mut pub_key = [0u8; 32];
-                                    pub_key.copy_from_slice(&pub_key_bytes);
-                                    if verify_wrapper_signature(&wrapper, &pub_key).is_ok() {
-                                        signature_valid = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if !signature_valid {
-                            tracing::warn!(
-                                "Message signature verification failed from {}; continuing to wait for valid response",
-                                server_addr
-                            );
+            match Self::wait_for_response(&transport, retry_interval, csk, &config_manager).await {
+                Ok(Some((wrapper, server_addr))) => {
+                    // Process the authenticated response
+                    match Self::process_auth_response(&wrapper, &transport, challenge, keypair, csk, &config_manager, server_addr).await {
+                        Ok(result) => return result,
+                        Err(ResponseError::InvalidMessage) => {
+                            // Continue waiting for valid response
                             continue;
                         }
-
-                        // Now check message type and handle appropriately
-                        match &wrapper.payload {
-                            Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(
-                                _grant,
-                            )) => {
-                                // For grants, also verify the signed_challenge
-                                let mut grant_valid = false;
-                                for (_id, server) in paired_servers.iter() {
-                                    if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
-                                        if pub_key_bytes.len() == 32 {
-                                            let mut pub_key = [0u8; 32];
-                                            pub_key.copy_from_slice(&pub_key_bytes);
-                                            if verify_auth_grant(&wrapper, challenge, &pub_key)
-                                                .is_ok()
-                                            {
-                                                grant_valid = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if grant_valid {
-                                    tracing::info!(
-                                        "Authentication granted by server: {}",
-                                        server_addr
-                                    );
-                                    // Send confirmation in background and finalize without blocking PAM
-                                    let confirmation = create_grant_confirmation(challenge)?;
-                                    let mut conf_wrapper = wrap_grant_confirmation(confirmation);
-                                    sign_wrapper_message(&mut conf_wrapper, keypair)?;
-                                    let conf_packet =
-                                        create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper)?;
-
-                                    let t = transport.clone();
-                                    tokio::spawn(async move {
-                                        // Best-effort: up to 3 sends within ~450ms total
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        tokio::time::sleep(Duration::from_millis(150)).await;
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        tokio::time::sleep(Duration::from_millis(150)).await;
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        let _ = t.finalize().await;
-                                    });
-                                    return Ok(());
-                                } else {
-                                    tracing::warn!("Grant challenge verification failed; continuing to wait for valid response");
-                                }
-                            }
-                            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(
-                                _denial,
-                            )) => {
-                                // Signature already verified above
-                                tracing::warn!(
-                                    "Authentication explicitly denied by server: {}",
-                                    server_addr
-                                );
-
-                                // Send confirmation even for denial in background and finalize
-                                let confirmation = create_grant_confirmation(challenge)?;
-                                let mut conf_wrapper = wrap_grant_confirmation(confirmation);
-                                sign_wrapper_message(&mut conf_wrapper, keypair)?;
-                                let conf_packet =
-                                    create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper)?;
-
-                                let t = transport.clone();
-                                tokio::spawn(async move {
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    tokio::time::sleep(Duration::from_millis(150)).await;
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    tokio::time::sleep(Duration::from_millis(150)).await;
-                                    let _ = t.send_confirmation(&conf_packet).await;
-                                    let _ = t.finalize().await;
-                                });
-                                return Err(AuthHandlerError::ExplicitDenial);
-                            }
-                            _ => {
-                                tracing::debug!(
-                                    "Unexpected message type, waiting for valid response"
-                                );
-                            }
+                        Err(ResponseError::Fatal(e)) => {
+                            return Err(e);
                         }
                     }
-                    Ok(ReceiveResult::Timeout) => {
-                        attempt += 1;
-                        break; // Retry send
-                    }
+                }
+                Ok(None) => {
+                    // Timeout - retry
+                    attempt += 1;
+                }
+                Err(e) => {
+                    let _ = transport.finalize().await;
+                    return Err(e);
                 }
             }
         }
     }
+
+    async fn wait_for_response<T: Transport + Send + Sync>(
+        transport: &Arc<T>,
+        retry_interval: Duration,
+        csk: &ClientSymmetricKey,
+        config_manager: &ClientConfigManager,
+    ) -> Result<Option<(shared::protocol::pb::WrapperMessage, String)>, AuthHandlerError> {
+        match transport.receive_response(retry_interval).await {
+            Err(e) => Err(e),
+            Ok(ReceiveResult::Timeout) => Ok(None),
+            Ok(ReceiveResult::Response(response_packet, server_addr)) => {
+                let wrapper = decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
+                let addr_str = server_addr.to_string();
+                tracing::debug!("Received message from {}", addr_str);
+
+                // Verify signature
+                if Self::verify_response_signature(&wrapper, config_manager)? {
+                    Ok(Some((wrapper, addr_str)))
+                } else {
+                    tracing::warn!(
+                        "Message signature verification failed from {}; continuing to wait for valid response",
+                        addr_str
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn verify_response_signature(
+        wrapper: &shared::protocol::pb::WrapperMessage,
+        config_manager: &ClientConfigManager,
+    ) -> Result<bool, AuthHandlerError> {
+        let paired_servers = config_manager.load_paired_servers()?;
+        for (_id, server) in paired_servers.iter() {
+            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
+                if pub_key_bytes.len() == 32 {
+                    let mut pub_key = [0u8; 32];
+                    pub_key.copy_from_slice(&pub_key_bytes);
+                    if verify_wrapper_signature(wrapper, &pub_key).is_ok() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn process_auth_response<T: Transport + Send + Sync + 'static>(
+        wrapper: &shared::protocol::pb::WrapperMessage,
+        transport: &Arc<T>,
+        challenge: &[u8; 32],
+        keypair: &Ed25519KeyPair,
+        csk: &ClientSymmetricKey,
+        config_manager: &ClientConfigManager,
+        server_addr: String,
+    ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
+        match &wrapper.payload {
+            Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(_)) => {
+                Self::handle_auth_grant(wrapper, transport, challenge, keypair, csk, config_manager, server_addr).await
+            }
+            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
+                Self::handle_auth_denial(transport, challenge, keypair, csk, server_addr).await
+            }
+            _ => {
+                tracing::debug!("Unexpected message type, waiting for valid response");
+                Err(ResponseError::InvalidMessage)
+            }
+        }
+    }
+
+    async fn handle_auth_grant<T: Transport + Send + Sync + 'static>(
+        wrapper: &shared::protocol::pb::WrapperMessage,
+        transport: &Arc<T>,
+        challenge: &[u8; 32],
+        keypair: &Ed25519KeyPair,
+        csk: &ClientSymmetricKey,
+        config_manager: &ClientConfigManager,
+        server_addr: String,
+    ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
+        // Verify signed_challenge
+        let paired_servers = config_manager.load_paired_servers()
+            .map_err(|e| ResponseError::Fatal(e.into()))?;
+        
+        let grant_valid = paired_servers.iter().any(|(_id, server)| {
+            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
+                if pub_key_bytes.len() == 32 {
+                    let mut pub_key = [0u8; 32];
+                    pub_key.copy_from_slice(&pub_key_bytes);
+                    return verify_auth_grant(wrapper, challenge, &pub_key).is_ok();
+                }
+            }
+            false
+        });
+
+        if grant_valid {
+            tracing::info!("Authentication granted by server: {}", server_addr);
+            Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
+            Ok(Ok(()))
+        } else {
+            tracing::warn!("Grant challenge verification failed; continuing to wait for valid response");
+            Err(ResponseError::InvalidMessage)
+        }
+    }
+
+    async fn handle_auth_denial<T: Transport + Send + Sync + 'static>(
+        transport: &Arc<T>,
+        challenge: &[u8; 32],
+        keypair: &Ed25519KeyPair,
+        csk: &ClientSymmetricKey,
+        server_addr: String,
+    ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
+        tracing::warn!("Authentication explicitly denied by server: {}", server_addr);
+        Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
+        Ok(Err(AuthHandlerError::ExplicitDenial))
+    }
+
+    fn send_confirmation_background<T: Transport + Send + Sync + 'static>(
+        transport: Arc<T>,
+        challenge: &[u8; 32],
+        keypair: &Ed25519KeyPair,
+        csk: &ClientSymmetricKey,
+    ) {
+        let confirmation = match create_grant_confirmation(challenge) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to create confirmation: {}", e);
+                return;
+            }
+        };
+        
+        let mut conf_wrapper = wrap_grant_confirmation(confirmation);
+        if let Err(e) = sign_wrapper_message(&mut conf_wrapper, keypair) {
+            tracing::error!("Failed to sign confirmation: {}", e);
+            return;
+        }
+        
+        let conf_packet = match create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to encrypt confirmation: {}", e);
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            // Best-effort: up to 3 sends within ~450ms total
+            let _ = transport.send_confirmation(&conf_packet).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = transport.send_confirmation(&conf_packet).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = transport.send_confirmation(&conf_packet).await;
+            let _ = transport.finalize().await;
+        });
+    }
+}
+
+/// Error type for response processing
+enum ResponseError {
+    /// Invalid message that should be ignored (wait for another response)
+    InvalidMessage,
+    /// Fatal error that should terminate authentication
+    Fatal(AuthHandlerError),
 }
