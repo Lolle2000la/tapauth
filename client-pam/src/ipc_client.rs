@@ -33,7 +33,7 @@ pub struct IpcClient {
 
 impl IpcClient {
     /// Connect to tapauthd socket with configurable timeout for blocking operations.
-    /// 
+    ///
     /// The timeout applies to connect, send, and receive operations to prevent
     /// PAM module hangs if the daemon is unresponsive.
     pub fn connect(timeout: Duration) -> Result<Self, IpcError> {

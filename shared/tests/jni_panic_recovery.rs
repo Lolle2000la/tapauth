@@ -20,16 +20,16 @@ fn test_jni_functions_handle_null_inputs_gracefully() {
 fn test_crypto_operations_validate_input_lengths() {
     // Verify that input validation prevents panics from crypto operations
     // The actual validation happens in the JNI layer before calling Rust crypto functions
-    
+
     // Key lengths that should be validated:
     // - Ed25519: 32-byte private key, 32-byte public key, 64-byte signature
     // - X25519: 32-byte private key, 32-byte public key
     // - CSK: 32 bytes
     // - Challenge: 32 bytes
-    
+
     const VALID_KEY_LEN: usize = 32;
     const VALID_SIG_LEN: usize = 64;
-    
+
     // These constants are used in the JNI validation logic
     assert_eq!(VALID_KEY_LEN, 32);
     assert_eq!(VALID_SIG_LEN, 64);
@@ -38,10 +38,10 @@ fn test_crypto_operations_validate_input_lengths() {
 #[test]
 fn test_protobuf_operations_handle_invalid_data() {
     // Verify that protobuf parsing errors are caught and converted to exceptions
-    
+
     // Invalid protobuf data should result in an exception, not a panic
     let invalid_protobuf = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-    
+
     // The JNI layer should catch prost::DecodeError and convert to IOException
     // We can't test this directly without a JVM, but we verify the infrastructure exists
     assert!(!invalid_protobuf.is_empty());
@@ -51,10 +51,10 @@ fn test_protobuf_operations_handle_invalid_data() {
 fn test_error_conversion_infrastructure() {
     // Verify that the error conversion infrastructure from Rust errors to Java exceptions
     // is properly set up
-    
+
     // This is verified by the existence of the JNI panic guards in jni_api.rs
     // which use env.throw() to convert errors to exceptions
-    
+
     // Exception types that should be thrown:
     // - IllegalArgumentException: for input validation
     // - GeneralSecurityException: for crypto failures

@@ -44,9 +44,7 @@ impl From<crate::crypto::CryptoError> for TapAuthError {
     fn from(err: crate::crypto::CryptoError) -> Self {
         use crate::crypto::CryptoError;
         match err {
-            CryptoError::InvalidKeyLength => {
-                TapAuthError::InvalidInput(format!("crypto: {}", err))
-            }
+            CryptoError::InvalidKeyLength => TapAuthError::InvalidInput(format!("crypto: {}", err)),
             CryptoError::DecryptionFailed => TapAuthError::AeadBadTag,
             CryptoError::InvalidSignature => {
                 // Signature verification failure is not an exception in JNI;
@@ -54,15 +52,11 @@ impl From<crate::crypto::CryptoError> for TapAuthError {
                 TapAuthError::Crypto("signature verification internal error".to_string())
             }
             CryptoError::KeyDerivationFailed => TapAuthError::Crypto("KDF failed".to_string()),
-            CryptoError::EncryptionFailed => {
-                TapAuthError::Crypto("encryption failed".to_string())
-            }
+            CryptoError::EncryptionFailed => TapAuthError::Crypto("encryption failed".to_string()),
             CryptoError::RandomGenerationFailed => {
                 TapAuthError::Crypto("random generation failed".to_string())
             }
-            CryptoError::SystemTimeError => {
-                TapAuthError::State("system time error".to_string())
-            }
+            CryptoError::SystemTimeError => TapAuthError::State("system time error".to_string()),
         }
     }
 }

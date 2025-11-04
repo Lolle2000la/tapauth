@@ -2,6 +2,7 @@
 
 use super::{ReceiveResult, Transport};
 use crate::auth_handler::AuthHandlerError as AuthError;
+use shared::protocol::messages::sign_wrapper_message;
 use shared::protocol::pb::EncryptedPacket;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,11 +128,13 @@ impl BleTransport {
         let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
 
         // Create GrantConfirmation with challenge signature
-        let confirmation = create_grant_confirmation(&self.keypair, &self.challenge)
+        let confirmation = create_grant_confirmation(&self.challenge)
             .map_err(|e| AuthError::BleError(format!("Failed to create confirmation: {}", e)))?;
 
-        // Wrap in WrapperMessage
-        let wrapper = wrap_grant_confirmation(confirmation);
+        // Wrap in WrapperMessage and sign it
+        let mut wrapper = wrap_grant_confirmation(confirmation);
+        sign_wrapper_message(&mut wrapper, &self.keypair)
+            .map_err(|e| AuthError::BleError(format!("Failed to sign confirmation: {}", e)))?;
 
         // Serialize wrapper
         let plaintext = wrapper.encode_to_vec();
@@ -579,9 +582,9 @@ impl Transport for BleTransport {
                     "receive_response returning Response, total elapsed={:?}",
                     start.elapsed()
                 );
-                let dummy_addr = "0.0.0.0:0".parse().unwrap_or_else(|_| {
-                    std::net::SocketAddr::from(([0, 0, 0, 0], 0))
-                });
+                let dummy_addr = "0.0.0.0:0"
+                    .parse()
+                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                 return Ok(ReceiveResult::Response(encrypted_response, dummy_addr));
             }
 

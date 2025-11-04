@@ -7,6 +7,9 @@ use crate::crypto::{
 };
 use crate::protocol::pb::*;
 
+#[cfg(test)]
+use super::messages::sign_wrapper_message;
+
 /// Encrypt and package a WrapperMessage into an EncryptedPacket
 pub fn create_encrypted_packet(
     csk: &ClientSymmetricKey,
@@ -86,6 +89,8 @@ pub fn decrypt_encrypted_packet_with_csk_nonce(
 pub fn wrap_auth_request(request: AuthenticationRequest) -> WrapperMessage {
     WrapperMessage {
         version: 1,
+        signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        signature: Vec::new(),
         payload: Some(wrapper_message::Payload::AuthRequest(request)),
     }
 }
@@ -94,6 +99,8 @@ pub fn wrap_auth_request(request: AuthenticationRequest) -> WrapperMessage {
 pub fn wrap_auth_grant(grant: AuthenticationGrant) -> WrapperMessage {
     WrapperMessage {
         version: 1,
+        signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        signature: Vec::new(),
         payload: Some(wrapper_message::Payload::AuthGrant(grant)),
     }
 }
@@ -102,6 +109,8 @@ pub fn wrap_auth_grant(grant: AuthenticationGrant) -> WrapperMessage {
 pub fn wrap_auth_denial(denial: AuthenticationDenial) -> WrapperMessage {
     WrapperMessage {
         version: 1,
+        signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        signature: Vec::new(),
         payload: Some(wrapper_message::Payload::AuthDenial(denial)),
     }
 }
@@ -110,6 +119,8 @@ pub fn wrap_auth_denial(denial: AuthenticationDenial) -> WrapperMessage {
 pub fn wrap_grant_confirmation(confirmation: GrantConfirmation) -> WrapperMessage {
     WrapperMessage {
         version: 1,
+        signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        signature: Vec::new(),
         payload: Some(wrapper_message::Payload::GrantConfirmation(confirmation)),
     }
 }
@@ -118,6 +129,8 @@ pub fn wrap_grant_confirmation(confirmation: GrantConfirmation) -> WrapperMessag
 pub fn wrap_auth_cancel(cancel: AuthenticationCancel) -> WrapperMessage {
     WrapperMessage {
         version: 1,
+        signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        signature: Vec::new(),
         payload: Some(wrapper_message::Payload::AuthCancel(cancel)),
     }
 }
@@ -147,8 +160,9 @@ mod tests {
         let context = b"test_context";
 
         // Create a request
-        let request = create_auth_request(&keypair, "user", "host").unwrap();
-        let wrapper = wrap_auth_request(request);
+        let request = create_auth_request("user", "host").unwrap();
+        let mut wrapper = wrap_auth_request(request);
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
 
         // Encrypt
         let packet = create_encrypted_packet(&csk, &challenge, context, &wrapper).unwrap();
@@ -166,8 +180,7 @@ mod tests {
 
     #[test]
     fn test_extract_challenge() {
-        let keypair = Ed25519KeyPair::generate().unwrap();
-        let request = create_auth_request(&keypair, "user", "host").unwrap();
+        let request = create_auth_request("user", "host").unwrap();
         let challenge = request.challenge.clone();
         let wrapper = wrap_auth_request(request);
 
@@ -300,12 +313,12 @@ mod protobuf_tests {
             username: "testuser".to_string(),
             hostname: "testhost".to_string(),
             timestamp_unix_seconds: 1234567890,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            signature: vec![0xBB; 64],
         };
 
         let wrapper = WrapperMessage {
             version: 1,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xBB; 64],
             payload: Some(wrapper_message::Payload::AuthRequest(request)),
         };
 
@@ -324,12 +337,12 @@ mod protobuf_tests {
     fn test_wrapper_message_grant_confirmation_type() {
         let confirmation = GrantConfirmation {
             challenge: vec![0xCC; 32],
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            signature: vec![0xBB; 64],
         };
 
         let wrapper = WrapperMessage {
             version: 1,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xBB; 64],
             payload: Some(wrapper_message::Payload::GrantConfirmation(confirmation)),
         };
 
@@ -347,12 +360,12 @@ mod protobuf_tests {
     fn test_wrapper_message_auth_cancel_type() {
         let cancel = AuthenticationCancel {
             challenge: vec![0xDD; 32],
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            signature: vec![0xCC; 64],
         };
 
         let wrapper = WrapperMessage {
             version: 1,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xCC; 64],
             payload: Some(wrapper_message::Payload::AuthCancel(cancel)),
         };
 
@@ -374,12 +387,12 @@ mod protobuf_tests {
             username: "user".to_string(),
             hostname: "host".to_string(),
             timestamp_unix_seconds: 1234567890,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            signature: vec![0xFF; 64],
         };
 
         let wrapper = WrapperMessage {
             version: 42, // Non-standard version
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: vec![0xFF; 64],
             payload: Some(wrapper_message::Payload::AuthRequest(request)),
         };
 
@@ -399,6 +412,8 @@ mod protobuf_tests {
         // Empty wrapper message (no payload set)
         let wrapper = WrapperMessage {
             version: 1,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: Vec::new(),
             payload: None,
         };
 

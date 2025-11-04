@@ -3,8 +3,11 @@ package dev.rourunisen.tapauth.protocol
 import com.google.gson.annotations.SerializedName
 
 /**
- * Protobuf message representations parsed from JSON These match the structure of the messages in
- * auth_protocol.proto
+ * Protobuf message representations parsed from JSON.
+ * 
+ * Note: These data classes represent the legacy protocol v1 structure where signatures
+ * were embedded in individual messages. In protocol v2+, signatures are in WrapperMessage.
+ * The JNI parsing layer maintains compatibility by extracting wrapper signatures.
  */
 data class EncryptedPacket(
     @SerializedName("temporal_identifier") val temporalIdentifier: String, // Base64 encoded
@@ -17,26 +20,26 @@ data class AuthenticationRequest(
     val username: String,
     val hostname: String,
     @SerializedName("timestamp_unix_seconds") val timestampUnixSeconds: Long,
-    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
-    val signature: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int, // From WrapperMessage (v2+)
+    val signature: String, // Base64 encoded, from WrapperMessage (v2+)
 )
 
 data class AuthenticationGrant(
     @SerializedName("signed_challenge") val signedChallenge: String, // Base64 encoded
-    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
-    val signature: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int, // From WrapperMessage (v2+)
+    val signature: String, // Base64 encoded, from WrapperMessage (v2+)
 )
 
 data class GrantConfirmation(
     val challenge: String, // Base64 encoded
-    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
-    val signature: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int, // From WrapperMessage (v2+)
+    val signature: String, // Base64 encoded, from WrapperMessage (v2+)
 )
 
 data class AuthenticationCancel(
     val challenge: String, // Base64 encoded
-    @SerializedName("signature_algorithm") val signatureAlgorithm: Int,
-    val signature: String, // Base64 encoded
+    @SerializedName("signature_algorithm") val signatureAlgorithm: Int, // From WrapperMessage (v2+)
+    val signature: String, // Base64 encoded, from WrapperMessage (v2+)
 )
 
 /** Helper object for parsing protobuf messages via JNI */
@@ -70,11 +73,6 @@ object ProtobufParser {
             signature =
                 android.util.Base64.encodeToString(req.signature, android.util.Base64.NO_WRAP),
         )
-    }
-
-    /** Create an AuthenticationGrant protobuf message */
-    fun createAuthGrant(signedChallenge: ByteArray): ByteArray {
-        return dev.rourunisen.tapauth.crypto.TapAuthCrypto.createAuthGrant(signedChallenge)
     }
 
     /** Parse GrantConfirmation from protobuf bytes */

@@ -31,9 +31,7 @@ pub fn generate_temporal_identifier(
     let bytes = result.into_bytes();
 
     let mut identifier = [0u8; 16];
-    let slice = bytes
-        .get(..16)
-        .ok_or(CryptoError::KeyDerivationFailed)?;
+    let slice = bytes.get(..16).ok_or(CryptoError::KeyDerivationFailed)?;
     identifier.copy_from_slice(slice);
 
     Ok(identifier)
@@ -53,9 +51,7 @@ pub fn generate_temporal_identifier_ble(
     let bytes = result.into_bytes();
 
     let mut identifier = [0u8; 10];
-    let slice = bytes
-        .get(..10)
-        .ok_or(CryptoError::KeyDerivationFailed)?;
+    let slice = bytes.get(..10).ok_or(CryptoError::KeyDerivationFailed)?;
     identifier.copy_from_slice(slice);
 
     Ok(identifier)

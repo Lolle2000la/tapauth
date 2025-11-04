@@ -73,20 +73,15 @@ object TapAuthCrypto {
     external fun sha256(data: ByteArray): String
 
     /**
-     * Parse AuthenticationRequest from protobuf bytes
+     * Parse AuthenticationRequest from WrapperMessage protobuf bytes.
      *
-     * @param requestBytes Protobuf-encoded request
-     * @return AuthRequest object with request contents
+     * Extracts the request payload and copies signature_algorithm/signature from the
+     * WrapperMessage into the returned data class for compatibility.
+     *
+     * @param requestBytes Protobuf-encoded WrapperMessage containing AuthRequest
+     * @return AuthRequest object with request contents and wrapper signature
      */
     external fun parseAuthRequest(requestBytes: ByteArray): AuthRequest
-
-    /**
-     * Create and serialize an AuthenticationGrant
-     *
-     * @param signedChallenge The challenge signed by server
-     * @return Protobuf-encoded grant bytes
-     */
-    external fun createAuthGrant(signedChallenge: ByteArray): ByteArray
 
     /**
      * Verify Ed25519 signature
@@ -112,26 +107,35 @@ object TapAuthCrypto {
     external fun signData(privateKey: ByteArray, message: ByteArray): ByteArray
 
     /**
-     * Serialize an AuthenticationRequest for signature verification (with signature field empty)
+     * Serialize an AuthenticationRequest as a WrapperMessage for signature verification.
      *
-     * @param requestJson JSON representation of the request
-     * @return Serialized protobuf bytes
+     * Creates a WrapperMessage with the request payload and signature fields from JSON.
+     * Used to reconstruct the exact bytes that were signed by the client.
+     *
+     * @param requestJson JSON representation of the request (must include signature_algorithm)
+     * @return Serialized WrapperMessage protobuf bytes
      */
     external fun serializeAuthRequestForVerification(requestJson: String): ByteArray
 
     /**
-     * Parse GrantConfirmation from protobuf bytes
+     * Parse GrantConfirmation from WrapperMessage protobuf bytes.
      *
-     * @param confirmationBytes Protobuf-encoded confirmation
-     * @return GrantConfirmation object with confirmation contents
+     * Extracts the confirmation payload and copies signature_algorithm/signature from the
+     * WrapperMessage into the returned data class for compatibility.
+     *
+     * @param confirmationBytes Protobuf-encoded WrapperMessage containing GrantConfirmation
+     * @return GrantConfirmation object with confirmation contents and wrapper signature
      */
     external fun parseGrantConfirmation(confirmationBytes: ByteArray): GrantConfirmation
 
     /**
-     * Parse AuthenticationCancel from protobuf bytes
+     * Parse AuthenticationCancel from WrapperMessage protobuf bytes.
      *
-     * @param cancelBytes Protobuf-encoded cancel message
-     * @return AuthenticationCancel object with cancel contents
+     * Extracts the cancel payload and copies signature_algorithm/signature from the
+     * WrapperMessage into the returned data class for compatibility.
+     *
+     * @param cancelBytes Protobuf-encoded WrapperMessage containing AuthenticationCancel
+     * @return AuthenticationCancel object with cancel contents and wrapper signature
      */
     external fun parseAuthenticationCancel(cancelBytes: ByteArray): AuthenticationCancel
 
@@ -169,11 +173,16 @@ object TapAuthCrypto {
     external fun determineMessageType(wrapperMessageBytes: ByteArray): String
 
     /**
-     * Create a WrapperMessage containing an AuthenticationGrant
+     * Create a signed WrapperMessage containing an AuthenticationGrant.
+     *
+     * This is the recommended way to create grant responses. The function:
+     * 1. Creates AuthenticationGrant with signed_challenge
+     * 2. Wraps it in WrapperMessage
+     * 3. Signs the entire wrapper with the private key
      *
      * @param signedChallenge The signed challenge bytes
-     * @param privateKey Private key (32 bytes)
-     * @return Serialized WrapperMessage protobuf bytes
+     * @param privateKey Ed25519 private key (32 bytes) for signing the wrapper
+     * @return Serialized WrapperMessage protobuf bytes (signed)
      */
     external fun createGrantWrapperMessage(
         signedChallenge: ByteArray,
@@ -181,11 +190,16 @@ object TapAuthCrypto {
     ): ByteArray
 
     /**
-     * Create a WrapperMessage containing an AuthenticationDenial
+     * Create a signed WrapperMessage containing an AuthenticationDenial.
      *
-     * @param challenge The challenge bytes (32 bytes)
-     * @param privateKey Private key (32 bytes)
-     * @return Serialized WrapperMessage protobuf bytes
+     * This is the recommended way to create denial responses. The function:
+     * 1. Creates AuthenticationDenial with challenge
+     * 2. Wraps it in WrapperMessage
+     * 3. Signs the entire wrapper with the private key
+     *
+     * @param challenge The challenge bytes (32 bytes) from the request
+     * @param privateKey Ed25519 private key (32 bytes) for signing the wrapper
+     * @return Serialized WrapperMessage protobuf bytes (signed)
      */
     external fun createDenialWrapperMessage(challenge: ByteArray, privateKey: ByteArray): ByteArray
 

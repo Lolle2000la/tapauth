@@ -158,12 +158,12 @@ impl AuthSession {
 
         // Create the authentication request
         let request = create_auth_request_with_challenge(
-            &self.state.keypair,
             &self.username,
             &self.state.hostname,
             &self.challenge,
         )?;
-        let wrapper = wrap_auth_request(request);
+        let mut wrapper = wrap_auth_request(request);
+        sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
         let packet = create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?;
 
         // Run authentication with timeout
@@ -258,8 +258,9 @@ impl AuthSession {
 
         // Pre-compute cancel packet to dismiss notifications
         let cancel_packet = {
-            let msg = create_auth_cancel(&self.state.keypair, &self.challenge)?;
-            let wrapper = wrap_auth_cancel(msg);
+            let msg = create_auth_cancel(&self.challenge)?;
+            let mut wrapper = wrap_auth_cancel(msg);
+            sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
             create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?
         };
 
@@ -553,38 +554,62 @@ impl AuthSession {
 
                         tracing::debug!("Received message from {}", server_addr);
 
-                        match wrapper.payload {
+                        // Verify wrapper signature against any paired server key
+                        let paired_servers = config_manager.load_paired_servers()?;
+                        let mut signature_valid = false;
+                        for (_id, server) in paired_servers.iter() {
+                            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
+                                if pub_key_bytes.len() == 32 {
+                                    let mut pub_key = [0u8; 32];
+                                    pub_key.copy_from_slice(&pub_key_bytes);
+                                    if verify_wrapper_signature(&wrapper, &pub_key).is_ok() {
+                                        signature_valid = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !signature_valid {
+                            tracing::warn!(
+                                "Message signature verification failed from {}; continuing to wait for valid response",
+                                server_addr
+                            );
+                            continue;
+                        }
+
+                        // Now check message type and handle appropriately
+                        match &wrapper.payload {
                             Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(
-                                grant,
+                                _grant,
                             )) => {
-                                // Verify against any paired server key
-                                let paired_servers = config_manager.load_paired_servers()?;
-                                let mut valid = false;
+                                // For grants, also verify the signed_challenge
+                                let mut grant_valid = false;
                                 for (_id, server) in paired_servers.iter() {
                                     if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
                                         if pub_key_bytes.len() == 32 {
                                             let mut pub_key = [0u8; 32];
                                             pub_key.copy_from_slice(&pub_key_bytes);
-                                            if verify_auth_grant(&grant, challenge, &pub_key)
+                                            if verify_auth_grant(&wrapper, challenge, &pub_key)
                                                 .is_ok()
                                             {
-                                                valid = true;
+                                                grant_valid = true;
                                                 break;
                                             }
                                         }
                                     }
                                 }
-                                if valid {
+                                if grant_valid {
                                     tracing::info!(
                                         "Authentication granted by server: {}",
                                         server_addr
                                     );
                                     // Send confirmation in background and finalize without blocking PAM
-                                    let confirmation =
-                                        create_grant_confirmation(keypair, challenge)?;
-                                    let wrapper = wrap_grant_confirmation(confirmation);
+                                    let confirmation = create_grant_confirmation(challenge)?;
+                                    let mut conf_wrapper = wrap_grant_confirmation(confirmation);
+                                    sign_wrapper_message(&mut conf_wrapper, keypair)?;
                                     let conf_packet =
-                                        create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
+                                        create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper)?;
 
                                     let t = transport.clone();
                                     tokio::spawn(async move {
@@ -598,55 +623,35 @@ impl AuthSession {
                                     });
                                     return Ok(());
                                 } else {
-                                    tracing::warn!("Grant verification failed; continuing to wait for valid response");
+                                    tracing::warn!("Grant challenge verification failed; continuing to wait for valid response");
                                 }
                             }
                             Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(
-                                denial,
+                                _denial,
                             )) => {
-                                // Verify denial signature against any paired server key
-                                let paired_servers = config_manager.load_paired_servers()?;
-                                let mut valid = false;
-                                for (_id, server) in paired_servers.iter() {
-                                    if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
-                                        if pub_key_bytes.len() == 32 {
-                                            let mut pub_key = [0u8; 32];
-                                            pub_key.copy_from_slice(&pub_key_bytes);
-                                            if verify_auth_denial(&denial, &pub_key).is_ok() {
-                                                valid = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if valid {
-                                    tracing::warn!(
-                                        "Authentication explicitly denied by server: {}",
-                                        server_addr
-                                    );
+                                // Signature already verified above
+                                tracing::warn!(
+                                    "Authentication explicitly denied by server: {}",
+                                    server_addr
+                                );
 
-                                    // Send confirmation even for denial in background and finalize
-                                    let confirmation =
-                                        create_grant_confirmation(keypair, challenge)?;
-                                    let wrapper = wrap_grant_confirmation(confirmation);
-                                    let conf_packet =
-                                        create_encrypted_packet_with_csk_nonce(csk, &wrapper)?;
+                                // Send confirmation even for denial in background and finalize
+                                let confirmation = create_grant_confirmation(challenge)?;
+                                let mut conf_wrapper = wrap_grant_confirmation(confirmation);
+                                sign_wrapper_message(&mut conf_wrapper, keypair)?;
+                                let conf_packet =
+                                    create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper)?;
 
-                                    let t = transport.clone();
-                                    tokio::spawn(async move {
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        tokio::time::sleep(Duration::from_millis(150)).await;
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        tokio::time::sleep(Duration::from_millis(150)).await;
-                                        let _ = t.send_confirmation(&conf_packet).await;
-                                        let _ = t.finalize().await;
-                                    });
-                                    return Err(AuthHandlerError::ExplicitDenial);
-                                } else {
-                                    tracing::warn!(
-                                        "Denial verification failed; continuing to wait for valid response"
-                                    );
-                                }
+                                let t = transport.clone();
+                                tokio::spawn(async move {
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    let _ = t.send_confirmation(&conf_packet).await;
+                                    let _ = t.finalize().await;
+                                });
+                                return Err(AuthHandlerError::ExplicitDenial);
                             }
                             _ => {
                                 tracing::debug!(

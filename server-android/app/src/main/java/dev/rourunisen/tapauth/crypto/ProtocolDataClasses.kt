@@ -8,12 +8,15 @@ package dev.rourunisen.tapauth.crypto
 /**
  * Parsed AuthenticationRequest message.
  *
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
+ * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ *
  * @property challenge 32-byte authentication challenge
  * @property username Username requesting authentication
  * @property hostname Hostname where authentication is requested
  * @property timestampUnixSeconds Unix timestamp when request was created
- * @property signatureAlgorithm Signature algorithm used (e.g., Ed25519 = 1)
- * @property signature Digital signature over the request fields
+ * @property signatureAlgorithm Signature algorithm from WrapperMessage (e.g., Ed25519 = 1)
+ * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
  */
 data class AuthRequest(
     val challenge: ByteArray,
@@ -53,9 +56,12 @@ data class AuthRequest(
 /**
  * Parsed GrantConfirmation message.
  *
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
+ * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ *
  * @property challenge 32-byte challenge that was signed
- * @property signatureAlgorithm Signature algorithm used
- * @property signature Digital signature over the challenge
+ * @property signatureAlgorithm Signature algorithm from WrapperMessage
+ * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
  */
 data class GrantConfirmation(
     val challenge: ByteArray,
@@ -86,9 +92,12 @@ data class GrantConfirmation(
 /**
  * Parsed AuthenticationCancel message.
  *
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
+ * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ *
  * @property challenge 32-byte challenge of the request being cancelled
- * @property signatureAlgorithm Signature algorithm used
- * @property signature Digital signature over the cancellation
+ * @property signatureAlgorithm Signature algorithm from WrapperMessage
+ * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
  */
 data class AuthenticationCancel(
     val challenge: ByteArray,

@@ -16,7 +16,7 @@ const DEFAULT_PAM_TIMEOUT_SECS: u64 = 3;
 pub struct PamConfig {
     /// Timeout for individual PAM operations (connect, send, receive) in seconds.
     /// Default: 3 seconds
-    /// 
+    ///
     /// This is the per-operation timeout for PAM module interactions with the daemon.
     /// The authentication session on the phone can continue for up to 120 seconds
     /// independently, but PAM operations will timeout after this duration to prevent
@@ -41,7 +41,7 @@ impl PamConfig {
     /// Load configuration from a specific path, using defaults for missing fields.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
-        
+
         // If file doesn't exist or can't be read, use defaults
         let contents = match fs::read_to_string(path) {
             Ok(c) => c,
@@ -98,7 +98,7 @@ mod tests {
         let toml = r#"
             pam_operation_timeout_secs = 5
         "#;
-        
+
         let config: PamConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 5);
     }

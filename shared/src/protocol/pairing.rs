@@ -475,7 +475,8 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
+            let mut session =
+                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             let (csk, _client_pub, _client_device_name, sas) = session
                 .complete_pairing(stream, "TestServer")
@@ -526,7 +527,8 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
+            let mut session =
+                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             let (_, _, client_device_name, _) = session
                 .complete_pairing(stream, "MyAndroidPhone")
@@ -572,7 +574,8 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session = ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
+            let mut session =
+                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
 
             session.complete_pairing(stream, "").await
         });

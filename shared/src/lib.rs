@@ -1,5 +1,10 @@
 //! Shared TapAuth core library.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 //!
 //! Provides cryptographic primitives, protocol definitions, network transports,
 //! and configuration management shared between client (PAM, GUI) and server (Android)
