@@ -44,6 +44,8 @@ SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
 SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
 SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
+UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
+UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
 # Print functions
 print_info() {
@@ -492,6 +494,53 @@ detect_distribution() {
         DISTRO_ID="unknown"
         DISTRO_NAME="Unknown"
         print_warning "Could not detect distribution"
+    fi
+}
+
+# Check for existing installation and offer to uninstall
+check_existing_installation() {
+    if [[ "$BUILD_ONLY" == true || "$DRY_RUN" == true ]]; then
+        return
+    fi
+    
+    if [[ ! -f "$UNINSTALL_SCRIPT_DEST" ]]; then
+        # No existing installation
+        return
+    fi
+    
+    print_header "Existing Installation Detected"
+    print_warning "An existing TapAuth installation was found."
+    echo ""
+    print_info "It is recommended to uninstall the old version first to ensure"
+    print_info "a clean upgrade, especially if components have changed."
+    echo ""
+    
+    if [[ "$INTERACTIVE" == true ]]; then
+        read -p "Uninstall existing version before installing? [Y/n]: " response
+        if [[ "$response" =~ ^[Nn]$ ]]; then
+            print_info "Proceeding with installation (will upgrade in-place)"
+            return
+        fi
+    else
+        print_info "Non-interactive mode: skipping uninstallation"
+        return
+    fi
+    
+    print_info "Running existing uninstaller..."
+    echo ""
+    
+    # Run the existing uninstaller without removing user data
+    # Pass --non-interactive to avoid prompts
+    if bash "$UNINSTALL_SCRIPT_DEST" --non-interactive; then
+        print_success "Previous version uninstalled successfully"
+        echo ""
+    else
+        print_error "Uninstallation failed"
+        read -p "Continue with installation anyway? [y/N]: " response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            print_info "Installation cancelled"
+            exit 1
+        fi
     fi
 }
 
@@ -1166,6 +1215,36 @@ install_config_gui() {
     print_success "Configuration GUI installed"
 }
 
+# Install uninstaller script for this version
+install_uninstaller() {
+    print_header "Installing Uninstaller"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would install uninstaller script"
+        echo ""
+        show_command "mkdir -p $(dirname $UNINSTALL_SCRIPT_DEST)" "Create uninstaller directory"
+        show_file_copy "$UNINSTALL_SCRIPT_SOURCE" "$UNINSTALL_SCRIPT_DEST"
+        show_command "chmod 755 $UNINSTALL_SCRIPT_DEST" "Set uninstaller executable permissions"
+        return
+    fi
+    
+    if [[ ! -f "$UNINSTALL_SCRIPT_SOURCE" ]]; then
+        print_warning "Uninstaller script not found at $UNINSTALL_SCRIPT_SOURCE"
+        print_warning "Skipping uninstaller installation"
+        return
+    fi
+    
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$UNINSTALL_SCRIPT_DEST")"
+    
+    print_info "Installing uninstaller to $UNINSTALL_SCRIPT_DEST"
+    cp "$UNINSTALL_SCRIPT_SOURCE" "$UNINSTALL_SCRIPT_DEST"
+    chmod 755 "$UNINSTALL_SCRIPT_DEST"
+    
+    print_success "Uninstaller installed"
+    print_info "To uninstall TapAuth, run: sudo $UNINSTALL_SCRIPT_DEST"
+}
+
 # Create installation summary
 create_summary() {
     print_header "Installation Summary"
@@ -1220,6 +1299,10 @@ create_summary() {
     echo "  3. Test authentication in a separate terminal"
     echo "  4. Keep a root shell open until you verify it works"
     
+    echo ""
+    print_info "Uninstallation:"
+    echo "  To uninstall TapAuth, run: sudo $UNINSTALL_SCRIPT_DEST"
+    
     # Check if SELinux is enabled and provide guidance
     if command -v getenforce &> /dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
         echo ""
@@ -1271,6 +1354,7 @@ main() {
     fi
     
     check_prerequisites
+    check_existing_installation
     build_components
     
     if [[ "$BUILD_ONLY" == true ]]; then
@@ -1283,6 +1367,7 @@ main() {
     install_pam
     configure_pam
     install_config_gui
+    install_uninstaller
     install_systemd_units
     
     # Restore SELinux contexts if available

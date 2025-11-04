@@ -33,6 +33,13 @@ CONFIG_DIR="/var/lib/tapauth"
 DAEMON_PATH="/usr/bin/tapauthd"
 SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
+INSTALLED_UNINSTALLER="/usr/share/tapauth/uninstall.sh"
+
+# Detect if we're running from the installed location
+RUNNING_FROM_INSTALLED=false
+if [[ "$(readlink -f "$0")" == "$INSTALLED_UNINSTALLER" ]]; then
+    RUNNING_FROM_INSTALLED=true
+fi
 
 # Print functions
 print_info() {
@@ -612,6 +619,39 @@ remove_system_users() {
     print_success "System users and groups removed"
 }
 
+# Remove the installed uninstaller script itself (if we're running from there)
+remove_self() {
+    if [[ "$RUNNING_FROM_INSTALLED" == false ]]; then
+        # Not running from installed location, nothing to do
+        return
+    fi
+    
+    print_header "Removing Uninstaller"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would remove installed uninstaller"
+        show_file_removal "$INSTALLED_UNINSTALLER" "Installed uninstaller script"
+        show_file_removal "$(dirname "$INSTALLED_UNINSTALLER")" "Uninstaller directory (if empty)"
+        return
+    fi
+    
+    # Remove the uninstaller script
+    if [[ -f "$INSTALLED_UNINSTALLER" ]]; then
+        print_info "Removing installed uninstaller script"
+        rm -f "$INSTALLED_UNINSTALLER"
+    fi
+    
+    # Remove the directory if it's empty
+    local uninstaller_dir="$(dirname "$INSTALLED_UNINSTALLER")"
+    if [[ -d "$uninstaller_dir" ]]; then
+        if rmdir "$uninstaller_dir" 2>/dev/null; then
+            print_info "Removed empty uninstaller directory"
+        fi
+    fi
+    
+    print_success "Uninstaller removed"
+}
+
 # Create uninstallation summary
 create_summary() {
     print_header "Uninstallation Summary"
@@ -622,6 +662,7 @@ create_summary() {
     echo "  ✓ Configuration GUI"
     echo "  ✓ System users and groups"
     echo "  ✓ All PAM configurations"
+    [[ "$RUNNING_FROM_INSTALLED" == true ]] && echo "  ✓ Uninstaller script"
     
     echo ""
     echo "User data:"
@@ -645,6 +686,19 @@ main() {
     print_header "TapAuth Uninstallation"
     
     parse_args "$@"
+    
+    # If we're NOT running from the installed location, check if there's an installed uninstaller
+    # and use that instead (it matches the installed version)
+    if [[ "$RUNNING_FROM_INSTALLED" == false && -f "$INSTALLED_UNINSTALLER" ]]; then
+        print_info "Found installed uninstaller at $INSTALLED_UNINSTALLER"
+        print_info "Using installed uninstaller to ensure version compatibility"
+        echo ""
+        
+        # Execute the installed uninstaller with all the same arguments
+        exec bash "$INSTALLED_UNINSTALLER" "$@"
+        # exec replaces this process, so we never reach here
+        exit 1  # Should never happen
+    fi
     
     if [[ "$INTERACTIVE" == true ]]; then
         print_warning "This will remove all TapAuth components from your system"
@@ -670,6 +724,7 @@ main() {
     remove_pam
     remove_user_data
     remove_system_users
+    remove_self  # Remove the uninstaller itself (if running from installed location)
     
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
