@@ -4,10 +4,10 @@ import com.google.gson.annotations.SerializedName
 
 /**
  * Protobuf message representations parsed from JSON.
- * 
- * Note: These data classes represent the legacy protocol v1 structure where signatures
- * were embedded in individual messages. In protocol v2+, signatures are in WrapperMessage.
- * The JNI parsing layer maintains compatibility by extracting wrapper signatures.
+ *
+ * Note: These data classes represent the legacy protocol v1 structure where signatures were
+ * embedded in individual messages. In protocol v2+, signatures are in WrapperMessage. The JNI
+ * parsing layer maintains compatibility by extracting wrapper signatures.
  */
 data class EncryptedPacket(
     @SerializedName("temporal_identifier") val temporalIdentifier: String, // Base64 encoded

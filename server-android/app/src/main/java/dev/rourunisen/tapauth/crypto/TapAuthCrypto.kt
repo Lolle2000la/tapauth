@@ -75,8 +75,8 @@ object TapAuthCrypto {
     /**
      * Parse AuthenticationRequest from WrapperMessage protobuf bytes.
      *
-     * Extracts the request payload and copies signature_algorithm/signature from the
-     * WrapperMessage into the returned data class for compatibility.
+     * Extracts the request payload and copies signature_algorithm/signature from the WrapperMessage
+     * into the returned data class for compatibility.
      *
      * @param requestBytes Protobuf-encoded WrapperMessage containing AuthRequest
      * @return AuthRequest object with request contents and wrapper signature
@@ -109,8 +109,8 @@ object TapAuthCrypto {
     /**
      * Serialize an AuthenticationRequest as a WrapperMessage for signature verification.
      *
-     * Creates a WrapperMessage with the request payload and signature fields from JSON.
-     * Used to reconstruct the exact bytes that were signed by the client.
+     * Creates a WrapperMessage with the request payload and signature fields from JSON. Used to
+     * reconstruct the exact bytes that were signed by the client.
      *
      * @param requestJson JSON representation of the request (must include signature_algorithm)
      * @return Serialized WrapperMessage protobuf bytes
@@ -131,8 +131,8 @@ object TapAuthCrypto {
     /**
      * Parse AuthenticationCancel from WrapperMessage protobuf bytes.
      *
-     * Extracts the cancel payload and copies signature_algorithm/signature from the
-     * WrapperMessage into the returned data class for compatibility.
+     * Extracts the cancel payload and copies signature_algorithm/signature from the WrapperMessage
+     * into the returned data class for compatibility.
      *
      * @param cancelBytes Protobuf-encoded WrapperMessage containing AuthenticationCancel
      * @return AuthenticationCancel object with cancel contents and wrapper signature

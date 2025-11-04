@@ -8,8 +8,8 @@ package dev.rourunisen.tapauth.crypto
 /**
  * Parsed AuthenticationRequest message.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
- * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
+ * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
  *
  * @property challenge 32-byte authentication challenge
  * @property username Username requesting authentication
@@ -56,8 +56,8 @@ data class AuthRequest(
 /**
  * Parsed GrantConfirmation message.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
- * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
+ * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
  *
  * @property challenge 32-byte challenge that was signed
  * @property signatureAlgorithm Signature algorithm from WrapperMessage
@@ -92,8 +92,8 @@ data class GrantConfirmation(
 /**
  * Parsed AuthenticationCancel message.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages.
- * The JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
+ * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
  *
  * @property challenge 32-byte challenge of the request being cancelled
  * @property signatureAlgorithm Signature algorithm from WrapperMessage
