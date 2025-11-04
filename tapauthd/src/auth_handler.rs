@@ -42,6 +42,25 @@ pub enum AuthHandlerError {
     BleError(String),
 }
 
+/// Type alias for transport task handles
+type TransportHandles = (
+    tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+    tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+);
+
+/// Parameters for awaiting authentication result
+#[cfg(feature = "ble")]
+struct AwaitAuthParams<'a> {
+    ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+    udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
+    cancel_rx: oneshot::Receiver<()>,
+    ble_abort: tokio::task::AbortHandle,
+    udp_abort: tokio::task::AbortHandle,
+    ble_transport: &'a Option<Arc<crate::transport::BleTransport>>,
+    udp_transport: &'a Arc<crate::transport::UdpTransport>,
+    cancel_packet: &'a EncryptedPacket,
+}
+
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
     pub config_manager: ClientConfigManager,
@@ -96,11 +115,8 @@ pub struct AuthSession {
 impl AuthSession {
     pub fn new(state: Arc<DaemonState>, username: String) -> Result<Self, std::io::Error> {
         let mut challenge = [0u8; 32];
-        getrandom::fill(&mut challenge).map_err(|e| {
-            std::io::Error::other(
-                format!("random generation failed: {}", e),
-            )
-        })?;
+        getrandom::fill(&mut challenge)
+            .map_err(|e| std::io::Error::other(format!("random generation failed: {}", e)))?;
 
         Ok(Self {
             state,
@@ -218,7 +234,8 @@ impl AuthSession {
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
         // Initialize transports
-        let (udp_transport, ble_transport) = self.initialize_transports(temporal_id, timeout).await?;
+        let (udp_transport, ble_transport) =
+            self.initialize_transports(temporal_id, timeout).await?;
 
         // Setup cancellation mechanism
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -228,26 +245,24 @@ impl AuthSession {
         let cancel_packet = self.create_cancel_packet()?;
 
         // Spawn authentication tasks
-        let (ble_handle, udp_handle) = self.spawn_auth_tasks(
-            &ble_transport,
-            &udp_transport,
-            packet,
-        );
+        let (ble_handle, udp_handle) =
+            self.spawn_auth_tasks(&ble_transport, &udp_transport, packet);
 
         let ble_abort = ble_handle.abort_handle();
         let udp_abort = udp_handle.abort_handle();
 
         // Wait for first success, both failures, or cancellation
-        self.await_auth_result(
+        self.await_auth_result(AwaitAuthParams {
             ble_handle,
             udp_handle,
             cancel_rx,
             ble_abort,
             udp_abort,
-            &ble_transport,
-            &udp_transport,
-            &cancel_packet,
-        ).await
+            ble_transport: &ble_transport,
+            udp_transport: &udp_transport,
+            cancel_packet: &cancel_packet,
+        })
+        .await
     }
 
     #[cfg(feature = "ble")]
@@ -255,23 +270,35 @@ impl AuthSession {
         &self,
         temporal_id: [u8; 10],
         timeout: Duration,
-    ) -> Result<(Arc<crate::transport::UdpTransport>, Option<Arc<crate::transport::BleTransport>>), AuthHandlerError> {
+    ) -> Result<
+        (
+            Arc<crate::transport::UdpTransport>,
+            Option<Arc<crate::transport::BleTransport>>,
+        ),
+        AuthHandlerError,
+    > {
         use crate::transport::{BleTransport, UdpTransport};
 
         let config = self.state.config_manager.load_config()?;
-        let udp_transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
+        let udp_transport =
+            UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
 
         let config_manager = Arc::new(ClientConfigManager::new());
         let keypair = Arc::new(self.state.keypair.clone());
         let challenge = self.challenge;
 
-        let ble_transport = match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await {
-            Ok(ble) => Some(Arc::new(ble)),
-            Err(e) => {
-                tracing::warn!("BLE initialization failed ({}). Falling back to UDP-only.", e);
-                None
-            }
-        };
+        let ble_transport =
+            match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await
+            {
+                Ok(ble) => Some(Arc::new(ble)),
+                Err(e) => {
+                    tracing::warn!(
+                        "BLE initialization failed ({}). Falling back to UDP-only.",
+                        e
+                    );
+                    None
+                }
+            };
 
         Ok((Arc::new(udp_transport), ble_transport))
     }
@@ -294,7 +321,10 @@ impl AuthSession {
         let msg = create_auth_cancel(&self.challenge)?;
         let mut wrapper = wrap_auth_cancel(msg);
         sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
-        Ok(create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?)
+        Ok(create_encrypted_packet_with_csk_nonce(
+            &self.state.csk,
+            &wrapper,
+        )?)
     }
 
     #[cfg(feature = "ble")]
@@ -303,10 +333,7 @@ impl AuthSession {
         ble_transport: &Option<Arc<crate::transport::BleTransport>>,
         udp_transport: &Arc<crate::transport::UdpTransport>,
         packet: &EncryptedPacket,
-    ) -> (
-        tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-    ) {
+    ) -> TransportHandles {
         let ble_handle = if let Some(ble) = ble_transport.clone() {
             let packet = packet.clone();
             let csk = self.state.csk.clone();
@@ -314,7 +341,8 @@ impl AuthSession {
             let challenge = self.challenge;
             let cfg = Arc::new(ClientConfigManager::new());
             tokio::spawn(async move {
-                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, cfg).await
+                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, cfg)
+                    .await
             })
         } else {
             tokio::spawn(async { Err(AuthHandlerError::BleError("BLE disabled".into())) })
@@ -328,7 +356,8 @@ impl AuthSession {
             let cfg = Arc::new(ClientConfigManager::new());
             let udp = udp_transport.clone();
             tokio::spawn(async move {
-                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, cfg).await
+                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, cfg)
+                    .await
             })
         };
 
@@ -336,18 +365,19 @@ impl AuthSession {
     }
 
     #[cfg(feature = "ble")]
-    async fn await_auth_result(
-        &self,
-        mut ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        mut udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        mut cancel_rx: oneshot::Receiver<()>,
-        ble_abort: tokio::task::AbortHandle,
-        udp_abort: tokio::task::AbortHandle,
-        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
-        udp_transport: &Arc<crate::transport::UdpTransport>,
-        cancel_packet: &EncryptedPacket,
-    ) -> Result<(), AuthHandlerError> {
+    async fn await_auth_result(&self, params: AwaitAuthParams<'_>) -> Result<(), AuthHandlerError> {
         use tokio::select;
+
+        let AwaitAuthParams {
+            mut ble_handle,
+            mut udp_handle,
+            mut cancel_rx,
+            ble_abort,
+            udp_abort,
+            ble_transport,
+            udp_transport,
+            cancel_packet,
+        } = params;
 
         select! {
             result = &mut ble_handle => {
@@ -375,19 +405,22 @@ impl AuthSession {
         match result {
             Ok(Ok(())) => {
                 tracing::info!("BLE authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 udp_abort.abort();
                 Ok(())
             }
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                 tracing::warn!("BLE authentication explicitly denied by user");
                 udp_abort.abort();
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Err(AuthHandlerError::ExplicitDenial)
             }
             Ok(Err(e)) => {
                 tracing::debug!("BLE authentication failed: {}", e);
-                self.handle_udp_fallback(udp_handle, ble_transport, udp_transport, cancel_packet).await
+                self.handle_udp_fallback(udp_handle, ble_transport, udp_transport, cancel_packet)
+                    .await
             }
             Err(_) => {
                 tracing::error!("BLE task panicked");
@@ -413,18 +446,21 @@ impl AuthSession {
             Ok(Ok(())) => {
                 tracing::info!("UDP authentication succeeded");
                 ble_abort.abort();
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Ok(())
             }
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                 tracing::warn!("UDP authentication explicitly denied by user");
                 ble_abort.abort();
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Err(AuthHandlerError::ExplicitDenial)
             }
             Ok(Err(e)) => {
                 tracing::debug!("UDP authentication failed: {}", e);
-                self.handle_ble_fallback(ble_handle, ble_transport, udp_transport, cancel_packet).await
+                self.handle_ble_fallback(ble_handle, ble_transport, udp_transport, cancel_packet)
+                    .await
             }
             Err(_) => {
                 tracing::error!("UDP task panicked");
@@ -447,11 +483,13 @@ impl AuthSession {
         match udp_handle.await {
             Ok(Ok(())) => {
                 tracing::info!("UDP authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Ok(())
             }
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Err(AuthHandlerError::ExplicitDenial)
             }
             Ok(Err(e)) => {
@@ -473,11 +511,13 @@ impl AuthSession {
         match ble_handle.await {
             Ok(Ok(())) => {
                 tracing::info!("BLE authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet).await;
+                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Ok(())
             }
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet).await;
+                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                    .await;
                 Err(AuthHandlerError::ExplicitDenial)
             }
             Ok(Err(e)) => {
@@ -515,7 +555,9 @@ impl AuthSession {
     ) {
         if let Some(ble) = ble_transport {
             let ble = ble.clone();
-            tokio::spawn(async move { let _ = ble.finalize().await; });
+            tokio::spawn(async move {
+                let _ = ble.finalize().await;
+            });
         }
         let _ = udp_transport.send_cancel(cancel_packet).await;
     }
@@ -530,7 +572,11 @@ impl AuthSession {
         cancel_packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
         let rid = self.request_id.as_deref().unwrap_or("-");
-        tracing::info!("Authentication cancelled (user={}, id={})", self.username, rid);
+        tracing::info!(
+            "Authentication cancelled (user={}, id={})",
+            self.username,
+            rid
+        );
 
         tracing::info!("Broadcasting AuthenticationCancel over UDP");
         if let Err(e) = udp_transport.send_cancel(cancel_packet).await {
@@ -543,7 +589,9 @@ impl AuthSession {
         if let Some(ble) = ble_transport {
             tracing::debug!("Disconnecting BLE clients (background)");
             let ble = ble.clone();
-            tokio::spawn(async move { let _ = ble.finalize().await; });
+            tokio::spawn(async move {
+                let _ = ble.finalize().await;
+            });
         }
 
         // Give network stack time to transmit packets
@@ -608,7 +656,17 @@ impl AuthSession {
             match Self::wait_for_response(&transport, retry_interval, csk, &config_manager).await {
                 Ok(Some((wrapper, server_addr))) => {
                     // Process the authenticated response
-                    match Self::process_auth_response(&wrapper, &transport, challenge, keypair, csk, &config_manager, server_addr).await {
+                    match Self::process_auth_response(
+                        &wrapper,
+                        &transport,
+                        challenge,
+                        keypair,
+                        csk,
+                        &config_manager,
+                        server_addr,
+                    )
+                    .await
+                    {
                         Ok(result) => return result,
                         Err(ResponseError::InvalidMessage) => {
                             // Continue waiting for valid response
@@ -689,7 +747,16 @@ impl AuthSession {
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
         match &wrapper.payload {
             Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(_)) => {
-                Self::handle_auth_grant(wrapper, transport, challenge, keypair, csk, config_manager, server_addr).await
+                Self::handle_auth_grant(
+                    wrapper,
+                    transport,
+                    challenge,
+                    keypair,
+                    csk,
+                    config_manager,
+                    server_addr,
+                )
+                .await
             }
             Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
                 Self::handle_auth_denial(transport, challenge, keypair, csk, server_addr).await
@@ -711,9 +778,10 @@ impl AuthSession {
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
         // Verify signed_challenge
-        let paired_servers = config_manager.load_paired_servers()
+        let paired_servers = config_manager
+            .load_paired_servers()
             .map_err(|e| ResponseError::Fatal(e.into()))?;
-        
+
         let grant_valid = paired_servers.iter().any(|(_id, server)| {
             if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
                 if pub_key_bytes.len() == 32 {
@@ -730,7 +798,9 @@ impl AuthSession {
             Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
             Ok(Ok(()))
         } else {
-            tracing::warn!("Grant challenge verification failed; continuing to wait for valid response");
+            tracing::warn!(
+                "Grant challenge verification failed; continuing to wait for valid response"
+            );
             Err(ResponseError::InvalidMessage)
         }
     }
@@ -742,7 +812,10 @@ impl AuthSession {
         csk: &ClientSymmetricKey,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
-        tracing::warn!("Authentication explicitly denied by server: {}", server_addr);
+        tracing::warn!(
+            "Authentication explicitly denied by server: {}",
+            server_addr
+        );
         Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
         Ok(Err(AuthHandlerError::ExplicitDenial))
     }
@@ -760,13 +833,13 @@ impl AuthSession {
                 return;
             }
         };
-        
+
         let mut conf_wrapper = wrap_grant_confirmation(confirmation);
         if let Err(e) = sign_wrapper_message(&mut conf_wrapper, keypair) {
             tracing::error!("Failed to sign confirmation: {}", e);
             return;
         }
-        
+
         let conf_packet = match create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper) {
             Ok(p) => p,
             Err(e) => {
