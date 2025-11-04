@@ -19,6 +19,7 @@
 //! for skip signals in terminal contexts.
 
 use crate::ipc_client::IpcClient;
+use crate::logging;
 use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
@@ -31,18 +32,6 @@ use std::time::{Duration, Instant};
 // No async runtime: PAM modules should avoid multithreading. We use a single-threaded
 // polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
 
-/// Initialize logging for the PAM module.
-fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
-}
-
 /// Main PAM authentication entry point.
 ///
 /// ## Returns
@@ -52,7 +41,7 @@ fn init_logging() {
 /// - `PAM_PERM_DENIED`: Not running as root
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
-    init_logging();
+    logging::init_logging();
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
@@ -411,11 +400,11 @@ fn map_pam_outcome(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::*;
+    use crate::logging;
 
     #[test]
     fn test_logging_init() {
-        init_logging();
-        init_logging();
+        logging::init_logging();
+        logging::init_logging();
     }
 }

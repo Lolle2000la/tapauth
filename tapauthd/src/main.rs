@@ -6,6 +6,7 @@
 )]
 
 mod auth_handler;
+mod logging;
 mod transport;
 
 use auth_handler::{AuthSession, DaemonState};
@@ -18,8 +19,6 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
-// use tokio::sync::Mutex; // no longer needed without session tracking
-use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
@@ -52,12 +51,7 @@ struct ServerState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    logging::init_logging();
 
     tracing::info!("tapauthd starting...");
 

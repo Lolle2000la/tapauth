@@ -10,6 +10,7 @@ bytes = "1.7"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "signal", "sync"] }
 getrandom = { workspace = true }
 nix = { workspace = true }

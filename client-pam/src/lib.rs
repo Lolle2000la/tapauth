@@ -31,6 +31,7 @@
 mod config;
 mod error;
 mod ipc_client;
+mod logging;
 mod pam_logic;
 mod pam_sys;
 
