@@ -110,12 +110,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
+            pam_conv.try_error("TapAuth: Cannot connect to daemon, trying password...");
             return pam_sys::PAM_IGNORE;
         }
     };
     if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
     {
         tracing::error!("Failed to send authenticate request: {}", e);
+        pam_conv.try_error("TapAuth: Communication error, trying password...");
         return pam_sys::PAM_IGNORE;
     }
 
@@ -392,6 +394,7 @@ fn map_pam_outcome(
                 username,
                 resp.detail
             );
+            pam_conv.try_error(&format!("TapAuth: Error - {}", resp.detail));
             pam_sys::PAM_IGNORE
         }
     }
