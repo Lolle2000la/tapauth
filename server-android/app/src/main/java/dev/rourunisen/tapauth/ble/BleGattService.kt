@@ -382,6 +382,43 @@ class BleGattService : Service() {
             return
         }
 
+        // Check for location permissions (required for BLE scanning on Android 10+)
+        val hasFineLocation =
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+
+        // Check for background location permission (required for background BLE scanning on Android
+        // 10+)
+        val hasBackgroundLocation =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ActivityCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true // Not required before Android 10
+            }
+
+        Log.i(TAG, "Fine location permission: $hasFineLocation")
+        Log.i(TAG, "Background location permission: $hasBackgroundLocation")
+
+        if (!hasFineLocation) {
+            Log.e(TAG, "ACCESS_FINE_LOCATION permission not granted - BLE scanning will fail")
+            dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
+            updateNotification()
+            stopSelf()
+            return
+        }
+
+        if (!hasBackgroundLocation && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Log.w(
+                TAG,
+                "WARNING: ACCESS_BACKGROUND_LOCATION not granted - BLE scanning may be killed in background!",
+            )
+            // Don't stop the service, but warn the user
+            // The service will work in foreground but may be killed when backgrounded
+        }
+
         // Update config now that we know the service is likely to run
         try {
             val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(this)

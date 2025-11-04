@@ -42,6 +42,24 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showBatteryConfirm by remember { mutableStateOf(false) }
     var udpPortText by remember { mutableStateOf(config.udpPort.toString()) }
     var udpPortError by remember { mutableStateOf<String?>(null) }
+
+    // Check background location permission status (re-check when screen is visible)
+    var hasBackgroundLocation by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            hasBackgroundLocation =
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    androidx.core.content.ContextCompat.checkSelfPermission(
+                        context,
+                        android.Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                } else {
+                    true
+                }
+            kotlinx.coroutines.delay(1000) // Check every second
+        }
+    }
+
     // Observe live state from ServiceStatusManager
     val udpState by
         dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.collectAsState(
@@ -251,7 +269,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             dev.rourunisen.tapauth.service.AuthenticationService
                                                 .stop(context)
                                     } catch (_: Exception) {}
-                                    // wait briefly for service to report state; timeout after 2s
+                                    // wait briefly for service to report state; timeout after
+                                    // 2s
                                     withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                     udpBusy = false
                                 }
@@ -290,6 +309,77 @@ fun SettingsScreen(onBack: () -> Unit) {
                             },
                         )
                         if (bleBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                    }
+
+                    // Background location permission warning for BLE (Android 10+)
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        if (!hasBackgroundLocation && bleState) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors =
+                                    CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                    ),
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(
+                                        "⚠️ Background Location Required",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    Text(
+                                        "BLE scanning requires background location permission to work when the app is in the background.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier = Modifier.padding(vertical = 4.dp),
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        "Steps to grant permission:",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    Text(
+                                        "1. Tap 'Open Settings' below\n" +
+                                            "2. Tap 'Permissions'\n" +
+                                            "3. Tap 'Location'\n" +
+                                            "4. Select 'Allow all the time'",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier =
+                                            Modifier.padding(
+                                                start = 8.dp,
+                                                top = 4.dp,
+                                                bottom = 8.dp,
+                                            ),
+                                    )
+                                    Button(
+                                        onClick = {
+                                            try {
+                                                val intent =
+                                                    Intent(
+                                                            Settings
+                                                                .ACTION_APPLICATION_DETAILS_SETTINGS
+                                                        )
+                                                        .apply {
+                                                            data =
+                                                                Uri.parse(
+                                                                    "package:${context.packageName}"
+                                                                )
+                                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                                        }
+                                                context.startActivity(intent)
+                                            } catch (_: Exception) {}
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) {
+                                        Text("Open Settings")
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Service status display

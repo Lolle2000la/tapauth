@@ -1,8 +1,10 @@
 package dev.rourunisen.tapauth
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
@@ -61,6 +63,7 @@ class MainActivity : FragmentActivity() {
     internal val cameraGranted = mutableStateOf(false)
     internal val bluetoothGranted = mutableStateOf(false)
     internal val locationGranted = mutableStateOf(false)
+    internal val backgroundLocationGranted = mutableStateOf(false)
     internal val notificationGranted = mutableStateOf(false)
 
     // Request codes for classic permission requests
@@ -70,6 +73,7 @@ class MainActivity : FragmentActivity() {
         private const val REQUEST_BLUETOOTH = 2
         private const val REQUEST_LOCATION = 3
         private const val REQUEST_NOTIFICATION = 4
+        private const val REQUEST_BACKGROUND_LOCATION = 5
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -349,6 +353,17 @@ class MainActivity : FragmentActivity() {
                 true // Not needed on older versions
             }
 
+        // Check background location (Android 10+)
+        backgroundLocationGranted.value =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true // Not needed on older versions
+            }
+
         // Check notifications (Android 13+)
         notificationGranted.value =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -385,6 +400,37 @@ class MainActivity : FragmentActivity() {
         } else {
             locationGranted.value = true
             checkAllPermissions()
+        }
+    }
+
+    fun requestBackgroundLocation() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Show explanation dialog before requesting
+            val builder = AlertDialog.Builder(this)
+            builder.setTitle("Background Location Permission")
+            builder.setMessage(
+                "To keep BLE scanning active when the app is in the background, TapAuth needs background location permission.\n\n" +
+                    "On the next screen:\n" +
+                    "1. Tap 'Permissions'\n" +
+                    "2. Tap 'Location'\n" +
+                    "3. Select 'Allow all the time'\n\n" +
+                    "Note: TapAuth does not track your location. This permission is only required by Android for BLE scanning."
+            )
+            builder.setPositiveButton("Open Settings") { dialog: DialogInterface, which: Int ->
+                try {
+                    val intent =
+                        Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                            .apply {
+                                data = android.net.Uri.parse("package:$packageName")
+                                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to open settings", e)
+                }
+            }
+            builder.setNegativeButton("Cancel") { _: DialogInterface, _: Int -> }
+            builder.show()
         }
     }
 
@@ -527,6 +573,8 @@ fun PermissionRequestScreen(activity: MainActivity?) {
     val cameraGranted by activity?.cameraGranted ?: remember { mutableStateOf(false) }
     val bluetoothGranted by activity?.bluetoothGranted ?: remember { mutableStateOf(false) }
     val locationGranted by activity?.locationGranted ?: remember { mutableStateOf(false) }
+    val backgroundLocationGranted by
+        activity?.backgroundLocationGranted ?: remember { mutableStateOf(false) }
     val notificationGranted by activity?.notificationGranted ?: remember { mutableStateOf(false) }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -580,6 +628,18 @@ fun PermissionRequestScreen(activity: MainActivity?) {
             )
 
             Spacer(modifier = Modifier.height(12.dp))
+
+            // Background Location Permission (Android 10+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                PermissionButton(
+                    label = "Background Location",
+                    description = "Required for BLE scanning when app is in background",
+                    isGranted = backgroundLocationGranted,
+                    onClick = { activity?.requestBackgroundLocation() },
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+            }
 
             // Notification Permission
             PermissionButton(
