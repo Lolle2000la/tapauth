@@ -554,6 +554,16 @@ impl Transport for BleTransport {
                             );
                         }
                     }
+                    Some(wrapper_message::Payload::AuthDenial(_)) => {
+                        // Create GrantConfirmation even for denial
+                        if let Ok(confirmation) = self.create_confirmation(&request_packet) {
+                            *self.confirmation_data.lock().await = Some(confirmation);
+                            tracing::trace!(
+                                "Stored confirmation for denial, elapsed={:?}",
+                                start.elapsed()
+                            );
+                        }
+                    }
                     _ => {
                         tracing::warn!("Unexpected message type, waiting for other devices");
                         continue;
@@ -563,7 +573,7 @@ impl Transport for BleTransport {
                 // Wait briefly for server to read confirmation
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
-                // Return success - the encrypted response will be verified by auth_client
+                // Return response - both grants and denials will be verified by auth_handler
                 // We use a dummy SocketAddr since BLE doesn't have IP addresses
                 tracing::trace!(
                     "receive_response returning Response, total elapsed={:?}",
