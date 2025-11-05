@@ -265,11 +265,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // Set tty nonblocking to avoid read(1) blocking unexpectedly
     {
-        let fd = tty.as_raw_fd();
-        if let Ok(cur) = fcntl(fd, FcntlArg::F_GETFL) {
+        if let Ok(cur) = fcntl(&tty, FcntlArg::F_GETFL) {
             let mut flags = OFlag::from_bits_truncate(cur);
             flags.insert(OFlag::O_NONBLOCK);
-            let _ = fcntl(fd, FcntlArg::F_SETFL(flags));
+            let _ = fcntl(&tty, FcntlArg::F_SETFL(flags));
         }
     }
 
