@@ -32,8 +32,5 @@ local-ip-address = "0.6"
 lazy_static = "1.5"
 whoami = "1.5"
 
-# Privilege escalation
-sudo = "0.6"
-
 # Native dialogs
 native-dialog = "0.9"

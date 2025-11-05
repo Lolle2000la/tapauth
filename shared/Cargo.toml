@@ -57,6 +57,3 @@ prost-build.workspace = true
 [features]
 default = []
 jni = ["dep:jni"]
-
-[dev-dependencies]
-tokio-test.workspace = true
