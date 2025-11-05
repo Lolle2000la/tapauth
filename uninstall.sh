@@ -20,6 +20,7 @@ REMOVE_DAEMON=true
 # PAM configurations are always removed to prevent inconsistent state
 # Only user data removal is configurable
 REMOVE_USER_DATA=false
+PRESERVE_SYSTEM_ACCOUNTS=false
 DRY_RUN=false
 
 # Installation paths (some will be detected at runtime)
@@ -121,6 +122,7 @@ OPTIONS:
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --remove-user-data      Remove user configuration data (keys, pairings)
+    --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
     --dry-run               Show what would be done without doing it
 
 NOTES:
@@ -129,7 +131,9 @@ NOTES:
     - PAM module (pam_tapauth.so)
     - PAM configurations (all modified PAM files)
     - Configuration GUI
-    - System users and groups (tapauthd, tapauthd-clients)
+    
+    By default, system users and groups are also removed.
+    Use --preserve-system-accounts during upgrades to avoid recreating them.
     
     Only user data removal is optional (keys, pairings).
 
@@ -139,6 +143,9 @@ EXAMPLES:
 
     # Non-interactive removal of everything including configs
     sudo $0 --yes
+
+    # Upgrade (preserve system accounts)
+    sudo $0 --non-interactive --preserve-system-accounts
 
     # Dry run to see what would be removed
     sudo $0 --dry-run --yes
@@ -209,6 +216,10 @@ parse_args() {
                 ;;
             --remove-user-data)
                 REMOVE_USER_DATA=true
+                shift
+                ;;
+            --preserve-system-accounts)
+                PRESERVE_SYSTEM_ACCOUNTS=true
                 shift
                 ;;
             --dry-run)
@@ -577,6 +588,11 @@ remove_user_data() {
 
 # Remove system users and groups
 remove_system_users() {
+    if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == true ]]; then
+        print_info "Preserving system user and group (upgrade mode)"
+        return
+    fi
+    
     print_header "Removing System Users and Groups"
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -667,7 +683,11 @@ create_summary() {
     echo "  ✓ Daemon"
     echo "  ✓ PAM module"
     echo "  ✓ Configuration GUI"
-    echo "  ✓ System users and groups"
+    if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
+        echo "  ✓ System users and groups"
+    else
+        echo "  ○ System users and groups (preserved)"
+    fi
     echo "  ✓ All PAM configurations"
     [[ "$RUNNING_FROM_INSTALLED" == true ]] && echo "  ✓ Uninstaller script"
     
@@ -742,7 +762,11 @@ main() {
         echo "  ✓ Daemon (tapauthd, tapauthd.socket/service)"
         echo "  ✓ PAM module"
         echo "  ✓ Configuration GUI"
-        echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"
+        if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
+            echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"
+        else
+            echo "  ○ System users and groups (preserved for upgrade)"
+        fi
         
         echo ""
         echo "PAM configurations:"

@@ -530,9 +530,9 @@ check_existing_installation() {
     print_info "Running existing uninstaller..."
     echo ""
     
-    # Run the existing uninstaller without removing user data
-    # Pass --non-interactive to avoid prompts
-    if bash "$UNINSTALL_SCRIPT_DEST" --non-interactive; then
+    # Run the existing uninstaller without removing user data or system accounts
+    # Pass --non-interactive and --preserve-system-accounts to avoid prompts and keep accounts
+    if bash "$UNINSTALL_SCRIPT_DEST" --non-interactive --preserve-system-accounts; then
         print_success "Previous version uninstalled successfully"
         echo ""
     else
@@ -612,14 +612,22 @@ create_system_users() {
 
     if ! id -u tapauthd >/dev/null 2>&1; then
         print_info "Creating system user 'tapauthd'"
-        useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd || true
+        if useradd --system --home /nonexistent --shell /usr/sbin/nologin tapauthd 2>/dev/null; then
+            print_success "System user 'tapauthd' created"
+        else
+            print_warning "Failed to create system user 'tapauthd' (may already exist)"
+        fi
     else
         print_info "System user 'tapauthd' already exists"
     fi
 
     if ! getent group tapauthd-clients >/dev/null 2>&1; then
         print_info "Creating group 'tapauthd-clients'"
-        groupadd --system tapauthd-clients || true
+        if groupadd --system tapauthd-clients 2>/dev/null; then
+            print_success "Group 'tapauthd-clients' created"
+        else
+            print_warning "Failed to create group 'tapauthd-clients' (may already exist)"
+        fi
     else
         print_info "Group 'tapauthd-clients' already exists"
     fi
@@ -658,7 +666,13 @@ create_system_users() {
         mkdir -p "$log_dir"
         chown tapauthd:tapauthd "$log_dir"
         chmod 755 "$log_dir"
+    else
+        # Ensure ownership and permissions even if directory exists
+        chown tapauthd:tapauthd "$log_dir"
+        chmod 755 "$log_dir"
     fi
+    
+    print_success "System users/groups configured"
 }
 
 # Install and enable systemd socket/service units for tapauthd
