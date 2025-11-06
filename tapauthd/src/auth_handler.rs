@@ -64,19 +64,26 @@ struct AwaitAuthParams<'a> {
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
     pub config_manager: ClientConfigManager,
-    pub keypair: Ed25519KeyPair,
+    pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
     pub csk: ClientSymmetricKey,
     pub hostname: String,
     pub udp_socket: Arc<tokio::net::UdpSocket>,
+    pub init_error: Option<String>, // Stores TPM or other initialization errors
 }
 
 impl DaemonState {
     pub fn new(udp_socket: tokio::net::UdpSocket) -> Result<Self, AuthHandlerError> {
         let config_manager = ClientConfigManager::new();
 
-        let keypair = config_manager
-            .load_keypair()
-            .map_err(AuthHandlerError::Config)?;
+        // Try to load keypair - if it fails due to TPM, enter degraded mode
+        let (keypair, init_error) = match config_manager.load_keypair() {
+            Ok(kp) => (Some(kp), None),
+            Err(e) => {
+                let error_msg = format!("Failed to load keypair: {}. Please open tapauth-config GUI to regenerate keys.", e);
+                tracing::error!("{}", error_msg);
+                (None, Some(error_msg))
+            }
+        };
 
         let csk = config_manager
             .load_csk()
@@ -91,7 +98,18 @@ impl DaemonState {
             csk,
             hostname,
             udp_socket: Arc::new(udp_socket),
+            init_error,
         })
+    }
+
+    /// Check if daemon is in a healthy state (has valid keypair)
+    pub fn is_healthy(&self) -> bool {
+        self.keypair.is_some()
+    }
+
+    /// Get error message for degraded state
+    pub fn get_init_error(&self) -> Option<&str> {
+        self.init_error.as_deref()
     }
 }
 
@@ -136,6 +154,20 @@ impl AuthSession {
         #[cfg(feature = "ble")] cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
         #[cfg(not(feature = "ble"))] cancel_registry: Arc<HashMap<String, oneshot::Sender<()>>>,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
+        // Check if daemon is in degraded state (TPM key load failure)
+        if !self.state.is_healthy() {
+            let error_detail = self
+                .state
+                .get_init_error()
+                .unwrap_or("Keypair unavailable. Please run tapauth-config to regenerate keys.");
+
+            return Ok(ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Error as i32,
+                detail: error_detail.to_string(),
+                challenge: self.challenge.to_vec(),
+            });
+        }
+
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
         self.cancel_registry = Some(cancel_registry);
@@ -178,7 +210,13 @@ impl AuthSession {
             &self.challenge,
         )?;
         let mut wrapper = wrap_auth_request(request);
-        sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
+        // Safety: keypair is Some after health check
+        let keypair = self
+            .state
+            .keypair
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("keypair checked in health check"));
+        sign_wrapper_message(&mut wrapper, keypair)?;
         let packet = create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?;
 
         // Run authentication with timeout
@@ -279,12 +317,19 @@ impl AuthSession {
     > {
         use crate::transport::{BleTransport, UdpTransport};
 
-        let config = self.state.config_manager.load_config()?;
+        let toml_config = shared::config::TapAuthConfig::load();
         let udp_transport =
-            UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
+            UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
 
         let config_manager = Arc::new(ClientConfigManager::new());
-        let keypair = Arc::new(self.state.keypair.clone());
+        // Safety: keypair is Some after health check in handle_authenticate
+        let keypair = Arc::new(
+            self.state
+                .keypair
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
+                .clone(),
+        );
         let challenge = self.challenge;
 
         let ble_transport =
@@ -320,7 +365,13 @@ impl AuthSession {
     fn create_cancel_packet(&self) -> Result<EncryptedPacket, AuthHandlerError> {
         let msg = create_auth_cancel(&self.challenge)?;
         let mut wrapper = wrap_auth_cancel(msg);
-        sign_wrapper_message(&mut wrapper, &self.state.keypair)?;
+        // Safety: keypair is Some after health check in handle_authenticate
+        let keypair = self
+            .state
+            .keypair
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("keypair checked in health check"));
+        sign_wrapper_message(&mut wrapper, keypair)?;
         Ok(create_encrypted_packet_with_csk_nonce(
             &self.state.csk,
             &wrapper,
@@ -337,7 +388,13 @@ impl AuthSession {
         let ble_handle = if let Some(ble) = ble_transport.clone() {
             let packet = packet.clone();
             let csk = self.state.csk.clone();
-            let keypair = self.state.keypair.clone();
+            // Safety: keypair is Some after health check in handle_authenticate
+            let keypair = self
+                .state
+                .keypair
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
+                .clone();
             let challenge = self.challenge;
             let cfg = Arc::new(ClientConfigManager::new());
             tokio::spawn(async move {
@@ -351,7 +408,13 @@ impl AuthSession {
         let udp_handle = {
             let packet = packet.clone();
             let csk = self.state.csk.clone();
-            let keypair = self.state.keypair.clone();
+            // Safety: keypair is Some after health check in handle_authenticate
+            let keypair = self
+                .state
+                .keypair
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
+                .clone();
             let challenge = self.challenge;
             let cfg = Arc::new(ClientConfigManager::new());
             let udp = udp_transport.clone();
@@ -611,15 +674,22 @@ impl AuthSession {
     ) -> Result<(), AuthHandlerError> {
         use crate::transport::{Transport, UdpTransport};
 
-        let config = self.state.config_manager.load_config()?;
-        let transport = UdpTransport::from_socket(self.state.udp_socket.clone(), config.udp_port);
+        let toml_config = shared::config::TapAuthConfig::load();
+        let transport =
+            UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
         let transport_arc = Arc::new(transport);
         let cfg = Arc::new(ClientConfigManager::new());
+        // Safety: keypair is Some after health check in handle_authenticate
+        let keypair = self
+            .state
+            .keypair
+            .as_ref()
+            .expect("keypair checked in health check");
         Self::authenticate_with_transport(
             transport_arc,
             packet,
             &self.state.csk,
-            &self.state.keypair,
+            keypair,
             &self.challenge,
             cfg,
         )

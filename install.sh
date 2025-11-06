@@ -675,6 +675,58 @@ create_system_users() {
     print_success "System users/groups configured"
 }
 
+# Create initial configuration file
+create_initial_config() {
+    print_header "Creating Initial Configuration"
+    
+    local config_file="/etc/tapauth/config.toml"
+    local config_dir="/etc/tapauth"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "[DRY RUN] Would create configuration file at $config_file"
+        echo "  • pam_operation_timeout_secs: 3"
+        echo "  • udp_port: 36692"
+        echo "  • use_tpm: $USE_TPM"
+        return
+    fi
+    
+    # Don't overwrite existing config
+    if [[ -f "$config_file" ]]; then
+        print_info "Configuration file already exists, skipping creation"
+        print_info "To enable/disable TPM, edit $config_file manually"
+        return
+    fi
+    
+    # Create config directory if it doesn't exist
+    mkdir -p "$config_dir"
+    
+    print_info "Creating configuration file at $config_file"
+    
+    # Create TOML config
+    cat > "$config_file" <<EOF
+# TapAuth Configuration
+# See config.toml.example for more details
+
+# PAM operation timeout in seconds
+pam_operation_timeout_secs = 3
+
+# UDP port for authentication protocol
+udp_port = 36692
+
+# Enable TPM 2.0 for secure key storage
+# Requires tpm2-tools to be installed
+use_tpm = $([[ "$USE_TPM" == true ]] && echo "true" || echo "false")
+EOF
+    
+    # Set permissions (readable by all, writable only by root)
+    chmod 644 "$config_file"
+    
+    print_success "Configuration file created"
+    if [[ "$USE_TPM" == true ]]; then
+        print_info "TPM support enabled in configuration"
+    fi
+}
+
 # Install and enable systemd socket/service units for tapauthd
 install_systemd_units() {
     print_header "Installing systemd Units"
@@ -744,12 +796,25 @@ build_components() {
     
     # Determine daemon features to build with
     local daemon_features=""
+    local feature_list=()
+    
+    # Add BLE if requested
     if [[ "$USE_BLE" == true ]]; then
-        daemon_features="--features ble"
-        print_info "Building daemon with Bluetooth support (via BlueZ/DBus)"
+        feature_list+=("ble")
+    fi
+    
+    # Add TPM if requested
+    if [[ "$USE_TPM" == true ]]; then
+        feature_list+=("tpm")
+    fi
+    
+    # Build features string
+    if [[ ${#feature_list[@]} -gt 0 ]]; then
+        daemon_features="--features $(IFS=,; echo "${feature_list[*]}")"
+        print_info "Building daemon with features: ${feature_list[*]}"
     else
         daemon_features="--no-default-features"
-        print_info "Building daemon without Bluetooth support (UDP only)"
+        print_info "Building daemon without optional features (UDP only, no TPM)"
     fi
     
     print_info "Building with maximum optimizations for host architecture"
@@ -805,14 +870,26 @@ build_components() {
     $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p tapauthd $daemon_features
     print_success "Daemon built"
 
-    # Build PAM module (always)
-    print_info "Building PAM module"
-    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam
+    # Build PAM module with same TPM feature
+    local pam_features=""
+    if [[ "$USE_TPM" == true ]]; then
+        pam_features="--features tpm"
+    else
+        pam_features="--no-default-features"
+    fi
+    print_info "Building PAM module with features: $pam_features"
+    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam $pam_features
     print_success "PAM module built"
     
-    # Build configuration GUI (always)
-    print_info "Building configuration GUI..."
-    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-config-gui
+    # Build configuration GUI with same TPM feature
+    local gui_features=""
+    if [[ "$USE_TPM" == true ]]; then
+        gui_features="--features tpm"
+    else
+        gui_features="--no-default-features"
+    fi
+    print_info "Building configuration GUI with features: $gui_features"
+    $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-config-gui $gui_features
     print_success "Configuration GUI built"
     
     unset RUSTFLAGS
@@ -1409,6 +1486,7 @@ main() {
     fi
     
     create_system_users
+    create_initial_config
     install_daemon
     install_pam
     configure_pam

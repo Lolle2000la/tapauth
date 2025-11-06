@@ -61,6 +61,14 @@ pub enum ScreenMessage {
     SaveConfig,
     ConfigSaved,
     ConfigSaveFailed(String),
+
+    // TPM Recovery
+    #[cfg(feature = "tpm")]
+    RecoverFromTPMFailure,
+    #[cfg(feature = "tpm")]
+    TPMRecoveryComplete,
+    #[cfg(feature = "tpm")]
+    TPMRecoveryFailed(String),
 }
 
 impl Screen {

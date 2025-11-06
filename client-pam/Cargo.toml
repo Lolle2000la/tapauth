@@ -31,3 +31,4 @@ libc.workspace = true
 
 [features]
 default = []
+tpm = ["shared/tpm"]

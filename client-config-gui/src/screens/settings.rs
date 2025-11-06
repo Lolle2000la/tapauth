@@ -3,14 +3,15 @@ use iced::{
     widget::{button, column, container, scrollable, text, text_input, Space},
     Element, Length, Task,
 };
-use shared::config::{ClientConfig, ClientConfigManager};
+use shared::config::{ClientConfig, ClientConfigManager, TapAuthConfig, DEFAULT_CONFIG_PATH};
 
 #[derive(Debug, Clone)]
 pub struct SettingsScreen {
     rotating_csk: bool,
     error: Option<String>,
     success: Option<String>,
-    config: ClientConfig,
+    client_config: ClientConfig,
+    toml_config: TapAuthConfig,
     hostname_input: String,
     udp_port_input: String,
 }
@@ -18,15 +19,17 @@ pub struct SettingsScreen {
 impl SettingsScreen {
     pub fn new() -> Self {
         let config_manager = ClientConfigManager::new();
-        let config = config_manager.load_config().unwrap_or_default();
+        let client_config = config_manager.load_config().unwrap_or_default();
+        let toml_config = TapAuthConfig::load();
 
         Self {
             rotating_csk: false,
             error: None,
             success: None,
-            hostname_input: config.hostname.clone(),
-            udp_port_input: config.udp_port.to_string(),
-            config,
+            hostname_input: client_config.hostname.clone(),
+            udp_port_input: toml_config.udp_port.to_string(),
+            client_config,
+            toml_config,
         }
     }
 
@@ -56,24 +59,28 @@ impl SettingsScreen {
             }
             ScreenMessage::HostnameChanged(hostname) => {
                 self.hostname_input = hostname.clone();
-                self.config.hostname = hostname;
+                self.client_config.hostname = hostname;
                 Task::none()
             }
             ScreenMessage::UdpPortChanged(port_str) => {
                 self.udp_port_input = port_str.clone();
                 if let Ok(port) = port_str.parse::<u16>() {
-                    self.config.udp_port = port;
+                    self.toml_config.udp_port = port;
                 }
                 Task::none()
             }
             ScreenMessage::SaveConfig => {
                 self.error = None;
                 self.success = None;
-                let config = self.config.clone();
-                Task::perform(Self::save_config(config), |result| match result {
-                    Ok(_) => ScreenMessage::ConfigSaved,
-                    Err(e) => ScreenMessage::ConfigSaveFailed(e),
-                })
+                let client_config = self.client_config.clone();
+                let toml_config = self.toml_config.clone();
+                Task::perform(
+                    Self::save_config(client_config, toml_config),
+                    |result| match result {
+                        Ok(_) => ScreenMessage::ConfigSaved,
+                        Err(e) => ScreenMessage::ConfigSaveFailed(e),
+                    },
+                )
             }
             ScreenMessage::ConfigSaved => {
                 self.error = None;
@@ -182,12 +189,23 @@ impl SettingsScreen {
             .into()
     }
 
-    async fn save_config(config: ClientConfig) -> Result<(), String> {
+    async fn save_config(
+        client_config: ClientConfig,
+        toml_config: TapAuthConfig,
+    ) -> Result<(), String> {
         let config_manager = ClientConfigManager::new();
 
+        // Save client state config (hostname)
         config_manager
-            .save_config(&config)
-            .map_err(|e| format!("Failed to save configuration: {}", e))
+            .save_config(&client_config)
+            .map_err(|e| format!("Failed to save client configuration: {}", e))?;
+
+        // Save TOML config (UDP port, TPM, etc.)
+        toml_config
+            .save_to_path(DEFAULT_CONFIG_PATH)
+            .map_err(|e| format!("Failed to save TOML configuration: {}", e))?;
+
+        Ok(())
     }
 
     async fn rotate_csk() -> Result<(), String> {

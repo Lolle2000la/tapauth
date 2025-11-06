@@ -111,10 +111,17 @@ This will show detailed information about what would be installed, including:
 
 **No root access required for dry-run mode.**
 
-#### Install with TPM Support
+#### Install with TPM Support (Opt-in)
 ```bash
 sudo ./install.sh --use-tpm --configure-login --configure-sudo
 ```
+
+**Note**: TPM support is opt-in and requires:
+- TPM 2.0 hardware
+- `tpm2-tools` package installed
+- Building with `--use-tpm` flag
+
+See [docs/TPM_SUPPORT.md](docs/TPM_SUPPORT.md) for details.
 
 ### Installation Locations
 

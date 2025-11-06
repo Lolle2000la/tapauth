@@ -34,3 +34,7 @@ whoami = "1.5"
 
 # Native dialogs
 native-dialog = "0.9"
+
+[features]
+default = []
+tpm = ["shared/tpm"]

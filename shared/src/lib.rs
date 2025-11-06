@@ -33,6 +33,9 @@ pub mod models;
 pub mod network;
 pub mod protocol;
 
+#[cfg(feature = "tpm")]
+pub mod tpm;
+
 #[cfg(feature = "jni")]
 pub mod jni;
 

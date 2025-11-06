@@ -55,16 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("tapauthd starting...");
 
-    // Load configuration to get UDP port
-    let config_manager = shared::config::ClientConfigManager::new();
-    let config = config_manager.load_config().map_err(|e| {
-        tracing::error!("Failed to load configuration: {}", e);
-        std::io::Error::other(e.to_string())
-    })?;
+    // Load TOML configuration to get UDP port
+    let toml_config = shared::config::TapAuthConfig::load();
+    let udp_port = toml_config.udp_port;
 
     // Create global UDP socket for the daemon's lifetime
-    let udp_socket = shared::network::create_broadcast_socket(config.udp_port).await?;
-    tracing::info!("Created global UDP socket on port {}", config.udp_port);
+    let udp_socket = shared::network::create_broadcast_socket(udp_port).await?;
+    tracing::info!("Created global UDP socket on port {}", udp_port);
 
     // Load daemon state (config, keys, etc.)
     let daemon_state = match DaemonState::new(udp_socket) {

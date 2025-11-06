@@ -4003,6 +4003,7 @@ dependencies = [
  "socket2",
  "thiserror 2.0.17",
  "tokio",
+ "toml",
  "tracing",
  "x25519-dalek",
  "zeroize",

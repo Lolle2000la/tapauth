@@ -4,6 +4,11 @@
 //! and cryptographic keys. Operations enforce strict file permissions (700 for
 //! directories, 600 for files) to protect sensitive cryptographic material.
 //!
+//! ## Configuration Files
+//!
+//! - `/etc/tapauth/config.toml`: System-wide configuration (timeouts, ports, TPM)
+//! - `/var/lib/tapauth/`: Persistent state (keys, paired devices)
+//!
 //! ## Security
 //!
 //! - Persistent state is stored in `/var/lib/tapauth`
@@ -12,6 +17,10 @@
 //! - Writes are allowed when running as tapauthd; when running as root, files/dirs are
 //!   safely created then chowned to `tapauthd:tapauthd` to keep strict ownership
 //! - File permissions are enforced on every write operation and validated on reads
+
+mod toml_config;
+
+pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -207,10 +216,6 @@ pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
 pub struct ClientConfig {
     /// Hostname of this client
     pub hostname: String,
-    /// UDP port for authentication (default: 36692)
-    pub udp_port: u16,
-    /// Whether to use TPM for key storage
-    pub use_tpm: bool,
 }
 
 impl Default for ClientConfig {
@@ -220,8 +225,6 @@ impl Default for ClientConfig {
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".to_string()),
-            udp_port: 36692,
-            use_tpm: false,
         }
     }
 }
@@ -319,7 +322,43 @@ impl ClientConfigManager {
     }
 
     /// Load Ed25519 keypair
+    ///
+    /// If TPM is enabled in config, loads ONLY from TPM (no plaintext fallback).
+    /// If TPM is disabled, loads from plaintext file.
     pub fn load_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
+        // Try TPM if enabled and feature compiled in
+        #[cfg(feature = "tpm")]
+        {
+            let toml_config = TapAuthConfig::load();
+            if toml_config.use_tpm {
+                let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+
+                // TPM mode: ONLY load from TPM, no plaintext fallback
+                // This ensures we don't accidentally use old plaintext keys
+                if !tpm_key_path.with_extension("pub").exists() {
+                    return Err(ConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "TPM enabled but no TPM-sealed key found. Use tapauth-config GUI to regenerate keys.",
+                    )));
+                }
+
+                match crate::tpm::load_sealed_keypair(&tpm_key_path) {
+                    Ok(keypair) => {
+                        tracing::info!("Loaded Ed25519 keypair from TPM");
+                        return Ok(keypair);
+                    }
+                    Err(e) => {
+                        // TPM unsealing failed - this is a critical error
+                        return Err(ConfigError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to unseal key from TPM: {}. Use tapauth-config GUI to recover.", e),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // File-only mode: load from plaintext file
         let key_path = self.config_dir.join(CLIENT_KEY_FILE);
 
         if !key_path.exists() {
@@ -335,15 +374,50 @@ impl ClientConfigManager {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&data);
 
+        tracing::info!("Loaded Ed25519 keypair from file");
         Ok(Ed25519KeyPair::from_signing_key_bytes(&bytes)?)
     }
 
     /// Save Ed25519 keypair
+    ///
+    /// If TPM is enabled in config, seals the key with TPM only (no plaintext backup).
+    /// If TPM is disabled, saves as plaintext file with 600 permissions.
     pub fn save_keypair(&self, keypair: &Ed25519KeyPair) -> Result<(), ConfigError> {
         self.init()?;
-        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+
         let bytes = keypair.signing_key_bytes();
+
+        #[cfg(feature = "tpm")]
+        {
+            let toml_config = TapAuthConfig::load();
+            if toml_config.use_tpm {
+                // TPM-only mode: seal with TPM, no plaintext backup
+                if !crate::tpm::is_tpm_available() {
+                    return Err(ConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "TPM enabled in config but tpm2-tools not available",
+                    )));
+                }
+
+                let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path).map_err(|e| {
+                    ConfigError::Io(std::io::Error::other(format!(
+                        "Failed to seal key with TPM: {}",
+                        e
+                    )))
+                })?;
+
+                tracing::info!("Sealed Ed25519 keypair with TPM (no plaintext backup)");
+                return Ok(());
+            }
+        }
+
+        // File-only mode: save plaintext with 600 permissions
+        // (Also used when TPM feature is not compiled in)
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
         write_secure_file(&key_path, &bytes)?;
+        tracing::info!("Saved Ed25519 keypair to file");
+
         Ok(())
     }
 
@@ -478,6 +552,59 @@ impl ClientConfigManager {
         }
         Ok(())
     }
+
+    /// Recover from TPM failure by regenerating all keys and clearing pairings
+    ///
+    /// This is a complete reset that:
+    /// 1. Deletes TPM-sealed key files (if they exist)
+    /// 2. Deletes plaintext key file (if it exists)
+    /// 3. Generates new Ed25519 keypair
+    /// 4. Generates new CSK
+    /// 5. Clears all paired servers (they used the old keys)
+    ///
+    /// Returns Ok(()) if successful. The daemon must be restarted after this operation.
+    #[cfg(feature = "tpm")]
+    pub fn recover_from_tpm_failure(&self) -> Result<(), ConfigError> {
+        tracing::warn!("Starting TPM recovery: regenerating all keys and clearing pairings");
+
+        // Delete TPM-sealed key files if they exist
+        let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+        let tpm_pub = tpm_key_path.with_extension("pub");
+        let tpm_priv = tpm_key_path.with_extension("priv");
+
+        if tpm_pub.exists() {
+            fs::remove_file(&tpm_pub)?;
+            tracing::info!("Deleted TPM public key file");
+        }
+        if tpm_priv.exists() {
+            fs::remove_file(&tpm_priv)?;
+            tracing::info!("Deleted TPM private key file");
+        }
+
+        // Delete plaintext key file if it exists
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+        if key_path.exists() {
+            fs::remove_file(&key_path)?;
+            tracing::info!("Deleted plaintext key file");
+        }
+
+        // Clear all paired servers since they have the old public key
+        self.clear_paired_servers()?;
+        tracing::info!("Cleared all paired servers");
+
+        // Generate new Ed25519 keypair
+        self.generate_and_save_keypair()?;
+        tracing::info!("Generated new Ed25519 keypair");
+
+        // Rotate CSK to force re-pairing
+        self.rotate_csk()?;
+        tracing::info!("Generated new CSK");
+
+        tracing::warn!(
+            "TPM recovery complete. Daemon must be restarted and all devices must be re-paired."
+        );
+        Ok(())
+    }
 }
 
 impl Default for ClientConfigManager {
@@ -500,16 +627,12 @@ mod tests {
     fn test_config_serialization() {
         let config = ClientConfig {
             hostname: "test-host".to_string(),
-            udp_port: 12345,
-            use_tpm: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ClientConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.hostname, deserialized.hostname);
-        assert_eq!(config.udp_port, deserialized.udp_port);
-        assert_eq!(config.use_tpm, deserialized.use_tpm);
     }
 
     #[test]
