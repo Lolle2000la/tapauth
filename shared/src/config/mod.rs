@@ -349,8 +349,7 @@ impl ClientConfigManager {
                     }
                     Err(e) => {
                         // TPM unsealing failed - this is a critical error
-                        return Err(ConfigError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(ConfigError::Io(std::io::Error::other(
                             format!("Failed to unseal key from TPM: {}. Use tapauth-config GUI to recover.", e),
                         )));
                     }
