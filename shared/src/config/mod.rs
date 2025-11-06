@@ -349,9 +349,10 @@ impl ClientConfigManager {
                     }
                     Err(e) => {
                         // TPM unsealing failed - this is a critical error
-                        return Err(ConfigError::Io(std::io::Error::other(
-                            format!("Failed to unseal key from TPM: {}. Use tapauth-config GUI to recover.", e),
-                        )));
+                        return Err(ConfigError::Io(std::io::Error::other(format!(
+                            "Failed to unseal key from TPM: {}. Use tapauth-config GUI to recover.",
+                            e
+                        ))));
                     }
                 }
             }
@@ -399,14 +400,18 @@ impl ClientConfigManager {
                 }
 
                 let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
-                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path).map_err(|e| {
+                let pcr_list = toml_config.tpm_pcr_policy.pcr_list();
+                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path, pcr_list).map_err(|e| {
                     ConfigError::Io(std::io::Error::other(format!(
                         "Failed to seal key with TPM: {}",
                         e
                     )))
                 })?;
 
-                tracing::info!("Sealed Ed25519 keypair with TPM (no plaintext backup)");
+                tracing::info!(
+                    "Sealed Ed25519 keypair with TPM using PCR policy {:?} (no plaintext backup)",
+                    toml_config.tpm_pcr_policy
+                );
                 return Ok(());
             }
         }
@@ -619,7 +624,9 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ClientConfig::default();
-        assert_eq!(config.udp_port, 36692);
+        // ClientConfig only contains hostname, which is system-dependent
+        // Just verify it's not empty
+        assert!(!config.hostname.is_empty());
     }
 
     #[test]

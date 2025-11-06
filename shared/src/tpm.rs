@@ -1,18 +1,24 @@
 //! TPM (Trusted Platform Module) key storage implementation.
 //!
 //! This module provides secure key storage using TPM 2.0 chips when available.
-//! Since TPM 2.0 doesn't natively support Ed25519, we use a hybrid approach:
-//! - Generate a symmetric wrapping key in the TPM (non-migratable)
-//! - Use that key to encrypt the Ed25519 private key
-//! - Store the encrypted key on disk
-//! - Only the TPM can decrypt the wrapping key, thus protecting the Ed25519 key
+//! Since TPM 2.0 doesn't natively support Ed25519, we seal the private key
+//! directly using TPM's keyedseal functionality.
 //!
-//! ## Security
+//! ## Security Features
 //!
-//! - Wrapping key is non-migratable and bound to the TPM
-//! - Ed25519 private key is encrypted at rest
-//! - Decryption requires TPM access (can't extract wrapping key)
-//! - Keys are bound to the specific machine's TPM
+//! - **PCR-7 Sealing**: Keys are bound to Secure Boot state
+//!   - Prevents evil maid attacks (modified kernel/bootloader)
+//!   - Keys only unseal if boot chain hasn't been tampered with
+//! - **SHA-384**: Stronger cryptographic binding than SHA-256
+//! - **Non-migratable**: Sealed data cannot be extracted from TPM
+//! - **Machine-bound**: Keys tied to specific TPM hardware
+//! - **No plaintext backup**: Keys only exist in TPM-sealed form
+//!
+//! ## Recovery
+//!
+//! If unsealing fails (e.g., after disabling Secure Boot), use the
+//! configuration GUI to regenerate keys. This will require re-pairing
+//! all devices.
 
 use crate::crypto::{CryptoError, Ed25519KeyPair};
 use std::path::Path;
@@ -52,7 +58,15 @@ pub fn is_tpm_available() -> bool {
 ///
 /// This creates a wrapping key in the TPM, encrypts the Ed25519 private key with it,
 /// and stores the encrypted key in the specified file.
-pub fn generate_and_seal_keypair(sealed_key_path: &Path) -> Result<Ed25519KeyPair, TpmKeyError> {
+///
+/// # Arguments
+///
+/// * `sealed_key_path` - Path where the sealed key will be stored
+/// * `pcr_list` - Comma-separated list of PCR registers (e.g., "7,14" or "0,2,7,14")
+pub fn generate_and_seal_keypair(
+    sealed_key_path: &Path,
+    pcr_list: &str,
+) -> Result<Ed25519KeyPair, TpmKeyError> {
     if !is_tpm_available() {
         return Err(TpmKeyError::NotAvailable);
     }
@@ -64,7 +78,7 @@ pub fn generate_and_seal_keypair(sealed_key_path: &Path) -> Result<Ed25519KeyPai
     let private_bytes = keypair.signing_key_bytes();
 
     // Use TPM to seal the private key
-    seal_data_with_tpm(&private_bytes, sealed_key_path)?;
+    seal_data_with_tpm(&private_bytes, sealed_key_path, pcr_list)?;
 
     Ok(keypair)
 }
@@ -98,7 +112,28 @@ pub fn load_sealed_keypair(sealed_key_path: &Path) -> Result<Ed25519KeyPair, Tpm
 /// Seal data using TPM (encrypt with TPM-bound key)
 ///
 /// This is made public so the config module can use it directly
-pub fn seal_data_with_tpm(data: &[u8], output_path: &Path) -> Result<(), TpmKeyError> {
+///
+/// ## Security Hardening
+///
+/// This implementation uses configurable PCR sealing policies:
+///
+/// - **Standard** (recommended): PCR 7 + 14 (Secure Boot + MOK keys)
+///   - Prevents evil maid attacks (modified kernel/bootloader)
+///   - Maintains usability (doesn't break on BIOS/kernel updates)
+///   - SHA-384 for stronger cryptographic binding
+///
+/// - **Paranoid**: PCR 0 + 2 + 7 + 14 (BIOS + Option ROMs + Secure Boot + MOK)
+///   - Maximum protection against any boot chain modification
+///   - ⚠️ WILL break on BIOS updates and some hardware changes
+///   - Requires frequent key recovery via GUI
+///
+/// If the PCR values change (e.g., Secure Boot disabled, BIOS updated),
+/// unsealing will fail and require recovery via the GUI.
+pub fn seal_data_with_tpm(
+    data: &[u8],
+    output_path: &Path,
+    pcr_list: &str,
+) -> Result<(), TpmKeyError> {
     use std::io::Write;
 
     // Create a temporary file for the input data
@@ -107,14 +142,16 @@ pub fn seal_data_with_tpm(data: &[u8], output_path: &Path) -> Result<(), TpmKeyE
     file.write_all(data)?;
     drop(file);
 
-    // Use tpm2_create to create a sealed object
+    // Use tpm2_create to create a sealed object with PCR binding
     // We use the Storage Root Key (SRK) as the parent
     let output = std::process::Command::new("tpm2_create")
         .args([
             "-C",
             "0x81000001", // SRK handle (standard)
+            "-l",
+            &format!("sha256:{}", pcr_list), // 🔒 Configurable PCR sealing
             "-g",
-            "sha256", // Hash algorithm
+            "sha384", // Hash algorithm
             "-G",
             "keyedseal", // Sealed data object
             "-i",

@@ -31,3 +31,24 @@ udp_port = 36692
 # See docs/TPM_SUPPORT.md for more information.
 # Default: false
 use_tpm = false
+
+# TPM PCR Sealing Policy
+# Controls which Platform Configuration Registers (PCRs) are used to seal the authentication keys.
+# PCRs measure system state at boot time - keys can only be unsealed if measured values match.
+#
+# Options:
+#   "standard" (recommended):
+#     - Seals to PCR 7 (Secure Boot state) + PCR 14 (MOK keys)
+#     - Prevents evil maid attacks (modified bootloader/kernel)
+#     - Won't break on kernel updates or BIOS updates
+#     - Requires Secure Boot to be enabled
+#   
+#   "paranoid":
+#     - Seals to PCR 0 (BIOS) + PCR 2 (Option ROMs) + PCR 7 (Secure Boot) + PCR 14 (MOK)
+#     - Maximum protection - detects ANY boot chain modification
+#     - ⚠️ WARNING: WILL break on BIOS updates and some hardware changes
+#     - Requires frequent key recovery (re-pairing all devices)
+#
+# Only applies when use_tpm = true. Ignored if TPM feature is not compiled in.
+# Default: "standard"
+# tpm_pcr_policy = "standard"

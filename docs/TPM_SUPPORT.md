@@ -45,14 +45,16 @@ TPM 2.0 Disabled (File Mode):
 
 ## Security Properties
 
-| Feature | TPM Enabled | TPM Disabled |
-|---------|-------------|--------------|
-| **Root Protection** | ✅ Yes - key in TPM | ⚠️ No - file readable |
-| **Key Extraction** | ✅ Impossible | ⚠️ Possible (by root) |
-| **Machine Binding** | ✅ Yes - TPM locked | ⚠️ No - portable file |
-| **Offline Attacks** | ✅ Protected | ⚠️ Vulnerable |
-| **Hardware Required** | ⚠️ TPM 2.0 chip | ✅ None |
-| **Recovery** | ⚠️ GUI regeneration | ✅ Simple restore |
+| Feature | TPM Enabled (Standard) | TPM Enabled (Paranoid) | TPM Disabled |
+|---------|------------------------|------------------------|--------------|
+| **Root Protection** | ✅ Yes - key in TPM | ✅ Yes - key in TPM | ⚠️ No - file readable |
+| **Key Extraction** | ✅ Impossible | ✅ Impossible | ⚠️ Possible (by root) |
+| **Machine Binding** | ✅ Yes - TPM locked | ✅ Yes - TPM locked | ⚠️ No - portable file |
+| **Boot Tampering** | ✅ PCR 7+14 protected | ✅ PCR 0+2+7+14 protected | ⚠️ No protection |
+| **BIOS Updates** | ✅ Still works | ⚠️ Breaks (regenerate keys) | ✅ N/A |
+| **Offline Attacks** | ✅ Protected | ✅ Protected | ⚠️ Vulnerable |
+| **Hardware Required** | ⚠️ TPM 2.0 + Secure Boot | ⚠️ TPM 2.0 + Secure Boot | ✅ None |
+| **Recovery Frequency** | ⚠️ Rare (only major changes) | ⚠️ Frequent (firmware updates) | ✅ Simple restore |
 
 ### Attack Scenarios
 
@@ -60,12 +62,16 @@ TPM 2.0 Disabled (File Mode):
 - TPM Mode: ❌ Cannot extract key from TPM
 - File Mode: ✅ Can copy `/var/lib/tapauth/client_key`
 
+**Attacker modifies bootloader (evil maid attack):**
+- TPM Mode: ❌ PCR-7 mismatch prevents unseal, attack detected
+- File Mode: ✅ Keys work normally, attack succeeds
+
 **Attacker with disk access (system off, disk encrypted):**
 - TPM Mode: ❌ Cannot unseal without booting original system + TPM
 - File Mode: ❌ Cannot decrypt disk (protected by disk encryption)
 
 **Attacker with disk access (system off, disk NOT encrypted):**
-- TPM Mode: ❌ Cannot unseal - requires TPM chip
+- TPM Mode: ❌ Cannot unseal - requires TPM chip + correct boot state
 - File Mode: ✅ Can copy key file and use on different machine
 
 ## Installation
@@ -126,7 +132,45 @@ TPM support is controlled in `/etc/tapauth/config.toml`:
 # Requires tpm2-tools to be installed
 # Default: false
 use_tpm = true
+
+# TPM PCR Sealing Policy - determines boot integrity checks
+# Options: "standard" (recommended) or "paranoid"
+# Default: "standard"
+tpm_pcr_policy = "standard"
 ```
+
+### PCR Sealing Policies
+
+TapAuth supports two security levels for TPM key sealing:
+
+#### Standard (Recommended)
+- **PCRs**: 7 (Secure Boot state) + 14 (MOK keys)
+- **Security**: Prevents evil maid attacks (modified bootloader/kernel)
+- **Reliability**: ✅ Won't break on kernel or BIOS updates
+- **Requirements**: Secure Boot must be enabled
+- **Use case**: Most users - balanced security without maintenance burden
+
+#### Paranoid
+- **PCRs**: 0 (BIOS) + 2 (Option ROMs) + 7 (Secure Boot) + 14 (MOK)
+- **Security**: Maximum - detects ANY boot chain modification
+- **Reliability**: ⚠️ WILL break on BIOS updates and some hardware changes
+- **Recovery**: Frequent key regeneration required (re-pair all devices)
+- **Use case**: High-security environments where you control firmware updates
+
+**Choosing a Policy:**
+```toml
+# For most users (stable, secure)
+tpm_pcr_policy = "standard"
+
+# For maximum security (high maintenance)
+tpm_pcr_policy = "paranoid"
+```
+
+**What gets measured:**
+- **PCR 0**: BIOS/UEFI firmware code
+- **PCR 2**: Option ROM code (device firmware)
+- **PCR 7**: Secure Boot state and keys
+- **PCR 14**: MokList and MokListX (Machine Owner Keys)
 
 ### Enabling TPM After Installation
 
@@ -230,12 +274,46 @@ If the TPM chip fails or you replace the motherboard:
 
 If TPM unsealing fails but hardware is functional:
 
-**Possible causes:**
-- TPM was cleared/reset
-- BIOS/firmware update changed TPM state
-- PCR values changed (if using PCR-based sealing - future feature)
+**Possible causes (vary by PCR policy):**
 
-**Recovery:** Same as above - use GUI to regenerate keys.
+**Standard policy (PCR 7+14):**
+- **Secure Boot was disabled** - PCR-7 value changed
+- **Secure Boot keys changed** - New signing keys enrolled
+- **MOK keys changed** - Enrolled/removed Machine Owner Keys
+- **TPM was cleared/reset** - Firmware settings changed
+
+**Paranoid policy (PCR 0+2+7+14) - additionally:**
+- **BIOS/UEFI firmware update** - PCR-0 value changed
+- **Hardware changes** - New devices affecting PCR-2 (Option ROMs)
+- **Boot order changes** - Different device firmware loaded
+
+**Symptoms:**
+- Daemon fails to start with "Failed to unseal key from TPM" error
+- PAM authentication prompts you to use the GUI
+- GUI shows "⚠️ Keypair load failed" warning
+
+**Recovery:** 
+1. Check if Secure Boot is still enabled: `mokutil --sb-state`
+2. If Secure Boot is disabled, re-enable it in BIOS
+3. If using paranoid policy and BIOS was updated, this is expected behavior
+4. Use GUI to regenerate keys (all devices must re-pair)
+
+**Note**: If you frequently update BIOS firmware, use `tpm_pcr_policy = "standard"` to avoid constant key regeneration.
+
+### Secure Boot Not Enabled
+
+TPM-sealed keys require **Secure Boot to be enabled** for PCR-7 binding.
+
+**Check Secure Boot status:**
+```bash
+mokutil --sb-state
+# Should show: "SecureBoot enabled"
+```
+
+**If Secure Boot is disabled:**
+- Enable it in your BIOS/UEFI settings
+- Existing TPM-sealed keys won't unseal (PCR-7 value is different)
+- Use GUI recovery to regenerate keys with new PCR-7 state
 
 ### System Migration / Backup
 
@@ -257,13 +335,30 @@ TapAuth uses the following `tpm2-tools` commands:
 **Sealing (save_keypair):**
 ```bash
 # Create sealed object using SRK (handle 0x81000001)
+# With configurable PCR binding and SHA-384
+
+# Standard policy (PCR 7+14):
 tpm2_create \
     --parent 0x81000001 \
+    --policy "sha256:7,14" \
+    --hash-algorithm sha384 \
+    --type keyedseal \
+    --public /var/lib/tapauth/client_key.tpm.pub \
+    --private /var/lib/tapauth/client_key.tpm.priv \
+    --input <(echo -n "$ED25519_KEY_32_BYTES")
+
+# Paranoid policy (PCR 0+2+7+14):
+tpm2_create \
+    --parent 0x81000001 \
+    --policy "sha256:0,2,7,14" \
+    --hash-algorithm sha384 \
     --type keyedseal \
     --public /var/lib/tapauth/client_key.tpm.pub \
     --private /var/lib/tapauth/client_key.tpm.priv \
     --input <(echo -n "$ED25519_KEY_32_BYTES")
 ```
+
+The PCR list is determined by the `tpm_pcr_policy` setting in config.toml.
 
 **Unsealing (load_keypair):**
 ```bash

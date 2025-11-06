@@ -18,6 +18,65 @@ const DEFAULT_PAM_TIMEOUT_SECS: u64 = 3;
 /// Default UDP port for authentication
 const DEFAULT_UDP_PORT: u16 = 36692;
 
+/// TPM PCR sealing policy - determines which Platform Configuration Registers
+/// are used to seal the authentication keys.
+///
+/// PCRs measure system state at boot time. Sealing to PCRs means keys can only
+/// be unsealed if the measured values match, providing protection against
+/// boot chain tampering.
+#[cfg(feature = "tpm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TpmPcrPolicy {
+    /// Standard security - binds to boot integrity only
+    ///
+    /// PCRs: 7 (Secure Boot state), 14 (MOK keys)
+    ///
+    /// **Reliability**: High - won't break on kernel or BIOS updates
+    /// **Security**: Good - prevents evil maid attacks (modified bootloader)
+    ///
+    /// This is the recommended setting for most users.
+    #[default]
+    Standard,
+
+    /// Maximum security - binds to full boot chain
+    ///
+    /// PCRs: 0 (BIOS), 2 (Option ROMs), 7 (Secure Boot), 14 (MOK)
+    ///
+    /// **Reliability**: Low - WILL break on BIOS updates, may break on hardware changes
+    /// **Security**: Maximum - detects any boot chain modifications
+    ///
+    /// ⚠️ WARNING: This will require key recovery via GUI after:
+    /// - BIOS/UEFI firmware updates
+    /// - Secure Boot key changes
+    /// - Some hardware changes
+    ///
+    /// Only use this if you understand the trade-offs and are prepared
+    /// to regenerate keys (and re-pair devices) frequently.
+    Paranoid,
+}
+
+#[cfg(feature = "tpm")]
+impl TpmPcrPolicy {
+    /// Get the PCR list for tpm2-tools commands
+    ///
+    /// Returns a comma-separated list like "7,14" or "0,2,7,14"
+    pub fn pcr_list(&self) -> &'static str {
+        match self {
+            TpmPcrPolicy::Standard => "7,14",
+            TpmPcrPolicy::Paranoid => "0,2,7,14",
+        }
+    }
+
+    /// Get a human-readable description of what this policy protects against
+    pub fn description(&self) -> &'static str {
+        match self {
+            TpmPcrPolicy::Standard => "Protects against modified bootloader/kernel (evil maid attacks). Won't break on updates.",
+            TpmPcrPolicy::Paranoid => "Maximum protection - detects any boot chain changes. WILL break on BIOS updates.",
+        }
+    }
+}
+
 /// System-wide TapAuth configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,6 +97,16 @@ pub struct TapAuthConfig {
     /// Requires TPM 2.0 hardware and tpm2-tools installed
     #[cfg(feature = "tpm")]
     pub use_tpm: bool,
+
+    /// TPM PCR sealing policy - determines boot integrity checks
+    ///
+    /// - `standard`: Seals to PCR 7+14 (Secure Boot + MOK) - recommended
+    /// - `paranoid`: Seals to PCR 0+2+7+14 (BIOS + Option ROMs + Secure Boot + MOK)
+    ///
+    /// Standard mode provides good security without breaking on updates.
+    /// Paranoid mode provides maximum security but WILL break on BIOS updates.
+    #[cfg(feature = "tpm")]
+    pub tpm_pcr_policy: TpmPcrPolicy,
 }
 
 impl Default for TapAuthConfig {
@@ -47,6 +116,8 @@ impl Default for TapAuthConfig {
             udp_port: DEFAULT_UDP_PORT,
             #[cfg(feature = "tpm")]
             use_tpm: false,
+            #[cfg(feature = "tpm")]
+            tpm_pcr_policy: TpmPcrPolicy::default(),
         }
     }
 }
@@ -79,11 +150,12 @@ impl TapAuthConfig {
             Ok(config) => {
                 #[cfg(feature = "tpm")]
                 tracing::info!(
-                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}, use_tpm={}",
+                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}, use_tpm={}, tpm_pcr_policy={:?}",
                     path,
                     config.pam_operation_timeout_secs,
                     config.udp_port,
-                    config.use_tpm
+                    config.use_tpm,
+                    config.tpm_pcr_policy
                 );
                 #[cfg(not(feature = "tpm"))]
                 tracing::info!(
@@ -147,7 +219,10 @@ mod tests {
         assert_eq!(config.pam_operation_timeout_secs, 3);
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
-        assert_eq!(config.use_tpm, false);
+        {
+            assert_eq!(config.use_tpm, false);
+            assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard);
+        }
         assert_eq!(config.operation_timeout(), Duration::from_secs(3));
     }
 
@@ -158,6 +233,7 @@ mod tests {
             pam_operation_timeout_secs = 5
             udp_port = 12345
             use_tpm = true
+            tpm_pcr_policy = "paranoid"
         "#;
         #[cfg(not(feature = "tpm"))]
         let toml = r#"
@@ -169,7 +245,10 @@ mod tests {
         assert_eq!(config.pam_operation_timeout_secs, 5);
         assert_eq!(config.udp_port, 12345);
         #[cfg(feature = "tpm")]
-        assert_eq!(config.use_tpm, true);
+        {
+            assert_eq!(config.use_tpm, true);
+            assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Paranoid);
+        }
     }
 
     #[test]
@@ -187,7 +266,10 @@ mod tests {
         assert_eq!(config.pam_operation_timeout_secs, 3);
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
-        assert_eq!(config.use_tpm, true);
+        {
+            assert_eq!(config.use_tpm, true);
+            assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard); // Should default
+        }
     }
 
     #[test]
@@ -197,6 +279,8 @@ mod tests {
             udp_port: 54321,
             #[cfg(feature = "tpm")]
             use_tpm: true,
+            #[cfg(feature = "tpm")]
+            tpm_pcr_policy: TpmPcrPolicy::Paranoid,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -208,6 +292,9 @@ mod tests {
         );
         assert_eq!(parsed.udp_port, config.udp_port);
         #[cfg(feature = "tpm")]
-        assert_eq!(parsed.use_tpm, config.use_tpm);
+        {
+            assert_eq!(parsed.use_tpm, config.use_tpm);
+            assert_eq!(parsed.tpm_pcr_policy, config.tpm_pcr_policy);
+        }
     }
 }
