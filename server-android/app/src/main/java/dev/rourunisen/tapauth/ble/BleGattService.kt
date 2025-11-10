@@ -84,7 +84,6 @@ class BleGattService : Service() {
     private var bluetoothManager: BluetoothManager? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothLeScanner: BluetoothLeScanner? = null
-    private var bluetoothGatt: BluetoothGatt? = null
 
     private lateinit var deviceRepository: DeviceRepository
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
@@ -592,7 +591,7 @@ class BleGattService : Service() {
         }
 
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
-        bluetoothGatt = device.connectGatt(this, false, gattCallback)
+        device.connectGatt(this, false, gattCallback)
     }
 
     private suspend fun handleIncomingBleMessage(gatt: BluetoothGatt, data: ByteArray) {
@@ -1218,12 +1217,6 @@ class BleGattService : Service() {
         }
 
         stopScanning()
-
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
-                        PackageManager.PERMISSION_GRANTED
-        ) {
-            bluetoothGatt?.close()
-        }
 
         // Disconnect all active connections
         activeConnectionsByChallenge.values.forEach { gatt ->
