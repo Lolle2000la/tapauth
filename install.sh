@@ -450,11 +450,13 @@ prompt_pam_configuration() {
     
     if [[ "$has_kde" == true ]]; then
         local kde_default="n"
+        local kde_prompt="[y/N]"
         if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
             kde_default="Y"
+            kde_prompt="[Y/n]"
             print_info "KDE lock screen recommended when using system-auth"
         fi
-        read -p "Configure TapAuth for KDE (lock screen unlock)? [${kde_default}/$([ "$kde_default" = "Y" ] && echo "n" || echo "N")]: " response
+        read -p "Configure TapAuth for KDE (lock screen unlock)? ${kde_prompt}: " response
         if [[ "$kde_default" == "Y" ]]; then
             [[ ! "$response" =~ ^[Nn]$ ]] && CONFIGURE_PAM_KDE=true || CONFIGURE_PAM_KDE=false
         else
