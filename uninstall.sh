@@ -310,6 +310,7 @@ remove_pam_config() {
         echo ""
         
         show_pam_restore_diff "/etc/pam.d/login"
+        show_pam_restore_diff "/etc/pam.d/su"
         show_pam_restore_diff "/etc/pam.d/su-l"
         show_pam_restore_diff "/etc/pam.d/sudo"
         
@@ -360,6 +361,12 @@ remove_pam_config() {
     if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
         print_info "Removing TapAuth from login PAM configuration"
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
+    fi
+
+    # Remove from su
+    if [[ -f /etc/pam.d/su ]] && grep -q "pam_tapauth.so" /etc/pam.d/su 2>/dev/null; then
+        print_info "Removing TapAuth from su PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su
     fi
 
     # Remove from su-l
