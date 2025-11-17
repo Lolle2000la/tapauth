@@ -310,6 +310,7 @@ remove_pam_config() {
         echo ""
         
         show_pam_restore_diff "/etc/pam.d/login"
+        show_pam_restore_diff "/etc/pam.d/su-l"
         show_pam_restore_diff "/etc/pam.d/sudo"
         
         # Check both possible polkit locations
@@ -359,6 +360,12 @@ remove_pam_config() {
     if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
         print_info "Removing TapAuth from login PAM configuration"
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
+    fi
+
+    # Remove from su-l
+    if [[ -f /etc/pam.d/su-l ]] && grep -q "pam_tapauth.so" /etc/pam.d/su-l 2>/dev/null; then
+        print_info "Removing TapAuth from su-l PAM configuration"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su-l
     fi
     
     # Remove from sudo

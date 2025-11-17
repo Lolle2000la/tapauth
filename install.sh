@@ -21,6 +21,7 @@ INSTALL_DAEMON=true
 CONFIGURE_PAM_LOGIN=false
 CONFIGURE_PAM_SUDO=false
 CONFIGURE_PAM_POLKIT=false
+CONFIGURE_PAM_SU_L=false
 CONFIGURE_PAM_SYSTEM_AUTH=false
 CONFIGURE_PAM_GDM=false
 CONFIGURE_PAM_SDDM=false
@@ -183,6 +184,7 @@ OPTIONS:
     --use-tpm               Enable TPM support for key storage
     --configure-login       Configure PAM for login authentication
     --configure-sudo        Configure PAM for sudo authentication
+    --configure-su-l        Configure PAM for su-l (root shells via su -)
     --configure-polkit      Configure PAM for polkit authentication
     --configure-system-auth Configure PAM for system-auth (used by SDDM, lock screen, etc.)
     --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
@@ -233,6 +235,7 @@ parse_args() {
                 CONFIGURE_PAM_LOGIN=true
                 CONFIGURE_PAM_SUDO=true
                 CONFIGURE_PAM_POLKIT=true
+                CONFIGURE_PAM_SU_L=true
                 CONFIGURE_PAM_SYSTEM_AUTH=true
                 CONFIGURE_PAM_GDM=true
                 CONFIGURE_PAM_SDDM=false
@@ -250,6 +253,10 @@ parse_args() {
                 ;;
             --configure-sudo)
                 CONFIGURE_PAM_SUDO=true
+                shift
+                ;;
+            --configure-su-l)
+                CONFIGURE_PAM_SU_L=true
                 shift
                 ;;
             --configure-polkit)
@@ -378,6 +385,7 @@ prompt_pam_configuration() {
             CONFIGURE_PAM_LOGIN=false
             CONFIGURE_PAM_SUDO=false
             CONFIGURE_PAM_POLKIT=false
+            CONFIGURE_PAM_SU_L=false
         else
             CONFIGURE_PAM_SYSTEM_AUTH=false
             echo ""
@@ -386,6 +394,9 @@ prompt_pam_configuration() {
             
             read -p "Configure TapAuth for login (console/TTY login)? [y/N]: " response
             [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
+
+            read -p "Configure TapAuth for su-l (root shells via 'su -')? [y/N]: " response
+            [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SU_L=true || CONFIGURE_PAM_SU_L=false
             
             read -p "Configure TapAuth for sudo? [y/N]: " response
             [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SUDO=true || CONFIGURE_PAM_SUDO=false
@@ -400,6 +411,9 @@ prompt_pam_configuration() {
         
         read -p "Configure TapAuth for login (console/TTY login)? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_LOGIN=true || CONFIGURE_PAM_LOGIN=false
+
+        read -p "Configure TapAuth for su-l (root shells via 'su -')? [y/N]: " response
+        [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SU_L=true || CONFIGURE_PAM_SU_L=false
         
         read -p "Configure TapAuth for sudo? [y/N]: " response
         [[ "$response" =~ ^[Yy]$ ]] && CONFIGURE_PAM_SUDO=true || CONFIGURE_PAM_SUDO=false
@@ -948,8 +962,8 @@ install_pam() {
 
 # Configure PAM
 configure_pam() {
-    if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
-          "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
+        if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SU_L" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
+            "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
           "$CONFIGURE_PAM_LIGHTDM" == false && "$CONFIGURE_PAM_KDE" == false ]]; then
         print_info "No PAM services selected for configuration"
         return
@@ -965,6 +979,10 @@ configure_pam() {
         
         if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
             show_pam_diff "/etc/pam.d/login" "$pam_line" "pam_env.so"
+        fi
+
+        if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
+            show_pam_diff "/etc/pam.d/su-l" "$pam_line" "pam_env.so"
         fi
         
         if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
@@ -1089,6 +1107,26 @@ configure_pam() {
                 print_success "Configured PAM for login"
             else
                 print_warning "PAM login already configured"
+            fi
+        fi
+
+        # Configure su-l (used by `su -`)
+        if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
+            local su_l_file="/etc/pam.d/su-l"
+            print_info "Configuring PAM for su-l (root shells via 'su -')..."
+            if [[ -f "$su_l_file" ]]; then
+                if ! grep -q "pam_tapauth.so" "$su_l_file" 2>/dev/null; then
+                    if grep -q "pam_env.so" "$su_l_file"; then
+                        sed -i "/pam_env.so/a $pam_line" "$su_l_file"
+                    else
+                        sed -i "1i $pam_line" "$su_l_file"
+                    fi
+                    print_success "Configured PAM for su-l"
+                else
+                    print_warning "PAM su-l already configured"
+                fi
+            else
+                print_warning "su-l PAM configuration not found at $su_l_file"
             fi
         fi
         
@@ -1251,14 +1289,14 @@ configure_pam() {
     fi
     
     # Inform about when changes take effect
-    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true || \
+    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SU_L" == true || "$CONFIGURE_PAM_SUDO" == true || "$CONFIGURE_PAM_POLKIT" == true || \
           "$CONFIGURE_PAM_SYSTEM_AUTH" == true || "$CONFIGURE_PAM_GDM" == true || "$CONFIGURE_PAM_SDDM" == true || \
           "$CONFIGURE_PAM_LIGHTDM" == true || "$CONFIGURE_PAM_KDE" == true ]]; then
         echo ""
         print_info "PAM configuration updated"
         print_info "Changes take effect:"
         if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
-            echo "  • system-auth: On next login session (covers login, sudo, polkit)"
+            echo "  • system-auth: On next login session (covers login, su-l, sudo, polkit)"
         else
             if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
                 echo "  • sudo: Immediately (no restart needed)"
@@ -1268,6 +1306,9 @@ configure_pam() {
             fi
             if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
                 echo "  • login: On next login session (logout/login required)"
+            fi
+            if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
+                echo "  • su-l: Immediately (new 'su -' shells)"
             fi
         fi
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
@@ -1382,11 +1423,13 @@ create_summary() {
     if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]]; then
         echo "  ✓ System-auth (covers login, sudo, polkit)"
         echo "  ○ Login (covered by system-auth)"
+        echo "  ○ su-l (covered by system-auth)"
         echo "  ○ Sudo (covered by system-auth)"
         echo "  ○ Polkit (covered by system-auth)"
     else
         echo "  ✗ System-auth"
         [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (console/TTY)" || echo "  ✗ Login"
+        [[ "$CONFIGURE_PAM_SU_L" == true ]] && echo "  ✓ su-l (root shells via su -)" || echo "  ✗ su-l"
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo" || echo "  ✗ Sudo"
         [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (GUI privilege elevation)" || echo "  ✗ Polkit"
     fi
@@ -1435,13 +1478,16 @@ create_summary() {
         echo "  • Quick fix: sudo ausearch -m avc -ts recent | grep tapauthd | audit2allow -M tapauth_sddm && sudo semodule -i tapauth_sddm.pp"
     fi
     
-    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SUDO" == true ]]; then
+    if [[ "$CONFIGURE_PAM_LOGIN" == true || "$CONFIGURE_PAM_SU_L" == true || "$CONFIGURE_PAM_SUDO" == true ]]; then
         echo ""
         print_warning "IMPORTANT: Before logging out:"
         echo "  - Verify authentication works in a separate terminal"
         echo "  - Keep a root shell open as backup"
         if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
             echo "  - Test sudo now: 'sudo -k && sudo echo test' (works immediately)"
+        fi
+        if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
+            echo "  - Test 'su -' in another terminal to confirm su-l works"
         fi
         if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
             echo "  - Login authentication requires logout/login to take effect"
