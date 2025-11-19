@@ -1,5 +1,6 @@
 mod app;
 mod logging;
+mod pairing;
 mod screens;
 mod utils;
 
