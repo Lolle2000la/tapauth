@@ -12,22 +12,104 @@ use shared::{
     models::pairing::generate_pairing_url,
     protocol::ClientPairingSession,
 };
+use std::process::Command;
 use std::rc::Rc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-// Global state to store pairing session between SAS display and completion
-lazy_static! {
-    static ref PAIRING_STATE: Mutex<Option<PairingSessionState>> = Mutex::new(None);
+// ============================================================================
+// FirewallGuard - RAII pattern for ephemeral firewall rules
+// ============================================================================
+
+pub struct FirewallGuard {
+    port: u16,
 }
 
-struct PairingSessionState {
+impl FirewallGuard {
+    pub fn new(port: u16) -> Result<Self, String> {
+        // 1. Construct the command to INSERT (-I) the rule at position 1
+        // Note: Running as root, so no 'sudo' needed
+        let status = Command::new("iptables")
+            .args([
+                "-I",
+                "INPUT",
+                "1",
+                "-p",
+                "tcp",
+                "--dport",
+                &port.to_string(),
+                "-j",
+                "ACCEPT",
+            ])
+            .status()
+            .map_err(|e| format!("Failed to execute iptables: {}", e))?;
+
+        if status.success() {
+            tracing::info!("Firewall: Opened ephemeral port {}", port);
+            Ok(Self { port })
+        } else {
+            Err(format!("Firewall command failed with status: {}", status))
+        }
+    }
+}
+
+impl Drop for FirewallGuard {
+    fn drop(&mut self) {
+        // 2. Construct the command to DELETE (-D) the exact same rule
+        // This runs automatically when the struct goes out of scope
+        let _ = Command::new("iptables")
+            .args([
+                "-D",
+                "INPUT",
+                "-p",
+                "tcp",
+                "--dport",
+                &self.port.to_string(),
+                "-j",
+                "ACCEPT",
+            ])
+            .status()
+            .map_err(|e| {
+                tracing::error!("Failed to close firewall port {}: {}", self.port, e);
+                e
+            });
+
+        tracing::info!("Firewall: Closed ephemeral port {}", self.port);
+    }
+}
+
+// ============================================================================
+// Session State Management
+// ============================================================================
+
+pub struct PendingPairingState {
+    pub listener: TcpListener,
+    pub firewall_guard: FirewallGuard,
+    #[allow(dead_code)]
+    pub pairing_url: String,
+}
+
+pub struct PairingSessionState {
     stream: TcpStream,
     session: ClientPairingSession,
     server_public_key: [u8; 32],
     server_device_name: String,
     #[allow(dead_code)]
     keypair: Ed25519KeyPair,
+    // Keep firewall guard alive during active pairing
+    #[allow(dead_code)]
+    _firewall_guard: FirewallGuard,
+}
+
+pub enum SessionState {
+    None,
+    Pending(PendingPairingState),
+    Active(Box<PairingSessionState>),
+}
+
+// Global state to store pairing session between lifecycle phases
+lazy_static! {
+    static ref SESSION_STATE: Mutex<SessionState> = Mutex::new(SessionState::None);
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +372,7 @@ impl PairingScreen {
         let ipv6 = get_local_ipv6().ok_or("Failed to get IPv6 address")?;
         tracing::debug!("IPv4: {}, IPv6: {}", ipv4, ipv6);
 
-        // Start TCP listener on ephemeral port
+        // 1. Bind ONCE. Keep this listener alive!
         let listener = TcpListener::bind("0.0.0.0:0")
             .await
             .map_err(|e| format!("Failed to bind TCP listener: {}", e))?;
@@ -300,7 +382,11 @@ impl PairingScreen {
             .map_err(|e| format!("Failed to get local address: {}", e))?
             .port();
 
-        tracing::debug!("TCP listener on port {}", port);
+        tracing::debug!("TCP listener bound to port {}", port);
+
+        // 2. Create the Ephemeral Firewall Rule
+        // The rule exists as long as this variable exists
+        let firewall_guard = FirewallGuard::new(port)?;
 
         // Generate pairing URL with X25519 public key
         let session = ClientPairingSession::new(keypair.clone())
@@ -310,7 +396,15 @@ impl PairingScreen {
         let url = generate_pairing_url(&x25519_pubkey_hex, port, Some(ipv4), Some(ipv6));
         tracing::debug!("Generated URL: {}", url);
 
-        // Don't wait for connection here - just return URL and port
+        // 3. Store EVERYTHING in the global mutex
+        let pending_state = PendingPairingState {
+            listener,
+            firewall_guard,
+            pairing_url: url.clone(),
+        };
+
+        *SESSION_STATE.lock().await = SessionState::Pending(pending_state);
+
         Ok((url, port))
     }
 
@@ -327,11 +421,17 @@ impl PairingScreen {
             .load_keypair()
             .map_err(|e| format!("Failed to load keypair: {}", e))?;
 
-        // Bind and wait for connection (with 5 minute timeout)
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-            .await
-            .map_err(|e| format!("Failed to bind: {}", e))?;
+        // 1. Retrieve the existing listener and firewall guard from global state
+        let mut guard = SESSION_STATE.lock().await;
 
+        let (listener, firewall_guard) = match std::mem::replace(&mut *guard, SessionState::None) {
+            SessionState::Pending(state) => (state.listener, state.firewall_guard),
+            _ => return Err("No pending session found".to_string()),
+        };
+        drop(guard); // Unlock mutex while we await connection
+
+        // 2. Accept connection on the EXISTING listener
+        // The firewall rule is still active because `firewall_guard` is still in scope
         let accept_result = timeout(Duration::from_secs(300), listener.accept()).await;
 
         let (stream, _addr) = match accept_result {
@@ -363,16 +463,18 @@ impl PairingScreen {
             &sas
         );
 
-        // Store session state globally for phase 2
+        // 3. Transition to Active State
+        // We MUST move `firewall_guard` into the new state so it doesn't drop yet!
         let state = PairingSessionState {
             stream,
             session,
             server_public_key,
             server_device_name: server_device_name.clone(),
             keypair: keypair.clone(),
+            _firewall_guard: firewall_guard,
         };
 
-        *PAIRING_STATE.lock().await = Some(state);
+        *SESSION_STATE.lock().await = SessionState::Active(Box::new(state));
 
         // Return SAS immediately to show to user
         Ok((shared::crypto::format_sas(&sas), port))
@@ -389,8 +491,11 @@ impl PairingScreen {
         tracing::info!("Pairing as user: {}", username);
 
         // Retrieve stored session state
-        let mut state_guard = PAIRING_STATE.lock().await;
-        let state = state_guard.take().ok_or("No pairing session in progress")?;
+        let mut state_guard = SESSION_STATE.lock().await;
+        let state = match std::mem::replace(&mut *state_guard, SessionState::None) {
+            SessionState::Active(s) => s,
+            _ => return Err("No active pairing session in progress".to_string()),
+        };
         drop(state_guard); // Release lock early
 
         let PairingSessionState {
@@ -399,7 +504,8 @@ impl PairingScreen {
             server_public_key,
             server_device_name,
             keypair: _,
-        } = state;
+            _firewall_guard: _,
+        } = *state;
 
         // Load or generate CSK
         let csk = config
