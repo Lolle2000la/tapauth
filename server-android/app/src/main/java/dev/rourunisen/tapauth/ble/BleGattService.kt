@@ -1089,7 +1089,8 @@ class BleGattService : Service() {
                         BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
                     ) == BluetoothStatusCodes.SUCCESS
                 } else {
-                    @Suppress("DEPRECATION") responseChar.value = response
+                    @Suppress("DEPRECATION")
+                    responseChar.value = response
                     @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
                 }
 
@@ -1188,7 +1189,8 @@ class BleGattService : Service() {
                             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
                         ) == BluetoothStatusCodes.SUCCESS
                     } else {
-                        @Suppress("DEPRECATION") responseChar.value = response
+                        @Suppress("DEPRECATION")
+                        responseChar.value = response
                         @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
                     }
 

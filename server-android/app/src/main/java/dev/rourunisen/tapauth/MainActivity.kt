@@ -510,7 +510,7 @@ class MainActivity : FragmentActivity() {
         unregisterReceiver(authRequestReceiver)
     }
 
-    override fun onNewIntent(intent: Intent?) {
+    override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         // Note: Auth request intents from notifications now go to BiometricPromptActivity
         // This onNewIntent is kept for compatibility but shouldn't receive auth requests
