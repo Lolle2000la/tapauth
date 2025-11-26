@@ -586,10 +586,14 @@ class AuthenticationService : Service() {
 
             // Verify signature
             // Reconstruct the message with signature field empty
+            val challengeBytes = android.util.Base64.decode(
+                authRequest.challenge,
+                android.util.Base64.NO_WRAP,
+            )
             val messageForVerification =
                 try {
                     dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
-                        authRequest.challenge,
+                        challengeBytes,
                         authRequest.username,
                         authRequest.hostname,
                         authRequest.timestampUnixSeconds,
