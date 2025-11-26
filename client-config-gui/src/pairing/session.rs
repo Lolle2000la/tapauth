@@ -10,7 +10,15 @@ impl FirewallGuard {
     pub fn new(port: u16) -> Result<Self, String> {
         let status = Command::new("iptables")
             .args([
-                "-I", "INPUT", "1", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT",
+                "-I",
+                "INPUT",
+                "1",
+                "-p",
+                "tcp",
+                "--dport",
+                &port.to_string(),
+                "-j",
+                "ACCEPT",
             ])
             .status()
             .map_err(|e| format!("Failed to execute iptables: {}", e))?;
@@ -28,7 +36,14 @@ impl Drop for FirewallGuard {
     fn drop(&mut self) {
         let _ = Command::new("iptables")
             .args([
-                "-D", "INPUT", "-p", "tcp", "--dport", &self.port.to_string(), "-j", "ACCEPT",
+                "-D",
+                "INPUT",
+                "-p",
+                "tcp",
+                "--dport",
+                &self.port.to_string(),
+                "-j",
+                "ACCEPT",
             ])
             .status()
             .map_err(|e| {
