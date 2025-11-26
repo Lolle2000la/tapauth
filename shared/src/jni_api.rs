@@ -29,7 +29,7 @@
 //! - `IllegalArgumentException`: Invalid inputs (wrong sizes, null, malformed UTF-8)
 //! - `IllegalStateException`: JNI/VM interop errors (class lookup, array operations)
 //! - `OutOfMemoryError`: Allocation failures
-//! - `IOException`: Protobuf encode/decode and JSON serialization failures
+//! - `IOException`: Protobuf encode/decode failures
 //! - `GeneralSecurityException`: General crypto errors (nonce generation, encryption setup)
 //! - `AEADBadTagException`: AEAD decryption authentication failures
 //! - `BadPaddingException`: Decryption padding/format errors
@@ -1089,77 +1089,59 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_signData
 
 /// Serialize AuthenticationRequest for signature verification.
 ///
-/// Takes JSON representation and creates protobuf bytes with empty signature field.
+/// Creates protobuf bytes with empty signature field.
 /// Used to reconstruct the exact bytes that were signed.
 ///
-/// @param requestJson JSON with challenge, username, hostname, timestamp_unix_seconds, signature_algorithm (byte fields base64-encoded)
-/// @return Serialized AuthenticationRequest protobuf with empty signature field
-/// @throws IllegalArgumentException if requestJson cannot be read
-/// @throws IOException if JSON parsing, base64 decoding, or protobuf encoding fails
+/// @param challenge 32-byte authentication challenge
+/// @param username Username requesting authentication
+/// @param hostname Hostname where authentication is requested
+/// @param timestampUnixSeconds Unix timestamp when request was created
+/// @param signatureAlgorithm Signature algorithm (e.g., Ed25519 = 1)
+/// @return Serialized WrapperMessage protobuf with empty signature field
+/// @throws IllegalArgumentException if challenge cannot be read
+/// @throws IOException if protobuf encoding fails
 /// @throws OutOfMemoryError if result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializeAuthRequestForVerification(
     mut env: JNIEnv,
     _class: JClass,
-    request_json: JString,
+    challenge: JByteArray,
+    username: JString,
+    hostname: JString,
+    timestamp_unix_seconds: jlong,
+    signature_algorithm: jint,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jstring_to_rust, vec_to_jbytearray};
-        use super::jni::exceptions::throw_io_exception;
+        use super::jni::conversions::{jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray};
         use super::jni::protobuf::encode_message;
         use crate::protocol::pb;
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-        let json_str = match jstring_to_rust(&mut env, request_json, "request_json") {
+        let challenge_bytes = match jbytearray_to_vec(&mut env, challenge, "challenge") {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
+
+        let username_str = match jstring_to_rust(&mut env, username, "username") {
             Some(s) => s,
             None => return std::ptr::null_mut(),
         };
 
-        let json_value: serde_json::Value = match serde_json::from_str(&json_str) {
-            Ok(val) => val,
-            Err(err) => {
-                throw_io_exception(&mut env, &format!("failed to parse JSON: {err}"));
-                return std::ptr::null_mut();
-            }
-        };
-
-        let challenge_b64 = json_value
-            .get("challenge")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let challenge = match BASE64.decode(challenge_b64) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                throw_io_exception(&mut env, &format!("failed to decode challenge: {err}"));
-                return std::ptr::null_mut();
-            }
+        let hostname_str = match jstring_to_rust(&mut env, hostname, "hostname") {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
         };
 
         let auth_request = pb::AuthenticationRequest {
-            challenge,
-            username: json_value
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            hostname: json_value
-                .get("hostname")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            timestamp_unix_seconds: json_value
-                .get("timestamp_unix_seconds")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            challenge: challenge_bytes,
+            username: username_str,
+            hostname: hostname_str,
+            timestamp_unix_seconds: timestamp_unix_seconds as u64,
         };
 
-        // Wrap in WrapperMessage (signature fields will be set by Android after signing)
+        // Wrap in WrapperMessage (signature field is empty for verification)
         let wrapper = pb::WrapperMessage {
             version: 1,
-            signature_algorithm: json_value
-                .get("signature_algorithm")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32,
+            signature_algorithm,
             signature: vec![],
             payload: Some(pb::wrapper_message::Payload::AuthRequest(auth_request)),
         };
@@ -1249,10 +1231,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
 /// Parse AuthenticationCancel from WrapperMessage protobuf.
 ///
 /// @param cancelBytes Serialized WrapperMessage containing AuthenticationCancel
-/// @return JSON string with challenge, signature_algorithm, signature fields (byte fields base64-encoded)
+/// @return AuthenticationCancel object with challenge, signatureAlgorithm, signature fields
 /// @throws IllegalArgumentException if cancelBytes cannot be read
-/// @throws IOException if protobuf decoding fails, payload is not AuthenticationCancel, or JSON serialization fails
-/// @throws OutOfMemoryError if result string allocation fails
+/// @throws IOException if protobuf decoding fails or payload is not AuthenticationCancel
+/// @throws OutOfMemoryError if result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAuthenticationCancel(
     mut env: JNIEnv,

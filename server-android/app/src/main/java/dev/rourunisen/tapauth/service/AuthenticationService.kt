@@ -586,11 +586,15 @@ class AuthenticationService : Service() {
 
             // Verify signature
             // Reconstruct the message with signature field empty
-            val gson = com.google.gson.Gson()
-            val requestJson = gson.toJson(authRequest)
             val messageForVerification =
                 try {
-                    dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(requestJson)
+                    dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
+                        authRequest.challenge,
+                        authRequest.username,
+                        authRequest.hostname,
+                        authRequest.timestampUnixSeconds,
+                        authRequest.signatureAlgorithm,
+                    )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to serialize request for verification", e)
                     return

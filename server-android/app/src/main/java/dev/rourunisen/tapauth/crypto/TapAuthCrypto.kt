@@ -109,13 +109,23 @@ object TapAuthCrypto {
     /**
      * Serialize an AuthenticationRequest as a WrapperMessage for signature verification.
      *
-     * Creates a WrapperMessage with the request payload and signature fields from JSON. Used to
+     * Creates a WrapperMessage with the request payload and empty signature field. Used to
      * reconstruct the exact bytes that were signed by the client.
      *
-     * @param requestJson JSON representation of the request (must include signature_algorithm)
+     * @param challenge 32-byte authentication challenge
+     * @param username Username requesting authentication
+     * @param hostname Hostname where authentication is requested
+     * @param timestampUnixSeconds Unix timestamp when request was created
+     * @param signatureAlgorithm Signature algorithm (e.g., Ed25519 = 1)
      * @return Serialized WrapperMessage protobuf bytes
      */
-    external fun serializeAuthRequestForVerification(requestJson: String): ByteArray
+    external fun serializeAuthRequestForVerification(
+        challenge: ByteArray,
+        username: String,
+        hostname: String,
+        timestampUnixSeconds: Long,
+        signatureAlgorithm: Int,
+    ): ByteArray
 
     /**
      * Parse GrantConfirmation from WrapperMessage protobuf bytes.
@@ -452,8 +462,20 @@ fun signData(privateKey: ByteArray, message: ByteArray): ByteArray {
 }
 
 /** Serialize an AuthenticationRequest for signature verification */
-fun serializeAuthRequestForVerification(requestJson: String): ByteArray {
-    return TapAuthCrypto.serializeAuthRequestForVerification(requestJson)
+fun serializeAuthRequestForVerification(
+    challenge: ByteArray,
+    username: String,
+    hostname: String,
+    timestampUnixSeconds: Long,
+    signatureAlgorithm: Int,
+): ByteArray {
+    return TapAuthCrypto.serializeAuthRequestForVerification(
+        challenge,
+        username,
+        hostname,
+        timestampUnixSeconds,
+        signatureAlgorithm,
+    )
 }
 
 /**

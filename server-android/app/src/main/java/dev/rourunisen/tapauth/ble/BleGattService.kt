@@ -892,12 +892,14 @@ class BleGattService : Service() {
             Log.d(TAG, "Verifying signature for matched device: ${matchedDevice.displayName}")
 
             // Reconstruct message for verification
-            val gson = com.google.gson.Gson()
-            val requestJson = gson.toJson(authRequest)
             val messageForVerification =
                     try {
                         dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
-                                requestJson
+                                authRequest.challenge,
+                                authRequest.username,
+                                authRequest.hostname,
+                                authRequest.timestampUnixSeconds,
+                                authRequest.signatureAlgorithm,
                         )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to serialize BLE request for verification", e)

@@ -341,6 +341,70 @@ class TapAuthCryptoTest {
     }
 
     @Test
+    fun testSerializeAuthRequestForVerification() {
+        val challenge = ByteArray(32) { it.toByte() }
+        val username = "testuser"
+        val hostname = "testhost.local"
+        val timestampUnixSeconds = 1700000000L
+        val signatureAlgorithm = 1 // Ed25519
+
+        val serialized = TapAuthCrypto.serializeAuthRequestForVerification(
+            challenge,
+            username,
+            hostname,
+            timestampUnixSeconds,
+            signatureAlgorithm,
+        )
+
+        assertNotNull("Serialized request should not be null", serialized)
+        assertTrue("Serialized request should have content", serialized.isNotEmpty())
+
+        // Verify the message type is AUTH_REQUEST
+        val messageType = TapAuthCrypto.determineMessageType(serialized)
+        assertEquals("Should be AUTH_REQUEST", "AUTH_REQUEST", messageType)
+    }
+
+    @Test
+    fun testSerializeAuthRequestForVerificationRoundTrip() {
+        // Create and sign an auth request, then verify we can recreate the signed bytes
+        val challenge = ByteArray(32) { it.toByte() }
+        val username = "testuser"
+        val hostname = "testhost.local"
+        val timestampUnixSeconds = 1700000000L
+        val signatureAlgorithm = 1 // Ed25519
+
+        val keypair = TapAuthCrypto.generateKeypair()
+        val privateKey = keypair[0] as ByteArray
+        val publicKey = keypair[1] as ByteArray
+
+        // Serialize the request for signing (empty signature)
+        val messageForSigning = TapAuthCrypto.serializeAuthRequestForVerification(
+            challenge,
+            username,
+            hostname,
+            timestampUnixSeconds,
+            signatureAlgorithm,
+        )
+
+        // Sign the message
+        val signature = TapAuthCrypto.signData(privateKey, messageForSigning)
+        assertEquals("Ed25519 signature should be 64 bytes", 64, signature.size)
+
+        // Re-serialize to get the same bytes for verification
+        val messageForVerification = TapAuthCrypto.serializeAuthRequestForVerification(
+            challenge,
+            username,
+            hostname,
+            timestampUnixSeconds,
+            signatureAlgorithm,
+        )
+
+        // Verify the signature
+        val isValid = TapAuthCrypto.verifySignature(publicKey, messageForVerification, signature)
+        assertTrue("Signature should verify with reconstructed message", isValid)
+    }
+
+    @Test
     fun testCreateAndDecryptEncryptedPacket() {
         val csk = ByteArray(32) { it.toByte() }
         val keypair = TapAuthCrypto.generateKeypair()
