@@ -3,8 +3,8 @@
 //! Provides privilege elevation helpers and network interface enumeration.
 
 pub mod elevation;
-pub mod system_check;
 pub mod service;
+pub mod system_check;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

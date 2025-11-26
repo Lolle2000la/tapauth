@@ -3,7 +3,7 @@ use tokio::process::Command;
 /// Restart the tapauthd systemd service
 pub async fn restart_tapauthd_service() -> Result<(), String> {
     tracing::info!("Restarting tapauthd service...");
-    
+
     let output = Command::new("systemctl")
         .arg("restart")
         .arg("tapauthd.service")
