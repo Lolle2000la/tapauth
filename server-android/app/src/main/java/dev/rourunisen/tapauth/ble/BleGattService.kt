@@ -892,10 +892,6 @@ class BleGattService : Service() {
             Log.d(TAG, "Verifying signature for matched device: ${matchedDevice.displayName}")
 
             // Reconstruct message for verification
-            val challengeBytes = android.util.Base64.decode(
-                    authRequest.challenge,
-                    android.util.Base64.NO_WRAP,
-            )
             val messageForVerification =
                     try {
                         dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
