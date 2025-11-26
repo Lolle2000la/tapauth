@@ -348,13 +348,14 @@ class TapAuthCryptoTest {
         val timestampUnixSeconds = 1700000000L
         val signatureAlgorithm = 1 // Ed25519
 
-        val serialized = TapAuthCrypto.serializeAuthRequestForVerification(
-            challenge,
-            username,
-            hostname,
-            timestampUnixSeconds,
-            signatureAlgorithm,
-        )
+        val serialized =
+            TapAuthCrypto.serializeAuthRequestForVerification(
+                challenge,
+                username,
+                hostname,
+                timestampUnixSeconds,
+                signatureAlgorithm,
+            )
 
         assertNotNull("Serialized request should not be null", serialized)
         assertTrue("Serialized request should have content", serialized.isNotEmpty())
@@ -378,26 +379,28 @@ class TapAuthCryptoTest {
         val publicKey = keypair[1] as ByteArray
 
         // Serialize the request for signing (empty signature)
-        val messageForSigning = TapAuthCrypto.serializeAuthRequestForVerification(
-            challenge,
-            username,
-            hostname,
-            timestampUnixSeconds,
-            signatureAlgorithm,
-        )
+        val messageForSigning =
+            TapAuthCrypto.serializeAuthRequestForVerification(
+                challenge,
+                username,
+                hostname,
+                timestampUnixSeconds,
+                signatureAlgorithm,
+            )
 
         // Sign the message
         val signature = TapAuthCrypto.signData(privateKey, messageForSigning)
         assertEquals("Ed25519 signature should be 64 bytes", 64, signature.size)
 
         // Re-serialize to get the same bytes for verification
-        val messageForVerification = TapAuthCrypto.serializeAuthRequestForVerification(
-            challenge,
-            username,
-            hostname,
-            timestampUnixSeconds,
-            signatureAlgorithm,
-        )
+        val messageForVerification =
+            TapAuthCrypto.serializeAuthRequestForVerification(
+                challenge,
+                username,
+                hostname,
+                timestampUnixSeconds,
+                signatureAlgorithm,
+            )
 
         // Verify the signature
         val isValid = TapAuthCrypto.verifySignature(publicKey, messageForVerification, signature)
