@@ -4,6 +4,7 @@
 
 pub mod elevation;
 pub mod system_check;
+pub mod service;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

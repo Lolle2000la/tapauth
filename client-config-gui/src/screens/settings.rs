@@ -205,6 +205,9 @@ impl SettingsScreen {
             .save_to_path(DEFAULT_CONFIG_PATH)
             .map_err(|e| format!("Failed to save TOML configuration: {}", e))?;
 
+        // Restart service to apply changes
+        crate::utils::service::restart_tapauthd_service().await?;
+
         Ok(())
     }
 
@@ -213,7 +216,11 @@ impl SettingsScreen {
 
         config
             .rotate_csk()
-            .map(|_| ()) // Discard the returned CSK, we just need success
-            .map_err(|e| format!("Failed to rotate CSK: {}", e))
+            .map_err(|e| format!("Failed to rotate CSK: {}", e))?;
+
+        // Restart service to apply changes
+        crate::utils::service::restart_tapauthd_service().await?;
+
+        Ok(())
     }
 }
