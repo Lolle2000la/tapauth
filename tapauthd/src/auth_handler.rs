@@ -10,10 +10,7 @@ use shared::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
-
-#[cfg(feature = "ble")]
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 #[cfg(feature = "ble")]
 use shared::crypto::generate_current_temporal_identifier_ble;
@@ -43,6 +40,7 @@ pub enum AuthHandlerError {
 }
 
 /// Type alias for transport task handles
+#[cfg(feature = "ble")]
 type TransportHandles = (
     tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
     tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
@@ -113,11 +111,7 @@ impl DaemonState {
     }
 }
 
-#[cfg(feature = "ble")]
 type CancelRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
-
-#[cfg(not(feature = "ble"))]
-type CancelRegistry = Arc<HashMap<String, oneshot::Sender<()>>>;
 
 /// Per-request authentication session
 pub struct AuthSession {
@@ -151,8 +145,7 @@ impl AuthSession {
         mut self,
         timeout_seconds: Option<u32>,
         request_id: Option<String>,
-        #[cfg(feature = "ble")] cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-        #[cfg(not(feature = "ble"))] cancel_registry: Arc<HashMap<String, oneshot::Sender<()>>>,
+        cancel_registry: CancelRegistry,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
         // Check if daemon is in degraded state (TPM key load failure)
         if !self.state.is_healthy() {
@@ -672,7 +665,7 @@ impl AuthSession {
         &mut self,
         packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
-        use crate::transport::{Transport, UdpTransport};
+        use crate::transport::UdpTransport;
 
         let toml_config = shared::config::TapAuthConfig::load();
         let transport =
