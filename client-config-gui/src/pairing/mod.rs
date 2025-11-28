@@ -2,9 +2,10 @@ pub mod session;
 
 use crate::utils::{get_local_ipv4, get_local_ipv6};
 use lazy_static::lazy_static;
-use session::{FirewallGuard, PairingSessionState, PendingPairingState, SessionState};
+use session::{PairingSessionState, PendingPairingState, SessionState};
 use shared::{
     config::{ClientConfigManager, PairedServer},
+    firewall::{FirewallGuard, Protocol},
     models::pairing::generate_pairing_url,
     protocol::ClientPairingSession,
 };
@@ -40,7 +41,7 @@ pub async fn start_pairing() -> Result<(String, u16), String> {
 
     tracing::debug!("TCP listener bound to port {}", port);
 
-    let firewall_guard = FirewallGuard::new(port)?;
+    let firewall_guard = FirewallGuard::new(port, Protocol::Tcp)?;
 
     let session = ClientPairingSession::new(keypair.clone())
         .map_err(|e| format!("Failed to create pairing session: {}", e))?;

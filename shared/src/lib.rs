@@ -36,6 +36,9 @@ pub mod protocol;
 #[cfg(feature = "tpm")]
 pub mod tpm;
 
+#[cfg(feature = "firewall")]
+pub mod firewall;
+
 #[cfg(feature = "jni")]
 pub mod jni;
 

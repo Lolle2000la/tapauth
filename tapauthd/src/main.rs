@@ -11,6 +11,7 @@ mod transport;
 
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
+use clap::{Parser, Subcommand};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
 use shared::ipc::pb as ipc;
@@ -21,6 +22,28 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Manage firewall rules (requires root)
+    ManageFirewall {
+        #[arg(value_enum)]
+        action: FirewallAction,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone)]
+enum FirewallAction {
+    Open,
+    Close,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
@@ -52,6 +75,44 @@ struct ServerState {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init_logging();
+
+    let args = Args::parse();
+
+    // Handle subcommands
+    if let Some(Commands::ManageFirewall { action }) = args.command {
+        let toml_config = shared::config::TapAuthConfig::load();
+        let udp_port = toml_config.udp_port;
+
+        #[cfg(feature = "firewall")]
+        match action {
+            FirewallAction::Open => {
+                tracing::info!("Opening firewall port {}/udp", udp_port);
+                if let Err(e) =
+                    shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
+                {
+                    tracing::error!("Failed to open firewall: {}", e);
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            FirewallAction::Close => {
+                tracing::info!("Closing firewall port {}/udp", udp_port);
+                if let Err(e) =
+                    shared::firewall::close_port(udp_port, shared::firewall::Protocol::Udp)
+                {
+                    tracing::error!("Failed to close firewall: {}", e);
+                    // Don't exit with error on close failure to avoid service failure state
+                }
+                std::process::exit(0);
+            }
+        }
+
+        #[cfg(not(feature = "firewall"))]
+        {
+            tracing::warn!("Firewall feature not enabled, ignoring request");
+            std::process::exit(0);
+        }
+    }
 
     tracing::info!("tapauthd starting...");
 
@@ -127,8 +188,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Drop privileges to tapauthd:tapauthd
-    drop_privileges_to_tapauthd()?;
-    tracing::info!("Dropped privileges to tapauthd user");
+    // Note: When running under systemd with User=tapauthd, this is redundant but harmless
+    // as long as we don't fail if already dropped.
+    if let Err(e) = drop_privileges_to_tapauthd() {
+        tracing::warn!(
+            "Failed to drop privileges (might already be running as user): {}",
+            e
+        );
+    } else {
+        tracing::info!("Dropped privileges to tapauthd user");
+    }
 
     let server_state = Arc::new(ServerState {
         daemon: daemon_state.clone(),

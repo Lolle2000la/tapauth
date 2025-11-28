@@ -58,4 +58,6 @@ prost-build.workspace = true
 [features]
 default = []
 jni = ["dep:jni"]
-tpm = []          # TPM 2.0 support (requires tpm2-tools on system)
+tpm = [] # TPM 2.0 support (requires tpm2-tools on system)
+firewall = [
+] # Firewall management support (requires iptables/nftables on system)

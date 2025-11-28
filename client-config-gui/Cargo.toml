@@ -8,7 +8,7 @@ name = "tapauth-config"
 path = "src/main.rs"
 
 [dependencies]
-shared.workspace = true
+shared = { workspace = true, features = ["firewall"] }
 
 # GUI framework
 iced = { version = "0.13", features = ["tokio", "qr_code", "image"] }
