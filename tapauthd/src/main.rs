@@ -80,35 +80,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle subcommands
     if let Some(Commands::ManageFirewall { action }) = args.command {
-        let toml_config = shared::config::TapAuthConfig::load();
-        let udp_port = toml_config.udp_port;
-
         #[cfg(feature = "firewall")]
-        match action {
-            FirewallAction::Open => {
-                tracing::info!("Opening firewall port {}/udp", udp_port);
-                if let Err(e) =
-                    shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
-                {
-                    tracing::error!("Failed to open firewall: {}", e);
-                    std::process::exit(1);
+        {
+            let toml_config = shared::config::TapAuthConfig::load();
+            let udp_port = toml_config.udp_port;
+
+            match action {
+                FirewallAction::Open => {
+                    tracing::info!("Opening firewall port {}/udp", udp_port);
+                    if let Err(e) =
+                        shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
+                    {
+                        tracing::error!("Failed to open firewall: {}", e);
+                        std::process::exit(1);
+                    }
+                    std::process::exit(0);
                 }
-                std::process::exit(0);
-            }
-            FirewallAction::Close => {
-                tracing::info!("Closing firewall port {}/udp", udp_port);
-                if let Err(e) =
-                    shared::firewall::close_port(udp_port, shared::firewall::Protocol::Udp)
-                {
-                    tracing::error!("Failed to close firewall: {}", e);
-                    // Don't exit with error on close failure to avoid service failure state
+                FirewallAction::Close => {
+                    tracing::info!("Closing firewall port {}/udp", udp_port);
+                    if let Err(e) =
+                        shared::firewall::close_port(udp_port, shared::firewall::Protocol::Udp)
+                    {
+                        tracing::error!("Failed to close firewall: {}", e);
+                        // Don't exit with error on close failure to avoid service failure state
+                    }
+                    std::process::exit(0);
                 }
-                std::process::exit(0);
             }
         }
 
         #[cfg(not(feature = "firewall"))]
         {
+            let _ = action; // Suppress unused warning
             tracing::warn!("Firewall feature not enabled, ignoring request");
             std::process::exit(0);
         }

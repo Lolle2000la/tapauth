@@ -74,6 +74,7 @@ pub trait Transport: Send + Sync {
     ///
     /// # Returns
     /// Ok(()) if the send was successful, Err otherwise
+    #[allow(dead_code)]
     fn send_cancel(
         &self,
         packet: &EncryptedPacket,
