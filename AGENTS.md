@@ -88,11 +88,14 @@ When `client-pam` triggers `tapauthd`:
 ### Rust Considerations
 * **Async**: The daemon uses `tokio`. Ensure no blocking operations occur in the main event loop, especially regarding BLE socket handling.
 * **Error Handling**: Use `thiserror` in libraries and `anyhow` in binaries/tests.
+* **Verify Buildability**: Always run `cargo check` with the appropriate features (or `--all-features`) after modifying shared code. Run it for the whole workspace for a final check.
+* **Code Formatting**: Use `cargo fmt` and `cargo clippy` regularly to maintain code quality.
 
 ### Android Considerations
 * **Foreground Requirement**: Authentication listeners (`BleGattService`, `AuthenticationService`) **must** run as Foreground Services. Ensure `startForeground` is called immediately in `onCreate` to avoid `ForegroundServiceDidNotStartInTimeException`.
 * **Permissions**: Handling `POST_NOTIFICATIONS` (Android 13+) is a prerequisite for starting the foreground services.
 * **Biometrics**: Relies on `androidx.biometric`.
+* **Spotless Format**: Use Spotless for Kotlin code formatting. Run `./gradlew spotlessApply` before commits.
 
 ## 7. Common Tasks for Agents
 
