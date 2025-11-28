@@ -207,11 +207,13 @@ class AuthenticationService : Service() {
                     updateNotification()
                 } catch (_: Exception) {}
 
-                val buffer = ByteArray(1024)
-
                 while (isActive && isRunning) {
                     try {
+                        // Allocate new buffer for each packet to work around android bug
+                        // Sometimes the receive call gets stuck if reusing the same buffer
+                        val buffer = ByteArray(4096)
                         val packet = DatagramPacket(buffer, buffer.size)
+
                         udpSocket?.receive(packet)
 
                         val data = packet.data.copyOf(packet.length)
