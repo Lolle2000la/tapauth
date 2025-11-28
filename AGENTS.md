@@ -89,6 +89,7 @@ When `client-pam` triggers `tapauthd`:
 * **Async**: The daemon uses `tokio`. Ensure no blocking operations occur in the main event loop, especially regarding BLE socket handling.
 * **Error Handling**: Use `thiserror` in libraries and `anyhow` in binaries/tests.
 * **Verify Buildability**: Always run `cargo check` with the appropriate features (or `--all-features`) after modifying shared code. Run it for the whole workspace for a final check.
+* **Verify Tests**: Run `cargo test` in for the entire workspace to ensure no tests are broken. You may need to run with `--all-features`.
 * **Code Formatting**: Use `cargo fmt` and `cargo clippy` regularly to maintain code quality.
 
 ### Android Considerations
