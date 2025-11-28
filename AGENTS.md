@@ -91,6 +91,7 @@ When `client-pam` triggers `tapauthd`:
 * **Verify Buildability**: Always run `cargo check` with the appropriate features (or `--all-features`) after modifying shared code. Run it for the whole workspace for a final check.
 * **Verify Tests**: Run `cargo test` in for the entire workspace to ensure no tests are broken. You may need to run with `--all-features`.
 * **Code Formatting**: Use `cargo fmt` and `cargo clippy` regularly to maintain code quality.
+* **No `mod.rs` Syntax**: Follow Rust's 2018 module system guidelines by avoiding `mod.rs` files. Instead, use the new file-based module system for better clarity and organization.
 
 ### Android Considerations
 * **Foreground Requirement**: Authentication listeners (`BleGattService`, `AuthenticationService`) **must** run as Foreground Services. Ensure `startForeground` is called immediately in `onCreate` to avoid `ForegroundServiceDidNotStartInTimeException`.
