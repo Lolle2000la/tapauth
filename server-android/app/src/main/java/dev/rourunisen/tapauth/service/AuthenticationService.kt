@@ -42,6 +42,7 @@ class AuthenticationService : Service() {
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var rejoinJob: Job? = null
 
     companion object {
         private const val TAG = "AuthenticationService"
@@ -49,6 +50,10 @@ class AuthenticationService : Service() {
         private const val NOTIFICATION_ID = TapAuthApplication.FOREGROUND_NOTIFICATION_ID
         // Socket timeout to prevent indefinite blocking (5 seconds)
         private const val SOCKET_TIMEOUT_MS = 5000
+        // Cached IPv6 multicast address to avoid repeated DNS lookups
+        private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff02::1")
+        // Debounce delay for multicast rejoin operations (milliseconds)
+        private const val REJOIN_DEBOUNCE_MS = 500L
 
         // Broadcast actions for BLE communication
         const val ACTION_CANCEL_BLE_CONNECTION =
@@ -186,14 +191,15 @@ class AuthenticationService : Service() {
 
                 // Join IPv6 multicast group ff02::1 (all nodes on local segment)
                 try {
-                    val multicastGroup = InetAddress.getByName("ff02::1")
-
                     // Join the multicast group on all available network interfaces
                     NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
                         if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                             try {
                                 udpSocket?.joinGroup(
-                                    java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                                    java.net.InetSocketAddress(
+                                        IPV6_MULTICAST_GROUP,
+                                        appConfig.udpPort,
+                                    ),
                                     networkInterface,
                                 )
                                 Log.d(
@@ -274,14 +280,17 @@ class AuthenticationService : Service() {
     private fun stopListening() {
         isRunning = false
 
+        // Cancel any pending rejoin operation
+        rejoinJob?.cancel()
+        rejoinJob = null
+
         // Leave IPv6 multicast group before closing socket
         try {
-            val multicastGroup = InetAddress.getByName("ff02::1")
             NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
                 if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                     try {
                         udpSocket?.leaveGroup(
-                            java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                            java.net.InetSocketAddress(IPV6_MULTICAST_GROUP, appConfig.udpPort),
                             networkInterface,
                         )
                     } catch (e: Exception) {
@@ -339,7 +348,9 @@ class AuthenticationService : Service() {
                     }
                 }
 
-            networkCallback?.let { connectivityManager?.registerNetworkCallback(networkRequest, it) }
+            networkCallback?.let {
+                connectivityManager?.registerNetworkCallback(networkRequest, it)
+            }
             Log.d(TAG, "Registered network callback for connectivity monitoring")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register network callback: ${e.message}")
@@ -364,47 +375,61 @@ class AuthenticationService : Service() {
      * Re-join IPv6 multicast groups on all available network interfaces. This is called when
      * network connectivity changes to ensure we continue receiving multicast traffic after Wi-Fi
      * reconnects or network switches.
+     *
+     * Uses debouncing to prevent overlapping rejoin operations when multiple network callbacks fire
+     * in quick succession (e.g., onAvailable followed by onCapabilitiesChanged).
      */
     private fun rejoinMulticastGroups() {
         val socket = udpSocket ?: return
 
-        serviceScope.launch {
-            try {
-                val multicastGroup = InetAddress.getByName("ff02::1")
+        // Cancel any pending rejoin operation to debounce rapid callbacks
+        rejoinJob?.cancel()
 
-                // Re-join the multicast group on all available network interfaces
-                NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-                    if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                        try {
-                            // Try to leave first (ignore errors if not joined)
+        rejoinJob =
+            serviceScope.launch {
+                // Debounce: wait before actually rejoining to coalesce rapid callbacks
+                delay(REJOIN_DEBOUNCE_MS)
+
+                try {
+                    // Re-join the multicast group on all available network interfaces
+                    NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
+                        if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                             try {
-                                socket.leaveGroup(
-                                    java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                                // Try to leave first (ignore errors if not joined)
+                                try {
+                                    socket.leaveGroup(
+                                        java.net.InetSocketAddress(
+                                            IPV6_MULTICAST_GROUP,
+                                            appConfig.udpPort,
+                                        ),
+                                        networkInterface,
+                                    )
+                                } catch (_: Exception) {}
+
+                                // Then join
+                                socket.joinGroup(
+                                    java.net.InetSocketAddress(
+                                        IPV6_MULTICAST_GROUP,
+                                        appConfig.udpPort,
+                                    ),
                                     networkInterface,
                                 )
-                            } catch (_: Exception) {}
-
-                            // Then join
-                            socket.joinGroup(
-                                java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
-                                networkInterface,
-                            )
-                            Log.d(
-                                TAG,
-                                "Re-joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
-                            )
-                        } catch (e: Exception) {
-                            Log.w(
-                                TAG,
-                                "Failed to re-join multicast on ${networkInterface.name}: ${e.message}",
-                            )
+                                Log.d(
+                                    TAG,
+                                    "Re-joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
+                                )
+                            } catch (e: Exception) {
+                                Log.w(
+                                    TAG,
+                                    "Failed to re-join multicast on ${networkInterface.name}: ${e.message}",
+                                )
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to re-join IPv6 multicast groups: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to re-join IPv6 multicast groups: ${e.message}")
             }
-        }
     }
 
     /** Handle incoming packet and route to appropriate handler based on message type */
