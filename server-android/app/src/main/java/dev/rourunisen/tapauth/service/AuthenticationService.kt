@@ -339,7 +339,7 @@ class AuthenticationService : Service() {
                     }
                 }
 
-            connectivityManager?.registerNetworkCallback(networkRequest, networkCallback!!)
+            networkCallback?.let { connectivityManager?.registerNetworkCallback(networkRequest, it) }
             Log.d(TAG, "Registered network callback for connectivity monitoring")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register network callback: ${e.message}")
