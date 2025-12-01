@@ -44,6 +44,11 @@ fun SettingsScreen(onBack: () -> Unit) {
     var udpPortText by remember { mutableStateOf(config.udpPort.toString()) }
     var udpPortError by remember { mutableStateOf<String?>(null) }
 
+    // Local state to represent the persistent 'Enabled' preference
+    // These are initialized from saved preferences and updated when the user toggles
+    var udpEnabledState by remember { mutableStateOf(config.udpEnabled) }
+    var bleEnabledState by remember { mutableStateOf(config.bleEnabled) }
+
     // Snackbar for showing error messages to the user
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -261,7 +266,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                         var udpBusy by remember { mutableStateOf(false) }
                         Switch(
-                            checked = udpState,
+                            checked = udpEnabledState,
                             onCheckedChange = { checked ->
                                 coroutineScope.launch {
                                     udpBusy = true
@@ -273,8 +278,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             dev.rourunisen.tapauth.service.AuthenticationService
                                                 .stop(context)
                                         }
-                                        // Only save preference after successful start/stop
+                                        // Save preference and update UI state after successful
+                                        // start/stop
                                         config.udpEnabled = checked
+                                        udpEnabledState = checked
                                     } catch (e: Exception) {
                                         // Log the error for debugging
                                         Log.e(
@@ -282,6 +289,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             "Failed to ${if (checked) "start" else "stop"} UDP service",
                                             e,
                                         )
+                                        // Revert UI state to saved preference on failure
+                                        udpEnabledState = config.udpEnabled
                                         // Show error message to user
                                         val action = if (checked) "start" else "stop"
                                         snackbarHostState.showSnackbar(
@@ -314,7 +323,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                         var bleBusy by remember { mutableStateOf(false) }
                         Switch(
-                            checked = bleState,
+                            checked = bleEnabledState,
                             onCheckedChange = { checked ->
                                 coroutineScope.launch {
                                     bleBusy = true
@@ -324,8 +333,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         } else {
                                             dev.rourunisen.tapauth.ble.BleGattService.stop(context)
                                         }
-                                        // Only save preference after successful start/stop
+                                        // Save preference and update UI state after successful
+                                        // start/stop
                                         config.bleEnabled = checked
+                                        bleEnabledState = checked
                                     } catch (e: Exception) {
                                         // Log the error for debugging
                                         Log.e(
@@ -333,6 +344,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             "Failed to ${if (checked) "start" else "stop"} BLE service",
                                             e,
                                         )
+                                        // Revert UI state to saved preference on failure
+                                        bleEnabledState = config.bleEnabled
                                         // Show error message to user
                                         val action = if (checked) "start" else "stop"
                                         snackbarHostState.showSnackbar(
@@ -351,7 +364,7 @@ fun SettingsScreen(onBack: () -> Unit) {
 
                     // Background location permission warning for BLE (Android 10+)
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                        if (!hasBackgroundLocation && bleState) {
+                        if (!hasBackgroundLocation && bleEnabledState) {
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
                                 colors =
