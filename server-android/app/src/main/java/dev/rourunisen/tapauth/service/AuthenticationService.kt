@@ -5,6 +5,10 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -16,6 +20,7 @@ import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.SocketTimeoutException
 import kotlinx.coroutines.*
 
 /**
@@ -35,11 +40,15 @@ class AuthenticationService : Service() {
     private val requestRateLimiter = RequestRateLimiter()
     private lateinit var temporalIdCache: TemporalIdCache
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     companion object {
         private const val TAG = "AuthenticationService"
         // Use the global shared notification ID to avoid duplicate notifications
         private const val NOTIFICATION_ID = TapAuthApplication.FOREGROUND_NOTIFICATION_ID
+        // Socket timeout to prevent indefinite blocking (5 seconds)
+        private const val SOCKET_TIMEOUT_MS = 5000
 
         // Broadcast actions for BLE communication
         const val ACTION_CANCEL_BLE_CONNECTION =
@@ -129,6 +138,9 @@ class AuthenticationService : Service() {
             }
         }
 
+        // Register network callback to handle connectivity changes
+        registerNetworkCallback()
+
         Log.d(TAG, "Authentication service created")
     }
 
@@ -147,6 +159,7 @@ class AuthenticationService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        unregisterNetworkCallback()
         stopListening()
         retransmissionManager.stopAll()
         // Check if initialized before accessing
@@ -162,6 +175,11 @@ class AuthenticationService : Service() {
             try {
                 // Use MulticastSocket to support both unicast and multicast
                 udpSocket = MulticastSocket(appConfig.udpPort)
+
+                // Set socket timeout to prevent indefinite blocking
+                // This allows the loop to periodically check isActive/isRunning flags
+                // and respond to network state changes
+                udpSocket?.soTimeout = SOCKET_TIMEOUT_MS
 
                 // Enable broadcast reception (for IPv4 255.255.255.255)
                 udpSocket?.broadcast = true
@@ -230,6 +248,10 @@ class AuthenticationService : Service() {
 
                         // Process authentication request
                         launch { handleIncomingPacket(data, senderAddress, senderPort) }
+                    } catch (e: SocketTimeoutException) {
+                        // Expected timeout - allows loop to check isActive/isRunning flags
+                        // and handle network state changes gracefully
+                        continue
                     } catch (e: Exception) {
                         // Ignore "Socket closed" exception when service is stopping
                         if (isActive && isRunning) {
@@ -277,6 +299,112 @@ class AuthenticationService : Service() {
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false)
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Register a network callback to monitor connectivity changes. When the network changes (e.g.,
+     * Wi-Fi reconnects), we re-join multicast groups.
+     */
+    private fun registerNetworkCallback() {
+        try {
+            connectivityManager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+            val networkRequest =
+                NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    .build()
+
+            networkCallback =
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        Log.d(TAG, "Network available, re-joining multicast groups")
+                        rejoinMulticastGroups()
+                    }
+
+                    override fun onLost(network: Network) {
+                        Log.d(TAG, "Network lost")
+                    }
+
+                    override fun onCapabilitiesChanged(
+                        network: Network,
+                        networkCapabilities: NetworkCapabilities,
+                    ) {
+                        // Network capabilities changed (e.g., gained/lost internet)
+                        // Re-join multicast groups to ensure we're on the right interfaces
+                        Log.d(TAG, "Network capabilities changed, re-joining multicast groups")
+                        rejoinMulticastGroups()
+                    }
+                }
+
+            connectivityManager?.registerNetworkCallback(networkRequest, networkCallback!!)
+            Log.d(TAG, "Registered network callback for connectivity monitoring")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register network callback: ${e.message}")
+        }
+    }
+
+    /** Unregister the network callback. */
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let {
+                connectivityManager?.unregisterNetworkCallback(it)
+                Log.d(TAG, "Unregistered network callback")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister network callback: ${e.message}")
+        }
+        networkCallback = null
+        connectivityManager = null
+    }
+
+    /**
+     * Re-join IPv6 multicast groups on all available network interfaces. This is called when
+     * network connectivity changes to ensure we continue receiving multicast traffic after Wi-Fi
+     * reconnects or network switches.
+     */
+    private fun rejoinMulticastGroups() {
+        val socket = udpSocket ?: return
+
+        serviceScope.launch {
+            try {
+                val multicastGroup = InetAddress.getByName("ff02::1")
+
+                // Re-join the multicast group on all available network interfaces
+                NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
+                    if (networkInterface.isUp && networkInterface.supportsMulticast()) {
+                        try {
+                            // Try to leave first (ignore errors if not joined)
+                            try {
+                                socket.leaveGroup(
+                                    java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                                    networkInterface,
+                                )
+                            } catch (_: Exception) {}
+
+                            // Then join
+                            socket.joinGroup(
+                                java.net.InetSocketAddress(multicastGroup, appConfig.udpPort),
+                                networkInterface,
+                            )
+                            Log.d(
+                                TAG,
+                                "Re-joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
+                            )
+                        } catch (e: Exception) {
+                            Log.w(
+                                TAG,
+                                "Failed to re-join multicast on ${networkInterface.name}: ${e.message}",
+                            )
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to re-join IPv6 multicast groups: ${e.message}")
+            }
+        }
     }
 
     /** Handle incoming packet and route to appropriate handler based on message type */
