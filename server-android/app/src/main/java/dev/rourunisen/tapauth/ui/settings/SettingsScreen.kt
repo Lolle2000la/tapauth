@@ -5,6 +5,7 @@ package dev.rourunisen.tapauth.ui.settings
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -42,6 +43,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showBatteryConfirm by remember { mutableStateOf(false) }
     var udpPortText by remember { mutableStateOf(config.udpPort.toString()) }
     var udpPortError by remember { mutableStateOf<String?>(null) }
+
+    // Snackbar for showing error messages to the user
+    val snackbarHostState = remember { SnackbarHostState() }
 
     // Check background location permission status (re-check when screen is visible)
     var hasBackgroundLocation by remember { mutableStateOf(false) }
@@ -86,7 +90,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                 },
             )
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Column(
             modifier =
@@ -270,9 +275,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         }
                                         // Only save preference after successful start/stop
                                         config.udpEnabled = checked
-                                    } catch (_: Exception) {
-                                        // Service failed to start/stop - don't update
-                                        // preference
+                                    } catch (e: Exception) {
+                                        // Log the error for debugging
+                                        Log.e(
+                                            "SettingsScreen",
+                                            "Failed to ${if (checked) "start" else "stop"} UDP service",
+                                            e,
+                                        )
+                                        // Show error message to user
+                                        val action = if (checked) "start" else "stop"
+                                        snackbarHostState.showSnackbar(
+                                            message =
+                                                "Failed to $action UDP service: ${e.message ?: "Unknown error"}",
+                                            duration = SnackbarDuration.Short,
+                                        )
                                     }
                                     // wait briefly for service to report state; timeout after
                                     // 2s
@@ -310,9 +326,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         }
                                         // Only save preference after successful start/stop
                                         config.bleEnabled = checked
-                                    } catch (_: Exception) {
-                                        // Service failed to start/stop - don't update
-                                        // preference
+                                    } catch (e: Exception) {
+                                        // Log the error for debugging
+                                        Log.e(
+                                            "SettingsScreen",
+                                            "Failed to ${if (checked) "start" else "stop"} BLE service",
+                                            e,
+                                        )
+                                        // Show error message to user
+                                        val action = if (checked) "start" else "stop"
+                                        snackbarHostState.showSnackbar(
+                                            message =
+                                                "Failed to $action BLE service: ${e.message ?: "Unknown error"}",
+                                            duration = SnackbarDuration.Short,
+                                        )
                                     }
                                     withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                     bleBusy = false
