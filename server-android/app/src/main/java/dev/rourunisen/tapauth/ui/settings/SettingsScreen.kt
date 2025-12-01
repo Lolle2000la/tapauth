@@ -260,15 +260,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                             onCheckedChange = { checked ->
                                 coroutineScope.launch {
                                     udpBusy = true
-                                    config.udpRunning = checked
                                     try {
-                                        if (checked)
+                                        if (checked) {
                                             dev.rourunisen.tapauth.service.AuthenticationService
                                                 .start(context)
-                                        else
+                                        } else {
                                             dev.rourunisen.tapauth.service.AuthenticationService
                                                 .stop(context)
-                                    } catch (_: Exception) {}
+                                        }
+                                        // Only save preference after successful start/stop
+                                        config.udpEnabled = checked
+                                    } catch (_: Exception) {
+                                        // Service failed to start/stop - don't update
+                                        // preference
+                                    }
                                     // wait briefly for service to report state; timeout after
                                     // 2s
                                     withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
@@ -297,12 +302,18 @@ fun SettingsScreen(onBack: () -> Unit) {
                             onCheckedChange = { checked ->
                                 coroutineScope.launch {
                                     bleBusy = true
-                                    config.bleRunning = checked
                                     try {
-                                        if (checked)
+                                        if (checked) {
                                             dev.rourunisen.tapauth.ble.BleGattService.start(context)
-                                        else dev.rourunisen.tapauth.ble.BleGattService.stop(context)
-                                    } catch (_: Exception) {}
+                                        } else {
+                                            dev.rourunisen.tapauth.ble.BleGattService.stop(context)
+                                        }
+                                        // Only save preference after successful start/stop
+                                        config.bleEnabled = checked
+                                    } catch (_: Exception) {
+                                        // Service failed to start/stop - don't update
+                                        // preference
+                                    }
                                     withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                     bleBusy = false
                                 }

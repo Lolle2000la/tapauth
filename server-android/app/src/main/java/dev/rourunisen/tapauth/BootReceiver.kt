@@ -36,13 +36,29 @@ class BootReceiver : BroadcastReceiver() {
 
             Log.d("BootReceiver", "Starting TapAuth background services")
             try {
-                AuthenticationService.start(context)
-                val bleIntent =
-                    Intent(context, dev.rourunisen.tapauth.ble.BleGattService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(bleIntent)
+                // Get configuration to check enabled preferences
+                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+
+                // Only start UDP service if user has it enabled
+                if (config.udpEnabled) {
+                    Log.d("BootReceiver", "UDP service enabled, starting...")
+                    AuthenticationService.start(context)
                 } else {
-                    context.startService(bleIntent)
+                    Log.d("BootReceiver", "UDP service disabled by user preference, skipping")
+                }
+
+                // Only start BLE service if user has it enabled
+                if (config.bleEnabled) {
+                    Log.d("BootReceiver", "BLE service enabled, starting...")
+                    val bleIntent =
+                        Intent(context, dev.rourunisen.tapauth.ble.BleGattService::class.java)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(bleIntent)
+                    } else {
+                        context.startService(bleIntent)
+                    }
+                } else {
+                    Log.d("BootReceiver", "BLE service disabled by user preference, skipping")
                 }
             } catch (e: Exception) {
                 Log.w("BootReceiver", "Failed to start services on boot: ${e.message}")
