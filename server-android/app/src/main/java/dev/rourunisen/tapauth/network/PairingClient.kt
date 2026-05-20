@@ -86,8 +86,7 @@ class PairingClient(private val context: Context) {
                 Log.d(TAG, "Received PairingResponse (${responseBytes.size} bytes)")
 
                 // Parse PairingResponse
-                val response =
-                    dev.rourunisen.tapauth.crypto.parsePairingResponse(responseBytes)
+                val response = dev.rourunisen.tapauth.crypto.parsePairingResponse(responseBytes)
                 val clientVersion = response.version
                 val clientX25519Key = response.x25519PublicKey
                 val clientEd25519Key = response.ed25519PublicKey
@@ -193,10 +192,7 @@ class PairingClient(private val context: Context) {
 
                 // Encrypt the CSK hash with PSK
                 val encryptedCskHash =
-                    dev.rourunisen.tapauth.crypto.encryptWithPsk(
-                        psk = psk,
-                        plaintext = cskHash,
-                    )
+                    dev.rourunisen.tapauth.crypto.encryptWithPsk(psk = psk, plaintext = cskHash)
 
                 // Step 7: Send PairingComplete message with encrypted CSK hash
                 val completeMessage =

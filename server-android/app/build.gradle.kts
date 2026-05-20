@@ -12,19 +12,23 @@ plugins {
 // Dynamic ABI filtering: when Android Studio deploys to a specific device/emulator
 // it injects the target ABI via this property, so we only build that one.
 val injectedAbi = project.findProperty("android.injected.build.abi") as? String
-val nativeTargets = if (!injectedAbi.isNullOrEmpty()) {
-    injectedAbi.split(",").mapNotNull { abi ->
-        when (abi.trim()) {
-            "arm64-v8a" -> "arm64"
-            "armeabi-v7a" -> "arm"
-            "x86_64" -> "x86_64"
-            "x86" -> "x86"
-            else -> null
-        }
-    }.distinct()
-} else {
-    listOf("arm", "arm64", "x86", "x86_64")
-}
+val nativeTargets =
+    if (!injectedAbi.isNullOrEmpty()) {
+        injectedAbi
+            .split(",")
+            .mapNotNull { abi ->
+                when (abi.trim()) {
+                    "arm64-v8a" -> "arm64"
+                    "armeabi-v7a" -> "arm"
+                    "x86_64" -> "x86_64"
+                    "x86" -> "x86"
+                    else -> null
+                }
+            }
+            .distinct()
+    } else {
+        listOf("arm", "arm64", "x86", "x86_64")
+    }
 
 cargo {
     module = "../../shared"
@@ -40,9 +44,7 @@ gradle.taskGraph.whenReady {
     cargo.profile = if (isReleaseBuild) "release" else "debug"
 }
 
-tasks.named("preBuild") {
-    dependsOn("cargoBuild")
-}
+tasks.named("preBuild") { dependsOn("cargoBuild") }
 
 android {
     namespace = "dev.rourunisen.tapauth"
@@ -149,8 +151,4 @@ spotless {
     }
 }
 
-kotlin {
-    compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_11)
-    }
-}
+kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_11) } }

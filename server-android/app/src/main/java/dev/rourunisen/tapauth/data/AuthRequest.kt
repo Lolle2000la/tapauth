@@ -46,7 +46,7 @@ data class AuthRequest(
     }
 }
 
-enum class TransportType {
-    UDP,
-    BLE,
+enum class TransportType(val displayName: String) {
+    UDP("Local Network"),
+    BLE("Bluetooth"),
 }
