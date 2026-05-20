@@ -25,7 +25,7 @@ use crate::protocol::pb::EncryptedPacket;
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static IPV6_CHECKED: AtomicBool = AtomicBool::new(false);
 
-const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(5);
+const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(1);
 static INTERFACE_ADDR_CACHE: OnceLock<RwLock<InterfaceCache>> = OnceLock::new();
 
 struct InterfaceCache {
