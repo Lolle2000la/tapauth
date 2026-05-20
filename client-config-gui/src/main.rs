@@ -47,5 +47,6 @@ fn main() -> iced::Result {
         app::TapAuthConfig::view,
     )
     .theme(app::TapAuthConfig::theme)
+    .font(lucide_icons::LUCIDE_FONT_BYTES)
     .run_with(app::TapAuthConfig::new)
 }

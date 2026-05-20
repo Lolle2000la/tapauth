@@ -200,7 +200,12 @@ impl PairingScreen {
 
         column![
             row![
-                text("✓").size(48).color(Color::from_rgb(0.0, 0.7, 0.0)),
+                container(
+                    lucide_icons::iced::icon_check()
+                        .size(48)
+                        .color(Color::from_rgb(0.0, 0.7, 0.0)),
+                )
+                .padding(iced::Padding::ZERO.top(8)),
                 Space::with_width(Length::Fixed(15.0)),
                 text("Pairing Successful!").size(32),
             ]
@@ -221,7 +226,12 @@ impl PairingScreen {
 
         column![
             row![
-                text("✗").size(48).color(Color::from_rgb(0.8, 0.0, 0.0)),
+                container(
+                    lucide_icons::iced::icon_x()
+                        .size(48)
+                        .color(Color::from_rgb(0.8, 0.0, 0.0)),
+                )
+                .padding(iced::Padding::ZERO.top(8)),
                 Space::with_width(Length::Fixed(15.0)),
                 text("Pairing Failed").size(32),
             ]

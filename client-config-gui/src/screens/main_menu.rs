@@ -87,12 +87,22 @@ impl MainMenuScreen {
 
         #[cfg(feature = "tpm")]
         if let Some(ref error) = self.tpm_error {
-            let error_text = text(format!("⚠️  {}", error))
-                .size(16)
-                .style(|_theme| iced::widget::text::Style {
-                    color: Some(iced::Color::from_rgb(0.9, 0.2, 0.2)),
-                })
-                .width(Length::Fixed(500.0));
+            let error_text = iced::widget::row![
+                container(
+                    lucide_icons::iced::icon_alert_triangle()
+                        .size(18)
+                        .color(iced::Color::from_rgb(0.9, 0.2, 0.2)),
+                )
+                .padding(iced::Padding::ZERO.top(3)),
+                text(format!(" {}", error))
+                    .size(16)
+                    .style(|_theme| iced::widget::text::Style {
+                        color: Some(iced::Color::from_rgb(0.9, 0.2, 0.2)),
+                    })
+                    .width(Length::Fixed(480.0)),
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(5);
 
             let recover_button = button(
                 text("Recover Keys (Will Clear Pairings)")

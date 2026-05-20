@@ -81,7 +81,15 @@ impl DeviceListScreen {
     }
 
     pub fn view(&self) -> Element<'_, ScreenMessage> {
-        let back_button = button(text("← Back").size(16))
+        let back_button = button(
+            row![
+                container(lucide_icons::iced::icon_arrow_left().size(16))
+                    .padding(iced::Padding::ZERO.top(2)),
+                text("Back").size(16),
+            ]
+                .align_y(iced::Alignment::Center)
+                .spacing(5),
+        )
             .padding(10)
             .on_press(ScreenMessage::NavigateToMainMenu);
 
