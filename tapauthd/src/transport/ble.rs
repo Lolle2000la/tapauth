@@ -16,7 +16,7 @@ pub struct BleTransport {
     temporal_id: [u8; 10],
     timeout: Duration,
     request_packet: Arc<tokio::sync::Mutex<Option<EncryptedPacket>>>,
-    config_manager: Arc<shared::config::ClientConfigManager>,
+    csk: shared::crypto::ClientSymmetricKey,
     keypair: Arc<shared::crypto::Ed25519KeyPair>,
     challenge: [u8; 32],
     // Keep advertisement and GATT server alive
@@ -38,13 +38,13 @@ impl BleTransport {
     /// # Arguments
     /// * `temporal_id` - The 10-byte temporal identifier for BLE advertising
     /// * `timeout` - Timeout for authentication
-    /// * `config_manager` - Configuration manager for loading config/keys
+    /// * `csk` - Client Symmetric Key (cached at daemon startup)
     /// * `keypair` - Ed25519 keypair for signing
     /// * `challenge` - 32-byte challenge for confirmation
     pub async fn new(
         temporal_id: [u8; 10],
         timeout: Duration,
-        config_manager: Arc<shared::config::ClientConfigManager>,
+        csk: shared::crypto::ClientSymmetricKey,
         keypair: Arc<shared::crypto::Ed25519KeyPair>,
         challenge: [u8; 32],
     ) -> Result<Self, AuthError> {
@@ -105,7 +105,7 @@ impl BleTransport {
             temporal_id,
             timeout,
             request_packet: Arc::new(tokio::sync::Mutex::new(None)),
-            config_manager,
+            csk,
             keypair,
             challenge,
             adv_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -124,9 +124,6 @@ impl BleTransport {
         use shared::protocol::messages::create_grant_confirmation;
         use shared::protocol::packet::wrap_grant_confirmation;
 
-        // Load CSK
-        let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
-
         // Create GrantConfirmation with challenge signature
         let confirmation = create_grant_confirmation(&self.challenge)
             .map_err(|e| AuthError::BleError(format!("Failed to create confirmation: {}", e)))?;
@@ -140,7 +137,7 @@ impl BleTransport {
         let plaintext = wrapper.encode_to_vec();
 
         // Encrypt using CSK with a random, prepended nonce
-        let ciphertext = encrypt_with_csk_and_random_nonce(&csk, &plaintext)
+        let ciphertext = encrypt_with_csk_and_random_nonce(&self.csk, &plaintext)
             .map_err(|e| AuthError::BleError(format!("Failed to encrypt confirmation: {}", e)))?;
 
         // Create encrypted packet with same temporal identifier as request
@@ -529,12 +526,9 @@ impl Transport for BleTransport {
                     }
                 };
 
-                // Load CSK from config manager
-                let csk = self.config_manager.load_csk().map_err(AuthError::Config)?;
-
                 // Decrypt response
                 let decrypted_message =
-                    match decrypt_encrypted_packet_with_csk_nonce(&csk, &encrypted_response) {
+                    match decrypt_encrypted_packet_with_csk_nonce(&self.csk, &encrypted_response) {
                         Ok(m) => m,
                         Err(e) => {
                             tracing::warn!(

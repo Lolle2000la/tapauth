@@ -330,7 +330,6 @@ impl AuthSession {
         let udp_transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
 
-        let config_manager = self.state.config_manager.clone();
         // Safety: keypair is Some after health check in handle_authenticate
         let keypair = Arc::new(
             self.state
@@ -339,10 +338,11 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone(),
         );
+        let csk = self.state.csk.clone();
         let challenge = self.challenge;
 
         let ble_transport =
-            match BleTransport::new(temporal_id, timeout, config_manager, keypair, challenge).await
+            match BleTransport::new(temporal_id, timeout, csk, keypair, challenge).await
             {
                 Ok(ble) => Some(Arc::new(ble)),
                 Err(e) => {
