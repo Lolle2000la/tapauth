@@ -1958,7 +1958,7 @@ static INIT_LOGGING: std::sync::Once = std::sync::Once::new();
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_initLogging(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
