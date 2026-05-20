@@ -87,11 +87,11 @@ impl DeviceListScreen {
                     .padding(iced::Padding::ZERO.top(2)),
                 text("Back").size(16),
             ]
-                .align_y(iced::Alignment::Center)
-                .spacing(5),
+            .align_y(iced::Alignment::Center)
+            .spacing(5),
         )
-            .padding(10)
-            .on_press(ScreenMessage::NavigateToMainMenu);
+        .padding(10)
+        .on_press(ScreenMessage::NavigateToMainMenu);
 
         let title = text("Paired Devices").size(32);
 

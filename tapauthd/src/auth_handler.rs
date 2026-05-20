@@ -342,8 +342,7 @@ impl AuthSession {
         let challenge = self.challenge;
 
         let ble_transport =
-            match BleTransport::new(temporal_id, timeout, csk, keypair, challenge).await
-            {
+            match BleTransport::new(temporal_id, timeout, csk, keypair, challenge).await {
                 Ok(ble) => Some(Arc::new(ble)),
                 Err(e) => {
                     tracing::warn!(
@@ -726,7 +725,15 @@ impl AuthSession {
 
             // Wait for response
             let retry_interval = shared::network::get_client_retry_interval(attempt);
-            match Self::wait_for_response(&transport, retry_interval, csk, &paired_servers, &mut nonce_cache).await {
+            match Self::wait_for_response(
+                &transport,
+                retry_interval,
+                csk,
+                &paired_servers,
+                &mut nonce_cache,
+            )
+            .await
+            {
                 Ok(Some((wrapper, server_addr))) => {
                     // Process the authenticated response
                     match Self::process_auth_response(
@@ -776,10 +783,7 @@ impl AuthSession {
                     data
                 };
                 if !nonce_cache.insert(nonce_fingerprint) {
-                    tracing::warn!(
-                        "Replayed packet detected from {}, ignoring",
-                        server_addr
-                    );
+                    tracing::warn!("Replayed packet detected from {}, ignoring", server_addr);
                     return Ok(None);
                 }
 
