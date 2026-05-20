@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -46,12 +48,19 @@ android {
     namespace = "dev.rourunisen.tapauth"
     compileSdk { version = release(36) }
 
+    // Dynamically resolve NDK path from environment when available
+    // (e.g. CI/CD runners, direct NDK installations).
+    // Falls back to ndkVersion-based lookup from the Android SDK when not set.
+    System.getenv("ANDROID_NDK_HOME")?.let { ndkPath = it }
+        ?: System.getenv("ANDROID_NDK_ROOT")?.let { ndkPath = it }
+
     defaultConfig {
         applicationId = "dev.rourunisen.tapauth"
         minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        ndkVersion = "30.0.14904198"
 
         testInstrumentationRunner = "dev.rourunisen.tapauth.crypto.TapAuthTestRunner"
     }
@@ -77,7 +86,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions { jvmTarget = "11" }
     buildFeatures { compose = true }
 }
 
@@ -138,5 +146,11 @@ spotless {
     kotlinGradle {
         target("*.gradle.kts")
         ktfmt().kotlinlangStyle()
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_11)
     }
 }
