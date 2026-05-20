@@ -108,10 +108,7 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
         .map_err(|e| format!("Failed to execute iptables -D: {}", e))?;
 
     if !status.success() {
-        return Err(format!(
-            "iptables -D failed with exit status: {}",
-            status
-        ));
+        return Err(format!("iptables -D failed with exit status: {}", status));
     }
 
     tracing::info!(
