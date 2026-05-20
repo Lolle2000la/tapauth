@@ -75,16 +75,17 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 
 ### 2.3. Signature Generation
 
-All signed messages must use a canonical format to guarantee verifiability *before encryption*.
+All signed messages must use a canonical format to guarantee verifiability *before encryption*. Signatures are placed on the `WrapperMessage`, not on individual inner messages.
 
-* **Data-To-Be-Signed**: The **binary-serialized Protobuf message** (e.g., `AuthenticationRequest`) with its `signature` field temporarily empty.
+* **Data-To-Be-Signed**: The **binary-serialized `WrapperMessage`** with its `signature` field set to empty bytes. The `WrapperMessage` contains the inner payload (e.g., `AuthenticationRequest`) in its `payload` field.
 * **Process**:
     1.  Construct the inner message object (e.g., `AuthenticationRequest`).
-    2.  Set the `signature_algorithm` field to the algorithm agreed upon during pairing (e.g., `ED25519`).
-    3.  Serialize this message to a byte array. This is the data to be signed.
-    4.  Sign the byte array using the sender's private key and the specified algorithm.
-    5.  Place the resulting signature into the `signature` field of the message object.
-    6.  This completed message is then placed in a `WrapperMessage`, which is then encrypted for transmission.
+    2.  Place the inner message into a `WrapperMessage` using the appropriate `payload` variant.
+    3.  Set the `signature_algorithm` field on the `WrapperMessage` to the algorithm agreed upon during pairing (e.g., `ED25519`).
+    4.  Leave the `signature` field empty and serialize the `WrapperMessage` to a byte array. This is the data to be signed.
+    5.  Sign the byte array using the sender's private key and the specified algorithm.
+    6.  Place the resulting signature into the `signature` field of the `WrapperMessage`.
+    7.  The completed `WrapperMessage` is then serialized, encrypted, and placed into an `EncryptedPacket` for transmission.
 
 ### 2.4. Transport Layer Considerations
 

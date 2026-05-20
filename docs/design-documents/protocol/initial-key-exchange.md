@@ -31,7 +31,7 @@ sequenceDiagram
     Server (Phone)->>Server (Phone): Store Client info & Client_Pub
     Server (Phone)->>Server (Phone): Generate own Key Pairs
     
-    Server (Phone)->>Client (Desktop): Connect (TCP) and send PairingHandshake
+    Server (Phone)->>Client (Desktop): Connect (TCP) and send PairingHello
     
     Note over Client (Desktop),Server (Phone): Both sides now compute the temporary PSK
     Client (Desktop)->>Client (Desktop): psk = ECDH(Client_Priv, Server_Pub)
@@ -45,8 +45,8 @@ sequenceDiagram
     User->>Client (Desktop): Approve pairing
     User->>Server (Phone): Approve pairing
     
-    Client (Desktop)->>Server (Phone): Send ClientKeyDelivery (CSK encrypted with PSK)
-    Server (Phone)->>Client (Desktop): Send PairingConfirmation (CSK hash encrypted with PSK)
+    Client (Desktop)->>Server (Phone): Send PairingCskMessage (CSK encrypted with PSK)
+    Server (Phone)->>Client (Desktop): Send PairingComplete (CSK hash encrypted with PSK)
     
     Note over Client (Desktop),Server (Phone): Pairing complete. Both discard PSK and store CSK.
 ```
@@ -73,7 +73,7 @@ The **Client (desktop)** generates its key pair (if one doesn't exist) and its C
 
 The **User** scans the code with the **Server (phone)**. The app parses the URL, extracts the Client's public key and connection details, and generates its own key pair. It then establishes a **TCP connection** to the Client.
 
-Upon connection, the Server sends a `PairingHandshake` message. This message contains:
+Upon connection, the Server sends a `PairingHello` message. This message contains:
 *   The Server's public key.
 *   A list of cryptographic algorithms the Server supports (e.g., for signatures, symmetric encryption, and hashing).
 
@@ -99,13 +99,13 @@ Failure to verify the SAS could allow a Man-in-the-Middle (MITM) attacker to int
 
 ### Step 5: Client Sends Shared Key
 
-After the user confirms the SAS on the Client, the Client selects a compatible set of cryptographic algorithms from the list provided by the Server. It then sends a `ClientKeyDelivery` message to the Server. This message contains the long-term `CSK`, encrypted with the temporary `PSK`.
+After the user confirms the SAS on the Client, the Client selects a compatible set of cryptographic algorithms from the list provided by the Server. It then sends a `PairingCskMessage` message to the Server. This message contains the long-term `CSK`, encrypted with the temporary `PSK`.
 
 The Client and Server will use this negotiated set of algorithms for all subsequent communication.
 
 ### Step 6: Server Confirms and Finalizes
 
-The Server receives the message and decrypts it using the `PSK` to retrieve the `CSK`. After the user confirms the SAS on the Server, it computes a hash of the received `CSK` using the negotiated hash algorithm (e.g., SHA-256). It then sends a `PairingConfirmation` message back to the Client, containing:
+The Server receives the message and decrypts it using the `PSK` to retrieve the `CSK`. After the user confirms the SAS on the Server, it computes a hash of the received `CSK` using the negotiated hash algorithm (e.g., SHA-256). It then sends a `PairingComplete` message back to the Client, containing:
 *   The `hash_algorithm` used.
 *   The resulting hash, encrypted with the `PSK`.
 

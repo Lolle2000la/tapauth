@@ -10,9 +10,9 @@ The cryptographic private keys are the foundation of the system's security. They
 
 * **Client (Linux)**: The key storage strategy depends on the hardware capabilities of the machine and when the key is needed.
 
-    * **Preferred Method: TPM (Trusted Platform Module)**: On systems with a TPM 2.0 chip, the Client's private key **must** be generated as a **non-migratable key** within the TPM. The PAM module will then interact with the TPM to perform signing operations without ever having access to the key material itself. This provides the highest level of security, as the key cannot be extracted even by a user with root privileges.
+    * **Preferred Method: TPM (Trusted Platform Module)**: On systems with a TPM 2.0 chip, the Client's private key **must** be generated as a **non-migratable key** within the TPM. The daemon (`tapauthd`) will then interact with the TPM to perform signing operations without ever having access to the key material itself. This provides the highest level of security, as the key cannot be extracted even by a user with root privileges.
 
-    * **Fallback Method: Root-Protected File**: On systems without a TPM, the PAM module **must** read the Client's private key from a file owned by `root` with permissions set to `600` (read/write for root only). A recommended location is `/etc/tapauth/client_key`. This isolates the key from all other users on the system.
+    * **Fallback Method: Root-Protected File**: On systems without a TPM, the daemon **must** read the Client's private key from a file owned by `root` with permissions set to `600` (read/write for root only). The keys are stored in `/var/lib/tapauth/`. This isolates the key from all other users on the system.
 
     * **Management Applications (Post-Authentication)**: Any user-facing application for managing pairings after login **should** use the standard OS-level credential manager via the **Secret Service API (DBus)**.
 
