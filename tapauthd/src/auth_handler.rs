@@ -2,7 +2,7 @@
 
 use crate::transport::{ReceiveResult, Transport};
 use shared::{
-    config::ClientConfigManager,
+    config::{ClientConfigManager, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
     network::get_session_timeout,
     protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
@@ -61,7 +61,9 @@ struct AwaitAuthParams<'a> {
 
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
+    #[allow(dead_code)]
     pub config_manager: Arc<ClientConfigManager>,
+    pub paired_servers: Arc<HashMap<String, PairedServer>>,
     pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
     pub csk: ClientSymmetricKey,
     pub hostname: String,
@@ -87,11 +89,14 @@ impl DaemonState {
             .load_csk()
             .map_err(AuthHandlerError::Config)?;
 
+        let paired_servers = Arc::new(config_manager.load_paired_servers()?);
+
         let config = config_manager.load_config()?;
         let hostname = config.hostname;
 
         Ok(Self {
             config_manager,
+            paired_servers,
             keypair,
             csk,
             hostname,
@@ -165,7 +170,7 @@ impl AuthSession {
         self.request_id = request_id;
         self.cancel_registry = Some(cancel_registry);
         // Check if we have any paired devices
-        let paired_servers = self.state.config_manager.load_paired_servers()?;
+        let paired_servers = self.state.paired_servers.clone();
         if paired_servers.is_empty() {
             // No configuration/pairings yet: do not block other PAM methods
             return Ok(ipc::PamAuthenticateResponse {
@@ -393,9 +398,9 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone();
             let challenge = self.challenge;
-            let cfg = self.state.config_manager.clone();
+            let servers = self.state.paired_servers.clone();
             tokio::spawn(async move {
-                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, cfg)
+                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, servers)
                     .await
             })
         } else {
@@ -413,10 +418,10 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone();
             let challenge = self.challenge;
-            let cfg = self.state.config_manager.clone();
+            let servers = self.state.paired_servers.clone();
             let udp = udp_transport.clone();
             tokio::spawn(async move {
-                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, cfg)
+                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, servers)
                     .await
             })
         };
@@ -675,7 +680,7 @@ impl AuthSession {
         let transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
         let transport_arc = Arc::new(transport);
-        let cfg = self.state.config_manager.clone();
+        let servers = self.state.paired_servers.clone();
         // Safety: keypair is Some after health check in handle_authenticate
         let keypair = self
             .state
@@ -688,7 +693,7 @@ impl AuthSession {
             &self.state.csk,
             keypair,
             &self.challenge,
-            cfg,
+            servers,
         )
         .await
     }
@@ -700,7 +705,7 @@ impl AuthSession {
         csk: &ClientSymmetricKey,
         keypair: &Ed25519KeyPair,
         challenge: &[u8; 32],
-        config_manager: Arc<ClientConfigManager>,
+        paired_servers: Arc<HashMap<String, PairedServer>>,
     ) -> Result<(), AuthHandlerError> {
         let timeout = get_session_timeout();
         let start = Instant::now();
@@ -720,7 +725,7 @@ impl AuthSession {
 
             // Wait for response
             let retry_interval = shared::network::get_client_retry_interval(attempt);
-            match Self::wait_for_response(&transport, retry_interval, csk, &config_manager).await {
+            match Self::wait_for_response(&transport, retry_interval, csk, &paired_servers).await {
                 Ok(Some((wrapper, server_addr))) => {
                     // Process the authenticated response
                     match Self::process_auth_response(
@@ -729,7 +734,7 @@ impl AuthSession {
                         challenge,
                         keypair,
                         csk,
-                        &config_manager,
+                        &paired_servers,
                         server_addr,
                     )
                     .await
@@ -738,9 +743,6 @@ impl AuthSession {
                         Err(ResponseError::InvalidMessage) => {
                             // Continue waiting for valid response
                             continue;
-                        }
-                        Err(ResponseError::Fatal(e)) => {
-                            return Err(e);
                         }
                     }
                 }
@@ -760,7 +762,7 @@ impl AuthSession {
         transport: &Arc<T>,
         retry_interval: Duration,
         csk: &ClientSymmetricKey,
-        config_manager: &ClientConfigManager,
+        paired_servers: &HashMap<String, PairedServer>,
     ) -> Result<Option<(shared::protocol::pb::WrapperMessage, String)>, AuthHandlerError> {
         match transport.receive_response(retry_interval).await {
             Err(e) => Err(e),
@@ -771,7 +773,7 @@ impl AuthSession {
                 tracing::debug!("Received message from {}", addr_str);
 
                 // Verify signature
-                if Self::verify_response_signature(&wrapper, config_manager)? {
+                if Self::verify_response_signature(&wrapper, paired_servers)? {
                     Ok(Some((wrapper, addr_str)))
                 } else {
                     tracing::warn!(
@@ -786,9 +788,8 @@ impl AuthSession {
 
     fn verify_response_signature(
         wrapper: &shared::protocol::pb::WrapperMessage,
-        config_manager: &ClientConfigManager,
+        paired_servers: &HashMap<String, PairedServer>,
     ) -> Result<bool, AuthHandlerError> {
-        let paired_servers = config_manager.load_paired_servers()?;
         for (_id, server) in paired_servers.iter() {
             if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
                 if pub_key_bytes.len() == 32 {
@@ -809,7 +810,7 @@ impl AuthSession {
         challenge: &[u8; 32],
         keypair: &Ed25519KeyPair,
         csk: &ClientSymmetricKey,
-        config_manager: &ClientConfigManager,
+        paired_servers: &HashMap<String, PairedServer>,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
         match &wrapper.payload {
@@ -820,7 +821,7 @@ impl AuthSession {
                     challenge,
                     keypair,
                     csk,
-                    config_manager,
+                    paired_servers,
                     server_addr,
                 )
                 .await
@@ -841,14 +842,10 @@ impl AuthSession {
         challenge: &[u8; 32],
         keypair: &Ed25519KeyPair,
         csk: &ClientSymmetricKey,
-        config_manager: &ClientConfigManager,
+        paired_servers: &HashMap<String, PairedServer>,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
         // Verify signed_challenge
-        let paired_servers = config_manager
-            .load_paired_servers()
-            .map_err(|e| ResponseError::Fatal(e.into()))?;
-
         let grant_valid = paired_servers.iter().any(|(_id, server)| {
             if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
                 if pub_key_bytes.len() == 32 {
@@ -931,6 +928,4 @@ impl AuthSession {
 enum ResponseError {
     /// Invalid message that should be ignored (wait for another response)
     InvalidMessage,
-    /// Fatal error that should terminate authentication
-    Fatal(AuthHandlerError),
 }
