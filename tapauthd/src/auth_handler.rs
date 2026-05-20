@@ -245,6 +245,17 @@ impl AuthSession {
             }
             Err(_) => {
                 tracing::warn!("Authentication timeout for user {}", self.username);
+                // Broadcast AuthenticationCancel so servers stop retransmitting
+                if let Ok(cancel_packet) = self.create_cancel_packet() {
+                    let udp_socket = self.state.udp_socket.clone();
+                    let toml_config = shared::config::TapAuthConfig::load();
+                    let port = toml_config.udp_port;
+                    tokio::spawn(async move {
+                        use crate::transport::UdpTransport;
+                        let transport = UdpTransport::from_socket(udp_socket, port);
+                        let _ = transport.send_cancel(&cancel_packet).await;
+                    });
+                }
                 Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Timeout as i32,
                     detail: "Authentication timeout".to_string(),
@@ -354,7 +365,6 @@ impl AuthSession {
         }
     }
 
-    #[cfg(feature = "ble")]
     fn create_cancel_packet(&self) -> Result<EncryptedPacket, AuthHandlerError> {
         let msg = create_auth_cancel(&self.challenge)?;
         let mut wrapper = wrap_auth_cancel(msg);
