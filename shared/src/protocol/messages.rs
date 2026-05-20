@@ -118,7 +118,7 @@ pub fn is_request_timestamp_valid(request: &AuthenticationRequest) -> bool {
     };
 
     let timestamp = request.timestamp_unix_seconds;
-    const MAX_CLOCK_SKEW: u64 = 300; // 5 minutes
+    const MAX_CLOCK_SKEW: u64 = 60; // 60-second validity window per auth spec
 
     timestamp <= now + MAX_CLOCK_SKEW && timestamp >= now.saturating_sub(MAX_CLOCK_SKEW)
 }
