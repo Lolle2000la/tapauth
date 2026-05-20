@@ -542,23 +542,27 @@ impl Transport for BleTransport {
                 // Check message type and store confirmation
                 match decrypted_message.payload {
                     Some(wrapper_message::Payload::AuthGrant(_)) => {
-                        // Create GrantConfirmation
-                        if let Ok(confirmation) = self.create_confirmation(&request_packet) {
-                            *self.confirmation_data.lock().await = Some(confirmation);
-                            tracing::trace!(
-                                "Stored confirmation for server to read, elapsed={:?}",
-                                start.elapsed()
-                            );
+                        let mut data = self.confirmation_data.lock().await;
+                        if data.is_none() {
+                            if let Ok(confirmation) = self.create_confirmation(&request_packet) {
+                                *data = Some(confirmation);
+                                tracing::trace!(
+                                    "Stored confirmation for server to read, elapsed={:?}",
+                                    start.elapsed()
+                                );
+                            }
                         }
                     }
                     Some(wrapper_message::Payload::AuthDenial(_)) => {
-                        // Create GrantConfirmation even for denial
-                        if let Ok(confirmation) = self.create_confirmation(&request_packet) {
-                            *self.confirmation_data.lock().await = Some(confirmation);
-                            tracing::trace!(
-                                "Stored confirmation for denial, elapsed={:?}",
-                                start.elapsed()
-                            );
+                        let mut data = self.confirmation_data.lock().await;
+                        if data.is_none() {
+                            if let Ok(confirmation) = self.create_confirmation(&request_packet) {
+                                *data = Some(confirmation);
+                                tracing::trace!(
+                                    "Stored confirmation for denial, elapsed={:?}",
+                                    start.elapsed()
+                                );
+                            }
                         }
                     }
                     _ => {
