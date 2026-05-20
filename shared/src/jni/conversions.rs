@@ -3,11 +3,41 @@
 //! Provides helpers for converting between JNI types (byte arrays, strings)
 //! and Rust types, with automatic exception throwing on failure.
 
-use jni::objects::{JByteArray, JString};
+use jni::objects::{JByteArray, JIntArray, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
 
 use super::exceptions::{throw_illegal_argument, throw_out_of_memory};
+
+/// Convert a JNI int array to a Rust `Vec<i32>`.
+///
+/// ## Returns
+///
+/// `Some(Vec<i32>)` on success, `None` if reading fails.
+///
+/// ## Errors
+///
+/// Throws `IllegalArgumentException` and returns `None` if the array cannot be read.
+pub fn jintarray_to_vec(env: &mut JNIEnv, array: JIntArray) -> Option<Vec<i32>> {
+    match env.get_int_array_elements(&array, jni::objects::ReleaseMode::CopyBack) {
+        Ok(elements) => {
+            let len = elements.len();
+            let mut vec = Vec::with_capacity(len);
+            // Safety: elements is a valid pointer to an array of i32 of length `len`
+            unsafe {
+                let ptr = elements.as_ptr();
+                for i in 0..len {
+                    vec.push(*ptr.add(i));
+                }
+            }
+            Some(vec)
+        }
+        Err(err) => {
+            throw_illegal_argument(env, format!("failed to read int array: {err}"));
+            None
+        }
+    }
+}
 
 /// Convert a JNI byte array to a Rust `Vec<u8>`.
 ///

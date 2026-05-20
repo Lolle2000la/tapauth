@@ -162,15 +162,21 @@ data class EncryptedPacketInfo(
  * Parsed PairingResponse message.
  *
  * @property version Protocol version
- * @property x25519PublicKey Server's X25519 public key for key exchange
- * @property ed25519PublicKey Server's Ed25519 public key for signing
- * @property deviceName Server device name
+ * @property x25519PublicKey Client's X25519 public key for key exchange
+ * @property ed25519PublicKey Client's Ed25519 public key for signing
+ * @property deviceName Client device name
+ * @property selectedSymmetricAlgorithm Client's selected symmetric algorithm
+ * @property selectedHashAlgorithm Client's selected hash algorithm
+ * @property selectedSignatureAlgorithm Client's selected signature algorithm
  */
 data class PairingResponse(
     val version: Int,
     val x25519PublicKey: ByteArray,
     val ed25519PublicKey: ByteArray,
     val deviceName: String,
+    val selectedSymmetricAlgorithm: Int,
+    val selectedHashAlgorithm: Int,
+    val selectedSignatureAlgorithm: Int,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
@@ -182,6 +188,9 @@ data class PairingResponse(
         if (!x25519PublicKey.contentEquals(other.x25519PublicKey)) return false
         if (!ed25519PublicKey.contentEquals(other.ed25519PublicKey)) return false
         if (deviceName != other.deviceName) return false
+        if (selectedSymmetricAlgorithm != other.selectedSymmetricAlgorithm) return false
+        if (selectedHashAlgorithm != other.selectedHashAlgorithm) return false
+        if (selectedSignatureAlgorithm != other.selectedSignatureAlgorithm) return false
 
         return true
     }
@@ -191,6 +200,9 @@ data class PairingResponse(
         result = 31 * result + x25519PublicKey.contentHashCode()
         result = 31 * result + ed25519PublicKey.contentHashCode()
         result = 31 * result + deviceName.hashCode()
+        result = 31 * result + selectedSymmetricAlgorithm
+        result = 31 * result + selectedHashAlgorithm
+        result = 31 * result + selectedSignatureAlgorithm
         return result
     }
 }

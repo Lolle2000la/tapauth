@@ -76,7 +76,8 @@ message AuthenticationCancel {
 
 /**
  * Initial message sent by server during TCP pairing handshake.
- * Contains server's X25519 public key and Ed25519 public key.
+ * Contains server's X25519 public key, Ed25519 public key, and
+ * supported cryptographic algorithms.
  */
 message PairingHello {
   // Protocol version
@@ -87,11 +88,16 @@ message PairingHello {
   bytes ed25519_public_key = 3;
   // Server's device name for display purposes only (e.g., device model/hostname)
   string device_name = 4;
+  // Algorithms the server supports
+  repeated SymmetricAlgorithm supported_symmetric_algorithms = 5;
+  repeated HashAlgorithm supported_hash_algorithms = 6;
+  repeated SignatureAlgorithm supported_signature_algorithms = 7;
 }
 
 /**
  * Response sent by client during TCP pairing handshake.
- * Contains client's X25519 public key and Ed25519 public key.
+ * Contains client's X25519 public key, Ed25519 public key, and
+ * the client's selected algorithms for future communication.
  */
 message PairingResponse {
   // Protocol version
@@ -102,6 +108,12 @@ message PairingResponse {
   bytes ed25519_public_key = 3;
   // Client's device name for display purposes only (e.g., hostname)
   string device_name = 4;
+  // Client's selected algorithm for future symmetric encryption
+  SymmetricAlgorithm selected_symmetric_algorithm = 5;
+  // Client's selected algorithm for future hashing
+  HashAlgorithm selected_hash_algorithm = 6;
+  // Client's selected algorithm for future digital signatures
+  SignatureAlgorithm selected_signature_algorithm = 7;
 }
 
 /**

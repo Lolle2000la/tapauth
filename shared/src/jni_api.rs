@@ -44,8 +44,8 @@
 #![allow(non_snake_case)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
+use jni::objects::{JByteArray, JClass, JIntArray, JString};
+use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong, jobjectArray, jstring};
 use jni::JNIEnv;
 
 use crate::crypto;
@@ -1625,6 +1625,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
 /// @param x25519_public_key X25519 public key bytes
 /// @param ed25519_public_key Ed25519 public key bytes
 /// @param device_name Device name string
+/// @param supported_symmetric Array of supported SymmetricAlgorithm enum values
+/// @param supported_hash Array of supported HashAlgorithm enum values
+/// @param supported_signature Array of supported SignatureAlgorithm enum values
 /// @return Protobuf-encoded PairingHello bytes
 /// @throws IllegalArgumentException if inputs are invalid
 /// @throws IOException if protobuf encoding fails
@@ -1636,6 +1639,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     x25519_public_key: JByteArray,
     ed25519_public_key: JByteArray,
     device_name: JString,
+    supported_symmetric: JIntArray,
+    supported_hash: JIntArray,
+    supported_signature: JIntArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use crate::protocol::pb;
@@ -1657,11 +1663,27 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
             None => return std::ptr::null_mut(),
         };
 
+        let symmetric_algos = match jintarray_to_vec(&mut env, supported_symmetric) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        };
+        let hash_algos = match jintarray_to_vec(&mut env, supported_hash) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        };
+        let signature_algos = match jintarray_to_vec(&mut env, supported_signature) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        };
+
         let hello = pb::PairingHello {
             version: version as u32,
             x25519_public_key: x25519_bytes,
             ed25519_public_key: ed25519_bytes,
             device_name: device_name_str,
+            supported_symmetric_algorithms: symmetric_algos,
+            supported_hash_algorithms: hash_algos,
+            supported_signature_algorithms: signature_algos,
         };
 
         let buf = match encode_message(&mut env, &hello) {
@@ -1714,6 +1736,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
             &response.x25519_public_key,
             &response.ed25519_public_key,
             &response.device_name,
+            response.selected_symmetric_algorithm,
+            response.selected_hash_algorithm,
+            response.selected_signature_algorithm,
         ) {
             Some(obj) => obj.into_raw(),
             None => std::ptr::null_mut(),

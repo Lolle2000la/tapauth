@@ -66,6 +66,9 @@ class PairingClient(private val context: Context) {
                         x25519PublicKey = serverEphemeralKeyPair.publicKey,
                         ed25519PublicKey = serverEd25519PublicKey, // Use actual Ed25519 signing key
                         deviceName = deviceName,
+                        supportedSymmetricAlgorithms = intArrayOf(1), // AES_256_GCM
+                        supportedHashAlgorithms = intArrayOf(1), // SHA256
+                        supportedSignatureAlgorithms = intArrayOf(1), // ED25519
                     )
 
                 // Send length-prefixed protobuf message
@@ -83,8 +86,12 @@ class PairingClient(private val context: Context) {
                 Log.d(TAG, "Received PairingResponse (${responseBytes.size} bytes)")
 
                 // Parse PairingResponse
-                val (clientVersion, clientX25519Key, clientEd25519Key, clientDeviceName) =
+                val response =
                     dev.rourunisen.tapauth.crypto.parsePairingResponse(responseBytes)
+                val clientVersion = response.version
+                val clientX25519Key = response.x25519PublicKey
+                val clientEd25519Key = response.ed25519PublicKey
+                val clientDeviceName = response.deviceName
 
                 Log.d(
                     TAG,

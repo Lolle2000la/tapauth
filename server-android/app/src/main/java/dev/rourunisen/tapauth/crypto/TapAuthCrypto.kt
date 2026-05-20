@@ -299,6 +299,9 @@ object TapAuthCrypto {
      * @param x25519PublicKey X25519 ephemeral public key (32 bytes)
      * @param ed25519PublicKey Ed25519 identity public key (32 bytes)
      * @param deviceName Server's device name for display purposes
+     * @param supportedSymmetricAlgorithms Supported SymmetricAlgorithm enum values
+     * @param supportedHashAlgorithms Supported HashAlgorithm enum values
+     * @param supportedSignatureAlgorithms Supported SignatureAlgorithm enum values
      * @return Protobuf-encoded PairingHello bytes
      */
     external fun createPairingHello(
@@ -306,6 +309,9 @@ object TapAuthCrypto {
         x25519PublicKey: ByteArray,
         ed25519PublicKey: ByteArray,
         deviceName: String,
+        supportedSymmetricAlgorithms: IntArray,
+        supportedHashAlgorithms: IntArray,
+        supportedSignatureAlgorithms: IntArray,
     ): ByteArray
 
     /**
@@ -575,23 +581,28 @@ fun createPairingHello(
     x25519PublicKey: ByteArray,
     ed25519PublicKey: ByteArray,
     deviceName: String,
+    supportedSymmetricAlgorithms: IntArray,
+    supportedHashAlgorithms: IntArray,
+    supportedSignatureAlgorithms: IntArray,
 ): ByteArray {
-    return TapAuthCrypto.createPairingHello(version, x25519PublicKey, ed25519PublicKey, deviceName)
+    return TapAuthCrypto.createPairingHello(
+        version,
+        x25519PublicKey,
+        ed25519PublicKey,
+        deviceName,
+        supportedSymmetricAlgorithms,
+        supportedHashAlgorithms,
+        supportedSignatureAlgorithms,
+    )
 }
 
 /**
- * Parse a PairingResponse message and extract keys
+ * Parse a PairingResponse message and extract keys and selected algorithms
  *
- * @return Quadruple of (version, x25519PublicKey, ed25519PublicKey, deviceName)
+ * @return PairingResponse with all fields
  */
-fun parsePairingResponse(responseBytes: ByteArray): Quadruple<Int, ByteArray, ByteArray, String> {
-    val response = TapAuthCrypto.parsePairingResponse(responseBytes)
-    return Quadruple(
-        response.version,
-        response.x25519PublicKey,
-        response.ed25519PublicKey,
-        response.deviceName,
-    )
+fun parsePairingResponse(responseBytes: ByteArray): PairingResponse {
+    return TapAuthCrypto.parsePairingResponse(responseBytes)
 }
 
 /** Create a PairingCskMessage Note: Not used by Android server, kept for API completeness */

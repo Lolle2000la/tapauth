@@ -73,6 +73,10 @@ pub struct ClientPairingSession {
     server_x25519_public: Option<[u8; 32]>,
     psk: Option<PairingSymmetricKey>,
     sas: Option<String>,
+    /// Algorithms the server supports (from PairingHello)
+    server_supported_symmetric: Vec<i32>,
+    server_supported_hash: Vec<i32>,
+    server_supported_signature: Vec<i32>,
 }
 
 /// Server-side pairing state machine  
@@ -93,6 +97,9 @@ impl ClientPairingSession {
             server_x25519_public: None,
             psk: None,
             sas: None,
+            server_supported_symmetric: Vec::new(),
+            server_supported_hash: Vec::new(),
+            server_supported_signature: Vec::new(),
         })
     }
 
@@ -122,6 +129,11 @@ impl ClientPairingSession {
                 .try_into()
                 .map_err(|_| ProtocolError::InvalidMessageFormat)?,
         );
+
+        // Store server's supported algorithms
+        self.server_supported_symmetric = hello.supported_symmetric_algorithms.clone();
+        self.server_supported_hash = hello.supported_hash_algorithms.clone();
+        self.server_supported_signature = hello.supported_signature_algorithms.clone();
 
         let _client_x25519_priv = self.x25519_keypair.secret_key_bytes();
         let client_x25519_pub = self.x25519_keypair.public_key_bytes();
@@ -219,11 +231,31 @@ impl ClientPairingSession {
         stream: &mut TcpStream,
         client_device_name: &str,
     ) -> Result<(), ProtocolError> {
+        // Select algorithms from server's supported list (use defaults if server sent none)
+        let selected_symmetric = self
+            .server_supported_symmetric
+            .first()
+            .copied()
+            .unwrap_or(SymmetricAlgorithm::Aes256Gcm as i32);
+        let selected_hash = self
+            .server_supported_hash
+            .first()
+            .copied()
+            .unwrap_or(HashAlgorithm::Sha256 as i32);
+        let selected_signature = self
+            .server_supported_signature
+            .first()
+            .copied()
+            .unwrap_or(SignatureAlgorithm::Ed25519 as i32);
+
         let response = PairingResponse {
             version: PAIRING_VERSION,
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
             ed25519_public_key: self.ed25519_keypair.verifying_key_bytes().to_vec(),
             device_name: client_device_name.to_string(),
+            selected_symmetric_algorithm: selected_symmetric,
+            selected_hash_algorithm: selected_hash,
+            selected_signature_algorithm: selected_signature,
         };
 
         let buf = response.encode_to_vec();
@@ -392,6 +424,9 @@ impl ServerPairingSession {
             x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
             ed25519_public_key: self.ed25519_public_key.to_vec(),
             device_name: server_device_name.to_string(),
+            supported_symmetric_algorithms: vec![SymmetricAlgorithm::Aes256Gcm as i32],
+            supported_hash_algorithms: vec![HashAlgorithm::Sha256 as i32],
+            supported_signature_algorithms: vec![SignatureAlgorithm::Ed25519 as i32],
         };
 
         let buf = hello.encode_to_vec();

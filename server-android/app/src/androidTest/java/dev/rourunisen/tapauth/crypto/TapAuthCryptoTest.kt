@@ -450,7 +450,16 @@ class TapAuthCryptoTest {
         val ed25519Public = ed25519Keypair[1] as ByteArray
         val deviceName = "Test Device"
 
-        val pairingHello = createPairingHello(1, x25519Public, ed25519Public, deviceName)
+        val pairingHello =
+            createPairingHello(
+                1,
+                x25519Public,
+                ed25519Public,
+                deviceName,
+                intArrayOf(1),
+                intArrayOf(1),
+                intArrayOf(1),
+            )
 
         assertNotNull("PairingHello should not be null", pairingHello)
         assertTrue("PairingHello should have content", pairingHello.isNotEmpty())
@@ -466,7 +475,16 @@ class TapAuthCryptoTest {
 
         // Create a PairingHello and use its structure for testing
         // (In real usage, server would send PairingResponse)
-        val helloBytes = createPairingHello(1, x25519Public, ed25519Public, deviceName)
+        val helloBytes =
+            createPairingHello(
+                1,
+                x25519Public,
+                ed25519Public,
+                deviceName,
+                intArrayOf(1),
+                intArrayOf(1),
+                intArrayOf(1),
+            )
 
         // Note: This is a simplified test. In production, we'd need actual PairingResponse bytes
         // For now, we just verify the function doesn't crash with valid protobuf

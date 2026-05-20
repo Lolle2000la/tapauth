@@ -175,7 +175,10 @@ pub fn create_authentication_cancel<'local>(
 ///     val version: Int,
 ///     val x25519PublicKey: ByteArray,
 ///     val ed25519PublicKey: ByteArray,
-///     val deviceName: String
+///     val deviceName: String,
+///     val selectedSymmetricAlgorithm: Int,
+///     val selectedHashAlgorithm: Int,
+///     val selectedSignatureAlgorithm: Int
 /// )
 /// ```
 pub fn create_pairing_response<'local>(
@@ -184,6 +187,9 @@ pub fn create_pairing_response<'local>(
     x25519_public_key: &[u8],
     ed25519_public_key: &[u8],
     device_name: &str,
+    selected_symmetric_algorithm: i32,
+    selected_hash_algorithm: i32,
+    selected_signature_algorithm: i32,
 ) -> Option<JObject<'local>> {
     let x25519_array = vec_to_jbytearray(env, x25519_public_key)?;
     let ed25519_array = vec_to_jbytearray(env, ed25519_public_key)?;
@@ -196,12 +202,15 @@ pub fn create_pairing_response<'local>(
         JValue::Object(&x25519_array),
         JValue::Object(&ed25519_array),
         JValue::Object(&device_name_obj),
+        JValue::Int(selected_symmetric_algorithm),
+        JValue::Int(selected_hash_algorithm),
+        JValue::Int(selected_signature_algorithm),
     ];
 
     create_object(
         env,
         "dev/rourunisen/tapauth/crypto/PairingResponse",
-        "(I[B[BLjava/lang/String;)V",
+        "(I[B[BLjava/lang/String;III)V",
         &args,
     )
 }
