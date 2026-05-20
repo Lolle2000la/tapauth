@@ -7,7 +7,7 @@ use shared::{
     network::get_session_timeout,
     protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
@@ -710,6 +710,7 @@ impl AuthSession {
         let timeout = get_session_timeout();
         let start = Instant::now();
         let mut attempt = 0u32;
+        let mut nonce_cache: HashSet<Vec<u8>> = HashSet::new();
 
         loop {
             if start.elapsed() >= timeout {
@@ -725,7 +726,7 @@ impl AuthSession {
 
             // Wait for response
             let retry_interval = shared::network::get_client_retry_interval(attempt);
-            match Self::wait_for_response(&transport, retry_interval, csk, &paired_servers).await {
+            match Self::wait_for_response(&transport, retry_interval, csk, &paired_servers, &mut nonce_cache).await {
                 Ok(Some((wrapper, server_addr))) => {
                     // Process the authenticated response
                     match Self::process_auth_response(
@@ -763,11 +764,25 @@ impl AuthSession {
         retry_interval: Duration,
         csk: &ClientSymmetricKey,
         paired_servers: &HashMap<String, PairedServer>,
+        nonce_cache: &mut HashSet<Vec<u8>>,
     ) -> Result<Option<(shared::protocol::pb::WrapperMessage, String)>, AuthHandlerError> {
         match transport.receive_response(retry_interval).await {
             Err(e) => Err(e),
             Ok(ReceiveResult::Timeout) => Ok(None),
             Ok(ReceiveResult::Response(response_packet, server_addr)) => {
+                let nonce_fingerprint = {
+                    let mut data = response_packet.temporal_identifier.clone();
+                    data.extend_from_slice(&response_packet.ciphertext);
+                    data
+                };
+                if !nonce_cache.insert(nonce_fingerprint) {
+                    tracing::warn!(
+                        "Replayed packet detected from {}, ignoring",
+                        server_addr
+                    );
+                    return Ok(None);
+                }
+
                 let wrapper = decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
                 let addr_str = server_addr.to_string();
                 tracing::debug!("Received message from {}", addr_str);
