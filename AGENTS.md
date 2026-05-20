@@ -1,112 +1,177 @@
-# AGENTS.md - TapAuth Context & Architecture
+# AGENTS.md - TapAuth
 
-## 1. Project Overview
-**TapAuth** is a privacy-first, low-latency authentication system that allows a Linux desktop (**Client**) to be unlocked using a paired mobile device (**Server**) via biometrics.
+## Overview
+**TapAuth** is a local-first authentication system: a Linux desktop (**Client**) unlocks via a paired Android device (**Server**) over UDP broadcast/multicast or BLE.
 
-**Core Philosophy:**
-- **Local First:** No cloud servers. All communication happens over local UDP Broadcast/Multicast or Bluetooth Low Energy (BLE).
-- **Parallel Discovery:** To minimize latency, the Client "races" UDP and BLE simultaneously; the first successful transport wins.
-- **Privacy:** Uses rotating temporal identifiers to prevent passive network tracking.
-
-## 2. Terminology & Roles
-
-| Term | Role | Component Path | Tech Stack |
+| Term | Role | Path | Stack |
 | :--- | :--- | :--- | :--- |
-| **Client** | The Linux Desktop requesting authentication. | `tapauthd`, `client-pam`, `client-config-gui` | Rust |
-| **Server** | The Android/Mobile device performing biometric verification. | `server-android` | Kotlin / Jetpack Compose |
-| **Daemon** | The background service on the Client managing transport & crypto. | `tapauthd` | Rust (Tokio) |
-| **PAM** | The Pluggable Authentication Module integrating with Linux login. | `client-pam` | Rust (FFI) |
-| **Shared** | Common library for Protocol, Crypto, and Networking. | `shared` | Rust |
+| **Client** | Linux desktop requesting auth | `tapauthd`, `client-pam`, `client-config-gui` | Rust |
+| **Server** | Android device verifying biometrics | `server-android` | Kotlin / Compose |
+| **Daemon** | Background service managing transport & crypto | `tapauthd` | Rust (Tokio) |
+| **PAM** | Pluggable Authentication Module hooking into login/sudo | `client-pam` | Rust (FFI cdylib) |
+| **Shared** | Protocol, crypto, networking, JNI bridge | `shared` | Rust |
 
-## 3. Architecture & Component Interaction
+## Workspace & Build Commands
 
-### A. The Client Ecosystem (Linux)
-The Linux side is split into three parts to separate privileges and responsibilities:
-1.  **`client-pam`**:
-    * **Responsibility**: Hooks into the Linux login process (GDM, sudo, etc.).
-    * **Behavior**: Acts as a thin client. It pauses the login, sends an IPC request to `tapauthd`, and waits for a Yes/No response.
-2.  **`tapauthd` (The Core)**:
-    * **Responsibility**: Runs as a systemd service. Manages Bluetooth/UDP sockets, stores cryptographic keys, and handles the "Race" logic.
-    * **Privileges**: Needs network capabilities and access to BLE hardware.
-3.  **`client-config-gui`**:
-    * **Responsibility**: User interface for pairing new devices, managing keys, and settings.
-    * **Behavior**: Communicates with `tapauthd` via IPC to initiate pairing modes.
+### Rust crates (workspace members)
+```
+shared/          # lib (cdylib + rlib), build.rs generates protobuf
+client-pam/      # cdylib -> installed as pam_tapauth.so
+client-config-gui/ # bin "tapauth-config" (iced GUI)
+tapauthd/        # bin, the systemd daemon
+tests/           # EXCLUDED from workspace (separate Cargo.toml)
+```
 
-### B. The Server Ecosystem (Android)
-* **Path**: `server-android/`
-* **Architecture**: 
-    * **Foreground Services**: Both UDP (`AuthenticationService`) and BLE (`BleGattService`) run as Android Foreground Services to prevent the OS from killing them during background operation.
-    * **JNI Bridge**: The Android app is a "shell" for the UI and hardware access. All core logic resides in the Rust `shared` library.
-    * **Strict Boundary**: Kotlin code **never** parses or manipulates Protobuf messages directly. It passes raw bytes to the JNI layer (`jni_api.rs`), which handles validation, decryption, and parsing, returning safe POJOs to Kotlin.
+### Exact CI commands (verified)
+```bash
+# Build & test per crate (run from workspace root):
+cargo build --manifest-path shared/Cargo.toml
+cargo build --manifest-path shared/Cargo.toml --features jni
+cargo build --manifest-path client-pam/Cargo.toml
+cargo build --manifest-path client-config-gui/Cargo.toml
+cargo build --workspace
 
-### C. The Protocol (Shared)
-* **Definition**: `proto/auth_protocol.proto` & `proto/ipc.proto`.
-* **Logic**: Implemented in `shared/`.
-* **Packet Structure**:
-    * All payloads are wrapped in an `EncryptedPacket`.
-    * **Temporal ID**: The header contains a 16-byte (UDP) or 10-byte (BLE) ID derived from an HMAC-SHA256 of the current time window (60s). This allows the Server to identify the Client without exposing static IDs.
+cargo test --manifest-path shared/Cargo.toml
+cargo test --manifest-path shared/Cargo.toml --features jni
+cargo test --manifest-path client-pam/Cargo.toml
+cargo test --manifest-path client-config-gui/Cargo.toml
+cargo test --workspace
 
-## 4. Critical Workflows
+# Lint/format:
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
 
-### 4.1. Authentication "Race" Flow
-When `client-pam` triggers `tapauthd`:
-1.  `tapauthd` broadcasts `EncryptedPacket` via **UDP** (Port 36692).
-2.  `tapauthd` simultaneously starts **BLE Advertising**.
-3.  The `server-android` listens on both.
-4.  If the User approves on the Server:
-    * Server replies via the *same* transport method that delivered the request.
-    * Server retransmits the Grant every 500ms until confirmed or timed out (10s).
-5.  `tapauthd` accepts the first valid Grant, verifies the signature, and signals `client-pam` to unlock.
+### Android
+```bash
+# Format Kotlin:
+cd server-android && ./gradlew spotlessApply
 
-### 4.2. Pairing Flow
-1.  Client generates a QR code containing its public key and IP info.
-2.  Server scans QR code.
-3.  Key exchange occurs (Protocol details in `docs/design-documents/protocol/initial-key-exchange.md`).
-4.  **Client Symmetric Key (CSK)** is generated/exchanged. This key is used for future `EncryptedPacket` encryption.
+# Check formatting:
+cd server-android && ./gradlew spotlessCheck
 
-## 5. Directory Structure & Navigation
+# Unit tests (JVM):
+cd server-android && ./gradlew test
 
-* `docs/`: **READ FIRST.** Source-of-truth design docs (`authentication-flow.md` is critical).
-* `proto/`: Protobuf definitions. Modifying these requires recompiling `shared`, `tapauthd`, and `server-android`.
-* `shared/`:
-    * `src/crypto/`: Encryption (AES-GCM), Signing (Ed25519), and Key Derivation.
-    * `src/jni_api.rs`: **Critical.** The JNI interface. All Protobuf serialization/deserialization for Android happens here.
-* `tapauthd/`:
-    * `src/transport/`: Implementation of `ble.rs` (using `bluer`) and `udp.rs`.
-    * `src/auth_handler.rs`: The state machine deciding when to unlock.
-* `server-android/`:
-    * `app/src/main/java/dev/rourunisen/tapauth/crypto/TapAuthCrypto.kt`: The Kotlin gatekeeper for JNI calls.
+# Instrumentation tests (requires emulator + native libs built):
+cd server-android && ./gradlew connectedDebugAndroidTest
+```
 
-## 6. Development Constraints & Guidelines
+## Feature Flags (critical)
 
-### Security & Protocol Boundaries
-* **Rust is the Source of Truth**: Protocol logic, packet structures, and cryptographic operations live exclusively in Rust.
-* **No Manual Parsing in Kotlin**: The Android app must treat `ByteArray` messages as opaque until processed by `TapAuthCrypto` (JNI). Do not write manual parsers in Kotlin.
-* **Replay Protection**: The Server explicitly checks `challenge` nonces and `timestamp_unix_seconds` (60s window). Do not remove these checks.
-* **Metadata**: Never transmit static identifiers (like MAC addresses or Public Keys) in cleartext during the Authentication phase. Use Temporal IDs.
+| Crate | Default | Features |
+|-------|---------|----------|
+| `shared` | `[]` | `jni`, `tpm`, `firewall` |
+| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket` |
+| `client-pam` | `[]` | `tpm` |
+| `client-config-gui` | `[]` | `tpm` |
 
-### Rust Considerations
-* **Async**: The daemon uses `tokio`. Ensure no blocking operations occur in the main event loop, especially regarding BLE socket handling.
-* **Error Handling**: Use `thiserror` in libraries and `anyhow` in binaries/tests.
-* **Verify Buildability**: Always run `cargo check` with the appropriate features (or `--all-features`) after modifying shared code. Run it for the whole workspace for a final check.
-* **Verify Tests**: Run `cargo test` in for the entire workspace to ensure no tests are broken. You may need to run with `--all-features`.
-* **Code Formatting**: Use `cargo fmt` and `cargo clippy` regularly to maintain code quality.
-* **No `mod.rs` Syntax**: Follow Rust's 2018 module system guidelines by avoiding `mod.rs` files. Instead, use the new file-based module system for better clarity and organization.
+**Gotchas:**
+- `--all-features` **won't work locally** on a vanilla Linux box — it pulls in `jni` which requires `libjvm`/JDK headers. Use per-crate feature combos from CI.
+- **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
+- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Without this, the daemon errors out with "Systemd socket activation required."
+- `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
 
-### Android Considerations
-* **Foreground Requirement**: Authentication listeners (`BleGattService`, `AuthenticationService`) **must** run as Foreground Services. Ensure `startForeground` is called immediately in `onCreate` to avoid `ForegroundServiceDidNotStartInTimeException`.
-* **Permissions**: Handling `POST_NOTIFICATIONS` (Android 13+) is a prerequisite for starting the foreground services.
-* **Biometrics**: Relies on `androidx.biometric`.
-* **Spotless Format**: Use Spotless for Kotlin code formatting. Run `./gradlew spotlessApply` before commits.
+## Development Quick Start
+```bash
+# Create system users/groups and /var/lib/tapauth (needs root):
+sudo ./create-dev-users.sh
 
-## 7. Common Tasks for Agents
+# Run daemon in dev mode:
+cargo run --manifest-path tapauthd/Cargo.toml --features fallback-socket --no-default-features
 
-* **Adding a Protocol Field**:
-    1.  Edit `proto/auth_protocol.proto`.
-    2.  Update `shared/src/protocol/messages.rs` (Rust) to handle the logic.
-    3.  Update `shared/src/jni_api.rs` (Rust) to expose the new field to JNI.
-    4.  Update `ProtocolDataClasses.kt` (Kotlin) to receive the field.
-* **Debugging Connection Issues**:
-    1.  Check `tapauthd` logs (uses `tracing`).
-    2.  Verify `systemd` socket activation status.
-    3.  Check if `firewalld` is blocking UDP port 36692.
+# Run GUI for pairing:
+cargo run --manifest-path client-config-gui/Cargo.toml
+
+# PAM module (built as libclient_pam.so, installed as pam_tapauth.so):
+cargo build --manifest-path client-pam/Cargo.toml
+```
+
+## Protobuf Codegen
+- Proto definitions: `proto/auth_protocol.proto`, `proto/ipc.proto`
+- Generated by `shared/build.rs` into `shared::protocol::pb` and `shared::ipc::pb`
+- The `tests/` crate has its own `build.rs` compiling `ipc.proto` to `tapauth.ipc` namespace
+- **After editing a `.proto` file**, at minimum rebuild `shared` and `tapauthd`. If the Android JNI surface changed, also rebuild native libs for Android.
+
+## Architecture Notes
+
+### Daemon IPC protocol (Unix socket)
+- `tapauthd` listens on `/run/tapauthd/tapauthd.sock` (systemd socket activation, FD#3, or manual bind with `fallback-socket`)
+- Length-prefixed framing: 4-byte BE u32 length + protobuf body
+- Supported messages: `PamAuthenticateRequest`, `PamCancelRequest`
+- Response: `PamAuthenticateResponse` with outcome (`Granted`/`Denied`/`Ignore`/`Error`)
+
+### PAM Module (`client-pam`)
+- Built as `libclient_pam.so`, installed to distro-specific PAM dir as `pam_tapauth.so`
+- Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
+- Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
+
+### Authentication "Race" Flow
+1. `client-pam` sends IPC request to `tapauthd`
+2. `tapauthd` broadcasts via UDP (port 36692) **and** starts BLE advertising simultaneously
+3. Android device replies on the same transport
+4. First valid `Grant` wins; `tapauthd` signals `client-pam`
+
+### JNI Boundary (Android)
+- **Kotlin never parses Protobuf.** Raw `ByteArray` messages are passed to Rust JNI (`jni_api.rs`) for validation, decryption, and parsing.
+- JNI crypto tests (`TapAuthCryptoTest.kt`) are **instrumentation tests** requiring an emulator/device.
+- Native build for Android is handled by the `org.mozilla.rust-android-gradle` plugin in `app/build.gradle.kts` (the `cargo` block), not by a standalone script.
+
+### GUI Framework
+- `client-config-gui` uses **iced** (Rust GUI framework), not GTK. Requires X11 or Wayland.
+
+### Transport Details
+- **UDP port 36692** (default, user-configurable). IPv4 broadcast (`255.255.255.255`) + IPv6 multicast (`ff02::1`).
+- **BLE**: Service UUID `b4ad84c0-2adb-4876-8315-b39d983b2bde`. GATT characteristic UUIDs are in `docs/design-documents/protocol/ble-gatt-specification.md`.
+- **Pairing uses TCP** (not UDP). QR code URL format: `tapauth://pair?v=1&pk=<hex>&p=<port>&ip4=<ipv4>&ip6=<ipv6>`.
+
+### Cryptography Quick Reference
+- **X25519** for key exchange, **Ed25519** for signatures, **AES-256-GCM** for symmetric encryption.
+- **AES-GCM nonces**: 12-byte cryptographically random, prepended to ciphertext. **NEVER reuse** a nonce with the same key.
+- **PSK** (Pairing Symmetric Key): ephemeral, derived from ECDH, **must be discarded after pairing**.
+- **CSK** (Client Symmetric Key): one per Client, shared with all paired Servers. Stored long-term.
+
+### Key Storage
+- **Android**: Android Keystore System (hardware-backed where available).
+- **Linux**: TPM 2.0 preferred (`tpm` feature). Fallback: root-owned `/var/lib/tapauth/` with mode 700/600.
+
+### Replay & DoS Protections
+- **Two replay checks**: nonce cache (primary, 120s TTL) + timestamp window (secondary, 60s).
+- **Pre-authentication DoS**: temporal IDs are pre-computed per 60s window into a hash set for O(1) checks before crypto.
+- **Post-authentication rate limiting**: escalating backoff (1s → 2s → 4s → max 5s) per Client public key.
+
+### Retransmission
+- **Client** (`AuthenticationRequest`): exponential backoff (200ms → 400ms → 800ms → ...).
+- **Server** (`AuthenticationGrant`/`Denial`): fixed 500ms, up to 10s. Stops when `GrantConfirmation` received.
+- Client **must** resend `GrantConfirmation` up to 3 times if further retransmissions arrive.
+
+### Design Documents
+- Full protocol specs live in `docs/design-documents/protocol/`. Key files:
+  - `authentication-flow.md` — message sequencing, retransmission, replay protection
+  - `ble-gatt-specification.md` — BLE UUIDs and characteristic definitions
+  - `cryptography-specification.md` — algorithm choices, nonce management
+  - `initial-key-exchange.md` — pairing QR format, SAS verification
+  - `security-hardening.md` — key storage, rate limiting, DoS mitigation
+  - `device-lifecycle.md` — un-pairing, key rotation
+
+## Security Constraints
+- **Rust is the source of truth** for protocol logic, crypto, and packet structure.
+- **No static identifiers** in cleartext during authentication (use rotating temporal IDs, HMAC-SHA256 of 60s time window).
+- **Replay protection**: challenge nonces + 60-second timestamp window. Do not remove these checks.
+- **Config files**: mode 600 for files, 700 for directories under `/var/lib/tapauth/`, owned by `tapauthd` user.
+
+## Configuration
+- Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
+- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 3), `use_tpm` (default false)
+
+## Integration Tests (`tests/` crate)
+- **Excluded from workspace** — must be built/tested separately
+- **Require a running daemon** on `/run/tapauthd/tapauthd-test.sock` (override with `TAPAUTHD_SOCK` env var)
+- Test auth timeout, cancellation, malformed messages, and concurrency against live daemon
+
+## Docker Dev Environment
+```bash
+docker compose -f docker-compose.dev.yml up -d
+docker exec -it tapauth-dev bash
+# Inside container: build-tapauth, test-tapauth, test-pam-auth, run-gui
+```
