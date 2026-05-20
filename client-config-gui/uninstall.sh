@@ -23,6 +23,12 @@ if [ -f /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy ]; then
     rm /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy
 fi
 
+# Remove desktop icon
+if [ -f /usr/share/icons/hicolor/scalable/apps/tapauth-config.svg ]; then
+    echo "Removing desktop icon..."
+    rm /usr/share/icons/hicolor/scalable/apps/tapauth-config.svg
+fi
+
 # Remove desktop file
 if [ -f /usr/share/applications/tapauth-config.desktop ]; then
     echo "Removing desktop file..."
@@ -33,6 +39,12 @@ fi
 if command -v update-desktop-database &> /dev/null; then
     echo "Updating desktop database..."
     update-desktop-database /usr/share/applications
+fi
+
+# Update icon cache
+if command -v gtk-update-icon-cache &> /dev/null; then
+    echo "Updating icon cache..."
+    gtk-update-icon-cache -f /usr/share/icons/hicolor
 fi
 
 echo ""

@@ -29,6 +29,7 @@ PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
+CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
 CONFIG_DIR="/var/lib/tapauth"
 DAEMON_PATH="/usr/bin/tapauthd"
@@ -521,6 +522,7 @@ remove_config_gui() {
         print_info "[DRY RUN] Would remove configuration GUI"
         echo ""
         show_file_removal "$CONFIG_GUI_PATH" "Configuration GUI binary"
+        show_file_removal "$CONFIG_ICON_PATH" "Desktop icon"
         show_file_removal "$CONFIG_DESKTOP_PATH" "Desktop entry"
         show_file_removal "$CONFIG_POLICY_PATH" "Polkit policy"
         return
@@ -530,6 +532,12 @@ remove_config_gui() {
     if [[ -f "$CONFIG_GUI_PATH" ]]; then
         print_info "Removing configuration GUI binary"
         rm -f "$CONFIG_GUI_PATH"
+    fi
+    
+    # Remove desktop icon
+    if [[ -f "$CONFIG_ICON_PATH" ]]; then
+        print_info "Removing desktop icon"
+        rm -f "$CONFIG_ICON_PATH"
     fi
     
     # Remove desktop entry

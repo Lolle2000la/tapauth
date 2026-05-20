@@ -2,7 +2,7 @@
 Name=TapAuth Configuration
 Comment=Configure TapAuth authentication pairings
 Exec=sh -c 'pkexec env DISPLAY="$DISPLAY" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XAUTHORITY="$XAUTHORITY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" tapauth-config'
-Icon=security-high
+Icon=tapauth-config
 Terminal=false
 Type=Application
 Categories=Settings;Security;System;

@@ -39,6 +39,7 @@ PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
+CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
 CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
 CONFIG_DIR="/var/lib/tapauth"
 KEY_PATH="$CONFIG_DIR/client_key"
@@ -1379,6 +1380,13 @@ install_config_gui() {
         show_file_copy "target/release/tapauth-config" "$CONFIG_GUI_PATH"
         show_command "chmod 755 $CONFIG_GUI_PATH" "Set GUI executable permissions"
         
+        if [[ -d /usr/share/icons/hicolor ]]; then
+            show_file_copy "client-config-gui/assets/tapauth-config.svg" "$CONFIG_ICON_PATH"
+            show_command "chmod 644 $CONFIG_ICON_PATH" "Set icon permissions"
+        else
+            echo -e "${YELLOW}[SKIP]${NC} Desktop icon (hicolor theme doesn't exist)"
+        fi
+        
         if [[ -d /usr/share/applications ]]; then
             show_file_copy "client-config-gui/tapauth-config.desktop" "$CONFIG_DESKTOP_PATH"
             show_command "chmod 644 $CONFIG_DESKTOP_PATH" "Set desktop entry permissions"
@@ -1403,6 +1411,17 @@ install_config_gui() {
     # Restore SELinux context if available
     if command -v restorecon &> /dev/null; then
         restorecon "$CONFIG_GUI_PATH" || true
+    fi
+    
+    # Install desktop icon
+    if [[ -d /usr/share/icons/hicolor ]]; then
+        print_info "Installing desktop icon"
+        cp client-config-gui/assets/tapauth-config.svg "$CONFIG_ICON_PATH"
+        chmod 644 "$CONFIG_ICON_PATH"
+        
+        if command -v gtk-update-icon-cache &> /dev/null; then
+            gtk-update-icon-cache -f /usr/share/icons/hicolor
+        fi
     fi
     
     # Install desktop entry

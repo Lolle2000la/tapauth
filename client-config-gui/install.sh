@@ -24,6 +24,11 @@ echo "Installing polkit policy..."
 install -Dm644 dev.rourunisen.tapauth.policy \
     /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy
 
+# Install desktop icon
+echo "Installing desktop icon..."
+install -Dm644 assets/tapauth-config.svg \
+    /usr/share/icons/hicolor/scalable/apps/tapauth-config.svg
+
 # Install desktop file
 echo "Installing desktop file..."
 install -Dm644 tapauth-config.desktop \
@@ -33,6 +38,12 @@ install -Dm644 tapauth-config.desktop \
 if command -v update-desktop-database &> /dev/null; then
     echo "Updating desktop database..."
     update-desktop-database /usr/share/applications
+fi
+
+# Update icon cache
+if command -v gtk-update-icon-cache &> /dev/null; then
+    echo "Updating icon cache..."
+    gtk-update-icon-cache -f /usr/share/icons/hicolor
 fi
 
 echo ""
