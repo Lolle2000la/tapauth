@@ -7,13 +7,20 @@ use prost::Message as ProstMessage;
 
 use crate::crypto::{sign_ed25519, verify_ed25519, Ed25519KeyPair};
 use crate::protocol::pb::*;
-use sha2::{Digest, Sha256};
 
 pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    hex::encode(result)
+    #[cfg(debug_assertions)]
+    {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex::encode(hasher.finalize())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = data;
+        "<stripped>".to_string()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

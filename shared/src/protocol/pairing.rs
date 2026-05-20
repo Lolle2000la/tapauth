@@ -55,10 +55,18 @@ use crate::protocol::pb::*;
 use crate::protocol::ProtocolError;
 
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    #[cfg(debug_assertions)]
+    {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex::encode(hasher.finalize())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = data;
+        "<stripped>".to_string()
+    }
 }
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024; // 16KB max message size

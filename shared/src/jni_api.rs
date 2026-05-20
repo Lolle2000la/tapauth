@@ -53,9 +53,18 @@ use crate::jni::*;
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    #[cfg(debug_assertions)]
+    {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex::encode(hasher.finalize())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = data;
+        "<stripped>".to_string()
+    }
 }
 
 /// Generate a new Ed25519 keypair for signing.
@@ -409,7 +418,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
 ) -> jstring {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-        use sha2::{Digest, Sha256};
 
         let data_bytes = match jbytearray_to_vec(&mut env, data, "data") {
             Some(b) => b,
