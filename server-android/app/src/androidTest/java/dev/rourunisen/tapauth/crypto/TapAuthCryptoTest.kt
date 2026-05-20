@@ -504,12 +504,14 @@ class TapAuthCryptoTest {
 
     @Test
     fun testCreateAndParsePairingComplete() {
-        val completeBytes = TapAuthCrypto.createPairingComplete(true)
+        val dummyHash = ByteArray(12 + 32) // 12-byte nonce + 32-byte encrypted hash
+        val completeBytes = TapAuthCrypto.createPairingComplete(true, 1, dummyHash)
         assertNotNull("PairingComplete bytes should not be null", completeBytes)
 
         val parsed = TapAuthCrypto.parsePairingComplete(completeBytes)
         assertNotNull("Parsed PairingComplete should not be null", parsed)
         assertTrue("Success should be true", parsed.success)
+        assertEquals("Hash algorithm should be SHA256 (1)", 1, parsed.hashAlgorithm)
     }
 
     // ========== SHA-256 Tests ==========

@@ -116,11 +116,17 @@ message PairingCskMessage {
 }
 
 /**
- * Final acknowledgment from client that pairing is complete.
+ * Final acknowledgment from server that pairing is complete.
+ * Includes a hash of the received CSK encrypted with PSK so the client
+ * can verify the CSK was received intact (integrity check).
  */
 message PairingComplete {
   // Whether pairing was successful
   bool success = 1;
+  // Hash algorithm used for the CSK hash
+  HashAlgorithm hash_algorithm = 2;
+  // SHA-256 hash of the CSK, encrypted with the ephemeral PSK
+  bytes csk_hash = 3;
 }
 
 /**

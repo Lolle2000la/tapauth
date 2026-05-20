@@ -213,19 +213,29 @@ pub fn create_pairing_response<'local>(
 /// ## Constructor signature
 /// ```kotlin
 /// data class PairingComplete(
-///     val success: Boolean
+///     val success: Boolean,
+///     val hashAlgorithm: Int,
+///     val encryptedCskHash: ByteArray
 /// )
 /// ```
 pub fn create_pairing_complete<'local>(
     env: &mut JNIEnv<'local>,
     success: bool,
+    hash_algorithm: i32,
+    encrypted_csk_hash: &[u8],
 ) -> Option<JObject<'local>> {
-    let args = [JValue::Bool(success as u8)];
+    let hash_array = vec_to_jbytearray(env, encrypted_csk_hash)?;
+
+    let args = [
+        JValue::Bool(success as u8),
+        JValue::Int(hash_algorithm),
+        JValue::Object(&hash_array),
+    ];
 
     create_object(
         env,
         "dev/rourunisen/tapauth/crypto/PairingComplete",
-        "(Z)V",
+        "(ZI[B)V",
         &args,
     )
 }

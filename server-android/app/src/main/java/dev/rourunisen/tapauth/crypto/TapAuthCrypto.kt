@@ -336,18 +336,24 @@ object TapAuthCrypto {
     external fun parsePairingCskMessage(messageBytes: ByteArray): Array<Any>
 
     /**
-     * Create a PairingComplete message (protobuf)
+     * Create a PairingComplete protobuf message.
      *
      * @param success Whether pairing was successful
+     * @param hashAlgorithm Hash algorithm used for CSK hash (e.g., SHA256 = 1)
+     * @param encryptedCskHash CSK hash encrypted with PSK
      * @return Protobuf-encoded PairingComplete bytes
      */
-    external fun createPairingComplete(success: Boolean): ByteArray
+    external fun createPairingComplete(
+        success: Boolean,
+        hashAlgorithm: Int,
+        encryptedCskHash: ByteArray,
+    ): ByteArray
 
     /**
      * Parse a PairingComplete message (protobuf)
      *
      * @param completeBytes Protobuf-encoded PairingComplete
-     * @return PairingComplete object with success status
+     * @return PairingComplete object with success, hashAlgorithm, and encryptedCskHash
      */
     external fun parsePairingComplete(completeBytes: ByteArray): PairingComplete
 }
@@ -604,18 +610,21 @@ fun parsePairingCskMessage(messageBytes: ByteArray): Pair<ByteArray, String> {
 }
 
 /** Create a PairingComplete message */
-fun createPairingComplete(success: Boolean): ByteArray {
-    return TapAuthCrypto.createPairingComplete(success)
+fun createPairingComplete(
+    success: Boolean,
+    hashAlgorithm: Int,
+    encryptedCskHash: ByteArray,
+): ByteArray {
+    return TapAuthCrypto.createPairingComplete(success, hashAlgorithm, encryptedCskHash)
 }
 
 /**
  * Parse a PairingComplete message
  *
- * @return true if pairing was successful
+ * @return PairingComplete object with success, hashAlgorithm, and encryptedCskHash
  */
-fun parsePairingComplete(completeBytes: ByteArray): Boolean {
-    val complete = TapAuthCrypto.parsePairingComplete(completeBytes)
-    return complete.success
+fun parsePairingComplete(completeBytes: ByteArray): PairingComplete {
+    return TapAuthCrypto.parsePairingComplete(completeBytes)
 }
 
 private fun hexToBytes(hex: String): ByteArray {

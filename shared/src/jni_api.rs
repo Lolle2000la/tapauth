@@ -1825,6 +1825,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
 /// JNI wrapper for creating a PairingComplete message.
 ///
 /// @param success Whether pairing succeeded
+/// @param hash_algorithm Hash algorithm used for CSK hash (e.g., SHA256 = 1)
+/// @param encrypted_csk_hash CSK hash encrypted with PSK
 /// @return Protobuf-encoded PairingComplete bytes
 /// @throws IOException if protobuf encoding fails
 #[no_mangle]
@@ -1832,12 +1834,22 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     mut env: JNIEnv,
     _class: JClass,
     success: jboolean,
+    hash_algorithm: jint,
+    encrypted_csk_hash: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use crate::protocol::pb;
 
+        let hash_bytes =
+            match jbytearray_to_vec(&mut env, encrypted_csk_hash, "encrypted_csk_hash") {
+                Some(b) => b,
+                None => return std::ptr::null_mut(),
+            };
+
         let complete = pb::PairingComplete {
             success: success != 0,
+            hash_algorithm,
+            csk_hash: hash_bytes,
         };
 
         let buf = match encode_message(&mut env, &complete) {
@@ -1887,7 +1899,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
             None => return std::ptr::null_mut(),
         };
 
-        match create_pairing_complete(&mut env, complete.success) {
+        match create_pairing_complete(
+            &mut env,
+            complete.success,
+            complete.hash_algorithm,
+            &complete.csk_hash,
+        ) {
             Some(obj) => obj.into_raw(),
             None => std::ptr::null_mut(),
         }

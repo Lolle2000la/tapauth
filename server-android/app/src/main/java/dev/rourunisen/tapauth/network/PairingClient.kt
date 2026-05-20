@@ -180,8 +180,24 @@ class PairingClient(private val context: Context) {
 
                 Log.d(TAG, "Decrypted CSK (${csk.size} bytes)")
 
-                // Step 7: Send PairingComplete message (protobuf) to confirm success
-                val completeMessage = dev.rourunisen.tapauth.crypto.createPairingComplete(true)
+                // Compute SHA-256 hash of CSK for integrity verification
+                val md = java.security.MessageDigest.getInstance("SHA-256")
+                val cskHash = md.digest(csk)
+
+                // Encrypt the CSK hash with PSK
+                val encryptedCskHash =
+                    dev.rourunisen.tapauth.crypto.encryptWithPsk(
+                        psk = psk,
+                        plaintext = cskHash,
+                    )
+
+                // Step 7: Send PairingComplete message with encrypted CSK hash
+                val completeMessage =
+                    dev.rourunisen.tapauth.crypto.createPairingComplete(
+                        success = true,
+                        hashAlgorithm = 1, // SHA256
+                        encryptedCskHash = encryptedCskHash,
+                    )
 
                 output.writeInt(completeMessage.size)
                 output.write(completeMessage)

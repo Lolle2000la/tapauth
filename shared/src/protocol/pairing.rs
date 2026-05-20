@@ -188,7 +188,7 @@ impl ClientPairingSession {
         username: &str,
     ) -> Result<(), ProtocolError> {
         self.send_csk_message(&mut stream, csk, username).await?;
-        self.receive_pairing_complete(&mut stream).await?;
+        self.receive_pairing_complete(&mut stream, csk).await?;
 
         Ok(())
     }
@@ -274,7 +274,11 @@ impl ClientPairingSession {
         Ok(())
     }
 
-    async fn receive_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
+    async fn receive_pairing_complete(
+        &self,
+        stream: &mut TcpStream,
+        csk: &ClientSymmetricKey,
+    ) -> Result<(), ProtocolError> {
         let len = stream.read_u32().await?;
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(ProtocolError::InvalidMessageFormat);
@@ -286,6 +290,25 @@ impl ClientPairingSession {
         let complete = PairingComplete::decode(&buf[..])?;
 
         if !complete.success {
+            return Err(ProtocolError::InvalidMessageFormat);
+        }
+
+        // Verify CSK hash for integrity
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
+        let decrypted_hash = decrypt_with_psk(psk, &complete.csk_hash)?;
+
+        // Compute expected hash
+        use sha2::{Digest, Sha256};
+        let mut expected_hash = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(csk.as_bytes());
+        expected_hash.copy_from_slice(&hasher.finalize());
+
+        if decrypted_hash != expected_hash {
+            tracing::error!("CSK hash mismatch: server received a different CSK");
             return Err(ProtocolError::InvalidMessageFormat);
         }
 
@@ -347,8 +370,8 @@ impl ServerPairingSession {
         let sas = derive_sas(psk, &client_x25519_pub, &server_x25519_pub)?;
         self.sas = Some(sas.clone());
 
-        let csk = self.receive_csk_message(&mut stream).await?;
-        self.send_pairing_complete(&mut stream).await?;
+        let (csk, csk_hash) = self.receive_csk_message(&mut stream).await?;
+        self.send_pairing_complete(&mut stream, &csk_hash).await?;
 
         let client_ed25519_public: [u8; 32] = response
             .ed25519_public_key
@@ -403,7 +426,7 @@ impl ServerPairingSession {
     async fn receive_csk_message(
         &self,
         stream: &mut TcpStream,
-    ) -> Result<ClientSymmetricKey, ProtocolError> {
+    ) -> Result<(ClientSymmetricKey, [u8; 32]), ProtocolError> {
         let len = stream.read_u32().await?;
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(ProtocolError::InvalidMessageFormat);
@@ -440,11 +463,33 @@ impl ServerPairingSession {
         let mut csk_bytes = [0u8; 32];
         csk_bytes.copy_from_slice(&plaintext);
 
-        Ok(ClientSymmetricKey::from_bytes(csk_bytes))
+        // Compute SHA-256 hash of the CSK for integrity verification
+        let mut csk_hash = [0u8; 32];
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(csk_bytes);
+        csk_hash.copy_from_slice(&hasher.finalize());
+
+        Ok((ClientSymmetricKey::from_bytes(csk_bytes), csk_hash))
     }
 
-    async fn send_pairing_complete(&self, stream: &mut TcpStream) -> Result<(), ProtocolError> {
-        let complete = PairingComplete { success: true };
+    async fn send_pairing_complete(
+        &self,
+        stream: &mut TcpStream,
+        csk_hash: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        // Encrypt the CSK hash with PSK
+        let psk = self
+            .psk
+            .as_ref()
+            .ok_or(ProtocolError::MissingField("psk"))?;
+        let encrypted_hash = encrypt_with_psk(psk, csk_hash)?;
+
+        let complete = PairingComplete {
+            success: true,
+            hash_algorithm: HashAlgorithm::Sha256 as i32,
+            csk_hash: encrypted_hash,
+        };
 
         let buf = complete.encode_to_vec();
         stream.write_u32(buf.len() as u32).await?;

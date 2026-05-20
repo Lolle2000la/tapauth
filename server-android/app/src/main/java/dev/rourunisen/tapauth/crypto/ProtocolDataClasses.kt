@@ -199,5 +199,31 @@ data class PairingResponse(
  * Parsed PairingComplete message.
  *
  * @property success Whether pairing completed successfully
+ * @property hashAlgorithm Hash algorithm used for the CSK hash
+ * @property encryptedCskHash CSK SHA-256 hash encrypted with the ephemeral PSK
  */
-data class PairingComplete(val success: Boolean)
+data class PairingComplete(
+    val success: Boolean,
+    val hashAlgorithm: Int,
+    val encryptedCskHash: ByteArray,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as PairingComplete
+
+        if (success != other.success) return false
+        if (hashAlgorithm != other.hashAlgorithm) return false
+        if (!encryptedCskHash.contentEquals(other.encryptedCskHash)) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = success.hashCode()
+        result = 31 * result + hashAlgorithm
+        result = 31 * result + encryptedCskHash.contentHashCode()
+        return result
+    }
+}
