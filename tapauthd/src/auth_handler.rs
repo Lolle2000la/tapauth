@@ -879,7 +879,7 @@ impl AuthSession {
         csk: &ClientSymmetricKey,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
-        tracing::warn!(
+        tracing::info!(
             "Authentication explicitly denied by server: {}",
             server_addr
         );
