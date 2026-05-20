@@ -75,6 +75,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     _class: JClass,
 ) -> jobjectArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::info!("Keypair generation invoked via JNI channel.");
         let keypair = match crypto::Ed25519KeyPair::generate() {
             Ok(kp) => kp,
             Err(e) => {
@@ -1865,11 +1866,11 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use crate::protocol::pb;
 
-        let hash_bytes =
-            match jbytearray_to_vec(&mut env, encrypted_csk_hash, "encrypted_csk_hash") {
-                Some(b) => b,
-                None => return std::ptr::null_mut(),
-            };
+        let hash_bytes = match jbytearray_to_vec(&mut env, encrypted_csk_hash, "encrypted_csk_hash")
+        {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
 
         let complete = pb::PairingComplete {
             success: success != 0,
@@ -1940,4 +1941,36 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
             std::ptr::null_mut()
         }
     }
+}
+
+// ========== Logging Initialization ==========
+
+#[cfg(target_os = "android")]
+static INIT_LOGGING: std::sync::Once = std::sync::Once::new();
+
+/// Initialize native Android logcat forwarding for tracing events.
+///
+/// Configures a global tracing subscriber with API 30 structured log support.
+/// Automatically hooks file strings, line counts, and thread naming metadata.
+///
+/// Must be called once after `System.loadLibrary`. Subsequent calls are no-ops
+/// thanks to `std::sync::Once`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_initLogging(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        INIT_LOGGING.call_once(|| {
+            use tracing_subscriber::prelude::*;
+
+            let android_layer = paranoid_android::layer("TapAuthNative")
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_thread_names(true)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
+
+            tracing_subscriber::registry().with(android_layer).init();
+        });
+    }));
 }

@@ -8,12 +8,20 @@ object TapAuthCrypto {
     init {
         try {
             System.loadLibrary("shared")
+            initLogging()
         } catch (e: UnsatisfiedLinkError) {
             // Library not found - will fail at runtime if methods are called
             // This is expected during development before the native library is built
             e.printStackTrace()
         }
     }
+
+    /**
+     * Initialize native logging to Android logcat.
+     *
+     * Must be called once after System.loadLibrary. Subsequent calls are no-ops.
+     */
+    private external fun initLogging()
 
     /**
      * Generate a new Ed25519 keypair
