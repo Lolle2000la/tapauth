@@ -281,7 +281,7 @@ impl AuthSession {
 
         // Setup cancellation mechanism
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.register_cancel_handler(cancel_tx);
+        self.register_cancel_handler(cancel_tx).await;
 
         // Pre-compute cancel packet
         let cancel_packet = self.create_cancel_packet()?;
@@ -353,15 +353,9 @@ impl AuthSession {
     }
 
     #[cfg(feature = "ble")]
-    fn register_cancel_handler(&mut self, cancel_tx: oneshot::Sender<()>) {
+    async fn register_cancel_handler(&mut self, cancel_tx: oneshot::Sender<()>) {
         if let (Some(reg), Some(id)) = (self.cancel_registry.as_ref(), self.request_id.as_ref()) {
-            tokio::spawn({
-                let reg = reg.clone();
-                let id = id.clone();
-                async move {
-                    reg.lock().await.insert(id, cancel_tx);
-                }
-            });
+            reg.lock().await.insert(id.clone(), cancel_tx);
         }
     }
 
