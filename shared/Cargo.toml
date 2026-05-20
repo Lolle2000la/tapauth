@@ -10,12 +10,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Cryptography
 aes-gcm = "0.11.0-rc.1"
-ed25519-dalek = { version = "3.0.0-pre.1", features = [
+ed25519-dalek = { version = "3.0.0-pre.7", features = [
     "rand_core",
     "serde",
     "zeroize",
 ] }
-x25519-dalek = { version = "3.0.0-pre.1", features = [
+x25519-dalek = { version = "3.0.0-pre.6", features = [
     "serde",
     "static_secrets",
     "zeroize",
