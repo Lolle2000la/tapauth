@@ -827,7 +827,8 @@ impl AuthSession {
                 .await
             }
             Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
-                Self::handle_auth_denial(transport, challenge, keypair, csk, server_addr).await
+                Self::handle_auth_denial(wrapper, transport, challenge, keypair, csk, server_addr)
+                    .await
             }
             _ => {
                 tracing::debug!("Unexpected message type, waiting for valid response");
@@ -870,12 +871,24 @@ impl AuthSession {
     }
 
     async fn handle_auth_denial<T: Transport + Send + Sync + 'static>(
+        wrapper: &shared::protocol::pb::WrapperMessage,
         transport: &Arc<T>,
         challenge: &[u8; 32],
         keypair: &Ed25519KeyPair,
         csk: &ClientSymmetricKey,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
+        let denial = match &wrapper.payload {
+            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(d)) => d,
+            _ => return Err(ResponseError::InvalidMessage),
+        };
+        if denial.challenge.as_slice() != challenge.as_slice() {
+            tracing::warn!(
+                "AuthDenial challenge mismatch from {}, ignoring",
+                server_addr
+            );
+            return Err(ResponseError::InvalidMessage);
+        }
         tracing::info!(
             "Authentication explicitly denied by server: {}",
             server_addr
