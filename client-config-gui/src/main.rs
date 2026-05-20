@@ -40,6 +40,16 @@ fn main() -> iced::Result {
         original_user
     );
 
+    // Load window icon
+    let icon_data = include_bytes!("../assets/icon-256.png");
+    let icon = iced::window::icon::from_file_data(icon_data, None)
+        .expect("Failed to load TapAuth icon");
+
+    let window_settings = iced::window::Settings {
+        icon: Some(icon),
+        ..iced::window::Settings::default()
+    };
+
     // Run the application
     iced::application(
         "TapAuth Configuration",
@@ -48,5 +58,6 @@ fn main() -> iced::Result {
     )
     .theme(app::TapAuthConfig::theme)
     .font(lucide_icons::LUCIDE_FONT_BYTES)
+    .window(window_settings)
     .run_with(app::TapAuthConfig::new)
 }
