@@ -93,7 +93,7 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
         return Ok(());
     }
 
-    let _ = Command::new("iptables")
+    let status = Command::new("iptables")
         .args([
             "-D",
             "INPUT",
@@ -105,11 +105,14 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
             "ACCEPT",
         ])
         .status()
-        .map_err(|e| {
-            let msg = format!("Failed to close firewall port {}/{}: {}", port, protocol, e);
-            tracing::error!("{}", msg);
-            e
-        });
+        .map_err(|e| format!("Failed to execute iptables -D: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "iptables -D failed with exit status: {}",
+            status
+        ));
+    }
 
     tracing::info!(
         "Firewall (iptables): Closed ephemeral port {}/{}",
