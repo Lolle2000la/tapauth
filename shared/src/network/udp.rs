@@ -21,6 +21,8 @@ use tokio::net::UdpSocket;
 use super::NetworkError;
 use crate::protocol::pb::EncryptedPacket;
 
+const MAX_UDP_MESSAGE_SIZE: usize = 16 * 1024; // 16KB, matches TCP pairing path
+
 // Track whether IPv6 is available (cached after first check)
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static IPV6_CHECKED: AtomicBool = AtomicBool::new(false);
@@ -432,6 +434,13 @@ pub async fn receive_udp_packet(
                 "buffer length mismatch",
             ))
         })?;
+        if packet_bytes.len() > MAX_UDP_MESSAGE_SIZE {
+            tracing::warn!(
+                "UDP packet too large ({} bytes), dropping",
+                packet_bytes.len()
+            );
+            continue;
+        }
         let packet = EncryptedPacket::decode(packet_bytes)?;
         return Ok((packet, addr));
     }
