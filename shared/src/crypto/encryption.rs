@@ -47,7 +47,7 @@ pub fn decrypt_aes_gcm(
 }
 
 /// Derive a nonce from challenge and a context string
-pub fn derive_nonce(challenge: &[u8; 32], info: &[u8]) -> Result<[u8; 12], CryptoError> {
+pub(crate) fn derive_nonce(challenge: &[u8; 32], info: &[u8]) -> Result<[u8; 12], CryptoError> {
     let hk = Hkdf::<Sha256>::new(None, challenge);
     let mut nonce = [0u8; 12];
     hk.expand(info, &mut nonce)
@@ -56,7 +56,7 @@ pub fn derive_nonce(challenge: &[u8; 32], info: &[u8]) -> Result<[u8; 12], Crypt
 }
 
 /// Encrypt with CSK using derived nonce
-pub fn encrypt_with_csk(
+pub(crate) fn encrypt_with_csk(
     csk: &ClientSymmetricKey,
     challenge: &[u8; 32],
     context: &[u8],
@@ -67,7 +67,7 @@ pub fn encrypt_with_csk(
 }
 
 /// Decrypt with CSK using derived nonce
-pub fn decrypt_with_csk(
+pub(crate) fn decrypt_with_csk(
     csk: &ClientSymmetricKey,
     challenge: &[u8; 32],
     context: &[u8],
