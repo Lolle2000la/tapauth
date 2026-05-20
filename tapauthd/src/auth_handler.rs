@@ -61,7 +61,7 @@ struct AwaitAuthParams<'a> {
 
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
-    pub config_manager: ClientConfigManager,
+    pub config_manager: Arc<ClientConfigManager>,
     pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
     pub csk: ClientSymmetricKey,
     pub hostname: String,
@@ -71,7 +71,7 @@ pub struct DaemonState {
 
 impl DaemonState {
     pub fn new(udp_socket: tokio::net::UdpSocket) -> Result<Self, AuthHandlerError> {
-        let config_manager = ClientConfigManager::new();
+        let config_manager = Arc::new(ClientConfigManager::new());
 
         // Try to load keypair - if it fails due to TPM, enter degraded mode
         let (keypair, init_error) = match config_manager.load_keypair() {
@@ -314,7 +314,7 @@ impl AuthSession {
         let udp_transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
 
-        let config_manager = Arc::new(ClientConfigManager::new());
+        let config_manager = self.state.config_manager.clone();
         // Safety: keypair is Some after health check in handle_authenticate
         let keypair = Arc::new(
             self.state
@@ -389,7 +389,7 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone();
             let challenge = self.challenge;
-            let cfg = Arc::new(ClientConfigManager::new());
+            let cfg = self.state.config_manager.clone();
             tokio::spawn(async move {
                 Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, cfg)
                     .await
@@ -409,7 +409,7 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone();
             let challenge = self.challenge;
-            let cfg = Arc::new(ClientConfigManager::new());
+            let cfg = self.state.config_manager.clone();
             let udp = udp_transport.clone();
             tokio::spawn(async move {
                 Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, cfg)
@@ -671,7 +671,7 @@ impl AuthSession {
         let transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
         let transport_arc = Arc::new(transport);
-        let cfg = Arc::new(ClientConfigManager::new());
+        let cfg = self.state.config_manager.clone();
         // Safety: keypair is Some after health check in handle_authenticate
         let keypair = self
             .state
