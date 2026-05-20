@@ -451,9 +451,14 @@ fun performKeyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): Byt
     return psk
 }
 
-/** Generate 6-digit Short Authentication String */
+/** Generate 6-digit Short Authentication String formatted for display (e.g., "123-456"). */
 fun generateSAS(sharedSecret: ByteArray, clientPublic: ByteArray, serverPublic: ByteArray): String {
-    return TapAuthCrypto.getSas(sharedSecret, clientPublic, serverPublic)
+    val sas = TapAuthCrypto.getSas(sharedSecret, clientPublic, serverPublic)
+    return if (sas.length == 6) {
+        "${sas.substring(0, 3)}-${sas.substring(3)}"
+    } else {
+        sas
+    }
 }
 
 /** Decrypt data with PSK */
