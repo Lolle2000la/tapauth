@@ -181,6 +181,7 @@ pub fn create_authentication_cancel<'local>(
 ///     val selectedSignatureAlgorithm: Int
 /// )
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn create_pairing_response<'local>(
     env: &mut JNIEnv<'local>,
     version: i32,

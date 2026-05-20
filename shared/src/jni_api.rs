@@ -45,7 +45,7 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 use jni::objects::{JByteArray, JClass, JIntArray, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong, jobjectArray, jstring};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
 use jni::JNIEnv;
 
 use crate::crypto;
