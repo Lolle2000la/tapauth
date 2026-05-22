@@ -19,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -26,6 +27,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.PairingUrl
 import java.util.concurrent.Executors
 
@@ -33,7 +35,10 @@ import java.util.concurrent.Executors
 @Composable
 fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
     val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
-    var scanStatus by remember { mutableStateOf("Initializing camera...") }
+    val context = LocalContext.current
+    var scanStatus by remember {
+        mutableStateOf(context.getString(R.string.scanner_initializing))
+    }
     var lastScannedCode by remember { mutableStateOf<String?>(null) }
 
     // Handle system back button
@@ -48,12 +53,12 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Scan QR Code") },
+                title = { Text(stringResource(R.string.scanner_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.general_back),
                         )
                     }
                 },
@@ -73,7 +78,9 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
                         // Status overlay
                         Column(
                             modifier =
-                                Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp)
+                                Modifier.align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .padding(16.dp)
                         ) {
                             Card(
                                 colors =
@@ -84,13 +91,19 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
                             ) {
                                 Column(modifier = Modifier.padding(16.dp)) {
                                     Text(
-                                        text = "Status: $scanStatus",
+                                        text = stringResource(
+                                            R.string.scanner_status_prefix,
+                                            scanStatus,
+                                        ),
                                         style = MaterialTheme.typography.bodyMedium,
                                     )
                                     lastScannedCode?.let { code ->
                                         Spacer(modifier = Modifier.height(8.dp))
                                         Text(
-                                            text = "Last detected: ${code.take(50)}...",
+                                            text = stringResource(
+                                                R.string.scanner_last_detected,
+                                                code.take(50),
+                                            ),
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.primary,
                                         )
@@ -106,10 +119,14 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
-                        Text("Camera permission is required to scan QR codes")
+                        Text(
+                            stringResource(R.string.scanner_permission_required)
+                        )
                         Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { cameraPermissionState.launchPermissionRequest() }) {
-                            Text("Grant Permission")
+                        Button(
+                            onClick = { cameraPermissionState.launchPermissionRequest() }
+                        ) {
+                            Text(stringResource(R.string.scanner_grant_permission))
                         }
                     }
                 }
@@ -130,7 +147,9 @@ private fun CameraPreview(
     var hasScanned by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) { onScanStatus("Camera starting...") }
+    LaunchedEffect(Unit) {
+        onScanStatus(context.getString(R.string.scanner_camera_starting))
+    }
 
     errorMessage?.let { error ->
         Column(
@@ -138,7 +157,7 @@ private fun CameraPreview(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("Camera initialization failed:")
+            Text(stringResource(R.string.scanner_camera_failed))
             Text(error, color = MaterialTheme.colorScheme.error)
         }
         return
@@ -173,27 +192,45 @@ private fun CameraPreview(
                         val imageAnalysis =
                             ImageAnalysis.Builder()
                                 .setResolutionSelector(resolutionSelector)
-                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                                .setBackpressureStrategy(
+                                    ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST,
+                                )
+                                .setOutputImageFormat(
+                                    ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888,
+                                )
                                 .build()
                                 .also {
-                                    onScanStatus("Scanning for QR codes...")
+                                    onScanStatus(
+                                        context.getString(R.string.scanner_scanning)
+                                    )
                                     it.setAnalyzer(
                                         Executors.newSingleThreadExecutor(),
                                         QRCodeAnalyzer { qrCode ->
                                             if (!hasScanned) {
-                                                Log.d("QRScanner", "QR Code detected: $qrCode")
+                                                Log.d(
+                                                    "QRScanner",
+                                                    "QR Code detected: $qrCode",
+                                                )
                                                 onCodeDetected(qrCode)
-                                                onScanStatus("QR code detected! Parsing...")
+                                                onScanStatus(
+                                                    context.getString(
+                                                        R.string.scanner_detected
+                                                    )
+                                                )
 
                                                 // Try to parse as pairing URL
-                                                val pairingUrl = PairingUrl.parse(qrCode)
+                                                val pairingUrl =
+                                                    PairingUrl.parse(qrCode)
                                                 if (pairingUrl != null) {
                                                     Log.d(
                                                         "QRScanner",
                                                         "Valid pairing URL parsed successfully",
                                                     )
-                                                    onScanStatus("Valid pairing URL! Connecting...")
+                                                    onScanStatus(
+                                                        context.getString(
+                                                            R.string.scanner_valid_url
+                                                        )
+                                                    )
                                                     hasScanned = true
                                                     onQRCodeScanned(pairingUrl)
                                                 } else {
@@ -205,9 +242,14 @@ private fun CameraPreview(
                                                         "QRScanner",
                                                         "Expected: tapauth://pair?v=1&pk=...&p=...",
                                                     )
-                                                    Log.w("QRScanner", "Received: $qrCode")
+                                                    Log.w(
+                                                        "QRScanner",
+                                                        "Received: $qrCode",
+                                                    )
                                                     onScanStatus(
-                                                        "Invalid QR code format. Expected tapauth:// URL"
+                                                        context.getString(
+                                                            R.string.scanner_invalid_format
+                                                        )
                                                     )
                                                 }
                                             }
@@ -226,15 +268,29 @@ private fun CameraPreview(
                                 imageAnalysis,
                             )
                             Log.d("QRScanner", "Camera bound successfully")
-                            onScanStatus("Camera ready - point at QR code")
+                            onScanStatus(
+                                context.getString(R.string.scanner_camera_ready)
+                            )
                         } catch (e: Exception) {
-                            android.util.Log.e("QRScanner", "Camera binding failed", e)
-                            errorMessage = e.message ?: "Unknown camera error"
+                            android.util.Log.e(
+                                "QRScanner",
+                                "Camera binding failed",
+                                e,
+                            )
+                            errorMessage = e.message
+                                ?: context.getString(R.string.scanner_camera_failed)
+                                    .removeSuffix(":")
                             e.printStackTrace()
                         }
                     } catch (e: Exception) {
-                        android.util.Log.e("QRScanner", "Camera initialization failed", e)
-                        errorMessage = e.message ?: "Camera initialization failed"
+                        android.util.Log.e(
+                            "QRScanner",
+                            "Camera initialization failed",
+                            e,
+                        )
+                        errorMessage = e.message
+                            ?: context.getString(R.string.scanner_camera_failed)
+                                .removeSuffix(":")
                         e.printStackTrace()
                     }
                 },

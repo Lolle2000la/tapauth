@@ -1,0 +1,117 @@
+<resources>
+    <string name="app_name">TapAuth</string>
+
+    <!-- General / Shared -->
+    <string name="general_back">Zurück</string>
+    <string name="general_cancel">Abbrechen</string>
+    <string name="general_done">Fertig</string>
+    <string name="general_remove">Entfernen</string>
+    <string name="general_please_wait">Bitte warten</string>
+    <string name="general_retry">Wiederholen</string>
+    <string name="general_success">Erfolg</string>
+    <string name="general_error">Fehler</string>
+    <string name="general_warning">Warnung</string>
+
+    <!-- Pairing Screen -->
+    <string name="pairing_title">Geräte-Kopplung</string>
+    <string name="pairing_connecting">Verbinde mit Gerät …</string>
+    <string name="pairing_verify_sas_title">Sicherheitscode überprüfen</string>
+    <string name="pairing_compare_code">Vergleichen Sie diesen Code mit dem auf Ihrem Computer:</string>
+    <string name="pairing_codes_match">Stimmen die Codes überein?</string>
+    <string name="pairing_no_cancel">Nein, Abbrechen</string>
+    <string name="pairing_yes_pair">Ja, Koppeln</string>
+    <string name="pairing_finalizing">Kopplung abschließen …</string>
+    <string name="pairing_success">Kopplung erfolgreich!</string>
+    <string name="pairing_success_message">Ihr Gerät ist jetzt gekoppelt und bereit zur Authentifizierung</string>
+    <string name="pairing_failed">Kopplung fehlgeschlagen</string>
+    <string name="pairing_user_cancelled">Vom Benutzer abgebrochen</string>
+    <string name="pairing_no_ip">Keine IP-Adresse verfügbar</string>
+    <string name="pairing_cancelled_message">Kopplung abgebrochen</string>
+
+    <!-- QR Scanner Screen -->
+    <string name="scanner_title">QR-Code scannen</string>
+    <string name="scanner_initializing">Kamera wird initialisiert …</string>
+    <string name="scanner_permission_required">Kameraberechtigung zum Scannen von QR-Codes erforderlich</string>
+    <string name="scanner_grant_permission">Berechtigung erteilen</string>
+    <string name="scanner_camera_starting">Kamera startet …</string>
+    <string name="scanner_camera_failed">Kamera-Initialisierung fehlgeschlagen:</string>
+    <string name="scanner_scanning">Suche nach QR-Codes …</string>
+    <string name="scanner_detected">QR-Code erkannt! Analysiere …</string>
+    <string name="scanner_valid_url">Gültige Kopplungs-URL! Verbinde …</string>
+    <string name="scanner_invalid_format">Ungültiges QR-Code-Format. Erwartet: tapauth:// URL</string>
+    <string name="scanner_camera_ready">Kamera bereit – auf QR-Code richten</string>
+    <string name="scanner_status_prefix">Status: %s</string>
+    <string name="scanner_last_detected">Zuletzt erkannt: %s…</string>
+
+    <!-- Home Screen -->
+    <string name="home_title">TapAuth</string>
+    <string name="home_udp_service">UDP-Dienst</string>
+    <string name="home_port_display">Port %1$d</string>
+    <string name="home_ble_server">BLE GATT-Server</string>
+    <string name="home_ble_advertising">Werbend (Advertising)</string>
+    <string name="home_pair_new_device">Neues Gerät koppeln</string>
+    <string name="home_paired_devices">Gekoppelte Geräte</string>
+    <string name="home_settings">Einstellungen</string>
+    <string name="home_tagline">TapAuth ermöglicht die Authentifizierung an Ihrem Computer durch einfaches Antippen Ihres Telefons</string>
+
+    <!-- Device List Screen -->
+    <string name="devices_title">Gekoppelte Geräte</string>
+    <string name="devices_empty">Keine gekoppelten Geräte</string>
+    <string name="devices_empty_message">Koppeln Sie ein Gerät, indem Sie einen QR-Code von Ihrem Computer scannen</string>
+    <string name="devices_id_prefix">ID: %1$s…%2$s</string>
+    <string name="devices_allowed_users">Berechtigte Benutzer: %s</string>
+    <string name="devices_remove_entire_pairing_title">Gesamte Kopplung entfernen?</string>
+    <string name="devices_remove_device_title">Gerät entfernen?</string>
+    <string name="devices_remove_user_title">Benutzer entfernen?</string>
+    <string name="devices_remove_last_user_message">Benutzer „%1$s\" von „%2$s\" entfernen?\n\nDies ist der letzte Benutzer, daher wird die gesamte Kopplung entfernt.</string>
+    <string name="devices_remove_user_message">Benutzer „%1$s\" von „%2$s\" entfernen?\n\nAndere Benutzer (%3$s) können weiterhin authentifizieren.</string>
+    <string name="devices_remove_all">Alle entfernen</string>
+    <string name="devices_warning_multi_user">WARNUNG: Diese Kopplung wird von %d Benutzern verwendet!</string>
+    <string name="devices_users_label">Benutzer: %s</string>
+    <string name="devices_remove_confirm_message">Möchten Sie „%1$s\" wirklich entfernen? %2$s muss sich erneut koppeln, um mit diesem Gerät zu authentifizieren.</string>
+    <string name="devices_remove_individual_user">Einzelnen Benutzer entfernen:</string>
+    <string name="devices_paired_date">Gekoppelt am %1$s</string>
+    <string name="devices_remove_device_cd">Gerät entfernen</string>
+    <string name="devices_manage_users_cd">Benutzer verwalten</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Einstellungen</string>
+    <string name="settings_about_encryption">Über Verschlüsselung</string>
+    <string name="settings_csk_label">Client Symmetric Key (CSK)</string>
+    <string name="settings_csk_description">Jeder gekoppelte Desktop-Client generiert seinen eigenen CSK und teilt ihn beim Koppeln mit Ihnen. Dieser Schlüssel wird zur Verschlüsselung der gesamten Authentifizierungskommunikation verwendet. Der CSK wird vom Desktop-Client kontrolliert, nicht von dieser App.</string>
+    <string name="settings_security_note">Sicherheitshinweis</string>
+    <string name="settings_security_note_description">Wenn ein Desktop-Client seinen CSK rotiert, müssen Sie sich mit diesem Gerät erneut koppeln. Jedes gekoppelte Gerät hat seinen eigenen separaten Verschlüsselungsschlüssel.</string>
+    <string name="settings_about">Über</string>
+    <string name="settings_background">Hintergrund</string>
+    <string name="settings_network_config">Netzwerkkonfiguration</string>
+    <string name="settings_udp_port_label">UDP-Port</string>
+    <string name="settings_udp_port_default">Standard: 36692 (Erfordert Dienstneustart, wenn aktiv)</string>
+    <string name="settings_port_must_be_number">Muss eine Zahl sein</string>
+    <string name="settings_port_min">Port muss ≥ 1024 sein</string>
+    <string name="settings_port_max">Port muss ≤ 65535 sein</string>
+    <string name="settings_allow_background">Hintergrundbetrieb zulassen / Akku-Optimierungen</string>
+    <string name="settings_udp_service">UDP-Dienst</string>
+    <string name="settings_udp_listener_desc">UDP-Listener für Authentifizierungsanfragen</string>
+    <string name="settings_ble_server">BLE GATT-Server</string>
+    <string name="settings_ble_desc">BLE-Werbung und GATT-Server</string>
+    <string name="settings_failed_start_udp">Fehler beim %1$s des UDP-Dienstes: %2$s</string>
+    <string name="settings_failed_start_ble">Fehler beim %1$s des BLE-Dienstes: %2$s</string>
+    <string name="settings_location_required_title">⚠️ Hintergrund-Standortberechtigung erforderlich</string>
+    <string name="settings_location_required_description">BLE-Scanning benötigt die Hintergrund-Standortberechtigung, um zu funktionieren, wenn die App im Hintergrund ist.</string>
+    <string name="settings_location_steps_title">Schritte zur Berechtigungserteilung:</string>
+    <string name="settings_location_steps">1. Tippen Sie unten auf \'Einstellungen öffnen\'\n2. Tippen Sie auf \'Berechtigungen\'\n3. Tippen Sie auf \'Standort\'\n4. Wählen Sie \'Immer erlauben\'</string>
+    <string name="settings_open_settings">Einstellungen öffnen</string>
+    <string name="settings_service_status">Dienststatus:</string>
+    <string name="settings_udp_last_started">UDP-Listener zuletzt gestartet: %1$s</string>
+    <string name="settings_ble_last_started">BLE GATT zuletzt gestartet: %1$s</string>
+    <string name="settings_open_system_settings">Einstellungen öffnen</string>
+    <string name="settings_allow_background_dialog_title">Hintergrundbetrieb zulassen?</string>
+    <string name="settings_allow_background_dialog_message">Damit TapAuth auf Authentifizierungsanfragen reagieren kann, während die App geschlossen ist, erlauben Sie bitte, dass die App von Akku-Optimierungen ausgeschlossen wird. Sie werden zum Systemeinstellungsbildschirm weitergeleitet.</string>
+    <string name="settings_footer">TapAuth – Sichere biometrische Authentifizierung</string>
+    <string name="settings_app_version">App-Version</string>
+    <string name="settings_protocol_version">Protokoll-Version</string>
+    <string name="settings_encryption">Verschlüsselung</string>
+    <string name="settings_key_exchange">Schlüsselaustausch</string>
+    <string name="settings_signing">Signierung</string>
+    <string name="settings_never">nie</string>
+</resources>

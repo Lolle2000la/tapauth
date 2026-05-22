@@ -1,3 +1,117 @@
 <resources>
     <string name="app_name">TapAuth</string>
+
+    <!-- General / Shared -->
+    <string name="general_back">Back</string>
+    <string name="general_cancel">Cancel</string>
+    <string name="general_done">Done</string>
+    <string name="general_remove">Remove</string>
+    <string name="general_please_wait">Please wait</string>
+    <string name="general_retry">Retry</string>
+    <string name="general_success">Success</string>
+    <string name="general_error">Error</string>
+    <string name="general_warning">Warning</string>
+
+    <!-- Pairing Screen -->
+    <string name="pairing_title">Device Pairing</string>
+    <string name="pairing_connecting">Connecting to device…</string>
+    <string name="pairing_verify_sas_title">Verify Security Code</string>
+    <string name="pairing_compare_code">Compare this code with the one shown on your computer:</string>
+    <string name="pairing_codes_match">Do the codes match?</string>
+    <string name="pairing_no_cancel">No, Cancel</string>
+    <string name="pairing_yes_pair">Yes, Pair</string>
+    <string name="pairing_finalizing">Finalizing pairing…</string>
+    <string name="pairing_success">Pairing Successful!</string>
+    <string name="pairing_success_message">Your device is now paired and ready for authentication</string>
+    <string name="pairing_failed">Pairing Failed</string>
+    <string name="pairing_user_cancelled">User cancelled</string>
+    <string name="pairing_no_ip">No IP address available</string>
+    <string name="pairing_cancelled_message">Pairing cancelled</string>
+
+    <!-- QR Scanner Screen -->
+    <string name="scanner_title">Scan QR Code</string>
+    <string name="scanner_initializing">Initializing camera…</string>
+    <string name="scanner_permission_required">Camera permission is required to scan QR codes</string>
+    <string name="scanner_grant_permission">Grant Permission</string>
+    <string name="scanner_camera_starting">Camera starting…</string>
+    <string name="scanner_camera_failed">Camera initialization failed:</string>
+    <string name="scanner_scanning">Scanning for QR codes…</string>
+    <string name="scanner_detected">QR code detected! Parsing…</string>
+    <string name="scanner_valid_url">Valid pairing URL! Connecting…</string>
+    <string name="scanner_invalid_format">Invalid QR code format. Expected tapauth:// URL</string>
+    <string name="scanner_camera_ready">Camera ready - point at QR code</string>
+    <string name="scanner_status_prefix">Status: %s</string>
+    <string name="scanner_last_detected">Last detected: %s…</string>
+
+    <!-- Home Screen -->
+    <string name="home_title">TapAuth</string>
+    <string name="home_udp_service">UDP Service</string>
+    <string name="home_port_display">Port %1$d</string>
+    <string name="home_ble_server">BLE GATT Server</string>
+    <string name="home_ble_advertising">Advertising</string>
+    <string name="home_pair_new_device">Pair New Device</string>
+    <string name="home_paired_devices">Paired Devices</string>
+    <string name="home_settings">Settings</string>
+    <string name="home_tagline">TapAuth allows you to authenticate to your computer by simply tapping your phone</string>
+
+    <!-- Device List Screen -->
+    <string name="devices_title">Paired Devices</string>
+    <string name="devices_empty">No Paired Devices</string>
+    <string name="devices_empty_message">Pair a device by scanning a QR code from your computer</string>
+    <string name="devices_id_prefix">ID: %1$s…%2$s</string>
+    <string name="devices_allowed_users">Allowed users: %s</string>
+    <string name="devices_remove_entire_pairing_title">Remove Entire Pairing?</string>
+    <string name="devices_remove_device_title">Remove Device?</string>
+    <string name="devices_remove_user_title">Remove User?</string>
+    <string name="devices_remove_last_user_message">Remove user "%1$s" from "%2$s"?\n\nThis is the last user, so the entire pairing will be removed.</string>
+    <string name="devices_remove_user_message">Remove user "%1$s" from "%2$s"?\n\nOther users (%3$s) will still be able to authenticate.</string>
+    <string name="devices_remove_all">Remove All</string>
+    <string name="devices_warning_multi_user">WARNING: This pairing is used by %d users!</string>
+    <string name="devices_users_label">Users: %s</string>
+    <string name="devices_remove_confirm_message">Are you sure you want to remove "%1$s"? %2$s will need to pair again to authenticate with this device.</string>
+    <string name="devices_remove_individual_user">Remove individual user:</string>
+    <string name="devices_paired_date">Paired %1$s</string>
+    <string name="devices_remove_device_cd">Remove device</string>
+    <string name="devices_manage_users_cd">Manage users</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_about_encryption">About Encryption</string>
+    <string name="settings_csk_label">Client Symmetric Key (CSK)</string>
+    <string name="settings_csk_description">Each paired desktop client generates its own CSK and shares it with you during pairing. This key is used to encrypt all authentication communication. The CSK is controlled by the desktop client, not this app.</string>
+    <string name="settings_security_note">Security Note</string>
+    <string name="settings_security_note_description">If a desktop client rotates its CSK, you will need to re-pair with that device. Each paired device maintains its own separate encryption key.</string>
+    <string name="settings_about">About</string>
+    <string name="settings_background">Background</string>
+    <string name="settings_network_config">Network Configuration</string>
+    <string name="settings_udp_port_label">UDP Port</string>
+    <string name="settings_udp_port_default">Default: 36692 (Requires service restart if running)</string>
+    <string name="settings_port_must_be_number">Must be a number</string>
+    <string name="settings_port_min">Port must be ≥ 1024</string>
+    <string name="settings_port_max">Port must be ≤ 65535</string>
+    <string name="settings_allow_background">Allow background operation / Battery optimizations</string>
+    <string name="settings_udp_service">UDP Service</string>
+    <string name="settings_udp_listener_desc">UDP listener for auth requests</string>
+    <string name="settings_ble_server">BLE GATT Server</string>
+    <string name="settings_ble_desc">BLE advertisement and GATT server</string>
+    <string name="settings_failed_start_udp">Failed to %1$s UDP service: %2$s</string>
+    <string name="settings_failed_start_ble">Failed to %1$s BLE service: %2$s</string>
+    <string name="settings_location_required_title">⚠️ Background Location Required</string>
+    <string name="settings_location_required_description">BLE scanning requires background location permission to work when the app is in the background.</string>
+    <string name="settings_location_steps_title">Steps to grant permission:</string>
+    <string name="settings_location_steps">1. Tap \'Open Settings\' below\n2. Tap \'Permissions\'\n3. Tap \'Location\'\n4. Select \'Allow all the time\'</string>
+    <string name="settings_open_settings">Open Settings</string>
+    <string name="settings_service_status">Service status:</string>
+    <string name="settings_udp_last_started">UDP listener last started: %1$s</string>
+    <string name="settings_ble_last_started">BLE GATT last started: %1$s</string>
+    <string name="settings_open_system_settings">Open settings</string>
+    <string name="settings_allow_background_dialog_title">Allow background operation?</string>
+    <string name="settings_allow_background_dialog_message">To ensure TapAuth can respond to authentication requests while the app is closed, please allow the app to be excluded from battery optimizations. You will be taken to the system settings screen to do this.</string>
+    <string name="settings_footer">TapAuth - Secure biometric authentication</string>
+    <string name="settings_app_version">App Version</string>
+    <string name="settings_protocol_version">Protocol Version</string>
+    <string name="settings_encryption">Encryption</string>
+    <string name="settings_key_exchange">Key Exchange</string>
+    <string name="settings_signing">Signing</string>
+    <string name="settings_never">never</string>
 </resources>

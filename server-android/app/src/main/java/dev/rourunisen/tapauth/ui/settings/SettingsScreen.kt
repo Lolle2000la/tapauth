@@ -23,10 +23,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.AppConfiguration
 import java.text.DateFormat
 import java.util.Date
@@ -85,12 +87,12 @@ fun SettingsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Settings") },
+                title = { Text(stringResource(R.string.settings_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.general_back),
                         )
                     }
                 },
@@ -108,7 +110,7 @@ fun SettingsScreen(onBack: () -> Unit) {
         ) {
             // Information Section
             Text(
-                text = "About Encryption",
+                text = stringResource(R.string.settings_about_encryption),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -119,15 +121,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "Client Symmetric Key (CSK)",
+                        text = stringResource(R.string.settings_csk_label),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text =
-                            "Each paired desktop client generates its own CSK and shares it with you during pairing. " +
-                                "This key is used to encrypt all authentication communication. " +
-                                "The CSK is controlled by the desktop client, not this app.",
+                        text = stringResource(R.string.settings_csk_description),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -137,14 +136,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                         color = DividerDefaults.color,
                     )
                     Text(
-                        text = "Security Note",
+                        text = stringResource(R.string.settings_security_note),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text =
-                            "If a desktop client rotates its CSK, you will need to re-pair with that device. " +
-                                "Each paired device maintains its own separate encryption key.",
+                        text = stringResource(R.string.settings_security_note_description),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -154,7 +151,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // About Section
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "About",
+                text = stringResource(R.string.settings_about),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -164,15 +161,42 @@ fun SettingsScreen(onBack: () -> Unit) {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    InfoRow("App Version", "1.0.0")
+                    InfoRow(
+                        stringResource(R.string.settings_app_version),
+                        "1.0.0",
+                    )
                     HorizontalDivider()
-                    InfoRow("Protocol Version", "1")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
-                    InfoRow("Encryption", "AES-256-GCM")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
-                    InfoRow("Key Exchange", "X25519")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
-                    InfoRow("Signing", "Ed25519")
+                    InfoRow(
+                        stringResource(R.string.settings_protocol_version),
+                        "1",
+                    )
+                    HorizontalDivider(
+                        Modifier,
+                        DividerDefaults.Thickness,
+                        DividerDefaults.color,
+                    )
+                    InfoRow(
+                        stringResource(R.string.settings_encryption),
+                        "AES-256-GCM",
+                    )
+                    HorizontalDivider(
+                        Modifier,
+                        DividerDefaults.Thickness,
+                        DividerDefaults.color,
+                    )
+                    InfoRow(
+                        stringResource(R.string.settings_key_exchange),
+                        "X25519",
+                    )
+                    HorizontalDivider(
+                        Modifier,
+                        DividerDefaults.Thickness,
+                        DividerDefaults.color,
+                    )
+                    InfoRow(
+                        stringResource(R.string.settings_signing),
+                        "Ed25519",
+                    )
                 }
             }
 
@@ -180,7 +204,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // verticalScroll modifier allows the page to scroll when needed.
             // Background / Runtime controls
             Text(
-                text = "Background",
+                text = stringResource(R.string.settings_background),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -192,7 +216,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 ) {
                     // UDP Port Configuration
                     Text(
-                        text = "Network Configuration",
+                        text = stringResource(R.string.settings_network_config),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
                     )
@@ -204,13 +228,16 @@ fun SettingsScreen(onBack: () -> Unit) {
                             val port = newValue.toIntOrNull()
                             when {
                                 port == null -> {
-                                    udpPortError = "Must be a number"
+                                    udpPortError =
+                                        context.getString(R.string.settings_port_must_be_number)
                                 }
                                 port < 1024 -> {
-                                    udpPortError = "Port must be ≥ 1024"
+                                    udpPortError =
+                                        context.getString(R.string.settings_port_min)
                                 }
                                 port > 65535 -> {
-                                    udpPortError = "Port must be ≤ 65535"
+                                    udpPortError =
+                                        context.getString(R.string.settings_port_max)
                                 }
                                 else -> {
                                     udpPortError = null
@@ -228,11 +255,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 }
                             }
                         },
-                        label = { Text("UDP Port") },
+                        label = { Text(stringResource(R.string.settings_udp_port_label)) },
                         supportingText = {
                             Text(
                                 if (udpPortError != null) udpPortError!!
-                                else "Default: 36692 (Requires service restart if running)",
+                                else stringResource(R.string.settings_udp_port_default),
                                 color =
                                     if (udpPortError != null) MaterialTheme.colorScheme.error
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -244,11 +271,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                         modifier = Modifier.fillMaxWidth(),
                     )
 
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
+                    HorizontalDivider(
+                        Modifier,
+                        DividerDefaults.Thickness,
+                        DividerDefaults.color,
+                    )
 
                     // Battery optimization prompt
                     Button(onClick = { showBatteryConfirm = true }) {
-                        Text("Allow background operation / Battery optimizations")
+                        Text(stringResource(R.string.settings_allow_background))
                     }
 
                     // Service running switches
@@ -257,9 +288,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("UDP Service", style = MaterialTheme.typography.bodyMedium)
                             Text(
-                                "UDP listener for auth requests",
+                                stringResource(R.string.settings_udp_service),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                stringResource(R.string.settings_udp_listener_desc),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -295,18 +329,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         val action = if (checked) "start" else "stop"
                                         snackbarHostState.showSnackbar(
                                             message =
-                                                "Failed to $action UDP service: ${e.message ?: "Unknown error"}",
+                                                context.getString(
+                                                    R.string.settings_failed_start_udp,
+                                                    action,
+                                                    e.message ?: "Unknown error",
+                                                ),
                                             duration = SnackbarDuration.Short,
                                         )
                                     }
                                     // wait briefly for service to report state; timeout after
                                     // 2s
-                                    withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
+                                    withTimeoutOrNull(2000) {
+                                        kotlinx.coroutines.delay(600)
+                                    }
                                     udpBusy = false
                                 }
                             },
                         )
-                        if (udpBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                        if (udpBusy) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                        }
                     }
 
                     Row(
@@ -314,9 +356,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("BLE GATT Server", style = MaterialTheme.typography.bodyMedium)
                             Text(
-                                "BLE advertisement and GATT server",
+                                stringResource(R.string.settings_ble_server),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                stringResource(R.string.settings_ble_desc),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -329,9 +374,13 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     bleBusy = true
                                     try {
                                         if (checked) {
-                                            dev.rourunisen.tapauth.ble.BleGattService.start(context)
+                                            dev.rourunisen.tapauth.ble.BleGattService.start(
+                                                context
+                                            )
                                         } else {
-                                            dev.rourunisen.tapauth.ble.BleGattService.stop(context)
+                                            dev.rourunisen.tapauth.ble.BleGattService.stop(
+                                                context
+                                            )
                                         }
                                         // Save preference and update UI state after successful
                                         // start/stop
@@ -350,16 +399,24 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         val action = if (checked) "start" else "stop"
                                         snackbarHostState.showSnackbar(
                                             message =
-                                                "Failed to $action BLE service: ${e.message ?: "Unknown error"}",
+                                                context.getString(
+                                                    R.string.settings_failed_start_ble,
+                                                    action,
+                                                    e.message ?: "Unknown error",
+                                                ),
                                             duration = SnackbarDuration.Short,
                                         )
                                     }
-                                    withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
+                                    withTimeoutOrNull(2000) {
+                                        kotlinx.coroutines.delay(600)
+                                    }
                                     bleBusy = false
                                 }
                             },
                         )
-                        if (bleBusy) CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                        if (bleBusy) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                        }
                     }
 
                     // Background location permission warning for BLE (Android 10+)
@@ -369,34 +426,40 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 modifier = Modifier.fillMaxWidth(),
                                 colors =
                                     CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                        containerColor =
+                                            MaterialTheme.colorScheme.errorContainer
                                     ),
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
                                     Text(
-                                        "⚠️ Background Location Required",
+                                        stringResource(
+                                            R.string.settings_location_required_title
+                                        ),
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         fontWeight = FontWeight.Bold,
                                     )
                                     Text(
-                                        "BLE scanning requires background location permission to work when the app is in the background.",
+                                        stringResource(
+                                            R.string.settings_location_required_description
+                                        ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         modifier = Modifier.padding(vertical = 4.dp),
                                     )
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        "Steps to grant permission:",
+                                        stringResource(
+                                            R.string.settings_location_steps_title
+                                        ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         fontWeight = FontWeight.Bold,
                                     )
                                     Text(
-                                        "1. Tap 'Open Settings' below\n" +
-                                            "2. Tap 'Permissions'\n" +
-                                            "3. Tap 'Location'\n" +
-                                            "4. Select 'Allow all the time'",
+                                        stringResource(
+                                            R.string.settings_location_steps
+                                        ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         modifier =
@@ -419,14 +482,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                                                                 Uri.parse(
                                                                     "package:${context.packageName}"
                                                                 )
-                                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                                            flags =
+                                                                Intent.FLAG_ACTIVITY_NEW_TASK
                                                         }
                                                 context.startActivity(intent)
                                             } catch (_: Exception) {}
                                         },
                                         modifier = Modifier.fillMaxWidth(),
                                     ) {
-                                        Text("Open Settings")
+                                        Text(stringResource(R.string.settings_open_settings))
                                     }
                                 }
                             }
@@ -436,20 +500,22 @@ fun SettingsScreen(onBack: () -> Unit) {
                     // Service status display
                     val df = DateFormat.getDateTimeInstance()
                     val udpLast =
-                        if (config.udpLastStartMillis == 0L) "never"
-                        else df.format(Date(config.udpLastStartMillis))
+                        if (config.udpLastStartMillis == 0L) {
+                            stringResource(R.string.settings_never)
+                        } else df.format(Date(config.udpLastStartMillis))
                     val bleLast =
-                        if (config.bleLastStartMillis == 0L) "never"
-                        else df.format(Date(config.bleLastStartMillis))
+                        if (config.bleLastStartMillis == 0L) {
+                            stringResource(R.string.settings_never)
+                        } else df.format(Date(config.bleLastStartMillis))
 
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("Service status:")
+                    Text(stringResource(R.string.settings_service_status))
                     Text(
-                        "UDP listener last started: $udpLast",
+                        stringResource(R.string.settings_udp_last_started, udpLast),
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text(
-                        "BLE GATT last started: $bleLast",
+                        stringResource(R.string.settings_ble_last_started, bleLast),
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -471,7 +537,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                                         val intent =
                                             Intent(
-                                                Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
+                                                Settings
+                                                    .ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
                                             )
                                         context.startActivity(
                                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -489,23 +556,33 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 } catch (_: Exception) {}
                             }
                         ) {
-                            Text("Open settings")
+                            Text(stringResource(R.string.settings_open_system_settings))
                         }
                     },
                     dismissButton = {
-                        TextButton(onClick = { showBatteryConfirm = false }) { Text("Cancel") }
+                        TextButton(onClick = { showBatteryConfirm = false }) {
+                            Text(stringResource(R.string.general_cancel))
+                        }
                     },
-                    title = { Text("Allow background operation?") },
+                    title = {
+                        Text(
+                            stringResource(
+                                R.string.settings_allow_background_dialog_title
+                            )
+                        )
+                    },
                     text = {
                         Text(
-                            "To ensure TapAuth can respond to authentication requests while the app is closed, please allow the app to be excluded from battery optimizations. You will be taken to the system settings screen to do this."
+                            stringResource(
+                                R.string.settings_allow_background_dialog_message
+                            )
                         )
                     },
                 )
             }
             // Footer
             Text(
-                text = "TapAuth - Secure biometric authentication",
+                text = stringResource(R.string.settings_footer),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -517,7 +594,10 @@ fun SettingsScreen(onBack: () -> Unit) {
 
 @Composable
 private fun InfoRow(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodyMedium,

@@ -14,8 +14,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import java.text.SimpleDateFormat
@@ -49,13 +51,27 @@ fun DeviceListScreen(onBack: () -> Unit) {
 
         AlertDialog(
             onDismissRequest = { userToRemove = null },
-            title = { Text(if (isLastUser) "Remove Device?" else "Remove User?") },
+            title = {
+                Text(
+                    if (isLastUser) stringResource(R.string.devices_remove_device_title)
+                    else stringResource(R.string.devices_remove_user_title)
+                )
+            },
             text = {
                 Text(
                     if (isLastUser) {
-                        "Remove user \"$username\" from \"${device.displayName}\"?\n\nThis is the last user, so the entire pairing will be removed."
+                        stringResource(
+                            R.string.devices_remove_last_user_message,
+                            username,
+                            device.displayName,
+                        )
                     } else {
-                        "Remove user \"$username\" from \"${device.displayName}\"?\n\nOther users (${device.allowedUsers.filter { it != username }.joinToString(", ")}) will still be able to authenticate."
+                        stringResource(
+                            R.string.devices_remove_user_message,
+                            username,
+                            device.displayName,
+                            device.allowedUsers.filter { it != username }.joinToString(", "),
+                        )
                     }
                 )
             },
@@ -69,10 +85,17 @@ fun DeviceListScreen(onBack: () -> Unit) {
                         }
                     }
                 ) {
-                    Text("Remove", color = MaterialTheme.colorScheme.error)
+                    Text(
+                        stringResource(R.string.general_remove),
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
             },
-            dismissButton = { TextButton(onClick = { userToRemove = null }) { Text("Cancel") } },
+            dismissButton = {
+                TextButton(onClick = { userToRemove = null }) {
+                    Text(stringResource(R.string.general_cancel))
+                }
+            },
         )
     }
 
@@ -83,7 +106,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
 
         AlertDialog(
             onDismissRequest = { deviceToDelete = null },
-            title = { Text("Remove Entire Pairing?") },
+            title = { Text(stringResource(R.string.devices_remove_entire_pairing_title)) },
             text = {
                 Column {
                     if (multipleUsers) {
@@ -93,21 +116,33 @@ fun DeviceListScreen(onBack: () -> Unit) {
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Warning,
-                                contentDescription = "Warning",
+                                contentDescription = stringResource(R.string.general_warning),
                                 tint = MaterialTheme.colorScheme.error,
                             )
                             Text(
-                                "WARNING: This pairing is used by ${device.allowedUsers.size} users!",
+                                stringResource(
+                                    R.string.devices_warning_multi_user,
+                                    device.allowedUsers.size,
+                                ),
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.error,
                             )
                         }
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text("Users: ${device.allowedUsers.joinToString(", ")}")
+                        Text(
+                            stringResource(
+                                R.string.devices_users_label,
+                                device.allowedUsers.joinToString(", "),
+                            )
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
                     Text(
-                        "Are you sure you want to remove \"${device.displayName}\"? ${if (multipleUsers) "All users" else "You"} will need to pair again to authenticate with this device."
+                        stringResource(
+                            R.string.devices_remove_confirm_message,
+                            device.displayName,
+                            if (multipleUsers) "All users" else "You",
+                        )
                     )
                 }
             },
@@ -121,22 +156,29 @@ fun DeviceListScreen(onBack: () -> Unit) {
                         }
                     }
                 ) {
-                    Text("Remove All", color = MaterialTheme.colorScheme.error)
+                    Text(
+                        stringResource(R.string.devices_remove_all),
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
             },
-            dismissButton = { TextButton(onClick = { deviceToDelete = null }) { Text("Cancel") } },
+            dismissButton = {
+                TextButton(onClick = { deviceToDelete = null }) {
+                    Text(stringResource(R.string.general_cancel))
+                }
+            },
         )
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Paired Devices") },
+                title = { Text(stringResource(R.string.devices_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.general_back),
                         )
                     }
                 },
@@ -161,7 +203,9 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             DeviceCard(
                                 device = device,
                                 onRemoveDevice = { deviceToDelete = device },
-                                onRemoveUser = { username -> userToRemove = device to username },
+                                onRemoveUser = { username ->
+                                    userToRemove = device to username
+                                },
                             )
                         }
                     }
@@ -179,12 +223,12 @@ private fun EmptyState(modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
-            text = "No Paired Devices",
+            text = stringResource(R.string.devices_empty),
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
         )
         Text(
-            text = "Pair a device by scanning a QR code from your computer",
+            text = stringResource(R.string.devices_empty_message),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -217,13 +261,17 @@ private fun DeviceCard(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Paired $pairedDate",
+                        text = stringResource(R.string.devices_paired_date, pairedDate),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "ID: ${device.deviceId.take(16)}...",
+                        text = stringResource(
+                            R.string.devices_id_prefix,
+                            device.deviceId.take(16),
+                            "",
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
@@ -233,7 +281,10 @@ private fun DeviceCard(
                     if (device.allowedUsers.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Allowed users: ${device.allowedUsers.joinToString(", ")}",
+                            text = stringResource(
+                                R.string.devices_allowed_users,
+                                device.allowedUsers.joinToString(", "),
+                            ),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Medium,
@@ -246,7 +297,9 @@ private fun DeviceCard(
                     IconButton(onClick = onRemoveDevice) {
                         Icon(
                             imageVector = Icons.Default.Delete,
-                            contentDescription = "Remove device",
+                            contentDescription = stringResource(
+                                R.string.devices_remove_device_cd
+                            ),
                             tint = MaterialTheme.colorScheme.error,
                         )
                     }
@@ -256,7 +309,9 @@ private fun DeviceCard(
                         IconButton(onClick = { showUserMenu = !showUserMenu }) {
                             Icon(
                                 imageVector = Icons.Default.Person,
-                                contentDescription = "Manage users",
+                                contentDescription = stringResource(
+                                    R.string.devices_manage_users_cd
+                                ),
                             )
                         }
                     }
@@ -270,7 +325,7 @@ private fun DeviceCard(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "Remove individual user:",
+                    text = stringResource(R.string.devices_remove_individual_user),
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Bold,
                 )
@@ -283,9 +338,15 @@ private fun DeviceCard(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(text = username, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = username,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         TextButton(onClick = { onRemoveUser(username) }) {
-                            Text("Remove", color = MaterialTheme.colorScheme.error)
+                            Text(
+                                stringResource(R.string.general_remove),
+                                color = MaterialTheme.colorScheme.error,
+                            )
                         }
                     }
                 }

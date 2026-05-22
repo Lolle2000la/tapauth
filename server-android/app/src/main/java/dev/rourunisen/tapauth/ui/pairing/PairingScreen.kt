@@ -11,10 +11,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.network.PairingClient
@@ -45,7 +47,8 @@ fun PairingScreen(
                 pairingUrl.ipv4
                     ?: pairingUrl.ipv6
                     ?: run {
-                        pairingState = PairingState.Failed("No IP address available")
+                        pairingState =
+                            PairingState.Failed(context.getString(R.string.pairing_no_ip))
                         return@launch
                     }
 
@@ -73,12 +76,12 @@ fun PairingScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Device Pairing") },
+                title = { Text(text = stringResource(R.string.pairing_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.general_back),
                         )
                     }
                 },
@@ -127,8 +130,13 @@ fun PairingScreen(
                             // Close socket and discard PSK
                             state.socket.close()
                             state.psk.fill(0)
-                            pairingState = PairingState.Failed("User cancelled")
-                            onPairingFailed("Pairing cancelled")
+                            pairingState =
+                                PairingState.Failed(
+                                    context.getString(R.string.pairing_user_cancelled)
+                                )
+                            onPairingFailed(
+                                context.getString(R.string.pairing_cancelled_message)
+                            )
                         },
                     )
                 }
@@ -157,9 +165,12 @@ private fun ConnectingView() {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         CircularProgressIndicator()
-        Text(text = "Connecting to device...", style = MaterialTheme.typography.titleMedium)
         Text(
-            text = "Please wait",
+            text = stringResource(R.string.pairing_connecting),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.general_please_wait),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -174,13 +185,13 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         Text(
-            text = "Verify Security Code",
+            text = stringResource(R.string.pairing_verify_sas_title),
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
         )
 
         Text(
-            text = "Compare this code with the one shown on your computer:",
+            text = stringResource(R.string.pairing_compare_code),
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
         )
@@ -202,7 +213,7 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
         }
 
         Text(
-            text = "Do the codes match?",
+            text = stringResource(R.string.pairing_codes_match),
             style = MaterialTheme.typography.titleMedium,
             textAlign = TextAlign.Center,
         )
@@ -212,10 +223,12 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
-                Text("No, Cancel")
+                Text(stringResource(R.string.pairing_no_cancel))
             }
 
-            Button(onClick = onConfirm, modifier = Modifier.weight(1f)) { Text("Yes, Pair") }
+            Button(onClick = onConfirm, modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.pairing_yes_pair))
+            }
         }
     }
 }
@@ -227,7 +240,10 @@ private fun ConfirmingView() {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         CircularProgressIndicator()
-        Text(text = "Finalizing pairing...", style = MaterialTheme.typography.titleMedium)
+        Text(
+            text = stringResource(R.string.pairing_finalizing),
+            style = MaterialTheme.typography.titleMedium,
+        )
     }
 }
 
@@ -240,26 +256,28 @@ private fun SuccessView(onDone: () -> Unit) {
     ) {
         Icon(
             imageVector = Icons.Default.CheckCircle,
-            contentDescription = "Success",
+            contentDescription = stringResource(R.string.general_success),
             modifier = Modifier.size(72.dp),
             tint = MaterialTheme.colorScheme.primary,
         )
 
         Text(
-            text = "Pairing Successful!",
+            text = stringResource(R.string.pairing_success),
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
         )
 
         Text(
-            text = "Your device is now paired and ready for authentication",
+            text = stringResource(R.string.pairing_success_message),
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
         )
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Button(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text("Done") }
+        Button(onClick = onDone, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.general_done))
+        }
     }
 }
 
@@ -272,13 +290,13 @@ private fun FailedView(message: String, onRetry: () -> Unit, onBack: () -> Unit)
     ) {
         Icon(
             imageVector = Icons.Default.Close,
-            contentDescription = "Error",
+            contentDescription = stringResource(R.string.general_error),
             modifier = Modifier.size(72.dp),
             tint = MaterialTheme.colorScheme.error,
         )
 
         Text(
-            text = "Pairing Failed",
+            text = stringResource(R.string.pairing_failed),
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
         )
@@ -296,9 +314,13 @@ private fun FailedView(message: String, onRetry: () -> Unit, onBack: () -> Unit)
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            OutlinedButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
+            OutlinedButton(onClick = onBack, modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.general_back))
+            }
 
-            Button(onClick = onRetry, modifier = Modifier.weight(1f)) { Text("Retry") }
+            Button(onClick = onRetry, modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.general_retry))
+            }
         }
     }
 }
