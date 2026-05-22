@@ -2,6 +2,7 @@
 use nix::unistd::User;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidationError {
     pub title: String,
     pub message: String,

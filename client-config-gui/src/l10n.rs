@@ -14,15 +14,26 @@ impl L10n {
         };
 
         let mut messages = HashMap::new();
+        let mut current_key: Option<String> = None;
+
         for line in ftl_str.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
+
             if let Some(eq_pos) = line.find('=') {
                 let key = line[..eq_pos].trim().to_string();
-                let value = line[eq_pos + 1..].trim().to_string();
-                messages.insert(key, value);
+                let value = line[eq_pos + 1..].trim().to_string().replace("\\n", "\n");
+                messages.insert(key.clone(), value);
+                current_key = Some(key);
+            } else if line.starts_with(' ') || line.starts_with('\t') {
+                if let Some(ref key) = current_key {
+                    if let Some(msg) = messages.get_mut(key) {
+                        msg.push('\n');
+                        msg.push_str(&trimmed.replace("\\n", "\n"));
+                    }
+                }
             }
         }
 

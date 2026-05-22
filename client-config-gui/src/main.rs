@@ -19,13 +19,16 @@ fn main() -> iced::Result {
     // Store the original username in environment for app to use
     std::env::set_var("TAPAUTH_ORIGINAL_USER", &original_user);
 
+    // Detect system locale early for pre-check logging and dialog errors
+    let locale = l10n::detect_locale();
+    let bootstrap_l10n = l10n::L10n::new(locale);
+
     // Validate system prerequisites before continuing
-    if let Err(err) = utils::system_check::validate_tapauthd_user() {
-        // Show a native GUI error dialog since users typically launch from desktop
+    if let Err(_err) = utils::system_check::validate_tapauthd_user() {
         use native_dialog::{DialogBuilder, MessageLevel};
         let _ = DialogBuilder::message()
-            .set_title(&err.title)
-            .set_text(&err.message)
+            .set_title(bootstrap_l10n.tr("error-user-missing-title"))
+            .set_text(bootstrap_l10n.tr("error-user-missing-message"))
             .set_level(MessageLevel::Error)
             .alert()
             .show();
@@ -40,9 +43,6 @@ fn main() -> iced::Result {
         "Running GUI for user: {} (elevated for privileged operations)",
         original_user
     );
-
-    // Detect system locale for translations
-    let locale = l10n::detect_locale();
     tracing::info!("Using locale: {}", locale);
 
     // Load window icon
