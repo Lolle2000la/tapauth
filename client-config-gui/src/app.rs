@@ -11,6 +11,7 @@ pub struct TapAuthConfig {
 #[derive(Debug, Clone)]
 pub enum Message {
     ScreenMessage(ScreenMessage),
+    #[allow(dead_code)]
     LocaleChanged(String),
 }
 

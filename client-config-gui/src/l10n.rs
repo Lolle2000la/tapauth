@@ -58,7 +58,13 @@ impl L10n {
             if let Some(pattern) = msg.value() {
                 let mut fluent_args = FluentArgs::new();
                 for (k, v) in args {
-                    fluent_args.set(*k, *v);
+                    if let Ok(num) = v.parse::<i64>() {
+                        fluent_args.set(*k, num);
+                    } else if let Ok(float) = v.parse::<f64>() {
+                        fluent_args.set(*k, float);
+                    } else {
+                        fluent_args.set(*k, *v);
+                    }
                 }
                 let mut errors = vec![];
                 let value = self
