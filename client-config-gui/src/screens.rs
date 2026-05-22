@@ -95,8 +95,8 @@ impl Screen {
                 Task::none()
             }
 
-            ScreenMessage::LocaleChanged(locale) => {
-                let new_l10n = L10n::new(&locale);
+            ScreenMessage::LocaleChanged(_locale) => {
+                let new_l10n = l10n.clone();
                 match self {
                     Screen::MainMenu(s) => s.l10n = new_l10n,
                     Screen::Pairing(s) => s.l10n = new_l10n,

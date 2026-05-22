@@ -121,7 +121,9 @@ pub fn save_user_locale(username: &str, locale: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, locale.as_bytes());
+    if let Err(e) = std::fs::write(&path, locale.as_bytes()) {
+        tracing::warn!("Failed to persist locale preference for user {username}: {e}");
+    }
 }
 
 /// Load the user's persisted locale preference, if any
@@ -141,4 +143,3 @@ fn user_locale_path(username: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     home.join(".config/tapauth/locale")
 }
-
