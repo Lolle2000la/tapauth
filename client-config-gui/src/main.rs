@@ -71,15 +71,13 @@ fn main() -> iced::Result {
         ..iced::window::Settings::default()
     };
 
-    let app_title: &'static str = &*Box::leak(bootstrap_l10n.tr("app-title").into_boxed_str());
-
     // Run the application
     iced::application(
         move || app::TapAuthConfig::new(locale),
         app::TapAuthConfig::update,
         app::TapAuthConfig::view,
     )
-    .title(app_title)
+    .title(|state: &app::TapAuthConfig| state.title())
     .theme(app::TapAuthConfig::theme)
     .font(lucide_icons::LUCIDE_FONT_BYTES)
     .window(window_settings)

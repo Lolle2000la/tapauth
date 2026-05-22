@@ -11,6 +11,7 @@ pub struct TapAuthConfig {
 #[derive(Debug, Clone)]
 pub enum Message {
     ScreenMessage(ScreenMessage),
+    LocaleChanged(String),
 }
 
 impl TapAuthConfig {
@@ -31,6 +32,11 @@ impl TapAuthConfig {
                 let task = self.current_screen.update(screen_msg, &self.l10n);
                 task.map(Message::ScreenMessage)
             }
+            Message::LocaleChanged(new_locale) => {
+                self.l10n = L10n::new(&new_locale);
+                self.current_screen.set_l10n(self.l10n.clone());
+                Task::none()
+            }
         }
     }
 
@@ -40,5 +46,9 @@ impl TapAuthConfig {
 
     pub fn theme(&self) -> Theme {
         Theme::Light // Use Light theme so QR codes are black-on-white (required for scanning)
+    }
+
+    pub(crate) fn title(&self) -> String {
+        self.l10n.tr("app-title")
     }
 }

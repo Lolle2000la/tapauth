@@ -24,6 +24,15 @@ impl Screen {
     pub fn default_with_l10n(l10n: L10n) -> Self {
         Screen::MainMenu(MainMenuScreen::new(l10n))
     }
+
+    pub fn set_l10n(&mut self, l10n: L10n) {
+        match self {
+            Screen::MainMenu(s) => s.l10n = l10n,
+            Screen::Pairing(s) => s.l10n = l10n,
+            Screen::DeviceList(s) => s.l10n = l10n,
+            Screen::Settings(s) => s.l10n = l10n,
+        }
+    }
 }
 
 /// Messages that can be sent between screens
