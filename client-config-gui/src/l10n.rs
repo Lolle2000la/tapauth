@@ -6,6 +6,7 @@ use unic_langid::LanguageIdentifier;
 
 #[derive(Clone)]
 pub struct L10n {
+    locale: String,
     bundle: Rc<FluentBundle<Arc<FluentResource>>>,
 }
 
@@ -38,8 +39,13 @@ impl L10n {
         bundle.set_use_isolating(false);
 
         Self {
+            locale: locale.to_string(),
             bundle: Rc::new(bundle),
         }
+    }
+
+    pub fn locale(&self) -> &str {
+        &self.locale
     }
 
     pub fn tr(&self, key: &str) -> String {
@@ -92,3 +98,47 @@ pub fn detect_locale() -> &'static str {
     }
     "en"
 }
+
+/// Resolve the effective locale with this precedence:
+/// 1. CLI override (--locale flag, survives pkexec)
+/// 2. Per-user persisted preference (~/.config/tapauth/locale)
+/// 3. System locale detection (LANG/LC_ALL/LC_MESSAGES)
+pub fn resolve_locale(cli_override: Option<&str>, username: &str) -> String {
+    if let Some(loc) = cli_override {
+        if matches!(loc, "de" | "ja" | "en") {
+            return loc.to_string();
+        }
+    }
+    if let Some(loc) = load_user_locale(username) {
+        return loc;
+    }
+    detect_locale().to_string()
+}
+
+/// Save the user's locale preference to ~/.config/tapauth/locale
+pub fn save_user_locale(username: &str, locale: &str) {
+    let path = user_locale_path(username);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, locale.as_bytes());
+}
+
+/// Load the user's persisted locale preference, if any
+fn load_user_locale(username: &str) -> Option<String> {
+    let path = user_locale_path(username);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| matches!(s.as_str(), "de" | "ja" | "en"))
+}
+
+fn user_locale_path(username: &str) -> std::path::PathBuf {
+    let home = nix::unistd::User::from_name(username)
+        .ok()
+        .flatten()
+        .map(|u| u.dir.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    home.join(".config/tapauth/locale")
+}
+

@@ -57,6 +57,7 @@ settings-hostname-placeholder = Enter hostname
 settings-udp-port-label = UDP Port:
 settings-udp-port-placeholder = Enter UDP port (default: 36692)
 settings-security-section = Security
+settings-language-section = Language
 settings-csk-warning = Warning: Rotating CSK will invalidate all paired devices.
     You will need to re-pair them.
 settings-config-saved = Configuration saved successfully.

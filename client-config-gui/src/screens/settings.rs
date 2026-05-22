@@ -1,10 +1,47 @@
 use super::ScreenMessage;
 use crate::l10n::L10n;
 use iced::{
-    widget::{button, column, container, row, scrollable, text, text_input, Space},
+    widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
     Element, Font, Length, Task,
 };
 use shared::config::{ClientConfig, ClientConfigManager, TapAuthConfig, DEFAULT_CONFIG_PATH};
+use std::sync::LazyLock;
+
+mod locales_list {
+    include!(concat!(env!("OUT_DIR"), "/locales_list.rs"));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocaleOption {
+    code: &'static str,
+    display: &'static str,
+}
+
+impl std::fmt::Display for LocaleOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display)
+    }
+}
+
+fn locale_options() -> Vec<LocaleOption> {
+    locales_list::AVAILABLE_LOCALES
+        .iter()
+        .map(|&code| LocaleOption {
+            code,
+            display: locale_display_name(code),
+        })
+        .collect()
+}
+
+fn locale_display_name(code: &str) -> &'static str {
+    match code {
+        "de" => "Deutsch",
+        "ja" => "日本語",
+        _ => "English",
+    }
+}
+
+static LOCALE_OPTIONS: LazyLock<Vec<LocaleOption>> = LazyLock::new(locale_options);
 
 #[derive(Debug, Clone)]
 pub struct SettingsScreen {
@@ -94,6 +131,9 @@ impl SettingsScreen {
                 self.success = None;
                 Task::none()
             }
+            ScreenMessage::LocaleChanged(_locale) => {
+                Task::none()
+            }
             _ => Task::none(),
         }
     }
@@ -116,7 +156,6 @@ impl SettingsScreen {
         .on_press(ScreenMessage::NavigateToMainMenu);
 
         let title = text(self.l10n.tr("title-settings")).size(32);
-
         let config_title = text(self.l10n.tr("settings-config-section")).size(24);
 
         let hostname_label = text(self.l10n.tr("settings-hostname-label")).size(16);
@@ -157,6 +196,18 @@ impl SettingsScreen {
 
         let warning = text(self.l10n.tr("settings-csk-warning")).size(12);
 
+        // Language selector
+        let lang_title = text(self.l10n.tr("settings-language-section")).size(24);
+        let current_code = self.l10n.locale();
+        let selected = LOCALE_OPTIONS.iter().find(|o| o.code == current_code);
+
+        let lang_pick_list = pick_list(
+            LOCALE_OPTIONS.as_slice(),
+            selected,
+            |opt: LocaleOption| ScreenMessage::LocaleChanged(opt.code.to_string()),
+        )
+        .width(Length::Fixed(300.0));
+
         // Status messages
         let status_text = if let Some(ref error) = self.error {
             text(
@@ -180,6 +231,10 @@ impl SettingsScreen {
             udp_port_input,
             Space::new().height(Length::Fixed(20.0)),
             save_button,
+            Space::new().height(Length::Fixed(40.0)),
+            lang_title,
+            Space::new().height(Length::Fixed(15.0)),
+            lang_pick_list,
             Space::new().height(Length::Fixed(40.0)),
             security_title,
             Space::new().height(Length::Fixed(20.0)),
@@ -216,17 +271,14 @@ impl SettingsScreen {
     ) -> Result<(), String> {
         let config_manager = ClientConfigManager::new();
 
-        // Save client state config (hostname)
         config_manager
             .save_config(&client_config)
             .map_err(|e| format!("Failed to save client configuration: {}", e))?;
 
-        // Save TOML config (UDP port, TPM, etc.)
         toml_config
             .save_to_path(DEFAULT_CONFIG_PATH)
             .map_err(|e| format!("Failed to save TOML configuration: {}", e))?;
 
-        // Restart service to apply changes
         crate::utils::service::restart_tapauthd_service().await?;
 
         Ok(())
@@ -239,7 +291,6 @@ impl SettingsScreen {
             .rotate_csk()
             .map_err(|e| format!("Failed to rotate CSK: {}", e))?;
 
-        // Restart service to apply changes
         crate::utils::service::restart_tapauthd_service().await?;
 
         Ok(())

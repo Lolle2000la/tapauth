@@ -57,6 +57,7 @@ settings-hostname-placeholder = ホスト名を入力
 settings-udp-port-label = UDPポート:
 settings-udp-port-placeholder = UDPポートを入力（デフォルト: 36692）
 settings-security-section = セキュリティ
+settings-language-section = 言語
 settings-csk-warning = 警告：CSKをローテーションすると、すべてのペアリング済みデバイスが無効になります。
     再ペアリングが必要です。
 settings-config-saved = 設定が正常に保存されました。

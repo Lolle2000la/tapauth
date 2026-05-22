@@ -18,11 +18,11 @@ fn main() -> iced::Result {
     let original_user = utils::elevation::get_original_user();
 
     if !utils::elevation::is_root() {
-        // Detect locale before environment scrubbing happens
-        let current_locale = l10n::detect_locale();
+        // Resolve effective locale (per-user prefs + system) before pkexec scrubs env
+        let current_locale = l10n::resolve_locale(None, &original_user);
         utils::elevation::attempt_privilege_elevation(
             &original_user,
-            &["--locale", current_locale],
+            &["--locale", &current_locale],
         );
     }
 
@@ -30,19 +30,9 @@ fn main() -> iced::Result {
 
     logging::init_logging();
 
-    // Resolve locale prioritizing the preserved CLI argument
-    let locale: &str = if let Some(ref loc) = forced_locale {
-        // Map back to a static str to avoid leaking heap strings
-        match loc.as_str() {
-            "de" => "de",
-            "ja" => "ja",
-            _ => "en",
-        }
-    } else {
-        l10n::detect_locale()
-    };
+    let locale: String = l10n::resolve_locale(forced_locale.as_deref(), &original_user);
 
-    let bootstrap_l10n = l10n::L10n::new(locale);
+    let bootstrap_l10n = l10n::L10n::new(&locale);
 
     if let Err(_err) = utils::system_check::validate_tapauthd_user() {
         use native_dialog::{DialogBuilder, MessageLevel};
@@ -71,9 +61,11 @@ fn main() -> iced::Result {
         ..iced::window::Settings::default()
     };
 
+    let username = original_user;
+
     // Run the application
     iced::application(
-        move || app::TapAuthConfig::new(locale),
+        move || app::TapAuthConfig::new(&locale, &username),
         app::TapAuthConfig::update,
         app::TapAuthConfig::view,
     )
