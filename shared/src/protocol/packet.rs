@@ -147,6 +147,7 @@ pub fn extract_challenge(wrapper: &WrapperMessage) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::crypto::Ed25519KeyPair;
@@ -190,6 +191,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod protobuf_tests {
     use super::*;
     use prost::Message;
