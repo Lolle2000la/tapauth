@@ -3,7 +3,6 @@ use aes_gcm::{
     Aes256Gcm,
 };
 use hkdf::Hkdf;
-use rand::TryRngCore;
 use sha2::Sha256;
 
 use super::{ClientSymmetricKey, CryptoError, PairingSymmetricKey};
@@ -84,11 +83,8 @@ pub fn encrypt_with_csk_and_random_nonce(
     csk: &ClientSymmetricKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
-    OsRng
-        .try_fill_bytes(&mut nonce)
-        .map_err(|_| CryptoError::RandomGenerationFailed)?;
+    getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomGenerationFailed)?;
 
     let ciphertext = encrypt_aes_gcm(csk.as_bytes(), &nonce, plaintext, &[])?;
 
@@ -125,12 +121,8 @@ pub fn encrypt_with_psk(
     psk: &PairingSymmetricKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    // Use a random nonce, prepend it to the ciphertext to avoid nonce reuse.
-    use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
-    OsRng
-        .try_fill_bytes(&mut nonce)
-        .map_err(|_| CryptoError::RandomGenerationFailed)?;
+    getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomGenerationFailed)?;
 
     let ciphertext = encrypt_aes_gcm(psk.as_bytes(), &nonce, plaintext, &[])?;
 

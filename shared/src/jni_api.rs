@@ -1467,7 +1467,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
         use super::jni::protobuf::encode_message;
         use crate::crypto;
         use crate::protocol::pb;
-        use rand::{rngs::OsRng, TryRngCore};
 
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
@@ -1483,7 +1482,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
         let csk = crypto::ClientSymmetricKey::from_bytes(csk_array);
 
         let mut nonce = [0u8; 12];
-        if let Err(err) = OsRng.try_fill_bytes(&mut nonce) {
+        if let Err(err) = getrandom::fill(&mut nonce) {
             throw_security_exception(&mut env, &format!("random generation failed: {err}"));
             return std::ptr::null_mut();
         }

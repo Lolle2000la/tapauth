@@ -94,7 +94,7 @@ pub async fn wait_for_pairing_connection(port: u16) -> Result<(String, u16), Str
     let mut session = ClientPairingSession::new(keypair.clone())
         .map_err(|e| format!("Failed to create pairing session: {}", e))?;
 
-    let client_device_name = whoami::fallible::hostname().unwrap_or_else(|_| "Unknown".to_string());
+    let client_device_name = whoami::hostname().unwrap_or_else(|_| "Unknown".to_string());
 
     let (stream, server_public_key, server_device_name, sas) = session
         .initiate_pairing(stream, &client_device_name)

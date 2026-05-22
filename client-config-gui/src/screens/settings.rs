@@ -131,9 +131,7 @@ impl SettingsScreen {
                 self.success = None;
                 Task::none()
             }
-            ScreenMessage::LocaleChanged(_locale) => {
-                Task::none()
-            }
+            ScreenMessage::LocaleChanged(_locale) => Task::none(),
             _ => Task::none(),
         }
     }
@@ -201,11 +199,9 @@ impl SettingsScreen {
         let current_code = self.l10n.locale();
         let selected = LOCALE_OPTIONS.iter().find(|o| o.code == current_code);
 
-        let lang_pick_list = pick_list(
-            LOCALE_OPTIONS.as_slice(),
-            selected,
-            |opt: LocaleOption| ScreenMessage::LocaleChanged(opt.code.to_string()),
-        )
+        let lang_pick_list = pick_list(LOCALE_OPTIONS.as_slice(), selected, |opt: LocaleOption| {
+            ScreenMessage::LocaleChanged(opt.code.to_string())
+        })
         .width(Length::Fixed(300.0));
 
         // Status messages

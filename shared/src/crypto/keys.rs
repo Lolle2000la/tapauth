@@ -1,5 +1,4 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::{rngs::OsRng, TryRngCore};
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -117,9 +116,7 @@ impl ClientSymmetricKey {
     /// Generate a new random CSK
     pub fn generate() -> Result<Self, CryptoError> {
         let mut key = [0u8; 32];
-        let mut rng = OsRng;
-        rng.try_fill_bytes(&mut key)
-            .map_err(|_| CryptoError::RandomGenerationFailed)?;
+        getrandom::fill(&mut key).map_err(|_| CryptoError::RandomGenerationFailed)?;
         Ok(Self(SecretBox::new(Box::new(key))))
     }
 
