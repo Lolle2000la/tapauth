@@ -123,8 +123,7 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          sdkmanager --install "ndk;26.1.10909125"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+          sdkmanager --install "ndk;30.0.14904198"
 
       - name: Install protobuf compiler
         run: |
