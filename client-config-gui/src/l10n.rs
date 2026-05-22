@@ -1,11 +1,12 @@
 use fluent::{FluentArgs, FluentBundle, FluentResource};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
 #[derive(Clone)]
 pub struct L10n {
-    bundle: Arc<FluentBundle<Arc<FluentResource>>>,
+    bundle: Rc<FluentBundle<Arc<FluentResource>>>,
 }
 
 // Manual implementation to allow Screen structs to derive Debug seamlessly
@@ -37,7 +38,7 @@ impl L10n {
         bundle.set_use_isolating(false);
 
         Self {
-            bundle: Arc::new(bundle),
+            bundle: Rc::new(bundle),
         }
     }
 

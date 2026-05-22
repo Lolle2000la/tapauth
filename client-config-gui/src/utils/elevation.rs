@@ -83,12 +83,14 @@ fn get_username_from_uid(uid: u32) -> Result<String, ()> {
 /// Attempt to elevate privileges using pkexec or sudo.
 ///
 /// Preserves environment variables needed for GUI display (X11/Wayland).
+/// `extra_args` are injected before forwarded user args so the re-exec'd
+/// binary receives them (e.g. `--locale` to survive environment scrubbing).
 /// This function does not return if elevation succeeds.
 ///
 /// ## Panics
 ///
 /// Never panics. Exits the process with status code 1 if elevation fails.
-pub fn attempt_privilege_elevation(original_user: &str) -> ! {
+pub fn attempt_privilege_elevation(original_user: &str, extra_args: &[&str]) -> ! {
     tracing::info!(
         "Attempting privilege escalation for user: {}",
         original_user
@@ -135,6 +137,7 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
         .arg("env")
         .args(env_vars.iter().map(|(k, v)| format!("{}={}", k, v)))
         .arg(&current_exe)
+        .args(extra_args)
         .args(env::args().skip(1))
         .status();
 
@@ -157,6 +160,7 @@ pub fn attempt_privilege_elevation(original_user: &str) -> ! {
 
     let sudo_result = sudo_cmd
         .arg(&current_exe)
+        .args(extra_args)
         .args(env::args().skip(1))
         .status();
 
