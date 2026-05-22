@@ -161,42 +161,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    InfoRow(
-                        stringResource(R.string.settings_app_version),
-                        "1.0.0",
-                    )
+                    InfoRow(stringResource(R.string.settings_app_version), "1.0.0")
                     HorizontalDivider()
-                    InfoRow(
-                        stringResource(R.string.settings_protocol_version),
-                        "1",
-                    )
-                    HorizontalDivider(
-                        Modifier,
-                        DividerDefaults.Thickness,
-                        DividerDefaults.color,
-                    )
-                    InfoRow(
-                        stringResource(R.string.settings_encryption),
-                        "AES-256-GCM",
-                    )
-                    HorizontalDivider(
-                        Modifier,
-                        DividerDefaults.Thickness,
-                        DividerDefaults.color,
-                    )
-                    InfoRow(
-                        stringResource(R.string.settings_key_exchange),
-                        "X25519",
-                    )
-                    HorizontalDivider(
-                        Modifier,
-                        DividerDefaults.Thickness,
-                        DividerDefaults.color,
-                    )
-                    InfoRow(
-                        stringResource(R.string.settings_signing),
-                        "Ed25519",
-                    )
+                    InfoRow(stringResource(R.string.settings_protocol_version), "1")
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
+                    InfoRow(stringResource(R.string.settings_encryption), "AES-256-GCM")
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
+                    InfoRow(stringResource(R.string.settings_key_exchange), "X25519")
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
+                    InfoRow(stringResource(R.string.settings_signing), "Ed25519")
                 }
             }
 
@@ -232,12 +205,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         context.getString(R.string.settings_port_must_be_number)
                                 }
                                 port < 1024 -> {
-                                    udpPortError =
-                                        context.getString(R.string.settings_port_min)
+                                    udpPortError = context.getString(R.string.settings_port_min)
                                 }
                                 port > 65535 -> {
-                                    udpPortError =
-                                        context.getString(R.string.settings_port_max)
+                                    udpPortError = context.getString(R.string.settings_port_max)
                                 }
                                 else -> {
                                     udpPortError = null
@@ -271,11 +242,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         modifier = Modifier.fillMaxWidth(),
                     )
 
-                    HorizontalDivider(
-                        Modifier,
-                        DividerDefaults.Thickness,
-                        DividerDefaults.color,
-                    )
+                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
 
                     // Battery optimization prompt
                     Button(onClick = { showBatteryConfirm = true }) {
@@ -339,9 +306,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     }
                                     // wait briefly for service to report state; timeout after
                                     // 2s
-                                    withTimeoutOrNull(2000) {
-                                        kotlinx.coroutines.delay(600)
-                                    }
+                                    withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                     udpBusy = false
                                 }
                             },
@@ -374,13 +339,9 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     bleBusy = true
                                     try {
                                         if (checked) {
-                                            dev.rourunisen.tapauth.ble.BleGattService.start(
-                                                context
-                                            )
+                                            dev.rourunisen.tapauth.ble.BleGattService.start(context)
                                         } else {
-                                            dev.rourunisen.tapauth.ble.BleGattService.stop(
-                                                context
-                                            )
+                                            dev.rourunisen.tapauth.ble.BleGattService.stop(context)
                                         }
                                         // Save preference and update UI state after successful
                                         // start/stop
@@ -407,9 +368,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             duration = SnackbarDuration.Short,
                                         )
                                     }
-                                    withTimeoutOrNull(2000) {
-                                        kotlinx.coroutines.delay(600)
-                                    }
+                                    withTimeoutOrNull(2000) { kotlinx.coroutines.delay(600) }
                                     bleBusy = false
                                 }
                             },
@@ -426,15 +385,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 modifier = Modifier.fillMaxWidth(),
                                 colors =
                                     CardDefaults.cardColors(
-                                        containerColor =
-                                            MaterialTheme.colorScheme.errorContainer
+                                        containerColor = MaterialTheme.colorScheme.errorContainer
                                     ),
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
                                     Text(
-                                        stringResource(
-                                            R.string.settings_location_required_title
-                                        ),
+                                        stringResource(R.string.settings_location_required_title),
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         fontWeight = FontWeight.Bold,
@@ -449,17 +405,13 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     )
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        stringResource(
-                                            R.string.settings_location_steps_title
-                                        ),
+                                        stringResource(R.string.settings_location_steps_title),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         fontWeight = FontWeight.Bold,
                                     )
                                     Text(
-                                        stringResource(
-                                            R.string.settings_location_steps
-                                        ),
+                                        stringResource(R.string.settings_location_steps),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
                                         modifier =
@@ -482,8 +434,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                                                 Uri.parse(
                                                                     "package:${context.packageName}"
                                                                 )
-                                                            flags =
-                                                                Intent.FLAG_ACTIVITY_NEW_TASK
+                                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
                                                         }
                                                 context.startActivity(intent)
                                             } catch (_: Exception) {}
@@ -537,8 +488,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                                         val intent =
                                             Intent(
-                                                Settings
-                                                    .ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
+                                                Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
                                             )
                                         context.startActivity(
                                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -565,18 +515,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                     },
                     title = {
-                        Text(
-                            stringResource(
-                                R.string.settings_allow_background_dialog_title
-                            )
-                        )
+                        Text(stringResource(R.string.settings_allow_background_dialog_title))
                     },
                     text = {
-                        Text(
-                            stringResource(
-                                R.string.settings_allow_background_dialog_message
-                            )
-                        )
+                        Text(stringResource(R.string.settings_allow_background_dialog_message))
                     },
                 )
             }
@@ -594,10 +536,7 @@ fun SettingsScreen(onBack: () -> Unit) {
 
 @Composable
 private fun InfoRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodyMedium,

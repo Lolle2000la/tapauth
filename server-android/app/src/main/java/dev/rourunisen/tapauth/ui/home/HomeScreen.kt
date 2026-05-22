@@ -15,11 +15,8 @@ import dev.rourunisen.tapauth.R
 fun HomeScreen(onStartScanning: () -> Unit, onViewDevices: () -> Unit, onSettings: () -> Unit) {
     // Status display only; toggles were removed in favor of Settings controls
 
-    Scaffold(
-        topBar = {
-            TopAppBar(title = { Text(stringResource(R.string.home_title)) })
-        }
-    ) { padding ->
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.home_title)) }) }) {
+        padding ->
         Column(
             modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -72,10 +69,7 @@ fun HomeScreen(onStartScanning: () -> Unit, onViewDevices: () -> Unit, onSetting
             Spacer(modifier = Modifier.height(16.dp))
 
             // Pair New Device Button
-            Button(
-                onClick = onStartScanning,
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-            ) {
+            Button(onClick = onStartScanning, modifier = Modifier.fillMaxWidth().height(56.dp)) {
                 Text(
                     text = stringResource(R.string.home_pair_new_device),
                     style = MaterialTheme.typography.titleMedium,
@@ -94,10 +88,7 @@ fun HomeScreen(onStartScanning: () -> Unit, onViewDevices: () -> Unit, onSetting
             }
 
             // Settings Button
-            OutlinedButton(
-                onClick = onSettings,
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-            ) {
+            OutlinedButton(onClick = onSettings, modifier = Modifier.fillMaxWidth().height(56.dp)) {
                 Text(
                     text = stringResource(R.string.home_settings),
                     style = MaterialTheme.typography.titleMedium,

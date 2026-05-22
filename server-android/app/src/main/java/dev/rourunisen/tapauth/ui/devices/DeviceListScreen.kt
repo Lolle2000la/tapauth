@@ -203,9 +203,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             DeviceCard(
                                 device = device,
                                 onRemoveDevice = { deviceToDelete = device },
-                                onRemoveUser = { username ->
-                                    userToRemove = device to username
-                                },
+                                onRemoveUser = { username -> userToRemove = device to username },
                             )
                         }
                     }
@@ -267,11 +265,12 @@ private fun DeviceCard(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = stringResource(
-                            R.string.devices_id_prefix,
-                            device.deviceId.take(16),
-                            "",
-                        ),
+                        text =
+                            stringResource(
+                                R.string.devices_id_prefix,
+                                device.deviceId.take(16),
+                                "",
+                            ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
@@ -281,10 +280,11 @@ private fun DeviceCard(
                     if (device.allowedUsers.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = stringResource(
-                                R.string.devices_allowed_users,
-                                device.allowedUsers.joinToString(", "),
-                            ),
+                            text =
+                                stringResource(
+                                    R.string.devices_allowed_users,
+                                    device.allowedUsers.joinToString(", "),
+                                ),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Medium,
@@ -297,9 +297,7 @@ private fun DeviceCard(
                     IconButton(onClick = onRemoveDevice) {
                         Icon(
                             imageVector = Icons.Default.Delete,
-                            contentDescription = stringResource(
-                                R.string.devices_remove_device_cd
-                            ),
+                            contentDescription = stringResource(R.string.devices_remove_device_cd),
                             tint = MaterialTheme.colorScheme.error,
                         )
                     }
@@ -309,9 +307,8 @@ private fun DeviceCard(
                         IconButton(onClick = { showUserMenu = !showUserMenu }) {
                             Icon(
                                 imageVector = Icons.Default.Person,
-                                contentDescription = stringResource(
-                                    R.string.devices_manage_users_cd
-                                ),
+                                contentDescription =
+                                    stringResource(R.string.devices_manage_users_cd),
                             )
                         }
                     }
@@ -338,10 +335,7 @@ private fun DeviceCard(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            text = username,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
+                        Text(text = username, style = MaterialTheme.typography.bodyMedium)
                         TextButton(onClick = { onRemoveUser(username) }) {
                             Text(
                                 stringResource(R.string.general_remove),

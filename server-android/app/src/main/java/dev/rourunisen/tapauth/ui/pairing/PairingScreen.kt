@@ -134,9 +134,7 @@ fun PairingScreen(
                                 PairingState.Failed(
                                     context.getString(R.string.pairing_user_cancelled)
                                 )
-                            onPairingFailed(
-                                context.getString(R.string.pairing_cancelled_message)
-                            )
+                            onPairingFailed(context.getString(R.string.pairing_cancelled_message))
                         },
                     )
                 }
