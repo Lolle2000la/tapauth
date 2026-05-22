@@ -265,7 +265,7 @@ mod tests {
         let mut cli = client_from_stream(b);
 
         // Write BE length > 1 MiB; no payload needed as recv_response rejects on len alone
-        let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
+        let too_big: u32 = (1024 * 1024 + 1) as u32;
         let len_be = too_big.to_be_bytes();
         a.write_all(&len_be).expect("failed to write test data");
 
@@ -283,7 +283,7 @@ mod tests {
         b.set_nonblocking(true).expect("failed to set nonblocking");
         let mut cli = client_from_stream(b);
 
-        let too_big: u32 = (1 * 1024 * 1024 + 1) as u32;
+        let too_big: u32 = (1024 * 1024 + 1) as u32;
         a.write_all(&too_big.to_be_bytes())
             .expect("failed to write test data");
 

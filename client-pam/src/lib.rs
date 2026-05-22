@@ -83,18 +83,6 @@ pub extern "C" fn pam_sm_setcred(
     pam_sys::PAM_SUCCESS
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guard_returns_ignore_on_panic() {
-        let code = guard(|| panic!("boom"));
-        assert_eq!(code, crate::pam_sys::PAM_IGNORE);
-    }
-}
-
 /// PAM service module entry point for account management
 #[no_mangle]
 pub extern "C" fn pam_sm_acct_mgmt(
@@ -137,4 +125,16 @@ pub extern "C" fn pam_sm_chauthtok(
     _argv: *const *const std::os::raw::c_char,
 ) -> c_int {
     pam_sys::PAM_SUCCESS
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_returns_ignore_on_panic() {
+        let code = guard(|| panic!("boom"));
+        assert_eq!(code, crate::pam_sys::PAM_IGNORE);
+    }
 }
