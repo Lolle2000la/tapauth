@@ -53,7 +53,6 @@ pub async fn start_pairing() -> Result<(String, u16), String> {
     let pending_state = PendingPairingState {
         listener,
         firewall_guard,
-        pairing_url: url.clone(),
     };
 
     *SESSION_STATE.lock().await = SessionState::Pending(pending_state);
@@ -113,8 +112,7 @@ pub async fn wait_for_pairing_connection(port: u16) -> Result<(String, u16), Str
         session,
         server_public_key,
         server_device_name: server_device_name.clone(),
-        keypair: keypair.clone(),
-        _firewall_guard: firewall_guard,
+        firewall_guard,
     };
 
     *SESSION_STATE.lock().await = SessionState::Active(Box::new(state));
@@ -143,8 +141,7 @@ pub async fn complete_pairing(_port: u16) -> Result<String, String> {
         mut session,
         server_public_key,
         server_device_name,
-        keypair: _,
-        _firewall_guard: _,
+        firewall_guard: _,
     } = *state;
 
     let csk = config

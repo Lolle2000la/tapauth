@@ -14,8 +14,6 @@ pub struct DeviceListScreen {
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
-    #[allow(dead_code)]
-    error: Option<String>,
 }
 
 impl DeviceListScreen {
@@ -32,7 +30,6 @@ impl DeviceListScreen {
             devices: HashMap::new(),
             current_username,
             loading: true,
-            error: None,
         };
 
         let task = Task::perform(Self::load_devices(), |result| match result {
@@ -74,10 +71,6 @@ impl DeviceListScreen {
                         Err(e) => ScreenMessage::PairingFailed(e),
                     },
                 )
-            }
-            ScreenMessage::DeviceRemoved(_device_id) => {
-                // Already removed from self.devices in RemoveDevice
-                Task::none()
             }
             _ => Task::none(),
         }

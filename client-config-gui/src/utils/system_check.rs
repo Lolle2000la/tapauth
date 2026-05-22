@@ -1,12 +1,11 @@
 /// System prerequisite checks for the TapAuth configuration GUI
 use nix::unistd::User;
 
+/// Marker error type for system prerequisite failures.
+/// The actual user-visible messages are served by the Fluent bundle
+/// so they render in the current locale.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ValidationError {
-    pub title: String,
-    pub message: String,
-}
+pub struct ValidationError;
 
 /// Validates that the `tapauthd` system user exists
 ///
@@ -17,16 +16,6 @@ pub struct ValidationError {
 pub fn validate_tapauthd_user() -> Result<(), ValidationError> {
     match User::from_name("tapauthd") {
         Ok(Some(_)) => Ok(()),
-        Ok(None) | Err(_) => Err(ValidationError {
-            title: "System User Missing".to_string(),
-            message: "The 'tapauthd' system user is required but was not found.\n\n\
-                This user should have been created during installation.\n\n\
-                Recommended action:\n\
-                1. Log out and log back in (or restart your system)\n\
-                2. Try launching the application again\n\n\
-                If the problem persists, you may need to create the user manually:\n\
-                    sudo useradd --system --no-create-home tapauthd"
-                .to_string(),
-        }),
+        Ok(None) | Err(_) => Err(ValidationError),
     }
 }
