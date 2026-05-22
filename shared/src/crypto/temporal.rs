@@ -171,13 +171,16 @@ mod tests {
     fn test_previous_identifier_verification() {
         let csk = ClientSymmetricKey::generate().unwrap();
 
-        // This test assumes we're not at time window 0
-        if current_time_window().unwrap() > 0 {
-            let previous_id = generate_previous_temporal_identifier(&csk).unwrap();
+        let window = current_time_window().unwrap();
+        assert!(
+            window > 0,
+            "time window is zero - system clock may be broken"
+        );
 
-            // Previous identifier should also verify
-            assert!(verify_temporal_identifier(&csk, &previous_id).unwrap());
-        }
+        let previous_id = generate_previous_temporal_identifier(&csk).unwrap();
+
+        // Previous identifier should also verify
+        assert!(verify_temporal_identifier(&csk, &previous_id).unwrap());
     }
 
     #[test]

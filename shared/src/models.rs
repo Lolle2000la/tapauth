@@ -178,4 +178,33 @@ mod tests {
         let url = "http://pair?v=1&pk=aabbccdd&p=12345";
         assert!(pairing::PairingInfo::parse(url).is_err());
     }
+
+    #[test]
+    fn test_pairing_url_duplicate_parameters() {
+        // Last value should win for duplicate parameters
+        let url = "tapauth://pair?v=1&pk=first_key&p=12345&pk=second_key";
+        let info = pairing::PairingInfo::parse(url).unwrap();
+        assert_eq!(info.public_key_hex, "second_key");
+    }
+
+    #[test]
+    fn test_pairing_url_unknown_parameters_ignored() {
+        // Unknown parameters should be silently ignored
+        let url = "tapauth://pair?v=1&pk=abc&p=12345&extra=ignored&random=stuff";
+        let info = pairing::PairingInfo::parse(url).unwrap();
+        assert_eq!(info.public_key_hex, "abc");
+        assert_eq!(info.port, 12345);
+    }
+
+    #[test]
+    fn test_pairing_url_malformed_ipv4() {
+        let url = "tapauth://pair?v=1&pk=abc&p=12345&ip4=not_an_ip";
+        assert!(pairing::PairingInfo::parse(url).is_err());
+    }
+
+    #[test]
+    fn test_pairing_url_malformed_ipv6() {
+        let url = "tapauth://pair?v=1&pk=abc&p=12345&ip6=not_an_ip";
+        assert!(pairing::PairingInfo::parse(url).is_err());
+    }
 }

@@ -370,4 +370,54 @@ mod tests {
         request.timestamp_unix_seconds = 1000;
         assert!(!is_request_timestamp_valid(&request));
     }
+
+    #[test]
+    fn test_timestamp_validation_at_boundary() {
+        let challenge = [1u8; 32];
+        let request = create_auth_request_with_challenge("user", "host", &challenge).unwrap();
+
+        // Exactly at the +60s boundary (future)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut req_plus_60 = request.clone();
+        req_plus_60.timestamp_unix_seconds = now + 60;
+        assert!(is_request_timestamp_valid(&req_plus_60));
+
+        // Just beyond the +60s boundary
+        let mut req_plus_61 = request.clone();
+        req_plus_61.timestamp_unix_seconds = now + 61;
+        assert!(!is_request_timestamp_valid(&req_plus_61));
+
+        // Exactly at the -60s boundary (past)
+        let mut req_minus_60 = request.clone();
+        req_minus_60.timestamp_unix_seconds = now.saturating_sub(60);
+        assert!(is_request_timestamp_valid(&req_minus_60));
+
+        // Just beyond the -60s boundary
+        let mut req_minus_61 = request.clone();
+        req_minus_61.timestamp_unix_seconds = now.saturating_sub(61);
+        assert!(!is_request_timestamp_valid(&req_minus_61));
+    }
+
+    #[test]
+    fn test_sha256_hex_debug() {
+        let data = b"test data";
+        let result = sha256_hex(data);
+
+        // In debug, should be a 64-char hex string
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(result.len(), 64);
+            // All characters should be valid hex
+            assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        // In release, should return the stripped placeholder
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(result, "<stripped>");
+        }
+    }
 }

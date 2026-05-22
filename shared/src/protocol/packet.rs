@@ -193,6 +193,33 @@ mod tests {
         let extracted = extract_challenge(&wrapper).unwrap();
         assert_eq!(extracted, challenge);
     }
+
+    #[test]
+    fn test_extract_challenge_from_auth_grant() {
+        use crate::crypto::Ed25519KeyPair;
+        use crate::protocol::messages::create_auth_grant;
+
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let challenge = [5u8; 32];
+
+        let grant = create_auth_grant(&keypair, &challenge).unwrap();
+        let wrapper = wrap_auth_grant(grant);
+
+        // AuthGrant does not carry the challenge, so extract_challenge returns None
+        assert!(extract_challenge(&wrapper).is_none());
+    }
+
+    #[test]
+    fn test_extract_challenge_empty_wrapper() {
+        let wrapper = WrapperMessage {
+            version: 1,
+            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            signature: Vec::new(),
+            payload: None,
+        };
+
+        assert!(extract_challenge(&wrapper).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +254,7 @@ mod protobuf_tests {
     }
 
     #[test]
-    fn test_encrypted_packet_temporal_identifier_wrong_length() {
+    fn test_encrypted_packet_short_temporal_identifier_is_preserved() {
         // Create packet with wrong length temporal_identifier (should be 16 bytes)
         let packet = EncryptedPacket {
             temporal_identifier: vec![1, 2, 3, 4, 5], // Only 5 bytes

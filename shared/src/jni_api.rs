@@ -32,7 +32,6 @@
 //! - `IOException`: Protobuf encode/decode failures
 //! - `GeneralSecurityException`: General crypto errors (nonce generation, encryption setup)
 //! - `AEADBadTagException`: AEAD decryption authentication failures
-//! - `BadPaddingException`: Decryption padding/format errors
 //! - `InvalidKeyException`: Malformed key material
 //!
 //! ## Panics
@@ -302,7 +301,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
 /// ## Errors
 ///
 /// - `IllegalArgumentException`: PSK reading fails or PSK is not 32 bytes
-/// - `BadPaddingException`: Decryption or authentication fails
+/// - `AEADBadTagException`: Decryption or authentication tag verification fails
 /// - `OutOfMemoryError`: Result allocation fails
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptWithPsk(
@@ -327,7 +326,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
         let plaintext = match crypto::decrypt_with_psk(&psk, &ciphertext_bytes) {
             Ok(data) => data,
             Err(err) => {
-                throw_bad_padding(&mut env, format!("decryption failed: {err}"));
+                throw_aead_bad_tag(&mut env, format!("decryption failed: {err}"));
                 return std::ptr::null_mut();
             }
         };

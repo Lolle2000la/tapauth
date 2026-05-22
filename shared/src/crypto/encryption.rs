@@ -164,8 +164,10 @@ mod tests {
 
     #[test]
     fn test_aes_gcm_encryption() {
-        let key = [0u8; 32];
-        let nonce = [0u8; 12];
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("getrandom failed");
+        let mut nonce = [0u8; 12];
+        getrandom::fill(&mut nonce).expect("getrandom failed");
         let plaintext = b"Hello, World!";
         let aad = b"additional data";
 
@@ -298,5 +300,58 @@ mod tests {
         let p2 = decrypt_with_psk(&psk, &c2).unwrap();
         assert_eq!(p1, plaintext);
         assert_eq!(p2, plaintext);
+    }
+
+    #[test]
+    fn test_csk_random_nonce_roundtrip() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let plaintext = b"hello csk random nonce";
+
+        let ciphertext = encrypt_with_csk_and_random_nonce(&csk, plaintext).unwrap();
+        let decrypted = decrypt_with_csk_and_prepended_nonce(&csk, &ciphertext).unwrap();
+
+        assert_eq!(plaintext, decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_csk_random_nonce_uniqueness() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let plaintext = b"same plaintext, different nonces";
+
+        let c1 = encrypt_with_csk_and_random_nonce(&csk, plaintext).unwrap();
+        let c2 = encrypt_with_csk_and_random_nonce(&csk, plaintext).unwrap();
+
+        // Each encryption should produce a unique ciphertext due to random nonce
+        assert_ne!(c1, c2);
+
+        // Both should decrypt correctly
+        let p1 = decrypt_with_csk_and_prepended_nonce(&csk, &c1).unwrap();
+        let p2 = decrypt_with_csk_and_prepended_nonce(&csk, &c2).unwrap();
+        assert_eq!(p1, plaintext);
+        assert_eq!(p2, plaintext);
+    }
+
+    #[test]
+    fn test_csk_random_nonce_small_ciphertext_rejected() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        // Less than 12 bytes (minimum nonce length)
+        let result = decrypt_with_csk_and_prepended_nonce(&csk, &[1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_prepended_nonce_tampered() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let plaintext = b"tamper test";
+
+        let mut ciphertext = encrypt_with_csk_and_random_nonce(&csk, plaintext).unwrap();
+
+        // Tamper with a byte in the ciphertext portion (after the 12-byte nonce)
+        if ciphertext.len() > 13 {
+            ciphertext[13] ^= 0xFF;
+        }
+
+        let result = decrypt_with_csk_and_prepended_nonce(&csk, &ciphertext);
+        assert!(result.is_err());
     }
 }

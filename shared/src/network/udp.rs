@@ -495,8 +495,8 @@ mod tests {
 
         let result = send_udp_broadcast(&socket, local_port, &packet).await;
 
-        // Should succeed (or fail gracefully if no network interface)
-        assert!(result.is_ok() || result.is_err());
+        // Accept any result — network conditions vary across test environments
+        drop(result);
     }
 
     #[tokio::test]

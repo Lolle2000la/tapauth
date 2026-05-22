@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
         {
-            assert_eq!(config.use_tpm, false);
+            assert!(!config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard);
         }
         assert_eq!(config.operation_timeout(), Duration::from_secs(3));
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(config.udp_port, 12345);
         #[cfg(feature = "tpm")]
         {
-            assert_eq!(config.use_tpm, true);
+            assert!(config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Paranoid);
         }
     }
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
         {
-            assert_eq!(config.use_tpm, true);
+            assert!(config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard); // Should default
         }
     }
