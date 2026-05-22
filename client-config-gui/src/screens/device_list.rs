@@ -1,14 +1,16 @@
 use super::ScreenMessage;
+use crate::l10n::L10n;
 use crate::utils::elevation;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Element, Length, Task,
+    Element, Font, Length, Task,
 };
 use shared::config::{ClientConfigManager, PairedServer};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct DeviceListScreen {
+    pub l10n: L10n,
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
@@ -17,7 +19,7 @@ pub struct DeviceListScreen {
 }
 
 impl DeviceListScreen {
-    pub fn new() -> (Self, Task<ScreenMessage>) {
+    pub fn new(l10n: L10n) -> (Self, Task<ScreenMessage>) {
         tracing::debug!("Creating new DeviceListScreen and starting load task");
 
         // Get original username (before any privilege escalation)
@@ -26,6 +28,7 @@ impl DeviceListScreen {
         tracing::info!("Device list for user: {}", current_username);
 
         let screen = Self {
+            l10n,
             devices: HashMap::new(),
             current_username,
             loading: true,
@@ -83,9 +86,13 @@ impl DeviceListScreen {
     pub fn view(&self) -> Element<'_, ScreenMessage> {
         let back_button = button(
             row![
-                container(lucide_icons::iced::icon_arrow_left().size(16))
-                    .padding(iced::Padding::ZERO.top(2)),
-                text("Back").size(16),
+                container(
+                    text(char::from(lucide_icons::Icon::ArrowLeft))
+                        .font(Font::with_name("lucide"))
+                        .size(16)
+                )
+                .padding(iced::Padding::ZERO.top(2)),
+                text(self.l10n.tr("btn-back")).size(16),
             ]
             .align_y(iced::Alignment::Center)
             .spacing(5),
@@ -93,11 +100,14 @@ impl DeviceListScreen {
         .padding(10)
         .on_press(ScreenMessage::NavigateToMainMenu);
 
-        let title = text("Paired Devices").size(32);
+        let title = text(self.l10n.tr("title-paired-devices")).size(32);
 
-        let username_info = text(format!("Current user: {}", self.current_username))
-            .size(14)
-            .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
+        let username_info = text(self.l10n.tr_args(
+            "devices-current-user",
+            &[("username", &self.current_username)],
+        ))
+        .size(14)
+        .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
         // Filter devices to only show those that include current user
         let user_devices: HashMap<_, _> = self
@@ -107,7 +117,7 @@ impl DeviceListScreen {
             .collect();
 
         let device_list = if user_devices.is_empty() {
-            column![text("No paired devices for current user").size(16)]
+            column![text(self.l10n.tr("devices-none-for-user")).size(16)]
                 .align_x(iced::Alignment::Center)
         } else {
             let mut devices_column = column![].spacing(10);
@@ -115,10 +125,12 @@ impl DeviceListScreen {
             for (device_id, server) in user_devices {
                 let user_count = server.allowed_users.len();
                 let user_info = if user_count > 1 {
-                    format!(
-                        " (shared with {} other user{})",
-                        user_count - 1,
-                        if user_count - 1 == 1 { "" } else { "s" }
+                    self.l10n.tr_args(
+                        "devices-shared-info",
+                        &[
+                            ("count", &(user_count - 1).to_string()),
+                            ("s", if user_count - 1 == 1 { "" } else { "s" }),
+                        ],
                     )
                 } else {
                     String::new()
@@ -127,24 +139,28 @@ impl DeviceListScreen {
                 let device_row = row![
                     column![
                         text(&server.name).size(18),
-                        text(format!(
-                            "ID: {}...{}",
-                            &device_id[..8],
-                            if device_id.len() > 8 { "..." } else { "" }
+                        text(self.l10n.tr_args(
+                            "devices-id-truncated",
+                            &[
+                                ("prefix", &device_id[..device_id.len().min(8)]),
+                                ("suffix", if device_id.len() > 8 { "..." } else { "" }),
+                            ],
                         ))
                         .size(12)
                         .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-                        text(format!(
-                            "Users: {}{}",
-                            server.allowed_users.join(", "),
-                            user_info
+                        text(self.l10n.tr_args(
+                            "devices-users-list",
+                            &[
+                                ("users", &server.allowed_users.join(", ")),
+                                ("info", &user_info),
+                            ],
                         ))
                         .size(12)
                         .color(iced::Color::from_rgb(0.5, 0.5, 0.7)),
                     ]
                     .spacing(4)
                     .width(Length::Fill),
-                    button(text("Remove").size(14))
+                    button(text(self.l10n.tr("btn-remove")).size(14))
                         .padding(8)
                         .on_press(ScreenMessage::RemoveDevice(device_id.clone())),
                 ]
@@ -160,11 +176,11 @@ impl DeviceListScreen {
 
         let content = column![
             back_button,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             title,
-            Space::with_height(Length::Fixed(10.0)),
+            Space::new().height(Length::Fixed(10.0)),
             username_info,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             scrollable(device_list),
         ]
         .padding(20)

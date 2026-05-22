@@ -1,4 +1,5 @@
 mod app;
+mod l10n;
 mod logging;
 mod pairing;
 mod screens;
@@ -40,10 +41,14 @@ fn main() -> iced::Result {
         original_user
     );
 
+    // Detect system locale for translations
+    let locale = l10n::detect_locale();
+    tracing::info!("Using locale: {}", locale);
+
     // Load window icon
     let icon_data = include_bytes!("../assets/icon-256.png");
-    let icon = iced::window::icon::from_file_data(icon_data, None)
-        .expect("Failed to load TapAuth icon");
+    let icon =
+        iced::window::icon::from_file_data(icon_data, None).expect("Failed to load TapAuth icon");
 
     let window_settings = iced::window::Settings {
         icon: Some(icon),
@@ -52,12 +57,13 @@ fn main() -> iced::Result {
 
     // Run the application
     iced::application(
-        "TapAuth Configuration",
+        move || app::TapAuthConfig::new(locale),
         app::TapAuthConfig::update,
         app::TapAuthConfig::view,
     )
+    .title("TapAuth Configuration")
     .theme(app::TapAuthConfig::theme)
     .font(lucide_icons::LUCIDE_FONT_BYTES)
     .window(window_settings)
-    .run_with(app::TapAuthConfig::new)
+    .run()
 }

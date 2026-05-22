@@ -1,8 +1,10 @@
+use crate::l10n::L10n;
 use crate::screens::{Screen, ScreenMessage};
 use iced::{Element, Task, Theme};
 
 /// Main application state
 pub struct TapAuthConfig {
+    l10n: L10n,
     current_screen: Screen,
 }
 
@@ -12,10 +14,12 @@ pub enum Message {
 }
 
 impl TapAuthConfig {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(locale: &str) -> (Self, Task<Message>) {
+        let l10n = L10n::new(locale);
         (
             Self {
-                current_screen: Screen::default(),
+                l10n: l10n.clone(),
+                current_screen: Screen::default_with_l10n(l10n),
             },
             Task::none(),
         )
@@ -24,7 +28,7 @@ impl TapAuthConfig {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ScreenMessage(screen_msg) => {
-                let task = self.current_screen.update(screen_msg);
+                let task = self.current_screen.update(screen_msg, &self.l10n);
                 task.map(Message::ScreenMessage)
             }
         }

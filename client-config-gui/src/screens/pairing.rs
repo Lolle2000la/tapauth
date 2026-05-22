@@ -1,9 +1,10 @@
 use super::ScreenMessage;
+use crate::l10n::L10n;
 use crate::pairing::{complete_pairing, start_pairing, wait_for_pairing_connection};
 use iced::widget::qr_code::Data as QrData;
 use iced::{
     widget::{button, column, container, row, scrollable, text, QRCode, Space},
-    Color, Element, Length, Task,
+    Color, Element, Font, Length, Task,
 };
 use std::rc::Rc;
 
@@ -19,12 +20,14 @@ pub enum PairingState {
 
 #[derive(Debug, Clone)]
 pub struct PairingScreen {
+    pub l10n: L10n,
     state: PairingState,
 }
 
 impl PairingScreen {
-    pub fn new() -> Self {
+    pub fn new(l10n: L10n) -> Self {
         Self {
+            l10n,
             state: PairingState::Loading,
         }
     }
@@ -125,9 +128,9 @@ impl PairingScreen {
 
     fn view_loading(&self) -> Element<'_, ScreenMessage> {
         column![
-            text("Preparing pairing...").size(24),
-            Space::with_height(Length::Fixed(20.0)),
-            text("Please wait").size(16),
+            text(self.l10n.tr("pairing-preparing")).size(24),
+            Space::new().height(Length::Fixed(20.0)),
+            text(self.l10n.tr("label-please-wait")).size(16),
         ]
         .align_x(iced::Alignment::Center)
         .into()
@@ -138,20 +141,20 @@ impl PairingScreen {
         url: &'a str,
         qr_data: &'a Rc<QrData>,
     ) -> Element<'a, ScreenMessage> {
-        let back_button = button(text("Cancel").size(16))
+        let back_button = button(text(self.l10n.tr("btn-cancel")).size(16))
             .padding(10)
             .on_press(ScreenMessage::PairingCancelled);
 
         column![
-            text("Scan this QR code with your phone").size(24),
-            Space::with_height(Length::Fixed(30.0)),
+            text(self.l10n.tr("pairing-scan-qr")).size(24),
+            Space::new().height(Length::Fixed(30.0)),
             container(QRCode::<iced::Theme>::new(qr_data.as_ref()).cell_size(4))
                 .width(Length::Shrink)
                 .height(Length::Shrink),
-            Space::with_height(Length::Fixed(20.0)),
-            text("Or enter manually:").size(14),
+            Space::new().height(Length::Fixed(20.0)),
+            text(self.l10n.tr("pairing-enter-manually")).size(14),
             text(url).size(10),
-            Space::with_height(Length::Fixed(40.0)),
+            Space::new().height(Length::Fixed(40.0)),
             back_button,
         ]
         .width(Length::Fill)
@@ -161,32 +164,32 @@ impl PairingScreen {
 
     fn view_completing(&self) -> Element<'_, ScreenMessage> {
         column![
-            text("Completing pairing...").size(24),
-            Space::with_height(Length::Fixed(20.0)),
-            text("Please wait").size(16),
+            text(self.l10n.tr("pairing-completing")).size(24),
+            Space::new().height(Length::Fixed(20.0)),
+            text(self.l10n.tr("label-please-wait")).size(16),
         ]
         .align_x(iced::Alignment::Center)
         .into()
     }
 
     fn view_sas_verification<'a>(&self, sas: &'a str) -> Element<'a, ScreenMessage> {
-        let confirm_button = button(text("Confirm").size(16))
+        let confirm_button = button(text(self.l10n.tr("btn-confirm")).size(16))
             .padding(10)
             .on_press(ScreenMessage::PairingSASConfirmed);
 
-        let cancel_button = button(text("Cancel").size(16))
+        let cancel_button = button(text(self.l10n.tr("btn-cancel")).size(16))
             .padding(10)
             .on_press(ScreenMessage::PairingCancelled);
 
         column![
-            text("Verify Short Authentication String").size(24),
-            Space::with_height(Length::Fixed(30.0)),
-            text("Ensure this code matches on your device:").size(16),
-            Space::with_height(Length::Fixed(20.0)),
+            text(self.l10n.tr("pairing-verify-sas-title")).size(24),
+            Space::new().height(Length::Fixed(30.0)),
+            text(self.l10n.tr("pairing-sas-ensure-match")).size(16),
+            Space::new().height(Length::Fixed(20.0)),
             text(sas).size(48),
-            Space::with_height(Length::Fixed(40.0)),
+            Space::new().height(Length::Fixed(40.0)),
             confirm_button,
-            Space::with_height(Length::Fixed(10.0)),
+            Space::new().height(Length::Fixed(10.0)),
             cancel_button,
         ]
         .align_x(iced::Alignment::Center)
@@ -194,25 +197,30 @@ impl PairingScreen {
     }
 
     fn view_success<'a>(&self, device_id: &'a str) -> Element<'a, ScreenMessage> {
-        let done_button = button(text("Done").size(16))
+        let done_button = button(text(self.l10n.tr("btn-done")).size(16))
             .padding(10)
             .on_press(ScreenMessage::NavigateToMainMenu);
 
         column![
             row![
                 container(
-                    lucide_icons::iced::icon_check()
+                    text(char::from(lucide_icons::Icon::Check))
+                        .font(Font::with_name("lucide"))
                         .size(48)
                         .color(Color::from_rgb(0.0, 0.7, 0.0)),
                 )
                 .padding(iced::Padding::ZERO.top(8)),
-                Space::with_width(Length::Fixed(15.0)),
-                text("Pairing Successful!").size(32),
+                Space::new().width(Length::Fixed(15.0)),
+                text(self.l10n.tr("pairing-success")).size(32),
             ]
             .align_y(iced::Alignment::Center),
-            Space::with_height(Length::Fixed(20.0)),
-            text(format!("Device ID: {}", device_id)).size(14),
-            Space::with_height(Length::Fixed(40.0)),
+            Space::new().height(Length::Fixed(20.0)),
+            text(
+                self.l10n
+                    .tr_args("pairing-device-id", &[("device_id", device_id)])
+            )
+            .size(14),
+            Space::new().height(Length::Fixed(40.0)),
             done_button,
         ]
         .align_x(iced::Alignment::Center)
@@ -220,25 +228,26 @@ impl PairingScreen {
     }
 
     fn view_error<'a>(&self, message: &'a str) -> Element<'a, ScreenMessage> {
-        let back_button = button(text("Back").size(16))
+        let back_button = button(text(self.l10n.tr("btn-back")).size(16))
             .padding(10)
             .on_press(ScreenMessage::NavigateToMainMenu);
 
         column![
             row![
                 container(
-                    lucide_icons::iced::icon_x()
+                    text(char::from(lucide_icons::Icon::X))
+                        .font(Font::with_name("lucide"))
                         .size(48)
                         .color(Color::from_rgb(0.8, 0.0, 0.0)),
                 )
                 .padding(iced::Padding::ZERO.top(8)),
-                Space::with_width(Length::Fixed(15.0)),
-                text("Pairing Failed").size(32),
+                Space::new().width(Length::Fixed(15.0)),
+                text(self.l10n.tr("pairing-failed")).size(32),
             ]
             .align_y(iced::Alignment::Center),
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             text(message).size(14),
-            Space::with_height(Length::Fixed(40.0)),
+            Space::new().height(Length::Fixed(40.0)),
             back_button,
         ]
         .align_x(iced::Alignment::Center)

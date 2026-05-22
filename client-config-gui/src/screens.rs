@@ -8,6 +8,7 @@ pub use main_menu::MainMenuScreen;
 pub use pairing::PairingScreen;
 pub use settings::SettingsScreen;
 
+use crate::l10n::L10n;
 use iced::{Element, Task};
 
 /// All possible screens in the application
@@ -19,9 +20,9 @@ pub enum Screen {
     Settings(SettingsScreen),
 }
 
-impl Default for Screen {
-    fn default() -> Self {
-        Screen::MainMenu(MainMenuScreen::new())
+impl Screen {
+    pub fn default_with_l10n(l10n: L10n) -> Self {
+        Screen::MainMenu(MainMenuScreen::new(l10n))
     }
 }
 
@@ -72,26 +73,26 @@ pub enum ScreenMessage {
 }
 
 impl Screen {
-    pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
+    pub fn update(&mut self, message: ScreenMessage, l10n: &L10n) -> Task<ScreenMessage> {
         match message {
             // Navigation messages
             ScreenMessage::NavigateToMainMenu => {
-                *self = Screen::MainMenu(MainMenuScreen::new());
+                *self = Screen::MainMenu(MainMenuScreen::new(l10n.clone()));
                 Task::none()
             }
             ScreenMessage::NavigateToPairing => {
-                *self = Screen::Pairing(PairingScreen::new());
+                *self = Screen::Pairing(PairingScreen::new(l10n.clone()));
                 // Automatically trigger pairing when navigating to the screen
                 Task::done(ScreenMessage::PairingStarted)
             }
             ScreenMessage::NavigateToDeviceList => {
                 tracing::debug!("NavigateToDeviceList - creating DeviceListScreen");
-                let (screen, task) = DeviceListScreen::new();
+                let (screen, task) = DeviceListScreen::new(l10n.clone());
                 *self = Screen::DeviceList(screen);
                 task
             }
             ScreenMessage::NavigateToSettings => {
-                *self = Screen::Settings(SettingsScreen::new());
+                *self = Screen::Settings(SettingsScreen::new(l10n.clone()));
                 Task::none()
             }
 

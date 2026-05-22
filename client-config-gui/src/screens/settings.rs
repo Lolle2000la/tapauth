@@ -1,12 +1,14 @@
 use super::ScreenMessage;
+use crate::l10n::L10n;
 use iced::{
     widget::{button, column, container, row, scrollable, text, text_input, Space},
-    Element, Length, Task,
+    Element, Font, Length, Task,
 };
 use shared::config::{ClientConfig, ClientConfigManager, TapAuthConfig, DEFAULT_CONFIG_PATH};
 
 #[derive(Debug, Clone)]
 pub struct SettingsScreen {
+    pub l10n: L10n,
     rotating_csk: bool,
     error: Option<String>,
     success: Option<String>,
@@ -17,12 +19,13 @@ pub struct SettingsScreen {
 }
 
 impl SettingsScreen {
-    pub fn new() -> Self {
+    pub fn new(l10n: L10n) -> Self {
         let config_manager = ClientConfigManager::new();
         let client_config = config_manager.load_config().unwrap_or_default();
         let toml_config = TapAuthConfig::load();
 
         Self {
+            l10n,
             rotating_csk: false,
             error: None,
             success: None,
@@ -47,8 +50,7 @@ impl SettingsScreen {
             ScreenMessage::CSKRotated => {
                 self.rotating_csk = false;
                 self.error = None;
-                self.success =
-                    Some("CSK rotated successfully. All pairings have been cleared.".to_string());
+                self.success = Some(self.l10n.tr("settings-csk-rotated"));
                 Task::none()
             }
             ScreenMessage::CSKRotationFailed(error) => {
@@ -84,7 +86,7 @@ impl SettingsScreen {
             }
             ScreenMessage::ConfigSaved => {
                 self.error = None;
-                self.success = Some("Configuration saved successfully.".to_string());
+                self.success = Some(self.l10n.tr("settings-config-saved"));
                 Task::none()
             }
             ScreenMessage::ConfigSaveFailed(error) => {
@@ -99,9 +101,13 @@ impl SettingsScreen {
     pub fn view(&self) -> Element<'_, ScreenMessage> {
         let back_button = button(
             row![
-                container(lucide_icons::iced::icon_arrow_left().size(16))
-                    .padding(iced::Padding::ZERO.top(2)),
-                text("Back").size(16),
+                container(
+                    text(char::from(lucide_icons::Icon::ArrowLeft))
+                        .font(Font::with_name("lucide"))
+                        .size(16)
+                )
+                .padding(iced::Padding::ZERO.top(2)),
+                text(self.l10n.tr("btn-back")).size(16),
             ]
             .align_y(iced::Alignment::Center)
             .spacing(5),
@@ -109,48 +115,55 @@ impl SettingsScreen {
         .padding(10)
         .on_press(ScreenMessage::NavigateToMainMenu);
 
-        let title = text("Settings").size(32);
+        let title = text(self.l10n.tr("title-settings")).size(32);
 
-        let config_title = text("Configuration").size(24);
+        let config_title = text(self.l10n.tr("settings-config-section")).size(24);
 
-        let hostname_label = text("Hostname:").size(16);
-        let hostname_input = text_input("Enter hostname", &self.hostname_input)
-            .on_input(ScreenMessage::HostnameChanged)
-            .padding(10)
-            .width(Length::Fixed(400.0));
+        let hostname_label = text(self.l10n.tr("settings-hostname-label")).size(16);
+        let hostname_input = text_input(
+            &self.l10n.tr("settings-hostname-placeholder"),
+            &self.hostname_input,
+        )
+        .on_input(ScreenMessage::HostnameChanged)
+        .padding(10)
+        .width(Length::Fixed(400.0));
 
-        let udp_port_label = text("UDP Port:").size(16);
-        let udp_port_input = text_input("Enter UDP port (default: 36692)", &self.udp_port_input)
-            .on_input(ScreenMessage::UdpPortChanged)
-            .padding(10)
-            .width(Length::Fixed(400.0));
+        let udp_port_label = text(self.l10n.tr("settings-udp-port-label")).size(16);
+        let udp_port_input = text_input(
+            &self.l10n.tr("settings-udp-port-placeholder"),
+            &self.udp_port_input,
+        )
+        .on_input(ScreenMessage::UdpPortChanged)
+        .padding(10)
+        .width(Length::Fixed(400.0));
 
-        let save_button = button(text("Save Configuration").size(16))
+        let save_button = button(text(self.l10n.tr("btn-save-config")).size(16))
             .padding(15)
             .width(Length::Fixed(400.0))
             .on_press(ScreenMessage::SaveConfig);
 
-        let security_title = text("Security").size(24);
+        let security_title = text(self.l10n.tr("settings-security-section")).size(24);
 
         let rotate_button = if self.rotating_csk {
-            button(text("Rotating...").size(16))
+            button(text(self.l10n.tr("label-rotating")).size(16))
                 .padding(15)
                 .width(Length::Fixed(400.0))
         } else {
-            button(text("Rotate Client Symmetric Key").size(16))
+            button(text(self.l10n.tr("btn-rotate-csk")).size(16))
                 .padding(15)
                 .width(Length::Fixed(400.0))
                 .on_press(ScreenMessage::RotateCSK)
         };
 
-        let warning = text(
-            "Warning: Rotating CSK will invalidate all paired devices.\nYou will need to re-pair them.",
-        )
-        .size(12);
+        let warning = text(self.l10n.tr("settings-csk-warning")).size(12);
 
         // Status messages
         let status_text = if let Some(ref error) = self.error {
-            text(format!("Error: {}", error)).size(14)
+            text(
+                self.l10n
+                    .tr_args("settings-error-prefix", &[("message", error)]),
+            )
+            .size(14)
         } else if let Some(ref success) = self.success {
             text(success).size(14)
         } else {
@@ -159,21 +172,21 @@ impl SettingsScreen {
 
         let scrollable_content = column![
             config_title,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             hostname_label,
             hostname_input,
-            Space::with_height(Length::Fixed(15.0)),
+            Space::new().height(Length::Fixed(15.0)),
             udp_port_label,
             udp_port_input,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             save_button,
-            Space::with_height(Length::Fixed(40.0)),
+            Space::new().height(Length::Fixed(40.0)),
             security_title,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             rotate_button,
-            Space::with_height(Length::Fixed(10.0)),
+            Space::new().height(Length::Fixed(10.0)),
             warning,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             status_text,
         ]
         .spacing(10)
@@ -182,9 +195,9 @@ impl SettingsScreen {
 
         let content = column![
             back_button,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             title,
-            Space::with_height(Length::Fixed(20.0)),
+            Space::new().height(Length::Fixed(20.0)),
             scrollable(scrollable_content),
         ]
         .padding(20)

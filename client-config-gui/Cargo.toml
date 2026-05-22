@@ -10,8 +10,14 @@ path = "src/main.rs"
 [dependencies]
 shared = { workspace = true, features = ["firewall"] }
 
-# GUI framework
-iced = { version = "0.13", features = ["tokio", "qr_code", "image"] }
+iced = { version = "0.14", features = [
+    "advanced-shaping",
+    "wgpu",
+    "canvas",
+    "tokio",
+    "qr_code",
+    "image",
+] } # GUI framework
 
 # QR code generation
 qrcode = "0.14"
@@ -32,7 +38,7 @@ local-ip-address = "0.6"
 lazy_static = "1.5"
 whoami = "1.5"
 native-dialog = "0.9"
-lucide-icons = { version = "1.16", features = ["iced"] }
+lucide-icons = "1.16"
 
 [features]
 default = []

@@ -1,14 +1,19 @@
 use super::ScreenMessage;
+use crate::l10n::L10n;
 use iced::{
     widget::{button, column, container, text, Space},
     Element, Length, Task,
 };
 
 #[cfg(feature = "tpm")]
+use iced::Font;
+
+#[cfg(feature = "tpm")]
 use shared::config::ClientConfigManager;
 
 #[derive(Debug, Clone)]
 pub struct MainMenuScreen {
+    pub l10n: L10n,
     #[cfg(feature = "tpm")]
     tpm_error: Option<String>,
     #[cfg(feature = "tpm")]
@@ -17,7 +22,7 @@ pub struct MainMenuScreen {
 
 impl MainMenuScreen {
     #[cfg(feature = "tpm")]
-    pub fn new() -> Self {
+    pub fn new(l10n: L10n) -> Self {
         // Check for TPM errors by trying to load keypair
         let config_manager = ClientConfigManager::new();
         let tpm_error = match config_manager.load_keypair() {
@@ -26,14 +31,15 @@ impl MainMenuScreen {
         };
 
         Self {
+            l10n,
             tpm_error,
             recovery_status: None,
         }
     }
 
     #[cfg(not(feature = "tpm"))]
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(l10n: L10n) -> Self {
+        Self { l10n }
     }
 
     pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
@@ -43,7 +49,7 @@ impl MainMenuScreen {
             ScreenMessage::OpenSettings => Task::done(ScreenMessage::NavigateToSettings),
             #[cfg(feature = "tpm")]
             ScreenMessage::RecoverFromTPMFailure => {
-                self.recovery_status = Some("Recovering...".to_string());
+                self.recovery_status = Some(self.l10n.tr("label-recovering"));
                 Task::perform(Self::perform_tpm_recovery(), |result| match result {
                     Ok(_) => ScreenMessage::TPMRecoveryComplete,
                     Err(e) => ScreenMessage::TPMRecoveryFailed(e),
@@ -52,15 +58,15 @@ impl MainMenuScreen {
             #[cfg(feature = "tpm")]
             ScreenMessage::TPMRecoveryComplete => {
                 self.tpm_error = None;
-                self.recovery_status = Some(
-                    "Recovery successful! Please restart the daemon and re-pair devices."
-                        .to_string(),
-                );
+                self.recovery_status = Some(self.l10n.tr("label-recovery-success"));
                 Task::none()
             }
             #[cfg(feature = "tpm")]
             ScreenMessage::TPMRecoveryFailed(error) => {
-                self.recovery_status = Some(format!("Recovery failed: {}", error));
+                self.recovery_status = Some(
+                    self.l10n
+                        .tr_args("label-recovery-failed", &[("error", &error)]),
+                );
                 Task::none()
             }
             _ => Task::none(),
@@ -76,25 +82,29 @@ impl MainMenuScreen {
     }
 
     pub fn view(&self) -> Element<'_, ScreenMessage> {
-        let title = text("TapAuth Configuration")
+        let title = text(self.l10n.tr("title-main-menu"))
             .size(40)
             .width(Length::Fill)
             .center();
 
         // TPM error warning if present
-        let mut content_widgets =
-            vec![Space::with_height(Length::Fixed(50.0)).into(), title.into()];
+        let mut content_widgets = vec![
+            Space::new().height(Length::Fixed(50.0)).into(),
+            title.into(),
+        ];
 
         #[cfg(feature = "tpm")]
         if let Some(ref error) = self.tpm_error {
+            let error_display = self.l10n.tr_args("label-tpm-error", &[("error", error)]);
             let error_text = iced::widget::row![
                 container(
-                    lucide_icons::iced::icon_alert_triangle()
+                    text(char::from(lucide_icons::Icon::AlertTriangle))
+                        .font(Font::with_name("lucide"))
                         .size(18)
                         .color(iced::Color::from_rgb(0.9, 0.2, 0.2)),
                 )
                 .padding(iced::Padding::ZERO.top(3)),
-                text(format!(" {}", error))
+                text(error_display)
                     .size(16)
                     .style(|_theme| iced::widget::text::Style {
                         color: Some(iced::Color::from_rgb(0.9, 0.2, 0.2)),
@@ -105,7 +115,7 @@ impl MainMenuScreen {
             .spacing(5);
 
             let recover_button = button(
-                text("Recover Keys (Will Clear Pairings)")
+                text(self.l10n.tr("btn-recover-keys"))
                     .size(18)
                     .center()
                     .width(Length::Fill),
@@ -114,16 +124,16 @@ impl MainMenuScreen {
             .width(Length::Fixed(300.0))
             .on_press(ScreenMessage::RecoverFromTPMFailure);
 
-            content_widgets.push(Space::with_height(Length::Fixed(30.0)).into());
+            content_widgets.push(Space::new().height(Length::Fixed(30.0)).into());
             content_widgets.push(error_text.into());
-            content_widgets.push(Space::with_height(Length::Fixed(15.0)).into());
+            content_widgets.push(Space::new().height(Length::Fixed(15.0)).into());
             content_widgets.push(recover_button.into());
         }
 
         #[cfg(feature = "tpm")]
         if let Some(ref status) = self.recovery_status {
             let status_text = text(status).size(14).width(Length::Fixed(500.0));
-            content_widgets.push(Space::with_height(Length::Fixed(15.0)).into());
+            content_widgets.push(Space::new().height(Length::Fixed(15.0)).into());
             content_widgets.push(status_text.into());
         }
 
@@ -133,11 +143,13 @@ impl MainMenuScreen {
         let tpm_error_present = false;
 
         content_widgets.push(
-            Space::with_height(Length::Fixed(if tpm_error_present { 40.0 } else { 80.0 })).into(),
+            Space::new()
+                .height(Length::Fixed(if tpm_error_present { 40.0 } else { 80.0 }))
+                .into(),
         );
 
         let pair_button = button(
-            text("Pair New Device")
+            text(self.l10n.tr("btn-pair-new-device"))
                 .size(20)
                 .center()
                 .width(Length::Fill),
@@ -146,20 +158,30 @@ impl MainMenuScreen {
         .width(Length::Fixed(300.0))
         .on_press(ScreenMessage::StartPairing);
 
-        let devices_button = button(text("Manage Devices").size(20).center().width(Length::Fill))
-            .padding(20)
-            .width(Length::Fixed(300.0))
-            .on_press(ScreenMessage::ViewDevices);
+        let devices_button = button(
+            text(self.l10n.tr("btn-manage-devices"))
+                .size(20)
+                .center()
+                .width(Length::Fill),
+        )
+        .padding(20)
+        .width(Length::Fixed(300.0))
+        .on_press(ScreenMessage::ViewDevices);
 
-        let settings_button = button(text("Settings").size(20).center().width(Length::Fill))
-            .padding(20)
-            .width(Length::Fixed(300.0))
-            .on_press(ScreenMessage::OpenSettings);
+        let settings_button = button(
+            text(self.l10n.tr("btn-settings"))
+                .size(20)
+                .center()
+                .width(Length::Fill),
+        )
+        .padding(20)
+        .width(Length::Fixed(300.0))
+        .on_press(ScreenMessage::OpenSettings);
 
         content_widgets.push(pair_button.into());
-        content_widgets.push(Space::with_height(Length::Fixed(20.0)).into());
+        content_widgets.push(Space::new().height(Length::Fixed(20.0)).into());
         content_widgets.push(devices_button.into());
-        content_widgets.push(Space::with_height(Length::Fixed(20.0)).into());
+        content_widgets.push(Space::new().height(Length::Fixed(20.0)).into());
         content_widgets.push(settings_button.into());
 
         let content = column(content_widgets)
