@@ -18,6 +18,8 @@ iced = { version = "0.14", features = [
     "qr_code",
     "image",
 ] } # GUI framework
+fluent = "0.17"
+unic-langid = "0.9"
 
 # QR code generation
 qrcode = "0.14"

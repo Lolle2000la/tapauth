@@ -1,8 +1,18 @@
-use std::collections::HashMap;
+use fluent::{FluentArgs, FluentBundle, FluentResource};
+use std::fmt;
+use std::sync::Arc;
+use unic_langid::LanguageIdentifier;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct L10n {
-    messages: HashMap<String, String>,
+    bundle: Arc<FluentBundle<Arc<FluentResource>>>,
+}
+
+// Manual implementation to allow Screen structs to derive Debug seamlessly
+impl fmt::Debug for L10n {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("L10n").finish_non_exhaustive()
+    }
 }
 
 impl L10n {
@@ -13,52 +23,56 @@ impl L10n {
             _ => include_str!("../locales/en/main.ftl"),
         };
 
-        let mut messages = HashMap::new();
-        let mut current_key: Option<String> = None;
+        let res = FluentResource::try_new(ftl_str.to_string())
+            .expect("Failed to parse static FTL string.");
 
-        for line in ftl_str.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
+        let lang_id: LanguageIdentifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+        let mut bundle = FluentBundle::new(vec![lang_id]);
 
-            if let Some(eq_pos) = line.find('=') {
-                let key = line[..eq_pos].trim().to_string();
-                let value = line[eq_pos + 1..].trim().to_string().replace("\\n", "\n");
-                messages.insert(key.clone(), value);
-                current_key = Some(key);
-            } else if line.starts_with(' ') || line.starts_with('\t') {
-                if let Some(ref key) = current_key {
-                    if let Some(msg) = messages.get_mut(key) {
-                        msg.push('\n');
-                        msg.push_str(&trimmed.replace("\\n", "\n"));
-                    }
-                }
-            }
+        bundle
+            .add_resource(Arc::new(res))
+            .expect("Failed to add FTL resource to bundle.");
+
+        // Disables Unicode isolation marks (prevents rendering unexpected control characters in simple UIs)
+        bundle.set_use_isolating(false);
+
+        Self {
+            bundle: Arc::new(bundle),
         }
-
-        Self { messages }
     }
 
     pub fn tr(&self, key: &str) -> String {
-        self.messages
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| format!("??{}??", key))
+        if let Some(msg) = self.bundle.get_message(key) {
+            if let Some(pattern) = msg.value() {
+                let mut errors = vec![];
+                let value = self.bundle.format_pattern(pattern, None, &mut errors);
+                return value.to_string();
+            }
+        }
+        format!("??{}??", key)
     }
 
     pub fn tr_args(&self, key: &str, args: &[(&str, &str)]) -> String {
-        let mut result = self.tr(key);
-        for (name, value) in args {
-            result = result.replace(&format!("{{${}}}", name), value);
+        if let Some(msg) = self.bundle.get_message(key) {
+            if let Some(pattern) = msg.value() {
+                let mut fluent_args = FluentArgs::new();
+                for (k, v) in args {
+                    fluent_args.set(*k, *v);
+                }
+                let mut errors = vec![];
+                let value = self
+                    .bundle
+                    .format_pattern(pattern, Some(&fluent_args), &mut errors);
+                return value.to_string();
+            }
         }
-        result
+        format!("??{}??", key)
     }
 }
 
-/// Detect system locale from environment variables (LANG, LC_ALL)
+/// Detect system locale respecting POSIX priority rules (LC_ALL > LC_MESSAGES > LANG)
 pub fn detect_locale() -> &'static str {
-    for var in &["LANG", "LC_ALL", "LC_MESSAGES"] {
+    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(val) = std::env::var(var) {
             let val_lower = val.to_lowercase();
             if val_lower.starts_with("de") {
