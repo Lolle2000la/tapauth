@@ -65,10 +65,16 @@ jobs:
       - name: Build shared library (with jni feature)
         run: cargo build --manifest-path shared/Cargo.toml --features jni --verbose
 
-      - name: Build client PAM module (with BLE)
-        run: cargo build --manifest-path client-pam/Cargo.toml --features ble --verbose
+      - name: "Build tapauthd (default: BLE + firewall)"
+        run: cargo build --manifest-path tapauthd/Cargo.toml --verbose
 
-      - name: Build client PAM module (without BLE)
+      - name: "Build tapauthd (no BLE, firewall only)"
+        run: cargo build --manifest-path tapauthd/Cargo.toml --no-default-features --features firewall --verbose
+
+      - name: "Build client PAM module"
+        run: cargo build --manifest-path client-pam/Cargo.toml --verbose
+
+      - name: "Build client PAM module (no features)"
         run: cargo build --manifest-path client-pam/Cargo.toml --no-default-features --verbose
 
       - name: Build client config GUI
@@ -84,7 +90,7 @@ jobs:
         run: cargo test --manifest-path shared/Cargo.toml --features jni --verbose
 
       - name: Run tests for client PAM module
-        run: cargo test --manifest-path client-pam/Cargo.toml --features ble --verbose
+        run: cargo test --manifest-path client-pam/Cargo.toml --verbose
 
       - name: Run tests for client config GUI
         run: cargo test --manifest-path client-config-gui/Cargo.toml --verbose
@@ -96,7 +102,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   build-android:
     name: Build Android Native Libraries and APK
