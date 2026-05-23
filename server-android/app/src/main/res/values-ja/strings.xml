@@ -1,0 +1,117 @@
+<resources>
+    <string name="app_name">TapAuth</string>
+
+    <!-- General / Shared -->
+    <string name="general_back">戻る</string>
+    <string name="general_cancel">キャンセル</string>
+    <string name="general_done">完了</string>
+    <string name="general_remove">削除</string>
+    <string name="general_please_wait">お待ちください</string>
+    <string name="general_retry">再試行</string>
+    <string name="general_success">成功</string>
+    <string name="general_error">エラー</string>
+    <string name="general_warning">警告</string>
+
+    <!-- Pairing Screen -->
+    <string name="pairing_title">デバイスペアリング</string>
+    <string name="pairing_connecting">デバイスに接続中…</string>
+    <string name="pairing_verify_sas_title">セキュリティコードを確認</string>
+    <string name="pairing_compare_code">このコードをコンピューターに表示されているコードと比較してください：</string>
+    <string name="pairing_codes_match">コードは一致していますか？</string>
+    <string name="pairing_no_cancel">いいえ、キャンセル</string>
+    <string name="pairing_yes_pair">はい、ペアリング</string>
+    <string name="pairing_finalizing">ペアリングを完了中…</string>
+    <string name="pairing_success">ペアリング成功！</string>
+    <string name="pairing_success_message">デバイスがペアリングされ、認証の準備ができました</string>
+    <string name="pairing_failed">ペアリング失敗</string>
+    <string name="pairing_user_cancelled">ユーザーがキャンセルしました</string>
+    <string name="pairing_no_ip">IPアドレスが利用できません</string>
+    <string name="pairing_cancelled_message">ペアリングがキャンセルされました</string>
+
+    <!-- QR Scanner Screen -->
+    <string name="scanner_title">QRコードをスキャン</string>
+    <string name="scanner_initializing">カメラを初期化中…</string>
+    <string name="scanner_permission_required">QRコードをスキャンするにはカメラの許可が必要です</string>
+    <string name="scanner_grant_permission">許可を与える</string>
+    <string name="scanner_camera_starting">カメラ起動中…</string>
+    <string name="scanner_camera_failed">カメラの初期化に失敗しました：</string>
+    <string name="scanner_scanning">QRコードをスキャン中…</string>
+    <string name="scanner_detected">QRコードを検出しました！解析中…</string>
+    <string name="scanner_valid_url">有効なペアリングURL！接続中…</string>
+    <string name="scanner_invalid_format">無効なQRコード形式です。tapauth:// URL が必要です</string>
+    <string name="scanner_camera_ready">カメラ準備完了 – QRコードにかざしてください</string>
+    <string name="scanner_status_prefix">ステータス: %s</string>
+    <string name="scanner_last_detected">最後に検出: %s…</string>
+
+    <!-- Home Screen -->
+    <string name="home_title">TapAuth</string>
+    <string name="home_udp_service">UDPサービス</string>
+    <string name="home_port_display">ポート %1$d</string>
+    <string name="home_ble_server">BLE GATTサーバー</string>
+    <string name="home_ble_advertising">アドバタイズ中</string>
+    <string name="home_pair_new_device">新しいデバイスをペアリング</string>
+    <string name="home_paired_devices">ペアリング済みデバイス</string>
+    <string name="home_settings">設定</string>
+    <string name="home_tagline">TapAuth を使うと、スマートフォンをタップするだけでコンピューターに認証できます</string>
+
+    <!-- Device List Screen -->
+    <string name="devices_title">ペアリング済みデバイス</string>
+    <string name="devices_empty">ペアリング済みデバイスがありません</string>
+    <string name="devices_empty_message">コンピューターからQRコードをスキャンしてデバイスをペアリングしてください</string>
+    <string name="devices_id_prefix">ID: %1$s…%2$s</string>
+    <string name="devices_allowed_users">許可ユーザー: %s</string>
+    <string name="devices_remove_entire_pairing_title">ペアリング全体を削除しますか？</string>
+    <string name="devices_remove_device_title">デバイスを削除しますか？</string>
+    <string name="devices_remove_user_title">ユーザーを削除しますか？</string>
+    <string name="devices_remove_last_user_message">ユーザー「%1$s」を「%2$s」から削除しますか？\n\nこれが最後のユーザーであるため、ペアリング全体が削除されます。</string>
+    <string name="devices_remove_user_message">ユーザー「%1$s」を「%2$s」から削除しますか？\n\n他のユーザー（%3$s）は引き続き認証できます。</string>
+    <string name="devices_remove_all">すべて削除</string>
+    <string name="devices_warning_multi_user">警告：このペアリングは %d 人のユーザーによって使用されています！</string>
+    <string name="devices_users_label">ユーザー: %s</string>
+    <string name="devices_remove_confirm_message">「%1$s」を本当に削除しますか？%2$sはこのデバイスで再度ペアリングする必要があります。</string>
+    <string name="devices_remove_individual_user">個別ユーザーを削除：</string>
+    <string name="devices_paired_date">ペアリング日: %1$s</string>
+    <string name="devices_remove_device_cd">デバイスを削除</string>
+    <string name="devices_manage_users_cd">ユーザーを管理</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">設定</string>
+    <string name="settings_about_encryption">暗号化について</string>
+    <string name="settings_csk_label">クライアント対称鍵（CSK）</string>
+    <string name="settings_csk_description">ペアリングされた各デスクトップクライアントは独自のCSKを生成し、ペアリング時に共有します。この鍵はすべての認証通信の暗号化に使用されます。CSKはこのアプリではなく、デスクトップクライアントによって管理されます。</string>
+    <string name="settings_security_note">セキュリティ注意事項</string>
+    <string name="settings_security_note_description">デスクトップクライアントがCSKをローテーションした場合、そのデバイスと再ペアリングする必要があります。各ペアリングデバイスは独自の暗号化鍵を保持します。</string>
+    <string name="settings_about">バージョン情報</string>
+    <string name="settings_background">バックグラウンド</string>
+    <string name="settings_network_config">ネットワーク設定</string>
+    <string name="settings_udp_port_label">UDPポート</string>
+    <string name="settings_udp_port_default">デフォルト: 36692（実行中の場合はサービスの再起動が必要）</string>
+    <string name="settings_port_must_be_number">数値である必要があります</string>
+    <string name="settings_port_min">ポートは 1024 以上である必要があります</string>
+    <string name="settings_port_max">ポートは 65535 以下である必要があります</string>
+    <string name="settings_allow_background">バックグラウンド動作を許可 / バッテリー最適化</string>
+    <string name="settings_udp_service">UDPサービス</string>
+    <string name="settings_udp_listener_desc">認証リクエスト用のUDPリスナー</string>
+    <string name="settings_ble_server">BLE GATTサーバー</string>
+    <string name="settings_ble_desc">BLEアドバタイズとGATTサーバー</string>
+    <string name="settings_failed_start_udp">UDPサービスの%1$sに失敗しました：%2$s</string>
+    <string name="settings_failed_start_ble">BLEサービスの%1$sに失敗しました：%2$s</string>
+    <string name="settings_location_required_title">⚠️ バックグラウンド位置情報の許可が必要です</string>
+    <string name="settings_location_required_description">BLEスキャンがバックグラウンドで動作するには、バックグラウンド位置情報の許可が必要です。</string>
+    <string name="settings_location_steps_title">許可を与える手順：</string>
+    <string name="settings_location_steps">1. 下の「設定を開く」をタップ\n2.「権限」をタップ\n3.「位置情報」をタップ\n4.「常に許可」を選択</string>
+    <string name="settings_open_settings">設定を開く</string>
+    <string name="settings_service_status">サービス状態：</string>
+    <string name="settings_udp_last_started">UDPリスナー最終起動: %1$s</string>
+    <string name="settings_ble_last_started">BLE GATT最終起動: %1$s</string>
+    <string name="settings_open_system_settings">設定を開く</string>
+    <string name="settings_allow_background_dialog_title">バックグラウンド動作を許可しますか？</string>
+    <string name="settings_allow_background_dialog_message">アプリが閉じているときにもTapAuthが認証リクエストに応答できるようにするには、アプリをバッテリー最適化の対象から除外してください。システム設定画面に移動します。</string>
+    <string name="settings_footer">TapAuth – 安全な生体認証</string>
+    <string name="settings_app_version">アプリバージョン</string>
+    <string name="settings_protocol_version">プロトコルバージョン</string>
+    <string name="settings_encryption">暗号化</string>
+    <string name="settings_key_exchange">鍵交換</string>
+    <string name="settings_signing">署名</string>
+    <string name="settings_never">なし</string>
+</resources>

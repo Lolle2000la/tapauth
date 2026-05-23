@@ -1,0 +1,430 @@
+# TapAuth Development Environment
+# This container provides a complete development and testing environment for the TapAuth client
+
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Build tools
+    build-essential \
+    pkg-config \
+    cmake \
+    git \
+    curl \
+    wget \
+    # Rust dependencies
+    libssl-dev \
+    # Protocol Buffers compiler (required for build.rs)
+    protobuf-compiler \
+    # PAM development
+    libpam0g-dev \
+    pamtester \
+    # TPM development libraries (for optional TPM feature)
+    # Note: TPM support is optional, but we include libs for complete build
+    libtss2-dev \
+    # GUI dependencies (iced + X11)
+    libx11-dev \
+    libx11-xcb1 \
+    libx11-xcb-dev \
+    libxcb1-dev \
+    libxcb-render0-dev \
+    libxcb-shape0-dev \
+    libxcb-xfixes0-dev \
+    libxkbcommon-dev \
+    libxkbcommon-x11-0 \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    libexpat1-dev \
+    # X11 Input extension (for mouse/keyboard input)
+    libxi6 \
+    libxi-dev \
+    # X11 Randr extension (for display configuration)
+    libxrandr2 \
+    libxrandr-dev \
+    # X11 Cursor library
+    libxcursor1 \
+    libxcursor-dev \
+    # X11 Render extension
+    libxrender1 \
+    libxrender-dev \
+    # X11 Inenable extension
+    libxinerama1 \
+    libxinerama-dev \
+    # Mesa/DRI for software rendering (required for wgpu without GPU)
+    mesa-vulkan-drivers \
+    mesa-utils \
+    libgl1-mesa-dri \
+    libgl1 \
+    libglx-mesa0 \
+    libegl-mesa0 \
+    libgbm1 \
+    libdrm2 \
+    # X11 shared memory extension
+    libxext6 \
+    # Bluetooth
+    bluez \
+    bluez-tools \
+    libbluetooth-dev \
+    libdbus-1-dev \
+    rfkill \
+    linux-firmware \
+  # Network tools
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    tcpdump \
+    # Development tools
+    vim \
+    nano \
+    htop \
+    strace \
+    gdb \
+    valgrind \
+    # QR code generation (for GUI testing)
+    qrencode \
+    # X11 utilities
+    x11-apps \
+    xauth \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Rust components
+RUN rustup component add clippy rustfmt
+
+# Set up D-Bus and Bluetooth services
+RUN mkdir -p /var/run/dbus && \
+    mkdir -p /var/lib/bluetooth && \
+    mkdir -p /etc/bluetooth
+
+# Configure Bluetooth to run in container
+RUN echo '[General]\n\
+Name = TapAuth-Dev\n\
+Class = 0x000100\n\
+DiscoverableTimeout = 0\n\
+PairableTimeout = 0\n\
+' > /etc/bluetooth/main.conf
+
+# Set up working directory
+WORKDIR /tapauth
+
+# Create directories for compiled artifacts
+RUN mkdir -p /etc/tapauth /lib/security /usr/local/bin
+
+# Copy the entire project
+COPY . /tapauth/
+
+# Set environment variables for X11 and runtime
+ENV DISPLAY=:0
+ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+
+# Disable X11 MIT-SHM extension to avoid shared memory issues in containers
+ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV GALLIUM_DRIVER=llvmpipe
+ENV __GLX_VENDOR_LIBRARY_NAME=mesa
+
+# Disable MIT-SHM to prevent "Failed to attach to x11 shm" errors
+ENV QT_X11_NO_MITSHM=1
+ENV _JAVA_AWT_WM_NONREPARENTING=1
+
+# Force OpenGL backend for wgpu (better XWayland compatibility)
+ENV WGPU_BACKEND=gl
+
+# Create helper scripts for common tasks
+
+# Create a script to build all components
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "Building TapAuth components..."\n\
+\n\
+echo "==> Building shared library..."\n\
+cd /tapauth/shared && cargo build --release\n\
+\n\
+echo "==> Building PAM module with BLE..."\n\
+cd /tapauth/client-pam && cargo build --release --features ble\n\
+\n\
+echo "==> Building GUI..."\n\
+cd /tapauth/client-config-gui && cargo build --release\n\
+\n\
+echo "==> Installing PAM module..."\n\
+cp /tapauth/target/release/libclient_pam.so /lib/security/pam_tapauth.so\n\
+\n\
+echo "==> Installing GUI..."\n\
+cp /tapauth/target/release/tapauth-config /usr/local/bin/\n\
+\n\
+echo "Build complete!"\n\
+' > /usr/local/bin/build-tapauth && chmod +x /usr/local/bin/build-tapauth
+
+# Create a script to run tests
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "Running TapAuth tests..."\n\
+\n\
+echo "==> Unit tests - shared library..."\n\
+cd /tapauth/shared && cargo test --release\n\
+\n\
+echo "==> Unit tests - PAM module..."\n\
+cd /tapauth/client-pam && cargo test --release --features ble\n\
+\n\
+echo "Tests complete!"\n\
+' > /usr/local/bin/test-tapauth && chmod +x /usr/local/bin/test-tapauth
+
+# Create a script to test PAM authentication
+RUN echo '#!/bin/bash\n\
+\n\
+# Test PAM authentication with pamtester\n\
+# Usage: test-pam-auth [username]\n\
+\n\
+USERNAME="${1:-root}"\n\
+\n\
+echo "Testing PAM authentication for user: $USERNAME"\n\
+echo "This will test the tapauth PAM module"\n\
+echo ""\n\
+\n\
+# Check if PAM module is installed\n\
+if [ ! -f /lib/security/pam_tapauth.so ]; then\n\
+    echo "ERROR: PAM module not installed at /lib/security/pam_tapauth.so"\n\
+    echo "Run: build-tapauth"\n\
+    exit 1\n\
+fi\n\
+\n\
+# Check if PAM configuration exists\n\
+if [ ! -f /etc/pam.d/tapauth-test ]; then\n\
+    echo "Creating test PAM configuration..."\n\
+    cat > /etc/pam.d/tapauth-test << EOF\n\
+auth sufficient pam_tapauth.so\n\
+auth required pam_permit.so\n\
+account required pam_permit.so\n\
+EOF\n\
+fi\n\
+\n\
+echo "Starting PAM test..."\n\
+echo "You should see BLE advertisement and UDP broadcasts in logs"\n\
+echo "Use your paired Android device to authenticate"\n\
+echo ""\n\
+\n\
+# Run pamtester with verbose output\n\
+pamtester -v tapauth-test "$USERNAME" authenticate\n\
+\n\
+echo ""\n\
+echo "PAM test completed"\n\
+' > /usr/local/bin/test-pam-auth && chmod +x /usr/local/bin/test-pam-auth
+
+# Create a script to run the GUI
+RUN echo '#!/bin/bash\n\
+\n\
+# Run TapAuth configuration GUI\n\
+# Requires X11 forwarding to be set up\n\
+\n\
+echo "Starting TapAuth GUI..."\n\
+echo "Make sure X11 forwarding is enabled:"\n\
+echo "  - On host: xhost +local:docker"\n\
+echo "  - Docker run with: -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix"\n\
+echo ""\n\
+\n\
+# Check if GUI binary exists\n\
+if [ ! -f /usr/local/bin/tapauth-config ]; then\n\
+    echo "ERROR: GUI not installed at /usr/local/bin/tapauth-config"\n\
+    echo "Run: build-tapauth"\n\
+    exit 1\n\
+fi\n\
+\n\
+# Create /etc/tapauth directory if it doesn'\''t exist\n\
+mkdir -p /etc/tapauth\n\
+\n\
+# Run the GUI\n\
+tapauth-config\n\
+' > /usr/local/bin/run-gui && chmod +x /usr/local/bin/run-gui
+
+# Create a script to show Bluetooth status
+RUN echo '#!/bin/bash\n\
+\n\
+echo "=== Bluetooth Status ==="\n\
+echo ""\n\
+\n\
+# Check if bluetooth daemon is running\n\
+if pgrep -x bluetoothd > /dev/null; then\n\
+    echo "✅ Bluetooth daemon: RUNNING"\n\
+else\n\
+    echo "❌ Bluetooth daemon: NOT RUNNING"\n\
+    echo "   The container should auto-start it"\n\
+fi\n\
+\n\
+# Check D-Bus\n\
+if pgrep -x dbus-daemon > /dev/null; then\n\
+    echo "✅ D-Bus: RUNNING"\n\
+else\n\
+    echo "❌ D-Bus: NOT RUNNING"\n\
+fi\n\
+\n\
+echo ""\n\
+echo "=== Bluetooth Adapters ==="\n\
+hciconfig -a 2>/dev/null || echo "⚠️  No adapters found. Make sure host Bluetooth is disabled and container has access."\n\
+\n\
+echo ""\n\
+echo "=== Bluetooth Controller Info ==="\n\
+bluetoothctl show 2>/dev/null || echo "Cannot query Bluetooth controller"\n\
+\n\
+echo ""\n\
+echo "=== Paired Devices ==="\n\
+bluetoothctl devices 2>/dev/null || echo "Cannot list devices"\n\
+\n\
+echo ""\n\
+echo "=== D-Bus Bluetooth Service ==="\n\
+if dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null | grep -q "interface"; then\n\
+    echo "✅ Bluetooth service accessible via D-Bus"\n\
+else\n\
+    echo "❌ Cannot connect to Bluetooth via D-Bus"\n\
+fi\n\
+' > /usr/local/bin/bluetooth-status && chmod +x /usr/local/bin/bluetooth-status
+
+# Create a helpful motd
+RUN echo '#!/bin/bash\n\
+cat << EOF\n\
+\n\
+╔═══════════════════════════════════════════════════════════════╗\n\
+║                                                               ║\n\
+║         TapAuth Development Environment                       ║\n\
+║         Ready for Testing and Development                     ║\n\
+║                                                               ║\n\
+╚═══════════════════════════════════════════════════════════════╝\n\
+\n\
+Available Commands:\n\
+  build-tapauth      - Build all TapAuth components\n\
+  test-tapauth       - Run unit tests\n\
+  test-pam-auth      - Test PAM authentication with pamtester\n\
+  run-gui            - Launch the TapAuth configuration GUI\n\
+  bluetooth-status   - Show Bluetooth adapter status\n\
+\n\
+Quick Start:\n\
+  1. Build everything:     build-tapauth\n\
+  2. Pair a device:        run-gui\n\
+  3. Test authentication:  test-pam-auth root\n\
+\n\
+Configuration:\n\
+  PAM module:     /lib/security/pam_tapauth.so\n\
+  GUI binary:     /usr/local/bin/tapauth-config\n\
+  Config dir:     /etc/tapauth/\n\
+  Source code:    /tapauth/\n\
+\n\
+Network:\n\
+  UDP Port:       36692 (default)\n\
+  IPv6 Multicast: ff02::1 (all nodes on local segment)\n\
+\n\
+Bluetooth:\n\
+  Service UUID:   b4ad84c0-2adb-4876-8315-b39d983b2bde\n\
+  Check status:   bluetooth-status\n\
+  Note:           Running in-container D-Bus and Bluetooth services\n\
+  Adapter:        Requires host Bluetooth to be stopped (auto-managed by dev scripts)\n\
+\n\
+Logs:\n\
+  PAM logs:       journalctl -f | grep pam\n\
+  Network:        tcpdump -i any port 36692\n\
+  Bluetooth:      btmon (if available)\n\
+  D-Bus monitor:  dbus-monitor --system\n\
+\n\
+Documentation:\n\
+  See /tapauth/docs/ for detailed documentation\n\
+\n\
+EOF\n\
+' > /usr/local/bin/tapauth-welcome && chmod +x /usr/local/bin/tapauth-welcome
+
+# Show welcome message on login
+RUN echo 'tapauth-welcome' >> /root/.bashrc
+
+# Create container startup script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "Starting TapAuth development environment services..."\n\
+\n\
+# Start D-Bus\n\
+echo "Starting D-Bus..."\n\
+mkdir -p /var/run/dbus\n\
+rm -f /var/run/dbus/pid\n\
+dbus-daemon --system --fork\n\
+\n\
+# Wait a moment for D-Bus to be ready\n\
+sleep 1\n\
+\n\
+# Start Bluetooth daemon\n\
+echo "Starting Bluetooth daemon..."\n\
+bluetoothd &\n\
+\n\
+# Wait for Bluetooth to initialize\n\
+sleep 2\n\
+\n\
+# Power on Bluetooth adapter if available\n\
+echo "Powering on Bluetooth adapter..."\n\
+ADAPTER_FOUND=false\n\
+\n\
+# Try multiple methods to power on the adapter\n\
+if command -v hciconfig &> /dev/null; then\n\
+    # Method 1: Use hciconfig\n\
+    if hciconfig hci0 up 2>/dev/null; then\n\
+        echo "✅ Bluetooth adapter powered on (hciconfig)"\n\
+        ADAPTER_FOUND=true\n\
+    fi\n\
+fi\n\
+\n\
+# Method 2: Use bluetoothctl\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    if command -v bluetoothctl &> /dev/null; then\n\
+        sleep 1\n\
+        echo "power on" | bluetoothctl 2>/dev/null\n\
+        echo "agent on" | bluetoothctl 2>/dev/null\n\
+        sleep 1\n\
+        # Check if it worked\n\
+        if hciconfig hci0 2>/dev/null | grep -q "UP"; then\n\
+            echo "✅ Bluetooth adapter powered on (bluetoothctl)"\n\
+            ADAPTER_FOUND=true\n\
+        fi\n\
+    fi\n\
+fi\n\
+\n\
+# Method 3: Use rfkill to unblock\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    if command -v rfkill &> /dev/null; then\n\
+        rfkill unblock bluetooth 2>/dev/null || true\n\
+        sleep 1\n\
+        hciconfig hci0 up 2>/dev/null || true\n\
+        if hciconfig hci0 2>/dev/null | grep -q "UP"; then\n\
+            echo "✅ Bluetooth adapter powered on (rfkill)"\n\
+            ADAPTER_FOUND=true\n\
+        fi\n\
+    fi\n\
+fi\n\
+\n\
+if [ "$ADAPTER_FOUND" = false ]; then\n\
+    echo "⚠️  No Bluetooth adapter found or failed to power on"\n\
+    echo "   Container will still work, but BLE features will be unavailable"\n\
+    echo ""\n\
+    echo "   Troubleshooting:"\n\
+    echo "   1. Make sure host Bluetooth is stopped: sudo systemctl stop bluetooth"\n\
+    echo "   2. Check USB devices are accessible: ls -la /dev/bus/usb"\n\
+    echo "   3. Try manually: hciconfig hci0 up"\n\
+    echo "   4. Or use: echo '\''power on'\'' | bluetoothctl"\n\
+fi\n\
+\n\
+echo ""\n\
+echo "Services started successfully!"\n\
+echo ""\n\
+\n\
+# Execute the main command (usually bash)\n\
+exec "$@"\n\
+' > /usr/local/bin/container-start && chmod +x /usr/local/bin/container-start
+
+# Expose ports
+# 36692: UDP authentication port
+# 0: Dynamic port for TCP pairing (allocated at runtime)
+EXPOSE 36692/udp
+
+# Default command: start services, show welcome and start bash
+ENTRYPOINT ["/usr/local/bin/container-start"]
+CMD ["bash", "-c", "tapauth-welcome && /bin/bash"]

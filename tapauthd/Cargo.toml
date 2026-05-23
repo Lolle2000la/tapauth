@@ -1,0 +1,38 @@
+[package]
+name = "tapauthd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+shared = { path = "../shared", features = ["firewall"] }
+prost = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "fs",
+    "io-util",
+    "signal",
+    "sync",
+] }
+getrandom = { workspace = true }
+nix = { workspace = true }
+socket2 = { workspace = true }
+hex = { workspace = true }
+
+# BLE support
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+
+[features]
+default = ["ble", "firewall"]
+ble = ["bluer"]
+tpm = ["shared/tpm"]
+firewall = ["shared/firewall"]
+fallback-socket = [
+] # Enable manual socket binding for development/testing (production uses systemd socket activation)

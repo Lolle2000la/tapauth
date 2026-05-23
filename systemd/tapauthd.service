@@ -1,0 +1,36 @@
+# TapAuth daemon service
+[Unit]
+Description=TapAuth authentication daemon
+Requires=tapauthd.socket
+After=dbus.service bluetooth.target network.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=tapauthd
+Group=tapauthd
+# Socket activation handed via tapauthd.socket
+Sockets=tapauthd.socket
+# Manage firewall rules as root before/after the service runs
+ExecStartPre=+/usr/bin/tapauthd manage-firewall open
+ExecStopPost=+/usr/bin/tapauthd manage-firewall close
+ExecStart=/usr/bin/tapauthd
+Restart=on-failure
+StateDirectory=tapauth
+
+# Hardening (adjust as needed if daemon requires more access)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

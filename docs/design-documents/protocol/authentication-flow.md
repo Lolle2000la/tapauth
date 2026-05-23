@@ -45,6 +45,7 @@ To ensure confidentiality and privacy, all post-pairing communication is encrypt
     1.  Both Client and Server define a **time window** of 60 seconds. The current window is calculated as `floor(unix_timestamp / 60)`.
     2.  The identifier is the first 16 bytes of an HMAC-SHA256 of the time window, keyed with the shared `CSK`.
     3.  This creates a rotating identifier that is verifiable by the Server but appears random to an outside observer, preventing metadata tracking.
+    4.  **BLE Advertisement Exception**: For BLE advertisements only, a shortened 10-byte temporal identifier (first 10 bytes of the HMAC-SHA256) is used to fit within the 31-byte BLE advertisement size limit. See `ble-gatt-specification.md` for details.
 * **Process**:
     1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
     2.  Serialize the `WrapperMessage` to a byte array.
@@ -59,30 +60,32 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 
 * **Client `AuthenticationRequest` Retransmission**:
     * **Strategy**: Exponential backoff.
-    * **Initial Interval**: **200ms**. The first retransmission is sent 200ms after the initial message.
-    * **Backoff Schedule**: The interval doubles with each subsequent retry (400ms, 800ms, etc.).
-    * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time.
+    * **Intervals**: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms (doubling each retry).
+    * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time, while avoiding excessive network traffic.
 
 * **Server `AuthenticationGrant`/`Denial` Retransmission**:
     * **Strategy**: Fixed interval.
     * **Interval**: **500ms**.
-    * **Rationale**: After user interaction, the Server becomes persistent in delivering the result to ensure the login completes promptly. This continues until a `GrantConfirmation` is received from the Client or timeout.
+    * **Timeout**: **10 seconds** (maximum 20 retransmission attempts).
+    * **Rationale**: After user interaction, the Server persistently delivers the result to ensure the login completes promptly even with network packet loss. The 10-second timeout with 20 attempts is sufficient for reliable delivery on local networks while conserving battery and network resources. Retransmission continues until a `GrantConfirmation` is received from the Client or the retransmission timeout expires.
 
 * **Session Timeouts**:
-    * The entire authentication attempt will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+    * The entire authentication attempt (from initial request to user interaction) will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+    * Server response retransmission has a separate timeout of **10 seconds** as described above.
 
 ### 2.3. Signature Generation
 
-All signed messages must use a canonical format to guarantee verifiability *before encryption*.
+All signed messages must use a canonical format to guarantee verifiability *before encryption*. Signatures are placed on the `WrapperMessage`, not on individual inner messages.
 
-* **Data-To-Be-Signed**: The **binary-serialized Protobuf message** (e.g., `AuthenticationRequest`) with its `signature` field temporarily empty.
+* **Data-To-Be-Signed**: The **binary-serialized `WrapperMessage`** with its `signature` field set to empty bytes. The `WrapperMessage` contains the inner payload (e.g., `AuthenticationRequest`) in its `payload` field.
 * **Process**:
     1.  Construct the inner message object (e.g., `AuthenticationRequest`).
-    2.  Set the `signature_algorithm` field to the algorithm agreed upon during pairing (e.g., `ED25519`).
-    3.  Serialize this message to a byte array. This is the data to be signed.
-    4.  Sign the byte array using the sender's private key and the specified algorithm.
-    5.  Place the resulting signature into the `signature` field of the message object.
-    6.  This completed message is then placed in a `WrapperMessage`, which is then encrypted for transmission.
+    2.  Place the inner message into a `WrapperMessage` using the appropriate `payload` variant.
+    3.  Set the `signature_algorithm` field on the `WrapperMessage` to the algorithm agreed upon during pairing (e.g., `ED25519`).
+    4.  Leave the `signature` field empty and serialize the `WrapperMessage` to a byte array. This is the data to be signed.
+    5.  Sign the byte array using the sender's private key and the specified algorithm.
+    6.  Place the resulting signature into the `signature` field of the `WrapperMessage`.
+    7.  The completed `WrapperMessage` is then serialized, encrypted, and placed into an `EncryptedPacket` for transmission.
 
 ### 2.4. Transport Layer Considerations
 
@@ -91,12 +94,14 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 * **IP Network (Wired Ethernet or Wi-Fi)**:
     * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable.
     * **IPv4**: The Client sends to the broadcast address `255.255.255.255`.
-    * **IPv6**: The Client sends to the designated link-local multicast address **`ff02:bfb4:3e78:bc99:80f5:f6e5:9e8e:45b8`**.
+    * **IPv6**: The Client sends to the link-local multicast address **`ff02::1`** (all nodes on local network segment).
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
 
 * **Bluetooth Low Energy (BLE)**:
     * The Client acts in the **Advertiser/Peripheral** role.
     * The Server acts in the **Scanner/Central** role.
+    * **Advertisement**: Uses a 10-byte shortened temporal identifier in service data for discovery.
+    * **GATT Transfer**: Once connected, uses standard `EncryptedPacket` with 16-byte temporal identifier via GATT characteristics.
 
 ## 3. Protocol Flow
 

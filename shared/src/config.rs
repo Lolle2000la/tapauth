@@ -1,0 +1,702 @@
+//! Configuration management for TapAuth client and server.
+//!
+//! Provides secure file I/O for configuration, paired client/server data,
+//! and cryptographic keys. Operations enforce strict file permissions (700 for
+//! directories, 600 for files) to protect sensitive cryptographic material.
+//!
+//! ## Configuration Files
+//!
+//! - `/etc/tapauth/config.toml`: System-wide configuration (timeouts, ports, TPM)
+//! - `/var/lib/tapauth/`: Persistent state (keys, paired devices)
+//!
+//! ## Security
+//!
+//! - Persistent state is stored in `/var/lib/tapauth`
+//! - Ownership is `tapauthd:tapauthd`; files are mode 0600 (or 0400)
+//! - Reads are allowed when owned by root or tapauthd
+//! - Writes are allowed when running as tapauthd; when running as root, files/dirs are
+//!   safely created then chowned to `tapauthd:tapauthd` to keep strict ownership
+//! - File permissions are enforced on every write operation and validated on reads
+
+mod toml_config;
+
+pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH};
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
+use nix::unistd::{geteuid, User};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Insufficient permissions")]
+    InsufficientPermissions,
+    #[error("Invalid configuration")]
+    InvalidConfig,
+    #[error("Crypto error: {0}")]
+    Crypto(#[from] crate::crypto::CryptoError),
+}
+
+/// Well-known configuration directory (FHS-compliant persistent state)
+pub const CONFIG_DIR: &str = "/var/lib/tapauth";
+
+/// Client configuration file
+pub const CLIENT_CONFIG_FILE: &str = "client_config.json";
+
+/// Server configuration file (for storing paired servers on client)
+pub const PAIRED_SERVERS_FILE: &str = "paired_servers.json";
+
+/// Client private key file
+pub const CLIENT_KEY_FILE: &str = "client_key";
+
+/// Client symmetric key file
+pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
+
+/// Check if the current process is running as root.
+///
+/// ## Returns
+///
+/// `true` if the effective user ID is 0 (root), `false` otherwise.
+///
+/// ## Safety
+///
+/// Calls `libc::geteuid()` which is safe to call from any context.
+/// The function has no preconditions and does not modify any state.
+/// The returned UID is a snapshot and may change if the process drops privileges.
+pub fn is_root() -> bool {
+    // Use nix to query effective UID without unsafe
+    nix::unistd::geteuid().as_raw() == 0
+}
+
+/// Resolve the system user "tapauthd" to its UID (cached best-effort).
+fn tapauthd_uid() -> Option<u32> {
+    // If NSS lookup fails or user does not exist yet (during install), we return None
+    // and default to accepting only root-owned files. Callers must handle None.
+    User::from_name("tapauthd")
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw())
+}
+
+/// Whether the effective UID is the tapauthd user.
+fn is_euid_tapauthd() -> bool {
+    match tapauthd_uid() {
+        Some(uid) => geteuid().as_raw() == uid,
+        None => false,
+    }
+}
+
+/// Whether the effective UID is privileged for writes (tapauthd or root)
+fn is_euid_privileged_for_writes() -> bool {
+    is_euid_tapauthd() || nix::unistd::geteuid().as_raw() == 0
+}
+
+/// Chown a path to tapauthd:tapauthd when running as root
+/// If tapauthd user doesn't exist (e.g., during development), skip chown silently
+fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
+    // Only attempt when running as root
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Ok(());
+    }
+    let user = match User::from_name("tapauthd").ok().flatten() {
+        Some(u) => u,
+        None => {
+            // tapauthd user doesn't exist (development mode or pre-install) - skip chown
+            tracing::debug!("tapauthd user not found, skipping chown (development mode)");
+            return Ok(());
+        }
+    };
+    let uid = user.uid.as_raw();
+    let gid = user.gid.as_raw();
+    use std::ffi::CString;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+/// Ensure configuration directory exists with strict permissions (700)
+pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
+    // Only tapauthd or root may create/modify; if root, we will chown to tapauthd
+    if !is_euid_privileged_for_writes() {
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+
+    // Set permissions to 700 (rwx for owner only)
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)?;
+
+    // Ensure ownership is tapauthd:tapauthd when invoked as root
+    if !is_euid_tapauthd() {
+        chown_to_tapauthd(path)?;
+    }
+
+    Ok(())
+}
+
+/// Write data to a file with strict owner-only permissions (600)
+pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+    // Only tapauthd or root may write; if root, we will chown to tapauthd
+    if !is_euid_privileged_for_writes() {
+        tracing::error!("write_secure_file: insufficient permissions");
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    tracing::debug!(
+        "write_secure_file: writing {} bytes to {:?}",
+        data.len(),
+        path
+    );
+    fs::write(path, data)?;
+    tracing::debug!("write_secure_file: write complete");
+
+    // Set permissions to 600 (rw for owner only)
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    tracing::debug!("write_secure_file: permissions set to 0600");
+
+    // Ensure ownership is tapauthd:tapauthd when invoked as root
+    if !is_euid_tapauthd() {
+        tracing::debug!("write_secure_file: attempting chown to tapauthd");
+        chown_to_tapauthd(path)?;
+        tracing::debug!("write_secure_file: chown complete");
+    }
+
+    Ok(())
+}
+
+/// Read data from a secure file
+pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    // Verify file permissions
+    let metadata = fs::metadata(path)?;
+    let permissions = metadata.permissions();
+
+    // Check ownership: accept either root:root or tapauthd:tapauthd
+    let owner_uid = metadata.uid();
+    let tap_uid = tapauthd_uid();
+    let owner_ok = owner_uid == 0 || tap_uid.map(|u| owner_uid == u).unwrap_or(false);
+    if !owner_ok {
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    // Check group/other permissions
+    let mode = permissions.mode() & 0o777;
+
+    // For simplicity and safety, enforce 0600 or 0400 for all files (keys and config)
+    if mode != 0o600 && mode != 0o400 {
+        return Err(ConfigError::InsufficientPermissions);
+    }
+
+    Ok(fs::read(path)?)
+}
+
+/// Client configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    /// Hostname of this client
+    pub hostname: String,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            hostname: hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string()),
+        }
+    }
+}
+
+/// Information about a paired server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairedServer {
+    /// Server's display name
+    pub name: String,
+    /// Server's Ed25519 public key (32 bytes, hex-encoded)
+    pub public_key: String,
+    /// Username(s) on the client that this server can authenticate
+    /// SECURITY: Must contain at least one username to prevent privilege escalation
+    /// When a user pairs, their username is added to this list
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When this pairing was created
+    pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PairedServer {
+    /// Check if this server is allowed to authenticate the given user
+    /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        self.allowed_users.iter().any(|u| u == username)
+    }
+}
+
+/// Information about a paired client (stored on server)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairedClient {
+    /// Client's display name (hostname)
+    pub hostname: String,
+    /// Client's Ed25519 public key (32 bytes, hex-encoded)
+    pub public_key: String,
+    /// Client Symmetric Key (32 bytes, hex-encoded)
+    pub csk: String,
+    /// Username(s) on the client that this pairing can authenticate
+    /// SECURITY: Must contain at least one username to prevent privilege escalation
+    /// When a user pairs, their username is added to this list
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When this pairing was created
+    pub paired_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PairedClient {
+    /// Check if this client pairing is allowed to authenticate the given user
+    /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        self.allowed_users.iter().any(|u| u == username)
+    }
+}
+
+/// Client configuration manager
+pub struct ClientConfigManager {
+    config_dir: PathBuf,
+}
+
+impl ClientConfigManager {
+    /// Create a new configuration manager
+    pub fn new() -> Self {
+        Self {
+            config_dir: PathBuf::from(CONFIG_DIR),
+        }
+    }
+
+    /// Initialize configuration directory
+    pub fn init(&self) -> Result<(), ConfigError> {
+        ensure_secure_directory(&self.config_dir)?;
+        Ok(())
+    }
+
+    /// Load client configuration
+    pub fn load_config(&self) -> Result<ClientConfig, ConfigError> {
+        let config_path = self.config_dir.join(CLIENT_CONFIG_FILE);
+
+        if !config_path.exists() {
+            // Return default config if file doesn't exist
+            return Ok(ClientConfig::default());
+        }
+
+        let data = read_secure_file(&config_path)?;
+        let config = serde_json::from_slice(&data)?;
+        Ok(config)
+    }
+
+    /// Save client configuration
+    pub fn save_config(&self, config: &ClientConfig) -> Result<(), ConfigError> {
+        self.init()?;
+        let config_path = self.config_dir.join(CLIENT_CONFIG_FILE);
+        let data = serde_json::to_vec_pretty(config)?;
+        write_secure_file(&config_path, &data)?;
+        Ok(())
+    }
+
+    /// Load Ed25519 keypair
+    ///
+    /// If TPM is enabled in config, loads ONLY from TPM (no plaintext fallback).
+    /// If TPM is disabled, loads from plaintext file.
+    pub fn load_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
+        // Try TPM if enabled and feature compiled in
+        #[cfg(feature = "tpm")]
+        {
+            let toml_config = TapAuthConfig::load();
+            if toml_config.use_tpm {
+                let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+
+                // TPM mode: ONLY load from TPM, no plaintext fallback
+                // This ensures we don't accidentally use old plaintext keys
+                if !tpm_key_path.with_extension("pub").exists() {
+                    return Err(ConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "TPM enabled but no TPM-sealed key found. Use tapauth-config GUI to regenerate keys.",
+                    )));
+                }
+
+                match crate::tpm::load_sealed_keypair(&tpm_key_path) {
+                    Ok(keypair) => {
+                        tracing::info!("Loaded Ed25519 keypair from TPM");
+                        return Ok(keypair);
+                    }
+                    Err(e) => {
+                        // TPM unsealing failed - this is a critical error
+                        return Err(ConfigError::Io(std::io::Error::other(format!(
+                            "Failed to unseal key from TPM: {}. Use tapauth-config GUI to recover.",
+                            e
+                        ))));
+                    }
+                }
+            }
+        }
+
+        // File-only mode: load from plaintext file
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+
+        if !key_path.exists() {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let data = read_secure_file(&key_path)?;
+
+        if data.len() != 32 {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data);
+
+        tracing::info!("Loaded Ed25519 keypair from file");
+        Ok(Ed25519KeyPair::from_signing_key_bytes(&bytes)?)
+    }
+
+    /// Save Ed25519 keypair
+    ///
+    /// If TPM is enabled in config, seals the key with TPM only (no plaintext backup).
+    /// If TPM is disabled, saves as plaintext file with 600 permissions.
+    pub fn save_keypair(&self, keypair: &Ed25519KeyPair) -> Result<(), ConfigError> {
+        self.init()?;
+
+        let bytes = keypair.signing_key_bytes();
+
+        #[cfg(feature = "tpm")]
+        {
+            let toml_config = TapAuthConfig::load();
+            if toml_config.use_tpm {
+                // TPM-only mode: seal with TPM, no plaintext backup
+                if !crate::tpm::is_tpm_available() {
+                    return Err(ConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "TPM enabled in config but tpm2-tools not available",
+                    )));
+                }
+
+                let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+                let pcr_list = toml_config.tpm_pcr_policy.pcr_list();
+                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path, pcr_list).map_err(|e| {
+                    ConfigError::Io(std::io::Error::other(format!(
+                        "Failed to seal key with TPM: {}",
+                        e
+                    )))
+                })?;
+
+                tracing::info!(
+                    "Sealed Ed25519 keypair with TPM using PCR policy {:?} (no plaintext backup)",
+                    toml_config.tpm_pcr_policy
+                );
+                return Ok(());
+            }
+        }
+
+        // File-only mode: save plaintext with 600 permissions
+        // (Also used when TPM feature is not compiled in)
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+        write_secure_file(&key_path, &bytes)?;
+        tracing::info!("Saved Ed25519 keypair to file");
+
+        Ok(())
+    }
+
+    /// Generate and save a new keypair
+    pub fn generate_and_save_keypair(&self) -> Result<Ed25519KeyPair, ConfigError> {
+        let keypair = Ed25519KeyPair::generate()?;
+        self.save_keypair(&keypair)?;
+        Ok(keypair)
+    }
+
+    /// Load CSK
+    pub fn load_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        let csk_path = self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE);
+
+        if !csk_path.exists() {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let data = read_secure_file(&csk_path)?;
+
+        if data.len() != 32 {
+            return Err(ConfigError::InvalidConfig);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data);
+
+        Ok(ClientSymmetricKey::from_bytes(bytes))
+    }
+
+    /// Save CSK
+    pub fn save_csk(&self, csk: &ClientSymmetricKey) -> Result<(), ConfigError> {
+        self.init()?;
+        let csk_path = self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE);
+        write_secure_file(&csk_path, csk.as_bytes())?;
+        Ok(())
+    }
+
+    /// Generate and save a new CSK
+    pub fn generate_and_save_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        let csk = ClientSymmetricKey::generate()?;
+        self.save_csk(&csk)?;
+        Ok(csk)
+    }
+
+    /// Rotate CSK (generates new one, invalidating all pairings)
+    pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
+        // Delete all paired servers since they have the old CSK
+        let _ = self.clear_paired_servers();
+
+        // Generate and save new CSK
+        self.generate_and_save_csk()
+    }
+
+    /// Load paired servers
+    pub fn load_paired_servers(&self) -> Result<HashMap<String, PairedServer>, ConfigError> {
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+
+        if !servers_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let data = read_secure_file(&servers_path)?;
+        let servers = serde_json::from_slice(&data)?;
+        Ok(servers)
+    }
+
+    /// Save paired servers
+    pub fn save_paired_servers(
+        &self,
+        servers: &HashMap<String, PairedServer>,
+    ) -> Result<(), ConfigError> {
+        tracing::debug!("save_paired_servers: starting");
+        self.init()?;
+        tracing::debug!("save_paired_servers: init complete");
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+        tracing::debug!("save_paired_servers: path = {:?}", servers_path);
+        let data = serde_json::to_vec_pretty(servers)?;
+        tracing::debug!("save_paired_servers: serialized {} bytes", data.len());
+        write_secure_file(&servers_path, &data)?;
+        tracing::debug!("save_paired_servers: write complete");
+        Ok(())
+    }
+
+    /// Add a paired server
+    pub fn add_paired_server(&self, id: String, server: PairedServer) -> Result<(), ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+        servers.insert(id, server);
+        self.save_paired_servers(&servers)?;
+        Ok(())
+    }
+
+    /// Remove a paired server
+    pub fn remove_paired_server(&self, id: &str) -> Result<(), ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+        servers.remove(id);
+        self.save_paired_servers(&servers)?;
+        Ok(())
+    }
+
+    /// Remove current user from a paired server's allowed list
+    /// If this is the last user, removes the entire pairing
+    /// Returns true if the entire pairing was removed, false if just the user was removed
+    pub fn remove_user_from_pairing(&self, id: &str, username: &str) -> Result<bool, ConfigError> {
+        let mut servers = self.load_paired_servers()?;
+
+        if let Some(server) = servers.get_mut(id) {
+            // Remove the username from allowed_users
+            server.allowed_users.retain(|u| u != username);
+
+            // If no users left, remove the entire pairing
+            if server.allowed_users.is_empty() {
+                servers.remove(id);
+                self.save_paired_servers(&servers)?;
+                Ok(true) // Entire pairing removed
+            } else {
+                // Save with updated user list
+                self.save_paired_servers(&servers)?;
+                Ok(false) // Only user removed
+            }
+        } else {
+            // Server not found - nothing to remove
+            Ok(true)
+        }
+    }
+
+    /// Clear all paired servers
+    pub fn clear_paired_servers(&self) -> Result<(), ConfigError> {
+        let servers_path = self.config_dir.join(PAIRED_SERVERS_FILE);
+        if servers_path.exists() {
+            fs::remove_file(servers_path)?;
+        }
+        Ok(())
+    }
+
+    /// Recover from TPM failure by regenerating all keys and clearing pairings
+    ///
+    /// This is a complete reset that:
+    /// 1. Deletes TPM-sealed key files (if they exist)
+    /// 2. Deletes plaintext key file (if it exists)
+    /// 3. Generates new Ed25519 keypair
+    /// 4. Generates new CSK
+    /// 5. Clears all paired servers (they used the old keys)
+    ///
+    /// Returns Ok(()) if successful. The daemon must be restarted after this operation.
+    #[cfg(feature = "tpm")]
+    pub fn recover_from_tpm_failure(&self) -> Result<(), ConfigError> {
+        tracing::warn!("Starting TPM recovery: regenerating all keys and clearing pairings");
+
+        // Delete TPM-sealed key files if they exist
+        let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
+        let tpm_pub = tpm_key_path.with_extension("pub");
+        let tpm_priv = tpm_key_path.with_extension("priv");
+
+        if tpm_pub.exists() {
+            fs::remove_file(&tpm_pub)?;
+            tracing::info!("Deleted TPM public key file");
+        }
+        if tpm_priv.exists() {
+            fs::remove_file(&tpm_priv)?;
+            tracing::info!("Deleted TPM private key file");
+        }
+
+        // Delete plaintext key file if it exists
+        let key_path = self.config_dir.join(CLIENT_KEY_FILE);
+        if key_path.exists() {
+            fs::remove_file(&key_path)?;
+            tracing::info!("Deleted plaintext key file");
+        }
+
+        // Clear all paired servers since they have the old public key
+        self.clear_paired_servers()?;
+        tracing::info!("Cleared all paired servers");
+
+        // Generate new Ed25519 keypair
+        self.generate_and_save_keypair()?;
+        tracing::info!("Generated new Ed25519 keypair");
+
+        // Rotate CSK to force re-pairing
+        self.rotate_csk()?;
+        tracing::info!("Generated new CSK");
+
+        tracing::warn!(
+            "TPM recovery complete. Daemon must be restarted and all devices must be re-paired."
+        );
+        Ok(())
+    }
+}
+
+impl Default for ClientConfigManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ClientConfig::default();
+        // ClientConfig only contains hostname, which is system-dependent
+        // Just verify it's not empty
+        assert!(!config.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = ClientConfig {
+            hostname: "test-host".to_string(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ClientConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.hostname, deserialized.hostname);
+    }
+
+    #[test]
+    fn test_paired_server_user_authorization() {
+        let server = PairedServer {
+            name: "TestServer".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec!["alice".to_string(), "bob".to_string()],
+            paired_at: chrono::Utc::now(),
+        };
+
+        // Allowed users should pass
+        assert!(server.is_user_allowed("alice"));
+        assert!(server.is_user_allowed("bob"));
+
+        // Non-allowed users should fail
+        assert!(!server.is_user_allowed("charlie"));
+        assert!(!server.is_user_allowed(""));
+    }
+
+    #[test]
+    fn test_paired_server_empty_allowed_users() {
+        // SECURITY: Empty allowed_users list should deny all users
+        let server = PairedServer {
+            name: "TestServer".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec![],
+            paired_at: chrono::Utc::now(),
+        };
+
+        // No user should be allowed when list is empty
+        assert!(!server.is_user_allowed("alice"));
+        assert!(!server.is_user_allowed("root"));
+        assert!(!server.is_user_allowed(""));
+    }
+
+    #[test]
+    fn test_paired_client_serialization() {
+        let client = PairedClient {
+            hostname: "client-laptop".to_string(),
+            public_key: "def456".to_string(),
+            csk: "encrypted_key_data".to_string(),
+            allowed_users: vec!["user1".to_string()],
+            paired_at: chrono::Utc::now(),
+        };
+
+        let json = serde_json::to_string(&client).unwrap();
+        let deserialized: PairedClient = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(client.hostname, deserialized.hostname);
+        assert_eq!(client.public_key, deserialized.public_key);
+        assert_eq!(client.csk, deserialized.csk);
+        assert_eq!(client.allowed_users, deserialized.allowed_users);
+    }
+}

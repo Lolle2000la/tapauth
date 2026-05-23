@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Data extraction rules for Android backup and device transfer.
+   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
+   for details.
+-->
+<data-extraction-rules>
+  <cloud-backup>
+    <!-- Exclude cryptographic keys and sensitive data from cloud backup -->
+    <exclude domain="sharedpref" path="tapauth_keystore.xml" />
+    <exclude domain="database" />
+  </cloud-backup>
+  <!--
+    Device-to-device transfer is disabled to prevent key material from being
+    transferred to a new device. Users must re-pair devices after migration.
+    -->
+</data-extraction-rules>

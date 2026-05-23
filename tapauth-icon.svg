@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="hcBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0305"/>
+      <stop offset="100%" stop-color="#020001"/>
+    </linearGradient>
+    
+    <linearGradient id="hcGlowGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ff1744"/>
+      <stop offset="100%" stop-color="#ff5252"/>
+    </linearGradient>
+    
+    <linearGradient id="hcCoreGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#d81b60"/>
+      <stop offset="100%" stop-color="#ff1744"/>
+    </linearGradient>
+    
+    <filter id="hcHeavyShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="12" flood-color="#000000" flood-opacity="0.85"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#hcBgGrad)"/>
+
+  <g filter="url(#hcHeavyShadow)">
+    <path d="M 126 330 A 150 150 0 0 1 386 330" fill="none" stroke="url(#hcGlowGrad)" stroke-width="20" stroke-linecap="round" opacity="0.3"/>
+    <path d="M 161 295 A 115 115 0 0 1 351 295" fill="none" stroke="url(#hcGlowGrad)" stroke-width="24" stroke-linecap="round" opacity="0.6"/>
+    <path d="M 196 260 A 80 80 0 0 1 316 260" fill="none" stroke="url(#hcGlowGrad)" stroke-width="28" stroke-linecap="round"/>
+  </g>
+
+  <g filter="url(#hcHeavyShadow)">
+    <path d="M 211 190 C 211 145, 301 145, 301 190 C 301 265, 256 285, 256 340" fill="none" stroke="url(#hcCoreGrad)" stroke-width="30" stroke-linecap="round"/>
+    <path d="M 166 200 C 166 110, 346 110, 346 200 C 346 245, 316 275, 301 305" fill="none" stroke="url(#hcCoreGrad)" stroke-width="22" stroke-linecap="round" opacity="0.75"/>
+    <path d="M 256 235 L 256 238" fill="none" stroke="url(#hcCoreGrad)" stroke-width="32" stroke-linecap="round"/>
+  </g>
+</svg>

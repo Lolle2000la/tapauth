@@ -24,7 +24,6 @@ enum HashAlgorithm {
 /**
  * An AuthenticationRequest is broadcast by the Client (desktop) to
  * any available Server (phone), requesting authentication.
- * It is signed by the Client to prove its identity.
  */
 message AuthenticationRequest {
   // A random nonce for this specific login attempt.
@@ -35,123 +34,139 @@ message AuthenticationRequest {
   string hostname = 3;
   // The UTC time the request was created, to prevent replay attacks.
   uint64 timestamp_unix_seconds = 4;
-  // The algorithm used to generate the signature.
-  SignatureAlgorithm signature_algorithm = 5;
-  // Client's signature over the serialized request (with this field empty).
-  bytes signature = 6;
 }
 
 /**
  * An AuthenticationGrant is sent unicast by the Server (phone) to the
  * Client (desktop) after a successful user biometric verification.
- * It is signed by the Server to prove its identity.
  */
 message AuthenticationGrant {
   // The challenge from the request, now signed by the Server's private key.
   bytes signed_challenge = 1;
-  // The algorithm used to generate the signature.
-  SignatureAlgorithm signature_algorithm = 2;
-  // Server's signature over the serialized grant (with this field empty).
-  bytes signature = 3;
 }
 
 /**
  * An AuthenticationDenial is sent by the Server if the user denies
  * the request. The Server will repeat sending this until confirmation.
- * It is signed by the Server.
  */
 message AuthenticationDenial {
   // The challenge from the original request, for identification.
   bytes challenge = 1;
-  // The algorithm used to generate the signature.
-  SignatureAlgorithm signature_algorithm = 2;
-  // Server's signature over this message (with this field empty).
-  bytes signature = 3;
 }
 
 /**
  * A GrantConfirmation is sent unicast by the Client to the Server to
  * confirm receipt of a Grant or Denial, telling the Server to stop retransmitting.
- * It is signed by the Client.
  */
 message GrantConfirmation {
   // The challenge from the original request, to identify the session.
   bytes challenge = 1;
-  // The algorithm used to generate the signature.
-  SignatureAlgorithm signature_algorithm = 2;
-  // Client's signature over this message (with this field empty).
-  bytes signature = 3;
 }
 
 /**
  * An AuthenticationCancel is broadcast by the Client once it has been
  * unlocked, telling all other Servers to dismiss their pending prompts.
- * It is signed by the Client.
  */
 message AuthenticationCancel {
   // The challenge from the original request, to identify the session to cancel.
   bytes challenge = 1;
-  // The algorithm used to generate the signature.
-  SignatureAlgorithm signature_algorithm = 2;
-  // Client's signature over this message (with this field empty).
-  bytes signature = 3;
 }
 
 // -- Pairing Messages --
 
 /**
- * A generic container for encrypted data, used during pairing.
+ * Initial message sent by server during TCP pairing handshake.
+ * Contains server's X25519 public key, Ed25519 public key, and
+ * supported cryptographic algorithms.
  */
-message EncryptedData {
-  // The ciphertext of the encrypted payload.
-  bytes ciphertext = 1;
-}
-
-message PairingHandshake {
-  bytes server_public_key = 1;
-  // A list of signature algorithms the server supports for general communication.
-  repeated SignatureAlgorithm supported_signature_algorithms = 2;
-  // A list of symmetric algorithms the server supports for packet encryption.
-  repeated SymmetricAlgorithm supported_symmetric_algorithms = 3;
-  // A list of hash algorithms the server supports.
-  repeated HashAlgorithm supported_hash_algorithms = 4;
-}
-
-/**
- * Sent by the Client to the Server during pairing to deliver the shared key.
- */
-message ClientKeyDelivery {
-  // The Client Symmetric Key (CSK), encrypted with the temporary pairing key (PSK).
-  EncryptedData encrypted_csk = 1;
+message PairingHello {
+  // Protocol version
+  uint32 version = 1;
+  // Server's ephemeral X25519 public key for DH
+  bytes x25519_public_key = 2;
+  // Server's long-term Ed25519 public key for identification
+  bytes ed25519_public_key = 3;
+  // Server's device name for display purposes only (e.g., device model/hostname)
+  string device_name = 4;
+  // Algorithms the server supports
+  repeated SymmetricAlgorithm supported_symmetric_algorithms = 5;
+  repeated HashAlgorithm supported_hash_algorithms = 6;
+  repeated SignatureAlgorithm supported_signature_algorithms = 7;
 }
 
 /**
- * Sent by the Server to the Client to confirm successful receipt of the shared key.
+ * Response sent by client during TCP pairing handshake.
+ * Contains client's X25519 public key, Ed25519 public key, and
+ * the client's selected algorithms for future communication.
  */
-message PairingConfirmation {
-  // The algorithm used to produce the confirmation hash.
-  HashAlgorithm hash_algorithm = 1;
-  // A hash of the CSK (e.g., SHA-256), encrypted with the temporary pairing key (PSK).
-  EncryptedData encrypted_confirmation_hash = 2;
+message PairingResponse {
+  // Protocol version
+  uint32 version = 1;
+  // Client's ephemeral X25519 public key for DH
+  bytes x25519_public_key = 2;
+  // Client's long-term Ed25519 public key for identification
+  bytes ed25519_public_key = 3;
+  // Client's device name for display purposes only (e.g., hostname)
+  string device_name = 4;
+  // Client's selected algorithm for future symmetric encryption
+  SymmetricAlgorithm selected_symmetric_algorithm = 5;
+  // Client's selected algorithm for future hashing
+  HashAlgorithm selected_hash_algorithm = 6;
+  // Client's selected algorithm for future digital signatures
+  SignatureAlgorithm selected_signature_algorithm = 7;
+}
+
+/**
+ * Message containing CSK encrypted with PSK, sent from client to server.
+ * Includes the username of the user initiating the pairing.
+ */
+message PairingCskMessage {
+  // CSK encrypted with PSK derived from X25519 DH
+  bytes encrypted_csk = 1;
+  // The username of the user on the client who is pairing this device
+  string username = 2;
+}
+
+/**
+ * Final acknowledgment from server that pairing is complete.
+ * Includes a hash of the received CSK encrypted with PSK so the client
+ * can verify the CSK was received intact (integrity check).
+ */
+message PairingComplete {
+  // Whether pairing was successful
+  bool success = 1;
+  // Hash algorithm used for the CSK hash
+  HashAlgorithm hash_algorithm = 2;
+  // SHA-256 hash of the CSK, encrypted with the ephemeral PSK
+  bytes csk_hash = 3;
 }
 
 /**
  * A top-level wrapper for all possible messages.
  * In post-pairing communication, this is serialized and then encrypted.
+ * All messages are signed - the signature is over the entire WrapperMessage
+ * with the signature field set to empty bytes.
  */
 message WrapperMessage {
   // The version of the protocol being used. Currently 1.
   uint32 version = 1;
 
+  // The algorithm used to generate the signature.
+  SignatureAlgorithm signature_algorithm = 2;
+  
+  // Signature over the serialized WrapperMessage (with this field empty).
+  // For AuthenticationRequest, GrantConfirmation, and AuthenticationCancel:
+  //   signed by the Client's Ed25519 private key.
+  // For AuthenticationGrant and AuthenticationDenial:
+  //   signed by the Server's Ed25519 private key.
+  bytes signature = 3;
+
   oneof payload {
-    PairingHandshake pairing_handshake = 2;
-    PairingConfirmation pairing_confirmation = 3;
     AuthenticationRequest auth_request = 4;
     AuthenticationGrant auth_grant = 5;
     AuthenticationDenial auth_denial = 6;
     GrantConfirmation grant_confirmation = 7;
     AuthenticationCancel auth_cancel = 8;
-    ClientKeyDelivery client_key_delivery = 9;
   }
 }
 

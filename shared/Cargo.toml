@@ -1,0 +1,67 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Cryptography
+aes-gcm = "0.11.0-rc.3"
+ed25519-dalek = { version = "3.0.0-pre.7", features = [
+    "rand_core",
+    "serde",
+    "zeroize",
+] }
+x25519-dalek = { version = "3.0.0-pre.6", features = [
+    "serde",
+    "static_secrets",
+    "zeroize",
+] }
+hkdf = "0.13"
+sha2 = "0.11"
+hmac = "0.13"
+rand = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+secrecy.workspace = true
+
+# Serialization
+prost.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+toml.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Utilities
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+if-addrs.workspace = true
+hostname = "0.4"
+socket2.workspace = true
+nix.workspace = true
+
+# JNI support (optional)
+jni = { version = "0.21", optional = true }
+tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = { version = "0.2", features = ["api-30"] }
+
+[build-dependencies]
+prost-build.workspace = true
+
+[features]
+default = []
+jni = ["dep:jni"]
+tpm = [] # TPM 2.0 support (requires tpm2-tools on system)
+firewall = [
+] # Firewall management support (requires iptables/nftables on system)

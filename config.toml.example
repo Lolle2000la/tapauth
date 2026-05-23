@@ -1,0 +1,54 @@
+# TapAuth Configuration
+# Place this file at /etc/tapauth/config.toml
+# All settings are optional - defaults will be used if not specified
+
+# PAM Module Settings
+# Timeout for individual PAM operations (connect, send, receive) in seconds.
+# This prevents PAM module hangs if the daemon is unresponsive.
+# The authentication session on the phone can continue for up to 120 seconds,
+# but PAM operations will timeout after this duration to prevent user lockouts.
+# Default: 3
+pam_operation_timeout_secs = 3
+
+# Network Settings
+# UDP port for the authentication protocol.
+# Both the daemon and Android app must use the same port.
+# Default: 36692
+udp_port = 36692
+
+# TPM 2.0 Support
+# Enable TPM (Trusted Platform Module) for secure key storage.
+# When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).
+# This provides hardware-backed key protection - keys cannot be extracted even with root access.
+# 
+# Requirements:
+#   - TPM 2.0 hardware available on the system
+#   - tpm2-tools package installed (tpm2_create, tpm2_load, tpm2_unseal)
+#   - TapAuth must be compiled with the 'tpm' feature: ./install.sh --use-tpm
+#
+# Security: When enabled, NO plaintext backup is created - only TPM-sealed keys exist on disk.
+# Recovery: If TPM fails, use tapauth-config GUI to regenerate keys (requires re-pairing devices).
+# See docs/TPM_SUPPORT.md for more information.
+# Default: false
+use_tpm = false
+
+# TPM PCR Sealing Policy
+# Controls which Platform Configuration Registers (PCRs) are used to seal the authentication keys.
+# PCRs measure system state at boot time - keys can only be unsealed if measured values match.
+#
+# Options:
+#   "standard" (recommended):
+#     - Seals to PCR 7 (Secure Boot state) + PCR 14 (MOK keys)
+#     - Prevents evil maid attacks (modified bootloader/kernel)
+#     - Won't break on kernel updates or BIOS updates
+#     - Requires Secure Boot to be enabled
+#   
+#   "paranoid":
+#     - Seals to PCR 0 (BIOS) + PCR 2 (Option ROMs) + PCR 7 (Secure Boot) + PCR 14 (MOK)
+#     - Maximum protection - detects ANY boot chain modification
+#     - ⚠️ WARNING: WILL break on BIOS updates and some hardware changes
+#     - Requires frequent key recovery (re-pairing all devices)
+#
+# Only applies when use_tpm = true. Ignored if TPM feature is not compiled in.
+# Default: "standard"
+# tpm_pcr_policy = "standard"

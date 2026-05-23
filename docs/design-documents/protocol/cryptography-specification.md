@@ -41,8 +41,13 @@ The protocol uses modern Elliptic Curve Cryptography (ECC) based on Curve25519, 
 
 To prevent catastrophic security failures, the management of nonces (numbers used once) for AES-GCM is critical.
 
-*   **Uniqueness**: A nonce **MUST NEVER** be reused with the same key for two different encryption operations.
-*   **Generation**: The 32-byte `challenge` field from the initial `AuthenticationRequest` serves as the root for nonce generation within a single authentication session. For AES-GCM, which requires a 12-byte (96-bit) nonce, a session-specific nonce can be derived from the `challenge` using HKDF-SHA256 with a unique info tag for each message type (e.g., "auth_grant_nonce"). This ensures that each message within the session has a unique, deterministic, and cryptographically secure nonce.
+*   **Uniqueness**: A nonce **MUST NEVER** be reused with the same key for two different plaintexts. This is the most critical security requirement for AES-GCM.
+*   **Generation for EncryptedPacket**: For `EncryptedPacket` messages, a **12-byte cryptographically random nonce** is generated for each encryption operation using a secure random number generator. The nonce is prepended to the ciphertext and transmitted alongside it (nonces are not secret). This ensures that:
+    1. Each packet has a unique nonce, regardless of timing
+    2. Multiple authentication requests within the same time window have different nonces
+    3. No possibility of nonce reuse, eliminating the AES-GCM catastrophic failure mode
+*   **Nonce Transmission**: The 12-byte nonce is prepended to the ciphertext in the `ciphertext` field of `EncryptedPacket`. The receiver extracts the nonce from the first 12 bytes before decrypting the remainder.
+*   **Challenge-Based Nonces**: For messages sent *after* an `AuthenticationRequest` has been decrypted (e.g., `AuthenticationGrant`, `GrantConfirmation`), nonces can optionally be derived from the session's `challenge` field using HKDF-SHA256 with message-type-specific info tags (e.g., `"auth_grant_nonce"`). This is acceptable because the challenge is unique per authentication session and enforced by replay mitigation.
 
 ## 4. Symmetric Key Types
 

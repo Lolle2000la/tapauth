@@ -1,0 +1,213 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build and Test All Modules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libpam0g-dev \
+            protobuf-compiler \
+            libgtk-4-dev \
+            build-essential
+
+      - name: Build shared library (default features)
+        run: cargo build --manifest-path shared/Cargo.toml --verbose
+
+      - name: Build shared library (with jni feature)
+        run: cargo build --manifest-path shared/Cargo.toml --features jni --verbose
+
+      - name: "Build tapauthd (default: BLE + firewall)"
+        run: cargo build --manifest-path tapauthd/Cargo.toml --verbose
+
+      - name: "Build tapauthd (no BLE, firewall only)"
+        run: cargo build --manifest-path tapauthd/Cargo.toml --no-default-features --features firewall --verbose
+
+      - name: "Build client PAM module"
+        run: cargo build --manifest-path client-pam/Cargo.toml --verbose
+
+      - name: "Build client PAM module (no features)"
+        run: cargo build --manifest-path client-pam/Cargo.toml --no-default-features --verbose
+
+      - name: Build client config GUI
+        run: cargo build --manifest-path client-config-gui/Cargo.toml --verbose
+
+      - name: Build all workspace members
+        run: cargo build --workspace --verbose
+
+      - name: Run tests for shared library
+        run: cargo test --manifest-path shared/Cargo.toml --verbose
+
+      - name: Run tests for shared library (with jni feature)
+        run: cargo test --manifest-path shared/Cargo.toml --features jni --verbose
+
+      - name: Run tests for client PAM module
+        run: cargo test --manifest-path client-pam/Cargo.toml --verbose
+
+      - name: Run tests for client config GUI
+        run: cargo test --manifest-path client-config-gui/Cargo.toml --verbose
+
+      - name: Run all workspace tests
+        run: cargo test --workspace --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-android:
+    name: Build Android Native Libraries and APK
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;30.0.14904198"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.14904198" >> "$GITHUB_ENV"
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x server-android/gradlew
+
+      - name: Build native libraries (fail-fast)
+        run: cd server-android && ./gradlew cargoBuild
+
+      - name: Free disk space for emulator
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Enable KVM (for Android Emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-36
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: Run JNI instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: cd server-android && ./gradlew connectedDebugAndroidTest --stacktrace
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: instrumentation-test-results
+          path: server-android/app/build/reports/androidTests/
+          retention-days: 7
+
+      - name: Build Android APK (Debug)
+        run: cd server-android && ./gradlew assembleDebug --stacktrace
+
+      - name: Check Kotlin formatting with Spotless
+        run: cd server-android && ./gradlew spotlessCheck
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tapauth-debug-apk
+          path: server-android/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload native libraries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libraries
+          path: server-android/app/src/main/jniLibs/
+          retention-days: 30

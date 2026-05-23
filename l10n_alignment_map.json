@@ -1,0 +1,754 @@
+{
+  "project": "tapauth",
+  "generated": "2026-05-22",
+  "source_locales": ["en"],
+  "target_locales": ["de", "ja"],
+  "aligned_translations": [
+    {
+      "universal_id": "general_app_name",
+      "source_english": "TapAuth",
+      "android_binding": { "type": "xml_resource", "key": "app_name" },
+      "rust_binding": { "type": "fluent_key", "key": "app-title" }
+    },
+    {
+      "universal_id": "general_back",
+      "source_english": "Back",
+      "android_binding": { "type": "xml_resource", "key": "general_back" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-back" }
+    },
+    {
+      "universal_id": "general_cancel",
+      "source_english": "Cancel",
+      "android_binding": { "type": "xml_resource", "key": "general_cancel" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-cancel" }
+    },
+    {
+      "universal_id": "general_done",
+      "source_english": "Done",
+      "android_binding": { "type": "xml_resource", "key": "general_done" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-done" }
+    },
+    {
+      "universal_id": "general_remove",
+      "source_english": "Remove",
+      "android_binding": { "type": "xml_resource", "key": "general_remove" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-remove" }
+    },
+    {
+      "universal_id": "general_please_wait",
+      "source_english": "Please wait",
+      "android_binding": { "type": "xml_resource", "key": "general_please_wait" },
+      "rust_binding": { "type": "fluent_key", "key": "label-please-wait" }
+    },
+    {
+      "universal_id": "general_confirm",
+      "source_english": "Confirm",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "btn-confirm" }
+    },
+    {
+      "universal_id": "general_retry",
+      "source_english": "Retry",
+      "android_binding": { "type": "xml_resource", "key": "general_retry" },
+      "rust_binding": null
+    },
+
+    {
+      "universal_id": "pairing_title",
+      "source_english": "Device Pairing",
+      "android_binding": { "type": "xml_resource", "key": "pairing_title" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-title" }
+    },
+    {
+      "universal_id": "pairing_connecting",
+      "source_english": "Connecting to device...",
+      "android_binding": { "type": "xml_resource", "key": "pairing_connecting" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "pairing_preparing",
+      "source_english": "Preparing pairing...",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-preparing" }
+    },
+    {
+      "universal_id": "pairing_verify_sas_title",
+      "source_english": "Verify Security Code",
+      "android_binding": { "type": "xml_resource", "key": "pairing_verify_sas_title" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-verify-sas-title" }
+    },
+    {
+      "universal_id": "pairing_compare_code",
+      "source_english": "Compare this code with the one shown on your computer:",
+      "android_binding": { "type": "xml_resource", "key": "pairing_compare_code" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-compare-code" }
+    },
+    {
+      "universal_id": "pairing_codes_match",
+      "source_english": "Do the codes match?",
+      "android_binding": { "type": "xml_resource", "key": "pairing_codes_match" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "pairing_no_cancel",
+      "source_english": "No, Cancel",
+      "android_binding": { "type": "xml_resource", "key": "pairing_no_cancel" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "pairing_yes_pair",
+      "source_english": "Yes, Pair",
+      "android_binding": { "type": "xml_resource", "key": "pairing_yes_pair" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "pairing_finalizing",
+      "source_english": "Finalizing pairing...",
+      "android_binding": { "type": "xml_resource", "key": "pairing_finalizing" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-completing" }
+    },
+    {
+      "universal_id": "pairing_completing",
+      "source_english": "Completing pairing...",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-completing" }
+    },
+    {
+      "universal_id": "pairing_success",
+      "source_english": "Pairing Successful!",
+      "android_binding": { "type": "xml_resource", "key": "pairing_success" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-success" }
+    },
+    {
+      "universal_id": "pairing_success_message",
+      "source_english": "Your device is now paired and ready for authentication",
+      "android_binding": { "type": "xml_resource", "key": "pairing_success_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "pairing_failed",
+      "source_english": "Pairing Failed",
+      "android_binding": { "type": "xml_resource", "key": "pairing_failed" },
+      "rust_binding": { "type": "fluent_key", "key": "pairing-failed" }
+    },
+    {
+      "universal_id": "pairing_scan_qr",
+      "source_english": "Scan this QR code with your phone",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-scan-qr" }
+    },
+    {
+      "universal_id": "pairing_enter_manually",
+      "source_english": "Or enter manually:",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-enter-manually" }
+    },
+    {
+      "universal_id": "pairing_device_id",
+      "source_english": "Device ID: {$device_id}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-device-id", "variables": {"device_id": "str"} }
+    },
+    {
+      "universal_id": "pairing_sas_ensure_match",
+      "source_english": "Ensure this code matches on your device:",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "pairing-sas-ensure-match" }
+    },
+
+    {
+      "universal_id": "scanner_title",
+      "source_english": "Scan QR Code",
+      "android_binding": { "type": "xml_resource", "key": "scanner_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_initializing",
+      "source_english": "Initializing camera...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_initializing" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_permission_required",
+      "source_english": "Camera permission is required to scan QR codes",
+      "android_binding": { "type": "xml_resource", "key": "scanner_permission_required" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_grant_permission",
+      "source_english": "Grant Permission",
+      "android_binding": { "type": "xml_resource", "key": "scanner_grant_permission" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_camera_starting",
+      "source_english": "Camera starting...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_camera_starting" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_camera_failed",
+      "source_english": "Camera initialization failed:",
+      "android_binding": { "type": "xml_resource", "key": "scanner_camera_failed" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_scanning",
+      "source_english": "Scanning for QR codes...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_scanning" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_detected",
+      "source_english": "QR code detected! Parsing...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_detected" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_valid_url",
+      "source_english": "Valid pairing URL! Connecting...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_valid_url" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_invalid_format",
+      "source_english": "Invalid QR code format. Expected tapauth:// URL",
+      "android_binding": { "type": "xml_resource", "key": "scanner_invalid_format" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_camera_ready",
+      "source_english": "Camera ready - point at QR code",
+      "android_binding": { "type": "xml_resource", "key": "scanner_camera_ready" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_status_prefix",
+      "source_english": "Status: %s",
+      "android_binding": { "type": "xml_resource", "key": "scanner_status_prefix" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "scanner_last_detected",
+      "source_english": "Last detected: %s...",
+      "android_binding": { "type": "xml_resource", "key": "scanner_last_detected" },
+      "rust_binding": null
+    },
+
+    {
+      "universal_id": "home_title",
+      "source_english": "TapAuth",
+      "android_binding": { "type": "xml_resource", "key": "home_title" },
+      "rust_binding": { "type": "fluent_key", "key": "app-title" }
+    },
+    {
+      "universal_id": "home_udp_service",
+      "source_english": "UDP Service",
+      "android_binding": { "type": "xml_resource", "key": "home_udp_service" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "home_port_display",
+      "source_english": "Port %1$d",
+      "android_binding": { "type": "xml_resource", "key": "home_port_display" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "home_ble_server",
+      "source_english": "BLE GATT Server",
+      "android_binding": { "type": "xml_resource", "key": "home_ble_server" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "home_ble_advertising",
+      "source_english": "Advertising",
+      "android_binding": { "type": "xml_resource", "key": "home_ble_advertising" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "home_pair_new_device",
+      "source_english": "Pair New Device",
+      "android_binding": { "type": "xml_resource", "key": "home_pair_new_device" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-pair-new-device" }
+    },
+    {
+      "universal_id": "home_paired_devices",
+      "source_english": "Paired Devices",
+      "android_binding": { "type": "xml_resource", "key": "home_paired_devices" },
+      "rust_binding": { "type": "fluent_key", "key": "title-paired-devices" }
+    },
+    {
+      "universal_id": "home_settings",
+      "source_english": "Settings",
+      "android_binding": { "type": "xml_resource", "key": "home_settings" },
+      "rust_binding": { "type": "fluent_key", "key": "btn-settings" }
+    },
+    {
+      "universal_id": "home_tagline",
+      "source_english": "TapAuth allows you to authenticate to your computer by simply tapping your phone",
+      "android_binding": { "type": "xml_resource", "key": "home_tagline" },
+      "rust_binding": null
+    },
+
+    {
+      "universal_id": "devices_title",
+      "source_english": "Paired Devices",
+      "android_binding": { "type": "xml_resource", "key": "devices_title" },
+      "rust_binding": { "type": "fluent_key", "key": "title-paired-devices" }
+    },
+    {
+      "universal_id": "devices_empty",
+      "source_english": "No Paired Devices",
+      "android_binding": { "type": "xml_resource", "key": "devices_empty" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_empty_message",
+      "source_english": "Pair a device by scanning a QR code from your computer",
+      "android_binding": { "type": "xml_resource", "key": "devices_empty_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_no_devices_for_user",
+      "source_english": "No paired devices for current user",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "devices-none-for-user" }
+    },
+    {
+      "universal_id": "devices_id_prefix",
+      "source_english": "ID: %1$s...%2$s",
+      "android_binding": { "type": "xml_resource", "key": "devices_id_prefix" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_allowed_users",
+      "source_english": "Allowed users: %s",
+      "android_binding": { "type": "xml_resource", "key": "devices_allowed_users" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_current_user",
+      "source_english": "Current user: {$username}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "devices-current-user", "variables": {"username": "str"} }
+    },
+    {
+      "universal_id": "devices_users_list",
+      "source_english": "Users: {$users}{$info}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "devices-users-list", "variables": {"users": "str", "info": "str"} }
+    },
+    {
+      "universal_id": "devices_shared_info",
+      "source_english": " (shared with {$count} other user{$s})",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "devices-shared-info", "variables": {"count": "num", "s": "str"} }
+    },
+    {
+      "universal_id": "devices_id_truncated",
+      "source_english": "ID: {$prefix}...{$suffix}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "devices-id-truncated", "variables": {"prefix": "str", "suffix": "str"} }
+    },
+    {
+      "universal_id": "devices_remove_entire_pairing_title",
+      "source_english": "Remove Entire Pairing?",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_entire_pairing_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_device_title",
+      "source_english": "Remove Device?",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_device_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_user_title",
+      "source_english": "Remove User?",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_user_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_last_user_message",
+      "source_english": "Remove user \"%1$s\" from \"%2$s\"?\n\nThis is the last user, so the entire pairing will be removed.",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_last_user_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_user_message",
+      "source_english": "Remove user \"%1$s\" from \"%2$s\"?\n\nOther users (%3$s) will still be able to authenticate.",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_user_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_all",
+      "source_english": "Remove All",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_all" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_warning_multi_user",
+      "source_english": "WARNING: This pairing is used by %d users!",
+      "android_binding": { "type": "xml_resource", "key": "devices_warning_multi_user" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_users_label",
+      "source_english": "Users: %s",
+      "android_binding": { "type": "xml_resource", "key": "devices_users_label" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_confirm_message",
+      "source_english": "Are you sure you want to remove \"%1$s\"? %2$s will need to pair again to authenticate with this device.",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_confirm_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_remove_individual_user",
+      "source_english": "Remove individual user:",
+      "android_binding": { "type": "xml_resource", "key": "devices_remove_individual_user" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "devices_paired_date",
+      "source_english": "Paired %1$s",
+      "android_binding": { "type": "xml_resource", "key": "devices_paired_date" },
+      "rust_binding": null
+    },
+
+    {
+      "universal_id": "settings_title",
+      "source_english": "Settings",
+      "android_binding": { "type": "xml_resource", "key": "settings_title" },
+      "rust_binding": { "type": "fluent_key", "key": "title-settings" }
+    },
+    {
+      "universal_id": "settings_about_encryption",
+      "source_english": "About Encryption",
+      "android_binding": { "type": "xml_resource", "key": "settings_about_encryption" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_csk_label",
+      "source_english": "Client Symmetric Key (CSK)",
+      "android_binding": { "type": "xml_resource", "key": "settings_csk_label" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_csk_description",
+      "source_english": "Each paired desktop client generates its own CSK and shares it with you during pairing. This key is used to encrypt all authentication communication. The CSK is controlled by the desktop client, not this app.",
+      "android_binding": { "type": "xml_resource", "key": "settings_csk_description" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_security_note",
+      "source_english": "Security Note",
+      "android_binding": { "type": "xml_resource", "key": "settings_security_note" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_security_note_description",
+      "source_english": "If a desktop client rotates its CSK, you will need to re-pair with that device. Each paired device maintains its own separate encryption key.",
+      "android_binding": { "type": "xml_resource", "key": "settings_security_note_description" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_about",
+      "source_english": "About",
+      "android_binding": { "type": "xml_resource", "key": "settings_about" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_background",
+      "source_english": "Background",
+      "android_binding": { "type": "xml_resource", "key": "settings_background" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_network_config",
+      "source_english": "Network Configuration",
+      "android_binding": { "type": "xml_resource", "key": "settings_network_config" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_udp_port_label",
+      "source_english": "UDP Port",
+      "android_binding": { "type": "xml_resource", "key": "settings_udp_port_label" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_udp_port_default",
+      "source_english": "Default: 36692 (Requires service restart if running)",
+      "android_binding": { "type": "xml_resource", "key": "settings_udp_port_default" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_port_must_be_number",
+      "source_english": "Must be a number",
+      "android_binding": { "type": "xml_resource", "key": "settings_port_must_be_number" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_port_min",
+      "source_english": "Port must be \u2265 1024",
+      "android_binding": { "type": "xml_resource", "key": "settings_port_min" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_port_max",
+      "source_english": "Port must be \u2264 65535",
+      "android_binding": { "type": "xml_resource", "key": "settings_port_max" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_allow_background",
+      "source_english": "Allow background operation / Battery optimizations",
+      "android_binding": { "type": "xml_resource", "key": "settings_allow_background" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_udp_service",
+      "source_english": "UDP Service",
+      "android_binding": { "type": "xml_resource", "key": "settings_udp_service" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_udp_listener_desc",
+      "source_english": "UDP listener for auth requests",
+      "android_binding": { "type": "xml_resource", "key": "settings_udp_listener_desc" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_ble_server",
+      "source_english": "BLE GATT Server",
+      "android_binding": { "type": "xml_resource", "key": "settings_ble_server" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_ble_desc",
+      "source_english": "BLE advertisement and GATT server",
+      "android_binding": { "type": "xml_resource", "key": "settings_ble_desc" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_failed_start_udp",
+      "source_english": "Failed to %1$s UDP service: %2$s",
+      "android_binding": { "type": "xml_resource", "key": "settings_failed_start_udp" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_failed_start_ble",
+      "source_english": "Failed to %1$s BLE service: %2$s",
+      "android_binding": { "type": "xml_resource", "key": "settings_failed_start_ble" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_location_required_title",
+      "source_english": "\u26a0\ufe0f Background Location Required",
+      "android_binding": { "type": "xml_resource", "key": "settings_location_required_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_location_required_description",
+      "source_english": "BLE scanning requires background location permission to work when the app is in the background.",
+      "android_binding": { "type": "xml_resource", "key": "settings_location_required_description" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_location_steps_title",
+      "source_english": "Steps to grant permission:",
+      "android_binding": { "type": "xml_resource", "key": "settings_location_steps_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_location_steps",
+      "source_english": "1. Tap 'Open Settings' below\n2. Tap 'Permissions'\n3. Tap 'Location'\n4. Select 'Allow all the time'",
+      "android_binding": { "type": "xml_resource", "key": "settings_location_steps" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_open_settings",
+      "source_english": "Open Settings",
+      "android_binding": { "type": "xml_resource", "key": "settings_open_settings" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_service_status",
+      "source_english": "Service status:",
+      "android_binding": { "type": "xml_resource", "key": "settings_service_status" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_udp_last_started",
+      "source_english": "UDP listener last started: %1$s",
+      "android_binding": { "type": "xml_resource", "key": "settings_udp_last_started" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_ble_last_started",
+      "source_english": "BLE GATT last started: %1$s",
+      "android_binding": { "type": "xml_resource", "key": "settings_ble_last_started" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_open_system_settings",
+      "source_english": "Open settings",
+      "android_binding": { "type": "xml_resource", "key": "settings_open_system_settings" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_allow_background_dialog_title",
+      "source_english": "Allow background operation?",
+      "android_binding": { "type": "xml_resource", "key": "settings_allow_background_dialog_title" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_allow_background_dialog_message",
+      "source_english": "To ensure TapAuth can respond to authentication requests while the app is closed, please allow the app to be excluded from battery optimizations. You will be taken to the system settings screen to do this.",
+      "android_binding": { "type": "xml_resource", "key": "settings_allow_background_dialog_message" },
+      "rust_binding": null
+    },
+    {
+      "universal_id": "settings_footer",
+      "source_english": "TapAuth - Secure biometric authentication",
+      "android_binding": { "type": "xml_resource", "key": "settings_footer" },
+      "rust_binding": null
+    },
+
+    {
+      "universal_id": "settings_config_section",
+      "source_english": "Configuration",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-config-section" }
+    },
+    {
+      "universal_id": "settings_hostname_label",
+      "source_english": "Hostname:",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-hostname-label" }
+    },
+    {
+      "universal_id": "settings_hostname_placeholder",
+      "source_english": "Enter hostname",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-hostname-placeholder" }
+    },
+    {
+      "universal_id": "settings_udp_port_label_rust",
+      "source_english": "UDP Port:",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-udp-port-label" }
+    },
+    {
+      "universal_id": "settings_udp_port_placeholder",
+      "source_english": "Enter UDP port (default: 36692)",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-udp-port-placeholder" }
+    },
+    {
+      "universal_id": "settings_save_button",
+      "source_english": "Save Configuration",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "btn-save-config" }
+    },
+    {
+      "universal_id": "settings_security_section",
+      "source_english": "Security",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-security-section" }
+    },
+    {
+      "universal_id": "settings_rotate_csk_button",
+      "source_english": "Rotate Client Symmetric Key",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "btn-rotate-csk" }
+    },
+    {
+      "universal_id": "settings_rotating",
+      "source_english": "Rotating...",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "label-rotating" }
+    },
+    {
+      "universal_id": "settings_csk_warning",
+      "source_english": "Warning: Rotating CSK will invalidate all paired devices.\nYou will need to re-pair them.",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-csk-warning" }
+    },
+    {
+      "universal_id": "settings_config_saved",
+      "source_english": "Configuration saved successfully.",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-config-saved" }
+    },
+    {
+      "universal_id": "settings_csk_rotated",
+      "source_english": "CSK rotated successfully. All pairings have been cleared.",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-csk-rotated" }
+    },
+    {
+      "universal_id": "settings_error_prefix",
+      "source_english": "Error: {$message}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "settings-error-prefix", "variables": {"message": "str"} }
+    },
+
+    {
+      "universal_id": "main_menu_title",
+      "source_english": "TapAuth Configuration",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "title-main-menu" }
+    },
+    {
+      "universal_id": "main_menu_manage_devices",
+      "source_english": "Manage Devices",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "btn-manage-devices" }
+    },
+    {
+      "universal_id": "main_menu_recover_keys",
+      "source_english": "Recover Keys (Will Clear Pairings)",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "btn-recover-keys" }
+    },
+    {
+      "universal_id": "main_menu_recovering",
+      "source_english": "Recovering...",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "label-recovering" }
+    },
+    {
+      "universal_id": "main_menu_recovery_success",
+      "source_english": "Recovery successful! Please restart the daemon and re-pair devices.",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "label-recovery-success" }
+    },
+    {
+      "universal_id": "main_menu_recovery_failed",
+      "source_english": "Recovery failed: {$error}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "label-recovery-failed", "variables": {"error": "str"} }
+    },
+    {
+      "universal_id": "main_menu_tpm_error",
+      "source_english": " {$error}",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "label-tpm-error", "variables": {"error": "str"} }
+    },
+
+    {
+      "universal_id": "system_error_user_missing_title",
+      "source_english": "System User Missing",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "error-user-missing-title" }
+    },
+    {
+      "universal_id": "system_error_user_missing_message",
+      "source_english": "The 'tapauthd' system user is required but was not found.\n\nThis user should have been created during installation.\n\nRecommended action:\n1. Log out and log back in (or restart your system)\n2. Try launching the application again\n\nIf the problem persists, you may need to create the user manually:\n    sudo useradd --system --no-create-home tapauthd",
+      "android_binding": null,
+      "rust_binding": { "type": "fluent_key", "key": "error-user-missing-message" }
+    }
+  ]
+}

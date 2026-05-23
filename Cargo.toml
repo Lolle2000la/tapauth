@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["shared", "client-pam", "client-config-gui", "tapauthd"]
+exclude = ["tests"]
+
+[workspace.dependencies]
+# Shared library (used by all consuming crates)
+shared = { path = "shared" }
+
+# Serialization
+prost = "0.14"
+prost-build = "0.14"
+bytes = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# Networking
+socket2 = "0.6"
+if-addrs = "0.15"
+
+# Utilities
+clap = "4.6"
+hex = "0.4"
+thiserror = "2.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+getrandom = "0.3"
+libc = "0.2"
+chrono = "0.4"
+once_cell = "1.21"
+nix = { version = "0.31", features = ["user"] }
+secrecy = "0.10"
