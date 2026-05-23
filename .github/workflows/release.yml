@@ -58,7 +58,7 @@ jobs:
           tar --transform "s|^\./|tapauth-${{ steps.version_vars.outputs.VERSION }}/|" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
           rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
 
-          copr-cli build lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
+          copr-cli build --nowait lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
 
   release-ubuntu-ppa:
     name: Ubuntu Launchpad PPA Source Delivery
