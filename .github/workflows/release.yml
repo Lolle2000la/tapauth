@@ -101,6 +101,9 @@ jobs:
           else
             cargo vendor > .cargo/config.toml
           fi
+          # cargo vendor creates .orig backup files that dpkg-source
+          # interprets as "deleted from the orig tarball" — clean them
+          find vendor/ -name '*.orig' -delete 2>/dev/null || true
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
@@ -204,9 +207,12 @@ jobs:
 
             GPG_ARGS="--batch --pinentry-mode loopback --yes --no-tty"
             if [ -n "${GPG_PASSPHRASE:-}" ]; then
-              GPG_ARGS="${GPG_ARGS} --passphrase '${GPG_PASSPHRASE}'"
+              printf '%s' "${GPG_PASSPHRASE}" > /tmp/gpg-passphrase
+              chmod 600 /tmp/gpg-passphrase
+              GPG_ARGS="${GPG_ARGS} --passphrase-file /tmp/gpg-passphrase"
             fi
             debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            rm -f /tmp/gpg-passphrase
 
             dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
           done
