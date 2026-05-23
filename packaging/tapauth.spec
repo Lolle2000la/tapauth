@@ -50,6 +50,8 @@ install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 
 %post
+%sysusers_create_compat %{_sysusersdir}/tapauth.conf
+%tmpfiles_create %{_tmpfilesdir}/tapauth.conf
 %systemd_post tapauthd.service tapauthd.socket
 
 %preun
