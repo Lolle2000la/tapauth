@@ -14,6 +14,9 @@ BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pam-devel
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
 
 %description
 A modern, privacy-preserving local-first authentication system using Rust PAM modules,
@@ -44,6 +47,15 @@ install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
 # Structural Declarations
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
+
+%post
+%systemd_post tapauthd.service tapauthd.socket
+
+%preun
+%systemd_preun tapauthd.service tapauthd.socket
+
+%postun
+%systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %files
 %{_bindir}/tapauthd
