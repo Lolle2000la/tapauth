@@ -216,7 +216,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     if: ${{ !github.event.release.prerelease }}
-    needs: [release-fedora-copr, release-ubuntu-ppa]
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
