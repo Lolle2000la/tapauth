@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper dput
+          sudo apt-get install -y devscripts debhelper dput jq
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -107,6 +107,12 @@ jobs:
           else
             cargo vendor > .cargo/config.toml
           fi
+          # Newer cargo vendor no longer creates Cargo.toml.orig backups
+          # but .cargo-checksum.json may still reference them from the
+          # registry — strip stale entries so old cargo on builders
+          # doesn't try to verify nonexistent files.
+          find vendor/ -name .cargo-checksum.json -exec sh -c \
+            'jq ".files |= with_entries(select(.key | test(\"\\\\.orig$\") | not))" "$1" > "$1.tmp" && mv "$1.tmp" "$1"' _ {} \; || true
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
@@ -235,7 +241,7 @@ jobs:
             # before first attempt on any series after the first, then
             # retry with escalating backoff.
             if [ "${FIRST_UPLOAD_DONE}" = "1" ]; then
-              sleep 60
+              sleep 90
             fi
             for ATTEMPT in 1 2 3; do
               if dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes; then
