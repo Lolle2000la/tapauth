@@ -1,3 +1,7 @@
+# Rust --release produces stripped binaries; disable automatic debuginfo
+# subpackage generation to avoid empty debugsourcefiles.list errors on RHEL
+%global debug_package %{nil}
+
 Name:           tapauth
 Version:        %{?pkgversion}%{!?pkgversion:0.1.0}
 Release:        1%{?dist}
@@ -10,7 +14,11 @@ Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
+%if 0%{?suse_version}
+BuildRequires:  protobuf-devel
+%else
 BuildRequires:  protobuf-compiler
+%endif
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pkgconfig(gtk4)
