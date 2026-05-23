@@ -53,7 +53,9 @@ jobs:
           CURRENT_DATE=$(date +"%a %b %d %Y")
           echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
 
-          tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
+          # Strip the ./ prefix before adding the versioned directory so
+          # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths
+          tar --transform "s|^\./|tapauth-${{ steps.version_vars.outputs.VERSION }}/|" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
           rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
 
           copr-cli build lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
