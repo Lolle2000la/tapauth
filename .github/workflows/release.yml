@@ -111,7 +111,7 @@ jobs:
           Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, libgtk-4-dev
 
           Package: tapauth
-          Architecture: amd64 arm64
+          Architecture: any
           Depends: \${shlibs:Depends}, \${misc:Depends}
           Description: Local smartphone-based authentication framework
           EOF
