@@ -15,7 +15,7 @@ jobs:
     if: ${{ !github.event.release.prerelease }}
     steps:
       - name: Checkout Source Context
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Initialize System Build Dependencies
         run: |
@@ -71,7 +71,7 @@ jobs:
       GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - name: Checkout Source Context
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Initialize System Build Dependencies
         run: |
@@ -273,7 +273,7 @@ jobs:
     if: ${{ !github.event.release.prerelease }}
     steps:
       - name: Checkout Source Context
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Extract Dynamic Version Context
         id: version_vars
@@ -379,7 +379,7 @@ jobs:
     environment: release
     steps:
       - name: Checkout Source Context
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Extract Dynamic Version Context
         id: version_vars
