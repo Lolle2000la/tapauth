@@ -44,12 +44,17 @@ jobs:
           mkdir -p rpmbuild/{SOURCES,SRPMS,SPECS,BUILD}
           cp packaging/tapauth.spec rpmbuild/SPECS/tapauth.spec
 
-          # Dynamically append changelog entries to avoid fragile sed macros inside metadata lines
+          # Hardcode the release version into the spec so COPR's SRPM
+          # rebuild sees it; the conditional pkgversion macro doesn't
+          # survive COPR's dist-git extraction.
+          sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
+
+          # Dynamically append changelog entries
           CURRENT_DATE=$(date +"%a %b %d %Y")
           echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
 
           tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
-          rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild" --define "pkgversion ${{ steps.version_vars.outputs.VERSION }}"
+          rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
 
           copr-cli build lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
 
