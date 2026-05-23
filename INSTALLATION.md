@@ -2,6 +2,45 @@
 
 This guide covers the installation and uninstallation of TapAuth using the interactive scripts.
 
+## Native Distribution Packages
+
+Instead of managing manual compilation chains or using imperative fallback installation binaries, you can track native repositories integrated with systemic package validation tools:
+
+### 1. Fedora Linux / Enterprise Linux (RHEL Matrix)
+Stable pre-built binary target archives are compiled, integrated, and tracked using Fedora COPR.
+```bash
+sudo dnf copr enable lolle2000la/tapauth
+sudo dnf install tapauth
+```
+* **PAM Authentication Configuration:** Fedora systems require explicit management loops via `authselect`. Do not overwrite systemic file descriptors under `/etc/pam.d/` directly. Enable integration patterns utilizing:
+```bash
+sudo authselect enable-feature with-tapauth
+```
+
+### 2. Ubuntu / Debian Derivatives
+Upstream deployment targets are tracked natively via Launchpad Personal Package Archives (PPA).
+```bash
+sudo add-apt-repository ppa:lolle2000la/tapauth
+sudo apt-get update
+sudo apt-get install tapauth
+```
+* **PAM Authentication Configuration:** Debian platforms consume a standardized declarative verification matrix profiles layer. Installation automatically registers hooks inside the `pam-auth-update` manager. To configure, toggle manually by calling:
+```bash
+sudo pam-auth-update
+```
+
+### 3. Arch Linux / CachyOS
+Package metadata configurations are distributed directly via the Arch User Repository (AUR).
+```bash
+paru -S tapauth
+# or alternatively
+yay -S tapauth
+```
+* **PAM Authentication Configuration:** Arch Linux maintains system configurations natively without implicit post-install script side-effects. To complete activation loops, manually add your preference rules right inside your selected auth tracking layout files (e.g., `/etc/pam.d/system-auth`):
+```text
+auth      sufficient      pam_tapauth.so
+```
+
 ## Supported Distributions
 
 The installation scripts automatically detect and support the following Linux distributions:
