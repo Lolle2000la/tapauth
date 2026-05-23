@@ -2,11 +2,10 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.spotless)
     id("kotlin-parcelize")
-    id("org.mozilla.rust-android-gradle.rust-android")
+    id("net.mullvad.rust-android")
 }
 
 // Dynamic ABI filtering: when Android Studio deploys to a specific device/emulator
@@ -107,7 +106,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; resValues = true }
 }
 
 dependencies {
