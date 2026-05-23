@@ -216,7 +216,7 @@ jobs:
           # Target the two most recent Ubuntu LTS releases; Launchpad's
           # "Supported" status includes ancient ESM series which lack
           # the build dependencies (cargo, rust) we need.
-          ACTIVE_SERIES="noble"
+          ACTIVE_SERIES="resolute noble"
           echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
           FIRST=1
