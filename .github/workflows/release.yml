@@ -61,6 +61,7 @@ jobs:
     env:
       DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
       DEBFULLNAME: "Luca Auer"
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
@@ -68,7 +69,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput jq
+          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -190,14 +191,23 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
           cd "tapauth-${VERSION}"
 
-          ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status == "Current Stable Release" or .status == "Supported" or .status == "Active Development") | .name')
-          echo "Targeting Ubuntu series: $(echo $ACTIVE_SERIES | tr '\n' ' ')"
+          # Target the two most recent Ubuntu LTS releases; Launchpad's
+          # "Supported" status includes ancient ESM series which lack
+          # the build dependencies (cargo, rust) we need.
+          ACTIVE_SERIES="noble jammy"
+          echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
-          for SERIES in $ACTIVE_SERIES; do
+          for SERIES in ${ACTIVE_SERIES}; do
             rm -f debian/changelog
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
             dpkg-buildpackage -S -us -uc -d
-            debsign -p "gpg --batch --pinentry-mode loopback --yes --no-tty" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+
+            GPG_ARGS="--batch --pinentry-mode loopback --yes --no-tty"
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              GPG_ARGS="${GPG_ARGS} --passphrase '${GPG_PASSPHRASE}'"
+            fi
+            debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+
             dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
           done
 
