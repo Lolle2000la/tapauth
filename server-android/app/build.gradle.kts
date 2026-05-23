@@ -2,11 +2,10 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.spotless)
     id("kotlin-parcelize")
-    id("org.mozilla.rust-android-gradle.rust-android")
+    id("net.mullvad.rust-android")
 }
 
 // Dynamic ABI filtering: when Android Studio deploys to a specific device/emulator
@@ -56,12 +55,25 @@ android {
     System.getenv("ANDROID_NDK_HOME")?.let { ndkPath = it }
         ?: System.getenv("ANDROID_NDK_ROOT")?.let { ndkPath = it }
 
+    // CI release signing: configure from environment if a keystore is provided
+    val keystoreB64: String? = System.getenv("ANDROID_KEYSTORE_B64")
+    if (!keystoreB64.isNullOrEmpty()) {
+        signingConfigs {
+            create("ciRelease") {
+                storeFile = rootProject.file("release.keystore")
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "tapauth"
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: storePassword
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "dev.rourunisen.tapauth"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = (System.getenv("VERSION_CODE")?.toIntOrNull() ?: 1)
+        versionName = (System.getenv("VERSION_NAME") ?: "1.0")
         ndkVersion = "30.0.14904198"
 
         testInstrumentationRunner = "dev.rourunisen.tapauth.crypto.TapAuthTestRunner"
@@ -74,6 +86,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // Apply CI signing config when available
+            val ciReleaseSigning = signingConfigs.findByName("ciRelease")
+            if (ciReleaseSigning != null) {
+                signingConfig = ciReleaseSigning
+            }
         }
         debug {
             // Use different application ID suffix for debug builds
@@ -88,7 +105,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        resValues = true
+    }
 }
 
 dependencies {
