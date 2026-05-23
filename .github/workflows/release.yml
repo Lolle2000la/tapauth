@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper dput
+          sudo apt-get install -y devscripts debhelper dput jq
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -115,6 +115,21 @@ jobs:
           # the build will fail at compile time (not parse time) and
           # we'll pin an older version of that specific crate.
           find vendor/ -name Cargo.toml -exec sed -i 's/edition\s*=\s*"2024"/edition = "2021"/g' {} +
+          # Fix .cargo-checksum.json: drop .orig entries (may not exist
+          # after vendor) and recompute Cargo.toml checksums we touched.
+          for checksum in vendor/*/.cargo-checksum.json; do
+            [ -f "$checksum" ] || continue
+            dir=$(dirname "$checksum")
+            jq --argjson files "$(
+              for f in "$dir"/*; do
+                base=$(basename "$f")
+                [ "$base" = ".cargo-checksum.json" ] && continue
+                case "$base" in *.orig) continue ;; esac
+                sha=$(sha256sum "$f" | cut -d' ' -f1)
+                printf '{"%s":"%s"}\n' "$base" "$sha"
+              done | jq -s 'add'
+            )" '.files = $files' "$checksum" > "$checksum.tmp" && mv "$checksum.tmp" "$checksum"
+          done
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
