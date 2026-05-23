@@ -24,27 +24,15 @@ jobs:
           CLEAN_VER="${GITHUB_REF_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
 
-      - name: Execute COPR API Token Validation Check
+      - name: Validate COPR Authentication Token
         run: |
           mkdir -p ~/.config
           echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
           chmod 600 ~/.config/copr
-
-          # Robust check that fails closed if structural metadata is missing
-          EXP_DATE=$(grep -i 'expiration date' ~/.config/copr | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
-          if [ -z "$EXP_DATE" ]; then
-            echo "::error:: COPR Token Expiration Date comment not found in COPR_CONFIG secret! Please add '# expiration date: YYYY-MM-DD' to your secret."
+          pip install copr-cli
+          if ! copr-cli whoami; then
+            echo "::error:: COPR authentication failed — token may be expired or invalid."
             exit 1
-          fi
-          CURRENT_SEC=$(date +%s)
-          EXP_SEC=$(date -d "$EXP_DATE" +%s)
-          DIFF_DAYS=$(( (EXP_SEC - CURRENT_SEC) / 86400 ))
-          echo "COPR token verification guard: $DIFF_DAYS days remaining."
-          if [ "$DIFF_DAYS" -le 0 ]; then
-            echo "::error:: COPR Integration Key has expired. Aborting release."
-            exit 1
-          elif [ "$DIFF_DAYS" -le 14 ]; then
-            echo "::warning:: COPR Key inside safety warning window ($DIFF_DAYS days remaining)."
           fi
 
       - name: Build and Transmit Source RPM (SRPM)
@@ -56,7 +44,7 @@ jobs:
           CURRENT_DATE=$(date +"%a %b %d %Y")
           echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
 
-          tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=rpmbuild .
+          tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
           rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild" --define "pkgversion ${{ steps.version_vars.outputs.VERSION }}"
 
           pip install copr-cli
@@ -181,13 +169,16 @@ jobs:
           PARENT_DIR=$(basename $(pwd))
           cd ..
           tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
-          cd "${PARENT_DIR}"
 
-          # Query Launchpad API for all active (non-obsolete) Ubuntu series
+          # dpkg-buildpackage requires the working directory to match the source-version scheme
+          ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
+          cd "tapauth-${VERSION}"
+
           ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status != "Obsolete" and .status != "Future") | .name')
           echo "Targeting Ubuntu series: $(echo $ACTIVE_SERIES | tr '\n' ' ')"
 
           for SERIES in $ACTIVE_SERIES; do
+            rm -f debian/changelog
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
             dpkg-buildpackage -S -us -uc -d
             debsign -k "${{ secrets.GPG_KEY_ID }}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
