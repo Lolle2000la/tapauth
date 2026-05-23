@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper dput jq
+          sudo apt-get install -y devscripts debhelper dput
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,35 +101,12 @@ jobs:
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
           mkdir -p .cargo
-          # Append vendor sources to any existing config so future build flags are preserved
           if [ -f .cargo/config.toml ]; then
             cp .cargo/config.toml .cargo/config.toml.bak
             cargo vendor >> .cargo/config.toml
           else
             cargo vendor > .cargo/config.toml
           fi
-          # Launchpad noble/resolute use older cargo which can't
-          # parse edition="2024" manifests. Rewrite them to "2021".
-          # Most crates bump the edition field without actually using
-          # 2024-only features — if a crate genuinely requires them,
-          # the build will fail at compile time (not parse time) and
-          # we'll pin an older version of that specific crate.
-          find vendor/ -name Cargo.toml -exec sed -i 's/edition\s*=\s*"2024"/edition = "2021"/g' {} +
-          # Fix .cargo-checksum.json: drop .orig entries (may not exist
-          # after vendor) and recompute Cargo.toml checksums we touched.
-          for checksum in vendor/*/.cargo-checksum.json; do
-            [ -f "$checksum" ] || continue
-            dir=$(dirname "$checksum")
-            jq --argjson files "$(
-              for f in "$dir"/*; do
-                base=$(basename "$f")
-                [ "$base" = ".cargo-checksum.json" ] && continue
-                case "$base" in *.orig) continue ;; esac
-                sha=$(sha256sum "$f" | cut -d' ' -f1)
-                printf '{"%s":"%s"}\n' "$base" "$sha"
-              done | jq -s 'add'
-            )" '.files = $files' "$checksum" > "$checksum.tmp" && mv "$checksum.tmp" "$checksum"
-          done
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
@@ -165,12 +142,7 @@ jobs:
           	dh \$@
 
           override_dh_auto_build:
-          	# Cargo 1.75 (noble) cannot even parse Cargo.lock v4 — delete
-          	# it and let cargo regenerate a v3-format lock from vendors.
-          	# --offline keeps the build sandboxed (Launchpad builders lack
-          	# internet access). The vendored crates are complete.
-          	rm -f Cargo.lock
-          	cargo build --workspace --release --offline
+          	cargo build --workspace --release --offline --frozen
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
@@ -229,7 +201,7 @@ jobs:
           # Target the two most recent Ubuntu LTS releases; Launchpad's
           # "Supported" status includes ancient ESM series which lack
           # the build dependencies (cargo, rust) we need.
-          ACTIVE_SERIES="resolute noble"
+          ACTIVE_SERIES="resolute"
           echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
           FIRST=1
