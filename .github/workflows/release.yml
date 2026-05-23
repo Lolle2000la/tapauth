@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput
+          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput jq
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -183,7 +183,11 @@ jobs:
           tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
           cd "${PARENT_DIR}"
 
-          for SERIES in noble jammy; do
+          # Query Launchpad API for all active (non-obsolete) Ubuntu series
+          ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status != "Obsolete" and .status != "Future") | .name')
+          echo "Targeting Ubuntu series: $(echo $ACTIVE_SERIES | tr '\n' ' ')"
+
+          for SERIES in $ACTIVE_SERIES; do
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
             dpkg-buildpackage -S -us -uc -d
             debsign -k "${{ secrets.GPG_KEY_ID }}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
