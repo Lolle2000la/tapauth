@@ -79,6 +79,13 @@ jobs:
       - name: Configure GPG Verification Keyring
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_FPR=$(gpg --with-colons --list-secret-keys --keyid-format LONG | grep '^sec:' | cut -d: -f5)
+          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> $GITHUB_ENV
+          # Configure GPG for headless (non-TTY) signing
+          mkdir -p ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent || true
 
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
@@ -180,14 +187,14 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
           cd "tapauth-${VERSION}"
 
-          ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status != "Obsolete" and .status != "Future") | .name')
+          ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status == "Current Stable Release" or .status == "Supported" or .status == "Active Development") | .name')
           echo "Targeting Ubuntu series: $(echo $ACTIVE_SERIES | tr '\n' ' ')"
 
           for SERIES in $ACTIVE_SERIES; do
             rm -f debian/changelog
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
             dpkg-buildpackage -S -us -uc -d
-            debsign -k "${{ secrets.GPG_KEY_ID }}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            debsign -p "gpg --batch --pinentry-mode loopback --yes --no-tty" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
             dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
           done
 
