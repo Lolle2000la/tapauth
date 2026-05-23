@@ -47,7 +47,6 @@ jobs:
           tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
           rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild" --define "pkgversion ${{ steps.version_vars.outputs.VERSION }}"
 
-          pip install copr-cli
           copr-cli build lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
 
   release-ubuntu-ppa:
@@ -82,8 +81,13 @@ jobs:
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
           mkdir -p .cargo
-          # Redirect output directly to prevent duplicate keys in configuration files
-          cargo vendor > .cargo/config.toml
+          # Append vendor sources to any existing config so future build flags are preserved
+          if [ -f .cargo/config.toml ]; then
+            cp .cargo/config.toml .cargo/config.toml.bak
+            cargo vendor >> .cargo/config.toml
+          else
+            cargo vendor > .cargo/config.toml
+          fi
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
@@ -168,7 +172,7 @@ jobs:
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))
           cd ..
-          tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
+          tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" --exclude="${PARENT_DIR}/rpmbuild" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
 
           # dpkg-buildpackage requires the working directory to match the source-version scheme
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"

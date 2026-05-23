@@ -18,6 +18,10 @@ BuildRequires:  pam-devel
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
+Requires:       pam
+Requires:       gtk4
+Requires:       dbus-libs
+Requires:       systemd-libs
 
 %description
 A modern, privacy-preserving local-first authentication system using Rust PAM modules,
@@ -35,6 +39,7 @@ mkdir -p %{buildroot}%{_libdir}/security
 mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysusersdir}
 mkdir -p %{buildroot}%{_tmpfilesdir}
+mkdir -p %{buildroot}%{_datadir}/doc/tapauth
 
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
@@ -48,6 +53,7 @@ install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
 # Structural Declarations
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
+install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth/pam-config.example
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -69,3 +75,4 @@ install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 %{_unitdir}/tapauthd.socket
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
+%doc %{_datadir}/doc/tapauth/pam-config.example
