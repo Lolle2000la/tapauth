@@ -145,9 +145,11 @@ jobs:
           	dh \$@
 
           override_dh_auto_build:
-          	# --offline uses vendored crates; drop --frozen so cargo can
-          	# transparently downgrade the lock file format for older toolchains
-          	# (e.g. noble's cargo 1.75 can't read Cargo.lock v4)
+          	# Cargo 1.75 (noble) cannot even parse Cargo.lock v4 — delete
+          	# it and let cargo regenerate a v3-format lock from vendors.
+          	# --offline keeps the build sandboxed (Launchpad builders lack
+          	# internet access). The vendored crates are complete.
+          	rm -f Cargo.lock
           	cargo build --workspace --release --offline
 
           override_dh_auto_install:
