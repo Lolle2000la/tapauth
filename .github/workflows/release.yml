@@ -4,6 +4,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   release-fedora-copr:
     name: Fedora COPR Build Delivery
@@ -41,14 +44,21 @@ jobs:
           mkdir -p rpmbuild/{SOURCES,SRPMS,SPECS,BUILD}
           cp packaging/tapauth.spec rpmbuild/SPECS/tapauth.spec
 
-          # Dynamically append changelog entries to avoid fragile sed macros inside metadata lines
+          # Hardcode the release version into the spec so COPR's SRPM
+          # rebuild sees it; the conditional pkgversion macro doesn't
+          # survive COPR's dist-git extraction.
+          sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
+
+          # Dynamically append changelog entries
           CURRENT_DATE=$(date +"%a %b %d %Y")
           echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
 
-          tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
-          rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild" --define "pkgversion ${{ steps.version_vars.outputs.VERSION }}"
+          # Strip the ./ prefix before adding the versioned directory so
+          # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths
+          tar --transform "s|^\./|tapauth-${{ steps.version_vars.outputs.VERSION }}/|" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
+          rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
 
-          copr-cli build lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
+          copr-cli build --nowait lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm
 
   release-ubuntu-ppa:
     name: Ubuntu Launchpad PPA Source Delivery
@@ -58,6 +68,7 @@ jobs:
     env:
       DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
       DEBFULLNAME: "Luca Auer"
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
@@ -65,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput jq
+          sudo apt-get install -y devscripts debhelper dput
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -79,11 +90,17 @@ jobs:
       - name: Configure GPG Verification Keyring
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_FPR=$(gpg --with-colons --list-secret-keys --keyid-format LONG | grep '^sec:' | cut -d: -f5)
+          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> $GITHUB_ENV
+          # Configure GPG for headless (non-TTY) signing
+          mkdir -p ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent || true
 
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
           mkdir -p .cargo
-          # Append vendor sources to any existing config so future build flags are preserved
           if [ -f .cargo/config.toml ]; then
             cp .cargo/config.toml .cargo/config.toml.bak
             cargo vendor >> .cargo/config.toml
@@ -102,7 +119,8 @@ jobs:
           Section: admin
           Priority: optional
           Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-          Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, libgtk-4-dev
+          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev
+          Standards-Version: 4.7.0
 
           Package: tapauth
           Architecture: any
@@ -119,12 +137,22 @@ jobs:
           #!/usr/bin/make -f
 
           DEB_HOST_MULTIARCH ?= \$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+          # On jammy/noble, cargo-1.91 supplies /usr/bin/cargo-1.91 (not cargo).
+          # On resolute, the default cargo >= 1.93 is fine as-is.
+          CARGO := \$(shell which cargo-1.91 2>/dev/null || which cargo)
+          RUSTC := \$(shell which rustc-1.91 2>/dev/null || which rustc)
 
           %:
           	dh \$@
 
+          override_dh_clean:
+          	# dh_clean deletes *.orig files by default, which breaks
+          	# vendored crates that ship legitimate .orig assets.
+          	# Exclude the entire vendor directory from cleanup.
+          	dh_clean -Xvendor/
+
           override_dh_auto_build:
-          	cargo build --workspace --release --frozen --offline
+          	\$(CARGO) build --workspace --release --offline --frozen
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
@@ -133,6 +161,9 @@ jobs:
           	mkdir -p debian/tapauth/usr/lib/sysusers.d
           	mkdir -p debian/tapauth/usr/lib/tmpfiles.d
           	mkdir -p debian/tapauth/usr/share/pam-configs
+          	mkdir -p debian/tapauth/usr/share/applications
+          	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
+          	mkdir -p debian/tapauth/usr/share/polkit-1/actions
           	
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
@@ -142,6 +173,9 @@ jobs:
           	cp packaging/sysusers.conf debian/tapauth/usr/lib/sysusers.d/tapauth.conf
           	cp packaging/tmpfiles.conf debian/tapauth/usr/lib/tmpfiles.d/tapauth.conf
           	cp packaging/debian.pam-config debian/tapauth/usr/share/pam-configs/tapauth
+          	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
+          	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
+          	cp client-config-gui/dev.rourunisen.tapauth.policy debian/tapauth/usr/share/polkit-1/actions/
           EOF
           chmod +x debian/rules
 
@@ -150,6 +184,8 @@ jobs:
           #!/bin/sh
           set -e
           if [ "\$1" = "configure" ]; then
+          	systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+          	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
           	if command -v pam-auth-update >/dev/null 2>&1; then
           		pam-auth-update --package
           	fi
@@ -166,6 +202,10 @@ jobs:
           		pam-auth-update --package
           	fi
           fi
+          if [ "\$1" = "purge" ]; then
+          	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf || true
+          	systemd-sysusers --remove /usr/lib/sysusers.d/tapauth.conf || true
+          fi
           #DEBHELPER#
           exit 0
           EOF
@@ -180,15 +220,50 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
           cd "tapauth-${VERSION}"
 
-          ACTIVE_SERIES=$(curl -sL "https://api.launchpad.net/devel/ubuntu/series" | jq -r '.entries[] | select(.status != "Obsolete" and .status != "Future") | .name')
-          echo "Targeting Ubuntu series: $(echo $ACTIVE_SERIES | tr '\n' ' ')"
+          # Use rustc-1.91/cargo-1.91 backports on older series.
+          ACTIVE_SERIES="jammy noble resolute"
+          echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
-          for SERIES in $ACTIVE_SERIES; do
+          FIRST=1
+          FIRST_UPLOAD_DONE=0
+          for SERIES in ${ACTIVE_SERIES}; do
             rm -f debian/changelog
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
             dpkg-buildpackage -S -us -uc -d
-            debsign -k "${{ secrets.GPG_KEY_ID }}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
-            dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+
+            # The orig tarball is identical across series — Launchpad
+            # rejects duplicate uploads, so strip it before signing
+            if [ "${FIRST}" != "1" ]; then
+              sed -i '/\.orig\.tar\.gz/d' ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            fi
+            FIRST=0
+
+            GPG_ARGS="--batch --pinentry-mode loopback --yes --no-tty"
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              printf '%s' "${GPG_PASSPHRASE}" > /tmp/gpg-passphrase
+              chmod 600 /tmp/gpg-passphrase
+              GPG_ARGS="${GPG_ARGS} --passphrase-file /tmp/gpg-passphrase"
+            fi
+            debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            rm -f /tmp/gpg-passphrase
+
+            # dput can receive 550 internal-server errors when
+            # consecutive uploads for different series arrive before
+            # Launchpad's queue has ingested the first one. Wait 90s
+            # before first attempt on any series after the first, then
+            # retry with escalating backoff.
+            if [ "${FIRST_UPLOAD_DONE}" = "1" ]; then
+              sleep 90
+            fi
+            for ATTEMPT in 1 2 3; do
+              if dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes; then
+                echo "dput succeeded on attempt ${ATTEMPT}"
+                break
+              fi
+              echo "dput failed on attempt ${ATTEMPT} (exit $?), retrying..."
+              sleep $((2 ** (3 + ATTEMPT)))
+            done
+            FIRST_UPLOAD_DONE=1
           done
 
   release-arch-aur:
@@ -196,7 +271,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     if: ${{ !github.event.release.prerelease }}
-    needs: [release-fedora-copr, release-ubuntu-ppa]
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
@@ -241,14 +315,22 @@ jobs:
           arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
           license=('Apache-2.0')
-          depends=('dbus' 'gtk4' 'pam')
+          depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
+          prepare() {
+            cd "\$srcdir/\$pkgname-\$pkgver"
+            export CARGO_HOME="\${srcdir}/cargo-home"
+            cargo fetch --locked --target "\$CARCH-unknown-linux-gnu"
+          }
+
           build() {
             cd "\$srcdir/\$pkgname-\$pkgver"
-            cargo build --workspace --release
+            export CARGO_HOME="\${srcdir}/cargo-home"
+            export CARGO_PROFILE_RELEASE_STRIP=true
+            cargo build --frozen --workspace --release
           }
 
           package() {
@@ -260,6 +342,9 @@ jobs:
             install -Dm0644 systemd/tapauthd.socket "\$pkgdir/usr/lib/systemd/system/tapauthd.socket"
             install -Dm0644 packaging/sysusers.conf "\$pkgdir/usr/lib/sysusers.d/tapauth.conf"
             install -Dm0644 packaging/tmpfiles.conf "\$pkgdir/usr/lib/tmpfiles.d/tapauth.conf"
+            install -Dm0644 client-config-gui/tapauth-config.desktop "\$pkgdir/usr/share/applications/tapauth-config.desktop"
+            install -Dm0644 client-config-gui/assets/tapauth-config.svg "\$pkgdir/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
+            install -Dm0644 client-config-gui/dev.rourunisen.tapauth.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
           }
           EOF
@@ -277,7 +362,6 @@ jobs:
           	makedepends = rust
           	makedepends = protobuf
           	depends = dbus
-          	depends = gtk4
           	depends = pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
           	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}

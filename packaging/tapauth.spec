@@ -1,3 +1,7 @@
+# Rust --release produces stripped binaries; disable automatic debuginfo
+# subpackage generation to avoid empty debugsourcefiles.list errors on RHEL
+%global debug_package %{nil}
+
 Name:           tapauth
 Version:        %{?pkgversion}%{!?pkgversion:0.1.0}
 Release:        1%{?dist}
@@ -10,16 +14,18 @@ Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
+%if 0%{?suse_version}
+BuildRequires:  protobuf-devel
+%else
 BuildRequires:  protobuf-compiler
+%endif
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
-BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pam-devel
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 Requires:       pam
-Requires:       gtk4
 Requires:       dbus-libs
 Requires:       systemd-libs
 
@@ -40,6 +46,9 @@ mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysusersdir}
 mkdir -p %{buildroot}%{_tmpfilesdir}
 mkdir -p %{buildroot}%{_datadir}/doc/tapauth
+mkdir -p %{buildroot}%{_datadir}/applications
+mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
+mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
 
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
@@ -54,6 +63,9 @@ install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth/pam-config.example
+install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}/applications/tapauth-config.desktop
+install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
+install -m 0644 client-config-gui/dev.rourunisen.tapauth.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.policy
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -76,3 +88,6 @@ install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
 %doc %{_datadir}/doc/tapauth/pam-config.example
+%{_datadir}/applications/tapauth-config.desktop
+%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
+%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.policy
