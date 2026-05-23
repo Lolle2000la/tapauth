@@ -9,6 +9,7 @@ jobs:
     name: Fedora COPR Build Delivery
     runs-on: ubuntu-latest
     environment: release
+    if: ${{ !github.event.release.prerelease }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
@@ -53,6 +54,7 @@ jobs:
     name: Ubuntu Launchpad PPA Source Delivery
     runs-on: ubuntu-latest
     environment: release
+    if: ${{ !github.event.release.prerelease }}
     env:
       DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
       DEBFULLNAME: "Luca Auer"
@@ -193,6 +195,7 @@ jobs:
     name: Arch User Repository (AUR) Sync
     runs-on: ubuntu-latest
     environment: release
+    if: ${{ !github.event.release.prerelease }}
     needs: [release-fedora-copr, release-ubuntu-ppa]
     steps:
       - name: Checkout Source Context
@@ -299,8 +302,10 @@ jobs:
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
-          # Derive monotonically increasing versionCode from semver
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_VER"
+          # Derive monotonically increasing versionCode from semver;
+          # strip prerelease suffix so beta tags produce a valid integer
+          SEMVER="${CLEAN_VER%%-*}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
           VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
           echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_OUTPUT
 
