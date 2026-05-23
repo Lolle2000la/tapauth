@@ -2,6 +2,42 @@
 
 This guide covers the installation and uninstallation of TapAuth using the interactive scripts.
 
+## Native Distribution Packages
+
+You can install tapauth via native package repositories to receive automatic updates verified by your system's package manager.
+
+### 1. Fedora Linux
+Packages are built and tracked using Fedora COPR.
+```bash
+sudo dnf copr enable lolle2000la/tapauth
+sudo dnf install tapauth
+```
+* **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. A reference PAM config is installed at `/usr/share/doc/tapauth/pam-config.example`. To integrate TapAuth, create a custom authselect profile based on your current setup and add `auth sufficient pam_tapauth.so` to the profile's system-auth template.
+
+### 2. Ubuntu
+Packages are published via a Launchpad Personal Package Archive (PPA).
+```bash
+sudo add-apt-repository ppa:lolle2000la/tapauth
+sudo apt-get update
+sudo apt-get install tapauth
+```
+* **PAM Configuration:** Installation automatically registers a module profile hook. To toggle or configure the module non-interactively, run:
+```bash
+sudo pam-auth-update
+```
+
+### 3. Arch Linux / CachyOS
+The source package metadata configuration is available via the Arch User Repository (AUR).
+```bash
+paru -S tapauth
+# or alternatively
+yay -S tapauth
+```
+* **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
+```text
+auth      sufficient      pam_tapauth.so
+```
+
 ## Supported Distributions
 
 The installation scripts automatically detect and support the following Linux distributions:

@@ -1,0 +1,13 @@
+# TapAuth PAM module configuration example.
+# Add the following line to your PAM service file (e.g. /etc/pam.d/system-auth
+# for login, or /etc/pam.d/sudo for sudo) to enable phone-based authentication:
+#
+#   auth    sufficient    pam_tapauth.so
+#
+# For Fedora systems using authselect, create a custom profile first:
+#   sudo authselect create-profile tapauth-custom -b sssd
+# then edit /etc/authselect/custom/tapauth-custom/system-auth
+# and apply with: sudo authselect select custom/tapauth-custom
+#
+# For Arch Linux, manually add the line to /etc/pam.d/system-auth.
+# For Ubuntu/Debian, use: sudo pam-auth-update

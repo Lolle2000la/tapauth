@@ -1,0 +1,6 @@
+Name: TapAuth Phone Authentication Module
+Default: yes
+Priority: 256
+Auth-Type: Primary
+Auth:
+	sufficient	pam_tapauth.so
