@@ -63,8 +63,7 @@ android {
                 storeFile = rootProject.file("release.keystore")
                 storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "tapauth"
-                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
-                    ?: storePassword
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: storePassword
             }
         }
     }
@@ -106,7 +105,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    buildFeatures { compose = true; resValues = true }
+    buildFeatures {
+        compose = true
+        resValues = true
+    }
 }
 
 dependencies {
