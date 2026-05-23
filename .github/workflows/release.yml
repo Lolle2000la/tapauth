@@ -49,7 +49,10 @@ jobs:
         run: |
           mkdir -p rpmbuild/{SOURCES,SRPMS,SPECS,BUILD}
           cp packaging/tapauth.spec rpmbuild/SPECS/tapauth.spec
+          # Parameterize version strings and dynamically generate native changelog date headers
           sed -i "s/%{version}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
+          CURRENT_DATE=$(date +"%a %b %d %Y")
+          sed -i "s/_CHANGELOG_DATE_/${CURRENT_DATE}/g" rpmbuild/SPECS/tapauth.spec
 
           tar --transform "s/^/tapauth-${{ steps.version_vars.outputs.VERSION }}\//" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=rpmbuild .
           rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
@@ -61,6 +64,9 @@ jobs:
     name: Ubuntu Launchpad PPA Source Delivery
     runs-on: ubuntu-latest
     environment: release
+    env:
+      DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
+      DEBFULLNAME: "Lolle2000la Maintainers"
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v4
@@ -86,24 +92,23 @@ jobs:
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
           mkdir -p .cargo
-          # cargo vendor natively dumps structural stanzas into stdout cleanly. Do not append manual stanzas.
+          # Redirect output directly to prevent duplicate keys in configuration files
           cargo vendor > .cargo/config.toml
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
           mkdir -p debian/source
-          # Switched to native format to ensure the vendor/ directory tree layout scales safely
-          echo "3.0 (native)" > debian/source/format
+          echo "3.0 (quilt)" > debian/source/format
 
           cat > debian/control <<EOF
           Source: tapauth
           Section: admin
           Priority: optional
-          Maintainer: Lolle2000la Maintainers <lolle2000la@tapauth.dev>
+          Maintainer: Lolle2000la Maintainers <lolle2000.la+tapauth@gmail.com>
           Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, libgtk-4-dev
 
           Package: tapauth
-          Architecture: any
+          Architecture: amd64 arm64
           Depends: \${shlibs:Depends}, \${misc:Depends}
           Description: Local smartphone-based authentication framework
           EOF
@@ -139,23 +144,35 @@ jobs:
           EOF
           chmod +x debian/rules
 
+          # Include safety guards and mandatory #DEBHELPER# hooks for system service registrations
           cat > debian/postinst <<EOF
           #!/bin/sh
           set -e
           if [ "\$1" = "configure" ]; then
-          	pam-auth-update --package
+          	if command -v pam-auth-update >/dev/null 2>&1; then
+          		pam-auth-update --package
+          	fi
           fi
+          #DEBHELPER#
+          exit 0
           EOF
+
           cat > debian/postrm <<EOF
           #!/bin/sh
           set -e
           if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
-          	pam-auth-update --package
+          	if command -v pam-auth-update >/dev/null 2>&1; then
+          		pam-auth-update --package
+          	fi
           fi
+          #DEBHELPER#
+          exit 0
           EOF
           chmod +x debian/postinst debian/postrm
 
+          # Build upstream origin package format requirements natively
           dch --create --package tapauth -v "${{ steps.version_vars.outputs.VERSION }}-1~ppa1" "Automated production packaging update."
+          tar --exclude=debian -czf ../tapauth_${{ steps.version_vars.outputs.VERSION }}.orig.tar.gz .
           dpkg-buildpackage -S -us -uc -d
 
           debsign -k "${{ secrets.GPG_KEY_ID }}" ../tapauth_${{ steps.version_vars.outputs.VERSION }}-1~ppa1_source.changes
@@ -195,7 +212,7 @@ jobs:
           ssh-add ~/.ssh/id_aur
 
           git config --global user.name "AUR Deployment Pipeline"
-          git config --global user.email "lolle2000la@tapauth.dev"
+          git config --global user.email "lolle2000.la+tapauth@gmail.com"
 
           git clone aur@aur.archlinux.org:tapauth.git aur-repo
           cd aur-repo
@@ -206,9 +223,10 @@ jobs:
           pkgver=${{ steps.version_vars.outputs.VERSION }}
           pkgrel=1
           pkgdesc="Local smartphone-based authentication framework engine"
-          arch=('x86_64')
+          arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
           license=('Apache-2.0')
+          install=tapauth.install
           depends=('dbus' 'gtk4' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
@@ -231,6 +249,18 @@ jobs:
           }
           EOF
 
+          # Provision an install scriptlet to apply systemic configuration tasks immediately upon ingestion
+          cat > tapauth.install <<EOF
+          post_install() {
+            systemd-sysusers tapauth.conf
+            systemd-tmpfiles --create tapauth.conf
+          }
+          post_upgrade() {
+            systemd-sysusers tapauth.conf
+            systemd-tmpfiles --create tapauth.conf
+          }
+          EOF
+
           cat > .SRCINFO <<EOF
           pkgbase = tapauth
           	pkgdesc = Local smartphone-based authentication framework engine
@@ -238,6 +268,7 @@ jobs:
           	pkgrel = 1
           	url = https://github.com/lolle2000la/tapauth
           	arch = x86_64
+          	arch = aarch64
           	license = Apache-2.0
           	makedepends = cargo
           	makedepends = rust
@@ -251,6 +282,6 @@ jobs:
           pkgname = tapauth
           EOF
 
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO tapauth.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master

@@ -68,5 +68,5 @@ install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
 
 %changelog
-* Sat May 23 2026 Maintainer <lolle2000la@tapauth.dev> - %{version}-1
+* _CHANGELOG_DATE_ Maintainer <lolle2000.la+tapauth@gmail.com> - %{version}-1
 - Automated structural production container system build pipeline release tag conversion.
