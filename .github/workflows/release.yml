@@ -237,7 +237,7 @@ jobs:
 
             # dput can receive 550 internal-server errors when
             # consecutive uploads for different series arrive before
-            # Launchpad's queue has ingested the first one. Wait 60s
+            # Launchpad's queue has ingested the first one. Wait 90s
             # before first attempt on any series after the first, then
             # retry with escalating backoff.
             if [ "${FIRST_UPLOAD_DONE}" = "1" ]; then
