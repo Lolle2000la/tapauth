@@ -12,10 +12,7 @@ Packages are built and tracked using Fedora COPR.
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
 ```
-* **PAM Configuration:** Fedora uses `authselect` to manage authentication stacks. Do not edit files under `/etc/pam.d/` directly. Enable TapAuth integration using:
-```bash
-sudo authselect enable-feature with-tapauth
-```
+* **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. To integrate TapAuth, you should create a custom `authselect` profile based on your current setup and add `auth sufficient pam_tapauth.so` to the custom profile templates.
 
 ### 2. Ubuntu / Debian
 Packages are tracked via Launchpad Personal Package Archives (PPA).

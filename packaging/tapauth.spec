@@ -1,5 +1,5 @@
 Name:           tapauth
-Version:        %{version}
+Version:        %{?pkgversion}%{!?pkgversion:0.1.0}
 Release:        1%{?dist}
 Summary:        Local smartphone-based authentication framework
 
@@ -7,6 +7,7 @@ License:        Apache-2.0
 URL:            https://github.com/lolle2000la/tapauth
 Source0:        %{name}-%{version}.tar.gz
 
+ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  protobuf-compiler
@@ -23,7 +24,7 @@ A modern, privacy-preserving local-first authentication system using Rust PAM mo
 systemd system daemons, and low-level communication links.
 
 %prep
-%setup -q
+%setup -q -n %{name}-%{version}
 
 %build
 cargo build --workspace --release
@@ -66,7 +67,3 @@ install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 %{_unitdir}/tapauthd.socket
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
-
-%changelog
-* _CHANGELOG_DATE_ Maintainer <lolle2000.la+tapauth@gmail.com> - %{version}-1
-- Automated structural production container system build pipeline release tag conversion.
