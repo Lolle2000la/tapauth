@@ -348,7 +348,8 @@ jobs:
 
       - name: Decode release keystore
         run: |
-          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_B64:-}" ]; then
             echo "$ANDROID_KEYSTORE_B64" | base64 -d > server-android/release.keystore
           else
             echo "::warning:: ANDROID_KEYSTORE_B64 not set — APK will be unsigned"
