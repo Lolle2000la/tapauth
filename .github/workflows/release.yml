@@ -145,14 +145,13 @@ jobs:
           %:
           	dh \$@
 
+          override_dh_clean:
+          	# dh_clean deletes *.orig files by default, which breaks
+          	# vendored crates that ship legitimate .orig assets.
+          	# Exclude the entire vendor directory from cleanup.
+          	dh_clean -Xvendor/
+
           override_dh_auto_build:
-          	# dh_clean deletes *.orig files (including vendored Cargo.toml.orig)
-          	# before this target runs, leaving stale entries in
-          	# .cargo-checksum.json. Strip them from the JSON so cargo
-          	# doesn't try to verify nonexistent files.
-          	find vendor/ -name .cargo-checksum.json -exec sed -i \
-          		-e 's/"Cargo.toml.orig":"[a-f0-9]*",//g' \
-          		-e 's/,"Cargo.toml.orig":"[a-f0-9]*"//g' {} +
           	\$(CARGO) build --workspace --release --offline --frozen
 
           override_dh_auto_install:
