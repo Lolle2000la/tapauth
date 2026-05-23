@@ -37,11 +37,10 @@ cargo {
     extraCargoBuildArguments = listOf("--features", "jni")
 }
 
-// Select profile based on whether any Release task is in the graph
-gradle.taskGraph.whenReady {
-    val isReleaseBuild = allTasks.any { it.name.contains("Release", ignoreCase = true) }
-    cargo.profile = if (isReleaseBuild) "release" else "debug"
-}
+// Detect release profile at configuration time so cargoBuild tasks see it
+cargo.profile =
+    if (gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }) "release"
+    else "debug"
 
 tasks.named("preBuild") { dependsOn("cargoBuild") }
 
