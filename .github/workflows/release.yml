@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libpam0g-dev protobuf-compiler libgtk-4-dev build-essential devscripts dh-make dput
+          sudo apt-get install -y devscripts dput
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -130,7 +130,8 @@ jobs:
           Section: admin
           Priority: optional
           Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-          Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, libgtk-4-dev
+          Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev
+          Standards-Version: 4.7.0
 
           Package: tapauth
           Architecture: any
@@ -310,7 +311,7 @@ jobs:
           arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
           license=('Apache-2.0')
-          depends=('dbus' 'gtk4' 'pam')
+          depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
@@ -346,7 +347,6 @@ jobs:
           	makedepends = rust
           	makedepends = protobuf
           	depends = dbus
-          	depends = gtk4
           	depends = pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
           	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}

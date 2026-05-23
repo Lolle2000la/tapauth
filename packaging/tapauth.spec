@@ -21,13 +21,11 @@ BuildRequires:  protobuf-compiler
 %endif
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
-BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pam-devel
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 Requires:       pam
-Requires:       gtk4
 Requires:       dbus-libs
 Requires:       systemd-libs
 
