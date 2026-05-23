@@ -150,7 +150,7 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-36
+          key: avd-36-4g
 
       - name: Create AVD and generate snapshot for caching
         if: steps.avd-cache.outputs.cache-hit != 'true'
@@ -159,6 +159,7 @@ jobs:
           api-level: 36
           arch: x86_64
           force-avd-creation: false
+          disk-size: 4096
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
           script: echo "Generated AVD snapshot for caching."
@@ -169,6 +170,7 @@ jobs:
           api-level: 36
           arch: x86_64
           force-avd-creation: false
+          disk-size: 4096
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: cd server-android && ./gradlew connectedDebugAndroidTest --stacktrace
