@@ -143,7 +143,10 @@ jobs:
           	dh \$@
 
           override_dh_auto_build:
-          	cargo build --workspace --release --frozen --offline
+          	# --offline uses vendored crates; drop --frozen so cargo can
+          	# transparently downgrade the lock file format for older toolchains
+          	# (e.g. noble's cargo 1.75 can't read Cargo.lock v4)
+          	cargo build --workspace --release --offline
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
