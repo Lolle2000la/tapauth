@@ -232,7 +232,18 @@ jobs:
             debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
             rm -f /tmp/gpg-passphrase
 
-            dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            # dput can receive 550 internal-server errors when
+            # consecutive uploads for different series arrive before
+            # Launchpad's queue has ingested the first one. Retry with
+            # escalating backoff (8s / 16s / 32s).
+            for ATTEMPT in 1 2 3; do
+              if dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes; then
+                echo "dput succeeded on attempt ${ATTEMPT}"
+                break
+              fi
+              echo "dput failed on attempt ${ATTEMPT} (exit $?), retrying..."
+              sleep $((2 ** (3 + ATTEMPT)))
+            done
           done
 
   release-arch-aur:
