@@ -285,3 +285,86 @@ jobs:
           git add PKGBUILD .SRCINFO
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master
+
+  release-android-apk:
+    name: Android APK Build and Release
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v4
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          # Derive monotonically increasing versionCode from semver
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_VER"
+          VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_OUTPUT
+
+      - name: Install Rust toolchain with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-release-${{ hashFiles('server-android/**/*.gradle*', 'server-android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-release-
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;30.0.14904198"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.14904198" >> "$GITHUB_ENV"
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x server-android/gradlew
+
+      - name: Decode release keystore
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > server-android/release.keystore
+          else
+            echo "::warning:: ANDROID_KEYSTORE_B64 not set — APK will be unsigned"
+          fi
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+
+      - name: Build release APK
+        run: |
+          export VERSION_NAME="${{ steps.version_vars.outputs.VERSION }}"
+          export VERSION_CODE="${{ steps.version_vars.outputs.VERSION_CODE }}"
+          cd server-android && ./gradlew assembleRelease
+
+      - name: Upload APK to GitHub Release
+        run: |
+          APK_PATH=$(find server-android/app/build/outputs/apk/release -name "*.apk" -not -name "*unsigned*" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH="server-android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          fi
+          APK_NAME="tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk"
+          cp "$APK_PATH" "$APK_NAME"
+          gh release upload "${{ github.ref_name }}" "$APK_NAME" --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
