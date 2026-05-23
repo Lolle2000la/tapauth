@@ -108,10 +108,7 @@ jobs:
           else
             cargo vendor > .cargo/config.toml
           fi
-          # cargo vendor creates .orig backup files that dpkg-source
-          # interprets as "deleted from the orig tarball" — clean them
-          find vendor/ -name '*.orig' -delete 2>/dev/null || true
-          # Launchpad noble/jammy use cargo 1.75 / 1.59 which can't
+          # Launchpad noble/resolute use older cargo which can't
           # parse edition="2024" manifests. Rewrite them to "2021".
           # Most crates bump the edition field without actually using
           # 2024-only features — if a crate genuinely requires them,
