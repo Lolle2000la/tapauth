@@ -58,6 +58,7 @@ install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %files
+%license LICENSE
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_libdir}/security/pam_tapauth.so

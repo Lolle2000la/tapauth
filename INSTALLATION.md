@@ -4,39 +4,39 @@ This guide covers the installation and uninstallation of TapAuth using the inter
 
 ## Native Distribution Packages
 
-Instead of managing manual compilation chains or using imperative fallback installation binaries, you can track native repositories integrated with systemic package validation tools:
+You can install tapauth via native package repositories to receive automatic updates verified by your system's package manager.
 
-### 1. Fedora Linux / Enterprise Linux (RHEL Matrix)
-Stable pre-built binary target archives are compiled, integrated, and tracked using Fedora COPR.
+### 1. Fedora Linux
+Packages are built and tracked using Fedora COPR.
 ```bash
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
 ```
-* **PAM Authentication Configuration:** Fedora systems require explicit management loops via `authselect`. Do not overwrite systemic file descriptors under `/etc/pam.d/` directly. Enable integration patterns utilizing:
+* **PAM Configuration:** Fedora uses `authselect` to manage authentication stacks. Do not edit files under `/etc/pam.d/` directly. Enable TapAuth integration using:
 ```bash
 sudo authselect enable-feature with-tapauth
 ```
 
-### 2. Ubuntu / Debian Derivatives
-Upstream deployment targets are tracked natively via Launchpad Personal Package Archives (PPA).
+### 2. Ubuntu / Debian
+Packages are tracked via Launchpad Personal Package Archives (PPA).
 ```bash
 sudo add-apt-repository ppa:lolle2000la/tapauth
 sudo apt-get update
 sudo apt-get install tapauth
 ```
-* **PAM Authentication Configuration:** Debian platforms consume a standardized declarative verification matrix profiles layer. Installation automatically registers hooks inside the `pam-auth-update` manager. To configure, toggle manually by calling:
+* **PAM Configuration:** Installation automatically registers a module profile hook. To toggle or configure the module non-interactively, run:
 ```bash
 sudo pam-auth-update
 ```
 
 ### 3. Arch Linux / CachyOS
-Package metadata configurations are distributed directly via the Arch User Repository (AUR).
+The source package metadata configuration is available via the Arch User Repository (AUR).
 ```bash
 paru -S tapauth
 # or alternatively
 yay -S tapauth
 ```
-* **PAM Authentication Configuration:** Arch Linux maintains system configurations natively without implicit post-install script side-effects. To complete activation loops, manually add your preference rules right inside your selected auth tracking layout files (e.g., `/etc/pam.d/system-auth`):
+* **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
 ```text
 auth      sufficient      pam_tapauth.so
 ```

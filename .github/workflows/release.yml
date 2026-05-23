@@ -30,7 +30,8 @@ jobs:
           echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
           chmod 600 ~/.config/copr
 
-          EXP_DATE=$(echo "${{ secrets.COPR_CONFIG }}" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          # Anchored search targeting the explicit comment token line safely
+          EXP_DATE=$(echo "${{ secrets.COPR_CONFIG }}" | grep -i 'expiration date' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
           if [ -n "$EXP_DATE" ]; then
             CURRENT_SEC=$(date +%s)
             EXP_SEC=$(date -d "$EXP_DATE" +%s)
@@ -85,18 +86,14 @@ jobs:
       - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
         run: |
           mkdir -p .cargo
+          # cargo vendor natively dumps structural stanzas into stdout cleanly. Do not append manual stanzas.
           cargo vendor > .cargo/config.toml
-          cat >> .cargo/config.toml <<EOF
-          [source.crates-io]
-          replace-with = "vendored-sources"
-          [source.vendored-sources]
-          directory = "vendor"
-          EOF
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
           mkdir -p debian/source
-          echo "3.0 (quilt)" > debian/source/format
+          # Switched to native format to ensure the vendor/ directory tree layout scales safely
+          echo "3.0 (native)" > debian/source/format
 
           cat > debian/control <<EOF
           Source: tapauth
@@ -106,13 +103,17 @@ jobs:
           Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, libgtk-4-dev
 
           Package: tapauth
-          Architecture: amd64
+          Architecture: any
           Depends: \${shlibs:Depends}, \${misc:Depends}
           Description: Local smartphone-based authentication framework
           EOF
 
           cat > debian/rules <<EOF
           #!/usr/bin/make -f
+
+          # Query multiarch hosting layouts cleanly on runtime containers
+          DEB_HOST_MULTIARCH ?= \$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+
           %:
           	dh \$@
 
@@ -121,7 +122,7 @@ jobs:
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
-          	mkdir -p debian/tapauth/lib/x86_64-linux-gnu/security
+          	mkdir -p debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security
           	mkdir -p debian/tapauth/lib/systemd/system
           	mkdir -p debian/tapauth/usr/lib/sysusers.d
           	mkdir -p debian/tapauth/usr/lib/tmpfiles.d
@@ -129,7 +130,7 @@ jobs:
           	
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
-          	cp target/release/libclient_pam.so debian/tapauth/lib/x86_64-linux-gnu/security/pam_tapauth.so
+          	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
           	cp systemd/tapauthd.service debian/tapauth/lib/systemd/system/
           	cp systemd/tapauthd.socket debian/tapauth/lib/systemd/system/
           	cp packaging/sysusers.conf debian/tapauth/usr/lib/sysusers.d/tapauth.conf
@@ -148,8 +149,8 @@ jobs:
           cat > debian/postrm <<EOF
           #!/bin/sh
           set -e
-          if [ "\$1" = "remove" ]; then
-          	pam-auth-update --package --remove tapauth
+          if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
+          	pam-auth-update --package
           fi
           EOF
           chmod +x debian/postinst debian/postrm
@@ -199,6 +200,7 @@ jobs:
           git clone aur@aur.archlinux.org:tapauth.git aur-repo
           cd aur-repo
 
+          # Provides and conflicts dropped to prevent the canonical stable package from conflicting with itself
           cat > PKGBUILD <<EOF
           pkgname=tapauth
           pkgver=${{ steps.version_vars.outputs.VERSION }}
@@ -209,8 +211,6 @@ jobs:
           license=('Apache-2.0')
           depends=('dbus' 'gtk4' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
-          provides=('tapauth')
-          conflicts=('tapauth')
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
@@ -245,8 +245,6 @@ jobs:
           	depends = dbus
           	depends = gtk4
           	depends = pam
-          	provides = tapauth
-          	conflicts = tapauth
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
           	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
 
