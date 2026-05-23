@@ -205,6 +205,7 @@ jobs:
           ACTIVE_SERIES="noble jammy"
           echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
+          FIRST=1
           for SERIES in ${ACTIVE_SERIES}; do
             rm -f debian/changelog
             dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
@@ -219,6 +220,12 @@ jobs:
             debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
             rm -f /tmp/gpg-passphrase
 
+            # The orig tarball is identical across series — Launchpad
+            # rejects duplicate uploads, so strip it for subsequent series
+            if [ "${FIRST}" != "1" ]; then
+              sed -i '/\.orig\.tar\.gz/d' ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            fi
+            FIRST=0
             dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
           done
 
