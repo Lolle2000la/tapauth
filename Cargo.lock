@@ -780,7 +780,7 @@ name = "client-pam"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hex",
  "libc",
  "nix 0.31.3",
@@ -4472,7 +4472,7 @@ dependencies = [
  "base64",
  "chrono",
  "ed25519-dalek",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hex",
  "hkdf",
  "hmac",
@@ -4834,7 +4834,7 @@ dependencies = [
  "bluer",
  "bytes",
  "clap",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hex",
  "nix 0.31.3",
  "prost",
