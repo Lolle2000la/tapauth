@@ -138,14 +138,15 @@ jobs:
         run: cd server-android && ./gradlew cargoBuild
 
       - name: Free disk space for emulator
-        uses: easimon/maximize-build-space@v10
-        with:
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          remove-android: 'false'
-          overprovision-lvm: 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h
 
       - name: Enable KVM (for Android Emulator)
         run: |
