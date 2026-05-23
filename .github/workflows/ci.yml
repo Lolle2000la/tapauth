@@ -185,7 +185,7 @@ jobs:
           script: cd server-android && ./gradlew connectedDebugAndroidTest --stacktrace
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: instrumentation-test-results
@@ -199,14 +199,14 @@ jobs:
         run: cd server-android && ./gradlew spotlessCheck
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tapauth-debug-apk
           path: server-android/app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
       - name: Upload native libraries artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-libraries
           path: server-android/app/src/main/jniLibs/
