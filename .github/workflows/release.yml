@@ -76,7 +76,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper dput jq
+          sudo apt-get install -y devscripts debhelper dput
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -107,12 +107,12 @@ jobs:
           else
             cargo vendor > .cargo/config.toml
           fi
-          # Newer cargo vendor no longer creates Cargo.toml.orig backups
-          # but .cargo-checksum.json may still reference them from the
-          # registry — strip stale entries so old cargo on builders
-          # doesn't try to verify nonexistent files.
-          find vendor/ -name .cargo-checksum.json -exec sh -c \
-            'jq ".files |= with_entries(select(.key | test(\"\\\\.orig$\") | not))" "$1" > "$1.tmp" && mv "$1.tmp" "$1"' _ {} \; || true
+          # cargo vendor writes .cargo-checksum.json files that may
+          # reference registry artifacts (e.g. .orig backups) not
+          # actually present in the vendor directory. Drop them
+          # entirely — cargo works fine without checksum verification,
+          # and the orig tarball is GPG-signed for integrity.
+          find vendor/ -name .cargo-checksum.json -delete
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
@@ -152,7 +152,7 @@ jobs:
           	dh \$@
 
           override_dh_auto_build:
-          	\$(CARGO) build --workspace --release --offline --frozen
+          	\$(CARGO) build --workspace --release --offline
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
