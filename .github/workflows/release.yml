@@ -119,7 +119,7 @@ jobs:
           Section: admin
           Priority: optional
           Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-          Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev
+          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev
           Standards-Version: 4.7.0
 
           Package: tapauth
@@ -137,12 +137,16 @@ jobs:
           #!/usr/bin/make -f
 
           DEB_HOST_MULTIARCH ?= \$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+          # On jammy/noble, cargo-1.91 supplies /usr/bin/cargo-1.91 (not cargo).
+          # On resolute, the default cargo >= 1.93 is fine as-is.
+          CARGO := \$(shell which cargo-1.91 2>/dev/null || which cargo)
+          RUSTC := \$(shell which rustc-1.91 2>/dev/null || which rustc)
 
           %:
           	dh \$@
 
           override_dh_auto_build:
-          	cargo build --workspace --release --offline --frozen
+          	\$(CARGO) build --workspace --release --offline --frozen
 
           override_dh_auto_install:
           	mkdir -p debian/tapauth/usr/bin
@@ -198,10 +202,8 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
           cd "tapauth-${VERSION}"
 
-          # Target the two most recent Ubuntu LTS releases; Launchpad's
-          # "Supported" status includes ancient ESM series which lack
-          # the build dependencies (cargo, rust) we need.
-          ACTIVE_SERIES="resolute"
+          # Use rustc-1.91/cargo-1.91 backports on older series.
+          ACTIVE_SERIES="jammy noble resolute"
           echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
 
           FIRST=1
