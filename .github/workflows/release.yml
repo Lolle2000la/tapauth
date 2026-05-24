@@ -26,7 +26,7 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Validate COPR Authentication Token
         run: |
@@ -85,13 +85,13 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Configure GPG Verification Keyring
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
           GPG_KEY_FPR=$(gpg --with-colons --list-secret-keys --keyid-format LONG | grep '^sec:' | cut -d: -f5)
-          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> $GITHUB_ENV
+          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> "$GITHUB_ENV"
           # Configure GPG for headless (non-TTY) signing
           mkdir -p ~/.gnupg
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
@@ -279,7 +279,7 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch Remote Release Tarball Checksum
         id: calc_sha
@@ -287,7 +287,7 @@ jobs:
           TARBALL_URL="https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz"
           curl -sL "$TARBALL_URL" -o release.tar.gz
           SHA256_HASH=$(sha256sum release.tar.gz | cut -d' ' -f1)
-          echo "SHA256=${SHA256_HASH}" >> $GITHUB_OUTPUT
+          echo "SHA256=${SHA256_HASH}" >> "$GITHUB_OUTPUT"
           echo "Release archive verified hash: ${SHA256_HASH}"
 
       - name: Synchronize and Push Metadata Changes to the AUR
@@ -377,6 +377,9 @@ jobs:
     name: Android APK Build and Release
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      actions: write
+      contents: write
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -385,13 +388,23 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
-          # Derive monotonically increasing versionCode from semver;
-          # strip prerelease suffix so beta tags produce a valid integer
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          # Derive unique, monotonic versionCode from semver.
+          # Stable releases use patch*100 + 99 (always highest).
+          # Prerelease builds encode the prerelease number in the last
+          # two digits so beta1 < beta2 < ... < stable for the same semver.
           SEMVER="${CLEAN_VER%%-*}"
+          PREREL="${CLEAN_VER#*-}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
-          VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
-          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_OUTPUT
+          BASE=$((MAJOR * 1000000 + MINOR * 10000 + PATCH * 100))
+          if [ "${PREREL}" != "${CLEAN_VER}" ]; then
+            PREREL_NUM="${PREREL##*[!0-9]}"
+            PREREL_NUM="${PREREL_NUM:-0}"
+            VERSION_CODE=$((BASE + PREREL_NUM))
+          else
+            VERSION_CODE=$((BASE + 99))
+          fi
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain with Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -458,3 +471,80 @@ jobs:
           gh release upload "${{ github.ref_name }}" "$APK_NAME" --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  release-fdroid-repo:
+    name: F-Droid Custom Repository Delivery
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [ release-android-apk ]
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch F-Droid Repository URL from Git Context
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          sed -i "s|^repo_url:.*|repo_url: https://${OWNER}.github.io/${REPO}/fdroid/repo|" fdroid/config.yml
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Initialize F-Droid Server CLI Tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fdroidserver
+
+      - name: Fetch Published Release APK from GitHub Releases
+        run: |
+          mkdir -p fdroid/repo
+          gh release download "${{ github.ref_name }}" --pattern "tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk" --dir fdroid/repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Decode F-Droid Repository Signing Keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
+
+      - name: Construct Base Unsigned Metadata Indexes
+        run: fdroid update --no-sign
+        working-directory: fdroid
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Execute Absolute Path Asset Redirection Patching
+        run: python scripts/patch_fdroid_index.py
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Cryptographically Sign Patched F-Droid Repository Entry Points
+        run: fdroid signindex
+        working-directory: fdroid
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Assemble Minimal Clean Static Pages Workspace
+        run: |
+          mkdir -p dist/fdroid/repo
+          cp fdroid/repo/entry.* dist/fdroid/repo/
+          cp fdroid/repo/index-* dist/fdroid/repo/
+          if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
+
+      - name: Deploy Lightweight Metadata Directly to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: false
