@@ -494,7 +494,7 @@ jobs:
           sed -i "s|^repo_url:.*|repo_url: https://${OWNER}.github.io/${REPO}/fdroid/repo|" fdroid/config.yml
 
       - name: Set up Python Environment
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.14'
 
