@@ -379,6 +379,7 @@ jobs:
     environment: release
     permissions:
       actions: write
+      contents: write
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
