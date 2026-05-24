@@ -1,4 +1,4 @@
-repo_url: https://lolle2000la.github.io/tapauth/fdroid/repo
+repo_url: <OWNER>.github.io/<REPO>/fdroid/repo
 repo_name: TapAuth Repository
 repo_description: Secure local authentication framework that allows signing into Linux systems using a smartphone.
 

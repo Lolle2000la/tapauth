@@ -69,6 +69,9 @@ def main():
             for v_hash, v_info in old_versions.items():
                 if v_hash not in new_packages[app_id]["versions"]:
                     new_packages[app_id]["versions"][v_hash] = v_info
+            for key, value in old_app_info.items():
+                if key != "versions" and key not in new_packages[app_id]:
+                    new_packages[app_id][key] = value
         else:
             index_data["packages"][app_id] = dict(old_app_info)
 

@@ -44,9 +44,9 @@ A custom F-Droid repository delivers the TapAuth Android companion app without r
 **Add the repository to F-Droid:**
 1. Install [F-Droid](https://f-droid.org/) on your Android device.
 2. Open F-Droid, go to **Settings** → **Repositories** → tap the **+** button.
-3. Enter the repository URL:
+3. Enter the repository URL (replace `<owner>` and `<repo>` with the actual project coordinates):
    ```
-   https://lolle2000la.github.io/tapauth/fdroid/repo
+   https://<owner>.github.io/<repo>/fdroid/repo
    ```
 4. Tap **Add**, then refresh the repository list (pull down or use the refresh button).
 5. Search for **TapAuth** and install.
