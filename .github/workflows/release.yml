@@ -538,9 +538,8 @@ jobs:
       - name: Assemble Minimal Clean Static Pages Workspace
         run: |
           mkdir -p dist/fdroid/repo
-          cp fdroid/repo/index-v2.json dist/fdroid/repo/
-          cp fdroid/repo/entry.json dist/fdroid/repo/
-          cp fdroid/repo/entry.jar dist/fdroid/repo/
+          cp fdroid/repo/entry.* dist/fdroid/repo/
+          cp fdroid/repo/index-* dist/fdroid/repo/
           if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
 
       - name: Deploy Lightweight Metadata Directly to GitHub Pages
