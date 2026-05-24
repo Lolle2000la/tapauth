@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   release-fedora-copr:
@@ -27,7 +26,7 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Validate COPR Authentication Token
         run: |
@@ -86,13 +85,13 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Configure GPG Verification Keyring
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
           GPG_KEY_FPR=$(gpg --with-colons --list-secret-keys --keyid-format LONG | grep '^sec:' | cut -d: -f5)
-          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> $GITHUB_ENV
+          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> "$GITHUB_ENV"
           # Configure GPG for headless (non-TTY) signing
           mkdir -p ~/.gnupg
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
@@ -280,7 +279,7 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch Remote Release Tarball Checksum
         id: calc_sha
@@ -288,7 +287,7 @@ jobs:
           TARBALL_URL="https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz"
           curl -sL "$TARBALL_URL" -o release.tar.gz
           SHA256_HASH=$(sha256sum release.tar.gz | cut -d' ' -f1)
-          echo "SHA256=${SHA256_HASH}" >> $GITHUB_OUTPUT
+          echo "SHA256=${SHA256_HASH}" >> "$GITHUB_OUTPUT"
           echo "Release archive verified hash: ${SHA256_HASH}"
 
       - name: Synchronize and Push Metadata Changes to the AUR
@@ -378,6 +377,8 @@ jobs:
     name: Android APK Build and Release
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      actions: write
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -386,13 +387,13 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
           # Derive monotonically increasing versionCode from semver;
           # strip prerelease suffix so beta tags produce a valid integer
           SEMVER="${CLEAN_VER%%-*}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
           VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
-          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_OUTPUT
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain with Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -474,7 +475,7 @@ jobs:
         id: version_vars
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python Environment
         uses: actions/setup-python@v5
