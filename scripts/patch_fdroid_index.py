@@ -1,69 +1,75 @@
 import json
-import hashlib
 import os
 import sys
-
-
-def compute_sha256(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(8192):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+import urllib.request
 
 
 def main():
     tag = os.environ.get("GITHUB_REF_NAME")
-    if not tag:
-        print("CRITICAL: GITHUB_REF_NAME environment variable is missing.")
-        sys.exit(1)
-
     repo = os.environ.get("GITHUB_REPOSITORY")
-    if not repo:
-        print("CRITICAL: GITHUB_REPOSITORY environment variable is missing.")
+
+    if not tag or not repo:
+        print("CRITICAL: Environment parameters GITHUB_REF_NAME or GITHUB_REPOSITORY are missing.")
         sys.exit(1)
 
     index_path = "fdroid/repo/index-v2.json"
-    entry_path = "fdroid/repo/entry.json"
-
-    if not os.path.exists(index_path) or not os.path.exists(entry_path):
-        print("CRITICAL: F-Droid metadata generation targets not found.")
+    if not os.path.exists(index_path):
+        print(f"CRITICAL: Target file {index_path} was not found.")
         sys.exit(1)
+
+    owner, repo_name = repo.split("/")
+    live_index_url = f"https://{owner}.github.io/{repo_name}/fdroid/repo/index-v2.json"
+
+    old_versions = {}
+    try:
+        print(f"Fetching current deployment index from {live_index_url}...")
+        req = urllib.request.Request(
+            live_index_url,
+            headers={"User-Agent": "Mozilla/5.0 (F-Droid Index Merger Pipeline)"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            old_data = json.loads(response.read().decode("utf-8"))
+            old_packages = old_data.get("packages", {})
+            for app_id, app_info in old_packages.items():
+                if "versions" in app_info:
+                    old_versions[app_id] = app_info["versions"]
+        print("Successfully extracted history for preservation.")
+    except Exception as e:
+        print(f"No existing index detected or site is unreachable ({e}). Initializing a fresh timeline.")
 
     with open(index_path, "r", encoding="utf-8") as f:
         index_data = json.load(f)
 
-    packages = index_data.get("packages", {})
-    for app_id, app_info in packages.items():
+    new_packages = index_data.get("packages", {})
+
+    for app_id, old_app_versions in old_versions.items():
+        if app_id in new_packages:
+            if "versions" not in new_packages[app_id]:
+                new_packages[app_id]["versions"] = {}
+            for v_hash, v_info in old_app_versions.items():
+                if v_hash not in new_packages[app_id]["versions"]:
+                    new_packages[app_id]["versions"][v_hash] = v_info
+        else:
+            index_data["packages"][app_id] = {"versions": old_app_versions}
+
+    for app_id, app_info in new_packages.items():
         versions = app_info.get("versions", {})
         for version_hash, version_info in versions.items():
             if "file" in version_info and "name" in version_info["file"]:
-                original_filename = os.path.basename(version_info["file"]["name"])
-                version_info["file"]["name"] = (
-                    f"https://github.com/{repo}/releases/download/"
-                    f"{tag}/{original_filename}"
-                )
+                current_file_locator = version_info["file"]["name"]
+
+                if not current_file_locator.startswith("http"):
+                    original_filename = os.path.basename(current_file_locator)
+                    version_info["file"]["name"] = (
+                        f"https://github.com/{repo}/releases/download/"
+                        f"{tag}/{original_filename}"
+                    )
+                    print(f"Patched version hash {version_hash} -> Absolute GitHub Release target.")
 
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index_data, f, indent=2)
 
-    new_sha256 = compute_sha256(index_path)
-    new_size = os.path.getsize(index_path)
-
-    with open(entry_path, "r", encoding="utf-8") as f:
-        entry_data = json.load(f)
-
-    if "index" not in entry_data:
-        print("CRITICAL: entry.json is missing the 'index' object — cannot update hashes.")
-        sys.exit(1)
-
-    entry_data["index"]["sha256"] = new_sha256
-    entry_data["index"]["size"] = new_size
-
-    with open(entry_path, "w", encoding="utf-8") as f:
-        json.dump(entry_data, f, indent=2)
-
-    print("Successfully patched F-Droid index redirects to GitHub Releases.")
+    print("F-Droid tracking metadata lineage merge successfully completed.")
 
 
 if __name__ == "__main__":

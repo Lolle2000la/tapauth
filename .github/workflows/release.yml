@@ -467,7 +467,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     needs: [ release-android-apk ]
-    if: ${{ !github.event.release.prerelease }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
