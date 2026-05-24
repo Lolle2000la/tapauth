@@ -55,7 +55,7 @@ A custom F-Droid repository delivers the TapAuth Android companion app without r
 
 Updates to the app are delivered through the same F-Droid repository whenever a new release is published.
 
-**Enable prerelease (beta) updates:** The repository includes both stable and prerelease APKs by default. To opt in to beta versions, enable the repository's optional "pre-release" toggle within the F-Droid client if available, or check for updates manually — prerelease builds appear alongside stable builds in the version list.
+**Prerelease (beta) updates:** Prerelease versions appear in the F-Droid version list alongside stable builds and can be installed manually.
 
 ## Supported Distributions
 

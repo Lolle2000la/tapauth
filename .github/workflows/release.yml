@@ -389,11 +389,21 @@ jobs:
         run: |
           CLEAN_VER="${GITHUB_REF_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
-          # Derive monotonically increasing versionCode from semver;
-          # strip prerelease suffix so beta tags produce a valid integer
+          # Derive unique, monotonic versionCode from semver.
+          # Stable releases use patch*100 + 99 (always highest).
+          # Prerelease builds encode the prerelease number in the last
+          # two digits so beta1 < beta2 < ... < stable for the same semver.
           SEMVER="${CLEAN_VER%%-*}"
+          PREREL="${CLEAN_VER#*-}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
-          VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          BASE=$((MAJOR * 1000000 + MINOR * 10000 + PATCH * 100))
+          if [ "${PREREL}" != "${CLEAN_VER}" ]; then
+            PREREL_NUM="${PREREL##*[!0-9]}"
+            PREREL_NUM="${PREREL_NUM:-0}"
+            VERSION_CODE=$((BASE + PREREL_NUM))
+          else
+            VERSION_CODE=$((BASE + 99))
+          fi
           echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain with Android targets
