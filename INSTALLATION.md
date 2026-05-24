@@ -38,6 +38,25 @@ yay -S tapauth
 auth      sufficient      pam_tapauth.so
 ```
 
+### 4. Android (via F-Droid)
+A custom F-Droid repository delivers the TapAuth Android companion app without requiring any third-party app store account.
+
+**Add the repository to F-Droid:**
+1. Install [F-Droid](https://f-droid.org/) on your Android device.
+2. Open F-Droid, go to **Settings** → **Repositories** → tap the **+** button.
+3. Enter the repository URL:
+   ```
+   https://lolle2000la.github.io/tapauth/fdroid/repo
+   ```
+4. Tap **Add**, then refresh the repository list (pull down or use the refresh button).
+5. Search for **TapAuth** and install.
+
+**Fingerprint verification:** On first use, F-Droid will display the repository signing key fingerprint. Verify this against the fingerprint published with the release before proceeding.
+
+Updates to the app are delivered through the same F-Droid repository whenever a new release is published.
+
+**Enable prerelease (beta) updates:** The repository includes both stable and prerelease APKs by default. To opt in to beta versions, enable the repository's optional "pre-release" toggle within the F-Droid client if available, or check for updates manually — prerelease builds appear alongside stable builds in the version list.
+
 ## Supported Distributions
 
 The installation scripts automatically detect and support the following Linux distributions:
