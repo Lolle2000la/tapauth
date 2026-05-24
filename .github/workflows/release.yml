@@ -477,6 +477,12 @@ jobs:
           CLEAN_VER="${GITHUB_REF_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
 
+      - name: Patch F-Droid Repository URL from Git Context
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          sed -i "s|^repo_url:.*|repo_url: https://${OWNER}.github.io/${REPO}/fdroid/repo|" fdroid/config.yml
+
       - name: Set up Python Environment
         uses: actions/setup-python@v5
         with:

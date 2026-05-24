@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 
@@ -34,7 +35,13 @@ def main():
                 if "versions" in app_info:
                     old_versions[app_id] = app_info["versions"]
         print("Successfully extracted history for preservation.")
-    except Exception as e:
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("No existing index deployed yet (404). Initializing a fresh timeline.")
+        else:
+            print(f"CRITICAL: HTTP {e.code} fetching live index — cannot proceed safely.")
+            sys.exit(1)
+    except urllib.error.URLError as e:
         print(f"No existing index detected or site is unreachable ({e}). Initializing a fresh timeline.")
 
     with open(index_path, "r", encoding="utf-8") as f:
