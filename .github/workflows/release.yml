@@ -1,8 +1,9 @@
 name: Production Release Engine
 
-on:
+"on":
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ jobs:
     name: Fedora COPR Build Delivery
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -25,8 +26,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Validate COPR Authentication Token
         run: |
@@ -64,7 +74,7 @@ jobs:
     name: Ubuntu Launchpad PPA Source Delivery
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     env:
       DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
       DEBFULLNAME: "Luca Auer"
@@ -84,8 +94,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Configure GPG Verification Keyring
         run: |
@@ -270,7 +289,7 @@ jobs:
     name: Arch User Repository (AUR) Sync
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -278,8 +297,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Fetch Remote Release Tarball Checksum
         id: calc_sha
@@ -387,8 +415,15 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           # Derive unique, monotonic versionCode from semver.
           # Stable releases use patch*100 + 99 (always highest).
           # Prerelease builds encode the prerelease number in the last
@@ -405,6 +440,8 @@ jobs:
             VERSION_CODE=$((BASE + 99))
           fi
           echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Install Rust toolchain with Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -459,6 +496,11 @@ jobs:
           export VERSION_NAME="${{ steps.version_vars.outputs.VERSION }}"
           export VERSION_CODE="${{ steps.version_vars.outputs.VERSION_CODE }}"
           cd server-android && ./gradlew assembleRelease
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
       - name: Upload APK to GitHub Release
         run: |
@@ -468,7 +510,7 @@ jobs:
           fi
           APK_NAME="tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk"
           cp "$APK_PATH" "$APK_NAME"
-          gh release upload "${{ github.ref_name }}" "$APK_NAME" --repo "${{ github.repository }}"
+          gh release upload "${{ steps.version_vars.outputs.TAG_NAME }}" "$APK_NAME" --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -476,58 +518,93 @@ jobs:
     name: F-Droid Custom Repository Delivery
     runs-on: ubuntu-latest
     environment: release
-    needs: [ release-android-apk ]
+    needs: [release-android-apk]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
 
-      - name: Extract Dynamic Version Context
-        id: version_vars
+      - name: Patch F-Droid Repository URL to Custom Domain
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          sed -i "s|^repo_url:.*|repo_url: https://tapauth.rourunisen.dev/fdroid/repo|" fdroid/config.yml
 
-      - name: Patch F-Droid Repository URL from Git Context
-        run: |
-          OWNER="${GITHUB_REPOSITORY%%/*}"
-          REPO="${GITHUB_REPOSITORY#*/}"
-          sed -i "s|^repo_url:.*|repo_url: https://${OWNER}.github.io/${REPO}/fdroid/repo|" fdroid/config.yml
+      - name: Setup Android SDK (provides apksigner for repo signing)
+        uses: android-actions/setup-android@v4
 
       - name: Set up Python Environment
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.14"
 
       - name: Initialize F-Droid Server CLI Tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fdroidserver
+        run: pip install fdroidserver
 
-      - name: Fetch Published Release APK from GitHub Releases
+      - name: Determine Releases to Include
+        id: select_releases
+        run: |
+          set -euo pipefail
+          RELEASES=$(gh api "repos/${{ github.repository }}/releases" --jq '[.[] | select(.draft == false) | {tag_name, prerelease}]')
+
+          STABLE=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == false) | .tag_name) // ""')
+          echo "stable_tag=${STABLE}" >> "$GITHUB_OUTPUT"
+
+          PREVIEW=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == true) | .tag_name) // ""')
+          echo "preview_tag=${PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          INCLUDE_PREVIEW="false"
+          if [ -n "${PREVIEW}" ]; then
+            if [ -z "${STABLE}" ]; then
+              INCLUDE_PREVIEW="true"
+            else
+              STABLE_VER="${STABLE#v}"
+              PREVIEW_VER="${PREVIEW#v}"
+              HIGHER=$(printf '%s\n%s\n' "${STABLE_VER}" "${PREVIEW_VER}" | sort -V | tail -1)
+              if [ "${HIGHER}" = "${PREVIEW_VER}" ]; then
+                INCLUDE_PREVIEW="true"
+              fi
+            fi
+          fi
+          echo "include_preview=${INCLUDE_PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          echo "Stable: ${STABLE:-none}, Preview: ${PREVIEW:-none}, IncludePreview: ${INCLUDE_PREVIEW}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch Selected Release APKs
         run: |
           mkdir -p fdroid/repo
-          gh release download "${{ github.ref_name }}" --pattern "tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk" --dir fdroid/repo
+
+          STABLE_TAG="${{ steps.select_releases.outputs.stable_tag }}"
+          if [ -n "${STABLE_TAG}" ]; then
+            STABLE_VER="${STABLE_TAG#v}"
+            gh release download "${STABLE_TAG}" --pattern "tapauth-v${STABLE_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded stable APK: ${STABLE_TAG}"
+          fi
+
+          if [ "${{ steps.select_releases.outputs.include_preview }}" = "true" ]; then
+            PREVIEW_TAG="${{ steps.select_releases.outputs.preview_tag }}"
+            PREVIEW_VER="${PREVIEW_TAG#v}"
+            gh release download "${PREVIEW_TAG}" --pattern "tapauth-v${PREVIEW_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded preview APK: ${PREVIEW_TAG}"
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Decode F-Droid Repository Signing Keystore
         run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
 
-      - name: Construct Base Unsigned Metadata Indexes
-        run: fdroid update --no-sign
+      - name: Construct Unsigned Metadata Indexes
+        run: fdroid update --nosign --create-metadata
         working-directory: fdroid
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
 
-      - name: Execute Absolute Path Asset Redirection Patching
-        run: python scripts/patch_fdroid_index.py
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-
-      - name: Cryptographically Sign Patched F-Droid Repository Entry Points
+      - name: Cryptographically Sign F-Droid Repository Entry Points
         run: fdroid signindex
         working-directory: fdroid
         env:
@@ -535,16 +612,16 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
 
-      - name: Assemble Minimal Clean Static Pages Workspace
+      - name: Assemble Static Pages Workspace
         run: |
           mkdir -p dist/fdroid/repo
-          cp fdroid/repo/entry.* dist/fdroid/repo/
-          cp fdroid/repo/index-* dist/fdroid/repo/
-          if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
+          cp -r fdroid/repo/* dist/fdroid/repo/
 
-      - name: Deploy Lightweight Metadata Directly to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Static Web Site Artifacts
+        uses: actions/upload-pages-artifact@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
-          keep_files: false
+          path: ./dist
+
+      - name: Deploy Artifact Directly to GitHub Pages Hosted Edge
+        id: deployment
+        uses: actions/deploy-pages@v5
