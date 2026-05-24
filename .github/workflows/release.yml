@@ -458,3 +458,73 @@ jobs:
           gh release upload "${{ github.ref_name }}" "$APK_NAME" --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  release-fdroid-repo:
+    name: F-Droid Custom Repository Delivery
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [ release-android-apk ]
+    if: ${{ !github.event.release.prerelease }}
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> $GITHUB_OUTPUT
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Initialize F-Droid Server CLI Tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fdroidserver
+
+      - name: Fetch Published Release APK from GitHub Releases
+        run: |
+          mkdir -p fdroid/repo
+          gh release download "${{ github.ref_name }}" --pattern "tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk" --dir fdroid/repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Decode F-Droid Repository Signing Keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
+
+      - name: Construct Base Unsigned Metadata Indexes
+        run: fdroid update --no-sign
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Execute Absolute Path Asset Redirection Patching
+        run: python scripts/patch_fdroid_index.py
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Cryptographically Sign Patched F-Droid Repository Entry Points
+        run: fdroid signindex
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Assemble Minimal Clean Static Pages Workspace
+        run: |
+          mkdir -p dist/fdroid/repo
+          cp fdroid/repo/index-v2.json dist/fdroid/repo/
+          cp fdroid/repo/entry.json dist/fdroid/repo/
+          cp fdroid/repo/entry.jar dist/fdroid/repo/
+          if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
+
+      - name: Deploy Lightweight Metadata Directly to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: true

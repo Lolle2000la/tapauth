@@ -1,0 +1,10 @@
+repo_url: https://lolle2000la.github.io/tapauth/fdroid/repo
+repo_name: TapAuth Repository
+repo_description: Secure local authentication framework that allows signing into Linux systems using a smartphone.
+
+archive_older: 0
+
+keystore: repo-signer.jks
+keystorepass: {env: ANDROID_KEYSTORE_PASSWORD}
+keypass: {env: ANDROID_KEY_PASSWORD}
+repo_keyalias: {env: ANDROID_KEY_ALIAS}
