@@ -527,7 +527,10 @@ jobs:
 
       - name: Assemble Minimal Clean Static Pages Workspace
         run: |
+          # Create exactly one target directory path for all releases
           mkdir -p dist/fdroid/repo
+
+          # Stage the cleanly merged text index metadata layers
           cp fdroid/repo/index-v2.json dist/fdroid/repo/
           cp fdroid/repo/entry.json dist/fdroid/repo/
           cp fdroid/repo/entry.jar dist/fdroid/repo/
@@ -538,4 +541,4 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
-          keep_files: false
+          keep_files: false # Safely scrubs out any old beta subdirectory remnants
