@@ -89,7 +89,7 @@ def main():
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index_data, f, indent=2)
 
-    print("F-Droid tracking metadata lineage merge successfully completed.")
+    print("F-Droid tracking metadata lineage merge was successfully completed.")
 
 
 if __name__ == "__main__":
