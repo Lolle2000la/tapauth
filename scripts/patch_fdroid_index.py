@@ -18,6 +18,11 @@ def main():
         print("CRITICAL: GITHUB_REF_NAME environment variable is missing.")
         sys.exit(1)
 
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        print("CRITICAL: GITHUB_REPOSITORY environment variable is missing.")
+        sys.exit(1)
+
     index_path = "fdroid/repo/index-v2.json"
     entry_path = "fdroid/repo/entry.json"
 
@@ -35,7 +40,7 @@ def main():
             if "file" in version_info and "name" in version_info["file"]:
                 original_filename = os.path.basename(version_info["file"]["name"])
                 version_info["file"]["name"] = (
-                    f"https://github.com/lolle2000la/tapauth/releases/download/"
+                    f"https://github.com/{repo}/releases/download/"
                     f"{tag}/{original_filename}"
                 )
 
@@ -48,9 +53,12 @@ def main():
     with open(entry_path, "r", encoding="utf-8") as f:
         entry_data = json.load(f)
 
-    if "index" in entry_data:
-        entry_data["index"]["sha256"] = new_sha256
-        entry_data["index"]["size"] = new_size
+    if "index" not in entry_data:
+        print("CRITICAL: entry.json is missing the 'index' object — cannot update hashes.")
+        sys.exit(1)
+
+    entry_data["index"]["sha256"] = new_sha256
+    entry_data["index"]["size"] = new_size
 
     with open(entry_path, "w", encoding="utf-8") as f:
         json.dump(entry_data, f, indent=2)

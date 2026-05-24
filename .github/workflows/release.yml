@@ -498,6 +498,7 @@ jobs:
 
       - name: Construct Base Unsigned Metadata Indexes
         run: fdroid update --no-sign
+        working-directory: fdroid
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -507,9 +508,11 @@ jobs:
         run: python scripts/patch_fdroid_index.py
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Cryptographically Sign Patched F-Droid Repository Entry Points
         run: fdroid signindex
+        working-directory: fdroid
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
