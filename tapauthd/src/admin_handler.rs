@@ -268,8 +268,20 @@ fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         let mut guard = state.lock().await;
-        if guard.is_some() {
-            tracing::warn!("Pairing state timed out, cleaning up");
+        if matches!(*guard, Some(PairingState::Pending(_))) {
+            tracing::warn!("Pending pairing timed out, cleaning up");
+            *guard = None;
+        }
+    });
+}
+
+fn spawn_active_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>) {
+    let state = pairing_state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let mut guard = state.lock().await;
+        if matches!(*guard, Some(PairingState::Active(_))) {
+            tracing::warn!("Active pairing (SAS verification) timed out, cleaning up");
             *guard = None;
         }
     });
@@ -337,6 +349,8 @@ async fn handle_wait_for_pairing(
             };
 
             *pairing_state.lock().await = Some(PairingState::Active(active));
+
+            spawn_active_pairing_timeout(pairing_state);
 
             wait_pairing_success(sas_display, pending.port as u32)
         }
@@ -477,6 +491,14 @@ async fn handle_save_config(
     daemon: &Arc<DaemonState>,
     req: ipc::SaveConfigRequest,
 ) -> ipc::AdminResponse {
+    let port = req.udp_port as u16;
+    if port == 0 {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            "Invalid UDP port: must be 1-65535",
+        );
+    }
+
     let client_config = ClientConfig {
         hostname: req.hostname,
     };
@@ -488,13 +510,6 @@ async fn handle_save_config(
         );
     }
 
-    let port = req.udp_port as u16;
-    if port == 0 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            "Invalid UDP port: must be 1-65535",
-        );
-    }
     let mut toml_config = shared::config::TapAuthConfig::load();
     toml_config.udp_port = port;
     if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {

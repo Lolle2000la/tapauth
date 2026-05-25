@@ -75,15 +75,11 @@ impl DeviceListScreen {
                 Task::none()
             }
             ScreenMessage::RemoveDevice(device_id) => {
-                let username = self.current_username.clone();
                 self.devices.remove(&device_id);
-                Task::perform(
-                    Self::remove_device_for_user(device_id, username),
-                    |result| match result {
-                        Ok(_) => ScreenMessage::NavigateToDeviceList,
-                        Err(e) => ScreenMessage::PairingFailed(e),
-                    },
-                )
+                Task::perform(Self::remove_device(device_id), |result| match result {
+                    Ok(_) => ScreenMessage::NavigateToDeviceList,
+                    Err(e) => ScreenMessage::PairingFailed(e),
+                })
             }
             _ => Task::none(),
         }
@@ -115,6 +111,8 @@ impl DeviceListScreen {
         .size(14)
         .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
+        // Defense-in-depth: daemon already filters by caller identity via PolKit,
+        // but client-side filtering ensures the UI never displays another user's devices.
         let user_devices: HashMap<_, _> = self
             .devices
             .iter()
@@ -208,7 +206,7 @@ impl DeviceListScreen {
         Ok(devices)
     }
 
-    async fn remove_device_for_user(device_id: String, _username: String) -> Result<(), String> {
+    async fn remove_device(device_id: String) -> Result<(), String> {
         crate::ipc::remove_device(device_id).await
     }
 }

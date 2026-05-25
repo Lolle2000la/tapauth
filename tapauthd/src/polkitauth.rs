@@ -110,6 +110,10 @@ async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, Str
     Ok(is_authorized)
 }
 
+fn is_polkit_unavailable(error: &str) -> bool {
+    error.contains("connection") || error.contains("not found")
+}
+
 fn build_polkit_subject(
     identity: &PeerIdentity,
 ) -> std::collections::HashMap<String, zbus::zvariant::Value<'_>> {
@@ -131,8 +135,4 @@ fn build_polkit_subject(
         zbus::zvariant::Value::I32(identity.uid as i32),
     );
     subject
-}
-
-fn is_polkit_unavailable(error: &str) -> bool {
-    error.contains("connection") || error.contains("not found") || error.contains("No such")
 }
