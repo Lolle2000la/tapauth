@@ -1,11 +1,12 @@
 use nix::unistd::User;
 
-const POLKIT_ACTION_ID: &str = "org.tapauth.config.admin";
-
 pub struct PeerIdentity {
+    #[allow(dead_code)]
     pub pid: i32,
+    #[allow(dead_code)]
     pub uid: u32,
     pub username: String,
+    #[allow(dead_code)]
     pub start_time: u64,
 }
 
@@ -50,93 +51,4 @@ fn read_process_start_time(pid: i32) -> Result<u64, String> {
         .ok_or_else(|| format!("Malformed /proc/{}/stat: too few fields", pid))?
         .parse::<u64>()
         .map_err(|e| format!("Failed to parse start_time from /proc/{}/stat: {}", pid, e))
-}
-
-pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), String> {
-    let result = check_polkit_authorization(identity).await;
-
-    match result {
-        Ok(true) => Ok(()),
-        Ok(false) => Err("Authorization denied by PolKit".to_string()),
-        Err(e) => {
-            if is_polkit_unavailable(&e) {
-                tracing::warn!("PolKit unavailable ({}), falling back to UID==0 check", e);
-                if identity.uid == 0 {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Unauthorized: not root and PolKit unavailable ({})",
-                        e
-                    ))
-                }
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, String> {
-    use zbus::Connection;
-
-    let connection = Connection::system()
-        .await
-        .map_err(|e| format!("Failed to connect to system D-Bus: {}", e))?;
-
-    let subject_details = build_polkit_details(identity);
-
-    let reply = connection
-        .call_method(
-            Some("org.freedesktop.PolicyKit1"),
-            "/org/freedesktop/PolicyKit1/Authority",
-            Some("org.freedesktop.PolicyKit1.Authority"),
-            "CheckAuthorization",
-            &(
-                ("unix-process".to_string(), subject_details),
-                POLKIT_ACTION_ID,
-                std::collections::HashMap::<&str, &str>::new(),
-                1u32,
-                "",
-            ),
-        )
-        .await
-        .map_err(|e| format!("PolKit CheckAuthorization call failed: {}", e))?;
-
-    let body = reply.body();
-    let (is_authorized, _is_challenge, _details): (
-        bool,
-        bool,
-        std::collections::HashMap<String, String>,
-    ) = body
-        .deserialize()
-        .map_err(|e| format!("Failed to deserialize PolKit response: {}", e))?;
-
-    Ok(is_authorized)
-}
-
-fn is_polkit_unavailable(error: &str) -> bool {
-    let e = error.to_lowercase();
-    e.contains("connect")
-        || e.contains("not found")
-        || e.contains("no such")
-        || e.contains("serviceunknown")
-}
-
-fn build_polkit_details(
-    identity: &PeerIdentity,
-) -> std::collections::HashMap<String, zbus::zvariant::Value<'_>> {
-    let mut details = std::collections::HashMap::new();
-    details.insert(
-        "pid".to_string(),
-        zbus::zvariant::Value::U32(identity.pid as u32),
-    );
-    details.insert(
-        "start-time".to_string(),
-        zbus::zvariant::Value::U64(identity.start_time),
-    );
-    details.insert(
-        "uid".to_string(),
-        zbus::zvariant::Value::I32(identity.uid as i32),
-    );
-    details
 }

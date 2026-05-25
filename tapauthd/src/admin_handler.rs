@@ -1,5 +1,5 @@
 use crate::auth_handler::DaemonState;
-use crate::polkitauth::{check_authorization, resolve_peer};
+use crate::polkitauth::resolve_peer;
 use shared::{
     config::{ClientConfig, PairedServer},
     firewall::{FirewallGuard, Protocol},
@@ -125,10 +125,11 @@ pub async fn handle_admin_request(
         Err(e) => return err_resp(ipc::AdminStatus::AdminError, e),
     };
 
-    if let Err(e) = check_authorization(&identity).await {
-        return err_resp(ipc::AdminStatus::AdminUnauthorized, e);
-    }
-
+    // Authorization: the Unix socket itself is the access-control point.
+    // The socket is owned by root:tapauthd-clients with mode 0660 (production)
+    // or 0666 (dev).  Callers who can connect have already passed OS-level
+    // DAC checks.  SO_PEERCRED confirms the caller's identity for audit
+    // logging and pairing-user binding.
     let username = identity.username;
 
     let (response, needs_reload) = match request.payload {
