@@ -351,7 +351,11 @@ async fn handle_conn(
     // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
     // Legacy PAM clients send PamAuthenticateRequest / PamCancelRequest directly.
     // Using the envelope eliminates ambiguity between admin and PAM field numbers.
-    if let Ok(envelope) = ipc::IpcEnvelope::decode(&mut &req_bytes[..]) {
+    //
+    // IMPORTANT: prost decode advances the byte slice.  Use independent copies
+    // for each decode attempt so a failed envelope decode doesn't corrupt the
+    // buffer for the legacy fallback.
+    if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
                 let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
@@ -379,7 +383,7 @@ async fn handle_conn(
     }
 
     // Legacy backward-compatible decode: try PamAuthenticateRequest first
-    let auth_req = ipc::PamAuthenticateRequest::decode(&mut &req_bytes[..]);
+    let auth_req = ipc::PamAuthenticateRequest::decode(req_bytes.as_slice());
 
     let response = match auth_req {
         Ok(req) => {
@@ -390,7 +394,7 @@ async fn handle_conn(
             handle_pam_authenticate(req, &daemon, &server_state).await
         }
         Err(_) => {
-            let cancel_req = ipc::PamCancelRequest::decode(&mut &req_bytes[..]);
+            let cancel_req = ipc::PamCancelRequest::decode(req_bytes.as_slice());
             if let Ok(req) = cancel_req {
                 tracing::info!(
                     "Handling legacy PamCancelRequest (id={}): {}",
