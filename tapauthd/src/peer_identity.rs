@@ -19,8 +19,14 @@ pub fn resolve_peer(pid: i32, uid: u32) -> Result<PeerIdentity, String> {
         ));
     }
     let username = User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .map_err(|e| format!("Failed to resolve UID {}: {}", uid, e))?
-        .ok_or_else(|| format!("No user found for UID {}", uid))?
+        .map_err(|e| {
+            tracing::warn!("Failed to resolve UID: {}", e);
+            "Failed to resolve peer identity".to_string()
+        })?
+        .ok_or_else(|| {
+            tracing::warn!("No user found for UID {uid}");
+            "Failed to resolve peer identity".to_string()
+        })?
         .name;
 
     let start_time = read_process_start_time(pid)?;
