@@ -28,9 +28,9 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     let euid = geteuid().as_raw();
     let egid = getegid().as_raw();
 
-    // Check read permission: owner, group, or other (root always passes)
+    // Check write+execute permission (both needed to create files in a directory)
     let has_rwx = if euid == 0 || euid == meta.uid() {
-        (mode & 0o500) == 0o500
+        (mode & 0o300) == 0o300
     } else {
         // Check supplementary groups
         let in_group = egid == 0
@@ -40,9 +40,9 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
                 .iter()
                 .any(|g| g.as_raw() == meta.gid());
         if in_group {
-            (mode & 0o050) == 0o050
+            (mode & 0o030) == 0o030
         } else {
-            (mode & 0o005) == 0o005
+            (mode & 0o003) == 0o003
         }
     };
 

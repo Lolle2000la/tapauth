@@ -372,10 +372,6 @@ async fn handle_conn(
     // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
     // Legacy PAM clients send PamAuthenticateRequest / PamCancelRequest directly.
     // Using the envelope eliminates ambiguity between admin and PAM field numbers.
-    //
-    // IMPORTANT: prost decode advances the byte slice.  Use independent copies
-    // for each decode attempt so a failed envelope decode doesn't corrupt the
-    // buffer for the legacy fallback.
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
@@ -395,7 +391,7 @@ async fn handle_conn(
                     caller_uid,
                 )
                 .await;
-                return write_admin_response(&mut stream, &admin_resp).await;
+                return write_framed(&mut stream, &admin_resp).await;
             }
             None => {
                 tracing::debug!("Empty IpcEnvelope");
@@ -538,13 +534,6 @@ async fn handle_pam_cancel(
         detail: "No matching request to cancel".to_string(),
         challenge: Vec::new(),
     }
-}
-
-async fn write_admin_response(
-    stream: &mut UnixStream,
-    response: &ipc::AdminResponse,
-) -> Result<(), DaemonError> {
-    write_framed(stream, response).await
 }
 
 async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {

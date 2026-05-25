@@ -12,17 +12,6 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
-pub enum AdminError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Config error: {0}")]
-    Config(#[from] shared::config::ConfigError),
-    #[error("{0}")]
-    Other(String),
-}
-
 fn err_resp(status: ipc::AdminStatus, msg: impl Into<String>) -> ipc::AdminResponse {
     ipc::AdminResponse {
         status: status as i32,
@@ -187,6 +176,10 @@ pub async fn handle_admin_request(
     response
 }
 
+/// Loads paired servers directly from disk (not the in-memory snapshot).
+/// This ensures `GetServers` always returns fresh data, even between daemon
+/// reloads. Auth requests use the in-memory snapshot (DaemonState.paired_servers)
+/// which may be slightly stale — the snapshots are refreshed on each reconnect.
 async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::AdminResponse {
     match daemon.config_manager.load_paired_servers() {
         Ok(servers) => {
@@ -589,6 +582,10 @@ async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
     }
 }
 
+/// Writes config to disk, saving TOML (port, requires restart) first
+/// before ClientConfig (hostname, takes effect immediately).
+/// If TOML save fails, nothing is written. If ClientConfig save fails,
+/// the port change is still persisted (correct, just needs restart).
 async fn handle_save_config(
     daemon: &Arc<DaemonState>,
     req: ipc::SaveConfigRequest,
@@ -604,23 +601,22 @@ async fn handle_save_config(
     }
     let port = req.udp_port as u16;
 
-    let client_config = ClientConfig {
-        hostname: req.hostname,
-    };
-
-    if let Err(e) = daemon.config_manager.save_config(&client_config) {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to save client config: {}", e),
-        );
-    }
-
     let mut toml_config = shared::config::TapAuthConfig::load();
     toml_config.udp_port = port;
     if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
         return err_resp(
             ipc::AdminStatus::AdminError,
             format!("Failed to save TOML config: {}", e),
+        );
+    }
+
+    let client_config = ClientConfig {
+        hostname: req.hostname,
+    };
+    if let Err(e) = daemon.config_manager.save_config(&client_config) {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!("Failed to save client config: {}", e),
         );
     }
     tracing::info!(
