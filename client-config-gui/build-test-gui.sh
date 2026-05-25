@@ -141,6 +141,15 @@ for i in $(seq 1 50); do
     if sudo test -S "$TAPAUTHD_SOCK_PATH"; then
         echo ""
         echo "✅ Socket ready: $TAPAUTHD_SOCK_PATH"
+        # Make the socket accessible to the unprivileged GUI user.
+        # Prefer tapauthd-clients group if available (production behaviour);
+        # otherwise open to world for dev/test convenience.
+        if getent group tapauthd-clients >/dev/null 2>&1; then
+            sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_PATH"
+            sudo chmod 0660 "$TAPAUTHD_SOCK_PATH"
+        else
+            sudo chmod 0666 "$TAPAUTHD_SOCK_PATH"
+        fi
         break
     fi
     echo -n "."
