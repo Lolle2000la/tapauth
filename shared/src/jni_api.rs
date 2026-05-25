@@ -67,8 +67,6 @@ use crate::jni::protobuf::{decode_message, encode_message};
 use crate::jni::*;
 use crate::protocol::messages::sign_wrapper_message;
 use crate::protocol::pb;
-use sha2::{Digest, Sha256};
-use tracing_subscriber::prelude::*;
 
 fn sha256_hex(data: &[u8]) -> String {
     #[cfg(debug_assertions)]
