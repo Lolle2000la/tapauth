@@ -45,7 +45,7 @@
 
 use jni::objects::{JByteArray, JClass, JIntArray, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
-use jni::JNIEnv;
+use jni::EnvUnowned as JNIEnv;
 
 use crate::crypto;
 use crate::jni::*;
@@ -273,7 +273,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_getSas(
         };
 
         match string_to_jstring(&mut env, &sas) {
-            Some(s) => s,
+            Some(s) => s.into_raw(),
             None => std::ptr::null_mut(),
         }
     })) {
@@ -427,7 +427,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
         let hex_hash = hex::encode(hash);
 
         match string_to_jstring(&mut env, &hex_hash) {
-            Some(s) => s,
+            Some(s) => s.into_raw(),
             None => std::ptr::null_mut(),
         }
     })) {
@@ -649,7 +649,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_determin
         };
 
         match string_to_jstring(&mut env, message_type) {
-            Some(s) => s,
+            Some(s) => s.into_raw(),
             None => std::ptr::null_mut(),
         }
     })) {
@@ -838,7 +838,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
         Ok(result) => result,
         Err(_) => {
             throw_illegal_state(&mut env, "panic caught in verifyTemporalId".to_string());
-            0
+            false
         }
     }
 }
@@ -1879,7 +1879,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
         };
 
         let complete = pb::PairingComplete {
-            success: success != 0,
+            success,
             hash_algorithm,
             csk_hash: hash_bytes,
         };
