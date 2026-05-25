@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["shared", "client-pam", "client-config-gui", "tapauthd"]
-exclude = ["tests"]
 
 [workspace.dependencies]
 # Shared library (used by all consuming crates)
