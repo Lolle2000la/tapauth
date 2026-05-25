@@ -5,8 +5,9 @@
 #
 # Usage: ./build-test-gui.sh
 #        ./build-test-gui.sh --release
-
-set -e
+#
+# Intentionally avoid `set -e` to keep logs visible on failure; check critical
+# steps manually.
 
 ORIGINAL_DIR="$(pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,14 +60,19 @@ fi
 TAPAUTHD_BIN="${PROJECT_ROOT}/${BUILD_DIR}/tapauthd"
 GUI_BIN="${PROJECT_ROOT}/${BUILD_DIR}/tapauth-config"
 TAPAUTHD_SOCK_DIR="/run/tapauthd"
-TAPAUTHD_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd-gui.sock"
+TAPAUTHD_DEFAULT_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd.sock"
+TAPAUTHD_GUI_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd-gui.sock"
 CONFIG_DIR="/var/lib/tapauth"
+CLIENT_KEY_FILE="${CONFIG_DIR}/client_key"
+CLIENT_CSK_FILE="${CONFIG_DIR}/client_symmetric_key"
+LOG_FILE="/tmp/tapauthd-gui-test.log"
 
 # ── Prerequisites ──────────────────────────────────────────────────
 
 if ! id tapauthd >/dev/null 2>&1; then
     echo "❌ System user 'tapauthd' not found."
     echo "   Run: sudo ./create-dev-users.sh"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 echo "✅ tapauthd user exists"
@@ -97,10 +103,12 @@ cargo build $RELEASE_FLAG --manifest-path client-config-gui/Cargo.toml
 
 if [ ! -x "$TAPAUTHD_BIN" ]; then
     echo "❌ tapauthd binary not found at $TAPAUTHD_BIN"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 if [ ! -x "$GUI_BIN" ]; then
     echo "❌ tapauth-config binary not found at $GUI_BIN"
+    cd "$ORIGINAL_DIR"
     exit 1
 fi
 echo "✅ Build complete"
@@ -109,66 +117,117 @@ echo "✅ Build complete"
 
 TEMP_UNIT_DIR=""
 TEMP_BIN_DIR=""
+DAEMON_PID=""
+ACTIVATION_MODE="manual"
+
 cleanup() {
     echo ""
-    echo "==> Cleaning up..."
-    sudo systemctl stop tapauthd-gui.service 2>/dev/null || true
-    sudo systemctl stop tapauthd-gui.socket 2>/dev/null || true
-    sudo rm -f /run/systemd/system/tapauthd-gui.socket 2>/dev/null || true
-    sudo rm -f /run/systemd/system/tapauthd-gui.service 2>/dev/null || true
-    sudo systemctl daemon-reload 2>/dev/null || true
-    sudo rm -f "$TAPAUTHD_SOCK_PATH" 2>/dev/null || true
-    if [ -n "$TEMP_UNIT_DIR" ] && [ -d "$TEMP_UNIT_DIR" ]; then
-        sudo rm -rf "$TEMP_UNIT_DIR" 2>/dev/null || true
+    echo "==> Cleaning up temporary files..."
+    # Grace period so daemon can finish background cleanup (BLE disconnects)
+    local GRACE_SECONDS="1"
+    if [ -n "$TAPAUTHD_GRACE_MS" ]; then
+        GRACE_SECONDS=$(awk -v ms="$TAPAUTHD_GRACE_MS" 'BEGIN{ printf "%.3f", ms/1000 }')
+    elif [ -n "$TAPAUTHD_GRACE_SECONDS" ]; then
+        GRACE_SECONDS="$TAPAUTHD_GRACE_SECONDS"
     fi
-    if [ -n "$TEMP_BIN_DIR" ] && [ -d "$TEMP_BIN_DIR" ]; then
-        sudo rm -rf "$TEMP_BIN_DIR" 2>/dev/null || true
-    fi
+    echo "    Granting daemon grace period: ${GRACE_SECONDS}s before teardown"
+    sleep "$GRACE_SECONDS"
+
+    case "$ACTIVATION_MODE" in
+        systemd-temp)
+            echo "    Stopping temporary systemd units..."
+            sudo systemctl stop tapauthd-gui.service 2>/dev/null || true
+            sudo systemctl stop tapauthd-gui.socket 2>/dev/null || true
+            sudo rm -f /run/systemd/system/tapauthd-gui.socket 2>/dev/null || true
+            sudo rm -f /run/systemd/system/tapauthd-gui.service 2>/dev/null || true
+            sudo systemctl daemon-reload 2>/dev/null || true
+            sudo rm -f "$TAPAUTHD_GUI_SOCK_PATH" 2>/dev/null || true
+            if [ -n "$TEMP_UNIT_DIR" ] && [ -d "$TEMP_UNIT_DIR" ]; then
+                sudo rm -rf "$TEMP_UNIT_DIR" 2>/dev/null || true
+            fi
+            if [ -n "$TEMP_BIN_DIR" ] && [ -d "$TEMP_BIN_DIR" ]; then
+                sudo rm -rf "$TEMP_BIN_DIR" 2>/dev/null || true
+            fi
+            ;;
+        manual)
+            if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+                echo "    Stopping tapauthd (PID=$DAEMON_PID)..."
+                kill "$DAEMON_PID" 2>/dev/null || true
+                wait "$DAEMON_PID" 2>/dev/null || true
+            fi
+            sudo rm -f "$TAPAUTHD_SOCK_PATH" 2>/dev/null || true
+            ;;
+        systemd-existing)
+            echo "    Using existing systemd socket; no socket cleanup needed."
+            ;;
+    esac
     echo "✅ Cleanup complete."
     cd "$ORIGINAL_DIR"
 }
 trap cleanup EXIT
 
-# ── Start daemon via ephemeral systemd units ───────────────────────
+# ── Start daemon ───────────────────────────────────────────────────
 
 echo ""
-echo "==> Starting tapauthd via ephemeral systemd units..."
+echo "==> Preparing tapauthd IPC socket"
 
 # Ensure runtime directory exists
-sudo mkdir -p "$TAPAUTHD_SOCK_DIR"
+sudo mkdir -p "$TAPAUTHD_SOCK_DIR" || true
 if getent group tapauthd-clients >/dev/null 2>&1; then
     sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
 fi
-sudo chmod 0750 "$TAPAUTHD_SOCK_DIR"
+sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
 
-# Create temporary directories for units and binary
-TEMP_UNIT_DIR=$(mktemp -d -t tapauthd-gui-units.XXXXXX)
-echo "    Temporary units directory: $TEMP_UNIT_DIR"
-
-# Copy daemon binary to an executable location (avoid noexec mounts)
-TEMP_BIN_DIR=$(sudo mktemp -d -p /run tapauthd-gui-bin.XXXXXX 2>/dev/null)
-if [ -z "$TEMP_BIN_DIR" ] || [ ! -d "$TEMP_BIN_DIR" ]; then
-    echo "❌ Failed to create temporary binary directory under /run"
-    exit 1
+# Detect whether TapAuth is configured (keys exist and are correct size)
+UNCONFIGURED=0
+if [ ! -f "$CLIENT_KEY_FILE" ] || [ "$(stat -c%s "$CLIENT_KEY_FILE" 2>/dev/null || echo 0)" -ne 32 ]; then
+    UNCONFIGURED=1
 fi
-sudo chmod 0755 "$TEMP_BIN_DIR"
-sudo install -m 0755 "$TAPAUTHD_BIN" "$TEMP_BIN_DIR/tapauthd"
+if [ ! -f "$CLIENT_CSK_FILE" ] || [ "$(stat -c%s "$CLIENT_CSK_FILE" 2>/dev/null || echo 0)" -ne 32 ]; then
+    UNCONFIGURED=1
+fi
 
-# Stop any prior instances
-sudo systemctl stop tapauthd-gui.service 2>/dev/null || true
-sudo systemctl stop tapauthd-gui.socket 2>/dev/null || true
-sudo rm -f /run/systemd/system/tapauthd-gui.socket 2>/dev/null || true
-sudo rm -f /run/systemd/system/tapauthd-gui.service 2>/dev/null || true
-sudo systemctl daemon-reload 2>/dev/null || true
+TAPAUTHD_SOCK_PATH="$TAPAUTHD_DEFAULT_SOCK_PATH"
 
-# Write temporary socket unit
-cat > "$TEMP_UNIT_DIR/tapauthd-gui.socket" << EOF
+if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
+    if sudo systemctl is-active --quiet tapauthd.socket; then
+        ACTIVATION_MODE="systemd-existing"
+        TAPAUTHD_SOCK_PATH="$TAPAUTHD_DEFAULT_SOCK_PATH"
+        echo "    Using existing systemd socket: $TAPAUTHD_SOCK_PATH"
+        echo "    View logs with: sudo journalctl -u tapauthd.service -f"
+    else
+        ACTIVATION_MODE="systemd-temp"
+        TAPAUTHD_SOCK_PATH="$TAPAUTHD_GUI_SOCK_PATH"
+        echo "    Creating temporary systemd units for testing..."
+
+        # Create temporary directories for units and binary
+        TEMP_UNIT_DIR=$(mktemp -d -t tapauthd-gui-units.XXXXXX)
+        echo "    Temporary units directory: $TEMP_UNIT_DIR"
+
+        # Install binary in executable location (avoid noexec mounts on /tmp, /home)
+        TEMP_BIN_DIR=$(sudo mktemp -d -p /run tapauthd-gui-bin.XXXXXX 2>/dev/null)
+        if [ -z "$TEMP_BIN_DIR" ] || [ ! -d "$TEMP_BIN_DIR" ]; then
+            echo "❌ Failed to create temporary binary directory under /run"
+            exit 1
+        fi
+        sudo chmod 0755 "$TEMP_BIN_DIR"
+        sudo install -m 0755 "$TAPAUTHD_BIN" "$TEMP_BIN_DIR/tapauthd"
+
+        # Stop any prior instances
+        sudo systemctl stop tapauthd-gui.service 2>/dev/null || true
+        sudo systemctl stop tapauthd-gui.socket 2>/dev/null || true
+        sudo rm -f /run/systemd/system/tapauthd-gui.socket 2>/dev/null || true
+        sudo rm -f /run/systemd/system/tapauthd-gui.service 2>/dev/null || true
+        sudo systemctl daemon-reload 2>/dev/null || true
+
+        # Write temporary socket unit (root:tapauthd-clients 0660)
+        cat > "$TEMP_UNIT_DIR/tapauthd-gui.socket" << EOF
 [Unit]
 Description=TapAuth daemon IPC test socket (GUI dev)
 PartOf=tapauthd-gui.service
 
 [Socket]
-ListenStream=$TAPAUTHD_SOCK_PATH
+ListenStream=$TAPAUTHD_GUI_SOCK_PATH
 SocketUser=root
 SocketGroup=tapauthd-clients
 SocketMode=0660
@@ -179,8 +238,8 @@ RemoveOnStop=yes
 WantedBy=sockets.target
 EOF
 
-# Write temporary service unit
-cat > "$TEMP_UNIT_DIR/tapauthd-gui.service" << EOF
+        # Write temporary service unit
+        cat > "$TEMP_UNIT_DIR/tapauthd-gui.service" << EOF
 [Unit]
 Description=TapAuth authentication daemon (GUI dev)
 Requires=tapauthd-gui.socket
@@ -205,14 +264,32 @@ ProtectHome=no
 WantedBy=multi-user.target
 EOF
 
-# Link and start
-sudo systemctl link --runtime "$TEMP_UNIT_DIR/tapauthd-gui.socket" || { echo "❌ Failed to link socket unit"; exit 1; }
-sudo systemctl link --runtime "$TEMP_UNIT_DIR/tapauthd-gui.service" || { echo "❌ Failed to link service unit"; exit 1; }
-sudo systemctl daemon-reload || { echo "❌ systemd daemon-reload failed"; exit 1; }
-sudo systemctl start tapauthd-gui.socket || { echo "❌ Failed to start socket"; exit 1; }
+        # Link and start
+        sudo systemctl link --runtime "$TEMP_UNIT_DIR/tapauthd-gui.socket" || { echo "❌ Failed to link socket unit"; exit 1; }
+        sudo systemctl link --runtime "$TEMP_UNIT_DIR/tapauthd-gui.service" || { echo "❌ Failed to link service unit"; exit 1; }
+        sudo systemctl daemon-reload || { echo "❌ systemd daemon-reload failed"; exit 1; }
+        sudo systemctl start tapauthd-gui.socket || { echo "❌ Failed to start socket"; exit 1; }
+        echo "    Started temporary socket: $TAPAUTHD_SOCK_PATH"
+        echo "    View logs with: sudo journalctl -u tapauthd-gui.service -f"
+    fi
+else
+    echo "    systemd not available; starting daemon manually"
+    echo "    Ensuring runtime directory at $TAPAUTHD_SOCK_DIR"
+    sudo mkdir -p "$TAPAUTHD_SOCK_DIR" || true
+    if getent group tapauthd-clients >/dev/null 2>&1; then
+        sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
+    fi
+    sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
 
-# Wait for socket
-echo -n "    Waiting for socket"
+    TAPAUTHD_SOCK_PATH="$TAPAUTHD_DEFAULT_SOCK_PATH"
+    echo "    Launching daemon with TAPAUTHD_SOCK=$TAPAUTHD_SOCK_PATH"
+    echo "    Daemon logs will be written to $LOG_FILE"
+    sudo env RUST_LOG="${RUST_LOG:-debug}" TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH" "$TAPAUTHD_BIN" > "$LOG_FILE" 2>&1 &
+    DAEMON_PID=$!
+fi
+
+# Wait for socket readiness
+echo -n "    Waiting for socket to appear"
 for i in $(seq 1 50); do
     if sudo test -S "$TAPAUTHD_SOCK_PATH"; then
         echo ""
@@ -224,12 +301,43 @@ for i in $(seq 1 50); do
 done
 if ! sudo test -S "$TAPAUTHD_SOCK_PATH"; then
     echo ""
-    echo "❌ Socket did not appear.  Check daemon logs:"
-    echo "   sudo journalctl -u tapauthd-gui.service -n 200 --no-pager"
+    echo "❌ Socket did not appear at $TAPAUTHD_SOCK_PATH"
+    if [ "$ACTIVATION_MODE" = "manual" ]; then
+        echo "   ➤ Check daemon logs: tail -n +1 -f $LOG_FILE"
+    else
+        UNIT_NAME="tapauthd.service"
+        [ "$ACTIVATION_MODE" = "systemd-temp" ] && UNIT_NAME="tapauthd-gui.service"
+        echo "   ➤ Check daemon logs: sudo journalctl -u $UNIT_NAME -n 200 --no-pager"
+    fi
     exit 1
 fi
 
-echo "    View logs: sudo journalctl -u tapauthd-gui.service -f"
+# Health check: only if configured. Otherwise skip to avoid failing on unconfigured hosts.
+if [ "$UNCONFIGURED" -eq 0 ]; then
+    echo "    Performing daemon health check..."
+    sudo python3 - << PY || { echo "❌ Health check failed"; exit 1; }
+import socket, struct
+path = "$TAPAUTHD_SOCK_PATH"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.5)
+s.connect(path)
+# send zero-length frame (u32 BE = 0)
+s.sendall(struct.pack('>I', 0))
+s.close()
+print("OK")
+PY
+    echo "✅ Daemon health check passed"
+else
+    echo "    Skipping daemon health check (TapAuth not configured: missing keys)"
+fi
+
+if [ "$ACTIVATION_MODE" = "manual" ]; then
+    echo "    ➤ View daemon logs with: tail -f $LOG_FILE"
+else
+    UNIT_NAME="tapauthd.service"
+    [ "$ACTIVATION_MODE" = "systemd-temp" ] && UNIT_NAME="tapauthd-gui.service"
+    echo "    ➤ View daemon logs with: sudo journalctl -u $UNIT_NAME -f"
+fi
 
 # ── Run GUI ────────────────────────────────────────────────────────
 
