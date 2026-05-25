@@ -4,7 +4,6 @@ use iced::{
     widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
     Element, Font, Length, Task,
 };
-use shared::config::{ClientConfig, TapAuthConfig};
 use std::sync::LazyLock;
 
 mod locales_list {
@@ -55,16 +54,13 @@ pub struct SettingsScreen {
 
 impl SettingsScreen {
     pub fn new(l10n: L10n) -> Self {
-        let client_config = ClientConfig::default();
-        let toml_config = TapAuthConfig::load();
-
         Self {
             l10n,
             rotating_csk: false,
             error: None,
             success: None,
-            hostname_input: client_config.hostname.clone(),
-            udp_port_input: toml_config.udp_port.to_string(),
+            hostname_input: String::new(),
+            udp_port_input: String::new(),
         }
     }
 
@@ -128,7 +124,11 @@ impl SettingsScreen {
                 self.success = None;
                 Task::none()
             }
-            ScreenMessage::LocaleChanged(_locale) => Task::none(),
+            ScreenMessage::ConfigLoaded(hostname, port) => {
+                self.hostname_input = hostname;
+                self.udp_port_input = port.to_string();
+                Task::none()
+            }
             _ => Task::none(),
         }
     }

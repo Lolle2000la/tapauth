@@ -348,140 +348,62 @@ async fn handle_conn(
             }
         };
 
-    // Try to parse as PamAuthenticateRequest first
+    // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
+    // Legacy PAM clients send PamAuthenticateRequest / PamCancelRequest directly.
+    // Using the envelope eliminates ambiguity between admin and PAM field numbers.
+    if let Ok(envelope) = ipc::IpcEnvelope::decode(&mut &req_bytes[..]) {
+        match envelope.msg {
+            Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
+                let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
+                return write_framed(&mut stream, &response).await;
+            }
+            Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
+                let response = handle_pam_cancel(cancel_req, &server_state);
+                return write_framed(&mut stream, &response).await;
+            }
+            Some(ipc::ipc_envelope::Msg::AdminRequest(admin_req)) => {
+                let admin_resp = admin_handler::handle_admin_request(
+                    admin_req,
+                    &server_state.daemon,
+                    &server_state.pending_pairing,
+                    caller_pid,
+                    caller_uid,
+                )
+                .await;
+                return write_admin_response(&mut stream, &admin_resp).await;
+            }
+            None => {
+                tracing::warn!("Empty IpcEnvelope");
+            }
+        }
+    }
+
+    // Legacy backward-compatible decode: try PamAuthenticateRequest first
     let auth_req = ipc::PamAuthenticateRequest::decode(&mut &req_bytes[..]);
 
     let response = match auth_req {
         Ok(req) => {
-            tracing::info!("Handling PamAuthenticateRequest for user: {}", req.username);
-
-            // Check for duplicate requests (within 1 second)
-            const DEDUP_WINDOW: Duration = Duration::from_secs(1);
-            let now = Instant::now();
-            let mut recent_requests = server_state.recent_requests.lock().await;
-
-            // Clean up old entries (older than 2 seconds)
-            recent_requests
-                .retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
-
-            // Check if we have a recent request for this user
-            let is_duplicate = if let Some(recent) = recent_requests.get(&req.username) {
-                now.duration_since(recent.timestamp) < DEDUP_WINDOW
-            } else {
-                false
-            };
-
-            if is_duplicate {
-                let elapsed_ms = recent_requests
-                    .get(&req.username)
-                    .map(|r| now.duration_since(r.timestamp).as_millis())
-                    .unwrap_or(0);
-
-                tracing::warn!(
-                    "Duplicate authentication request for user '{}' within {}ms - ignoring",
-                    req.username,
-                    elapsed_ms
-                );
-                drop(recent_requests); // Release lock before responding
-
-                // Return IGNORE to let this PAM session fall through to password
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Ignore as i32,
-                    detail: "Duplicate request - another authentication is in progress".to_string(),
-                    challenge: Vec::new(),
-                }
-            } else {
-                // Record/update timestamp for this user
-                recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
-                drop(recent_requests); // Release lock
-
-                // Run authentication
-                let timeout = Some(req.timeout_seconds);
-                match AuthSession::new(daemon.clone(), req.username.clone()) {
-                    Ok(sess) => {
-                        let result = sess
-                            .handle_authenticate(
-                                timeout,
-                                Some(req.request_id.clone()),
-                                server_state.cancel_registry.clone(),
-                            )
-                            .await;
-
-                        match result {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                tracing::error!("Authentication handler error: {}", e);
-                                ipc::PamAuthenticateResponse {
-                                    outcome: ipc::PamOutcome::Error as i32,
-                                    detail: format!("Internal error: {}", e),
-                                    challenge: Vec::new(), // Error case, no challenge
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create auth session: {}", e);
-                        ipc::PamAuthenticateResponse {
-                            outcome: ipc::PamOutcome::Error as i32,
-                            detail: format!("Internal error: {}", e),
-                            challenge: Vec::new(),
-                        }
-                    }
-                }
-            }
+            tracing::info!(
+                "Handling legacy PamAuthenticateRequest for user: {}",
+                req.username
+            );
+            handle_pam_authenticate(req, &daemon, &server_state).await
         }
         Err(_) => {
-            // Try PamCancelRequest
             let cancel_req = ipc::PamCancelRequest::decode(&mut &req_bytes[..]);
             if let Ok(req) = cancel_req {
                 tracing::info!(
-                    "Handling PamCancelRequest (id={}): {}",
+                    "Handling legacy PamCancelRequest (id={}): {}",
                     req.request_id,
                     req.reason
                 );
-                // Look up in-flight session by request_id and notify cancel
-                let mut reg = server_state.cancel_registry.lock().await;
-                if let Some(tx) = reg.remove(&req.request_id) {
-                    let _ = tx.send(());
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Ignore as i32,
-                        detail: "Cancel forwarded".to_string(),
-                        challenge: Vec::new(), // Cancel doesn't need challenge
-                    }
-                } else {
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Ignore as i32,
-                        detail: "No matching request to cancel".to_string(),
-                        challenge: Vec::new(),
-                    }
-                }
+                handle_pam_cancel(req, &server_state)
             } else {
-                // Try AdminRequest
-                let admin_req = ipc::AdminRequest::decode(&mut &req_bytes[..]);
-                if let Ok(req) = admin_req {
-                    tracing::info!(
-                        "Handling AdminRequest from PID={} UID={}",
-                        caller_pid,
-                        caller_uid
-                    );
-
-                    let admin_resp = admin_handler::handle_admin_request(
-                        req,
-                        &server_state.daemon,
-                        &server_state.pending_pairing,
-                        caller_pid,
-                        caller_uid,
-                    )
-                    .await;
-
-                    return write_admin_response(&mut stream, &admin_resp).await;
-                } else {
-                    tracing::warn!("Unknown IPC message type");
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Error as i32,
-                        detail: "Unknown IPC message".to_string(),
-                        challenge: Vec::new(),
-                    }
+                tracing::warn!("Unknown IPC message type");
+                ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Error as i32,
+                    detail: "Unknown IPC message".to_string(),
+                    challenge: Vec::new(),
                 }
             }
         }
@@ -504,6 +426,97 @@ async fn handle_conn(
         return Err(e);
     }
     Ok(())
+}
+
+async fn handle_pam_authenticate(
+    req: ipc::PamAuthenticateRequest,
+    daemon: &Arc<DaemonState>,
+    server_state: &Arc<ServerState>,
+) -> ipc::PamAuthenticateResponse {
+    const DEDUP_WINDOW: Duration = Duration::from_secs(1);
+    let now = Instant::now();
+    let mut recent_requests = server_state.recent_requests.lock().await;
+
+    recent_requests.retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
+
+    let is_duplicate = recent_requests
+        .get(&req.username)
+        .map(|r| now.duration_since(r.timestamp) < DEDUP_WINDOW)
+        .unwrap_or(false);
+
+    if is_duplicate {
+        let elapsed_ms = recent_requests
+            .get(&req.username)
+            .map(|r| now.duration_since(r.timestamp).as_millis())
+            .unwrap_or(0);
+        tracing::warn!(
+            "Duplicate authentication request for user '{}' within {}ms - ignoring",
+            req.username,
+            elapsed_ms
+        );
+        return ipc::PamAuthenticateResponse {
+            outcome: ipc::PamOutcome::Ignore as i32,
+            detail: "Duplicate request - another authentication is in progress".to_string(),
+            challenge: Vec::new(),
+        };
+    }
+
+    recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
+    drop(recent_requests);
+
+    let timeout = Some(req.timeout_seconds);
+    match AuthSession::new(daemon.clone(), req.username.clone()) {
+        Ok(sess) => match sess
+            .handle_authenticate(
+                timeout,
+                Some(req.request_id.clone()),
+                server_state.cancel_registry.clone(),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("Authentication handler error: {}", e);
+                ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Error as i32,
+                    detail: format!("Internal error: {}", e),
+                    challenge: Vec::new(),
+                }
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to create auth session: {}", e);
+            ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Error as i32,
+                detail: format!("Internal error: {}", e),
+                challenge: Vec::new(),
+            }
+        }
+    }
+}
+
+fn handle_pam_cancel(
+    req: ipc::PamCancelRequest,
+    server_state: &Arc<ServerState>,
+) -> ipc::PamAuthenticateResponse {
+    // Note: cancel_registry is behind an async Mutex; for cancel we'd need
+    // to spawn the lookup.  Since cancel is infrequent and idempotent,
+    // use try_lock.
+    if let Ok(mut reg) = server_state.cancel_registry.try_lock() {
+        if let Some(tx) = reg.remove(&req.request_id) {
+            let _ = tx.send(());
+            return ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Ignore as i32,
+                detail: "Cancel forwarded".to_string(),
+                challenge: Vec::new(),
+            };
+        }
+    }
+    ipc::PamAuthenticateResponse {
+        outcome: ipc::PamOutcome::Ignore as i32,
+        detail: "No matching request to cancel".to_string(),
+        challenge: Vec::new(),
+    }
 }
 
 async fn write_admin_response(

@@ -2,6 +2,20 @@ syntax = "proto3";
 
 package tapauth.ipc;
 
+// ── Top-level IPC envelope ──
+//
+// New clients (admin GUI) wrap all messages in IpcEnvelope so message-type
+// disambiguation is unambiguous.  Legacy PAM clients send PamAuthenticateRequest
+// and PamCancelRequest directly for backward compatibility; the daemon falls
+// back to legacy decode when the envelope does not match.
+message IpcEnvelope {
+  oneof msg {
+    PamAuthenticateRequest pam_authenticate = 10;
+    PamCancelRequest pam_cancel = 11;
+    AdminRequest admin_request = 20;
+  }
+}
+
 // Outcome of a PAM authentication attempt
 enum PamOutcome {
   SUCCESS = 0;   // Authentication granted
@@ -57,6 +71,7 @@ message AdminRequest {
     RotateCskRequest rotate_csk = 6;
     SaveConfigRequest save_config = 7;
     RecoverTpmRequest recover_tpm = 8;
+    GetConfigRequest get_config = 9;
   }
 }
 
@@ -68,6 +83,7 @@ message RemoveDeviceRequest { string public_key = 1; }
 message RotateCskRequest {}
 message SaveConfigRequest { string hostname = 1; uint32 udp_port = 2; }
 message RecoverTpmRequest {}
+message GetConfigRequest {}
 
 message AdminResponse {
   AdminStatus status = 1;
@@ -77,6 +93,7 @@ message AdminResponse {
     StartPairingResponse start_pairing = 4;
     WaitForPairingResponse wait_for_pairing = 5;
     CompletePairingResponse complete_pairing = 6;
+    GetConfigResponse get_config = 7;
   }
 }
 
@@ -84,3 +101,4 @@ message GetServersResponse { repeated PairedServerInfo servers = 1; }
 message StartPairingResponse { string url = 1; uint32 port = 2; }
 message WaitForPairingResponse { string sas_code = 1; uint32 port = 2; }
 message CompletePairingResponse { string server_hex = 1; }
+message GetConfigResponse { string hostname = 1; uint32 udp_port = 2; }

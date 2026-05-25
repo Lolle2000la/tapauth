@@ -103,7 +103,11 @@ async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, Str
         .map_err(|e| format!("PolKit CheckAuthorization call failed: {}", e))?;
 
     let body = reply.body();
-    let is_authorized: bool = body
+    let (is_authorized, _is_challenge, _details): (
+        bool,
+        bool,
+        std::collections::HashMap<String, String>,
+    ) = body
         .deserialize()
         .map_err(|e| format!("Failed to deserialize PolKit response: {}", e))?;
 
@@ -111,7 +115,11 @@ async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, Str
 }
 
 fn is_polkit_unavailable(error: &str) -> bool {
-    error.contains("connection") || error.contains("not found")
+    let e = error.to_lowercase();
+    e.contains("connect")
+        || e.contains("not found")
+        || e.contains("no such")
+        || e.contains("serviceunknown")
 }
 
 fn build_polkit_subject(

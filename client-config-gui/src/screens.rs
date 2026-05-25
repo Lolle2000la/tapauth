@@ -60,6 +60,7 @@ pub enum ScreenMessage {
     SaveConfig,
     ConfigSaved,
     ConfigSaveFailed(String),
+    ConfigLoaded(String, u16),
     LocaleChanged(String),
 
     // TPM Recovery
@@ -92,7 +93,10 @@ impl Screen {
             }
             ScreenMessage::NavigateToSettings => {
                 *self = Screen::Settings(SettingsScreen::new(l10n.clone()));
-                Task::none()
+                Task::perform(crate::ipc::get_config(), |result| match result {
+                    Ok((hostname, port)) => ScreenMessage::ConfigLoaded(hostname, port),
+                    Err(_) => ScreenMessage::ConfigLoaded(String::new(), 36692),
+                })
             }
 
             ScreenMessage::LocaleChanged(_locale) => {

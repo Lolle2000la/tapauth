@@ -78,6 +78,16 @@ fn complete_pairing_success(server_hex: String) -> ipc::AdminResponse {
     }
 }
 
+fn get_config_success(hostname: String, udp_port: u32) -> ipc::AdminResponse {
+    ipc::AdminResponse {
+        status: ipc::AdminStatus::AdminSuccess as i32,
+        error_message: String::new(),
+        payload: Some(ipc::admin_response::Payload::GetConfig(
+            ipc::GetConfigResponse { hostname, udp_port },
+        )),
+    }
+}
+
 pub struct PendingPairing {
     pub listener: TcpListener,
     pub firewall_guard: FirewallGuard,
@@ -92,6 +102,7 @@ pub struct ActivePairing {
     pub session: ClientPairingSession,
     pub server_public_key: [u8; 32],
     pub server_device_name: String,
+    pub port: u16,
     #[allow(dead_code)]
     pub firewall_guard: FirewallGuard,
 }
@@ -130,8 +141,8 @@ pub async fn handle_admin_request(
         Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
             (handle_wait_for_pairing(pairing_state, req).await, false)
         }
-        Some(ipc::admin_request::Payload::CompletePairing(_req)) => (
-            handle_complete_pairing(&daemon, pairing_state, &username).await,
+        Some(ipc::admin_request::Payload::CompletePairing(req)) => (
+            handle_complete_pairing(&daemon, pairing_state, &username, req).await,
             true,
         ),
         Some(ipc::admin_request::Payload::RemoveDevice(req)) => {
@@ -143,6 +154,9 @@ pub async fn handle_admin_request(
         }
         Some(ipc::admin_request::Payload::RecoverTpm(_)) => {
             (handle_recover_tpm(&daemon).await, true)
+        }
+        Some(ipc::admin_request::Payload::GetConfig(_)) => {
+            (handle_get_config(&daemon).await, false)
         }
         None => (
             err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
@@ -293,8 +307,8 @@ async fn handle_wait_for_pairing(
 ) -> ipc::AdminResponse {
     let mut guard = pairing_state.lock().await;
 
-    let pending = match guard.take() {
-        Some(PairingState::Pending(p)) => p,
+    let expected_port = match &*guard {
+        Some(PairingState::Pending(p)) => p.port,
         Some(PairingState::Active(_)) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
@@ -304,12 +318,20 @@ async fn handle_wait_for_pairing(
         None => return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session"),
     };
 
-    if req.port != 0 && req.port != pending.port as u32 {
+    if req.port != 0 && req.port != expected_port as u32 {
         return err_resp(
             ipc::AdminStatus::AdminError,
-            format!("Port mismatch: expected {}, got {}", pending.port, req.port),
+            format!(
+                "Port mismatch: expected {}, got {}",
+                expected_port, req.port
+            ),
         );
     }
+
+    let pending = match guard.take() {
+        Some(PairingState::Pending(p)) => p,
+        _ => unreachable!("checked above"),
+    };
 
     drop(guard);
 
@@ -345,6 +367,7 @@ async fn handle_wait_for_pairing(
                 session,
                 server_public_key,
                 server_device_name,
+                port: pending.port,
                 firewall_guard: pending.firewall_guard,
             };
 
@@ -369,11 +392,12 @@ async fn handle_complete_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
     username: &str,
+    req: ipc::CompletePairingRequest,
 ) -> ipc::AdminResponse {
     let mut guard = pairing_state.lock().await;
 
-    let active = match guard.take() {
-        Some(PairingState::Active(a)) => a,
+    let expected_port = match &*guard {
+        Some(PairingState::Active(a)) => a.port,
         Some(PairingState::Pending(_)) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
@@ -381,6 +405,21 @@ async fn handle_complete_pairing(
             )
         }
         None => return err_resp(ipc::AdminStatus::AdminError, "No active pairing session"),
+    };
+
+    if req.port != 0 && req.port != expected_port as u32 {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!(
+                "Port mismatch: expected {}, got {}",
+                expected_port, req.port
+            ),
+        );
+    }
+
+    let active = match guard.take() {
+        Some(PairingState::Active(a)) => a,
+        _ => unreachable!("checked above"),
     };
 
     drop(guard);
@@ -491,13 +530,13 @@ async fn handle_save_config(
     daemon: &Arc<DaemonState>,
     req: ipc::SaveConfigRequest,
 ) -> ipc::AdminResponse {
-    let port = req.udp_port as u16;
-    if port == 0 {
+    if req.udp_port == 0 || req.udp_port > 65535 {
         return err_resp(
             ipc::AdminStatus::AdminError,
             "Invalid UDP port: must be 1-65535",
         );
     }
+    let port = req.udp_port as u16;
 
     let client_config = ClientConfig {
         hostname: req.hostname,
@@ -541,4 +580,10 @@ async fn handle_recover_tpm(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
         let _ = daemon;
         err_resp(ipc::AdminStatus::AdminError, "TPM support not compiled in")
     }
+}
+
+async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
+    let client_config = daemon.config_manager.load_config().unwrap_or_default();
+    let toml_config = shared::config::TapAuthConfig::load();
+    get_config_success(client_config.hostname, toml_config.udp_port as u32)
 }

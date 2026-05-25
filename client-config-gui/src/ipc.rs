@@ -45,11 +45,15 @@ fn err_msg(resp: &ipc::AdminResponse) -> String {
 }
 
 pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::AdminResponse, String> {
+    let envelope = ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
+    };
+
     let mut stream = daemon_socket()
         .await
         .map_err(|e| format!("Failed to connect to daemon: {}", e))?;
 
-    let req_bytes = request.encode_to_vec();
+    let req_bytes = envelope.encode_to_vec();
     write_framed(&mut stream, &req_bytes)
         .await
         .map_err(|e| format!("Failed to send admin request: {}", e))?;
@@ -206,4 +210,25 @@ pub async fn recover_tpm() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub async fn get_config() -> Result<(String, u16), String> {
+    let request = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::GetConfig(
+            ipc::GetConfigRequest {},
+        )),
+    };
+
+    let response = send_admin_request(request).await?;
+
+    if response.status != ipc::AdminStatus::AdminSuccess as i32 {
+        return Err(err_msg(&response));
+    }
+
+    match response.payload {
+        Some(ipc::admin_response::Payload::GetConfig(resp)) => {
+            Ok((resp.hostname, resp.udp_port as u16))
+        }
+        _ => Err("Unexpected response type".to_string()),
+    }
 }
