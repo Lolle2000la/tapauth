@@ -446,6 +446,8 @@ Type=simple
 User=tapauthd
 Group=tapauthd
 Sockets=tapauthd-test.socket
+ExecStartPre=$TEMP_BIN_DIR/tapauthd manage-firewall open
+ExecStopPost=$TEMP_BIN_DIR/tapauthd manage-firewall close
 ExecStart=$TEMP_BIN_DIR/tapauthd
 Restart=on-failure
 Environment="RUST_LOG=${RUST_LOG:-debug}"
