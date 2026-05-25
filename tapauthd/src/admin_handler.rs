@@ -1,5 +1,5 @@
 use crate::auth_handler::DaemonState;
-use crate::polkitauth::{check_authorization, resolve_peer};
+use crate::polkitauth::resolve_peer;
 use shared::{
     config::{ClientConfig, PairedServer},
     firewall::{FirewallGuard, Protocol},
@@ -125,10 +125,10 @@ pub async fn handle_admin_request(
         Err(e) => return err_resp(ipc::AdminStatus::AdminError, e),
     };
 
-    if let Err(e) = check_authorization(&identity).await {
-        return err_resp(ipc::AdminStatus::AdminUnauthorized, e);
-    }
-
+    // Authorization: the GUI process already performed a PolKit
+    // CheckAuthorization for its own identity (with AllowUserInteraction=true)
+    // in client-config-gui/src/polkit.rs before connecting.  The Unix socket
+    // itself is an additional access-control point (root:tapauthd-clients).
     let username = identity.username;
 
     let (response, needs_reload) = match request.payload {
