@@ -1,6 +1,6 @@
 use super::ScreenMessage;
 use crate::l10n::L10n;
-use crate::utils::elevation;
+use crate::utils::identity;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Element, Font, Length, Task,
@@ -35,7 +35,7 @@ impl DeviceListScreen {
     pub fn new(l10n: L10n) -> (Self, Task<ScreenMessage>) {
         tracing::debug!("Creating new DeviceListScreen and starting load task");
 
-        let current_username = elevation::get_username();
+        let current_username = identity::get_username();
 
         tracing::info!("Device list for user: {}", current_username);
 

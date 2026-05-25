@@ -14,7 +14,7 @@ fn main() -> iced::Result {
         }
     }
 
-    let original_user = utils::elevation::get_username();
+    let original_user = utils::identity::get_username();
 
     logging::init_logging();
 

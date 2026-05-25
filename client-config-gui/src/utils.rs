@@ -2,5 +2,5 @@
 //!
 //! Provides identity helpers and system prerequisite checks.
 
-pub mod elevation;
+pub mod identity;
 pub mod system_check;
