@@ -365,4 +365,9 @@ echo "    The GUI connects to $TAPAUTHD_SOCK_PATH for all admin operations."
 echo ""
 
 export TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH"
-exec "$GUI_BIN"
+"$GUI_BIN"
+GUI_EXIT_CODE=$?
+
+echo ""
+echo "GUI exited with code $GUI_EXIT_CODE."
+# Cleanup fires via trap EXIT when the shell exits
