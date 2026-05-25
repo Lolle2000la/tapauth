@@ -83,7 +83,12 @@ pub fn init_logging() {
             "tapauth-config: /var/log/tapauth not writable, falling back to /tmp/tapauth-logs"
         );
         let fallback = std::path::PathBuf::from("/tmp/tapauth-logs");
-        create_safe_tmp_dir(&fallback);
+        if !create_safe_tmp_dir(&fallback) {
+            eprintln!(
+                "tapauth-config: /tmp/tapauth-logs is unsafe (symlink or wrong owner), \
+                 using stdout only"
+            );
+        }
         fallback
     };
 

@@ -2,6 +2,7 @@ use crate::auth_handler::DaemonState;
 use crate::peer_identity::{check_authorization, resolve_peer};
 use shared::{
     config::{ClientConfig, PairedServer},
+    crypto::keys::ClientSymmetricKey,
     firewall::{FirewallGuard, Protocol},
     ipc::pb as ipc,
     models::pairing::generate_pairing_url,
@@ -227,23 +228,31 @@ async fn handle_start_pairing(
     // a transient public key and subsequent auth requests fail signature verification.
     let keypair = match daemon.config_manager.load_keypair() {
         Ok(kp) => kp,
-        Err(_) => match daemon.config_manager.generate_and_save_keypair() {
-            Ok(kp) => kp,
-            Err(e) => {
-                return err_resp(
-                    ipc::AdminStatus::AdminError,
-                    format!("Keypair load/generation failed: {}", e),
-                )
+        Err(shared::config::ConfigError::InvalidConfig) => {
+            match daemon.config_manager.generate_and_save_keypair() {
+                Ok(kp) => kp,
+                Err(e) => {
+                    return err_resp(
+                        ipc::AdminStatus::AdminError,
+                        format!("Keypair generation failed: {}", e),
+                    )
+                }
             }
-        },
+        }
+        Err(e) => {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!("Failed to load keypair: {}", e),
+            )
+        }
     };
 
-    let ipv4_addr = match local_ip_address::local_ip() {
-        Ok(std::net::IpAddr::V4(ip)) if !ip.is_loopback() => ip,
+    let ipv4 = match local_ip_address::local_ip() {
+        Ok(std::net::IpAddr::V4(ip)) if !ip.is_loopback() => Some(ip),
         _ => find_non_loopback_ipv4(),
     };
 
-    let ipv6_addr = find_non_loopback_ipv6();
+    let ipv6 = find_non_loopback_ipv6();
 
     let listener = match TcpListener::bind("0.0.0.0:0").await {
         Ok(l) => l,
@@ -286,7 +295,7 @@ async fn handle_start_pairing(
     };
 
     let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
-    let url = generate_pairing_url(&x25519_pubkey_hex, port, Some(ipv4_addr), Some(ipv6_addr));
+    let url = generate_pairing_url(&x25519_pubkey_hex, port, ipv4, ipv6);
 
     let gen = next_generation();
     let pending = PendingPairing {
@@ -444,32 +453,32 @@ fn daemon_hostname() -> String {
     whoami::hostname().unwrap_or_else(|_| "Unknown".to_string())
 }
 
-fn find_non_loopback_ipv4() -> std::net::Ipv4Addr {
+fn find_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::IpAddr;
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (_name, ip) in interfaces {
             if let IpAddr::V4(ipv4) = ip {
                 if !ipv4.is_loopback() {
-                    return ipv4;
+                    return Some(ipv4);
                 }
             }
         }
     }
-    std::net::Ipv4Addr::new(127, 0, 0, 1)
+    None
 }
 
-fn find_non_loopback_ipv6() -> std::net::Ipv6Addr {
+fn find_non_loopback_ipv6() -> Option<std::net::Ipv6Addr> {
     use std::net::IpAddr;
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (_name, ip) in interfaces {
             if let IpAddr::V6(ipv6) = ip {
                 if !ipv6.is_loopback() && !ipv6.is_unspecified() {
-                    return ipv6;
+                    return Some(ipv6);
                 }
             }
         }
     }
-    std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)
+    None
 }
 
 async fn handle_complete_pairing(
@@ -510,19 +519,21 @@ async fn handle_complete_pairing(
 
     let csk = match daemon.config_manager.load_csk() {
         Ok(c) => c,
-        Err(_) => match daemon.config_manager.generate_and_save_csk() {
+        Err(shared::config::ConfigError::InvalidConfig) => match ClientSymmetricKey::generate() {
             Ok(c) => c,
             Err(e) => {
                 return err_resp(
                     ipc::AdminStatus::AdminError,
-                    format!(
-                        "CSK generation failed: {}. Ensure tapauthd is installed and the \
-                         'tapauthd' user and group exist, then retry pairing.",
-                        e
-                    ),
+                    format!("CSK generation failed: {}", e),
                 )
             }
         },
+        Err(e) => {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!("Failed to load CSK: {}", e),
+            )
+        }
     };
 
     let mut session = active.session;

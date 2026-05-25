@@ -100,15 +100,21 @@ pub fn init_logging() {
             log_dir
         } else {
             let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
-            create_safe_tmp_dir(&fallback);
+            if !create_safe_tmp_dir(&fallback) {
+                tracing::warn!(
+                    "Cannot write to /var/log/tapauth and /tmp fallback is unsafe, \
+                     logging to stdout only"
+                );
+            }
             fallback
         }
     } else {
         let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
-        let _ = std::fs::create_dir_all(&fallback);
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
+        if !create_safe_tmp_dir(&fallback) {
+            tracing::warn!(
+                "Cannot write to /var/log/tapauth and /tmp fallback is unsafe, \
+                 logging to stdout only"
+            );
         }
         fallback
     };
