@@ -109,6 +109,30 @@ where
             return None;
         }
     };
+    let len = match env
+        .with_env(|env| {
+            let array_obj = unsafe { JObjectArray::<JObject>::from_raw(env, array) };
+            array_obj.len(env)
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(len) => len,
+        Outcome::Err(err) => {
+            throw_illegal_state(env, format!("failed to read array length: {err}"));
+            return None;
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, "failed to read array length: panic".to_string());
+            return None;
+        }
+    };
+    if index >= len {
+        throw_illegal_state(
+            env,
+            format!("array index {index} out of bounds for length {len}"),
+        );
+        return None;
+    }
     match env
         .with_env(|env| {
             let array_obj = unsafe { JObjectArray::<JObject>::from_raw(env, array) };
