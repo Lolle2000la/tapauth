@@ -1,6 +1,6 @@
 //! Protobuf encoding/decoding helpers for JNI.
 
-use jni::JNIEnv;
+use jni::EnvUnowned as JNIEnv;
 use prost::Message;
 
 use super::exceptions::throw_io_exception;
