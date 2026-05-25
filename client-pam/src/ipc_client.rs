@@ -90,8 +90,11 @@ impl IpcClient {
             reason: reason.to_string(),
             request_id: request_id.to_string(),
         };
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamCancel(req)),
+        };
 
-        self.send_message(&req)?;
+        self.send_message(&envelope)?;
         // Short read timeout for cancel acknowledgement
         self.stream
             .set_read_timeout(Some(Duration::from_millis(750)))?;
@@ -122,8 +125,11 @@ impl IpcClient {
             timeout_seconds,
             request_id: request_id.to_string(),
         };
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
+        };
 
-        self.send_message(&req)?;
+        self.send_message(&envelope)?;
         // Align with spec: wait exactly the session timeout
         self.stream
             .set_read_timeout(Some(Duration::from_secs(timeout_seconds as u64)))?;
@@ -144,7 +150,11 @@ impl IpcClient {
             timeout_seconds,
             request_id: request_id.to_string(),
         };
-        self.send_message(&req)
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
+        };
+        tracing::trace!("Sending PamAuthenticateRequest [request_id={request_id}]");
+        self.send_message(&envelope)
     }
 
     /// Nonblocking attempt to read a full response frame; Ok(None) if incomplete.
@@ -212,8 +222,11 @@ impl IpcClient {
                     io::ErrorKind::InvalidData,
                     "frame too short",
                 )))?;
-                let resp = ipc::PamAuthenticateResponse::decode(data)?;
-                return Ok(Some(resp));
+                let resp = ipc::IpcEnvelope::decode(data)?;
+                if let Some(ipc::ipc_envelope::Msg::PamResponse(response)) = resp.msg {
+                    return Ok(Some(response));
+                }
+                return Ok(None);
             }
         }
         Ok(None)
@@ -247,7 +260,15 @@ impl IpcClient {
         let mut data = vec![0u8; len as usize];
         self.stream.read_exact(&mut data)?;
 
-        Ok(ipc::PamAuthenticateResponse::decode(&data[..])?)
+        let envelope = ipc::IpcEnvelope::decode(&data[..])?;
+        if let Some(ipc::ipc_envelope::Msg::PamResponse(response)) = envelope.msg {
+            Ok(response)
+        } else {
+            Err(IpcError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Expected PamResponse in IpcEnvelope",
+            )))
+        }
     }
 }
 

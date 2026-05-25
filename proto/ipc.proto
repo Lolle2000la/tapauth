@@ -4,15 +4,15 @@ package tapauth.ipc;
 
 // ── Top-level IPC envelope ──
 //
-// New clients (admin GUI) wrap all messages in IpcEnvelope so message-type
-// disambiguation is unambiguous.  Legacy PAM clients send PamAuthenticateRequest
-// and PamCancelRequest directly for backward compatibility; the daemon falls
-// back to legacy decode when the envelope does not match.
+// All IPC messages are wrapped in IpcEnvelope for unambiguous message-type
+// disambiguation.  Both the PAM module and the admin GUI use this envelope.
 message IpcEnvelope {
   oneof msg {
     PamAuthenticateRequest pam_authenticate = 10;
     PamCancelRequest pam_cancel = 11;
+    PamAuthenticateResponse pam_response = 12;
     AdminRequest admin_request = 20;
+    AdminResponse admin_response = 21;
   }
 }
 

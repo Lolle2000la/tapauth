@@ -370,17 +370,16 @@ async fn handle_conn(
     }
 
     // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
-    // Legacy PAM clients send PamAuthenticateRequest / PamCancelRequest directly.
-    // Using the envelope eliminates ambiguity between admin and PAM field numbers.
+    // All messages arrive wrapped in IpcEnvelope for unambiguous dispatch.
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
                 let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
-                return write_framed(&mut stream, &response).await;
+                return write_framed(&mut stream, &envelope_pam_response(response)).await;
             }
             Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
                 let response = handle_pam_cancel(cancel_req, &server_state).await;
-                return write_framed(&mut stream, &response).await;
+                return write_framed(&mut stream, &envelope_pam_response(response)).await;
             }
             Some(ipc::ipc_envelope::Msg::AdminRequest(admin_req)) => {
                 let admin_resp = admin_handler::handle_admin_request(
@@ -391,47 +390,27 @@ async fn handle_conn(
                     caller_uid,
                 )
                 .await;
-                return write_framed(&mut stream, &admin_resp).await;
+                return write_framed(&mut stream, &envelope_admin_response(admin_resp)).await;
             }
             None => {
                 tracing::debug!("Empty IpcEnvelope");
             }
+            Some(ipc::ipc_envelope::Msg::PamResponse(_))
+            | Some(ipc::ipc_envelope::Msg::AdminResponse(_)) => {
+                tracing::warn!("Received response-type message from client — ignoring");
+            }
         }
     }
 
-    // Legacy backward-compatible decode: try PamAuthenticateRequest first
-    let auth_req = ipc::PamAuthenticateRequest::decode(req_bytes.as_slice());
-
-    let response = match auth_req {
-        Ok(req) => {
-            tracing::info!(
-                "Handling legacy PamAuthenticateRequest for user: {}",
-                req.username
-            );
-            handle_pam_authenticate(req, &daemon, &server_state).await
-        }
-        Err(_) => {
-            let cancel_req = ipc::PamCancelRequest::decode(req_bytes.as_slice());
-            if let Ok(req) = cancel_req {
-                tracing::info!(
-                    "Handling legacy PamCancelRequest (id={}): {}",
-                    req.request_id,
-                    req.reason
-                );
-                handle_pam_cancel(req, &server_state).await
-            } else {
-                tracing::warn!("Unknown IPC message type");
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Error as i32,
-                    detail: "Unknown IPC message".to_string(),
-                    challenge: Vec::new(),
-                }
-            }
-        }
+    tracing::warn!("Unknown IPC message type");
+    let response = ipc::PamAuthenticateResponse {
+        outcome: ipc::PamOutcome::Error as i32,
+        detail: "Unknown IPC message".to_string(),
+        challenge: Vec::new(),
     };
 
     // Frame and write response
-    if let Err(e) = write_framed(&mut stream, &response).await {
+    if let Err(e) = write_framed(&mut stream, &envelope_pam_response(response)).await {
         // Gracefully ignore common disconnect races
         if let DaemonError::Io(ref ioe) = e {
             use std::io::ErrorKind::*;
@@ -550,6 +529,18 @@ async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<()
 
     stream.write_all(&buf).await?;
     Ok(())
+}
+
+fn envelope_pam_response(response: ipc::PamAuthenticateResponse) -> ipc::IpcEnvelope {
+    ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::PamResponse(response)),
+    }
+}
+
+fn envelope_admin_response(response: ipc::AdminResponse) -> ipc::IpcEnvelope {
+    ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::AdminResponse(response)),
+    }
 }
 
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {

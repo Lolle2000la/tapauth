@@ -83,8 +83,12 @@ pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::Admin
         .map_err(|_| "Timed out waiting for admin response".to_string())?
         .map_err(|e| format!("Failed to read admin response: {}", e))?;
 
-    ipc::AdminResponse::decode(&mut &result[..])
-        .map_err(|e| format!("Failed to decode admin response: {}", e))
+    let envelope = ipc::IpcEnvelope::decode(&mut &result[..])
+        .map_err(|e| format!("Failed to decode IPC envelope: {}", e))?;
+    match envelope.msg {
+        Some(ipc::ipc_envelope::Msg::AdminResponse(resp)) => Ok(resp),
+        _ => Err("Daemon returned unexpected envelope type".to_string()),
+    }
 }
 
 pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, String> {
