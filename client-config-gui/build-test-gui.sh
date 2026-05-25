@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
             echo "  - 'tapauthd' and 'tapauthd-clients' system user/group must exist"
             echo "    (run create-dev-users.sh)"
             echo "  - /var/lib/tapauth must be writable by tapauthd"
-            echo "  - The PolKit action org.tapauth.config.admin should be configured,"
+            echo "  - The PolKit action dev.rourunisen.tapauth.config.admin should be configured,"
             echo "    or run as root (UID=0 fallback)"
             cd "$ORIGINAL_DIR"
             exit 0
@@ -65,7 +65,7 @@ TAPAUTHD_GUI_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd-gui.sock"
 CONFIG_DIR="/var/lib/tapauth"
 CLIENT_KEY_FILE="${CONFIG_DIR}/client_key"
 CLIENT_CSK_FILE="${CONFIG_DIR}/client_symmetric_key"
-POLICY_FILE="${PROJECT_ROOT}/tapauthd/org.tapauth.config.admin.policy"
+POLICY_FILE="${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy"
 POLICY_INSTALL_DIR="/usr/local/share/polkit-1/actions"
 LOG_FILE="/tmp/tapauthd-gui-test.log"
 

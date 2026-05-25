@@ -1,7 +1,7 @@
 use nix::unistd::User;
 use zbus::Connection;
 
-const POLKIT_ACTION_ID: &str = "org.tapauth.config.admin";
+const POLKIT_ACTION_ID: &str = "dev.rourunisen.tapauth.config.admin";
 
 pub struct PeerIdentity {
     #[allow(dead_code)]

@@ -21,8 +21,8 @@ install -Dm755 ../target/release/tapauth-config /usr/bin/tapauth-config
 
 # Install polkit policy
 echo "Installing polkit policy..."
-install -Dm644 ../tapauthd/org.tapauth.config.admin.policy \
-    /usr/share/polkit-1/actions/org.tapauth.config.admin.policy
+install -Dm644 ../tapauthd/dev.rourunisen.tapauth.config.admin.policy \
+    /usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 
 # Install desktop icon
 echo "Installing desktop icon..."

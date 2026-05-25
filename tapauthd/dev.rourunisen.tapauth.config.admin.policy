@@ -6,7 +6,7 @@
   <vendor>TapAuth</vendor>
   <vendor_url>https://github.com/Lolle2000la/tapauth</vendor_url>
 
-  <action id="org.tapauth.config.admin">
+  <action id="dev.rourunisen.tapauth.config.admin">
     <description>Configure TapAuth authentication</description>
     <message>Authentication is required to configure TapAuth pairing devices</message>
     <icon_name>security-high</icon_name>

@@ -110,7 +110,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 - After admin mutations (pairing, device removal, CSK rotation), the daemon calls `DaemonState::reload()` to refresh in-memory state from disk without restarting.
 - The daemon resolves the caller's identity via `SO_PEERCRED` (PID, UID → username + `/proc/PID/stat` start-time)
 - Authorization is enforced daemon-side via `PolicyKit1.Authority.CheckAuthorization` with `unix-process` subject
-- The `tapauthd` user is registered as an action owner (`org.freedesktop.policykit.owner`) via `tapauthd/org.tapauth.config.admin.policy` to permit cross-identity queries
+- The `tapauthd` user is registered as an action owner (`org.freedesktop.policykit.owner`) via `tapauthd/dev.rourunisen.tapauth.config.admin.policy` to permit cross-identity queries
 - Falls back to UID==0 check when D-Bus/PolKit is unavailable
 - Socket permissions serve as an additional access gate: `root:tapauthd-clients 0660`
 
