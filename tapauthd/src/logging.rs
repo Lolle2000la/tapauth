@@ -15,10 +15,14 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     use nix::unistd::{getegid, geteuid};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let meta = match std::fs::metadata(path) {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return false,
     };
+
+    if meta.file_type().is_symlink() {
+        return false;
+    }
 
     if !meta.is_dir() {
         return false;
@@ -115,8 +119,8 @@ fn resolve_log_dir() -> Option<std::path::PathBuf> {
         return Some(fallback);
     }
 
-    tracing::warn!(
-        "Cannot write to /var/log/tapauth and /tmp/tapauthd-logs is unsafe, \
+    eprintln!(
+        "tapauthd: Cannot write to /var/log/tapauth and /tmp/tapauthd-logs is unsafe, \
          logging to stdout only"
     );
     None

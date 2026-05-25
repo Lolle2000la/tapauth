@@ -467,6 +467,11 @@ impl ClientConfigManager {
         Ok(csk)
     }
 
+    /// Whether a CSK already exists on disk (file present, may be corrupt)
+    pub fn has_csk_file(&self) -> bool {
+        self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE).exists()
+    }
+
     /// Rotate CSK (generates new one, invalidating all pairings)
     pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
         // Delete all paired servers since they have the old CSK

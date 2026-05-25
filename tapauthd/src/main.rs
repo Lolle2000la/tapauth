@@ -369,6 +369,9 @@ async fn handle_conn(
     }
 
     // All messages arrive wrapped in IpcEnvelope for unambiguous dispatch.
+    // PAM auth/cancel requests skip PolKit by design: the PAM module runs
+    // *during* authentication and the subject hasn't been verified yet.
+    // Access is gated by socket permissions (root:tapauthd-clients 0660).
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
@@ -400,7 +403,7 @@ async fn handle_conn(
         }
     }
 
-    tracing::warn!("Unknown IPC message type");
+    tracing::warn!("Unrecognized IPC data — not a valid IpcEnvelope");
     let response = ipc::PamAuthenticateResponse {
         outcome: ipc::PamOutcome::Error as i32,
         detail: "Unknown IPC message".to_string(),

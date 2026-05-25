@@ -519,15 +519,24 @@ async fn handle_complete_pairing(
 
     let csk = match daemon.config_manager.load_csk() {
         Ok(c) => c,
-        Err(shared::config::ConfigError::InvalidConfig) => match ClientSymmetricKey::generate() {
-            Ok(c) => c,
-            Err(e) => {
+        Err(shared::config::ConfigError::InvalidConfig) => {
+            if daemon.config_manager.has_csk_file() {
                 return err_resp(
                     ipc::AdminStatus::AdminError,
-                    format!("CSK generation failed: {}", e),
-                )
+                    "CSK file is corrupt.  Use `Rotate CSK` in settings to regenerate \
+                     (this will invalidate all existing pairings).",
+                );
             }
-        },
+            match ClientSymmetricKey::generate() {
+                Ok(c) => c,
+                Err(e) => {
+                    return err_resp(
+                        ipc::AdminStatus::AdminError,
+                        format!("CSK generation failed: {}", e),
+                    )
+                }
+            }
+        }
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
