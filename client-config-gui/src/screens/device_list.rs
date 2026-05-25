@@ -116,7 +116,17 @@ impl DeviceListScreen {
         let user_devices: HashMap<_, _> = self
             .devices
             .iter()
-            .filter(|(_, server)| server.allowed_users.contains(&self.current_username))
+            .filter(|(_, server)| {
+                if !server.allowed_users.contains(&self.current_username) {
+                    tracing::warn!(
+                        "Daemon returned device '{}' not associated with current user '{}'",
+                        server.name,
+                        self.current_username
+                    );
+                    return false;
+                }
+                true
+            })
             .collect();
 
         let device_list = if user_devices.is_empty() {
