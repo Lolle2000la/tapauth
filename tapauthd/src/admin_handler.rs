@@ -132,6 +132,11 @@ pub async fn handle_admin_request(
         return err_resp(ipc::AdminStatus::AdminUnauthorized, e);
     }
 
+    // identity.username is derived from the peer UID. For the normal case
+    // (unprivileged GUI), this is the actual user's name (e.g. "alice").
+    // If somebody runs the GUI as root (sudo tapauth-config), this will be
+    // "root" — and pairing/devices target root's configuration.  This is
+    // expected: root is not a magic proxy for other users.
     let username = identity.username;
 
     let (response, needs_reload) = match request.payload {

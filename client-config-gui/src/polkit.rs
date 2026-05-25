@@ -7,10 +7,13 @@ const ACTION_ID: &str = "org.tapauth.config.admin";
 /// Calls PolicyKit1.CheckAuthorization with `AllowUserInteraction = true` so
 /// the desktop's authentication agent can prompt for the user's password.
 ///
-/// Fails closed: if PolKit is unavailable or returns an error, the caller
-/// is denied.  To use the GUI without PolKit, run as root (UID 0) — the
-/// daemon's socket permissions still gate access.
+/// Fails closed for unprivileged users: if PolKit is unavailable or returns
+/// an error, the caller is denied.  Root (UID 0) bypasses PolKit entirely —
+/// the daemon's socket permissions still gate access.
 pub async fn authorize_admin_action() -> Result<(), String> {
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
     match try_polkit().await {
         Ok(true) => Ok(()),
         Ok(false) => Err("Authorization denied by authentication agent".to_string()),
