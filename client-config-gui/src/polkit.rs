@@ -6,18 +6,25 @@ const ACTION_ID: &str = "org.tapauth.config.admin";
 ///
 /// Calls PolicyKit1.CheckAuthorization with `AllowUserInteraction = true` so
 /// the desktop's authentication agent can prompt for the user's password.
-/// Falls back to allowing access when PolKit is unavailable (the Unix socket
-/// already gates access via group membership).
+///
+/// Fails closed: if PolKit is unavailable or returns an error, the caller
+/// is denied.  To use the GUI without PolKit, run as root (UID 0) — the
+/// daemon's socket permissions still gate access.
 pub async fn authorize_admin_action() -> Result<(), String> {
     match try_polkit().await {
         Ok(true) => Ok(()),
         Ok(false) => Err("Authorization denied by authentication agent".to_string()),
         Err(e) => {
-            tracing::warn!(
-                "PolKit unavailable or not configured ({}); allowing access via socket membership",
-                e
-            );
-            Ok(())
+            if is_dbus_unavailable(&e) {
+                Err(format!(
+                    "PolicyKit is not available on this system ({}).\n\
+                     Run the TapAuth config GUI as root (sudo) to bypass PolKit, \
+                     or install and configure PolicyKit.",
+                    e
+                ))
+            } else {
+                Err(format!("PolKit authorization failed: {}", e))
+            }
         }
     }
 }
@@ -38,7 +45,6 @@ async fn try_polkit() -> Result<bool, String> {
         "start-time".to_string(),
         zbus::zvariant::Value::U64(start_time),
     );
-    // uid is implicitly the caller's uid — omit for self-check
 
     let reply = connection
         .call_method(
@@ -50,7 +56,7 @@ async fn try_polkit() -> Result<bool, String> {
                 ("unix-process".to_string(), details),
                 ACTION_ID,
                 HashMap::<&str, &str>::new(),
-                1u32, // AllowUserInteraction
+                1u32,
                 "",
             ),
         )
@@ -63,6 +69,15 @@ async fn try_polkit() -> Result<bool, String> {
         .map_err(|e| format!("PolKit response parse failed: {}", e))?;
 
     Ok(is_authorized)
+}
+
+fn is_dbus_unavailable(error: &str) -> bool {
+    let e = error.to_lowercase();
+    e.contains("dbus unavailable")
+        || e.contains("connection")
+        || e.contains("not found")
+        || e.contains("no such")
+        || e.contains("serviceunknown")
 }
 
 fn read_self_start_time() -> Result<u64, String> {
