@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost = { workspace = true }
-bytes = { workspace = true }
+prost = "0.14"
+bytes = "1.11"
 
 [build-dependencies]
-prost-build = { workspace = true }
+prost-build = "0.14"
 
 [[test]]
 name = "integration_test"
