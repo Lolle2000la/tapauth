@@ -171,12 +171,13 @@ trap cleanup EXIT
 echo ""
 echo "==> Preparing tapauthd IPC socket"
 
-# Ensure runtime directory exists
+# Ensure runtime directory exists (world-readable for dev so unprivileged
+# GUI can reach the socket; production uses tapauthd-clients group instead)
 sudo mkdir -p "$TAPAUTHD_SOCK_DIR" || true
 if getent group tapauthd-clients >/dev/null 2>&1; then
     sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
 fi
-sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
+sudo chmod 0755 "$TAPAUTHD_SOCK_DIR" || true
 
 # Detect whether TapAuth is configured (keys exist and are correct size)
 UNCONFIGURED=0
@@ -220,7 +221,8 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         sudo rm -f /run/systemd/system/tapauthd-gui.service 2>/dev/null || true
         sudo systemctl daemon-reload 2>/dev/null || true
 
-        # Write temporary socket unit (root:tapauthd-clients 0660)
+        # Write temporary socket unit (world-accessible for dev convenience;
+        # production uses tapauthd-clients group with 0660 instead)
         cat > "$TEMP_UNIT_DIR/tapauthd-gui.socket" << EOF
 [Unit]
 Description=TapAuth daemon IPC test socket (GUI dev)
@@ -230,8 +232,8 @@ PartOf=tapauthd-gui.service
 ListenStream=$TAPAUTHD_GUI_SOCK_PATH
 SocketUser=root
 SocketGroup=tapauthd-clients
-SocketMode=0660
-DirectoryMode=0750
+SocketMode=0666
+DirectoryMode=0755
 RemoveOnStop=yes
 
 [Install]
@@ -279,7 +281,7 @@ else
     if getent group tapauthd-clients >/dev/null 2>&1; then
         sudo chgrp tapauthd-clients "$TAPAUTHD_SOCK_DIR" || true
     fi
-    sudo chmod 0750 "$TAPAUTHD_SOCK_DIR" || true
+    sudo chmod 0755 "$TAPAUTHD_SOCK_DIR" || true
 
     TAPAUTHD_SOCK_PATH="$TAPAUTHD_DEFAULT_SOCK_PATH"
     echo "    Launching daemon with TAPAUTHD_SOCK=$TAPAUTHD_SOCK_PATH"
@@ -294,6 +296,11 @@ for i in $(seq 1 50); do
     if sudo test -S "$TAPAUTHD_SOCK_PATH"; then
         echo ""
         echo "✅ Socket ready: $TAPAUTHD_SOCK_PATH"
+        # In manual mode the daemon creates the socket as tapauthd:tapauthd 0660.
+        # Make it world-accessible so the unprivileged GUI can connect.
+        if [ "$ACTIVATION_MODE" = "manual" ]; then
+            sudo chmod 0666 "$TAPAUTHD_SOCK_PATH" 2>/dev/null || true
+        fi
         break
     fi
     echo -n "."
