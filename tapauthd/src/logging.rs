@@ -114,7 +114,7 @@ fn resolve_log_dir() -> Option<std::path::PathBuf> {
     }
 
     let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
-    if create_safe_dir(&fallback) {
+    if create_safe_dir(&fallback) && is_dir_writable(&fallback) {
         return Some(fallback);
     }
 
@@ -135,7 +135,8 @@ fn create_safe_dir(path: &std::path::Path) -> bool {
             return false;
         }
         if meta.is_dir() && meta.uid() == geteuid().as_raw() {
-            return true;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            return is_dir_writable(path);
         }
     }
     if std::fs::create_dir_all(path).is_err() {

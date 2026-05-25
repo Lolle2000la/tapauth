@@ -29,6 +29,7 @@ pub struct DeviceListScreen {
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
+    error: Option<String>,
 }
 
 impl DeviceListScreen {
@@ -44,6 +45,7 @@ impl DeviceListScreen {
             devices: HashMap::new(),
             current_username,
             loading: true,
+            error: None,
         };
 
         let task = Task::perform(Self::load_devices(), |result| match result {
@@ -59,6 +61,7 @@ impl DeviceListScreen {
             ScreenMessage::NavigateToDeviceList => {
                 tracing::debug!("NavigateToDeviceList message received");
                 self.loading = true;
+                self.error = None;
                 Task::perform(Self::load_devices(), |result| match result {
                     Ok(devices) => ScreenMessage::DevicesLoaded(devices),
                     Err(e) => ScreenMessage::PairingFailed(e),
@@ -71,6 +74,7 @@ impl DeviceListScreen {
                 );
                 self.devices = devices;
                 self.loading = false;
+                self.error = None;
                 tracing::debug!("State updated, now have {} devices", self.devices.len());
                 Task::none()
             }
@@ -80,6 +84,11 @@ impl DeviceListScreen {
                     Ok(_) => ScreenMessage::NavigateToDeviceList,
                     Err(e) => ScreenMessage::PairingFailed(e),
                 })
+            }
+            ScreenMessage::PairingFailed(error) => {
+                self.error = Some(error);
+                self.loading = false;
+                Task::none()
             }
             _ => Task::none(),
         }
@@ -187,6 +196,15 @@ impl DeviceListScreen {
             devices_column
         };
 
+        let error_display: Element<'_, ScreenMessage> = if let Some(ref error) = self.error {
+            text(error)
+                .size(14)
+                .color(iced::Color::from_rgb(0.9, 0.2, 0.2))
+                .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
+
         let content = column![
             back_button,
             Space::new().height(Length::Fixed(20.0)),
@@ -194,6 +212,7 @@ impl DeviceListScreen {
             Space::new().height(Length::Fixed(10.0)),
             username_info,
             Space::new().height(Length::Fixed(20.0)),
+            error_display,
             scrollable(device_list),
         ]
         .padding(20)
