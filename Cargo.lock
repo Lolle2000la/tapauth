@@ -759,7 +759,6 @@ dependencies = [
  "fluent",
  "hex",
  "iced",
- "lazy_static",
  "libc",
  "local-ip-address",
  "lucide-icons",
