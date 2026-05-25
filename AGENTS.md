@@ -40,6 +40,7 @@ cargo test --workspace
 # Lint/format:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+# ^ NOTE: --all-features won't work locally (pulls in jni). See feature table.
 ```
 
 ### Android
@@ -63,14 +64,15 @@ cd server-android && ./gradlew connectedDebugAndroidTest
 |-------|---------|----------|
 | `shared` | `[]` | `jni`, `tpm`, `firewall` |
 | `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket` |
-| `client-pam` | `[]` | `tpm` |
-| `client-config-gui` | `[]` | `tpm` |
+| `client-pam` | `[]` | `tpm`, `dev-socket-override` |
+| `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
 
 **Gotchas:**
 - `--all-features` **won't work locally** on a vanilla Linux box — it pulls in `jni` which requires `libjvm`/JDK headers. Use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
 - **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Without this, the daemon errors out with "Systemd socket activation required."
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
+- **`dev-socket-override`** on `client-pam` and `client-config-gui`: enables `TAPAUTHD_SOCK` env var to override the default IPC socket path.  This is for development/testing only — production builds must NOT enable this feature, as it would allow environment-controlled socket redirection.
 
 ## Development Quick Start
 ```bash
@@ -98,12 +100,25 @@ cargo build --manifest-path client-pam/Cargo.toml
 ### Daemon IPC protocol (Unix socket)
 - `tapauthd` listens on `/run/tapauthd/tapauthd.sock` (systemd socket activation, FD#3, or manual bind with `fallback-socket`)
 - Length-prefixed framing: 4-byte BE u32 length + protobuf body
-- Supported messages: `PamAuthenticateRequest`, `PamCancelRequest`
-- Response: `PamAuthenticateResponse` with outcome (`Granted`/`Denied`/`Ignore`/`Error`)
+- **All messages are wrapped in `IpcEnvelope`** (`oneof msg`) for unambiguous dispatch:
+  - **PAM ops**: `PamAuthenticateRequest` / `PamCancelRequest` / `PamAuthenticateResponse`
+  - **Admin ops**: `AdminRequest` / `AdminResponse` with multiple request/response variants
+- Admin request variants: `GetServers`, `StartPairing`, `WaitForPairing`, `CompletePairing`, `RemoveDevice`, `RotateCsk`, `SaveConfig`, `RecoverTpm`, `GetConfig`, `GetDaemonStatus`
+- `PamAuthenticateResponse` outcome: `Granted`/`Denied`/`Ignore`/`Error`
+
+### Admin IPC Authorization (PolKit)
+- The daemon is the **single writer** of all config files (`/var/lib/tapauth/`, `/etc/tapauth/config.toml`).  The GUI and PAM module never write config files directly.
+- After admin mutations (pairing, device removal, CSK rotation), the daemon calls `DaemonState::reload()` to refresh in-memory state from disk without restarting.
+- The daemon resolves the caller's identity via `SO_PEERCRED` (PID, UID → username + `/proc/PID/stat` start-time)
+- Authorization is enforced daemon-side via `PolicyKit1.Authority.CheckAuthorization` with `unix-process` subject
+- The `tapauthd` user is registered as an action owner (`org.freedesktop.policykit.owner`) via `tapauthd/org.tapauth.config.admin.policy` to permit cross-identity queries
+- Falls back to UID==0 check when D-Bus/PolKit is unavailable
+- Socket permissions serve as an additional access gate: `root:tapauthd-clients 0660`
 
 ### PAM Module (`client-pam`)
 - Built as `libclient_pam.so`, installed to distro-specific PAM dir as `pam_tapauth.so`
 - Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
+- Wraps all IPC messages in `IpcEnvelope`, unwraps `PamResponse` from envelope
 - Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
 
 ### Authentication "Race" Flow
@@ -119,6 +134,8 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### GUI Framework
 - `client-config-gui` uses **iced** (Rust GUI framework), not GTK. Requires X11 or Wayland.
+- Runs **unprivileged** — all privileged operations (pairing, device management, config changes) are delegated to `tapauthd` via admin IPC.
+- Authorization is enforced daemon-side via PolKit; socket permissions gate access.
 
 ### Transport Details
 - **UDP port 36692** (default, user-configurable). IPv4 broadcast (`255.255.255.255`) + IPv6 multicast (`ff02::1`).
