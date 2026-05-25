@@ -6,10 +6,31 @@
 //! - `TAPAUTH_LOG_LEVEL`: Controls stdout log level (default: warn, only warnings and errors shown)
 //! - `TAPAUTH_FILE_LOG_LEVEL`: Controls file log level (default: info)
 //!
-//! Log files are stored in `/var/log/tapauth/tapauth-config.log` with daily rotation,
-//! keeping the last 7 days of logs.
+//! Log files are stored in `/var/log/tapauth/tapauth-config.log` with daily rotation
+//! when running as root.  Unprivileged runs fall back to `/tmp/tapauth-logs`.
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+fn is_dir_writable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mode = meta.permissions().mode();
+            let euid = nix::unistd::geteuid().as_raw();
+            let egid = nix::unistd::getegid().as_raw();
+
+            if euid == 0 || euid == meta.uid() {
+                mode & 0o200 != 0 // owner
+            } else if egid == 0 || egid == meta.gid() {
+                mode & 0o020 != 0 // group
+            } else {
+                mode & 0o002 != 0 // other
+            }
+        }
+        Err(_) => false,
+    }
+}
 
 /// Initialize logging for tapauth-config GUI
 ///
@@ -17,12 +38,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// - stdout: warn level by default (only warnings/errors), configurable via TAPAUTH_LOG_LEVEL
 /// - file: info level by default, configurable via TAPAUTH_FILE_LOG_LEVEL
 pub fn init_logging() {
-    // Determine log directory - fall back to /tmp if /var/log/tapauth is not accessible
+    // Determine log directory - prefer /var/log/tapauth if writable, else fall back
     let log_dir = std::path::PathBuf::from("/var/log/tapauth");
-    let log_dir = if log_dir.exists() || std::fs::create_dir_all(&log_dir).is_ok() {
+    let log_dir = if is_dir_writable(&log_dir) {
         log_dir
     } else {
-        eprintln!("Warning: Cannot write to /var/log/tapauth, falling back to /tmp/tapauth-logs");
+        eprintln!(
+            "tapauth-config: /var/log/tapauth not writable, falling back to /tmp/tapauth-logs"
+        );
         let fallback = std::path::PathBuf::from("/tmp/tapauth-logs");
         let _ = std::fs::create_dir_all(&fallback);
         fallback
