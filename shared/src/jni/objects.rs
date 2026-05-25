@@ -4,7 +4,9 @@
 //! instead of using error-prone JSON string serialization.
 
 use jni::objects::{JObject, JValue};
-use jni::JNIEnv;
+use jni::signature::RuntimeMethodSignature;
+use jni::strings::JNIString;
+use jni::{EnvUnowned as JNIEnv, Outcome};
 
 use super::conversions::{string_to_jstring, vec_to_jbytearray};
 use super::exceptions::throw_illegal_state;
@@ -24,22 +26,51 @@ fn create_object<'local>(
     constructor_sig: &str,
     args: &[JValue],
 ) -> Option<JObject<'local>> {
-    // Find the class
-    let class = match env.find_class(class_name) {
-        Ok(cls) => cls,
+    let class_name_jni = JNIString::new(class_name);
+    let constructor_sig = match RuntimeMethodSignature::from_str(constructor_sig) {
+        Ok(sig) => sig,
         Err(err) => {
+            throw_illegal_state(
+                env,
+                format!("failed to parse constructor signature {constructor_sig}: {err}"),
+            );
+            return None;
+        }
+    };
+
+    // Find the class
+    let class = match env
+        .with_env(|env| env.find_class(&class_name_jni))
+        .into_outcome()
+    {
+        Outcome::Ok(cls) => cls,
+        Outcome::Err(err) => {
             throw_illegal_state(env, format!("failed to find class {}: {}", class_name, err));
+            return None;
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, format!("failed to find class {}: panic", class_name));
             return None;
         }
     };
 
     // Create the object
-    match env.new_object(class, constructor_sig, args) {
-        Ok(obj) => Some(obj),
-        Err(err) => {
+    match env
+        .with_env(|env| env.new_object(class, constructor_sig.method_signature(), args))
+        .into_outcome()
+    {
+        Outcome::Ok(obj) => Some(obj),
+        Outcome::Err(err) => {
             throw_illegal_state(
                 env,
                 format!("failed to create object of type {}: {}", class_name, err),
+            );
+            None
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(
+                env,
+                format!("failed to create object of type {}: panic", class_name),
             );
             None
         }
@@ -75,13 +106,10 @@ pub fn create_auth_request<'local>(
     let hostname_str = string_to_jstring(env, hostname)?;
     let signature_array = vec_to_jbytearray(env, signature)?;
 
-    let username_obj = unsafe { JObject::from_raw(username_str) };
-    let hostname_obj = unsafe { JObject::from_raw(hostname_str) };
-
     let args = [
         JValue::Object(&challenge_array),
-        JValue::Object(&username_obj),
-        JValue::Object(&hostname_obj),
+        JValue::Object(username_str.as_ref()),
+        JValue::Object(hostname_str.as_ref()),
         JValue::Long(timestamp_unix_seconds),
         JValue::Int(signature_algorithm),
         JValue::Object(&signature_array),
@@ -196,13 +224,11 @@ pub fn create_pairing_response<'local>(
     let ed25519_array = vec_to_jbytearray(env, ed25519_public_key)?;
     let device_name_str = string_to_jstring(env, device_name)?;
 
-    let device_name_obj = unsafe { JObject::from_raw(device_name_str) };
-
     let args = [
         JValue::Int(version),
         JValue::Object(&x25519_array),
         JValue::Object(&ed25519_array),
-        JValue::Object(&device_name_obj),
+        JValue::Object(device_name_str.as_ref()),
         JValue::Int(selected_symmetric_algorithm),
         JValue::Int(selected_hash_algorithm),
         JValue::Int(selected_signature_algorithm),
@@ -237,7 +263,7 @@ pub fn create_pairing_complete<'local>(
     let hash_array = vec_to_jbytearray(env, encrypted_csk_hash)?;
 
     let args = [
-        JValue::Bool(success as u8),
+        JValue::Bool(success),
         JValue::Int(hash_algorithm),
         JValue::Object(&hash_array),
     ];

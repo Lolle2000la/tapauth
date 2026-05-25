@@ -1,8 +1,9 @@
 //! JNI object array construction helpers.
 
 use jni::objects::{JClass, JObject};
+use jni::strings::JNIString;
 use jni::sys::jobjectArray;
-use jni::JNIEnv;
+use jni::{EnvUnowned as JNIEnv, Outcome};
 
 use super::conversions::{string_to_jstring, vec_to_jbytearray};
 use super::exceptions::{throw_illegal_state, throw_out_of_memory};
@@ -17,10 +18,17 @@ use super::exceptions::{throw_illegal_state, throw_out_of_memory};
 ///
 /// Throws `IllegalStateException` and returns `None` if the class cannot be found.
 pub fn byte_array_class<'local>(env: &mut JNIEnv<'local>) -> Option<JClass<'local>> {
-    match env.find_class("[B") {
-        Ok(cls) => Some(cls),
-        Err(err) => {
+    match env
+        .with_env(|env| env.find_class(jni::jni_str!("[B")))
+        .into_outcome()
+    {
+        Outcome::Ok(cls) => Some(cls),
+        Outcome::Err(err) => {
             throw_illegal_state(env, format!("failed to find byte array class: {err}"));
+            None
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, "failed to find byte array class: panic".to_string());
             None
         }
     }
@@ -42,18 +50,33 @@ pub fn byte_array_class<'local>(env: &mut JNIEnv<'local>) -> Option<JClass<'loca
 /// Throws `IllegalStateException` if class lookup fails.
 /// Throws `OutOfMemoryError` if array allocation fails.
 pub fn new_object_array(env: &mut JNIEnv, len: i32, class_sig: &str) -> Option<jobjectArray> {
-    let class = match env.find_class(class_sig) {
-        Ok(cls) => cls,
-        Err(err) => {
+    let class_sig_jni = JNIString::new(class_sig);
+    let class = match env
+        .with_env(|env| env.find_class(&class_sig_jni))
+        .into_outcome()
+    {
+        Outcome::Ok(cls) => cls,
+        Outcome::Err(err) => {
             throw_illegal_state(env, format!("failed to find class {class_sig}: {err}"));
+            return None;
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, format!("failed to find class {class_sig}: panic"));
             return None;
         }
     };
 
-    match env.new_object_array(len, class, JObject::null()) {
-        Ok(array) => Some(array.into_raw()),
-        Err(err) => {
+    match env
+        .with_env(|env| env.new_object_array(len, class, JObject::null()))
+        .into_outcome()
+    {
+        Outcome::Ok(array) => Some(array.into_raw()),
+        Outcome::Err(err) => {
             throw_out_of_memory(env, format!("failed to create object array: {err}"));
+            None
+        }
+        Outcome::Panic(_) => {
+            throw_out_of_memory(env, "failed to create object array: panic".to_string());
             None
         }
     }
@@ -79,11 +102,27 @@ where
     O: AsRef<JObject<'local>>,
 {
     use jni::objects::JObjectArray;
-    let array_obj = unsafe { JObjectArray::from_raw(array) };
-    match env.set_object_array_element(&array_obj, index, value) {
-        Ok(()) => Some(()),
-        Err(err) => {
+    let index = match usize::try_from(index) {
+        Ok(index) => index,
+        Err(_) => {
+            throw_illegal_state(env, format!("invalid array index: {index}"));
+            return None;
+        }
+    };
+    match env
+        .with_env(|env| {
+            let array_obj = unsafe { JObjectArray::<JObject>::from_raw(env, array) };
+            array_obj.set_element(env, index, value)
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(()) => Some(()),
+        Outcome::Err(err) => {
             throw_illegal_state(env, format!("failed to set array element: {err}"));
+            None
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, "failed to set array element: panic".to_string());
             None
         }
     }
@@ -132,8 +171,7 @@ pub fn make_bytes_string_array(
     string: &str,
 ) -> Option<jobjectArray> {
     let byte_array = vec_to_jbytearray(env, bytes)?;
-    let java_string_raw = string_to_jstring(env, string)?;
-    let java_string = unsafe { JObject::from_raw(java_string_raw) };
+    let java_string = string_to_jstring(env, string)?;
 
     let result_array = new_object_array(env, 2, "java/lang/Object")?;
     set_object_array_element(env, result_array, 0, &byte_array)?;
