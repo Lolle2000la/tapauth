@@ -113,6 +113,58 @@ impl DaemonState {
     pub fn get_init_error(&self) -> Option<&str> {
         self.init_error.as_deref()
     }
+
+    /// Reload in-memory state from disk after admin configuration changes.
+    /// Reuses the existing UDP socket (port changes require daemon restart).
+    pub fn reload(&self) -> Arc<DaemonState> {
+        let keypair = match self.config_manager.load_keypair() {
+            Ok(kp) => Some(kp),
+            Err(e) => {
+                tracing::error!("Failed to reload keypair: {}", e);
+                self.keypair.clone()
+            }
+        };
+
+        let csk = self.config_manager.load_csk().unwrap_or_else(|e| {
+            tracing::error!("Failed to reload CSK: {}", e);
+            self.csk.clone()
+        });
+
+        let paired_servers = self
+            .config_manager
+            .load_paired_servers()
+            .map(Arc::new)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to reload paired servers: {}", e);
+                self.paired_servers.clone()
+            });
+
+        let config = self.config_manager.load_config().unwrap_or_else(|e| {
+            tracing::error!("Failed to reload config: {}", e);
+            shared::config::ClientConfig {
+                hostname: self.hostname.clone(),
+            }
+        });
+
+        let init_error = if keypair.is_some() {
+            None
+        } else {
+            Some(
+                "Keypair unavailable after reload. Use tapauth-config to regenerate keys."
+                    .to_string(),
+            )
+        };
+
+        Arc::new(DaemonState {
+            config_manager: self.config_manager.clone(),
+            paired_servers,
+            keypair,
+            csk,
+            hostname: config.hostname,
+            udp_socket: self.udp_socket.clone(),
+            init_error,
+        })
+    }
 }
 
 type CancelRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;

@@ -9,7 +9,7 @@ use shared::{
 };
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -103,11 +103,12 @@ pub enum PairingState {
 
 pub async fn handle_admin_request(
     request: ipc::AdminRequest,
-    daemon: &Arc<DaemonState>,
+    daemon_lock: &RwLock<Arc<DaemonState>>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
     caller_pid: i32,
     caller_uid: u32,
 ) -> ipc::AdminResponse {
+    let daemon = daemon_lock.read().await.clone();
     let identity = match resolve_peer(caller_pid, caller_uid) {
         Ok(id) => id,
         Err(e) => return err_resp(ipc::AdminStatus::AdminError, e),
@@ -119,27 +120,43 @@ pub async fn handle_admin_request(
 
     let username = identity.username;
 
-    match request.payload {
+    let (response, needs_reload) = match request.payload {
         Some(ipc::admin_request::Payload::GetServers(_)) => {
-            handle_get_servers(daemon, &username).await
+            (handle_get_servers(&daemon, &username).await, false)
         }
         Some(ipc::admin_request::Payload::StartPairing(_)) => {
-            handle_start_pairing(pairing_state).await
+            (handle_start_pairing(pairing_state).await, false)
         }
-        Some(ipc::admin_request::Payload::WaitForPairing(_req)) => {
-            handle_wait_for_pairing(pairing_state).await
+        Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
+            (handle_wait_for_pairing(pairing_state, req).await, false)
         }
-        Some(ipc::admin_request::Payload::CompletePairing(_req)) => {
-            handle_complete_pairing(daemon, pairing_state, &username).await
-        }
+        Some(ipc::admin_request::Payload::CompletePairing(_req)) => (
+            handle_complete_pairing(&daemon, pairing_state, &username).await,
+            true,
+        ),
         Some(ipc::admin_request::Payload::RemoveDevice(req)) => {
-            handle_remove_device(daemon, &username, req).await
+            (handle_remove_device(&daemon, &username, req).await, true)
         }
-        Some(ipc::admin_request::Payload::RotateCsk(_)) => handle_rotate_csk(daemon).await,
-        Some(ipc::admin_request::Payload::SaveConfig(req)) => handle_save_config(daemon, req).await,
-        Some(ipc::admin_request::Payload::RecoverTpm(_)) => handle_recover_tpm(daemon).await,
-        None => err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
+        Some(ipc::admin_request::Payload::RotateCsk(_)) => (handle_rotate_csk(&daemon).await, true),
+        Some(ipc::admin_request::Payload::SaveConfig(req)) => {
+            (handle_save_config(&daemon, req).await, true)
+        }
+        Some(ipc::admin_request::Payload::RecoverTpm(_)) => {
+            (handle_recover_tpm(&daemon).await, true)
+        }
+        None => (
+            err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
+            false,
+        ),
+    };
+
+    if needs_reload {
+        let new_daemon = daemon.reload();
+        *daemon_lock.write().await = new_daemon;
+        tracing::info!("Daemon state reloaded after admin operation");
     }
+
+    response
 }
 
 async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::AdminResponse {
@@ -241,11 +258,26 @@ async fn handle_start_pairing(
 
     *pairing_state.lock().await = Some(PairingState::Pending(pending));
 
+    spawn_pairing_timeout(pairing_state);
+
     start_pairing_success(url, port as u32)
+}
+
+fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>) {
+    let state = pairing_state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let mut guard = state.lock().await;
+        if guard.is_some() {
+            tracing::warn!("Pairing state timed out, cleaning up");
+            *guard = None;
+        }
+    });
 }
 
 async fn handle_wait_for_pairing(
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
+    req: ipc::WaitForPairingRequest,
 ) -> ipc::AdminResponse {
     let mut guard = pairing_state.lock().await;
 
@@ -259,6 +291,13 @@ async fn handle_wait_for_pairing(
         }
         None => return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session"),
     };
+
+    if req.port != 0 && req.port != pending.port as u32 {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!("Port mismatch: expected {}, got {}", pending.port, req.port),
+        );
+    }
 
     drop(guard);
 
@@ -339,7 +378,11 @@ async fn handle_complete_pairing(
             Err(e) => {
                 return err_resp(
                     ipc::AdminStatus::AdminError,
-                    format!("CSK generation failed: {}", e),
+                    format!(
+                        "CSK generation failed: {}. Ensure tapauthd is installed and the \
+                         'tapauthd' user and group exist, then retry pairing.",
+                        e
+                    ),
                 )
             }
         },
@@ -358,7 +401,15 @@ async fn handle_complete_pairing(
     }
 
     if let Err(e) = daemon.config_manager.save_csk(&csk) {
-        tracing::error!("Failed to save CSK: {}", e);
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!(
+                "Paired on phone, but saving local key failed: {}. \
+                 Ensure tapauthd is installed and the 'tapauthd' user and group exist, \
+                 then retry pairing.",
+                e
+            ),
+        );
     }
 
     let server_hex = hex::encode(active.server_public_key);
@@ -438,15 +489,19 @@ async fn handle_save_config(
     }
 
     let port = req.udp_port as u16;
-    if port != 0 {
-        let mut toml_config = shared::config::TapAuthConfig::load();
-        toml_config.udp_port = port;
-        if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to save TOML config: {}", e),
-            );
-        }
+    if port == 0 {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            "Invalid UDP port: must be 1-65535",
+        );
+    }
+    let mut toml_config = shared::config::TapAuthConfig::load();
+    toml_config.udp_port = port;
+    if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!("Failed to save TOML config: {}", e),
+        );
     }
 
     empty_success()

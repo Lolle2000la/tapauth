@@ -10,7 +10,10 @@ use shared::ipc::pb::PairedServerInfo;
 use std::collections::HashMap;
 
 fn convert_to_paired_server(info: &PairedServerInfo) -> (String, PairedServer) {
-    let paired_at = chrono::Utc::now();
+    let paired_at = chrono::DateTime::parse_from_rfc3339(&info.paired_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
     let server = PairedServer {
         name: info.name.clone(),
         public_key: info.public_key.clone(),

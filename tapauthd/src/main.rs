@@ -62,7 +62,7 @@ pub enum DaemonError {
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 /// Tracks recent authentication requests to prevent duplicates
 #[derive(Clone)]
@@ -72,7 +72,7 @@ struct RecentAuthRequest {
 
 /// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
-    daemon: Arc<DaemonState>,
+    daemon: RwLock<Arc<DaemonState>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
     pending_pairing: Arc<Mutex<Option<PairingState>>>,
@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let server_state = Arc::new(ServerState {
-        daemon: daemon_state.clone(),
+        daemon: RwLock::new(daemon_state.clone()),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         recent_requests: Arc::new(Mutex::new(HashMap::new())),
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -222,9 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         tracing::debug!("Accepted connection: {:?}", addr);
+                        let daemon = server_state.daemon.read().await.clone();
                         let server_state = server_state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, server_state).await {
+                            if let Err(e) = handle_conn(stream, daemon, server_state).await {
                                 tracing::warn!("Connection error: {}", e);
                             }
                         });
@@ -310,6 +311,7 @@ fn drop_privileges_to_tapauthd() -> Result<(), String> {
 
 async fn handle_conn(
     mut stream: UnixStream,
+    daemon: Arc<DaemonState>,
     server_state: Arc<ServerState>,
 ) -> Result<(), DaemonError> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -395,7 +397,7 @@ async fn handle_conn(
 
                 // Run authentication
                 let timeout = Some(req.timeout_seconds);
-                match AuthSession::new(server_state.daemon.clone(), req.username.clone()) {
+                match AuthSession::new(daemon.clone(), req.username.clone()) {
                     Ok(sess) => {
                         let result = sess
                             .handle_authenticate(

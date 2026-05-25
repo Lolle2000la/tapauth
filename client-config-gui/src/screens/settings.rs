@@ -103,7 +103,13 @@ impl SettingsScreen {
                 self.error = None;
                 self.success = None;
                 let hostname = self.hostname_input.clone();
-                let udp_port = self.udp_port_input.parse::<u16>().unwrap_or(36692);
+                let udp_port = match self.udp_port_input.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        self.error = Some(self.l10n.tr("settings-invalid-port"));
+                        return Task::none();
+                    }
+                };
                 Task::perform(
                     crate::ipc::save_config(hostname, udp_port),
                     |result| match result {

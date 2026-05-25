@@ -63,6 +63,7 @@ settings-csk-warning = Warning: Rotating CSK will invalidate all paired devices.
 settings-config-saved = Configuration saved successfully.
 settings-csk-rotated = CSK rotated successfully. All pairings have been cleared.
 settings-error-prefix = Error: {$message}
+settings-invalid-port = Invalid port number (must be 1-65535)
 
 # ── System Error Dialogs ──
 error-user-missing-title = System User Missing
