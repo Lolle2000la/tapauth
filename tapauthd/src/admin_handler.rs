@@ -78,6 +78,19 @@ fn get_config_success(hostname: String, udp_port: u32) -> ipc::AdminResponse {
     }
 }
 
+fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResponse {
+    ipc::AdminResponse {
+        status: ipc::AdminStatus::AdminSuccess as i32,
+        error_message: String::new(),
+        payload: Some(ipc::admin_response::Payload::GetDaemonStatus(
+            ipc::GetDaemonStatusResponse {
+                tpm_enabled,
+                tpm_error,
+            },
+        )),
+    }
+}
+
 pub struct PendingPairing {
     pub listener: TcpListener,
     pub firewall_guard: FirewallGuard,
@@ -160,6 +173,9 @@ pub async fn handle_admin_request(
         }
         Some(ipc::admin_request::Payload::GetConfig(_)) => {
             (handle_get_config(&daemon).await, false)
+        }
+        Some(ipc::admin_request::Payload::GetDaemonStatus(_)) => {
+            (handle_get_daemon_status(&daemon).await, false)
         }
         None => (
             err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
@@ -651,4 +667,17 @@ async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
     let client_config = daemon.config_manager.load_config().unwrap_or_default();
     let toml_config = shared::config::TapAuthConfig::load();
     get_config_success(client_config.hostname, toml_config.udp_port as u32)
+}
+
+async fn handle_get_daemon_status(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
+    let tpm_enabled = cfg!(feature = "tpm");
+    let tpm_error = if tpm_enabled && daemon.keypair.is_none() {
+        daemon
+            .get_init_error()
+            .unwrap_or("TPM key unseal failed")
+            .to_string()
+    } else {
+        String::new()
+    };
+    daemon_status_success(tpm_enabled, tpm_error)
 }

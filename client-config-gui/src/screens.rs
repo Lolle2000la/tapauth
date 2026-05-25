@@ -21,8 +21,9 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub fn default_with_l10n(l10n: L10n) -> Self {
-        Screen::MainMenu(MainMenuScreen::new(l10n))
+    pub fn default_with_l10n(l10n: L10n) -> (Self, Task<ScreenMessage>) {
+        let (screen, task) = MainMenuScreen::new(l10n);
+        (Screen::MainMenu(screen), task)
     }
 }
 
@@ -65,6 +66,8 @@ pub enum ScreenMessage {
 
     // TPM Recovery
     #[cfg(feature = "tpm")]
+    TPMStatusChecked(Option<String>),
+    #[cfg(feature = "tpm")]
     RecoverFromTPMFailure,
     #[cfg(feature = "tpm")]
     TPMRecoveryComplete,
@@ -77,8 +80,9 @@ impl Screen {
         match message {
             // Navigation messages
             ScreenMessage::NavigateToMainMenu => {
-                *self = Screen::MainMenu(MainMenuScreen::new(l10n.clone()));
-                Task::none()
+                let (screen, task) = MainMenuScreen::new(l10n.clone());
+                *self = Screen::MainMenu(screen);
+                task
             }
             ScreenMessage::NavigateToPairing => {
                 *self = Screen::Pairing(PairingScreen::new(l10n.clone()));

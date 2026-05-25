@@ -19,17 +19,29 @@ pub struct MainMenuScreen {
 
 impl MainMenuScreen {
     #[cfg(feature = "tpm")]
-    pub fn new(l10n: L10n) -> Self {
-        Self {
-            l10n,
-            tpm_error: None,
-            recovery_status: None,
-        }
+    pub fn new(l10n: L10n) -> (Self, Task<ScreenMessage>) {
+        (
+            Self {
+                l10n,
+                tpm_error: None,
+                recovery_status: None,
+            },
+            Task::perform(Self::perform_check_tpm_status(), |result| match result {
+                Ok(error) => {
+                    if error.is_empty() {
+                        ScreenMessage::TPMStatusChecked(None)
+                    } else {
+                        ScreenMessage::TPMStatusChecked(Some(error))
+                    }
+                }
+                Err(_) => ScreenMessage::TPMStatusChecked(None),
+            }),
+        )
     }
 
     #[cfg(not(feature = "tpm"))]
-    pub fn new(l10n: L10n) -> Self {
-        Self { l10n }
+    pub fn new(l10n: L10n) -> (Self, Task<ScreenMessage>) {
+        (Self { l10n }, Task::none())
     }
 
     pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
@@ -37,6 +49,13 @@ impl MainMenuScreen {
             ScreenMessage::StartPairing => Task::done(ScreenMessage::NavigateToPairing),
             ScreenMessage::ViewDevices => Task::done(ScreenMessage::NavigateToDeviceList),
             ScreenMessage::OpenSettings => Task::done(ScreenMessage::NavigateToSettings),
+            #[cfg(feature = "tpm")]
+            ScreenMessage::TPMStatusChecked(error) => {
+                if let Some(error) = error {
+                    self.tpm_error = Some(error);
+                }
+                Task::none()
+            }
             #[cfg(feature = "tpm")]
             ScreenMessage::RecoverFromTPMFailure => {
                 self.recovery_status = Some(self.l10n.tr("label-recovering"));
@@ -61,6 +80,19 @@ impl MainMenuScreen {
             }
             _ => Task::none(),
         }
+    }
+
+    #[cfg(feature = "tpm")]
+    async fn perform_check_tpm_status() -> Result<String, String> {
+        crate::ipc::get_daemon_status()
+            .await
+            .map(|(tpm_enabled, tpm_error)| {
+                if tpm_enabled {
+                    tpm_error
+                } else {
+                    String::new()
+                }
+            })
     }
 
     #[cfg(feature = "tpm")]

@@ -49,6 +49,32 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     has_rwx
 }
 
+/// Create a safe directory under /tmp.  Returns true if the directory was
+/// created fresh or already existed with safe ownership (same UID, not a
+/// symlink).  Returns false if the path is a symlink, owned by someone else,
+/// or creation fails — the caller should fall back to stdout-only logging.
+fn create_safe_tmp_dir(path: &std::path::Path) -> bool {
+    use nix::unistd::geteuid;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if path.exists() {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+        if meta.is_dir() && meta.uid() == geteuid().as_raw() {
+            return true;
+        }
+    }
+    if std::fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok()
+}
+
 /// Initialize logging for tapauthd
 ///
 /// Sets up dual logging:
@@ -76,11 +102,7 @@ pub fn init_logging() {
             log_dir
         } else {
             let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
-            let _ = std::fs::create_dir_all(&fallback);
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
-            }
+            create_safe_tmp_dir(&fallback);
             fallback
         }
     } else {

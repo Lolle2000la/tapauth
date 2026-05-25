@@ -233,6 +233,31 @@ pub async fn recover_tpm() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "tpm")]
+pub async fn get_daemon_status() -> Result<(bool, String), String> {
+    let request = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::GetDaemonStatus(
+            ipc::GetDaemonStatusRequest {},
+        )),
+    };
+
+    let response = send_admin_request(request).await?;
+
+    if response.status != ipc::AdminStatus::AdminSuccess as i32 {
+        return Err(err_msg(&response));
+    }
+
+    let status = response
+        .payload
+        .and_then(|p| match p {
+            ipc::admin_response::Payload::GetDaemonStatus(s) => Some(s),
+            _ => None,
+        })
+        .ok_or("Daemon returned unexpected response type")?;
+
+    Ok((status.tpm_enabled, status.tpm_error))
+}
+
 pub async fn get_config() -> Result<(String, u16), String> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::GetConfig(

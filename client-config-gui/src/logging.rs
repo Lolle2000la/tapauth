@@ -48,6 +48,28 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     has_rwx
 }
 
+fn create_safe_tmp_dir(path: &std::path::Path) -> bool {
+    use nix::unistd::geteuid;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if path.exists() {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+        if meta.is_dir() && meta.uid() == geteuid().as_raw() {
+            return true;
+        }
+    }
+    if std::fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok()
+}
+
 /// Initialize logging for tapauth-config GUI
 ///
 /// Sets up dual logging:
@@ -63,11 +85,7 @@ pub fn init_logging() {
             "tapauth-config: /var/log/tapauth not writable, falling back to /tmp/tapauth-logs"
         );
         let fallback = std::path::PathBuf::from("/tmp/tapauth-logs");
-        let _ = std::fs::create_dir_all(&fallback);
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
-        }
+        create_safe_tmp_dir(&fallback);
         fallback
     };
 

@@ -18,13 +18,14 @@ pub enum Message {
 impl TapAuthConfig {
     pub fn new(locale: &str, username: &str) -> (Self, Task<Message>) {
         let l10n = L10n::new(locale);
+        let (current_screen, init_task) = Screen::default_with_l10n(l10n.clone());
         (
             Self {
-                l10n: l10n.clone(),
-                current_screen: Screen::default_with_l10n(l10n),
+                l10n,
+                current_screen,
                 username: username.to_string(),
             },
-            Task::none(),
+            init_task.map(Message::ScreenMessage),
         )
     }
 

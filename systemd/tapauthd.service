@@ -30,7 +30,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # Allow the unprivileged service to manage netfilter rules (pairing opens ephemeral TCP ports)
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

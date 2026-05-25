@@ -72,6 +72,7 @@ message AdminRequest {
     SaveConfigRequest save_config = 7;
     RecoverTpmRequest recover_tpm = 8;
     GetConfigRequest get_config = 9;
+    GetDaemonStatusRequest get_daemon_status = 10;
   }
 }
 
@@ -84,6 +85,11 @@ message RotateCskRequest {}
 message SaveConfigRequest { string hostname = 1; uint32 udp_port = 2; }
 message RecoverTpmRequest {}
 message GetConfigRequest {}
+message GetDaemonStatusRequest {}
+message GetDaemonStatusResponse {
+  bool tpm_enabled = 1;
+  string tpm_error = 2;
+}
 
 message AdminResponse {
   AdminStatus status = 1;
@@ -94,6 +100,7 @@ message AdminResponse {
     WaitForPairingResponse wait_for_pairing = 5;
     CompletePairingResponse complete_pairing = 6;
     GetConfigResponse get_config = 7;
+    GetDaemonStatusResponse get_daemon_status = 8;
   }
 }
 
