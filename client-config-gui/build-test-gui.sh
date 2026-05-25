@@ -65,6 +65,8 @@ TAPAUTHD_GUI_SOCK_PATH="${TAPAUTHD_SOCK_DIR}/tapauthd-gui.sock"
 CONFIG_DIR="/var/lib/tapauth"
 CLIENT_KEY_FILE="${CONFIG_DIR}/client_key"
 CLIENT_CSK_FILE="${CONFIG_DIR}/client_symmetric_key"
+POLICY_FILE="${PROJECT_ROOT}/tapauthd/org.tapauth.config.admin.policy"
+POLICY_INSTALL_DIR="/usr/local/share/polkit-1/actions"
 LOG_FILE="/tmp/tapauthd-gui-test.log"
 
 # ── Prerequisites ──────────────────────────────────────────────────
@@ -90,6 +92,13 @@ if [ ! -d "$CONFIG_DIR" ]; then
     sudo chmod 0700 "$CONFIG_DIR"
 fi
 echo "✅ $CONFIG_DIR is ready"
+
+# Install PolKit policy so tapauthd can check authorizations for action owners
+if [ -f "$POLICY_FILE" ]; then
+    sudo mkdir -p "$POLICY_INSTALL_DIR"
+    sudo cp "$POLICY_FILE" "$POLICY_INSTALL_DIR/"
+    echo "✅ PolKit policy installed"
+fi
 
 # ── Build ──────────────────────────────────────────────────────────
 
