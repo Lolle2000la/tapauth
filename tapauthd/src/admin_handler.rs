@@ -136,7 +136,7 @@ pub async fn handle_admin_request(
             (handle_get_servers(&daemon, &username).await, false)
         }
         Some(ipc::admin_request::Payload::StartPairing(_)) => {
-            (handle_start_pairing(pairing_state).await, false)
+            (handle_start_pairing(&daemon, pairing_state).await, false)
         }
         Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
             (handle_wait_for_pairing(pairing_state, req).await, false)
@@ -196,19 +196,25 @@ async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::A
 }
 
 async fn handle_start_pairing(
+    daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
 ) -> ipc::AdminResponse {
-    use shared::crypto::Ed25519KeyPair;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    let keypair = match Ed25519KeyPair::generate() {
+    // The Ed25519 keypair identifies this client to the server during pairing.
+    // It MUST be the daemon's persistent keypair — otherwise the server stores
+    // a transient public key and subsequent auth requests fail signature verification.
+    let keypair = match daemon.config_manager.load_keypair() {
         Ok(kp) => kp,
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Key generation failed: {}", e),
-            )
-        }
+        Err(_) => match daemon.config_manager.generate_and_save_keypair() {
+            Ok(kp) => kp,
+            Err(e) => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    format!("Keypair load/generation failed: {}", e),
+                )
+            }
+        },
     };
 
     let ipv4_addr = match local_ip_address::local_ip() {
