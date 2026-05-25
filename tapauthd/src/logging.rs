@@ -12,24 +12,41 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 fn is_dir_writable(path: &std::path::Path) -> bool {
+    use nix::unistd::{getegid, geteuid};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mode = meta.permissions().mode();
-            let euid = nix::unistd::geteuid().as_raw();
-            let egid = nix::unistd::getegid().as_raw();
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
 
-            if euid == 0 || euid == meta.uid() {
-                mode & 0o200 != 0
-            } else if egid == 0 || egid == meta.gid() {
-                mode & 0o020 != 0
-            } else {
-                mode & 0o002 != 0
-            }
-        }
-        Err(_) => false,
+    if !meta.is_dir() {
+        return false;
     }
+
+    let mode = meta.permissions().mode();
+    let euid = geteuid().as_raw();
+    let egid = getegid().as_raw();
+
+    // Check read permission: owner, group, or other (root always passes)
+    let has_rwx = if euid == 0 || euid == meta.uid() {
+        (mode & 0o500) == 0o500
+    } else {
+        // Check supplementary groups
+        let in_group = egid == 0
+            || egid == meta.gid()
+            || nix::unistd::getgroups()
+                .unwrap_or_default()
+                .iter()
+                .any(|g| g.as_raw() == meta.gid());
+        if in_group {
+            (mode & 0o050) == 0o050
+        } else {
+            (mode & 0o005) == 0o005
+        }
+    };
+
+    has_rwx
 }
 
 /// Initialize logging for tapauthd

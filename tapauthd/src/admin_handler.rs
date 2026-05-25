@@ -623,6 +623,10 @@ async fn handle_save_config(
             format!("Failed to save TOML config: {}", e),
         );
     }
+    tracing::info!(
+        "UDP port changed to {} — will take effect on next daemon restart",
+        port
+    );
 
     empty_success()
 }
