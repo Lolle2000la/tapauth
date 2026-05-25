@@ -596,7 +596,8 @@ async fn handle_save_config(
             "Invalid UDP port: must be 1-65535",
         );
     }
-    if req.hostname.trim().is_empty() {
+    let hostname = req.hostname.trim().to_string();
+    if hostname.is_empty() {
         return err_resp(ipc::AdminStatus::AdminError, "Hostname must not be empty");
     }
     let port = req.udp_port as u16;
@@ -610,9 +611,7 @@ async fn handle_save_config(
         );
     }
 
-    let client_config = ClientConfig {
-        hostname: req.hostname,
-    };
+    let client_config = ClientConfig { hostname };
     if let Err(e) = daemon.config_manager.save_config(&client_config) {
         return err_resp(
             ipc::AdminStatus::AdminError,

@@ -12,6 +12,12 @@ pub struct PeerIdentity {
 }
 
 pub fn resolve_peer(pid: i32, uid: u32) -> Result<PeerIdentity, String> {
+    if pid <= 0 {
+        return Err(format!(
+            "Invalid peer PID {} from SO_PEERCRED — expected positive PID",
+            pid
+        ));
+    }
     let username = User::from_uid(nix::unistd::Uid::from_raw(uid))
         .map_err(|e| format!("Failed to resolve UID {}: {}", uid, e))?
         .ok_or_else(|| format!("No user found for UID {}", uid))?
