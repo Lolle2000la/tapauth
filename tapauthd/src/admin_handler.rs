@@ -7,6 +7,7 @@ use shared::{
     models::pairing::generate_pairing_url,
     protocol::ClientPairingSession,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
@@ -95,6 +96,7 @@ pub struct PendingPairing {
     #[allow(dead_code)]
     pub url: String,
     pub port: u16,
+    pub generation: u64,
 }
 
 pub struct ActivePairing {
@@ -105,11 +107,18 @@ pub struct ActivePairing {
     pub port: u16,
     #[allow(dead_code)]
     pub firewall_guard: FirewallGuard,
+    pub generation: u64,
 }
 
 pub enum PairingState {
     Pending(PendingPairing),
     Active(ActivePairing),
+}
+
+static PAIRING_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_generation() -> u64 {
+    PAIRING_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 pub async fn handle_admin_request(
@@ -199,8 +208,6 @@ async fn handle_start_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
 ) -> ipc::AdminResponse {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
     // The Ed25519 keypair identifies this client to the server during pairing.
     // It MUST be the daemon's persistent keypair — otherwise the server stores
     // a transient public key and subsequent auth requests fail signature verification.
@@ -218,12 +225,11 @@ async fn handle_start_pairing(
     };
 
     let ipv4_addr = match local_ip_address::local_ip() {
-        Ok(std::net::IpAddr::V4(ip)) => ip,
-        Ok(std::net::IpAddr::V6(_)) => Ipv4Addr::new(127, 0, 0, 1),
-        Err(_) => Ipv4Addr::new(127, 0, 0, 1),
+        Ok(std::net::IpAddr::V4(ip)) if !ip.is_loopback() => ip,
+        _ => find_non_loopback_ipv4(),
     };
 
-    let ipv6_addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+    let ipv6_addr = find_non_loopback_ipv6();
 
     let listener = match TcpListener::bind("0.0.0.0:0").await {
         Ok(l) => l,
@@ -268,40 +274,48 @@ async fn handle_start_pairing(
     let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
     let url = generate_pairing_url(&x25519_pubkey_hex, port, Some(ipv4_addr), Some(ipv6_addr));
 
+    let gen = next_generation();
     let pending = PendingPairing {
         listener,
         firewall_guard,
         session,
         url: url.clone(),
         port,
+        generation: gen,
     };
 
     *pairing_state.lock().await = Some(PairingState::Pending(pending));
 
-    spawn_pairing_timeout(pairing_state);
+    spawn_pairing_timeout(pairing_state, gen);
 
     start_pairing_success(url, port as u32)
 }
 
-fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>) {
+fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
     let state = pairing_state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Pending(_))) {
-            tracing::warn!("Pending pairing timed out, cleaning up");
+        if matches!(*guard, Some(PairingState::Pending(ref p)) if p.generation == generation) {
+            tracing::warn!(
+                "Pending pairing (gen={}) timed out, cleaning up",
+                generation
+            );
             *guard = None;
         }
     });
 }
 
-fn spawn_active_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>) {
+fn spawn_active_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
     let state = pairing_state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Active(_))) {
-            tracing::warn!("Active pairing (SAS verification) timed out, cleaning up");
+        if matches!(*guard, Some(PairingState::Active(ref a)) if a.generation == generation) {
+            tracing::warn!(
+                "Active pairing (gen={}, SAS verification) timed out, cleaning up",
+                generation
+            );
             *guard = None;
         }
     });
@@ -363,6 +377,7 @@ async fn handle_wait_for_pairing(
     let client_device_name = daemon_hostname();
 
     let mut session = pending.session;
+    let gen = pending.generation;
 
     match session.initiate_pairing(stream, &client_device_name).await {
         Ok((stream, server_public_key, server_device_name, sas)) => {
@@ -375,11 +390,12 @@ async fn handle_wait_for_pairing(
                 server_device_name,
                 port: pending.port,
                 firewall_guard: pending.firewall_guard,
+                generation: gen,
             };
 
             *pairing_state.lock().await = Some(PairingState::Active(active));
 
-            spawn_active_pairing_timeout(pairing_state);
+            spawn_active_pairing_timeout(pairing_state, gen);
 
             wait_pairing_success(sas_display, pending.port as u32)
         }
@@ -392,6 +408,34 @@ async fn handle_wait_for_pairing(
 
 fn daemon_hostname() -> String {
     whoami::hostname().unwrap_or_else(|_| "Unknown".to_string())
+}
+
+fn find_non_loopback_ipv4() -> std::net::Ipv4Addr {
+    use std::net::IpAddr;
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in interfaces {
+            if let IpAddr::V4(ipv4) = ip {
+                if !ipv4.is_loopback() {
+                    return ipv4;
+                }
+            }
+        }
+    }
+    std::net::Ipv4Addr::new(127, 0, 0, 1)
+}
+
+fn find_non_loopback_ipv6() -> std::net::Ipv6Addr {
+    use std::net::IpAddr;
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in interfaces {
+            if let IpAddr::V6(ipv6) = ip {
+                if !ipv6.is_loopback() && !ipv6.is_unspecified() {
+                    return ipv6;
+                }
+            }
+        }
+    }
+    std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)
 }
 
 async fn handle_complete_pairing(

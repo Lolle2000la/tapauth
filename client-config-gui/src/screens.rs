@@ -95,7 +95,10 @@ impl Screen {
                 *self = Screen::Settings(SettingsScreen::new(l10n.clone()));
                 Task::perform(crate::ipc::get_config(), |result| match result {
                     Ok((hostname, port)) => ScreenMessage::ConfigLoaded(hostname, port),
-                    Err(_) => ScreenMessage::ConfigLoaded(String::new(), 36692),
+                    Err(_) => ScreenMessage::ConfigLoaded(
+                        String::new(),
+                        shared::network::DEFAULT_UDP_PORT,
+                    ),
                 })
             }
 

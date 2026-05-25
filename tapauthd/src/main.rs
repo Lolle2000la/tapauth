@@ -383,7 +383,7 @@ async fn handle_conn(
                 return write_framed(&mut stream, &response).await;
             }
             Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
-                let response = handle_pam_cancel(cancel_req, &server_state);
+                let response = handle_pam_cancel(cancel_req, &server_state).await;
                 return write_framed(&mut stream, &response).await;
             }
             Some(ipc::ipc_envelope::Msg::AdminRequest(admin_req)) => {
@@ -422,7 +422,7 @@ async fn handle_conn(
                     req.request_id,
                     req.reason
                 );
-                handle_pam_cancel(req, &server_state)
+                handle_pam_cancel(req, &server_state).await
             } else {
                 tracing::warn!("Unknown IPC message type");
                 ipc::PamAuthenticateResponse {
@@ -520,22 +520,18 @@ async fn handle_pam_authenticate(
     }
 }
 
-fn handle_pam_cancel(
+async fn handle_pam_cancel(
     req: ipc::PamCancelRequest,
     server_state: &Arc<ServerState>,
 ) -> ipc::PamAuthenticateResponse {
-    // Note: cancel_registry is behind an async Mutex; for cancel we'd need
-    // to spawn the lookup.  Since cancel is infrequent and idempotent,
-    // use try_lock.
-    if let Ok(mut reg) = server_state.cancel_registry.try_lock() {
-        if let Some(tx) = reg.remove(&req.request_id) {
-            let _ = tx.send(());
-            return ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: "Cancel forwarded".to_string(),
-                challenge: Vec::new(),
-            };
-        }
+    let mut reg = server_state.cancel_registry.lock().await;
+    if let Some(tx) = reg.remove(&req.request_id) {
+        let _ = tx.send(());
+        return ipc::PamAuthenticateResponse {
+            outcome: ipc::PamOutcome::Ignore as i32,
+            detail: "Cancel forwarded".to_string(),
+            challenge: Vec::new(),
+        };
     }
     ipc::PamAuthenticateResponse {
         outcome: ipc::PamOutcome::Ignore as i32,
