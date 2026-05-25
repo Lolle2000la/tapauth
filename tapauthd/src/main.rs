@@ -348,6 +348,12 @@ async fn handle_conn(
             }
         };
 
+    // Zero-length frames are used by health checks — don't loop back
+    // through the IPC dispatch, just close the connection silently.
+    if req_bytes.is_empty() {
+        return Ok(());
+    }
+
     // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
     // Legacy PAM clients send PamAuthenticateRequest / PamCancelRequest directly.
     // Using the envelope eliminates ambiguity between admin and PAM field numbers.
@@ -377,7 +383,7 @@ async fn handle_conn(
                 return write_admin_response(&mut stream, &admin_resp).await;
             }
             None => {
-                tracing::warn!("Empty IpcEnvelope");
+                tracing::debug!("Empty IpcEnvelope");
             }
         }
     }
