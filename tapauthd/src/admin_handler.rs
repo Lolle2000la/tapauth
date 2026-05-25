@@ -1,5 +1,5 @@
 use crate::auth_handler::DaemonState;
-use crate::peer_identity::resolve_peer;
+use crate::peer_identity::{check_authorization, resolve_peer};
 use shared::{
     config::{ClientConfig, PairedServer},
     firewall::{FirewallGuard, Protocol},
@@ -134,10 +134,15 @@ pub async fn handle_admin_request(
         Err(e) => return err_resp(ipc::AdminStatus::AdminError, e),
     };
 
-    // Authorization: the GUI process already performed a PolKit
-    // CheckAuthorization for its own identity (with AllowUserInteraction=true)
-    // in client-config-gui/src/polkit.rs before connecting.  The Unix socket
-    // itself is an additional access-control point (root:tapauthd-clients).
+    // Daemon-side PolKit authorization: the daemon calls CheckAuthorization
+    // using the peer's PID/start-time as the subject.  This is the canonical
+    // enforcement point — no client can bypass it by skipping their own
+    // PolKit check.  The tapauthd user must be registered as an action owner
+    // via org.freedesktop.policykit.owner in the policy file.
+    if let Err(e) = check_authorization(&identity).await {
+        return err_resp(ipc::AdminStatus::AdminUnauthorized, e);
+    }
+
     let username = identity.username;
 
     let (response, needs_reload) = match request.payload {

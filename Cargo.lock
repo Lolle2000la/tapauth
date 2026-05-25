@@ -4852,6 +4852,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "whoami",
+ "zbus",
 ]
 
 [[package]]
