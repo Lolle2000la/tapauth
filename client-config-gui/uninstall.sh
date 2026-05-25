@@ -18,9 +18,9 @@ if [ -f /usr/bin/tapauth-config ]; then
 fi
 
 # Remove polkit policy
-if [ -f /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy ]; then
+if [ -f /usr/share/polkit-1/actions/org.tapauth.config.admin.policy ]; then
     echo "Removing polkit policy..."
-    rm /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy
+    rm /usr/share/polkit-1/actions/org.tapauth.config.admin.policy
 fi
 
 # Remove desktop icon

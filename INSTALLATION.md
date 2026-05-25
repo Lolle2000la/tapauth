@@ -190,7 +190,7 @@ Installation paths are automatically detected based on your distribution:
 | Config GUI | `/usr/bin/tapauth-config` |
 | Configuration | `/var/lib/tapauth/` |
 | Desktop Entry | `/usr/share/applications/tapauth-config.desktop` |
-| Polkit Policy | `/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy` |
+| Polkit Policy | `/usr/share/polkit-1/actions/org.tapauth.config.admin.policy` |
 
 **Note**: The PAM module location is automatically detected during installation based on your distribution's standard PAM directory.
 

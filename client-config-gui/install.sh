@@ -21,8 +21,8 @@ install -Dm755 ../target/release/tapauth-config /usr/bin/tapauth-config
 
 # Install polkit policy
 echo "Installing polkit policy..."
-install -Dm644 dev.rourunisen.tapauth.policy \
-    /usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy
+install -Dm644 ../tapauthd/org.tapauth.config.admin.policy \
+    /usr/share/polkit-1/actions/org.tapauth.config.admin.policy
 
 # Install desktop icon
 echo "Installing desktop icon..."
@@ -52,6 +52,6 @@ echo ""
 echo "You can now:"
 echo "  • Run from terminal: tapauth-config"
 echo "  • Run from application menu: TapAuth Configuration"
-echo "  • Run with pkexec: pkexec tapauth-config"
 echo ""
-echo "The application will automatically request root privileges when needed."
+echo "Authorization is handled via PolKit — you will be prompted for your"
+echo "password when performing administrative operations."
