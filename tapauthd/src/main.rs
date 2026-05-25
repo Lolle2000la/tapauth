@@ -349,8 +349,7 @@ async fn handle_conn(
 
     tracing::debug!("Connection from PID={} UID={}", caller_pid, caller_uid);
 
-    // Read a length-prefixed request (u32 BE) then message with 3-second timeout
-    // to prevent malicious clients from holding connections without sending data
+    // 3-second timeout to prevent malicious clients from holding connections open
     let req_bytes =
         match tokio::time::timeout(std::time::Duration::from_secs(3), read_framed(&mut stream))
             .await

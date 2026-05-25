@@ -32,7 +32,6 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     let has_rwx = if euid == 0 || euid == meta.uid() {
         (mode & 0o300) == 0o300
     } else {
-        // Check supplementary groups
         let in_group = egid == 0
             || egid == meta.gid()
             || nix::unistd::getgroups()
@@ -81,7 +80,6 @@ fn create_safe_tmp_dir(path: &std::path::Path) -> bool {
 /// - stdout: info level by default (for journalctl), configurable via TAPAUTH_LOG_LEVEL
 /// - file: info level by default, configurable via TAPAUTH_FILE_LOG_LEVEL
 pub fn init_logging() {
-    // Stdout layer - info level by default, configurable via TAPAUTH_LOG_LEVEL
     let stdout_filter = std::env::var("TAPAUTH_LOG_LEVEL")
         .ok()
         .and_then(|level| EnvFilter::try_new(&level).ok())
