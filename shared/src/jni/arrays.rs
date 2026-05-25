@@ -109,13 +109,25 @@ where
             return None;
         }
     };
-    let len = match env
+    let array_obj = match env
         .with_env(|env| {
-            let array_obj = unsafe { JObjectArray::<JObject>::from_raw(env, array) };
-            array_obj.len(env)
+            Ok::<JObjectArray<'_, JObject<'_>>, jni::errors::Error>(unsafe {
+                JObjectArray::<JObject>::from_raw(env, array)
+            })
         })
         .into_outcome()
     {
+        Outcome::Ok(array_obj) => array_obj,
+        Outcome::Err(err) => {
+            throw_illegal_state(env, format!("failed to access array reference: {err}"));
+            return None;
+        }
+        Outcome::Panic(_) => {
+            throw_illegal_state(env, "failed to access array reference: panic".to_string());
+            return None;
+        }
+    };
+    let len = match env.with_env(|env| array_obj.len(env)).into_outcome() {
         Outcome::Ok(len) => len,
         Outcome::Err(err) => {
             throw_illegal_state(env, format!("failed to read array length: {err}"));
@@ -134,10 +146,7 @@ where
         return None;
     }
     match env
-        .with_env(|env| {
-            let array_obj = unsafe { JObjectArray::<JObject>::from_raw(env, array) };
-            array_obj.set_element(env, index, value)
-        })
+        .with_env(|env| array_obj.set_element(env, index, value))
         .into_outcome()
     {
         Outcome::Ok(()) => Some(()),
