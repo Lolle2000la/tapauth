@@ -107,8 +107,8 @@ echo "==> Building tapauthd..."
 cargo build $RELEASE_FLAG --manifest-path tapauthd/Cargo.toml
 
 echo ""
-echo "==> Building tapauth-config GUI..."
-cargo build $RELEASE_FLAG --manifest-path client-config-gui/Cargo.toml
+echo "==> Building tapauth-config GUI (with dev-socket-override)..."
+cargo build $RELEASE_FLAG --manifest-path client-config-gui/Cargo.toml --features dev-socket-override
 
 if [ ! -x "$TAPAUTHD_BIN" ]; then
     echo "❌ tapauthd binary not found at $TAPAUTHD_BIN"

@@ -54,6 +54,14 @@ pub fn init_logging() {
     let log_dir = std::path::PathBuf::from("/var/log/tapauth");
     let log_dir = if is_dir_writable(&log_dir) {
         log_dir
+    } else if !log_dir.exists() {
+        if std::fs::create_dir_all(&log_dir).is_ok() && is_dir_writable(&log_dir) {
+            log_dir
+        } else {
+            let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
+            let _ = std::fs::create_dir_all(&fallback);
+            fallback
+        }
     } else {
         let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
         let _ = std::fs::create_dir_all(&fallback);

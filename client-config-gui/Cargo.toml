@@ -47,3 +47,7 @@ zbus = { workspace = true }
 [features]
 default = []
 tpm = ["shared/tpm"]
+# dev-socket-override: enable TAPAUTHD_SOCK env var to override the default
+# IPC socket path.  For development/testing only — production builds must NOT
+# enable this feature (security: attacker-controlled socket redirection).
+dev-socket-override = []

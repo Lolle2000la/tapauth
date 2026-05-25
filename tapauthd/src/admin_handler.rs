@@ -284,7 +284,15 @@ async fn handle_start_pairing(
         generation: gen,
     };
 
-    *pairing_state.lock().await = Some(PairingState::Pending(pending));
+    let mut guard = pairing_state.lock().await;
+    if guard.is_some() {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            "A pairing session is already in progress. Cancel or complete it first.",
+        );
+    }
+    *guard = Some(PairingState::Pending(pending));
+    drop(guard);
 
     spawn_pairing_timeout(pairing_state, gen);
 
@@ -585,6 +593,9 @@ async fn handle_save_config(
             ipc::AdminStatus::AdminError,
             "Invalid UDP port: must be 1-65535",
         );
+    }
+    if req.hostname.trim().is_empty() {
+        return err_resp(ipc::AdminStatus::AdminError, "Hostname must not be empty");
     }
     let port = req.udp_port as u16;
 

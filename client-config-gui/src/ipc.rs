@@ -8,8 +8,18 @@ use tokio::net::UnixStream;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
 
+fn socket_path() -> String {
+    #[cfg(feature = "dev-socket-override")]
+    {
+        if let Ok(p) = std::env::var("TAPAUTHD_SOCK") {
+            return p;
+        }
+    }
+    DEFAULT_SOCKET.to_string()
+}
+
 pub async fn daemon_socket() -> io::Result<UnixStream> {
-    let path = std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
+    let path = socket_path();
     UnixStream::connect(Path::new(&path)).await
 }
 
