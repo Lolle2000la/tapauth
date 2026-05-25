@@ -68,6 +68,9 @@ use crate::jni::*;
 use crate::protocol::messages::sign_wrapper_message;
 use crate::protocol::pb;
 
+#[cfg(target_os = "android")]
+use tracing_subscriber::prelude::*;
+
 fn sha256_hex(data: &[u8]) -> String {
     #[cfg(debug_assertions)]
     {
