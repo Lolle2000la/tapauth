@@ -1,6 +1,5 @@
 use super::ScreenMessage;
 use crate::l10n::L10n;
-use crate::pairing::{complete_pairing, start_pairing, wait_for_pairing_connection};
 use iced::widget::qr_code::Data as QrData;
 use iced::{
     widget::{button, column, container, row, scrollable, text, QRCode, Space},
@@ -36,7 +35,7 @@ impl PairingScreen {
         match message {
             ScreenMessage::PairingStarted => {
                 self.state = PairingState::Loading;
-                Task::perform(start_pairing(), |result| match result {
+                Task::perform(crate::ipc::start_pairing(), |result| match result {
                     Ok((url, _port)) => ScreenMessage::PairingComplete(url),
                     Err(e) => ScreenMessage::PairingFailed(e),
                 })
@@ -60,15 +59,16 @@ impl PairingScreen {
                         data.split("&p=").nth(1).and_then(|s| s.split('&').next())
                     {
                         if let Ok(port) = port_str.parse::<u16>() {
-                            return Task::perform(wait_for_pairing_connection(port), |result| {
-                                match result {
+                            return Task::perform(
+                                async move { crate::ipc::wait_for_pairing(port as u32).await },
+                                |result| match result {
                                     Ok((sas, port)) => ScreenMessage::PairingComplete(format!(
                                         "SAS:{}:{}",
                                         sas, port
                                     )),
                                     Err(e) => ScreenMessage::PairingFailed(e),
-                                }
-                            });
+                                },
+                            );
                         }
                     }
                 } else if data.starts_with("SAS:") {
@@ -88,10 +88,13 @@ impl PairingScreen {
                 if let PairingState::VerifyingSAS { port, .. } = &self.state {
                     let port = *port;
                     self.state = PairingState::CompletingPairing;
-                    return Task::perform(complete_pairing(port), |result| match result {
-                        Ok(device_id) => ScreenMessage::PairingComplete(device_id),
-                        Err(e) => ScreenMessage::PairingFailed(e),
-                    });
+                    return Task::perform(
+                        async move { crate::ipc::complete_pairing(port as u32).await },
+                        |result| match result {
+                            Ok(device_id) => ScreenMessage::PairingComplete(device_id),
+                            Err(e) => ScreenMessage::PairingFailed(e),
+                        },
+                    );
                 }
                 Task::none()
             }

@@ -42,7 +42,6 @@ local-ip-address = { workspace = true }
 whoami = { workspace = true }
 native-dialog = "0.9"
 lucide-icons = "1.16"
-zbus = { workspace = true }
 
 [features]
 default = []

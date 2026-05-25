@@ -58,8 +58,6 @@ pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::Admin
     use std::time::Duration;
     use tokio::time::timeout;
 
-    crate::polkit::authorize_admin_action().await?;
-
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };

@@ -223,10 +223,21 @@ impl IpcClient {
                     "frame too short",
                 )))?;
                 let resp = ipc::IpcEnvelope::decode(data)?;
-                if let Some(ipc::ipc_envelope::Msg::PamResponse(response)) = resp.msg {
-                    return Ok(Some(response));
-                }
-                return Ok(None);
+                match resp.msg {
+                    Some(ipc::ipc_envelope::Msg::PamResponse(response)) => {
+                        return Ok(Some(response));
+                    }
+                    other => {
+                        tracing::warn!(
+                            "Unexpected IPC message type on PAM connection: {:?}",
+                            other
+                        );
+                        return Err(IpcError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected IPC message type",
+                        )));
+                    }
+                };
             }
         }
         Ok(None)

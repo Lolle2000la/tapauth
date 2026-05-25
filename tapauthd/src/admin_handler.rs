@@ -415,7 +415,19 @@ async fn handle_wait_for_pairing(
                 generation: gen,
             };
 
-            *pairing_state.lock().await = Some(PairingState::Active(active));
+            let mut guard = pairing_state.lock().await;
+            if guard.is_some() {
+                tracing::warn!(
+                    "Pairing state changed during accept (gen={}), discarding completed connection",
+                    gen
+                );
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    "Pairing session was superseded by a newer request",
+                );
+            }
+            *guard = Some(PairingState::Active(active));
+            drop(guard);
 
             spawn_active_pairing_timeout(pairing_state, gen);
 

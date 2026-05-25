@@ -368,7 +368,6 @@ async fn handle_conn(
         return Ok(());
     }
 
-    // Dispatch: try IpcEnvelope first (new clients), then legacy PAM messages.
     // All messages arrive wrapped in IpcEnvelope for unambiguous dispatch.
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {

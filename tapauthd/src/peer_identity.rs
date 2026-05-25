@@ -143,9 +143,8 @@ async fn check_polkit(identity: &PeerIdentity) -> Result<bool, String> {
 
 fn is_dbus_unavailable(error: &str) -> bool {
     let e = error.to_lowercase();
-    e.contains("d-bus")
-        || e.contains("dbus")
-        || e.contains("connect")
+    e.contains("d-bus unavailable")
+        || e.contains("dbus unavailable")
         || e.contains("not found")
         || e.contains("no such")
         || e.contains("serviceunknown")
