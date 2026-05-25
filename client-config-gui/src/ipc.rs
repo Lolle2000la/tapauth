@@ -55,29 +55,38 @@ fn err_msg(resp: &ipc::AdminResponse) -> String {
 }
 
 pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::AdminResponse, String> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    crate::polkit::authorize_admin_action().await?;
+
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };
 
-    // Check authorization via PolKit before sending.  Falls back to allowing
-    // access when PolKit is unavailable (the socket permissions already gate
-    // access via group membership in that case).
-    crate::polkit::authorize_admin_action().await?;
+    let result = timeout(Duration::from_secs(10), async {
+        let mut stream = daemon_socket()
+            .await
+            .map_err(|e| format!("Failed to connect to daemon: {}", e))?;
 
-    let mut stream = daemon_socket()
+        let req_bytes = envelope.encode_to_vec();
+        timeout(
+            Duration::from_secs(5),
+            write_framed(&mut stream, &req_bytes),
+        )
         .await
-        .map_err(|e| format!("Failed to connect to daemon: {}", e))?;
-
-    let req_bytes = envelope.encode_to_vec();
-    write_framed(&mut stream, &req_bytes)
-        .await
+        .map_err(|_| "Timed out sending admin request".to_string())?
         .map_err(|e| format!("Failed to send admin request: {}", e))?;
 
-    let resp_bytes = read_framed(&mut stream)
-        .await
-        .map_err(|e| format!("Failed to read admin response: {}", e))?;
+        timeout(Duration::from_secs(10), read_framed(&mut stream))
+            .await
+            .map_err(|_| "Timed out waiting for admin response".to_string())?
+            .map_err(|e| format!("Failed to read admin response: {}", e))
+    })
+    .await
+    .map_err(|_| "Timed out connecting to daemon socket".to_string())??;
 
-    ipc::AdminResponse::decode(&mut &resp_bytes[..])
+    ipc::AdminResponse::decode(&mut &result[..])
         .map_err(|e| format!("Failed to decode admin response: {}", e))
 }
 

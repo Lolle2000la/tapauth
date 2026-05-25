@@ -1,5 +1,5 @@
 use crate::auth_handler::DaemonState;
-use crate::polkitauth::resolve_peer;
+use crate::peer_identity::resolve_peer;
 use shared::{
     config::{ClientConfig, PairedServer},
     firewall::{FirewallGuard, Protocol},

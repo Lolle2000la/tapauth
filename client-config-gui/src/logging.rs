@@ -48,6 +48,10 @@ pub fn init_logging() {
         );
         let fallback = std::path::PathBuf::from("/tmp/tapauth-logs");
         let _ = std::fs::create_dir_all(&fallback);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
+        }
         fallback
     };
 

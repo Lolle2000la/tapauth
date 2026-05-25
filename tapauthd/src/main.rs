@@ -8,7 +8,7 @@
 mod admin_handler;
 mod auth_handler;
 mod logging;
-mod polkitauth;
+mod peer_identity;
 mod transport;
 
 use admin_handler::PairingState;
