@@ -386,6 +386,12 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         ACTIVATION_MODE="systemd-temp"
         TAPAUTHD_SOCK_PATH="$TAPAUTHD_TEST_SOCK_PATH"
         echo "    Creating temporary systemd units for testing..."
+
+        # Kill any leftover daemon processes from previous test runs
+        # that might still be bound to the UDP port (stale systemd stops).
+        sudo pkill -f "tapauthd-test-bin" 2>/dev/null || true
+        sudo pkill -f "tapauthd-gui-bin" 2>/dev/null || true
+        sleep 0.5
         
         # Ensure socket directory exists before systemd tries to create the socket
         echo "    Ensuring runtime directory at $TAPAUTHD_SOCK_DIR"

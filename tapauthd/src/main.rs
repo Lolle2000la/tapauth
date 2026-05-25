@@ -243,6 +243,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down");
         }
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let sigterm_handle = signal(SignalKind::terminate());
+                if let Ok(mut sigterm) = sigterm_handle {
+                    sigterm.recv().await;
+                    tracing::info!("Received SIGTERM, shutting down");
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {}
     }
 
     // Cleanup socket on exit only if we created it ourselves

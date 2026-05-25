@@ -210,6 +210,12 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         TAPAUTHD_SOCK_PATH="$TAPAUTHD_GUI_SOCK_PATH"
         echo "    Creating temporary systemd units for testing..."
 
+        # Kill any leftover daemon processes from previous test runs
+        # that might still be bound to the UDP port (stale systemd stops).
+        sudo pkill -f "tapauthd-test-bin" 2>/dev/null || true
+        sudo pkill -f "tapauthd-gui-bin" 2>/dev/null || true
+        sleep 0.5
+
         # Create temporary directories for units and binary
         TEMP_UNIT_DIR=$(mktemp -d -t tapauthd-gui-units.XXXXXX)
         echo "    Temporary units directory: $TEMP_UNIT_DIR"
