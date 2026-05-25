@@ -11,6 +11,27 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
+fn is_dir_writable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mode = meta.permissions().mode();
+            let euid = nix::unistd::geteuid().as_raw();
+            let egid = nix::unistd::getegid().as_raw();
+
+            if euid == 0 || euid == meta.uid() {
+                mode & 0o200 != 0
+            } else if egid == 0 || egid == meta.gid() {
+                mode & 0o020 != 0
+            } else {
+                mode & 0o002 != 0
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Initialize logging for tapauthd
 ///
 /// Sets up dual logging:
@@ -28,56 +49,33 @@ pub fn init_logging() {
         .with_writer(std::io::stdout)
         .with_filter(stdout_filter);
 
-    // Try to set up file logging, but don't panic if it fails
-    // Use catch_unwind because tracing_appender::rolling::daily can panic
-    let file_layer_result =
-        std::panic::catch_unwind(|| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
-            // Determine log directory - fall back to /tmp if /var/log/tapauth is not accessible
-            let log_dir = std::path::PathBuf::from("/var/log/tapauth");
-            let log_dir = if log_dir.exists()
-                && std::fs::metadata(&log_dir)
-                    .map(|m| !m.permissions().readonly())
-                    .unwrap_or(false)
-            {
-                log_dir
-            } else {
-                if !log_dir.exists() {
-                    std::fs::create_dir_all(&log_dir)?;
-                }
-                // Test if we can write to it by creating a test file
-                let test_file = log_dir.join(".write_test");
-                std::fs::write(&test_file, b"test")?;
-                std::fs::remove_file(test_file)?;
-                log_dir
-            };
+    // Try file logging only if /var/log/tapauth is writable by the running user.
+    // Otherwise fall back to stdout-only (common in test/container environments).
+    let log_dir = std::path::PathBuf::from("/var/log/tapauth");
+    let log_dir = if is_dir_writable(&log_dir) {
+        log_dir
+    } else {
+        let fallback = std::path::PathBuf::from("/tmp/tapauthd-logs");
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    };
 
-            // Create rotating file appender (daily rotation, keep 7 days)
-            let file_appender = tracing_appender::rolling::daily(&log_dir, "tapauthd.log");
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-            // File layer - info level by default, configurable via TAPAUTH_FILE_LOG_LEVEL
-            let file_filter = std::env::var("TAPAUTH_FILE_LOG_LEVEL")
-                .ok()
-                .and_then(|level| EnvFilter::try_new(&level).ok())
-                .unwrap_or_else(|| EnvFilter::new("info"));
-
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_ansi(false)
-                .with_writer(non_blocking)
-                .with_filter(file_filter);
-
-            // Keep the guard alive for the lifetime of the program
-            std::mem::forget(guard);
-
-            Ok((file_layer, log_dir))
-        })
-        .ok()
-        .and_then(|r| r.ok());
-
-    // Combine layers - file layer is optional
-    match file_layer_result {
-        Some((file_layer, log_dir)) => {
+    match std::panic::catch_unwind(|| {
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "tapauthd.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let file_filter = std::env::var("TAPAUTH_FILE_LOG_LEVEL")
+            .ok()
+            .and_then(|level| EnvFilter::try_new(&level).ok())
+            .unwrap_or_else(|| EnvFilter::new("info"));
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .with_filter(file_filter);
+        std::mem::forget(guard);
+        (file_layer, log_dir)
+    }) {
+        Ok((file_layer, log_dir)) => {
             tracing_subscriber::registry()
                 .with(stdout_layer)
                 .with(file_layer)
@@ -87,7 +85,7 @@ pub fn init_logging() {
                 log_dir.display()
             );
         }
-        None => {
+        Err(_) => {
             tracing_subscriber::registry().with(stdout_layer).init();
             tracing::warn!("Logging initialized: stdout only (file logging unavailable)");
         }
