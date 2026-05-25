@@ -499,9 +499,7 @@ jobs:
           python-version: '3.14'
 
       - name: Initialize F-Droid Server CLI Tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fdroidserver
+        run: pip install fdroidserver
 
       - name: Fetch Published Release APK from GitHub Releases
         run: |
