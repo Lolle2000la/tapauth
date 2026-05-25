@@ -5,10 +5,13 @@
     clippy::indexing_slicing
 )]
 
+mod admin_handler;
 mod auth_handler;
 mod logging;
+mod polkitauth;
 mod transport;
 
+use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
 use clap::{Parser, Subcommand};
@@ -16,6 +19,8 @@ use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
 use shared::ipc::pb as ipc;
 use std::io;
+use std::os::fd::BorrowedFd;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -65,11 +70,12 @@ struct RecentAuthRequest {
     timestamp: Instant,
 }
 
-/// Server shared state (daemon runtime + cancel registry + deduplication)
+/// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
     daemon: Arc<DaemonState>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
+    pending_pairing: Arc<Mutex<Option<PairingState>>>,
 }
 
 #[tokio::main]
@@ -206,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon: daemon_state.clone(),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         recent_requests: Arc::new(Mutex::new(HashMap::new())),
+        pending_pairing: Arc::new(Mutex::new(None)),
     });
 
     let server = {
@@ -305,6 +312,26 @@ async fn handle_conn(
     mut stream: UnixStream,
     server_state: Arc<ServerState>,
 ) -> Result<(), DaemonError> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+    let (caller_pid, caller_uid) = {
+        let raw_fd = stream.as_raw_fd();
+        let fd_arg = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        match getsockopt(&fd_arg, PeerCredentials) {
+            Ok(creds) => (creds.pid(), creds.uid()),
+            Err(e) => {
+                tracing::warn!("Failed to get peer credentials: {}", e);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer cred unavailable",
+                )
+                .into());
+            }
+        }
+    };
+
+    tracing::debug!("Connection from PID={} UID={}", caller_pid, caller_uid);
+
     // Read a length-prefixed request (u32 BE) then message with 3-second timeout
     // to prevent malicious clients from holding connections without sending data
     let req_bytes =
@@ -427,11 +454,32 @@ async fn handle_conn(
                     }
                 }
             } else {
-                tracing::warn!("Unknown IPC message type");
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Error as i32,
-                    detail: "Unknown IPC message".to_string(),
-                    challenge: Vec::new(),
+                // Try AdminRequest
+                let admin_req = ipc::AdminRequest::decode(&mut &req_bytes[..]);
+                if let Ok(req) = admin_req {
+                    tracing::info!(
+                        "Handling AdminRequest from PID={} UID={}",
+                        caller_pid,
+                        caller_uid
+                    );
+
+                    let admin_resp = admin_handler::handle_admin_request(
+                        req,
+                        &server_state.daemon,
+                        &server_state.pending_pairing,
+                        caller_pid,
+                        caller_uid,
+                    )
+                    .await;
+
+                    return write_admin_response(&mut stream, &admin_resp).await;
+                } else {
+                    tracing::warn!("Unknown IPC message type");
+                    ipc::PamAuthenticateResponse {
+                        outcome: ipc::PamOutcome::Error as i32,
+                        detail: "Unknown IPC message".to_string(),
+                        challenge: Vec::new(),
+                    }
                 }
             }
         }
@@ -454,6 +502,13 @@ async fn handle_conn(
         return Err(e);
     }
     Ok(())
+}
+
+async fn write_admin_response(
+    stream: &mut UnixStream,
+    response: &ipc::AdminResponse,
+) -> Result<(), DaemonError> {
+    write_framed(stream, response).await
 }
 
 async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {

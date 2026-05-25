@@ -8,9 +8,6 @@ use iced::{
 #[cfg(feature = "tpm")]
 use iced::Font;
 
-#[cfg(feature = "tpm")]
-use shared::config::ClientConfigManager;
-
 #[derive(Debug, Clone)]
 pub struct MainMenuScreen {
     pub l10n: L10n,
@@ -23,16 +20,9 @@ pub struct MainMenuScreen {
 impl MainMenuScreen {
     #[cfg(feature = "tpm")]
     pub fn new(l10n: L10n) -> Self {
-        // Check for TPM errors by trying to load keypair
-        let config_manager = ClientConfigManager::new();
-        let tpm_error = match config_manager.load_keypair() {
-            Ok(_) => None,
-            Err(e) => Some(format!("Keypair load failed: {}. Recovery required.", e)),
-        };
-
         Self {
             l10n,
-            tpm_error,
+            tpm_error: None,
             recovery_status: None,
         }
     }
@@ -75,10 +65,7 @@ impl MainMenuScreen {
 
     #[cfg(feature = "tpm")]
     async fn perform_tpm_recovery() -> Result<(), String> {
-        let config_manager = ClientConfigManager::new();
-        config_manager
-            .recover_from_tpm_failure()
-            .map_err(|e| format!("TPM recovery failed: {}", e))
+        crate::ipc::recover_tpm().await
     }
 
     pub fn view(&self) -> Element<'_, ScreenMessage> {
@@ -87,7 +74,6 @@ impl MainMenuScreen {
             .width(Length::Fill)
             .center();
 
-        // TPM error warning if present
         let mut content_widgets = vec![
             Space::new().height(Length::Fixed(50.0)).into(),
             title.into(),

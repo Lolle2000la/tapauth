@@ -61,7 +61,6 @@ struct AwaitAuthParams<'a> {
 
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
-    #[allow(dead_code)]
     pub config_manager: Arc<ClientConfigManager>,
     pub paired_servers: Arc<HashMap<String, PairedServer>>,
     pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
