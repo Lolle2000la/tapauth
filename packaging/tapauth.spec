@@ -65,7 +65,7 @@ install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth/pam-config.example
 install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}/applications/tapauth-config.desktop
 install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
-install -m 0644 client-config-gui/dev.rourunisen.tapauth.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.policy
+install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -90,4 +90,4 @@ install -m 0644 client-config-gui/dev.rourunisen.tapauth.policy %{buildroot}%{_d
 %doc %{_datadir}/doc/tapauth/pam-config.example
 %{_datadir}/applications/tapauth-config.desktop
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
-%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.policy
+%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy

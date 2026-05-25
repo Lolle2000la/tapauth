@@ -2,8 +2,19 @@
 
 use super::{ReceiveResult, Transport};
 use crate::auth_handler::AuthHandlerError as AuthError;
-use shared::protocol::messages::sign_wrapper_message;
-use shared::protocol::pb::EncryptedPacket;
+use bluer::adv::Advertisement;
+use bluer::gatt::local::{
+    Application, Characteristic, CharacteristicRead, CharacteristicWrite, Service,
+};
+use prost::Message;
+use shared::crypto::encrypt_with_csk_and_random_nonce;
+use shared::models::ble::{
+    CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID,
+    SERVICE_UUID,
+};
+use shared::protocol::messages::{create_grant_confirmation, sign_wrapper_message};
+use shared::protocol::packet::{decrypt_encrypted_packet_with_csk_nonce, wrap_grant_confirmation};
+use shared::protocol::pb::{wrapper_message, EncryptedPacket};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -119,11 +130,6 @@ impl BleTransport {
 
     /// Create a GrantConfirmation message
     fn create_confirmation(&self, request_packet: &EncryptedPacket) -> Result<Vec<u8>, AuthError> {
-        use prost::Message;
-        use shared::crypto::encrypt_with_csk_and_random_nonce;
-        use shared::protocol::messages::create_grant_confirmation;
-        use shared::protocol::packet::wrap_grant_confirmation;
-
         // Create GrantConfirmation with challenge signature
         let confirmation = create_grant_confirmation(&self.challenge)
             .map_err(|e| AuthError::BleError(format!("Failed to create confirmation: {}", e)))?;
@@ -222,16 +228,6 @@ impl BleTransport {
 
 impl Transport for BleTransport {
     async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        use bluer::adv::Advertisement;
-        use bluer::gatt::local::{
-            Application, Characteristic, CharacteristicRead, CharacteristicWrite, Service,
-        };
-        use prost::Message;
-        use shared::models::ble::{
-            CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID, SERVER_RESPONSE_CHAR_UUID,
-            SERVICE_UUID,
-        };
-
         // Only set up once (on first call)
         if self.adv_handle.lock().await.is_some() {
             // Already set up, nothing to do
@@ -474,10 +470,6 @@ impl Transport for BleTransport {
     }
 
     async fn receive_response(&self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
-        use prost::Message;
-        use shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce;
-        use shared::protocol::pb::wrapper_message;
-
         let request_packet = self
             .request_packet
             .lock()

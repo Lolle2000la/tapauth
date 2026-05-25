@@ -5,6 +5,8 @@
 use jni::strings::{JNIStr, JNIString};
 use jni::{EnvUnowned as JNIEnv, Outcome};
 
+use crate::error::TapAuthError;
+
 fn throw_exception(env: &mut JNIEnv, class: &'static JNIStr, message: JNIString) {
     match env
         .with_env(|env| env.throw_new(class, &message))
@@ -114,8 +116,7 @@ pub fn throw_invalid_key(env: &mut JNIEnv, message: impl Into<String>) {
 /// - `AeadBadTag` → `AEADBadTagException`
 /// - `Crypto` → `GeneralSecurityException`
 /// - `State` → `IllegalStateException`
-pub fn throw_tapauth_error(env: &mut JNIEnv, err: &crate::error::TapAuthError) {
-    use crate::error::TapAuthError;
+pub fn throw_tapauth_error(env: &mut JNIEnv, err: &TapAuthError) {
     match err {
         TapAuthError::InvalidInput(msg) => throw_illegal_argument(env, msg),
         TapAuthError::Io(err) => throw_io_exception(env, err.to_string()),

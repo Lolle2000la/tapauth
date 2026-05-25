@@ -1,12 +1,13 @@
 mod app;
+mod ipc;
 mod l10n;
 mod logging;
-mod pairing;
 mod screens;
 mod utils;
 
+use native_dialog::{DialogBuilder, MessageLevel};
+
 fn main() -> iced::Result {
-    // Parse target locale flag if passed via elevation re-exec
     let args: Vec<String> = std::env::args().collect();
     let mut forced_locale = None;
     if let Some(pos) = args.iter().position(|arg| arg == "--locale") {
@@ -15,18 +16,7 @@ fn main() -> iced::Result {
         }
     }
 
-    let original_user = utils::elevation::get_original_user();
-
-    if !utils::elevation::is_root() {
-        // Resolve effective locale (per-user prefs + system) before pkexec scrubs env
-        let current_locale = l10n::resolve_locale(None, &original_user);
-        utils::elevation::attempt_privilege_elevation(
-            &original_user,
-            &["--locale", &current_locale],
-        );
-    }
-
-    std::env::set_var("TAPAUTH_ORIGINAL_USER", &original_user);
+    let original_user = utils::identity::get_username();
 
     logging::init_logging();
 
@@ -35,7 +25,6 @@ fn main() -> iced::Result {
     let bootstrap_l10n = l10n::L10n::new(&locale);
 
     if let Err(_err) = utils::system_check::validate_tapauthd_user() {
-        use native_dialog::{DialogBuilder, MessageLevel};
         let _ = DialogBuilder::message()
             .set_title(bootstrap_l10n.tr("error-user-missing-title"))
             .set_text(bootstrap_l10n.tr("error-user-missing-message"))
@@ -46,10 +35,7 @@ fn main() -> iced::Result {
     }
 
     tracing::info!("Starting TapAuth Configuration GUI");
-    tracing::info!(
-        "Running GUI for user: {} (elevated for privileged operations)",
-        original_user
-    );
+    tracing::info!("Running GUI as unprivileged user: {}", original_user);
     tracing::info!("Using locale: {}", locale);
 
     let icon_data = include_bytes!("../assets/icon-256.png");
@@ -63,7 +49,6 @@ fn main() -> iced::Result {
 
     let username = original_user;
 
-    // Run the application
     iced::application(
         move || app::TapAuthConfig::new(&locale, &username),
         app::TapAuthConfig::update,

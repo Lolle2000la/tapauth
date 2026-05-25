@@ -63,6 +63,7 @@ settings-csk-warning = 警告：CSKをローテーションすると、すべて
 settings-config-saved = 設定が正常に保存されました。
 settings-csk-rotated = CSKが正常にローテーションされました。すべてのペアリングがクリアされました。
 settings-error-prefix = エラー: {$message}
+settings-invalid-port = 無効なポート番号（1-65535である必要があります）
 
 # ── System Error Dialogs ──
 error-user-missing-title = システムユーザーが見つかりません

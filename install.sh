@@ -40,7 +40,7 @@ PAM_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
-CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.policy"
+CONFIG_POLICY_PATH="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
 CONFIG_DIR="/var/lib/tapauth"
 KEY_PATH="$CONFIG_DIR/client_key"
 DAEMON_PATH="/usr/bin/tapauthd"
@@ -1395,7 +1395,7 @@ install_config_gui() {
         fi
         
         if [[ -d /usr/share/polkit-1/actions ]]; then
-            show_file_copy "client-config-gui/dev.rourunisen.tapauth.policy" "$CONFIG_POLICY_PATH"
+            show_file_copy "tapauthd/dev.rourunisen.tapauth.config.admin.policy" "$CONFIG_POLICY_PATH"
             show_command "chmod 644 $CONFIG_POLICY_PATH" "Set polkit policy permissions"
         else
             echo -e "${YELLOW}[SKIP]${NC} Polkit policy (directory doesn't exist)"
@@ -1434,7 +1434,7 @@ install_config_gui() {
     # Install polkit policy
     if [[ -d /usr/share/polkit-1/actions ]]; then
         print_info "Installing polkit policy"
-        cp client-config-gui/dev.rourunisen.tapauth.policy "$CONFIG_POLICY_PATH"
+        cp tapauthd/dev.rourunisen.tapauth.config.admin.policy "$CONFIG_POLICY_PATH"
         chmod 644 "$CONFIG_POLICY_PATH"
     fi
     

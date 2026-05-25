@@ -63,6 +63,7 @@ settings-csk-warning = Warnung: Das Rotieren des CSK macht alle gekoppelten Ger�
 settings-config-saved = Konfiguration erfolgreich gespeichert.
 settings-csk-rotated = CSK erfolgreich rotiert. Alle Kopplungen wurden gelöscht.
 settings-error-prefix = Fehler: {$message}
+settings-invalid-port = Ungültige Portnummer (muss 1-65535 sein)
 
 # ── System Error Dialogs ──
 error-user-missing-title = Systembenutzer fehlt

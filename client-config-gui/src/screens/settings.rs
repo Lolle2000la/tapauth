@@ -4,7 +4,6 @@ use iced::{
     widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
     Element, Font, Length, Task,
 };
-use shared::config::{ClientConfig, ClientConfigManager, TapAuthConfig, DEFAULT_CONFIG_PATH};
 use std::sync::LazyLock;
 
 mod locales_list {
@@ -49,27 +48,19 @@ pub struct SettingsScreen {
     rotating_csk: bool,
     error: Option<String>,
     success: Option<String>,
-    client_config: ClientConfig,
-    toml_config: TapAuthConfig,
     hostname_input: String,
     udp_port_input: String,
 }
 
 impl SettingsScreen {
     pub fn new(l10n: L10n) -> Self {
-        let config_manager = ClientConfigManager::new();
-        let client_config = config_manager.load_config().unwrap_or_default();
-        let toml_config = TapAuthConfig::load();
-
         Self {
             l10n,
             rotating_csk: false,
             error: None,
             success: None,
-            hostname_input: client_config.hostname.clone(),
-            udp_port_input: toml_config.udp_port.to_string(),
-            client_config,
-            toml_config,
+            hostname_input: String::new(),
+            udp_port_input: String::new(),
         }
     }
 
@@ -98,23 +89,25 @@ impl SettingsScreen {
             }
             ScreenMessage::HostnameChanged(hostname) => {
                 self.hostname_input = hostname.clone();
-                self.client_config.hostname = hostname;
                 Task::none()
             }
             ScreenMessage::UdpPortChanged(port_str) => {
                 self.udp_port_input = port_str.clone();
-                if let Ok(port) = port_str.parse::<u16>() {
-                    self.toml_config.udp_port = port;
-                }
                 Task::none()
             }
             ScreenMessage::SaveConfig => {
                 self.error = None;
                 self.success = None;
-                let client_config = self.client_config.clone();
-                let toml_config = self.toml_config.clone();
+                let hostname = self.hostname_input.clone();
+                let udp_port = match self.udp_port_input.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        self.error = Some(self.l10n.tr("settings-invalid-port"));
+                        return Task::none();
+                    }
+                };
                 Task::perform(
-                    Self::save_config(client_config, toml_config),
+                    crate::ipc::save_config(hostname, udp_port),
                     |result| match result {
                         Ok(_) => ScreenMessage::ConfigSaved,
                         Err(e) => ScreenMessage::ConfigSaveFailed(e),
@@ -131,7 +124,11 @@ impl SettingsScreen {
                 self.success = None;
                 Task::none()
             }
-            ScreenMessage::LocaleChanged(_locale) => Task::none(),
+            ScreenMessage::ConfigLoaded(hostname, port) => {
+                self.hostname_input = hostname;
+                self.udp_port_input = port.to_string();
+                Task::none()
+            }
             _ => Task::none(),
         }
     }
@@ -194,7 +191,6 @@ impl SettingsScreen {
 
         let warning = text(self.l10n.tr("settings-csk-warning")).size(12);
 
-        // Language selector
         let lang_title = text(self.l10n.tr("settings-language-section")).size(24);
         let current_code = self.l10n.locale();
         let selected = LOCALE_OPTIONS.iter().find(|o| o.code == current_code);
@@ -204,7 +200,6 @@ impl SettingsScreen {
         })
         .width(Length::Fixed(300.0));
 
-        // Status messages
         let status_text = if let Some(ref error) = self.error {
             text(
                 self.l10n
@@ -261,34 +256,7 @@ impl SettingsScreen {
             .into()
     }
 
-    async fn save_config(
-        client_config: ClientConfig,
-        toml_config: TapAuthConfig,
-    ) -> Result<(), String> {
-        let config_manager = ClientConfigManager::new();
-
-        config_manager
-            .save_config(&client_config)
-            .map_err(|e| format!("Failed to save client configuration: {}", e))?;
-
-        toml_config
-            .save_to_path(DEFAULT_CONFIG_PATH)
-            .map_err(|e| format!("Failed to save TOML configuration: {}", e))?;
-
-        crate::utils::service::restart_tapauthd_service().await?;
-
-        Ok(())
-    }
-
     async fn rotate_csk() -> Result<(), String> {
-        let config = ClientConfigManager::new();
-
-        config
-            .rotate_csk()
-            .map_err(|e| format!("Failed to rotate CSK: {}", e))?;
-
-        crate::utils::service::restart_tapauthd_service().await?;
-
-        Ok(())
+        crate::ipc::rotate_csk().await
     }
 }

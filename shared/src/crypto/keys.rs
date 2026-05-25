@@ -1,4 +1,4 @@
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -39,7 +39,6 @@ impl Ed25519KeyPair {
     }
     /// Sign arbitrary data using the signing key
     pub fn sign(&self, data: &[u8]) -> ed25519_dalek::Signature {
-        use ed25519_dalek::Signer;
         let sk = SigningKey::from_bytes(self.signing_key_bytes.expose_secret());
         sk.sign(data)
     }

@@ -5,21 +5,35 @@
     clippy::indexing_slicing
 )]
 
+mod admin_handler;
 mod auth_handler;
 mod logging;
+mod peer_identity;
 mod transport;
 
+use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
 use shared::ipc::pb as ipc;
+use std::env;
 use std::io;
+use std::io::ErrorKind;
+use std::os::fd::BorrowedFd;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
+use tokio::signal::unix::{self as sigunix, SignalKind};
+
+#[cfg(feature = "fallback-socket")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "fallback-socket")]
+use std::path::Path;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
@@ -57,7 +71,7 @@ pub enum DaemonError {
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 /// Tracks recent authentication requests to prevent duplicates
 #[derive(Clone)]
@@ -65,11 +79,12 @@ struct RecentAuthRequest {
     timestamp: Instant,
 }
 
-/// Server shared state (daemon runtime + cancel registry + deduplication)
+/// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
-    daemon: Arc<DaemonState>,
+    daemon: RwLock<Arc<DaemonState>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
+    pending_pairing: Arc<Mutex<Option<PairingState>>>,
 }
 
 #[tokio::main]
@@ -151,7 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Production deployments should use systemd socket activation (see systemd/tapauthd.socket)
                 tracing::warn!("fallback-socket feature enabled - binding socket manually for development/testing");
 
-                use std::path::Path;
                 let sock_path = std::env::var("TAPAUTHD_SOCK")
                     .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
@@ -166,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Set permissions to 0660 for manual (non-systemd) runs
                 #[allow(unused_imports)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
                     if let Err(e) =
                         std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660))
                     {
@@ -203,9 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let server_state = Arc::new(ServerState {
-        daemon: daemon_state.clone(),
+        daemon: RwLock::new(daemon_state.clone()),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         recent_requests: Arc::new(Mutex::new(HashMap::new())),
+        pending_pairing: Arc::new(Mutex::new(None)),
     });
 
     let server = {
@@ -215,9 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         tracing::debug!("Accepted connection: {:?}", addr);
+                        let daemon = server_state.daemon.read().await.clone();
                         let server_state = server_state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, server_state).await {
+                            if let Err(e) = handle_conn(stream, daemon, server_state).await {
                                 tracing::warn!("Connection error: {}", e);
                             }
                         });
@@ -235,6 +250,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down");
         }
+        _ = async {
+            #[cfg(unix)]
+            {
+                let sigterm_handle = sigunix::signal(SignalKind::terminate());
+                if let Ok(mut sigterm) = sigterm_handle {
+                    sigterm.recv().await;
+                    tracing::info!("Received SIGTERM, shutting down");
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {}
     }
 
     // Cleanup socket on exit only if we created it ourselves
@@ -253,8 +282,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Try to adopt a pre-opened Unix socket from systemd (FD#3)
 fn adopt_systemd_socket() -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
-    use std::env;
-
     let listen_fds: i32 = match env::var("LISTEN_FDS").ok().and_then(|v| v.parse().ok()) {
         Some(n) if n > 0 => n,
         _ => return Ok(None),
@@ -303,10 +330,28 @@ fn drop_privileges_to_tapauthd() -> Result<(), String> {
 
 async fn handle_conn(
     mut stream: UnixStream,
+    daemon: Arc<DaemonState>,
     server_state: Arc<ServerState>,
 ) -> Result<(), DaemonError> {
-    // Read a length-prefixed request (u32 BE) then message with 3-second timeout
-    // to prevent malicious clients from holding connections without sending data
+    let (caller_pid, caller_uid) = {
+        let raw_fd = stream.as_raw_fd();
+        let fd_arg = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        match getsockopt(&fd_arg, PeerCredentials) {
+            Ok(creds) => (creds.pid(), creds.uid()),
+            Err(e) => {
+                tracing::warn!("Failed to get peer credentials: {}", e);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer cred unavailable",
+                )
+                .into());
+            }
+        }
+    };
+
+    tracing::debug!("Connection from PID={} UID={}", caller_pid, caller_uid);
+
+    // 3-second timeout to prevent malicious clients from holding connections open
     let req_bytes =
         match tokio::time::timeout(std::time::Duration::from_secs(3), read_framed(&mut stream))
             .await
@@ -319,131 +364,60 @@ async fn handle_conn(
             }
         };
 
-    // Try to parse as PamAuthenticateRequest first
-    let auth_req = ipc::PamAuthenticateRequest::decode(&mut &req_bytes[..]);
+    // Zero-length frames are used by health checks — don't loop back
+    // through the IPC dispatch, just close the connection silently.
+    if req_bytes.is_empty() {
+        return Ok(());
+    }
 
-    let response = match auth_req {
-        Ok(req) => {
-            tracing::info!("Handling PamAuthenticateRequest for user: {}", req.username);
-
-            // Check for duplicate requests (within 1 second)
-            const DEDUP_WINDOW: Duration = Duration::from_secs(1);
-            let now = Instant::now();
-            let mut recent_requests = server_state.recent_requests.lock().await;
-
-            // Clean up old entries (older than 2 seconds)
-            recent_requests
-                .retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
-
-            // Check if we have a recent request for this user
-            let is_duplicate = if let Some(recent) = recent_requests.get(&req.username) {
-                now.duration_since(recent.timestamp) < DEDUP_WINDOW
-            } else {
-                false
-            };
-
-            if is_duplicate {
-                let elapsed_ms = recent_requests
-                    .get(&req.username)
-                    .map(|r| now.duration_since(r.timestamp).as_millis())
-                    .unwrap_or(0);
-
-                tracing::warn!(
-                    "Duplicate authentication request for user '{}' within {}ms - ignoring",
-                    req.username,
-                    elapsed_ms
-                );
-                drop(recent_requests); // Release lock before responding
-
-                // Return IGNORE to let this PAM session fall through to password
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Ignore as i32,
-                    detail: "Duplicate request - another authentication is in progress".to_string(),
-                    challenge: Vec::new(),
-                }
-            } else {
-                // Record/update timestamp for this user
-                recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
-                drop(recent_requests); // Release lock
-
-                // Run authentication
-                let timeout = Some(req.timeout_seconds);
-                match AuthSession::new(server_state.daemon.clone(), req.username.clone()) {
-                    Ok(sess) => {
-                        let result = sess
-                            .handle_authenticate(
-                                timeout,
-                                Some(req.request_id.clone()),
-                                server_state.cancel_registry.clone(),
-                            )
-                            .await;
-
-                        match result {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                tracing::error!("Authentication handler error: {}", e);
-                                ipc::PamAuthenticateResponse {
-                                    outcome: ipc::PamOutcome::Error as i32,
-                                    detail: format!("Internal error: {}", e),
-                                    challenge: Vec::new(), // Error case, no challenge
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create auth session: {}", e);
-                        ipc::PamAuthenticateResponse {
-                            outcome: ipc::PamOutcome::Error as i32,
-                            detail: format!("Internal error: {}", e),
-                            challenge: Vec::new(),
-                        }
-                    }
-                }
+    // All messages arrive wrapped in IpcEnvelope for unambiguous dispatch.
+    // PAM auth/cancel requests skip PolKit by design: the PAM module runs
+    // *during* authentication and the subject hasn't been verified yet.
+    // Access is gated by socket permissions (root:tapauthd-clients 0660).
+    if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
+        match envelope.msg {
+            Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
+                let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
+                return write_framed(&mut stream, &envelope_pam_response(response)).await;
+            }
+            Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
+                let response = handle_pam_cancel(cancel_req, &server_state).await;
+                return write_framed(&mut stream, &envelope_pam_response(response)).await;
+            }
+            Some(ipc::ipc_envelope::Msg::AdminRequest(admin_req)) => {
+                let admin_resp = admin_handler::handle_admin_request(
+                    admin_req,
+                    &server_state.daemon,
+                    &server_state.pending_pairing,
+                    caller_pid,
+                    caller_uid,
+                )
+                .await;
+                return write_framed(&mut stream, &envelope_admin_response(admin_resp)).await;
+            }
+            None => {
+                tracing::debug!("Empty IpcEnvelope");
+            }
+            Some(ipc::ipc_envelope::Msg::PamResponse(_))
+            | Some(ipc::ipc_envelope::Msg::AdminResponse(_)) => {
+                tracing::warn!("Received response-type message from client — ignoring");
             }
         }
-        Err(_) => {
-            // Try PamCancelRequest
-            let cancel_req = ipc::PamCancelRequest::decode(&mut &req_bytes[..]);
-            if let Ok(req) = cancel_req {
-                tracing::info!(
-                    "Handling PamCancelRequest (id={}): {}",
-                    req.request_id,
-                    req.reason
-                );
-                // Look up in-flight session by request_id and notify cancel
-                let mut reg = server_state.cancel_registry.lock().await;
-                if let Some(tx) = reg.remove(&req.request_id) {
-                    let _ = tx.send(());
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Ignore as i32,
-                        detail: "Cancel forwarded".to_string(),
-                        challenge: Vec::new(), // Cancel doesn't need challenge
-                    }
-                } else {
-                    ipc::PamAuthenticateResponse {
-                        outcome: ipc::PamOutcome::Ignore as i32,
-                        detail: "No matching request to cancel".to_string(),
-                        challenge: Vec::new(),
-                    }
-                }
-            } else {
-                tracing::warn!("Unknown IPC message type");
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Error as i32,
-                    detail: "Unknown IPC message".to_string(),
-                    challenge: Vec::new(),
-                }
-            }
-        }
+    }
+
+    tracing::warn!("Unrecognized IPC data — not a valid IpcEnvelope");
+    let response = ipc::PamAuthenticateResponse {
+        outcome: ipc::PamOutcome::Error as i32,
+        detail: "Unknown IPC message".to_string(),
+        challenge: Vec::new(),
     };
 
     // Frame and write response
-    if let Err(e) = write_framed(&mut stream, &response).await {
+    if let Err(e) = write_framed(&mut stream, &envelope_pam_response(response)).await {
         // Gracefully ignore common disconnect races
         if let DaemonError::Io(ref ioe) = e {
-            use std::io::ErrorKind::*;
             match ioe.kind() {
-                BrokenPipe | ConnectionReset | UnexpectedEof => {
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof => {
                     tracing::debug!("Client disconnected before response could be sent: {}", ioe);
                     return Ok(());
                 }
@@ -454,6 +428,93 @@ async fn handle_conn(
         return Err(e);
     }
     Ok(())
+}
+
+async fn handle_pam_authenticate(
+    req: ipc::PamAuthenticateRequest,
+    daemon: &Arc<DaemonState>,
+    server_state: &Arc<ServerState>,
+) -> ipc::PamAuthenticateResponse {
+    const DEDUP_WINDOW: Duration = Duration::from_secs(1);
+    let now = Instant::now();
+    let mut recent_requests = server_state.recent_requests.lock().await;
+
+    recent_requests.retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
+
+    let is_duplicate = recent_requests
+        .get(&req.username)
+        .map(|r| now.duration_since(r.timestamp) < DEDUP_WINDOW)
+        .unwrap_or(false);
+
+    if is_duplicate {
+        let elapsed_ms = recent_requests
+            .get(&req.username)
+            .map(|r| now.duration_since(r.timestamp).as_millis())
+            .unwrap_or(0);
+        tracing::warn!(
+            "Duplicate authentication request for user '{}' within {}ms - ignoring",
+            req.username,
+            elapsed_ms
+        );
+        return ipc::PamAuthenticateResponse {
+            outcome: ipc::PamOutcome::Ignore as i32,
+            detail: "Duplicate request - another authentication is in progress".to_string(),
+            challenge: Vec::new(),
+        };
+    }
+
+    recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
+    drop(recent_requests);
+
+    let timeout = Some(req.timeout_seconds);
+    match AuthSession::new(daemon.clone(), req.username.clone()) {
+        Ok(sess) => match sess
+            .handle_authenticate(
+                timeout,
+                Some(req.request_id.clone()),
+                server_state.cancel_registry.clone(),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("Authentication handler error: {}", e);
+                ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Error as i32,
+                    detail: format!("Internal error: {}", e),
+                    challenge: Vec::new(),
+                }
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to create auth session: {}", e);
+            ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Error as i32,
+                detail: format!("Internal error: {}", e),
+                challenge: Vec::new(),
+            }
+        }
+    }
+}
+
+async fn handle_pam_cancel(
+    req: ipc::PamCancelRequest,
+    server_state: &Arc<ServerState>,
+) -> ipc::PamAuthenticateResponse {
+    let mut reg = server_state.cancel_registry.lock().await;
+    if let Some(tx) = reg.remove(&req.request_id) {
+        let _ = tx.send(());
+        return ipc::PamAuthenticateResponse {
+            outcome: ipc::PamOutcome::Ignore as i32,
+            detail: "Cancel forwarded".to_string(),
+            challenge: Vec::new(),
+        };
+    }
+    ipc::PamAuthenticateResponse {
+        outcome: ipc::PamOutcome::Ignore as i32,
+        detail: "No matching request to cancel".to_string(),
+        challenge: Vec::new(),
+    }
 }
 
 async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {
@@ -472,9 +533,19 @@ async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<()
     Ok(())
 }
 
-async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
-    use tokio::io::AsyncReadExt;
+fn envelope_pam_response(response: ipc::PamAuthenticateResponse) -> ipc::IpcEnvelope {
+    ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::PamResponse(response)),
+    }
+}
 
+fn envelope_admin_response(response: ipc::AdminResponse) -> ipc::IpcEnvelope {
+    ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::AdminResponse(response)),
+    }
+}
+
+async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;

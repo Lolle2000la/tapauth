@@ -1,6 +1,6 @@
 //! Authentication request handler that creates on-demand transports and runs auth flow.
 
-use crate::transport::{ReceiveResult, Transport};
+use crate::transport::{ReceiveResult, Transport, UdpTransport};
 use shared::{
     config::{ClientConfigManager, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
@@ -13,7 +13,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
 
 #[cfg(feature = "ble")]
+use crate::transport::BleTransport;
+#[cfg(feature = "ble")]
 use shared::crypto::generate_current_temporal_identifier_ble;
+#[cfg(feature = "ble")]
+use tokio::select;
 
 use shared::ipc::pb as ipc;
 
@@ -61,7 +65,6 @@ struct AwaitAuthParams<'a> {
 
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
-    #[allow(dead_code)]
     pub config_manager: Arc<ClientConfigManager>,
     pub paired_servers: Arc<HashMap<String, PairedServer>>,
     pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
@@ -113,6 +116,58 @@ impl DaemonState {
     /// Get error message for degraded state
     pub fn get_init_error(&self) -> Option<&str> {
         self.init_error.as_deref()
+    }
+
+    /// Reload in-memory state from disk after admin configuration changes.
+    /// Reuses the existing UDP socket (port changes require daemon restart).
+    pub fn reload(&self) -> Arc<DaemonState> {
+        let keypair = match self.config_manager.load_keypair() {
+            Ok(kp) => Some(kp),
+            Err(e) => {
+                tracing::error!("Failed to reload keypair: {}", e);
+                self.keypair.clone()
+            }
+        };
+
+        let csk = self.config_manager.load_csk().unwrap_or_else(|e| {
+            tracing::error!("Failed to reload CSK: {}", e);
+            self.csk.clone()
+        });
+
+        let paired_servers = self
+            .config_manager
+            .load_paired_servers()
+            .map(Arc::new)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to reload paired servers: {}", e);
+                self.paired_servers.clone()
+            });
+
+        let config = self.config_manager.load_config().unwrap_or_else(|e| {
+            tracing::error!("Failed to reload config: {}", e);
+            shared::config::ClientConfig {
+                hostname: self.hostname.clone(),
+            }
+        });
+
+        let init_error = if keypair.is_some() {
+            None
+        } else {
+            Some(
+                "Keypair unavailable after reload. Use tapauth-config to regenerate keys."
+                    .to_string(),
+            )
+        };
+
+        Arc::new(DaemonState {
+            config_manager: self.config_manager.clone(),
+            paired_servers,
+            keypair,
+            csk,
+            hostname: config.hostname,
+            udp_socket: self.udp_socket.clone(),
+            init_error,
+        })
     }
 }
 
@@ -256,7 +311,6 @@ impl AuthSession {
                     let toml_config = shared::config::TapAuthConfig::load();
                     let port = toml_config.udp_port;
                     tokio::spawn(async move {
-                        use crate::transport::UdpTransport;
                         let transport = UdpTransport::from_socket(udp_socket, port);
                         let _ = transport.send_cancel(&cancel_packet).await;
                     });
@@ -324,8 +378,6 @@ impl AuthSession {
         ),
         AuthHandlerError,
     > {
-        use crate::transport::{BleTransport, UdpTransport};
-
         let toml_config = shared::config::TapAuthConfig::load();
         let udp_transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
@@ -430,8 +482,6 @@ impl AuthSession {
 
     #[cfg(feature = "ble")]
     async fn await_auth_result(&self, params: AwaitAuthParams<'_>) -> Result<(), AuthHandlerError> {
-        use tokio::select;
-
         let AwaitAuthParams {
             mut ble_handle,
             mut udp_handle,
@@ -673,8 +723,6 @@ impl AuthSession {
         &mut self,
         packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
-        use crate::transport::UdpTransport;
-
         let toml_config = shared::config::TapAuthConfig::load();
         let transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);

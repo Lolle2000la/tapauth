@@ -9,6 +9,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 /// Default configuration path
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 
@@ -194,7 +197,6 @@ impl TapAuthConfig {
         // Set restrictive permissions (readable by all, writable by root)
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(path)?.permissions();
             perms.set_mode(0o644);
             fs::set_permissions(path, perms)?;

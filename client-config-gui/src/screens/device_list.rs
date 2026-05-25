@@ -1,12 +1,27 @@
 use super::ScreenMessage;
 use crate::l10n::L10n;
-use crate::utils::elevation;
+use crate::utils::identity;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Element, Font, Length, Task,
 };
-use shared::config::{ClientConfigManager, PairedServer};
+use shared::config::PairedServer;
+use shared::ipc::pb::PairedServerInfo;
 use std::collections::HashMap;
+
+fn convert_to_paired_server(info: &PairedServerInfo) -> (String, PairedServer) {
+    let paired_at = chrono::DateTime::parse_from_rfc3339(&info.paired_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    let server = PairedServer {
+        name: info.name.clone(),
+        public_key: info.public_key.clone(),
+        allowed_users: info.allowed_users.clone(),
+        paired_at,
+    };
+    (info.public_key.clone(), server)
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceListScreen {
@@ -14,14 +29,14 @@ pub struct DeviceListScreen {
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
+    error: Option<String>,
 }
 
 impl DeviceListScreen {
     pub fn new(l10n: L10n) -> (Self, Task<ScreenMessage>) {
         tracing::debug!("Creating new DeviceListScreen and starting load task");
 
-        // Get original username (before any privilege escalation)
-        let current_username = elevation::get_username();
+        let current_username = identity::get_username();
 
         tracing::info!("Device list for user: {}", current_username);
 
@@ -30,6 +45,7 @@ impl DeviceListScreen {
             devices: HashMap::new(),
             current_username,
             loading: true,
+            error: None,
         };
 
         let task = Task::perform(Self::load_devices(), |result| match result {
@@ -44,8 +60,8 @@ impl DeviceListScreen {
         match message {
             ScreenMessage::NavigateToDeviceList => {
                 tracing::debug!("NavigateToDeviceList message received");
-                // Load devices when navigating to this screen
                 self.loading = true;
+                self.error = None;
                 Task::perform(Self::load_devices(), |result| match result {
                     Ok(devices) => ScreenMessage::DevicesLoaded(devices),
                     Err(e) => ScreenMessage::PairingFailed(e),
@@ -58,19 +74,21 @@ impl DeviceListScreen {
                 );
                 self.devices = devices;
                 self.loading = false;
+                self.error = None;
                 tracing::debug!("State updated, now have {} devices", self.devices.len());
                 Task::none()
             }
             ScreenMessage::RemoveDevice(device_id) => {
-                let username = self.current_username.clone();
                 self.devices.remove(&device_id);
-                Task::perform(
-                    Self::remove_device_for_user(device_id, username),
-                    |result| match result {
-                        Ok(_) => ScreenMessage::NavigateToDeviceList,
-                        Err(e) => ScreenMessage::PairingFailed(e),
-                    },
-                )
+                Task::perform(Self::remove_device(device_id), |result| match result {
+                    Ok(_) => ScreenMessage::NavigateToDeviceList,
+                    Err(e) => ScreenMessage::PairingFailed(e),
+                })
+            }
+            ScreenMessage::PairingFailed(error) => {
+                self.error = Some(error);
+                self.loading = false;
+                Task::none()
             }
             _ => Task::none(),
         }
@@ -102,11 +120,22 @@ impl DeviceListScreen {
         .size(14)
         .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
 
-        // Filter devices to only show those that include current user
+        // Defense-in-depth: daemon already filters by caller identity via PolKit,
+        // but client-side filtering ensures the UI never displays another user's devices.
         let user_devices: HashMap<_, _> = self
             .devices
             .iter()
-            .filter(|(_, server)| server.allowed_users.contains(&self.current_username))
+            .filter(|(_, server)| {
+                if !server.allowed_users.contains(&self.current_username) {
+                    tracing::warn!(
+                        "Daemon returned device '{}' not associated with current user '{}'",
+                        server.name,
+                        self.current_username
+                    );
+                    return false;
+                }
+                true
+            })
             .collect();
 
         let device_list = if user_devices.is_empty() {
@@ -167,6 +196,15 @@ impl DeviceListScreen {
             devices_column
         };
 
+        let error_display: Element<'_, ScreenMessage> = if let Some(ref error) = self.error {
+            text(error)
+                .size(14)
+                .color(iced::Color::from_rgb(0.9, 0.2, 0.2))
+                .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
+
         let content = column![
             back_button,
             Space::new().height(Length::Fixed(20.0)),
@@ -174,6 +212,7 @@ impl DeviceListScreen {
             Space::new().height(Length::Fixed(10.0)),
             username_info,
             Space::new().height(Length::Fixed(20.0)),
+            error_display,
             scrollable(device_list),
         ]
         .padding(20)
@@ -188,38 +227,15 @@ impl DeviceListScreen {
     }
 
     async fn load_devices() -> Result<HashMap<String, PairedServer>, String> {
-        tracing::debug!("load_devices() called");
-        let config = ClientConfigManager::new();
-
-        let result = config
-            .load_paired_servers()
-            .map_err(|e| format!("Failed to load paired devices: {}", e));
-
-        match &result {
-            Ok(devices) => tracing::debug!("Loaded {} devices", devices.len()),
-            Err(e) => tracing::error!("Error loading devices: {}", e),
-        }
-
-        result
+        tracing::debug!("load_devices() called via IPC");
+        let servers = crate::ipc::get_paired_servers().await?;
+        let devices: HashMap<String, PairedServer> =
+            servers.iter().map(convert_to_paired_server).collect();
+        tracing::debug!("Loaded {} devices", devices.len());
+        Ok(devices)
     }
 
-    async fn remove_device_for_user(device_id: String, username: String) -> Result<(), String> {
-        let config = ClientConfigManager::new();
-
-        let entire_pairing_removed = config
-            .remove_user_from_pairing(&device_id, &username)
-            .map_err(|e| format!("Failed to remove pairing: {}", e))?;
-
-        if entire_pairing_removed {
-            tracing::info!("Removed entire pairing for device {}", device_id);
-        } else {
-            tracing::info!(
-                "Removed user {} from device {}, other users remain",
-                username,
-                device_id
-            );
-        }
-
-        Ok(())
+    async fn remove_device(device_id: String) -> Result<(), String> {
+        crate::ipc::remove_device(device_id).await
     }
 }
