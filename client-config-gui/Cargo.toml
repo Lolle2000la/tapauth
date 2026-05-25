@@ -38,7 +38,6 @@ libc.workspace = true
 nix.workspace = true
 prost.workspace = true
 bytes.workspace = true
-local-ip-address = { workspace = true }
 whoami = { workspace = true }
 native-dialog = "0.9"
 lucide-icons = "1.16"

@@ -760,7 +760,6 @@ dependencies = [
  "hex",
  "iced",
  "libc",
- "local-ip-address",
  "lucide-icons",
  "native-dialog",
  "nix 0.31.3",

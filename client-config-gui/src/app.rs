@@ -6,7 +6,7 @@ use iced::{Element, Task, Theme};
 pub struct TapAuthConfig {
     l10n: L10n,
     current_screen: Screen,
-    /// Original (pre-elevation) username for per-user locale persistence
+    /// Current username for per-user locale persistence and UI display
     username: String,
 }
 
