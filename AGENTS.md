@@ -40,7 +40,8 @@ cargo test --workspace
 # Lint/format:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-# ^ NOTE: --all-features won't work locally (pulls in jni). See feature table.
+# ^ NOTE: --all-features may fail locally (pulls in jni, which needs libjvm/JDK headers).
+#    Use per-crate feature combos from CI (see feature table below).
 ```
 
 ### Android
@@ -68,7 +69,7 @@ cd server-android && ./gradlew connectedDebugAndroidTest
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
 
 **Gotchas:**
-- `--all-features` **won't work locally** on a vanilla Linux box — it pulls in `jni` which requires `libjvm`/JDK headers. Use per-crate feature combos from CI.
+- `--all-features` **may not work locally** — it pulls in `jni` which requires `libjvm`/JDK headers. If you have a JDK installed, it should compile; otherwise use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
 - **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Without this, the daemon errors out with "Systemd socket activation required."
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
