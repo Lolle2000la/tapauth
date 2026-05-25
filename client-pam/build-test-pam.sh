@@ -559,11 +559,12 @@ echo "  Use your paired Android device to approve the authentication."
 echo "---------------------------------------------------------------------"
 echo ""
 
-# Run pamtester with verbose output, targeting the specified user
-# Requires running the script with sudo; preserve env so PAM module sees TAPAUTHD_SOCK
-export TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH"
+# Run pamtester with verbose output, targeting the specified user.
+# sudo -E may strip custom variables like TAPAUTHD_SOCK on some distros
+# (env_reset).  Pass them explicitly via `sudo env` so they survive.
 set +e
-sudo -E RUST_LOG="debug" pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
+sudo env TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH" RUST_LOG="debug" \
+    pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
 PAMTESTER_EXIT_CODE=$?
 set -e # Re-enable exit on error
 
