@@ -207,8 +207,8 @@ if [ -n "$SUDO_USER" ]; then
         echo "   Ensure Rust is installed correctly for the user who ran sudo."
         cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Building client-pam as $SUDO_USER..."
-    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $SUDO_USER (with dev-socket-override)..."
+    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p client-pam --features dev-socket-override || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     echo "    Building tapauthd as $SUDO_USER (NO_BLE=$NO_BLE)..."
     if [ "$NO_BLE" -eq 1 ]; then
         sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
@@ -221,8 +221,8 @@ else
         echo "   Ensure Rust is installed correctly."
         cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Building client-pam as $(whoami)..."
-    cargo build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $(whoami) (with dev-socket-override)..."
+    cargo build --release -p client-pam --features dev-socket-override || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     echo "    Building tapauthd as $(whoami) (NO_BLE=$NO_BLE)..."
     if [ "$NO_BLE" -eq 1 ]; then
         cargo build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }

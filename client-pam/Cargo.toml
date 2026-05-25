@@ -32,3 +32,8 @@ libc.workspace = true
 [features]
 default = []
 tpm = ["shared/tpm"]
+# dev-socket-override: enable TAPAUTHD_SOCK env var to override the default
+# IPC socket path.  This is for development/testing only — production builds
+# must NOT enable this feature, as it would allow environment-controlled
+# socket redirection which could bypass authentication.
+dev-socket-override = []

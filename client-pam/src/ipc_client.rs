@@ -11,6 +11,16 @@ use std::time::Duration;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
+fn socket_path() -> String {
+    #[cfg(feature = "dev-socket-override")]
+    {
+        if let Ok(override_path) = std::env::var("TAPAUTHD_SOCK") {
+            return override_path;
+        }
+    }
+    DEFAULT_SOCKET_PATH.to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     #[error("io: {0}")]
@@ -37,8 +47,7 @@ impl IpcClient {
     /// The timeout applies to connect, send, and receive operations to prevent
     /// PAM module hangs if the daemon is unresponsive.
     pub fn connect(timeout: Duration) -> Result<Self, IpcError> {
-        let sock_path =
-            std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+        let sock_path = socket_path();
 
         let stream = UnixStream::connect(&sock_path)?;
 
@@ -57,8 +66,7 @@ impl IpcClient {
     /// Connect and set nonblocking immediately (for poll/select driven loops).
     /// Does NOT set read/write timeouts since poll() handles all timing.
     pub fn connect_nonblocking() -> Result<Self, IpcError> {
-        let sock_path =
-            std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+        let sock_path = socket_path();
 
         // Connect and immediately set nonblocking for poll-based I/O
         // No timeouts - poll() in pam_logic.rs handles all timing
