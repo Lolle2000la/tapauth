@@ -3,6 +3,7 @@ mod ipc;
 mod l10n;
 mod logging;
 mod pairing;
+mod polkit;
 mod screens;
 mod utils;
 

@@ -49,6 +49,11 @@ pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::Admin
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };
 
+    // Check authorization via PolKit before sending.  Falls back to allowing
+    // access when PolKit is unavailable (the socket permissions already gate
+    // access via group membership in that case).
+    crate::polkit::authorize_admin_action().await?;
+
     let mut stream = daemon_socket()
         .await
         .map_err(|e| format!("Failed to connect to daemon: {}", e))?;
