@@ -83,7 +83,7 @@ async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, Str
         .await
         .map_err(|e| format!("Failed to connect to system D-Bus: {}", e))?;
 
-    let subject = build_polkit_subject(identity);
+    let subject_details = build_polkit_details(identity);
 
     let reply = connection
         .call_method(
@@ -92,7 +92,7 @@ async fn check_polkit_authorization(identity: &PeerIdentity) -> Result<bool, Str
             Some("org.freedesktop.PolicyKit1.Authority"),
             "CheckAuthorization",
             &(
-                subject,
+                ("unix-process".to_string(), subject_details),
                 POLKIT_ACTION_ID,
                 std::collections::HashMap::<&str, &str>::new(),
                 1u32,
@@ -122,25 +122,21 @@ fn is_polkit_unavailable(error: &str) -> bool {
         || e.contains("serviceunknown")
 }
 
-fn build_polkit_subject(
+fn build_polkit_details(
     identity: &PeerIdentity,
 ) -> std::collections::HashMap<String, zbus::zvariant::Value<'_>> {
-    let mut subject = std::collections::HashMap::new();
-    subject.insert(
-        "type".to_string(),
-        zbus::zvariant::Value::Str("unix-process".into()),
-    );
-    subject.insert(
+    let mut details = std::collections::HashMap::new();
+    details.insert(
         "pid".to_string(),
         zbus::zvariant::Value::U32(identity.pid as u32),
     );
-    subject.insert(
+    details.insert(
         "start-time".to_string(),
         zbus::zvariant::Value::U64(identity.start_time),
     );
-    subject.insert(
+    details.insert(
         "uid".to_string(),
         zbus::zvariant::Value::I32(identity.uid as i32),
     );
-    subject
+    details
 }
