@@ -5,6 +5,8 @@ mod logging;
 mod screens;
 mod utils;
 
+use native_dialog::{DialogBuilder, MessageLevel};
+
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
     let mut forced_locale = None;
@@ -23,7 +25,6 @@ fn main() -> iced::Result {
     let bootstrap_l10n = l10n::L10n::new(&locale);
 
     if let Err(_err) = utils::system_check::validate_tapauthd_user() {
-        use native_dialog::{DialogBuilder, MessageLevel};
         let _ = DialogBuilder::message()
             .set_title(bootstrap_l10n.tr("error-user-missing-title"))
             .set_text(bootstrap_l10n.tr("error-user-missing-message"))

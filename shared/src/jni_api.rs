@@ -47,14 +47,32 @@ use jni::objects::{JByteArray, JClass, JIntArray, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
 use jni::EnvUnowned as JNIEnv;
 
-use crate::crypto;
-use crate::jni::*;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+
+use crate::crypto;
+use crate::jni::conversions::{
+    jbytearray_to_ed25519_keypair, jbytearray_to_fixed, jbytearray_to_vec, jstring_to_rust,
+    string_to_jstring, vec_to_jbytearray,
+};
+use crate::jni::exceptions::{
+    throw_aead_bad_tag, throw_illegal_argument, throw_invalid_key, throw_io_exception,
+    throw_security_exception, throw_tapauth_error,
+};
+use crate::jni::objects::{
+    create_auth_request, create_authentication_cancel, create_encrypted_packet_info,
+    create_grant_confirmation, create_pairing_complete, create_pairing_response,
+};
+use crate::jni::protobuf::{decode_message, encode_message};
+use crate::jni::*;
+use crate::protocol::messages::sign_wrapper_message;
+use crate::protocol::pb;
+use sha2::{Digest, Sha256};
+use tracing_subscriber::prelude::*;
 
 fn sha256_hex(data: &[u8]) -> String {
     #[cfg(debug_assertions)]
     {
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
@@ -87,7 +105,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
         let keypair = match crypto::Ed25519KeyPair::generate() {
             Ok(kp) => kp,
             Err(e) => {
-                use crate::jni::exceptions::throw_tapauth_error;
                 throw_tapauth_error(&mut env, &e.into());
                 return std::ptr::null_mut();
             }
@@ -128,7 +145,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
         let keypair = match crypto::X25519KeyPair::generate() {
             Ok(kp) => kp,
             Err(e) => {
-                use crate::jni::exceptions::throw_tapauth_error;
                 throw_tapauth_error(&mut env, &e.into());
                 return std::ptr::null_mut();
             }
@@ -416,8 +432,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_sha256(
     data: JByteArray,
 ) -> jstring {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-
         let data_bytes = match jbytearray_to_vec(&mut env, data, "data") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -453,12 +467,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     request_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::jbytearray_to_vec;
-        use super::jni::exceptions::throw_io_exception;
-        use super::jni::objects::create_auth_request;
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, request_bytes, "request_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -515,11 +523,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseEnc
     packet_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::jbytearray_to_vec;
-        use super::jni::objects::create_encrypted_packet_info;
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, packet_bytes, "packet_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -568,11 +571,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
     packet_bytes: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_vec, vec_to_jbytearray};
-        use super::jni::exceptions::throw_io_exception;
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, packet_bytes, "packet_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -624,10 +622,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_determin
     wrapper_message_bytes: JByteArray,
 ) -> jstring {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_vec, string_to_jstring};
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, wrapper_message_bytes, "wrapper_message_bytes")
         {
             Some(b) => b,
@@ -680,9 +674,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     timestamp_seconds: jlong,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, vec_to_jbytearray};
-        use super::jni::exceptions::throw_security_exception;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -735,9 +726,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_generate
     timestamp_seconds: jlong,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, vec_to_jbytearray};
-        use super::jni::exceptions::throw_security_exception;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -792,9 +780,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifyTe
     csk: JByteArray,
 ) -> jboolean {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec};
-        use super::jni::exceptions::{throw_illegal_argument, throw_security_exception};
-
         let id_bytes = match jbytearray_to_vec(&mut env, id, "id") {
             Some(b) => b,
             None => return false as jboolean,
@@ -866,11 +851,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_encryptW
     plaintext: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{
-            jbytearray_to_fixed, jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray,
-        };
-        use super::jni::exceptions::throw_security_exception;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -942,11 +922,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptW
     ciphertext: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{
-            jbytearray_to_fixed, jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray,
-        };
-        use super::jni::exceptions::throw_aead_bad_tag;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -1012,10 +987,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_verifySi
     signature: JByteArray,
 ) -> bool {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec};
-        use super::jni::exceptions::throw_invalid_key;
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
         let public_key_array = match jbytearray_to_fixed::<32>(&mut env, public_key, "public_key") {
             Some(arr) => arr,
             None => return false,
@@ -1065,9 +1036,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_signData
     message: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec, vec_to_jbytearray};
-        use ed25519_dalek::{Signer, SigningKey};
-
         let private_key_array =
             match jbytearray_to_fixed::<32>(&mut env, private_key, "private_key") {
                 Some(arr) => arr,
@@ -1120,10 +1088,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_serializ
     signature_algorithm: jint,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_vec, jstring_to_rust, vec_to_jbytearray};
-        use super::jni::protobuf::encode_message;
-        use crate::protocol::pb;
-
         let challenge_bytes = match jbytearray_to_vec(&mut env, challenge, "challenge") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1188,12 +1152,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseGra
     confirmation_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::jbytearray_to_vec;
-        use super::jni::exceptions::throw_io_exception;
-        use super::jni::objects::create_grant_confirmation;
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let bytes = match jbytearray_to_vec(&mut env, confirmation_bytes, "confirmation_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1250,12 +1208,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAut
     cancel_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::jbytearray_to_vec;
-        use super::jni::exceptions::throw_io_exception;
-        use super::jni::objects::create_authentication_cancel;
-        use super::jni::protobuf::decode_message;
-        use crate::protocol::pb;
-
         let bytes = match jbytearray_to_vec(&mut env, cancel_bytes, "cancel_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1314,12 +1266,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
     private_key: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{
-            jbytearray_to_ed25519_keypair, jbytearray_to_vec, vec_to_jbytearray,
-        };
-        use super::jni::protobuf::encode_message;
-        use crate::protocol::pb;
-
         let signed_challenge_bytes =
             match jbytearray_to_vec(&mut env, signed_challenge, "signed_challenge") {
                 Some(b) => b,
@@ -1344,7 +1290,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createGr
         };
 
         // Sign the wrapper (not the inner message)
-        use crate::protocol::messages::sign_wrapper_message;
         if let Err(err) = sign_wrapper_message(&mut wrapper, &keypair) {
             throw_io_exception(&mut env, &format!("failed to sign wrapper: {err}"));
             return std::ptr::null_mut();
@@ -1386,12 +1331,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createDe
     private_key: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{
-            jbytearray_to_ed25519_keypair, jbytearray_to_fixed, vec_to_jbytearray,
-        };
-        use super::jni::protobuf::encode_message;
-        use crate::protocol::pb;
-
         let challenge_bytes = match jbytearray_to_fixed::<32>(&mut env, challenge, "challenge") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -1415,7 +1354,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createDe
         };
 
         // Sign the wrapper (not the inner message)
-        use crate::protocol::messages::sign_wrapper_message;
         if let Err(err) = sign_wrapper_message(&mut wrapper, &keypair) {
             throw_io_exception(&mut env, &format!("failed to sign wrapper: {err}"));
             return std::ptr::null_mut();
@@ -1461,12 +1399,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createEn
     wrapper_message_bytes: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::conversions::{jbytearray_to_fixed, jbytearray_to_vec, vec_to_jbytearray};
-        use super::jni::exceptions::throw_security_exception;
-        use super::jni::protobuf::encode_message;
-        use crate::crypto;
-        use crate::protocol::pb;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -1553,9 +1485,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_decryptE
     encrypted_packet_bytes: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use crate::crypto;
-        use crate::protocol::pb;
-
         let csk_array = match jbytearray_to_fixed::<32>(&mut env, csk, "csk") {
             Some(arr) => arr,
             None => return std::ptr::null_mut(),
@@ -1651,8 +1580,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     supported_signature: JIntArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use crate::protocol::pb;
-
         let x25519_bytes = match jbytearray_to_vec(&mut env, x25519_public_key, "x25519_public_key")
         {
             Some(b) => b,
@@ -1724,9 +1651,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
     response_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::objects::create_pairing_response;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, response_bytes, "response_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1774,8 +1698,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     username: JString,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use crate::protocol::pb;
-
         let encrypted_csk_bytes = match jbytearray_to_vec(&mut env, encrypted_csk, "encrypted_csk")
         {
             Some(b) => b,
@@ -1826,8 +1748,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
     message_bytes: JByteArray,
 ) -> jobjectArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, message_bytes, "message_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1870,8 +1790,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_createPa
     encrypted_csk_hash: JByteArray,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use crate::protocol::pb;
-
         let hash_bytes = match jbytearray_to_vec(&mut env, encrypted_csk_hash, "encrypted_csk_hash")
         {
             Some(b) => b,
@@ -1918,9 +1836,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parsePai
     complete_bytes: JByteArray,
 ) -> jni::sys::jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use super::jni::objects::create_pairing_complete;
-        use crate::protocol::pb;
-
         let data = match jbytearray_to_vec(&mut env, complete_bytes, "complete_bytes") {
             Some(b) => b,
             None => return std::ptr::null_mut(),
@@ -1969,8 +1884,6 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_initLogg
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         INIT_LOGGING.call_once(|| {
-            use tracing_subscriber::prelude::*;
-
             let android_layer = paranoid_android::layer("TapAuthNative")
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
                 .with_thread_names(true)

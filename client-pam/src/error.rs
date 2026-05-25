@@ -3,6 +3,8 @@
 use std::os::raw::c_int;
 use thiserror::Error;
 
+use crate::pam_sys;
+
 /// Errors that can occur during PAM authentication.
 #[derive(Error, Debug)]
 pub enum PamError {
@@ -56,7 +58,6 @@ impl PamError {
     /// - `Timeout`, `Ipc*`, `DaemonError`, `ProtoDecode`, `Ignore` → `PAM_IGNORE`
     /// - `ConfigError` → `PAM_SYSTEM_ERR`
     pub fn to_pam_code(&self) -> c_int {
-        use crate::pam_sys;
         match self {
             PamError::ExplicitDenied => pam_sys::PAM_PERM_DENIED,
             PamError::UserUnknown => pam_sys::PAM_USER_UNKNOWN,

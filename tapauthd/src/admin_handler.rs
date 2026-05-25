@@ -8,6 +8,7 @@ use shared::{
     models::pairing::generate_pairing_url,
     protocol::ClientPairingSession,
 };
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -454,7 +455,6 @@ fn daemon_hostname() -> String {
 }
 
 fn find_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
-    use std::net::IpAddr;
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (_name, ip) in interfaces {
             if let IpAddr::V4(ipv4) = ip {
@@ -468,7 +468,6 @@ fn find_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
 }
 
 fn find_non_loopback_ipv6() -> Option<std::net::Ipv6Addr> {
-    use std::net::IpAddr;
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (_name, ip) in interfaces {
             if let IpAddr::V6(ipv6) = ip {

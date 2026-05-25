@@ -18,6 +18,9 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
+#[cfg(unix)]
+use std::ffi::CString;
+
 use super::NetworkError;
 use crate::protocol::pb::EncryptedPacket;
 
@@ -175,8 +178,6 @@ pub fn is_local_ip(addr: &IpAddr) -> bool {
 /// The `CString` ensures proper null termination and lifetime for the FFI call.
 #[cfg(unix)]
 fn get_interface_index(name: &str) -> Result<u32, std::io::Error> {
-    use std::ffi::CString;
-
     let c_name = CString::new(name).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
     })?;

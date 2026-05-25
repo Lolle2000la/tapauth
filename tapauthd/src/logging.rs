@@ -9,12 +9,11 @@
 //! Log files are stored in `/var/log/tapauth/tapauthd.log` with daily rotation,
 //! keeping the last 7 days of logs.
 
+use nix::unistd::{getegid, geteuid};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 fn is_dir_writable(path: &std::path::Path) -> bool {
-    use nix::unistd::{getegid, geteuid};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return false,
@@ -127,9 +126,6 @@ fn resolve_log_dir() -> Option<std::path::PathBuf> {
 }
 
 fn create_safe_dir(path: &std::path::Path) -> bool {
-    use nix::unistd::geteuid;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     if path.exists() {
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,

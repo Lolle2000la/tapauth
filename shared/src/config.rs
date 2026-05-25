@@ -24,6 +24,7 @@ pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -117,7 +118,6 @@ fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
     };
     let uid = user.uid.as_raw();
     let gid = user.gid.as_raw();
-    use std::ffi::CString;
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
     let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };

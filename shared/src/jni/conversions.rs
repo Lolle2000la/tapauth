@@ -7,6 +7,7 @@ use jni::objects::{JByteArray, JIntArray, JString};
 use jni::{EnvUnowned as JNIEnv, Outcome};
 
 use super::exceptions::{throw_illegal_argument, throw_out_of_memory};
+use crate::crypto::Ed25519KeyPair;
 
 /// Convert a JNI int array to a Rust `Vec<i32>`.
 ///
@@ -191,8 +192,6 @@ pub fn jbytearray_to_ed25519_keypair(
     array: JByteArray,
     name: &str,
 ) -> Option<crate::crypto::Ed25519KeyPair> {
-    use crate::crypto::Ed25519KeyPair;
-
     let bytes = jbytearray_to_vec(env, array, name)?;
 
     let signing_key = match bytes.len() {

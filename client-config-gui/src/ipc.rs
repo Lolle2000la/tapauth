@@ -3,8 +3,10 @@ use prost::Message;
 use shared::ipc::pb as ipc;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
 
@@ -55,9 +57,6 @@ fn err_msg(resp: &ipc::AdminResponse) -> String {
 }
 
 pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::AdminResponse, String> {
-    use std::time::Duration;
-    use tokio::time::timeout;
-
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };

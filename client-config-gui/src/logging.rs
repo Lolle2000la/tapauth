@@ -9,12 +9,11 @@
 //! Log files are stored in `/var/log/tapauth/tapauth-config.log` with daily rotation
 //! when running as root.  Unprivileged runs fall back to `/tmp/tapauth-logs`.
 
+use nix::unistd::{getegid, geteuid};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 fn is_dir_writable(path: &std::path::Path) -> bool {
-    use nix::unistd::{getegid, geteuid};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return false,
@@ -52,9 +51,6 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
 }
 
 fn create_safe_tmp_dir(path: &std::path::Path) -> bool {
-    use nix::unistd::geteuid;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     if path.exists() {
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,

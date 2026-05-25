@@ -1,4 +1,5 @@
 use nix::unistd::User;
+use zbus::Connection;
 
 const POLKIT_ACTION_ID: &str = "org.tapauth.config.admin";
 
@@ -101,8 +102,6 @@ pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), String> 
 }
 
 async fn check_polkit(identity: &PeerIdentity) -> Result<bool, String> {
-    use zbus::Connection;
-
     let connection = Connection::system()
         .await
         .map_err(|e| format!("D-Bus unavailable: {}", e))?;

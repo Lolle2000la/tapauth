@@ -15,16 +15,25 @@ use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
 use shared::ipc::pb as ipc;
+use std::env;
 use std::io;
+use std::io::ErrorKind;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
+use tokio::signal::unix::{self as sigunix, SignalKind};
+
+#[cfg(feature = "fallback-socket")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "fallback-socket")]
+use std::path::Path;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
@@ -157,7 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Production deployments should use systemd socket activation (see systemd/tapauthd.socket)
                 tracing::warn!("fallback-socket feature enabled - binding socket manually for development/testing");
 
-                use std::path::Path;
                 let sock_path = std::env::var("TAPAUTHD_SOCK")
                     .unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
@@ -172,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Set permissions to 0660 for manual (non-systemd) runs
                 #[allow(unused_imports)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
                     if let Err(e) =
                         std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660))
                     {
@@ -246,8 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = async {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::{signal, SignalKind};
-                let sigterm_handle = signal(SignalKind::terminate());
+                let sigterm_handle = sigunix::signal(SignalKind::terminate());
                 if let Ok(mut sigterm) = sigterm_handle {
                     sigterm.recv().await;
                     tracing::info!("Received SIGTERM, shutting down");
@@ -276,8 +282,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Try to adopt a pre-opened Unix socket from systemd (FD#3)
 fn adopt_systemd_socket() -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
-    use std::env;
-
     let listen_fds: i32 = match env::var("LISTEN_FDS").ok().and_then(|v| v.parse().ok()) {
         Some(n) if n > 0 => n,
         _ => return Ok(None),
@@ -329,8 +333,6 @@ async fn handle_conn(
     daemon: Arc<DaemonState>,
     server_state: Arc<ServerState>,
 ) -> Result<(), DaemonError> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-
     let (caller_pid, caller_uid) = {
         let raw_fd = stream.as_raw_fd();
         let fd_arg = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -414,9 +416,8 @@ async fn handle_conn(
     if let Err(e) = write_framed(&mut stream, &envelope_pam_response(response)).await {
         // Gracefully ignore common disconnect races
         if let DaemonError::Io(ref ioe) = e {
-            use std::io::ErrorKind::*;
             match ioe.kind() {
-                BrokenPipe | ConnectionReset | UnexpectedEof => {
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof => {
                     tracing::debug!("Client disconnected before response could be sent: {}", ioe);
                     return Ok(());
                 }
@@ -545,8 +546,6 @@ fn envelope_admin_response(response: ipc::AdminResponse) -> ipc::IpcEnvelope {
 }
 
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
-    use tokio::io::AsyncReadExt;
-
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
