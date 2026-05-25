@@ -754,16 +754,16 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client-config-gui"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "fluent",
  "hex",
  "iced",
- "lazy_static",
  "libc",
- "local-ip-address",
  "lucide-icons",
  "native-dialog",
  "nix 0.31.3",
+ "prost",
  "qrcode 0.14.1",
  "shared",
  "thiserror 2.0.18",
@@ -3092,6 +3092,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -4833,11 +4834,14 @@ version = "0.1.0"
 dependencies = [
  "bluer",
  "bytes",
+ "chrono",
  "clap",
  "getrandom 0.4.2",
  "hex",
+ "local-ip-address",
  "nix 0.31.3",
  "prost",
+ "serde_json",
  "shared",
  "socket2",
  "thiserror 2.0.18",
@@ -4845,6 +4849,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "whoami",
+ "zbus",
 ]
 
 [[package]]
@@ -5047,6 +5053,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -6557,6 +6564,7 @@ dependencies = [
  "rustix 1.1.2",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",

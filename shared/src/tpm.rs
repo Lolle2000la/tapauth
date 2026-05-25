@@ -21,6 +21,7 @@
 //! all devices.
 
 use crate::crypto::{CryptoError, Ed25519KeyPair};
+use std::io::Write;
 use std::path::Path;
 
 /// Error types for TPM operations
@@ -134,8 +135,6 @@ pub fn seal_data_with_tpm(
     output_path: &Path,
     pcr_list: &str,
 ) -> Result<(), TpmKeyError> {
-    use std::io::Write;
-
     // Create a temporary file for the input data
     let temp_input = output_path.with_extension("tmp_in");
     let mut file = std::fs::File::create(&temp_input)?;

@@ -5,6 +5,8 @@
 
 use thiserror::Error;
 
+use crate::crypto::CryptoError;
+
 /// Central error type for TapAuth operations.
 ///
 /// Maps to JNI exceptions:
@@ -42,7 +44,6 @@ pub enum TapAuthError {
 
 impl From<crate::crypto::CryptoError> for TapAuthError {
     fn from(err: crate::crypto::CryptoError) -> Self {
-        use crate::crypto::CryptoError;
         match err {
             CryptoError::InvalidKeyLength => TapAuthError::InvalidInput(format!("crypto: {}", err)),
             CryptoError::DecryptionFailed => TapAuthError::AeadBadTag,

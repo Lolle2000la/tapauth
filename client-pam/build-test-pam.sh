@@ -207,8 +207,8 @@ if [ -n "$SUDO_USER" ]; then
         echo "   Ensure Rust is installed correctly for the user who ran sudo."
         cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Building client-pam as $SUDO_USER..."
-    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $SUDO_USER (with dev-socket-override)..."
+    sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p client-pam --features dev-socket-override || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     echo "    Building tapauthd as $SUDO_USER (NO_BLE=$NO_BLE)..."
     if [ "$NO_BLE" -eq 1 ]; then
         sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
@@ -221,8 +221,8 @@ else
         echo "   Ensure Rust is installed correctly."
         cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Building client-pam as $(whoami)..."
-    cargo build --release -p client-pam || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    echo "    Building client-pam as $(whoami) (with dev-socket-override)..."
+    cargo build --release -p client-pam --features dev-socket-override || { echo "❌ client-pam build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     echo "    Building tapauthd as $(whoami) (NO_BLE=$NO_BLE)..."
     if [ "$NO_BLE" -eq 1 ]; then
         cargo build --release -p tapauthd --no-default-features || { echo "❌ tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
@@ -386,6 +386,12 @@ if command -v systemctl >/dev/null 2>&1 && pidof systemd >/dev/null 2>&1; then
         ACTIVATION_MODE="systemd-temp"
         TAPAUTHD_SOCK_PATH="$TAPAUTHD_TEST_SOCK_PATH"
         echo "    Creating temporary systemd units for testing..."
+
+        # Kill any leftover daemon processes from previous test runs
+        # that might still be bound to the UDP port (stale systemd stops).
+        sudo pkill -f "tapauthd-test-bin" 2>/dev/null || true
+        sudo pkill -f "tapauthd-gui-bin" 2>/dev/null || true
+        sleep 0.5
         
         # Ensure socket directory exists before systemd tries to create the socket
         echo "    Ensuring runtime directory at $TAPAUTHD_SOCK_DIR"
@@ -446,6 +452,8 @@ Type=simple
 User=tapauthd
 Group=tapauthd
 Sockets=tapauthd-test.socket
+ExecStartPre=$TEMP_BIN_DIR/tapauthd manage-firewall open
+ExecStopPost=$TEMP_BIN_DIR/tapauthd manage-firewall close
 ExecStart=$TEMP_BIN_DIR/tapauthd
 Restart=on-failure
 Environment="RUST_LOG=${RUST_LOG:-debug}"
@@ -455,6 +463,8 @@ NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=no
 ProtectHome=no
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
@@ -557,11 +567,12 @@ echo "  Use your paired Android device to approve the authentication."
 echo "---------------------------------------------------------------------"
 echo ""
 
-# Run pamtester with verbose output, targeting the specified user
-# Requires running the script with sudo; preserve env so PAM module sees TAPAUTHD_SOCK
-export TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH"
+# Run pamtester with verbose output, targeting the specified user.
+# sudo -E may strip custom variables like TAPAUTHD_SOCK on some distros
+# (env_reset).  Pass them explicitly via `sudo env` so they survive.
 set +e
-sudo -E RUST_LOG="debug" pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
+sudo env TAPAUTHD_SOCK="$TAPAUTHD_SOCK_PATH" RUST_LOG="debug" \
+    pamtester -v "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
 PAMTESTER_EXIT_CODE=$?
 set -e # Re-enable exit on error
 

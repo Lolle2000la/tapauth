@@ -1,6 +1,6 @@
 //! JNI object array construction helpers.
 
-use jni::objects::{JClass, JObject};
+use jni::objects::{JClass, JObject, JObjectArray};
 use jni::strings::JNIString;
 use jni::sys::jobjectArray;
 use jni::{EnvUnowned as JNIEnv, Outcome};
@@ -101,7 +101,6 @@ pub fn set_object_array_element<'local, O>(
 where
     O: AsRef<JObject<'local>>,
 {
-    use jni::objects::JObjectArray;
     let index = match usize::try_from(index) {
         Ok(index) => index,
         Err(_) => {

@@ -36,12 +36,16 @@ hex.workspace = true
 chrono.workspace = true
 libc.workspace = true
 nix.workspace = true
-local-ip-address = "0.6"
-lazy_static = "1.5"
-whoami = "2.1"
+prost.workspace = true
+bytes.workspace = true
+whoami = { workspace = true }
 native-dialog = "0.9"
 lucide-icons = "1.16"
 
 [features]
 default = []
 tpm = ["shared/tpm"]
+# dev-socket-override: enable TAPAUTHD_SOCK env var to override the default
+# IPC socket path.  For development/testing only — production builds must NOT
+# enable this feature (security: attacker-controlled socket redirection).
+dev-socket-override = []

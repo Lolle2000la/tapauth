@@ -5,13 +5,15 @@
 
 use prost::Message as ProstMessage;
 
-use crate::crypto::{sign_ed25519, verify_ed25519, Ed25519KeyPair};
+use crate::crypto::{sign_ed25519, verify_ed25519, CryptoError, Ed25519KeyPair};
 use crate::protocol::pb::*;
+
+#[cfg(debug_assertions)]
+use sha2::{Digest, Sha256};
 
 pub fn sha256_hex(data: &[u8]) -> String {
     #[cfg(debug_assertions)]
     {
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
@@ -83,10 +85,8 @@ pub fn create_auth_request(
     hostname: &str,
 ) -> Result<AuthenticationRequest, ProtocolError> {
     let mut challenge = [0u8; 32];
-    getrandom::fill(&mut challenge).map_err(|_| {
-        use crate::crypto::CryptoError;
-        ProtocolError::Crypto(CryptoError::RandomGenerationFailed)
-    })?;
+    getrandom::fill(&mut challenge)
+        .map_err(|_| ProtocolError::Crypto(CryptoError::RandomGenerationFailed))?;
 
     create_auth_request_with_challenge(username, hostname, &challenge)
 }
@@ -103,10 +103,7 @@ pub fn create_auth_request_with_challenge(
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| {
-            use crate::crypto::CryptoError;
-            ProtocolError::Crypto(CryptoError::SystemTimeError)
-        })?
+        .map_err(|_| ProtocolError::Crypto(CryptoError::SystemTimeError))?
         .as_secs();
 
     Ok(AuthenticationRequest {

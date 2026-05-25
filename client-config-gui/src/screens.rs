@@ -21,8 +21,9 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub fn default_with_l10n(l10n: L10n) -> Self {
-        Screen::MainMenu(MainMenuScreen::new(l10n))
+    pub fn default_with_l10n(l10n: L10n) -> (Self, Task<ScreenMessage>) {
+        let (screen, task) = MainMenuScreen::new(l10n);
+        (Screen::MainMenu(screen), task)
     }
 }
 
@@ -60,9 +61,12 @@ pub enum ScreenMessage {
     SaveConfig,
     ConfigSaved,
     ConfigSaveFailed(String),
+    ConfigLoaded(String, u16),
     LocaleChanged(String),
 
     // TPM Recovery
+    #[cfg(feature = "tpm")]
+    TPMStatusChecked(Option<String>),
     #[cfg(feature = "tpm")]
     RecoverFromTPMFailure,
     #[cfg(feature = "tpm")]
@@ -76,8 +80,9 @@ impl Screen {
         match message {
             // Navigation messages
             ScreenMessage::NavigateToMainMenu => {
-                *self = Screen::MainMenu(MainMenuScreen::new(l10n.clone()));
-                Task::none()
+                let (screen, task) = MainMenuScreen::new(l10n.clone());
+                *self = Screen::MainMenu(screen);
+                task
             }
             ScreenMessage::NavigateToPairing => {
                 *self = Screen::Pairing(PairingScreen::new(l10n.clone()));
@@ -92,7 +97,14 @@ impl Screen {
             }
             ScreenMessage::NavigateToSettings => {
                 *self = Screen::Settings(SettingsScreen::new(l10n.clone()));
-                Task::none()
+                Task::perform(crate::ipc::get_config(), |result| match result {
+                    Ok((hostname, port)) => ScreenMessage::ConfigLoaded(hostname, port),
+                    Err(_) => {
+                        let default_config = shared::config::ClientConfig::default();
+                        let default_toml = shared::config::TapAuthConfig::load();
+                        ScreenMessage::ConfigLoaded(default_config.hostname, default_toml.udp_port)
+                    }
+                })
             }
 
             ScreenMessage::LocaleChanged(_locale) => {

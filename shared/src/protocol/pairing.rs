@@ -44,6 +44,7 @@
 //! - All messages after SAS are authenticated via PSK encryption
 
 use prost::Message as ProstMessage;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -57,7 +58,6 @@ use crate::protocol::ProtocolError;
 fn sha256_hex(data: &[u8]) -> String {
     #[cfg(debug_assertions)]
     {
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
@@ -341,7 +341,6 @@ impl ClientPairingSession {
         let decrypted_hash = decrypt_with_psk(psk, &complete.csk_hash)?;
 
         // Compute expected hash
-        use sha2::{Digest, Sha256};
         let mut expected_hash = [0u8; 32];
         let mut hasher = Sha256::new();
         hasher.update(csk.as_bytes());
@@ -508,7 +507,6 @@ impl ServerPairingSession {
 
         // Compute SHA-256 hash of the CSK for integrity verification
         let mut csk_hash = [0u8; 32];
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(csk_bytes);
         csk_hash.copy_from_slice(&hasher.finalize());

@@ -11,6 +11,16 @@ use std::time::Duration;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
+fn socket_path() -> String {
+    #[cfg(feature = "dev-socket-override")]
+    {
+        if let Ok(override_path) = std::env::var("TAPAUTHD_SOCK") {
+            return override_path;
+        }
+    }
+    DEFAULT_SOCKET_PATH.to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     #[error("io: {0}")]
@@ -37,8 +47,7 @@ impl IpcClient {
     /// The timeout applies to connect, send, and receive operations to prevent
     /// PAM module hangs if the daemon is unresponsive.
     pub fn connect(timeout: Duration) -> Result<Self, IpcError> {
-        let sock_path =
-            std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+        let sock_path = socket_path();
 
         let stream = UnixStream::connect(&sock_path)?;
 
@@ -57,8 +66,7 @@ impl IpcClient {
     /// Connect and set nonblocking immediately (for poll/select driven loops).
     /// Does NOT set read/write timeouts since poll() handles all timing.
     pub fn connect_nonblocking() -> Result<Self, IpcError> {
-        let sock_path =
-            std::env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
+        let sock_path = socket_path();
 
         // Connect and immediately set nonblocking for poll-based I/O
         // No timeouts - poll() in pam_logic.rs handles all timing
@@ -82,8 +90,11 @@ impl IpcClient {
             reason: reason.to_string(),
             request_id: request_id.to_string(),
         };
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamCancel(req)),
+        };
 
-        self.send_message(&req)?;
+        self.send_message(&envelope)?;
         // Short read timeout for cancel acknowledgement
         self.stream
             .set_read_timeout(Some(Duration::from_millis(750)))?;
@@ -114,8 +125,11 @@ impl IpcClient {
             timeout_seconds,
             request_id: request_id.to_string(),
         };
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
+        };
 
-        self.send_message(&req)?;
+        self.send_message(&envelope)?;
         // Align with spec: wait exactly the session timeout
         self.stream
             .set_read_timeout(Some(Duration::from_secs(timeout_seconds as u64)))?;
@@ -136,7 +150,11 @@ impl IpcClient {
             timeout_seconds,
             request_id: request_id.to_string(),
         };
-        self.send_message(&req)
+        let envelope = ipc::IpcEnvelope {
+            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
+        };
+        tracing::trace!("Sending PamAuthenticateRequest [request_id={request_id}]");
+        self.send_message(&envelope)
     }
 
     /// Nonblocking attempt to read a full response frame; Ok(None) if incomplete.
@@ -204,8 +222,22 @@ impl IpcClient {
                     io::ErrorKind::InvalidData,
                     "frame too short",
                 )))?;
-                let resp = ipc::PamAuthenticateResponse::decode(data)?;
-                return Ok(Some(resp));
+                let resp = ipc::IpcEnvelope::decode(data)?;
+                match resp.msg {
+                    Some(ipc::ipc_envelope::Msg::PamResponse(response)) => {
+                        return Ok(Some(response));
+                    }
+                    other => {
+                        tracing::warn!(
+                            "Unexpected IPC message type on PAM connection: {:?}",
+                            other
+                        );
+                        return Err(IpcError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unexpected IPC message type",
+                        )));
+                    }
+                };
             }
         }
         Ok(None)
@@ -239,7 +271,15 @@ impl IpcClient {
         let mut data = vec![0u8; len as usize];
         self.stream.read_exact(&mut data)?;
 
-        Ok(ipc::PamAuthenticateResponse::decode(&data[..])?)
+        let envelope = ipc::IpcEnvelope::decode(&data[..])?;
+        if let Some(ipc::ipc_envelope::Msg::PamResponse(response)) = envelope.msg {
+            Ok(response)
+        } else {
+            Err(IpcError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Expected PamResponse in IpcEnvelope",
+            )))
+        }
     }
 }
 
