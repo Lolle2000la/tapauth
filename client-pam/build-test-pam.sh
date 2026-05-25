@@ -455,6 +455,8 @@ NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=no
 ProtectHome=no
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
