@@ -548,10 +548,10 @@ jobs:
           set -euo pipefail
           RELEASES=$(gh api "repos/${{ github.repository }}/releases" --jq '[.[] | select(.draft == false) | {tag_name, prerelease}]')
 
-          STABLE=$(echo "$RELEASES" | jq -r '[. | select(.prerelease == false)][0].tag_name // ""')
+          STABLE=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == false) | .tag_name) // ""')
           echo "stable_tag=${STABLE}" >> "$GITHUB_OUTPUT"
 
-          PREVIEW=$(echo "$RELEASES" | jq -r '[. | select(.prerelease == true)][0].tag_name // ""')
+          PREVIEW=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == true) | .tag_name) // ""')
           echo "preview_tag=${PREVIEW}" >> "$GITHUB_OUTPUT"
 
           INCLUDE_PREVIEW="false"
