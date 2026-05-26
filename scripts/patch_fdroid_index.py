@@ -47,8 +47,7 @@ def main():
         print(f"CRITICAL: Target file {index_path} was not found.")
         sys.exit(1)
 
-    owner, repo_name = repo.split("/")
-    live_index_url = f"https://{owner}.github.io/{repo_name}/fdroid/repo/index-v2.json"
+    live_index_url = "https://tapauth.rourunisen.dev/fdroid/repo/index-v2.json"
 
     old_data = fetch_live_index(live_index_url)
 
