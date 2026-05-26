@@ -102,13 +102,17 @@ def main():
     if os.path.exists(entry_path):
         with open(entry_path, "r", encoding="utf-8") as f:
             entry = json.load(f)
-        index_key = os.path.basename(index_path)
-        entry_target = entry.setdefault(index_key, {})
-        entry_target["sha256"] = new_hash
-        entry_target["size"] = new_size
+        if not isinstance(entry, dict):
+            entry = {}
+        index_target = entry.get("index")
+        if not isinstance(index_target, dict):
+            index_target = {}
+            entry["index"] = index_target
+        index_target["sha256"] = new_hash
+        index_target["size"] = new_size
         with open(entry_path, "w", encoding="utf-8") as f:
             json.dump(entry, f, indent=2)
-        print(f"Updated {entry_path} SHA-256 and size for {index_key}: {new_hash} ({new_size} bytes)")
+        print(f"Updated {entry_path} index SHA-256: {new_hash} ({new_size} bytes)")
 
     print("F-Droid tracking metadata lineage merge was successfully completed.")
 
