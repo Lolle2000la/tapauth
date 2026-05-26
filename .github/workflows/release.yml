@@ -1,8 +1,9 @@
 name: Production Release Engine
 
-on:
+"on":
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ jobs:
     name: Fedora COPR Build Delivery
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -25,8 +26,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '{tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Validate COPR Authentication Token
         run: |
@@ -64,7 +74,7 @@ jobs:
     name: Ubuntu Launchpad PPA Source Delivery
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     env:
       DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
       DEBFULLNAME: "Luca Auer"
@@ -84,8 +94,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '{tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Configure GPG Verification Keyring
         run: |
@@ -270,7 +289,7 @@ jobs:
     name: Arch User Repository (AUR) Sync
     runs-on: ubuntu-latest
     environment: release
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -278,8 +297,17 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '{tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Fetch Remote Release Tarball Checksum
         id: calc_sha
@@ -387,8 +415,15 @@ jobs:
       - name: Extract Dynamic Version Context
         id: version_vars
         run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '{tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
           echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           # Derive unique, monotonic versionCode from semver.
           # Stable releases use patch*100 + 99 (always highest).
           # Prerelease builds encode the prerelease number in the last
@@ -405,6 +440,8 @@ jobs:
             VERSION_CODE=$((BASE + 99))
           fi
           echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Install Rust toolchain with Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -473,7 +510,7 @@ jobs:
           fi
           APK_NAME="tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk"
           cp "$APK_PATH" "$APK_NAME"
-          gh release upload "${{ github.ref_name }}" "$APK_NAME" --repo "${{ github.repository }}"
+          gh release upload "${{ steps.version_vars.outputs.TAG_NAME }}" "$APK_NAME" --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ github.token }}
 
