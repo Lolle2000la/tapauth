@@ -545,7 +545,7 @@ jobs:
 
       # Package the compiled workspace into a compressed system artifact
       - name: Upload Static Web Site Artifacts
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: ./dist
 
