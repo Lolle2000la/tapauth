@@ -102,7 +102,12 @@ def main():
     if os.path.exists(entry_path):
         with open(entry_path, "r", encoding="utf-8") as f:
             entry = json.load(f)
-        index_target = entry.setdefault("index", {})
+        if not isinstance(entry, dict):
+            entry = {}
+        index_target = entry.get("index")
+        if not isinstance(index_target, dict):
+            index_target = {}
+            entry["index"] = index_target
         index_target["sha256"] = new_hash
         index_target["size"] = new_size
         with open(entry_path, "w", encoding="utf-8") as f:
