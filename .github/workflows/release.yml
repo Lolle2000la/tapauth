@@ -515,7 +515,7 @@ jobs:
         run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
 
       - name: Construct Base Unsigned Metadata Indexes
-        run: fdroid update --nosign
+        run: fdroid update --nosign --create-metadata
         working-directory: fdroid
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
