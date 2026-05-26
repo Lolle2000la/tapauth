@@ -482,24 +482,20 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     needs: [release-android-apk]
-    # Explicitly grant cryptographic scopes required for direct token-based Pages streaming
     permissions:
-      contents: read # To allow checking out the source tree
-      pages: write # To allow streaming assets to the Pages API
-      id-token: write # To allow secure OIDC cryptographic token exchange
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
 
-      - name: Extract Dynamic Version Context
-        id: version_vars
-        run: |
-          CLEAN_VER="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
-
       - name: Patch F-Droid Repository URL to Custom Domain
         run: |
           sed -i "s|^repo_url:.*|repo_url: https://tapauth.rourunisen.dev/fdroid/repo|" fdroid/config.yml
+
+      - name: Setup Android SDK (provides apksigner for repo signing)
+        uses: android-actions/setup-android@v4
 
       - name: Set up Python Environment
         uses: actions/setup-python@v6
@@ -509,17 +505,61 @@ jobs:
       - name: Initialize F-Droid Server CLI Tooling
         run: pip install fdroidserver
 
-      - name: Fetch Published Release APK from GitHub Releases
+      - name: Determine Releases to Include
+        id: select_releases
+        run: |
+          set -euo pipefail
+          RELEASES=$(gh api "repos/${{ github.repository }}/releases" --jq '[.[] | select(.draft == false) | {tag_name, prerelease}]')
+
+          STABLE=$(echo "$RELEASES" | jq -r '[. | select(.prerelease == false)][0].tag_name // ""')
+          echo "stable_tag=${STABLE}" >> "$GITHUB_OUTPUT"
+
+          PREVIEW=$(echo "$RELEASES" | jq -r '[. | select(.prerelease == true)][0].tag_name // ""')
+          echo "preview_tag=${PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          INCLUDE_PREVIEW="false"
+          if [ -n "${PREVIEW}" ]; then
+            if [ -z "${STABLE}" ]; then
+              INCLUDE_PREVIEW="true"
+            else
+              STABLE_VER="${STABLE#v}"
+              PREVIEW_VER="${PREVIEW#v}"
+              HIGHER=$(printf '%s\n%s\n' "${STABLE_VER}" "${PREVIEW_VER}" | sort -V | tail -1)
+              if [ "${HIGHER}" = "${PREVIEW_VER}" ]; then
+                INCLUDE_PREVIEW="true"
+              fi
+            fi
+          fi
+          echo "include_preview=${INCLUDE_PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          echo "Stable: ${STABLE:-none}, Preview: ${PREVIEW:-none}, IncludePreview: ${INCLUDE_PREVIEW}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch Selected Release APKs
         run: |
           mkdir -p fdroid/repo
-          gh release download "${{ github.ref_name }}" --pattern "tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk" --dir fdroid/repo
+
+          STABLE_TAG="${{ steps.select_releases.outputs.stable_tag }}"
+          if [ -n "${STABLE_TAG}" ]; then
+            STABLE_VER="${STABLE_TAG#v}"
+            gh release download "${STABLE_TAG}" --pattern "tapauth-v${STABLE_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded stable APK: ${STABLE_TAG}"
+          fi
+
+          if [ "${{ steps.select_releases.outputs.include_preview }}" = "true" ]; then
+            PREVIEW_TAG="${{ steps.select_releases.outputs.preview_tag }}"
+            PREVIEW_VER="${PREVIEW_TAG#v}"
+            gh release download "${PREVIEW_TAG}" --pattern "tapauth-v${PREVIEW_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded preview APK: ${PREVIEW_TAG}"
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Decode F-Droid Repository Signing Keystore
         run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
 
-      - name: Construct Base Unsigned Metadata Indexes
+      - name: Construct Unsigned Metadata Indexes
         run: fdroid update --nosign --create-metadata
         working-directory: fdroid
         env:
@@ -527,13 +567,7 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
 
-      - name: Execute Absolute Path Asset Redirection Patching
-        run: python scripts/patch_fdroid_index.py
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-
-      - name: Cryptographically Sign Patched F-Droid Repository Entry Points
+      - name: Cryptographically Sign F-Droid Repository Entry Points
         run: fdroid signindex
         working-directory: fdroid
         env:
@@ -541,20 +575,16 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
 
-      - name: Assemble Minimal Clean Static Pages Workspace
+      - name: Assemble Static Pages Workspace
         run: |
           mkdir -p dist/fdroid/repo
-          cp fdroid/repo/entry.* dist/fdroid/repo/
-          cp fdroid/repo/index-* dist/fdroid/repo/
-          if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
+          cp -r fdroid/repo/* dist/fdroid/repo/
 
-      # Package the compiled workspace into a compressed system artifact
       - name: Upload Static Web Site Artifacts
         uses: actions/upload-pages-artifact@v5
         with:
           path: ./dist
 
-      # Stream the compressed artifact straight onto the GitHub Pages production CDN
       - name: Deploy Artifact Directly to GitHub Pages Hosted Edge
         id: deployment
         uses: actions/deploy-pages@v5
