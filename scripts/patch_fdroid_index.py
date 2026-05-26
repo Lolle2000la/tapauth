@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -91,6 +92,19 @@ def main():
 
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index_data, f, indent=2)
+
+    with open(index_path, "rb") as f:
+        new_hash = hashlib.sha256(f.read()).hexdigest()
+
+    entry_path = "fdroid/repo/entry.json"
+    if os.path.exists(entry_path):
+        with open(entry_path, "r", encoding="utf-8") as f:
+            entry = json.load(f)
+        index_key = os.path.basename(index_path)
+        entry.setdefault(index_key, {})["sha256"] = new_hash
+        with open(entry_path, "w", encoding="utf-8") as f:
+            json.dump(entry, f, indent=2)
+        print(f"Updated {entry_path} SHA-256 for {index_key}: {new_hash}")
 
     print("F-Droid tracking metadata lineage merge was successfully completed.")
 
