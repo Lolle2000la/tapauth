@@ -476,7 +476,12 @@ jobs:
     name: F-Droid Custom Repository Delivery
     runs-on: ubuntu-latest
     environment: release
-    needs: [ release-android-apk ]
+    needs: [release-android-apk]
+    # Explicitly grant cryptographic scopes required for direct token-based Pages streaming
+    permissions:
+      contents: read # To allow checking out the source tree
+      pages: write # To allow streaming assets to the Pages API
+      id-token: write # To allow secure OIDC cryptographic token exchange
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
@@ -494,7 +499,7 @@ jobs:
       - name: Set up Python Environment
         uses: actions/setup-python@v6
         with:
-          python-version: '3.14'
+          python-version: "3.14"
 
       - name: Initialize F-Droid Server CLI Tooling
         run: pip install fdroidserver
@@ -538,10 +543,13 @@ jobs:
           cp fdroid/repo/index-* dist/fdroid/repo/
           if [ -d fdroid/repo/icons ]; then cp -r fdroid/repo/icons dist/fdroid/repo/; fi
 
-      - name: Deploy Lightweight Metadata Directly to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      # Package the compiled workspace into a compressed system artifact
+      - name: Upload Static Web Site Artifacts
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
-          keep_files: false
-          cname: tapauth.rourunisen.dev
+          path: ./dist
+
+      # Stream the compressed artifact straight onto the GitHub Pages production CDN
+      - name: Deploy Artifact Directly to GitHub Pages Hosted Edge
+        id: deployment
+        uses: actions/deploy-pages@v4
