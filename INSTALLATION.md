@@ -39,7 +39,7 @@ auth      sufficient      pam_tapauth.so
 ```
 
 ### 4. Android (via F-Droid)
-A custom, unified F-Droid repository delivers the TapAuth Android companion app and tracking channels without requiring any third-party app store account.
+A custom, unified F-Droid repository delivers the TapAuth Android companion app and update channels without requiring any third-party app store account.
 
 **Add the repository to F-Droid:**
 1. Install [F-Droid](https://f-droid.org/) on your Android device.
@@ -51,7 +51,7 @@ A custom, unified F-Droid repository delivers the TapAuth Android companion app 
 4. Tap **Add**, then refresh the repository list (pull down or use the refresh button).
 5. Search for **TapAuth** and install.
 
-Updates and pre-release testing tracks are delivered automatically through this same repository endpoint. If you wish to receive alpha or beta builds, ensure "Include unstable/beta versions" is toggled on within your F-Droid client app settings.
+Updates and pre-release testing tracks are delivered automatically through this same repository endpoint. If you wish to receive alpha or beta builds, ensure "Show unstable versions" is toggled on within your F-Droid client app settings.
 
 ## Supported Distributions
 
