@@ -1437,6 +1437,14 @@ install_config_gui() {
         cp tapauthd/dev.rourunisen.tapauth.config.admin.policy "$CONFIG_POLICY_PATH"
         chmod 644 "$CONFIG_POLICY_PATH"
     fi
+
+    # Install polkit authorization rules for firewalld
+    if [[ -d /usr/share/polkit-1/rules.d ]]; then
+        print_info "Installing polkit firewalld authorization rules"
+        cp packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
+        chmod 644 /usr/share/polkit-1/rules.d/50-tapauthd.rules
+        chown root:root /usr/share/polkit-1/rules.d/50-tapauthd.rules
+    fi
     
     print_success "Configuration GUI installed"
 }

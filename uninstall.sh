@@ -551,6 +551,13 @@ remove_config_gui() {
         print_info "Removing polkit policy"
         rm -f "$CONFIG_POLICY_PATH"
     fi
+
+    # Remove polkit firewalld authorization rules
+    local rules_file="/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+    if [[ -f "$rules_file" ]]; then
+        print_info "Removing polkit firewalld authorization rules"
+        rm -f "$rules_file"
+    fi
     
     print_success "Configuration GUI removed"
 }
