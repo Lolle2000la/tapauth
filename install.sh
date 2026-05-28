@@ -801,8 +801,7 @@ install_daemon() {
         show_file_copy "$daemon_src" "$daemon_dest"
         show_command "chmod 755 $daemon_dest" "Set daemon executable permissions"
         if [[ -d /usr/share/polkit-1/rules.d ]]; then
-            show_file_copy "packaging/50-tapauthd.rules" "/usr/share/polkit-1/rules.d/50-tapauthd.rules"
-            show_command "chmod 644 /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Set polkit rules permissions"
+            show_command "install -m 0644 packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Install polkit rules"
             if command -v restorecon &> /dev/null; then
                 show_command "restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Restore SELinux context"
             fi
@@ -827,8 +826,7 @@ install_daemon() {
     # Install polkit authorization rules for firewalld
     if [[ -d /usr/share/polkit-1/rules.d ]]; then
         print_info "Installing polkit firewalld authorization rules"
-        cp packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
-        chmod 644 /usr/share/polkit-1/rules.d/50-tapauthd.rules
+        install -m 0644 packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
         if command -v restorecon &> /dev/null; then
             restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules || true
         fi

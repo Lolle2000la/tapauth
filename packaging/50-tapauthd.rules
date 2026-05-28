@@ -1,6 +1,5 @@
 polkit.addRule(function(action, subject) {
-    if ((action.id === "org.fedoraproject.FirewallD1.config" ||
-         action.id === "org.fedoraproject.FirewallD1.all") &&
+    if (action.id === "org.fedoraproject.FirewallD1.all" &&
         subject.user === "tapauthd") {
         return polkit.Result.YES;
     }
