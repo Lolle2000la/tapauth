@@ -143,7 +143,9 @@ jobs:
 
           Package: tapauth
           Architecture: any
-          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
+          Recommends: firewalld
+          Suggests: iptables
           Description: Local smartphone-based authentication framework
            A modern, privacy-preserving local-first authentication system
            using Rust PAM modules, systemd system daemons, and low-level

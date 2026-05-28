@@ -28,6 +28,9 @@ Requires(postun): systemd
 Requires:       pam
 Requires:       dbus-libs
 Requires:       systemd-libs
+Requires:       polkit
+Recommends:     firewalld
+Suggests:       iptables
 
 %description
 A modern, privacy-preserving local-first authentication system using Rust PAM modules,
