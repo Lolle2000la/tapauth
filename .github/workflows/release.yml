@@ -346,9 +346,9 @@ jobs:
           license=('Apache-2.0')
           depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
-           backup=('etc/tapauth/config.toml')
-           install=tapauth.install
-           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
+          backup=('etc/tapauth/config.toml')
+          install=tapauth.install
+          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
           prepare() {
