@@ -140,10 +140,14 @@ impl DaemonState {
             }
         };
 
-        let csk = self.config_manager.load_csk().ok().or_else(|| {
-            tracing::error!("Failed to reload CSK, keeping existing value");
-            self.csk.clone()
-        });
+        let csk = self
+            .config_manager
+            .load_csk()
+            .map(Some)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to reload CSK: {}, keeping existing value", e);
+                self.csk.clone()
+            });
 
         let paired_servers = self
             .config_manager
