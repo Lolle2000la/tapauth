@@ -492,8 +492,13 @@ If you encounter issues:
 ### Socket access policy
 
 The IPC socket `/run/tapauthd/tapauthd.sock` is created as `root:tapauthd-clients` with mode `0660`.
-- The installer creates the group `tapauthd-clients` but does not add any users to it by default.
-- System services with dedicated users can be added to this group manually if they need non-root access to the socket.
+- The installer creates the group `tapauthd-clients` and automatically adds the installing user to it.
+- A logout/login cycle is required for the new group membership to take effect.
+- If you need to grant access to additional users, add them manually:
+  ```bash
+  sudo usermod -aG tapauthd-clients $USER
+  ```
+- System services with dedicated users can be added to this group if they need non-root access to the socket.
 
 ## License
 

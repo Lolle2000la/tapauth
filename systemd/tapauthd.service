@@ -11,12 +11,13 @@ User=tapauthd
 Group=tapauthd
 # Socket activation handed via tapauthd.socket
 Sockets=tapauthd.socket
-# Manage firewall rules as root before/after the service runs
-ExecStartPre=+/usr/bin/tapauthd manage-firewall open
-ExecStopPost=+/usr/bin/tapauthd manage-firewall close
+# Manage firewall rules before/after the service runs (uses ambient CAP_NET_ADMIN)
+ExecStartPre=/usr/bin/tapauthd manage-firewall open
+ExecStopPost=/usr/bin/tapauthd manage-firewall close
 ExecStart=/usr/bin/tapauthd
 Restart=on-failure
 StateDirectory=tapauth
+LogsDirectory=tapauth
 
 # Hardening (adjust as needed if daemon requires more access)
 NoNewPrivileges=yes

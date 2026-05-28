@@ -673,7 +673,7 @@ create_system_users() {
     fi
 
     if [[ -n "$install_user" ]]; then
-        if ! groups "$install_user" | grep -q tapauthd-clients; then
+        if ! id -nG "$install_user" | grep -qw tapauthd-clients; then
             print_info "Adding user '$install_user' to group 'tapauthd-clients'"
             usermod -aG tapauthd-clients "$install_user"
             print_warning "You will need to log out and back in for group membership to take effect"

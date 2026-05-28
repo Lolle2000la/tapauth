@@ -11,7 +11,7 @@ SocketMode=0660
 DirectoryMode=0750
 RemoveOnStop=yes
 # Fix directory group ownership after creation
-ExecStartPost=/bin/chgrp tapauthd-clients /run/tapauthd
+ExecStartPost=/usr/bin/chgrp tapauthd-clients /run/tapauthd
 
 [Install]
 WantedBy=sockets.target

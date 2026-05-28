@@ -34,6 +34,17 @@ mkdir -p "$CONFIG_DIR"
 chown -R tapauthd:tapauthd "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
+# Add the calling user to tapauthd-clients group if running via sudo
+if [[ -n "$SUDO_USER" ]]; then
+    if ! id -nG "$SUDO_USER" | grep -qw tapauthd-clients; then
+        echo "  Adding user '$SUDO_USER' to group 'tapauthd-clients'"
+        usermod -aG tapauthd-clients "$SUDO_USER"
+        echo "  Note: You will need to log out and back in for group membership to take effect"
+    else
+        echo "  User '$SUDO_USER' is already a member of 'tapauthd-clients'"
+    fi
+fi
+
 echo ""
 echo "Done! You can now run the GUI for pairing."
 echo ""
