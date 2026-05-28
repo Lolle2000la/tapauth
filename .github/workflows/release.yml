@@ -346,8 +346,9 @@ jobs:
           license=('Apache-2.0')
           depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
-          backup=('etc/tapauth/config.toml')
-          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
+           backup=('etc/tapauth/config.toml')
+           install=tapauth.install
+           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
           prepare() {
@@ -381,6 +382,27 @@ jobs:
           }
           EOF
 
+          cat > tapauth.install <<EOF
+          post_install() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl enable --now tapauthd.socket
+          }
+
+          post_upgrade() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl reenable tapauthd.socket
+            systemctl restart tapauthd.socket
+          }
+
+          pre_remove() {
+            systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
+          }
+          EOF
+
           cat > .SRCINFO <<EOF
           pkgbase = tapauth
           	pkgdesc = Local smartphone-based authentication framework engine
@@ -390,6 +412,7 @@ jobs:
           	arch = x86_64
           	arch = aarch64
           	license = Apache-2.0
+          	install = tapauth.install
           	makedepends = cargo
           	makedepends = rust
           	makedepends = protobuf
@@ -401,7 +424,7 @@ jobs:
           pkgname = tapauth
           EOF
 
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO tapauth.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master
 
