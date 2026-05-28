@@ -126,9 +126,7 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                "iptables binary not found; skipping automated port cleanup"
-            );
+            tracing::warn!("iptables binary not found; skipping automated port cleanup");
             Ok(())
         }
         Err(e) => Err(format!("Failed to execute iptables -D: {}", e)),
