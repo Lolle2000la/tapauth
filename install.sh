@@ -1400,6 +1400,13 @@ install_config_gui() {
         else
             echo -e "${YELLOW}[SKIP]${NC} Polkit policy (directory doesn't exist)"
         fi
+
+        if [[ -d /usr/share/polkit-1/rules.d ]]; then
+            show_file_copy "packaging/50-tapauthd.rules" "/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+            show_command "chmod 644 /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Set polkit rules permissions"
+        else
+            echo -e "${YELLOW}[SKIP]${NC} Polkit rules (directory doesn't exist)"
+        fi
         return
     fi
     

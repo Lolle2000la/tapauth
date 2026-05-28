@@ -525,6 +525,7 @@ remove_config_gui() {
         show_file_removal "$CONFIG_ICON_PATH" "Desktop icon"
         show_file_removal "$CONFIG_DESKTOP_PATH" "Desktop entry"
         show_file_removal "$CONFIG_POLICY_PATH" "Polkit policy"
+        show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         return
     fi
     
