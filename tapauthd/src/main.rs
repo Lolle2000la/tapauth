@@ -105,9 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
                     {
                         eprintln!("Failed to open firewall: {}", e);
-                        std::process::exit(1);
+                        return Err(e.into());
                     }
-                    std::process::exit(0);
+                    return Ok(());
                 }
                 FirewallAction::Close => {
                     eprintln!("Closing firewall port {}/udp", udp_port);
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Failed to close firewall: {}", e);
                         // Don't exit with error on close failure to avoid service failure state
                     }
-                    std::process::exit(0);
+                    return Ok(());
                 }
             }
         }
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let _ = action;
             eprintln!("Firewall feature not enabled, ignoring request");
-            std::process::exit(0);
+            return Ok(());
         }
     }
 

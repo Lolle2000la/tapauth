@@ -229,7 +229,23 @@ impl AuthSession {
         request_id: Option<String>,
         cancel_registry: CancelRegistry,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
-        // Check if daemon is in degraded state (TPM key load failure)
+        // Record cancel context for targeted cancellation
+        self.request_id = request_id;
+        self.cancel_registry = Some(cancel_registry);
+        // Check if we have any paired devices first — if not, return Ignore
+        // silently so PAM falls through to other methods without noisy errors.
+        let paired_servers = self.state.paired_servers.clone();
+        if paired_servers.is_empty() {
+            return Ok(ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Ignore as i32,
+                detail: "No paired devices configured".to_string(),
+                challenge: self.challenge.to_vec(),
+            });
+        }
+
+        // Only check if daemon is unhealthy when paired devices exist.
+        // On a fresh install with no keys, paired_servers is also empty,
+        // so we never reach this point to pollute logs with Error outcomes.
         if !self.state.is_healthy() {
             let error_detail = self
                 .state
@@ -239,20 +255,6 @@ impl AuthSession {
             return Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Error as i32,
                 detail: error_detail.to_string(),
-                challenge: self.challenge.to_vec(),
-            });
-        }
-
-        // Record cancel context for targeted cancellation
-        self.request_id = request_id;
-        self.cancel_registry = Some(cancel_registry);
-        // Check if we have any paired devices
-        let paired_servers = self.state.paired_servers.clone();
-        if paired_servers.is_empty() {
-            // No configuration/pairings yet: do not block other PAM methods
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: "No paired devices configured".to_string(),
                 challenge: self.challenge.to_vec(),
             });
         }
