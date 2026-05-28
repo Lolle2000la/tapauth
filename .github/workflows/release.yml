@@ -183,6 +183,7 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/applications
           	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
           	mkdir -p debian/tapauth/usr/share/polkit-1/actions
+          	mkdir -p debian/tapauth/etc/tapauth
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
           	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
@@ -343,6 +344,7 @@ jobs:
           license=('Apache-2.0')
           depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
+          backup=('etc/tapauth/config.toml')
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
@@ -361,6 +363,7 @@ jobs:
 
           package() {
             cd "\$srcdir/\$pkgname-\$pkgver"
+            install -dm0755 "\$pkgdir/etc/tapauth"
             install -Dm0755 target/release/tapauthd "\$pkgdir/usr/bin/tapauthd"
             install -Dm0755 target/release/tapauth-config "\$pkgdir/usr/bin/tapauth-config"
             install -Dm0755 target/release/libclient_pam.so "\$pkgdir/usr/lib/security/pam_tapauth.so"
