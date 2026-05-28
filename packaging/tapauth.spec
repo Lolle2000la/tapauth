@@ -49,6 +49,7 @@ mkdir -p %{buildroot}%{_datadir}/doc/tapauth
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
+mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
@@ -80,6 +81,7 @@ install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}
 
 %files
 %license LICENSE
+%dir %{_sysconfdir}/tapauth
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_libdir}/security/pam_tapauth.so
