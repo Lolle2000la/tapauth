@@ -89,11 +89,9 @@ struct ServerState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    logging::init_logging();
-
     let args = Args::parse();
 
-    // Handle subcommands
+    // Handle subcommands — log only to stderr to avoid log-file ownership issues
     if let Some(Commands::ManageFirewall { action }) = args.command {
         #[cfg(feature = "firewall")]
         {
@@ -102,21 +100,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match action {
                 FirewallAction::Open => {
-                    tracing::info!("Opening firewall port {}/udp", udp_port);
+                    eprintln!("Opening firewall port {}/udp", udp_port);
                     if let Err(e) =
                         shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
                     {
-                        tracing::error!("Failed to open firewall: {}", e);
+                        eprintln!("Failed to open firewall: {}", e);
                         std::process::exit(1);
                     }
                     std::process::exit(0);
                 }
                 FirewallAction::Close => {
-                    tracing::info!("Closing firewall port {}/udp", udp_port);
+                    eprintln!("Closing firewall port {}/udp", udp_port);
                     if let Err(e) =
                         shared::firewall::close_port(udp_port, shared::firewall::Protocol::Udp)
                     {
-                        tracing::error!("Failed to close firewall: {}", e);
+                        eprintln!("Failed to close firewall: {}", e);
                         // Don't exit with error on close failure to avoid service failure state
                     }
                     std::process::exit(0);
@@ -126,11 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(not(feature = "firewall"))]
         {
-            let _ = action; // Suppress unused warning
-            tracing::warn!("Firewall feature not enabled, ignoring request");
+            let _ = action;
+            eprintln!("Firewall feature not enabled, ignoring request");
             std::process::exit(0);
         }
     }
+
+    logging::init_logging();
 
     tracing::info!("tapauthd starting...");
 

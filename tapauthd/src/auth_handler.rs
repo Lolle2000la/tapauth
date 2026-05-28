@@ -68,7 +68,7 @@ pub struct DaemonState {
     pub config_manager: Arc<ClientConfigManager>,
     pub paired_servers: Arc<HashMap<String, PairedServer>>,
     pub keypair: Option<Ed25519KeyPair>, // None if TPM unsealing failed
-    pub csk: ClientSymmetricKey,
+    pub csk: Option<ClientSymmetricKey>,
     pub hostname: String,
     pub udp_socket: Arc<tokio::net::UdpSocket>,
     pub init_error: Option<String>, // Stores TPM or other initialization errors
@@ -88,9 +88,21 @@ impl DaemonState {
             }
         };
 
-        let csk = config_manager
-            .load_csk()
-            .map_err(AuthHandlerError::Config)?;
+        let (csk, init_error) = match config_manager.load_csk() {
+            Ok(csk) => (Some(csk), init_error),
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to load CSK: {}. Please open tapauth-config GUI to configure keys.",
+                    e
+                );
+                tracing::error!("{}", error_msg);
+                let combined = match init_error {
+                    Some(prev) => Some(format!("{}; {}", prev, error_msg)),
+                    None => Some(error_msg),
+                };
+                (None, combined)
+            }
+        };
 
         let paired_servers = Arc::new(config_manager.load_paired_servers()?);
 
@@ -108,9 +120,8 @@ impl DaemonState {
         })
     }
 
-    /// Check if daemon is in a healthy state (has valid keypair)
     pub fn is_healthy(&self) -> bool {
-        self.keypair.is_some()
+        self.keypair.is_some() && self.csk.is_some()
     }
 
     /// Get error message for degraded state
@@ -129,8 +140,8 @@ impl DaemonState {
             }
         };
 
-        let csk = self.config_manager.load_csk().unwrap_or_else(|e| {
-            tracing::error!("Failed to reload CSK: {}", e);
+        let csk = self.config_manager.load_csk().ok().or_else(|| {
+            tracing::error!("Failed to reload CSK, keeping existing value");
             self.csk.clone()
         });
 
@@ -150,13 +161,20 @@ impl DaemonState {
             }
         });
 
-        let init_error = if keypair.is_some() {
+        let init_error = if keypair.is_some() && csk.is_some() {
             None
         } else {
-            Some(
-                "Keypair unavailable after reload. Use tapauth-config to regenerate keys."
-                    .to_string(),
-            )
+            let mut missing = Vec::new();
+            if keypair.is_none() {
+                missing.push("Keypair");
+            }
+            if csk.is_none() {
+                missing.push("CSK");
+            }
+            Some(format!(
+                "{} unavailable after reload. Use tapauth-config to regenerate keys.",
+                missing.join(" and ")
+            ))
         };
 
         Arc::new(DaemonState {
@@ -270,7 +288,13 @@ impl AuthSession {
             .as_ref()
             .unwrap_or_else(|| unreachable!("keypair checked in health check"));
         sign_wrapper_message(&mut wrapper, keypair)?;
-        let packet = create_encrypted_packet_with_csk_nonce(&self.state.csk, &wrapper)?;
+        let packet = create_encrypted_packet_with_csk_nonce(
+            self.state
+                .csk
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("csk checked in health check")),
+            &wrapper,
+        )?;
 
         // Run authentication with timeout
         let timeout_duration = Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
@@ -329,7 +353,12 @@ impl AuthSession {
         &mut self,
         packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
-        let temporal_id = generate_current_temporal_identifier_ble(&self.state.csk)?;
+        let temporal_id = generate_current_temporal_identifier_ble(
+            self.state
+                .csk
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("csk checked in health check")),
+        )?;
         let timeout = get_session_timeout();
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
@@ -390,7 +419,11 @@ impl AuthSession {
                 .unwrap_or_else(|| unreachable!("keypair checked in health check"))
                 .clone(),
         );
-        let csk = self.state.csk.clone();
+        let csk = self
+            .state
+            .csk
+            .clone()
+            .unwrap_or_else(|| unreachable!("csk checked in health check"));
         let challenge = self.challenge;
 
         let ble_transport =
@@ -426,7 +459,10 @@ impl AuthSession {
             .unwrap_or_else(|| unreachable!("keypair checked in health check"));
         sign_wrapper_message(&mut wrapper, keypair)?;
         Ok(create_encrypted_packet_with_csk_nonce(
-            &self.state.csk,
+            self.state
+                .csk
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("csk checked in health check")),
             &wrapper,
         )?)
     }
@@ -440,7 +476,11 @@ impl AuthSession {
     ) -> TransportHandles {
         let ble_handle = if let Some(ble) = ble_transport.clone() {
             let packet = packet.clone();
-            let csk = self.state.csk.clone();
+            let csk = self
+                .state
+                .csk
+                .clone()
+                .unwrap_or_else(|| unreachable!("csk checked in health check"));
             // Safety: keypair is Some after health check in handle_authenticate
             let keypair = self
                 .state
@@ -460,7 +500,11 @@ impl AuthSession {
 
         let udp_handle = {
             let packet = packet.clone();
-            let csk = self.state.csk.clone();
+            let csk = self
+                .state
+                .csk
+                .clone()
+                .unwrap_or_else(|| unreachable!("csk checked in health check"));
             // Safety: keypair is Some after health check in handle_authenticate
             let keypair = self
                 .state
@@ -733,11 +777,16 @@ impl AuthSession {
             .state
             .keypair
             .as_ref()
-            .expect("keypair checked in health check");
+            .unwrap_or_else(|| unreachable!("keypair checked in health check"));
+        let csk = self
+            .state
+            .csk
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("csk checked in health check"));
         Self::authenticate_with_transport(
             transport_arc,
             packet,
-            &self.state.csk,
+            csk,
             keypair,
             &self.challenge,
             servers,
