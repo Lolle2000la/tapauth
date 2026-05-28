@@ -28,6 +28,9 @@ Requires(postun): systemd
 Requires:       pam
 Requires:       dbus-libs
 Requires:       systemd-libs
+Requires:       polkit
+Recommends:     firewalld
+Suggests:       iptables
 
 %description
 A modern, privacy-preserving local-first authentication system using Rust PAM modules,
@@ -49,6 +52,7 @@ mkdir -p %{buildroot}%{_datadir}/doc/tapauth
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
+mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
@@ -67,6 +71,7 @@ install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth
 install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}/applications/tapauth-config.desktop
 install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
+install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -93,3 +98,4 @@ install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}
 %{_datadir}/applications/tapauth-config.desktop
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
+%{_datadir}/polkit-1/rules.d/50-tapauthd.rules

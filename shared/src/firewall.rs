@@ -49,7 +49,7 @@ pub fn open_port(port: u16, protocol: Protocol) -> Result<(), String> {
     }
 
     // Fallback to iptables
-    let status = Command::new("iptables")
+    let result = Command::new("iptables")
         .args([
             "-I",
             "INPUT",
@@ -61,18 +61,25 @@ pub fn open_port(port: u16, protocol: Protocol) -> Result<(), String> {
             "-j",
             "ACCEPT",
         ])
-        .status()
-        .map_err(|e| format!("Failed to execute iptables: {}", e))?;
+        .status();
 
-    if status.success() {
-        tracing::info!(
-            "Firewall (iptables): Opened ephemeral port {}/{}",
-            port,
-            protocol
-        );
-        Ok(())
-    } else {
-        Err(format!("Firewall command failed with status: {}", status))
+    match result {
+        Ok(status) if status.success() => {
+            tracing::info!(
+                "Firewall (iptables): Opened ephemeral port {}/{}",
+                port,
+                protocol
+            );
+            Ok(())
+        }
+        Ok(status) => Err(format!("iptables command failed with status: {}", status)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "Neither firewalld nor iptables found on host; skipping automated port allocation"
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to execute iptables: {}", e)),
     }
 }
 
@@ -93,7 +100,7 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
         return Ok(());
     }
 
-    let status = Command::new("iptables")
+    let result = Command::new("iptables")
         .args([
             "-D",
             "INPUT",
@@ -104,19 +111,26 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
             "-j",
             "ACCEPT",
         ])
-        .status()
-        .map_err(|e| format!("Failed to execute iptables -D: {}", e))?;
+        .status();
 
-    if !status.success() {
-        return Err(format!("iptables -D failed with exit status: {}", status));
+    match result {
+        Ok(status) if !status.success() => {
+            Err(format!("iptables -D failed with exit status: {}", status))
+        }
+        Ok(_) => {
+            tracing::info!(
+                "Firewall (iptables): Closed ephemeral port {}/{}",
+                port,
+                protocol
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!("iptables binary not found; skipping automated port cleanup");
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to execute iptables -D: {}", e)),
     }
-
-    tracing::info!(
-        "Firewall (iptables): Closed ephemeral port {}/{}",
-        port,
-        protocol
-    );
-    Ok(())
 }
 
 fn is_firewalld_running() -> bool {

@@ -1,0 +1,6 @@
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.fedoraproject.FirewallD1.all" &&
+        subject.user === "tapauthd") {
+        return polkit.Result.YES;
+    }
+});

@@ -143,7 +143,9 @@ jobs:
 
           Package: tapauth
           Architecture: any
-          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
+          Recommends: firewalld
+          Suggests: iptables
           Description: Local smartphone-based authentication framework
            A modern, privacy-preserving local-first authentication system
            using Rust PAM modules, systemd system daemons, and low-level
@@ -183,6 +185,7 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/applications
           	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
           	mkdir -p debian/tapauth/usr/share/polkit-1/actions
+          	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
           	mkdir -p debian/tapauth/etc/tapauth
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
@@ -195,6 +198,7 @@ jobs:
           	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
           	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
           	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
+          	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
           EOF
           chmod +x debian/rules
 
@@ -345,6 +349,7 @@ jobs:
           depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
           backup=('etc/tapauth/config.toml')
+          install=tapauth.install
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
@@ -374,7 +379,29 @@ jobs:
             install -Dm0644 client-config-gui/tapauth-config.desktop "\$pkgdir/usr/share/applications/tapauth-config.desktop"
             install -Dm0644 client-config-gui/assets/tapauth-config.svg "\$pkgdir/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
             install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
+            install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+          EOF
+
+          cat > tapauth.install <<EOF
+          post_install() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl enable --now tapauthd.socket
+          }
+
+          post_upgrade() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl reenable tapauthd.socket
+            systemctl restart tapauthd.socket
+          }
+
+          pre_remove() {
+            systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
           }
           EOF
 
@@ -387,6 +414,7 @@ jobs:
           	arch = x86_64
           	arch = aarch64
           	license = Apache-2.0
+          	install = tapauth.install
           	makedepends = cargo
           	makedepends = rust
           	makedepends = protobuf
@@ -398,7 +426,7 @@ jobs:
           pkgname = tapauth
           EOF
 
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO tapauth.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master
 

@@ -800,6 +800,12 @@ install_daemon() {
         print_info "[DRY RUN] Would install daemon binary"
         show_file_copy "$daemon_src" "$daemon_dest"
         show_command "chmod 755 $daemon_dest" "Set daemon executable permissions"
+        if [[ -d /usr/share/polkit-1/rules.d ]]; then
+            show_command "install -m 0644 packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Install polkit rules"
+            if command -v restorecon &> /dev/null; then
+                show_command "restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Restore SELinux context"
+            fi
+        fi
         return
     fi
 
@@ -815,6 +821,15 @@ install_daemon() {
     # Restore SELinux context if available
     if command -v restorecon &> /dev/null; then
         restorecon "$daemon_dest" || true
+    fi
+
+    # Install polkit authorization rules for firewalld
+    if [[ -d /usr/share/polkit-1/rules.d ]]; then
+        print_info "Installing polkit firewalld authorization rules"
+        install -m 0644 packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
+        if command -v restorecon &> /dev/null; then
+            restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules || true
+        fi
     fi
 }
 

@@ -167,6 +167,7 @@ remove_systemd_units_and_daemon() {
         show_command "systemctl daemon-reload" "Reload systemd units"
         show_file_removal "$DAEMON_PATH" "TapAuth daemon binary"
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
+        show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         return
     fi
 
@@ -193,6 +194,13 @@ remove_systemd_units_and_daemon() {
     # Clean up stale socket if any
     if [[ -S "/run/tapauthd/tapauthd.sock" ]]; then
         rm -f /run/tapauthd/tapauthd.sock || true
+    fi
+
+    # Remove polkit firewalld authorization rules
+    local rules_file="/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+    if [[ -f "$rules_file" ]]; then
+        print_info "Removing polkit firewalld authorization rules"
+        rm -f "$rules_file"
     fi
 
     print_success "Daemon and systemd units removed (if present)"
