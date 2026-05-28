@@ -1450,7 +1450,6 @@ install_config_gui() {
         print_info "Installing polkit firewalld authorization rules"
         cp packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
         chmod 644 /usr/share/polkit-1/rules.d/50-tapauthd.rules
-        chown root:root /usr/share/polkit-1/rules.d/50-tapauthd.rules
     fi
     
     print_success "Configuration GUI installed"
