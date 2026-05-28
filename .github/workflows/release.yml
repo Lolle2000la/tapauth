@@ -183,7 +183,6 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/applications
           	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
           	mkdir -p debian/tapauth/usr/share/polkit-1/actions
-          	
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
           	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
@@ -223,7 +222,6 @@ jobs:
           fi
           if [ "\$1" = "purge" ]; then
           	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf || true
-          	systemd-sysusers --remove /usr/lib/sysusers.d/tapauth.conf || true
           fi
           #DEBHELPER#
           exit 0
