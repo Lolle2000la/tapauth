@@ -86,7 +86,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts debhelper dput
+          sudo apt-get install -y devscripts debhelper dput distro-info
 
       - name: Initialize Verified Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -242,9 +242,16 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
           cd "tapauth-${VERSION}"
 
-          # Use rustc-1.91/cargo-1.91 backports on older series.
-          ACTIVE_SERIES="jammy noble resolute"
-          echo "Targeting Ubuntu series: ${ACTIVE_SERIES}"
+          ACTIVE_SERIES=""
+          for SERIES in $(ubuntu-distro-info --supported 2>/dev/null); do
+            if REL_VER=$(ubuntu-distro-info -r --series="${SERIES}" 2>/dev/null) && [ -n "$REL_VER" ]; then
+              CLEAN_VER="${REL_VER%% *}"
+              if dpkg --compare-versions "${CLEAN_VER}" ge "22.04" 2>/dev/null; then
+                ACTIVE_SERIES="${ACTIVE_SERIES} ${SERIES}"
+              fi
+            fi
+          done
+          echo "Dynamically targeting Ubuntu series: ${ACTIVE_SERIES}"
 
           FIRST=1
           FIRST_UPLOAD_DONE=0
