@@ -208,6 +208,10 @@ class AuthenticationService : Service() {
         }
 
         listenerJob?.cancel()
+        try {
+            udpSocket?.close()
+        } catch (_: Exception) {}
+        udpSocket = null
         listenerJob =
             serviceScope.launch {
                 try {
