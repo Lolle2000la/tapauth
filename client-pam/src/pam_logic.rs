@@ -380,16 +380,11 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
     let service = unsafe { pam_sys::get_service_name(pamh) }?;
     tracing::debug!("Calling PAM service name: {}", service);
 
-    if matches!(
-        service.as_str(),
-        "sddm"
-            | "sddm-autologin"
-            | "gdm-password"
-            | "gdm-fingerprint"
-            | "lightdm"
-            | "lightdm-autologin"
-            | "lxdm"
-    ) {
+    if service.starts_with("sddm")
+        || service.starts_with("gdm")
+        || service.starts_with("lightdm")
+        || service.starts_with("lxdm")
+        || matches!(service.as_str(), "slim" | "xdm" | "kdm" | "greetd") {
         tracing::info!(
             "TapAuth: Service '{}' is a primary display manager. \
              Skipping to avoid breaking keyring auto-unlock.",
