@@ -413,7 +413,7 @@ async fn handle_conn(
         challenge: Vec::new(),
     };
 
-    return write_response(&mut stream, &envelope_pam_response(response), "Client").await;
+    write_response(&mut stream, &envelope_pam_response(response), "Client").await
 }
 
 async fn handle_pam_authenticate(
