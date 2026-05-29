@@ -230,8 +230,8 @@ class AuthenticationService : Service() {
                     // Join IPv6 multicast group ff02::1 (all nodes on local segment)
                     try {
                         // Join the multicast group on all available network interfaces
-                        NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface
-                            ->
+                        NetworkInterface.getNetworkInterfaces()?.toList()?.forEach {
+                            networkInterface ->
                             if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                                 try {
                                     udpSocket?.joinGroup(
@@ -337,7 +337,7 @@ class AuthenticationService : Service() {
 
         // Leave IPv6 multicast group before closing socket
         try {
-            NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
+            NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
                 if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                     try {
                         udpSocket?.leaveGroup(
