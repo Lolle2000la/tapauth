@@ -22,6 +22,8 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Foreground service that listens for UDP authentication requests and responds after biometric
@@ -30,8 +32,8 @@ import kotlinx.coroutines.*
 class AuthenticationService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var udpSocket: MulticastSocket? = null
-    private var isRunning = false
+    @Volatile private var udpSocket: MulticastSocket? = null
+    @Volatile private var isRunning = false
     private lateinit var deviceRepository: DeviceRepository
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
@@ -42,8 +44,8 @@ class AuthenticationService : Service() {
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var rejoinJob: Job? = null
-    private val multicastLockMonitor = Any()
+    @Volatile private var rejoinJob: Job? = null
+    private val multicastLockMutex = Mutex()
     @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     companion object {
@@ -178,35 +180,35 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
-        synchronized(multicastLockMonitor) {
-            if (multicastLock == null) {
-                try {
-                    val wifiManager =
-                        applicationContext.getSystemService(Context.WIFI_SERVICE)
-                            as? android.net.wifi.WifiManager
-                    multicastLock =
-                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
-                            setReferenceCounted(false)
-                            acquire()
+        serviceScope.launch {
+            multicastLockMutex.withLock {
+                if (multicastLock == null) {
+                    try {
+                        val wifiManager =
+                            applicationContext.getSystemService(Context.WIFI_SERVICE)
+                                as? android.net.wifi.WifiManager
+                        multicastLock =
+                            wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
+                                setReferenceCounted(false)
+                                acquire()
+                            }
+                        if (multicastLock != null) {
+                            Log.d(
+                                TAG,
+                                "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
+                            )
+                        } else {
+                            Log.w(
+                                TAG,
+                                "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
+                            )
                         }
-                    if (multicastLock != null) {
-                        Log.d(
-                            TAG,
-                            "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
-                        )
-                    } else {
-                        Log.w(
-                            TAG,
-                            "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
-                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
                 }
             }
-        }
 
-        serviceScope.launch {
             try {
                 // Use MulticastSocket to support both unicast and multicast
                 udpSocket = MulticastSocket(appConfig.udpPort)
@@ -303,18 +305,20 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
-        synchronized(multicastLockMonitor) {
-            try {
-                multicastLock?.let {
-                    if (it.isHeld) {
-                        it.release()
-                        Log.d(TAG, "Released Wifi MulticastLock")
+        runBlocking {
+            multicastLockMutex.withLock {
+                try {
+                    multicastLock?.let {
+                        if (it.isHeld) {
+                            it.release()
+                            Log.d(TAG, "Released Wifi MulticastLock")
+                        }
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
+                multicastLock = null
             }
-            multicastLock = null
         }
 
         isRunning = false
