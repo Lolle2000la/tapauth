@@ -178,24 +178,26 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
-        if (multicastLock == null) {
-            try {
-                val wifiManager =
-                    applicationContext.getSystemService(Context.WIFI_SERVICE)
-                        as? android.net.wifi.WifiManager
-                multicastLock =
-                    wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
-                        setReferenceCounted(false)
-                        acquire()
+        synchronized(this) {
+            if (multicastLock == null) {
+                try {
+                    val wifiManager =
+                        applicationContext.getSystemService(Context.WIFI_SERVICE)
+                            as? android.net.wifi.WifiManager
+                    multicastLock =
+                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
+                            setReferenceCounted(false)
+                            acquire()
+                        }
+                    if (multicastLock != null) {
+                        Log.d(
+                            TAG,
+                            "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
+                        )
                     }
-                if (multicastLock != null) {
-                    Log.d(
-                        TAG,
-                        "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
-                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
             }
         }
 
@@ -296,17 +298,19 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
-        try {
-            multicastLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                    Log.d(TAG, "Released Wifi MulticastLock")
+        synchronized(this) {
+            try {
+                multicastLock?.let {
+                    if (it.isHeld) {
+                        it.release()
+                        Log.d(TAG, "Released Wifi MulticastLock")
+                    }
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
+            multicastLock = null
         }
-        multicastLock = null
 
         isRunning = false
 
