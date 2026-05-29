@@ -43,6 +43,7 @@ class AuthenticationService : Service() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var rejoinJob: Job? = null
+    @Volatile
     private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     companion object {
@@ -289,9 +290,7 @@ class AuthenticationService : Service() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start UDP listener", e)
-                withContext(Dispatchers.Main) {
-                    stopListening()
-                }
+                stopListening()
             }
         }
     }
