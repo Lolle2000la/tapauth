@@ -87,6 +87,9 @@ extern "C" {
 /// Safe wrapper to get the PAM service name
 #[allow(dead_code)]
 pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
+    if pamh.is_null() {
+        return None;
+    }
     let mut item: *const c_void = std::ptr::null();
     let ret = pam_get_item(pamh, PAM_SERVICE, &mut item);
 
