@@ -129,12 +129,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             if now >= deadline {
                 break;
             }
-            let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+            let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                 PollFlags::POLLIN,
             )];
-            match poll(&mut fds, remain_ms_u16) {
+            match poll(&mut fds, remain_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
                     if let Some(rev) = fds[0].revents() {
@@ -206,8 +206,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                     PollFlags::POLLIN,
                 )];
-                let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
-                match poll(&mut fds, remain_ms_u16) {
+                let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+                match poll(&mut fds, remain_ms) {
                     Ok(0) => continue,
                     Ok(_) => {
                         if let Some(rev) = fds[0].revents() {
@@ -278,7 +278,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -289,7 +289,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 PollFlags::POLLIN,
             ),
         ];
-        match poll(&mut fds, remain_ms_u16) {
+        match poll(&mut fds, remain_ms) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
@@ -335,7 +335,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                 tracing::info!("User pressed Enter to skip");
                                 // Best-effort cancel uses a new blocking connection with a short
                                 // timeout so the skip is not blocked by an unresponsive daemon.
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_secs(1)) {
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
                                 pam_conv.try_info("TapAuth: Skipped, trying password...");
