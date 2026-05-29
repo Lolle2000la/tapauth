@@ -178,35 +178,35 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
-        serviceScope.launch {
-            synchronized(multicastLockLock) {
-                if (multicastLock == null) {
-                    try {
-                        val wifiManager =
-                            applicationContext.getSystemService(Context.WIFI_SERVICE)
-                                as? android.net.wifi.WifiManager
-                        multicastLock =
-                            wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
-                                setReferenceCounted(false)
-                                acquire()
-                            }
-                        if (multicastLock != null) {
-                            Log.d(
-                                TAG,
-                                "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
-                            )
-                        } else {
-                            Log.w(
-                                TAG,
-                                "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
-                            )
+        synchronized(multicastLockLock) {
+            if (multicastLock == null) {
+                try {
+                    val wifiManager =
+                        applicationContext.getSystemService(Context.WIFI_SERVICE)
+                            as? android.net.wifi.WifiManager
+                    multicastLock =
+                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
+                            setReferenceCounted(false)
+                            acquire()
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
+                    if (multicastLock != null) {
+                        Log.d(
+                            TAG,
+                            "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
+                        )
+                    } else {
+                        Log.w(
+                            TAG,
+                            "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
+                        )
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
                 }
             }
+        }
 
+        serviceScope.launch {
             try {
                 // Use MulticastSocket to support both unicast and multicast
                 udpSocket = MulticastSocket(appConfig.udpPort)
