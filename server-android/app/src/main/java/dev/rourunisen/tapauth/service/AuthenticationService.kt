@@ -210,6 +210,11 @@ class AuthenticationService : Service() {
             try {
                 // Use MulticastSocket to support both unicast and multicast
                 udpSocket = MulticastSocket(appConfig.udpPort)
+                if (!isRunning) {
+                    udpSocket?.close()
+                    udpSocket = null
+                    return@launch
+                }
 
                 // Set socket timeout to prevent indefinite blocking
                 // This allows the loop to periodically check isActive/isRunning flags
