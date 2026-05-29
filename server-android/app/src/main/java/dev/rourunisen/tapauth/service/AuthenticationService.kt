@@ -44,8 +44,7 @@ class AuthenticationService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var rejoinJob: Job? = null
     private val multicastLockMonitor = Any()
-    @Volatile
-    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+    @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     companion object {
         private const val TAG = "AuthenticationService"
