@@ -542,7 +542,6 @@ async fn write_response<M: Message>(
                     _ => {}
                 }
             }
-            tracing::warn!("Connection error: {}", e);
             Err(e)
         }
     }

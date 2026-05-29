@@ -80,6 +80,7 @@ impl PamConfig {
     }
 
     /// Get the operation timeout as a Duration.
+    #[allow(dead_code)]
     pub fn operation_timeout(&self) -> Duration {
         Duration::from_secs(self.pam_operation_timeout_secs)
     }

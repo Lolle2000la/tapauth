@@ -333,8 +333,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             let b = kb[0];
                             if b == b'\n' || b == b'\r' {
                                 tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a fresh blocking connection with configured timeout
-                                if let Ok(mut c) = IpcClient::connect(config.operation_timeout()) {
+                                // Best-effort cancel uses a new blocking connection with a short
+                                // timeout so the skip is not blocked by an unresponsive daemon.
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_secs(3)) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
                                 pam_conv.try_info("TapAuth: Skipped, trying password...");
