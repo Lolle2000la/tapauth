@@ -22,8 +22,6 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 /**
  * Foreground service that listens for UDP authentication requests and responds after biometric
@@ -45,7 +43,7 @@ class AuthenticationService : Service() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var rejoinJob: Job? = null
-    private val multicastLockMutex = Mutex()
+    private val multicastLockLock = Any()
     @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     companion object {
@@ -181,7 +179,7 @@ class AuthenticationService : Service() {
 
     private fun startListening() {
         serviceScope.launch {
-            multicastLockMutex.withLock {
+            synchronized(multicastLockLock) {
                 if (multicastLock == null) {
                     try {
                         val wifiManager =
@@ -305,20 +303,18 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
-        runBlocking {
-            multicastLockMutex.withLock {
-                try {
-                    multicastLock?.let {
-                        if (it.isHeld) {
-                            it.release()
-                            Log.d(TAG, "Released Wifi MulticastLock")
-                        }
+        synchronized(multicastLockLock) {
+            try {
+                multicastLock?.let {
+                    if (it.isHeld) {
+                        it.release()
+                        Log.d(TAG, "Released Wifi MulticastLock")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
                 }
-                multicastLock = null
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
             }
+            multicastLock = null
         }
 
         isRunning = false
