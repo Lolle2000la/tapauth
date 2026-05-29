@@ -207,13 +207,10 @@ class AuthenticationService : Service() {
             }
         }
 
-        listenerJob?.cancel()
-        try {
-            udpSocket?.close()
-        } catch (_: Exception) {}
-        udpSocket = null
+        val oldJob = listenerJob
         listenerJob =
             serviceScope.launch {
+                oldJob?.cancelAndJoin()
                 var socket: MulticastSocket? = null
                 try {
                     val s = MulticastSocket(appConfig.udpPort)
