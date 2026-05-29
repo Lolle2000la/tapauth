@@ -19,6 +19,7 @@ pub const PAM_IGNORE: c_int = 25;
 pub const PAM_SYSTEM_ERR: c_int = 4;
 
 // PAM item types
+pub const PAM_SERVICE: c_int = 1;
 pub const PAM_USER: c_int = 2;
 pub const PAM_RUSER: c_int = 8;
 pub const PAM_CONV: c_int = 5;
@@ -81,6 +82,25 @@ extern "C" {
     /// Set a PAM item
     #[allow(dead_code)]
     pub fn pam_set_item(pamh: *mut PamHandle, item_type: c_int, item: *const c_void) -> c_int;
+}
+
+/// Safe wrapper to get the PAM service name
+#[allow(dead_code)]
+pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
+    if pamh.is_null() {
+        return None;
+    }
+    let mut item: *const c_void = std::ptr::null();
+    let ret = pam_get_item(pamh, PAM_SERVICE, &mut item);
+
+    if ret == PAM_SUCCESS && !item.is_null() {
+        CStr::from_ptr(item as *const c_char)
+            .to_str()
+            .ok()
+            .map(|s| s.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Safe wrapper to get username from PAM
