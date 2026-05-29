@@ -29,9 +29,13 @@ impl FirewallGuard {
 
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
-        if let Err(e) = close_port(self.port, self.protocol) {
-            tracing::error!("Failed to close firewall port: {}", e);
-        }
+        let port = self.port;
+        let protocol = self.protocol;
+        std::thread::spawn(move || {
+            if let Err(e) = close_port(port, protocol) {
+                tracing::error!("Failed to close firewall port: {}", e);
+            }
+        });
     }
 }
 

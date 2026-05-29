@@ -284,17 +284,33 @@ impl AuthSession {
         // Open firewall port for the duration of this authentication attempt.
         // The guard auto-closes the port when dropped (i.e. when auth finishes,
         // times out, or is cancelled), keeping the port closed when idle.
-        let toml_config = shared::config::TapAuthConfig::load();
-        let _fw_guard = match FirewallGuard::new(toml_config.udp_port, FwProtocol::Udp) {
-            Ok(g) => Some(g),
+        let port = match self.state.udp_socket.local_addr() {
+            Ok(addr) => addr.port(),
             Err(e) => {
-                tracing::warn!(
-                    "Failed to open firewall port for auth (continuing anyway): {}",
-                    e
-                );
-                None
+                tracing::error!("Failed to get local address of UDP socket: {}", e);
+                shared::config::TapAuthConfig::load().udp_port
             }
         };
+        let _fw_guard =
+            match tokio::task::spawn_blocking(move || FirewallGuard::new(port, FwProtocol::Udp))
+                .await
+            {
+                Ok(Ok(g)) => Some(g),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "Failed to open firewall port for auth (continuing anyway): {}",
+                        e
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to join firewall port opening task (continuing anyway): {}",
+                        e
+                    );
+                    None
+                }
+            };
 
         // Create the authentication request
         let request = create_auth_request_with_challenge(
