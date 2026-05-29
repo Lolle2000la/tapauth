@@ -6,7 +6,6 @@
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
@@ -78,12 +77,6 @@ impl PamConfig {
             }
         }
     }
-
-    /// Get the operation timeout as a Duration.
-    #[allow(dead_code)]
-    pub fn operation_timeout(&self) -> Duration {
-        Duration::from_secs(self.pam_operation_timeout_secs)
-    }
 }
 
 #[cfg(test)]
@@ -95,7 +88,6 @@ mod tests {
     fn test_default_config() {
         let config = PamConfig::default();
         assert_eq!(config.pam_operation_timeout_secs, 120);
-        assert_eq!(config.operation_timeout(), Duration::from_secs(120));
     }
 
     #[test]
