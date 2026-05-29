@@ -208,6 +208,10 @@ class AuthenticationService : Service() {
         }
 
         val oldJob = listenerJob
+        try {
+            udpSocket?.close()
+        } catch (_: Exception) {}
+        udpSocket = null
         listenerJob =
             serviceScope.launch {
                 oldJob?.cancelAndJoin()
