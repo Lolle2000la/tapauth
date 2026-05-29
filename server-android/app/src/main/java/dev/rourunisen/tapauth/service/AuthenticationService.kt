@@ -214,22 +214,22 @@ class AuthenticationService : Service() {
         udpSocket = null
         listenerJob =
             serviceScope.launch {
+                var socket: MulticastSocket? = null
                 try {
-                    // Use MulticastSocket to support both unicast and multicast
-                    udpSocket = MulticastSocket(appConfig.udpPort)
+                    val s = MulticastSocket(appConfig.udpPort)
+                    socket = s
                     if (!isRunning) {
-                        udpSocket?.close()
-                        udpSocket = null
                         return@launch
                     }
+                    udpSocket = s
 
                     // Set socket timeout to prevent indefinite blocking
                     // This allows the loop to periodically check isActive/isRunning flags
                     // and respond to network state changes
-                    udpSocket?.soTimeout = SOCKET_TIMEOUT_MS
+                    s.soTimeout = SOCKET_TIMEOUT_MS
 
                     // Enable broadcast reception (for IPv4 255.255.255.255)
-                    udpSocket?.broadcast = true
+                    s.broadcast = true
 
                     // Join IPv6 multicast group ff02::1 (all nodes on local segment)
                     try {
@@ -238,7 +238,7 @@ class AuthenticationService : Service() {
                             networkInterface ->
                             if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                                 try {
-                                    udpSocket?.joinGroup(
+                                    s.joinGroup(
                                         java.net.InetSocketAddress(
                                             IPV6_MULTICAST_GROUP,
                                             appConfig.udpPort,
@@ -280,7 +280,7 @@ class AuthenticationService : Service() {
                         try {
                             val packet = DatagramPacket(buffer, buffer.size)
 
-                            udpSocket?.receive(packet)
+                            s.receive(packet)
 
                             val data = packet.data.copyOf(packet.length)
                             val senderAddress = packet.address
@@ -309,8 +309,15 @@ class AuthenticationService : Service() {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start UDP listener", e)
-                    stopListening()
+                    if (isActive && isRunning) {
+                        Log.e(TAG, "Failed to start UDP listener", e)
+                        stopListening()
+                    }
+                } finally {
+                    socket?.close()
+                    if (udpSocket === socket) {
+                        udpSocket = null
+                    }
                 }
             }
     }
