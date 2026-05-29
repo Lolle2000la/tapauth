@@ -156,7 +156,6 @@ class AuthenticationService : Service() {
             // Foreground notification already started in onCreate()
             // Just start the UDP listener
             startListening()
-            isRunning = true
             Log.d(TAG, "Authentication service started")
         }
         return START_STICKY
@@ -178,6 +177,7 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
+        isRunning = true
         synchronized(multicastLockLock) {
             if (multicastLock == null) {
                 try {
