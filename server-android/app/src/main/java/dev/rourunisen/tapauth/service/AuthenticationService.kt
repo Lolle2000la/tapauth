@@ -218,7 +218,7 @@ class AuthenticationService : Service() {
                 try {
                     val s = MulticastSocket(appConfig.udpPort)
                     socket = s
-                    if (!isRunning) {
+                    if (!isActive || !isRunning) {
                         return@launch
                     }
                     udpSocket = s
