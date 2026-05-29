@@ -94,10 +94,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return PAM_IGNORE;
     }
     let request_id = hex::encode(rid_bytes);
-    // Session timeout used for both daemon and local bound
+    // Use the configured PAM operation timeout for both the local poll deadline
+    // and the daemon's authentication timeout, so they stay in sync.
     let timeout_secs = {
-        let dur = shared::network::get_session_timeout();
-        let secs = dur.as_secs();
+        let secs = config.pam_operation_timeout_secs;
         if secs > u64::from(u32::MAX) {
             u32::MAX
         } else {
@@ -129,12 +129,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             if now >= deadline {
                 break;
             }
-            let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+            let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                 PollFlags::POLLIN,
             )];
-            match poll(&mut fds, remain_ms_u16) {
+            match poll(&mut fds, remain_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
                     if let Some(rev) = fds[0].revents() {
@@ -206,9 +206,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                     PollFlags::POLLIN,
                 )];
-                let remain_ms_u16 =
-                    ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
-                match poll(&mut fds, remain_ms_u16) {
+                let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+                match poll(&mut fds, remain_ms) {
                     Ok(0) => continue,
                     Ok(_) => {
                         if let Some(rev) = fds[0].revents() {
@@ -279,7 +278,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -290,7 +289,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 PollFlags::POLLIN,
             ),
         ];
-        match poll(&mut fds, remain_ms_u16) {
+        match poll(&mut fds, remain_ms) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
@@ -334,8 +333,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             let b = kb[0];
                             if b == b'\n' || b == b'\r' {
                                 tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a fresh blocking connection with configured timeout
-                                if let Ok(mut c) = IpcClient::connect(config.operation_timeout()) {
+                                // Best-effort cancel uses a new blocking connection with a short
+                                // timeout so the skip is not blocked by an unresponsive daemon.
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
                                 pam_conv.try_info("TapAuth: Skipped, trying password...");

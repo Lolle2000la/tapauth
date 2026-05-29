@@ -3,12 +3,12 @@
 # All settings are optional - defaults will be used if not specified
 
 # PAM Module Settings
-# Timeout for individual PAM operations (connect, send, receive) in seconds.
-# This prevents PAM module hangs if the daemon is unresponsive.
-# The authentication session on the phone can continue for up to 120 seconds,
-# but PAM operations will timeout after this duration to prevent user lockouts.
-# Default: 3
-pam_operation_timeout_secs = 3
+# Timeout for the authentication session in seconds.
+# How long the PAM module waits for the daemon to complete an authentication
+# attempt (including phone discovery, BLE/UDP exchange, and user interaction).
+# After this, the PAM module falls through to the next method (e.g., password).
+# Default: 120
+pam_operation_timeout_secs = 120
 
 # Network Settings
 # UDP port for the authentication protocol.
