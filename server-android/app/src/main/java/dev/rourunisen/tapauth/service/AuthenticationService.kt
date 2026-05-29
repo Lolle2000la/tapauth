@@ -289,12 +289,9 @@ class AuthenticationService : Service() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start UDP listener", e)
-                try {
-                    dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning(
-                        { applicationContext },
-                        false,
-                    )
-                } catch (_: Exception) {}
+                withContext(Dispatchers.Main) {
+                    stopListening()
+                }
             }
         }
     }
