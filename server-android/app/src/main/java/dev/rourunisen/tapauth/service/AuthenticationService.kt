@@ -43,6 +43,7 @@ class AuthenticationService : Service() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var rejoinJob: Job? = null
+    private val multicastLockMonitor = Any()
     @Volatile
     private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
@@ -178,7 +179,7 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
-        synchronized(this) {
+        synchronized(multicastLockMonitor) {
             if (multicastLock == null) {
                 try {
                     val wifiManager =
@@ -193,6 +194,11 @@ class AuthenticationService : Service() {
                         Log.d(
                             TAG,
                             "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
+                        )
+                    } else {
+                        Log.w(
+                            TAG,
+                            "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
                         )
                     }
                 } catch (e: Exception) {
@@ -298,7 +304,7 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
-        synchronized(this) {
+        synchronized(multicastLockMonitor) {
             try {
                 multicastLock?.let {
                     if (it.isHeld) {
