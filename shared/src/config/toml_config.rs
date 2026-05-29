@@ -15,8 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 /// Default configuration path
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 
-/// Default PAM operation timeout in seconds
-const DEFAULT_PAM_TIMEOUT_SECS: u64 = 3;
+/// Default PAM authentication session timeout in seconds
+const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
 /// Default UDP port for authentication
 const DEFAULT_UDP_PORT: u16 = 36692;
@@ -84,13 +84,16 @@ impl TpmPcrPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TapAuthConfig {
-    /// Timeout for individual PAM operations (connect, send, receive) in seconds.
-    /// Default: 3 seconds
+    /// Authentication session timeout in seconds.
+    /// Default: 120 seconds
     ///
-    /// This is the per-operation timeout for PAM module interactions with the daemon.
-    /// The authentication session on the phone can continue for up to 120 seconds
-    /// independently, but PAM operations will timeout after this duration to prevent
-    /// user lockouts if the daemon is unresponsive.
+    /// How long the PAM module waits for the daemon to complete an authentication
+    /// attempt (including phone discovery, BLE/UDP exchange, and user interaction).
+    /// After this deadline, the PAM module falls through to the next authentication
+    /// method (typically password).
+    ///
+    /// Must be at least as long as the transport-level timeout so the daemon has
+    /// time to complete BLE/UDP discovery and receive the phone's response.
     pub pam_operation_timeout_secs: u64,
 
     /// UDP port for authentication (default: 36692)
@@ -224,14 +227,14 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = TapAuthConfig::default();
-        assert_eq!(config.pam_operation_timeout_secs, 3);
+        assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
         {
             assert!(!config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard);
         }
-        assert_eq!(config.operation_timeout(), Duration::from_secs(3));
+        assert_eq!(config.operation_timeout(), Duration::from_secs(120));
     }
 
     #[test]
@@ -271,7 +274,7 @@ mod tests {
             udp_port = 36692
         "#;
         let config: TapAuthConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.pam_operation_timeout_secs, 3);
+        assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.udp_port, 36692);
         #[cfg(feature = "tpm")]
         {

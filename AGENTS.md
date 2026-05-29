@@ -178,7 +178,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
-- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 3), `use_tpm` (default false)
+- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false)
 
 ## Docker Dev Environment
 ```bash

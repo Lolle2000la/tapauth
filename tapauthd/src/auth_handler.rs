@@ -328,7 +328,7 @@ impl AuthSession {
             Ok(Err(e)) => {
                 tracing::error!("Authentication failed: {}", e);
                 Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Denied as i32,
+                    outcome: ipc::PamOutcome::Ignore as i32,
                     detail: format!("Authentication failed: {}", e),
                     challenge: self.challenge.to_vec(),
                 })

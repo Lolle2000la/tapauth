@@ -378,11 +378,51 @@ async fn handle_conn(
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
                 let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
-                return write_framed(&mut stream, &envelope_pam_response(response)).await;
+                match write_framed(&mut stream, &envelope_pam_response(response)).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if let DaemonError::Io(ref ioe) = e {
+                            match ioe.kind() {
+                                ErrorKind::BrokenPipe
+                                | ErrorKind::ConnectionReset
+                                | ErrorKind::UnexpectedEof => {
+                                    tracing::debug!(
+                                        "PAM client disconnected before response could be sent: {}",
+                                        ioe
+                                    );
+                                    return Ok(());
+                                }
+                                _ => {}
+                            }
+                        }
+                        tracing::warn!("Connection error: {}", e);
+                        return Err(e);
+                    }
+                }
             }
             Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
                 let response = handle_pam_cancel(cancel_req, &server_state).await;
-                return write_framed(&mut stream, &envelope_pam_response(response)).await;
+                match write_framed(&mut stream, &envelope_pam_response(response)).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if let DaemonError::Io(ref ioe) = e {
+                            match ioe.kind() {
+                                ErrorKind::BrokenPipe
+                                | ErrorKind::ConnectionReset
+                                | ErrorKind::UnexpectedEof => {
+                                    tracing::debug!(
+                                        "PAM client disconnected before cancel response could be sent: {}",
+                                        ioe
+                                    );
+                                    return Ok(());
+                                }
+                                _ => {}
+                            }
+                        }
+                        tracing::warn!("Connection error: {}", e);
+                        return Err(e);
+                    }
+                }
             }
             Some(ipc::ipc_envelope::Msg::AdminRequest(admin_req)) => {
                 let admin_resp = admin_handler::handle_admin_request(
@@ -393,7 +433,27 @@ async fn handle_conn(
                     caller_uid,
                 )
                 .await;
-                return write_framed(&mut stream, &envelope_admin_response(admin_resp)).await;
+                match write_framed(&mut stream, &envelope_admin_response(admin_resp)).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if let DaemonError::Io(ref ioe) = e {
+                            match ioe.kind() {
+                                ErrorKind::BrokenPipe
+                                | ErrorKind::ConnectionReset
+                                | ErrorKind::UnexpectedEof => {
+                                    tracing::debug!(
+                                        "Admin client disconnected before response could be sent: {}",
+                                        ioe
+                                    );
+                                    return Ok(());
+                                }
+                                _ => {}
+                            }
+                        }
+                        tracing::warn!("Connection error: {}", e);
+                        return Err(e);
+                    }
+                }
             }
             None => {
                 tracing::debug!("Empty IpcEnvelope");

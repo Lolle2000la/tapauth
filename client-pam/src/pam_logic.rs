@@ -94,10 +94,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return PAM_IGNORE;
     }
     let request_id = hex::encode(rid_bytes);
-    // Session timeout used for both daemon and local bound
+    // Use the configured PAM operation timeout for both the local poll deadline
+    // and the daemon's authentication timeout, so they stay in sync.
     let timeout_secs = {
-        let dur = shared::network::get_session_timeout();
-        let secs = dur.as_secs();
+        let secs = config.pam_operation_timeout_secs;
         if secs > u64::from(u32::MAX) {
             u32::MAX
         } else {
@@ -129,7 +129,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             if now >= deadline {
                 break;
             }
-            let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+            let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                 PollFlags::POLLIN,
@@ -206,8 +206,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                     PollFlags::POLLIN,
                 )];
-                let remain_ms_u16 =
-                    ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+                let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
                 match poll(&mut fds, remain_ms_u16) {
                     Ok(0) => continue,
                     Ok(_) => {
@@ -279,7 +278,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms_u16 = ((deadline - now).as_millis() as u128).min(u16::MAX as u128) as u16;
+        let remain_ms_u16 = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },

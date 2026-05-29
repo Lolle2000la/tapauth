@@ -715,7 +715,7 @@ create_initial_config() {
     
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would create configuration file at $config_file"
-        echo "  • pam_operation_timeout_secs: 3"
+        echo "  • pam_operation_timeout_secs: 120"
         echo "  • udp_port: 36692"
         echo "  • use_tpm: $USE_TPM"
         return
@@ -738,8 +738,8 @@ create_initial_config() {
 # TapAuth Configuration
 # See config.toml.example for more details
 
-# PAM operation timeout in seconds
-pam_operation_timeout_secs = 3
+# Authentication session timeout in seconds
+pam_operation_timeout_secs = 120
 
 # UDP port for authentication protocol
 udp_port = 36692

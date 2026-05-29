@@ -9,18 +9,21 @@ use std::path::Path;
 use std::time::Duration;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
-const DEFAULT_PAM_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PamConfig {
-    /// Timeout for individual PAM operations (connect, send, receive) in seconds.
-    /// Default: 3 seconds
+    /// Authentication session timeout in seconds.
+    /// Default: 120 seconds
     ///
-    /// This is the per-operation timeout for PAM module interactions with the daemon.
-    /// The authentication session on the phone can continue for up to 120 seconds
-    /// independently, but PAM operations will timeout after this duration to prevent
-    /// user lockouts if the daemon is unresponsive.
+    /// How long the PAM module waits for the daemon to complete an authentication
+    /// attempt (including phone discovery, BLE/UDP exchange, and user interaction).
+    /// After this deadline, the PAM module falls through to the next authentication
+    /// method (typically password) without blocking the user.
+    ///
+    /// Must be at least as long as the transport-level timeout so the daemon has
+    /// time to complete BLE/UDP discovery and receive the phone's response.
     pub pam_operation_timeout_secs: u64,
 }
 
@@ -90,8 +93,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = PamConfig::default();
-        assert_eq!(config.pam_operation_timeout_secs, 3);
-        assert_eq!(config.operation_timeout(), Duration::from_secs(3));
+        assert_eq!(config.pam_operation_timeout_secs, 120);
+        assert_eq!(config.operation_timeout(), Duration::from_secs(120));
     }
 
     #[test]
@@ -109,6 +112,6 @@ mod tests {
         // Missing fields should use defaults
         let toml = "";
         let config: PamConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.pam_operation_timeout_secs, 3);
+        assert_eq!(config.pam_operation_timeout_secs, 120);
     }
 }
