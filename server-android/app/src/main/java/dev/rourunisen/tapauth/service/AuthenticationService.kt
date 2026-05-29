@@ -43,6 +43,7 @@ class AuthenticationService : Service() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var rejoinJob: Job? = null
+    @Volatile private var listenerJob: Job? = null
     private val multicastLockLock = Any()
     @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
@@ -206,105 +207,108 @@ class AuthenticationService : Service() {
             }
         }
 
-        serviceScope.launch {
-            try {
-                // Use MulticastSocket to support both unicast and multicast
-                udpSocket = MulticastSocket(appConfig.udpPort)
-                if (!isRunning) {
-                    udpSocket?.close()
-                    udpSocket = null
-                    return@launch
-                }
-
-                // Set socket timeout to prevent indefinite blocking
-                // This allows the loop to periodically check isActive/isRunning flags
-                // and respond to network state changes
-                udpSocket?.soTimeout = SOCKET_TIMEOUT_MS
-
-                // Enable broadcast reception (for IPv4 255.255.255.255)
-                udpSocket?.broadcast = true
-
-                // Join IPv6 multicast group ff02::1 (all nodes on local segment)
+        listenerJob?.cancel()
+        listenerJob =
+            serviceScope.launch {
                 try {
-                    // Join the multicast group on all available network interfaces
-                    NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface ->
-                        if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                            try {
-                                udpSocket?.joinGroup(
-                                    java.net.InetSocketAddress(
-                                        IPV6_MULTICAST_GROUP,
-                                        appConfig.udpPort,
-                                    ),
-                                    networkInterface,
-                                )
-                                Log.d(
-                                    TAG,
-                                    "Joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
-                                )
-                            } catch (e: Exception) {
-                                Log.w(
-                                    TAG,
-                                    "Failed to join multicast on ${networkInterface.name}: ${e.message}",
-                                )
+                    // Use MulticastSocket to support both unicast and multicast
+                    udpSocket = MulticastSocket(appConfig.udpPort)
+                    if (!isRunning) {
+                        udpSocket?.close()
+                        udpSocket = null
+                        return@launch
+                    }
+
+                    // Set socket timeout to prevent indefinite blocking
+                    // This allows the loop to periodically check isActive/isRunning flags
+                    // and respond to network state changes
+                    udpSocket?.soTimeout = SOCKET_TIMEOUT_MS
+
+                    // Enable broadcast reception (for IPv4 255.255.255.255)
+                    udpSocket?.broadcast = true
+
+                    // Join IPv6 multicast group ff02::1 (all nodes on local segment)
+                    try {
+                        // Join the multicast group on all available network interfaces
+                        NetworkInterface.getNetworkInterfaces().toList().forEach { networkInterface
+                            ->
+                            if (networkInterface.isUp && networkInterface.supportsMulticast()) {
+                                try {
+                                    udpSocket?.joinGroup(
+                                        java.net.InetSocketAddress(
+                                            IPV6_MULTICAST_GROUP,
+                                            appConfig.udpPort,
+                                        ),
+                                        networkInterface,
+                                    )
+                                    Log.d(
+                                        TAG,
+                                        "Joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
+                                    )
+                                } catch (e: Exception) {
+                                    Log.w(
+                                        TAG,
+                                        "Failed to join multicast on ${networkInterface.name}: ${e.message}",
+                                    )
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to set up IPv6 multicast: ${e.message}")
+                    }
+
+                    Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
+                    Log.d(TAG, "  - IPv4 broadcast: enabled")
+                    Log.d(TAG, "  - IPv6 multicast: ff02::1")
+
+                    // Mark UDP as running once we've successfully opened the socket
+                    try {
+                        dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning(
+                            { applicationContext },
+                            true,
+                        )
+                        updateNotification()
+                    } catch (_: Exception) {}
+
+                    val buffer = ByteArray(4096)
+
+                    while (isActive && isRunning) {
+                        try {
+                            val packet = DatagramPacket(buffer, buffer.size)
+
+                            udpSocket?.receive(packet)
+
+                            val data = packet.data.copyOf(packet.length)
+                            val senderAddress = packet.address
+                            val senderPort = packet.port
+
+                            Log.d(
+                                TAG,
+                                "Received auth request from ${senderAddress.hostAddress}:$senderPort",
+                            )
+                            Log.d(
+                                TAG,
+                                "Will respond to ${senderAddress.hostAddress}:${appConfig.udpPort} (configured port)",
+                            )
+
+                            // Process authentication request
+                            launch { handleIncomingPacket(data, senderAddress, senderPort) }
+                        } catch (e: SocketTimeoutException) {
+                            // Expected timeout - allows loop to check isActive/isRunning flags
+                            // and handle network state changes gracefully
+                            continue
+                        } catch (e: Exception) {
+                            // Ignore "Socket closed" exception when service is stopping
+                            if (isActive && isRunning) {
+                                Log.e(TAG, "Error receiving packet", e)
                             }
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to set up IPv6 multicast: ${e.message}")
+                    Log.e(TAG, "Failed to start UDP listener", e)
+                    stopListening()
                 }
-
-                Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
-                Log.d(TAG, "  - IPv4 broadcast: enabled")
-                Log.d(TAG, "  - IPv6 multicast: ff02::1")
-
-                // Mark UDP as running once we've successfully opened the socket
-                try {
-                    dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning(
-                        { applicationContext },
-                        true,
-                    )
-                    updateNotification()
-                } catch (_: Exception) {}
-
-                val buffer = ByteArray(4096)
-
-                while (isActive && isRunning) {
-                    try {
-                        val packet = DatagramPacket(buffer, buffer.size)
-
-                        udpSocket?.receive(packet)
-
-                        val data = packet.data.copyOf(packet.length)
-                        val senderAddress = packet.address
-                        val senderPort = packet.port
-
-                        Log.d(
-                            TAG,
-                            "Received auth request from ${senderAddress.hostAddress}:$senderPort",
-                        )
-                        Log.d(
-                            TAG,
-                            "Will respond to ${senderAddress.hostAddress}:${appConfig.udpPort} (configured port)",
-                        )
-
-                        // Process authentication request
-                        launch { handleIncomingPacket(data, senderAddress, senderPort) }
-                    } catch (e: SocketTimeoutException) {
-                        // Expected timeout - allows loop to check isActive/isRunning flags
-                        // and handle network state changes gracefully
-                        continue
-                    } catch (e: Exception) {
-                        // Ignore "Socket closed" exception when service is stopping
-                        if (isActive && isRunning) {
-                            Log.e(TAG, "Error receiving packet", e)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start UDP listener", e)
-                stopListening()
             }
-        }
     }
 
     private fun stopListening() {
@@ -323,6 +327,9 @@ class AuthenticationService : Service() {
             }
             multicastLock = null
         }
+
+        listenerJob?.cancel()
+        listenerJob = null
 
         // Cancel any pending rejoin operation
         rejoinJob?.cancel()
