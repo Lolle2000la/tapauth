@@ -363,6 +363,9 @@ impl Transport for BleTransport {
         };
 
         // Server Response Characteristic - Server writes response
+        // Use acknowledged writes (write_without_response: false) so the
+        // Android device can fragment the encrypted auth payload (> MTU-3)
+        // via GATT Prepare/Execute Long Write sequences.
         let response_queue = self.response_queue.clone();
         let connected_devices_write = self.connected_devices.clone();
         let adapter_write = adapter.clone();
@@ -370,7 +373,7 @@ impl Transport for BleTransport {
             uuid: server_resp_uuid,
             write: Some(CharacteristicWrite {
                 write: true,
-                write_without_response: true,
+                write_without_response: false,
                 method: bluer::gatt::local::CharacteristicWriteMethod::Fun(Box::new(
                     move |new_value, req| {
                         let response_queue = response_queue.clone();
