@@ -384,7 +384,8 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
         || service.starts_with("gdm")
         || service.starts_with("lightdm")
         || service.starts_with("lxdm")
-        || matches!(service.as_str(), "slim" | "xdm" | "kdm" | "greetd") {
+        || matches!(service.as_str(), "slim" | "xdm" | "kdm" | "greetd")
+    {
         tracing::info!(
             "TapAuth: Service '{}' is a primary display manager. \
              Skipping to avoid breaking keyring auto-unlock.",
