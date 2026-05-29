@@ -308,6 +308,8 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
+        isRunning = false
+
         synchronized(multicastLockLock) {
             try {
                 multicastLock?.let {
@@ -321,8 +323,6 @@ class AuthenticationService : Service() {
             }
             multicastLock = null
         }
-
-        isRunning = false
 
         // Cancel any pending rejoin operation
         rejoinJob?.cancel()
