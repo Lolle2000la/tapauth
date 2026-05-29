@@ -4,6 +4,7 @@ use crate::transport::{ReceiveResult, Transport, UdpTransport};
 use shared::{
     config::{ClientConfigManager, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
+    firewall::{FirewallGuard, Protocol as FwProtocol},
     network::get_session_timeout,
     protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
 };
@@ -279,6 +280,21 @@ impl AuthSession {
             allowed_servers.len(),
             self.username
         );
+
+        // Open firewall port for the duration of this authentication attempt.
+        // The guard auto-closes the port when dropped (i.e. when auth finishes,
+        // times out, or is cancelled), keeping the port closed when idle.
+        let toml_config = shared::config::TapAuthConfig::load();
+        let _fw_guard = match FirewallGuard::new(toml_config.udp_port, FwProtocol::Udp) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open firewall port for auth (continuing anyway): {}",
+                    e
+                );
+                None
+            }
+        };
 
         // Create the authentication request
         let request = create_auth_request_with_challenge(
