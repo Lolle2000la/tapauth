@@ -177,18 +177,25 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
-        try {
-            val wifiManager =
-                applicationContext.getSystemService(Context.WIFI_SERVICE)
-                    as android.net.wifi.WifiManager
-            multicastLock =
-                wifiManager.createMulticastLock("TapAuthMulticastLock").apply {
-                    setReferenceCounted(false)
-                    acquire()
+        if (multicastLock == null) {
+            try {
+                val wifiManager =
+                    applicationContext.getSystemService(Context.WIFI_SERVICE)
+                        as? android.net.wifi.WifiManager
+                multicastLock =
+                    wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
+                        setReferenceCounted(false)
+                        acquire()
+                    }
+                if (multicastLock != null) {
+                    Log.d(
+                        TAG,
+                        "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
+                    )
                 }
-            Log.d(TAG, "Acquired Wifi MulticastLock for UDP broadcast/multicast reception")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
+            }
         }
 
         serviceScope.launch {
