@@ -43,6 +43,7 @@ class AuthenticationService : Service() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var rejoinJob: Job? = null
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     companion object {
         private const val TAG = "AuthenticationService"
@@ -176,6 +177,20 @@ class AuthenticationService : Service() {
     }
 
     private fun startListening() {
+        try {
+            val wifiManager =
+                applicationContext.getSystemService(Context.WIFI_SERVICE)
+                    as android.net.wifi.WifiManager
+            multicastLock =
+                wifiManager.createMulticastLock("TapAuthMulticastLock").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            Log.d(TAG, "Acquired Wifi MulticastLock for UDP broadcast/multicast reception")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
+        }
+
         serviceScope.launch {
             try {
                 // Use MulticastSocket to support both unicast and multicast
@@ -278,6 +293,18 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
+        try {
+            multicastLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d(TAG, "Released Wifi MulticastLock")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
+        }
+        multicastLock = null
+
         isRunning = false
 
         // Cancel any pending rejoin operation
