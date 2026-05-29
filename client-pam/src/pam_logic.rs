@@ -45,6 +45,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
+    if let Some(pam_status) = guard_display_manager_bypass(pamh) {
+        return pam_status;
+    }
+
     // Load configuration for timeouts
     let config = crate::config::PamConfig::load();
     tracing::debug!(
@@ -356,6 +360,45 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     pam_conv.try_info("TapAuth: Timed out, trying password...");
     pam_sys::PAM_IGNORE
+}
+
+/// Yield `PAM_IGNORE` if the calling service is a primary display manager.
+///
+/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
+/// LightDM, LXDM), a successful phone confirmation authenticates the user but
+/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
+/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
+/// depend on that token to unlock the local secure keyring/wallet at login-time.
+///
+/// Bypassing DM services preserves the normal password collection flow so the
+/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
+/// secondary prompt. The module still runs for secondary services such as
+/// `sudo`, `polkit-1`, and desktop screensavers.
+///
+/// Returns `Some(PAM_IGNORE)` for display manager services, `None` otherwise.
+fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
+    let service = unsafe { pam_sys::get_service_name(pamh) }?;
+    tracing::debug!("Calling PAM service name: {}", service);
+
+    if matches!(
+        service.as_str(),
+        "sddm"
+            | "sddm-autologin"
+            | "gdm-password"
+            | "gdm-fingerprint"
+            | "lightdm"
+            | "lightdm-autologin"
+            | "lxdm"
+    ) {
+        tracing::info!(
+            "TapAuth: Service '{}' is a primary display manager. \
+             Skipping to avoid breaking keyring auto-unlock.",
+            service
+        );
+        return Some(pam_sys::PAM_IGNORE);
+    }
+
+    None
 }
 
 /// Spawn a thread to monitor `/dev/tty` for skip signals.
