@@ -122,8 +122,10 @@ impl PairingScreen {
             ScreenMessage::PairingCancelled => {
                 if let Some(cancel) = self.cancel_wait.take() {
                     cancel.notify_one();
+                    Task::none()
+                } else {
+                    Task::done(ScreenMessage::NavigateToMainMenu)
                 }
-                Task::done(ScreenMessage::NavigateToMainMenu)
             }
             _ => Task::none(),
         }
