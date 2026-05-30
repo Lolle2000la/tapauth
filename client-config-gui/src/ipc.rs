@@ -57,6 +57,13 @@ fn err_msg(resp: &ipc::AdminResponse) -> String {
 }
 
 pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::AdminResponse, String> {
+    send_admin_request_with_read_timeout(request, Duration::from_secs(120)).await
+}
+
+async fn send_admin_request_with_read_timeout(
+    request: ipc::AdminRequest,
+    read_timeout: Duration,
+) -> Result<ipc::AdminResponse, String> {
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };
@@ -75,7 +82,7 @@ pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::Admin
     .map_err(|_| "Timed out sending admin request".to_string())?
     .map_err(|e| format!("Failed to send admin request: {}", e))?;
 
-    let result = timeout(Duration::from_secs(10), read_framed(&mut stream))
+    let result = timeout(read_timeout, read_framed(&mut stream))
         .await
         .map_err(|_| "Timed out waiting for admin response".to_string())?
         .map_err(|e| format!("Failed to read admin response: {}", e))?;
@@ -133,7 +140,7 @@ pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), String> {
         )),
     };
 
-    let response = send_admin_request(request).await?;
+    let response = send_admin_request_with_read_timeout(request, Duration::from_secs(300)).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
         return Err(err_msg(&response));
