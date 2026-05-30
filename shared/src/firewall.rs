@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Protocol {
@@ -17,31 +17,51 @@ impl std::fmt::Display for Protocol {
     }
 }
 
-/// Reference-counted active ports: maps port → number of active guards.
-/// A firewall rule is only opened when the count goes from 0→1 and only
-/// closed when it drops back to 0, preventing concurrent auth sessions
-/// from prematurely tearing down the rule while another session is active.
-static ACTIVE_PORTS: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
-
-fn active_ports() -> &'static Mutex<HashMap<u16, usize>> {
-    ACTIVE_PORTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 pub struct FirewallGuard {
     port: u16,
     protocol: Protocol,
 }
 
+/// Per-port weak-tracking: when a live `Arc<FirewallGuard>` exists for a port,
+/// subsequent callers upgrade the `Weak` and share the guard.  When the last
+/// strong reference is dropped, `FirewallGuard::drop` closes the port
+/// automatically — no manual ref-counting needed.
+static GUARDS: OnceLock<Mutex<HashMap<u16, Weak<FirewallGuard>>>> = OnceLock::new();
+
+fn guards() -> &'static Mutex<HashMap<u16, Weak<FirewallGuard>>> {
+    GUARDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Acquire a shared `Arc<FirewallGuard>` for the given port.
+///
+/// If another caller already holds a live guard for this port, the existing
+/// `Arc` is cloned and returned (the port remains open).  Otherwise a new
+/// guard is created, the port is opened, and a `Weak` pointer is stored for
+/// future sharing.
+///
+/// This is useful when multiple concurrent sessions use the same port
+/// (e.g. UDP authentication) — the port stays open until the *last* session
+/// finishes.
+pub fn acquire_guard(port: u16, protocol: Protocol) -> Result<Arc<FirewallGuard>, String> {
+    let mut map = guards()
+        .lock()
+        .map_err(|e| format!("guard map lock poisoned: {}", e))?;
+
+    if let Some(existing) = map.get(&port).and_then(|w| w.upgrade()) {
+        return Ok(existing);
+    }
+
+    open_port(port, protocol)?;
+    let guard = Arc::new(FirewallGuard { port, protocol });
+    map.insert(port, Arc::downgrade(&guard));
+    Ok(guard)
+}
+
 impl FirewallGuard {
+    /// Create a standalone guard (no sharing).  For shared use (e.g. auth
+    /// sessions that may overlap), prefer [`acquire_guard`].
     pub fn new(port: u16, protocol: Protocol) -> Result<Self, String> {
-        let mut ports = active_ports()
-            .lock()
-            .map_err(|e| format!("active-ports lock poisoned: {}", e))?;
-        let count = ports.entry(port).or_insert(0);
-        if *count == 0 {
-            open_port(port, protocol)?;
-        }
-        *count = count.checked_add(1).unwrap_or(usize::MAX);
+        open_port(port, protocol)?;
         Ok(Self { port, protocol })
     }
 }
@@ -51,48 +71,29 @@ impl Drop for FirewallGuard {
         let port = self.port;
         let protocol = self.protocol;
 
-        let do_close = {
-            let mut ports = match active_ports().lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::error!("active-ports lock poisoned on drop: {}", e);
-                    return;
-                }
-            };
-            match ports.get_mut(&port) {
-                Some(count) => {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        ports.remove(&port);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        "FirewallGuard dropped for port {} but no entry in active_ports",
-                        port
-                    );
-                    false
-                }
+        // Clean up the weak entry when the last strong reference is gone.
+        if let Ok(mut map) = guards().lock() {
+            let should_remove = map
+                .get(&port)
+                .map(|w| w.strong_count() == 0)
+                .unwrap_or(false);
+            if should_remove {
+                map.remove(&port);
             }
-        };
+        }
 
-        if do_close {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn_blocking(move || {
-                    if let Err(e) = close_port(port, protocol) {
-                        tracing::error!("Failed to close firewall port: {}", e);
-                    }
-                });
-            } else {
-                std::thread::spawn(move || {
-                    if let Err(e) = close_port(port, protocol) {
-                        tracing::error!("Failed to close firewall port: {}", e);
-                    }
-                });
-            }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                if let Err(e) = close_port(port, protocol) {
+                    tracing::error!("Failed to close firewall port: {}", e);
+                }
+            });
+        } else {
+            std::thread::spawn(move || {
+                if let Err(e) = close_port(port, protocol) {
+                    tracing::error!("Failed to close firewall port: {}", e);
+                }
+            });
         }
     }
 }
