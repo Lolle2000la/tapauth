@@ -90,9 +90,7 @@ fn do_drop_close(port: u16, protocol: Protocol) {
             return;
         }
     };
-    if map.get(&port).and_then(|w| w.upgrade()).is_none() {
-        map.remove(&port);
-        drop(map);
+    if map.get(&port).and_then(|w| w.upgrade()).is_none() && map.remove(&port).is_some() {
         if let Err(e) = close_port(port, protocol) {
             tracing::error!("Failed to close firewall port: {}", e);
         }
