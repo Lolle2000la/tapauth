@@ -192,17 +192,12 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
     }
 }
 
-/// Cached firewalld status to avoid spawning `systemctl` on every open/close.
-static FIREWALLD_RUNNING: OnceLock<bool> = OnceLock::new();
-
 fn is_firewalld_running() -> bool {
-    *FIREWALLD_RUNNING.get_or_init(|| {
-        Command::new("systemctl")
-            .args(["is-active", "--quiet", "firewalld"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "firewalld"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn add_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), String> {
