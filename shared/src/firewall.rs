@@ -71,29 +71,30 @@ impl Drop for FirewallGuard {
         let port = self.port;
         let protocol = self.protocol;
 
-        // Clean up the weak entry when the last strong reference is gone.
-        if let Ok(mut map) = guards().lock() {
-            let should_remove = map
-                .get(&port)
-                .map(|w| w.strong_count() == 0)
-                .unwrap_or(false);
-            if should_remove {
-                map.remove(&port);
-            }
-        }
-
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
-                if let Err(e) = close_port(port, protocol) {
-                    tracing::error!("Failed to close firewall port: {}", e);
-                }
-            });
+            handle.spawn_blocking(move || do_drop_close(port, protocol));
         } else {
-            std::thread::spawn(move || {
-                if let Err(e) = close_port(port, protocol) {
-                    tracing::error!("Failed to close firewall port: {}", e);
-                }
-            });
+            std::thread::spawn(move || do_drop_close(port, protocol));
+        }
+    }
+}
+
+/// Called from a background thread/task: check whether the weak entry
+/// is still alive and, if not, close the port.  Holding the lock across
+/// the check **and** the removal avoids a race with `acquire_guard`.
+fn do_drop_close(port: u16, protocol: Protocol) {
+    let mut map = match guards().lock() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("guard map lock poisoned on drop: {}", e);
+            return;
+        }
+    };
+    if map.get(&port).and_then(|w| w.upgrade()).is_none() {
+        map.remove(&port);
+        drop(map);
+        if let Err(e) = close_port(port, protocol) {
+            tracing::error!("Failed to close firewall port: {}", e);
         }
     }
 }
