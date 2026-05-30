@@ -6,6 +6,7 @@ use iced::{
     Color, Element, Font, Length, Task,
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum PairingState {
@@ -21,6 +22,7 @@ pub enum PairingState {
 pub struct PairingScreen {
     pub l10n: L10n,
     state: PairingState,
+    cancel_wait: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl PairingScreen {
@@ -28,6 +30,7 @@ impl PairingScreen {
         Self {
             l10n,
             state: PairingState::Loading,
+            cancel_wait: None,
         }
     }
 
@@ -59,19 +62,32 @@ impl PairingScreen {
                         data.split("&p=").nth(1).and_then(|s| s.split('&').next())
                     {
                         if let Ok(port) = port_str.parse::<u16>() {
+                            let cancel = Arc::new(tokio::sync::Notify::new());
+                            let cancel2 = cancel.clone();
+                            self.cancel_wait = Some(cancel);
+
                             return Task::perform(
-                                async move { crate::ipc::wait_for_pairing(port as u32).await },
-                                |result| match result {
-                                    Ok((sas, port)) => ScreenMessage::PairingComplete(format!(
-                                        "SAS:{}:{}",
-                                        sas, port
-                                    )),
-                                    Err(e) => ScreenMessage::PairingFailed(e),
+                                async move {
+                                    tokio::select! {
+                                        result = crate::ipc::wait_for_pairing(port as u32) => {
+                                            match result {
+                                                Ok((sas, port)) => ScreenMessage::PairingComplete(
+                                                    format!("SAS:{}:{}", sas, port),
+                                                ),
+                                                Err(e) => ScreenMessage::PairingFailed(e),
+                                            }
+                                        }
+                                        _ = cancel2.notified() => {
+                                            ScreenMessage::PairingCancelled
+                                        }
+                                    }
                                 },
+                                |msg| msg,
                             );
                         }
                     }
                 } else if data.starts_with("SAS:") {
+                    self.cancel_wait = None;
                     let parts: Vec<&str> = data.splitn(3, ':').collect();
                     if parts.len() == 3 {
                         self.state = PairingState::VerifyingSAS {
@@ -99,10 +115,16 @@ impl PairingScreen {
                 Task::none()
             }
             ScreenMessage::PairingFailed(error) => {
+                self.cancel_wait = None;
                 self.state = PairingState::Error { message: error };
                 Task::none()
             }
-            ScreenMessage::PairingCancelled => Task::done(ScreenMessage::NavigateToMainMenu),
+            ScreenMessage::PairingCancelled => {
+                if let Some(cancel) = self.cancel_wait.take() {
+                    cancel.notify_one();
+                }
+                Task::done(ScreenMessage::NavigateToMainMenu)
+            }
             _ => Task::none(),
         }
     }
