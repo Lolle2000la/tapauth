@@ -32,37 +32,29 @@ fn guards() -> &'static Mutex<HashMap<u16, Weak<FirewallGuard>>> {
     GUARDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Acquire a shared `Arc<FirewallGuard>` for the given port.
-///
-/// If another caller already holds a live guard for this port, the existing
-/// `Arc` is cloned and returned (the port remains open).  Otherwise a new
-/// guard is created, the port is opened, and a `Weak` pointer is stored for
-/// future sharing.
-///
-/// This is useful when multiple concurrent sessions use the same port
-/// (e.g. UDP authentication) — the port stays open until the *last* session
-/// finishes.
-pub fn acquire_guard(port: u16, protocol: Protocol) -> Result<Arc<FirewallGuard>, String> {
-    let mut map = guards()
-        .lock()
-        .map_err(|e| format!("guard map lock poisoned: {}", e))?;
-
-    if let Some(existing) = map.get(&port).and_then(|w| w.upgrade()) {
-        return Ok(existing);
-    }
-
-    open_port(port, protocol)?;
-    let guard = Arc::new(FirewallGuard { port, protocol });
-    map.insert(port, Arc::downgrade(&guard));
-    Ok(guard)
-}
-
 impl FirewallGuard {
-    /// Create a standalone guard (no sharing).  For shared use (e.g. auth
-    /// sessions that may overlap), prefer [`acquire_guard`].
-    pub fn new(port: u16, protocol: Protocol) -> Result<Self, String> {
+    /// Create a shared `Arc<FirewallGuard>` for the given port.
+    ///
+    /// If another caller already holds a live guard for this port, the existing
+    /// `Arc` is cloned and returned (the port remains open).  Otherwise a new
+    /// guard is created, the port is opened, and a `Weak` pointer is stored for
+    /// future sharing.
+    ///
+    /// When the last strong reference is dropped, the port is automatically
+    /// closed in a background thread/task — no manual ref-counting needed.
+    pub fn new(port: u16, protocol: Protocol) -> Result<Arc<Self>, String> {
+        let mut map = guards()
+            .lock()
+            .map_err(|e| format!("guard map lock poisoned: {}", e))?;
+
+        if let Some(existing) = map.get(&port).and_then(|w| w.upgrade()) {
+            return Ok(existing);
+        }
+
         open_port(port, protocol)?;
-        Ok(Self { port, protocol })
+        let guard = Arc::new(Self { port, protocol });
+        map.insert(port, Arc::downgrade(&guard));
+        Ok(guard)
     }
 }
 

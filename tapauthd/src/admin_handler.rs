@@ -95,7 +95,7 @@ fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResp
 
 pub struct PendingPairing {
     pub listener: TcpListener,
-    pub firewall_guard: FirewallGuard,
+    pub firewall_guard: Arc<FirewallGuard>,
     pub session: ClientPairingSession,
     #[allow(dead_code)]
     pub url: String,
@@ -110,7 +110,7 @@ pub struct ActivePairing {
     pub server_device_name: String,
     pub port: u16,
     #[allow(dead_code)]
-    pub firewall_guard: FirewallGuard,
+    pub firewall_guard: Arc<FirewallGuard>,
     pub generation: u64,
 }
 

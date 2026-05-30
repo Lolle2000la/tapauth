@@ -4,7 +4,7 @@ use crate::transport::{ReceiveResult, Transport, UdpTransport};
 use shared::{
     config::{ClientConfigManager, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
-    firewall::{acquire_guard, Protocol as FwProtocol},
+    firewall::{FirewallGuard, Protocol as FwProtocol},
     network::get_session_timeout,
     protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
 };
@@ -292,7 +292,9 @@ impl AuthSession {
             }
         };
         let _fw_guard =
-            match tokio::task::spawn_blocking(move || acquire_guard(port, FwProtocol::Udp)).await {
+            match tokio::task::spawn_blocking(move || FirewallGuard::new(port, FwProtocol::Udp))
+                .await
+            {
                 Ok(Ok(g)) => Some(g),
                 Ok(Err(e)) => {
                     tracing::warn!(
