@@ -4,6 +4,7 @@ use crate::transport::{ReceiveResult, Transport, UdpTransport};
 use shared::{
     config::{ClientConfigManager, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
+    firewall::{FirewallGuard, Protocol as FwProtocol},
     network::get_session_timeout,
     protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
 };
@@ -279,6 +280,37 @@ impl AuthSession {
             allowed_servers.len(),
             self.username
         );
+
+        // Open firewall port for the duration of this authentication attempt.
+        // The guard auto-closes the port when dropped (i.e. when auth finishes,
+        // times out, or is cancelled), keeping the port closed when idle.
+        let port = match self.state.udp_socket.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                tracing::error!("Failed to get local address of UDP socket: {}", e);
+                shared::config::TapAuthConfig::load().udp_port
+            }
+        };
+        let _fw_guard =
+            match tokio::task::spawn_blocking(move || FirewallGuard::new(port, FwProtocol::Udp))
+                .await
+            {
+                Ok(Ok(g)) => Some(g),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "Failed to open firewall port for auth (continuing anyway): {}",
+                        e
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to join firewall port opening task (continuing anyway): {}",
+                        e
+                    );
+                    None
+                }
+            };
 
         // Create the authentication request
         let request = create_auth_request_with_challenge(

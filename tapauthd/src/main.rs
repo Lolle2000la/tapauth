@@ -14,7 +14,7 @@ mod transport;
 use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
-use clap::{Parser, Subcommand};
+
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
 use prost::Message;
@@ -36,28 +36,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
-
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Manage firewall rules (requires root)
-    ManageFirewall {
-        #[arg(value_enum)]
-        action: FirewallAction,
-    },
-}
-
-#[derive(clap::ValueEnum, Clone)]
-enum FirewallAction {
-    Open,
-    Close,
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
@@ -89,47 +67,6 @@ struct ServerState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    // Handle subcommands — log only to stderr to avoid log-file ownership issues
-    if let Some(Commands::ManageFirewall { action }) = args.command {
-        #[cfg(feature = "firewall")]
-        {
-            let toml_config = shared::config::TapAuthConfig::load();
-            let udp_port = toml_config.udp_port;
-
-            match action {
-                FirewallAction::Open => {
-                    eprintln!("Opening firewall port {}/udp", udp_port);
-                    if let Err(e) =
-                        shared::firewall::open_port(udp_port, shared::firewall::Protocol::Udp)
-                    {
-                        eprintln!("Failed to open firewall: {}", e);
-                        return Err(e.into());
-                    }
-                    return Ok(());
-                }
-                FirewallAction::Close => {
-                    eprintln!("Closing firewall port {}/udp", udp_port);
-                    if let Err(e) =
-                        shared::firewall::close_port(udp_port, shared::firewall::Protocol::Udp)
-                    {
-                        eprintln!("Failed to close firewall: {}", e);
-                        // Don't exit with error on close failure to avoid service failure state
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
-        #[cfg(not(feature = "firewall"))]
-        {
-            let _ = action;
-            eprintln!("Firewall feature not enabled, ignoring request");
-            return Ok(());
-        }
-    }
-
     logging::init_logging();
 
     tracing::info!("tapauthd starting...");

@@ -21,7 +21,6 @@ socket2 = "0.6"
 if-addrs = "0.15"
 
 # Utilities
-clap = "4.6"
 hex = "0.4"
 thiserror = "2.0"
 tracing = "0.1.44"
