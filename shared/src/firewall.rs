@@ -24,6 +24,7 @@ pub struct FirewallGuard {
 
 struct PortControl {
     weak: Weak<FirewallGuard>,
+    is_open: bool,
 }
 
 /// Per-port state.  The global map is locked only briefly to retrieve or
@@ -52,7 +53,12 @@ impl FirewallGuard {
                 .lock()
                 .map_err(|e| format!("guard map lock poisoned: {}", e))?;
             map.entry(port)
-                .or_insert_with(|| Arc::new(Mutex::new(PortControl { weak: Weak::new() })))
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(PortControl {
+                        weak: Weak::new(),
+                        is_open: false,
+                    }))
+                })
                 .clone()
         };
 
@@ -64,7 +70,10 @@ impl FirewallGuard {
             return Ok(existing);
         }
 
-        open_port(port, protocol)?;
+        if !ctrl.is_open {
+            open_port(port, protocol)?;
+            ctrl.is_open = true;
+        }
         let guard = Arc::new(Self { port, protocol });
         ctrl.weak = Arc::downgrade(&guard);
         Ok(guard)
@@ -103,7 +112,7 @@ fn do_drop_close(port: u16, protocol: Protocol) {
         }
     };
 
-    let ctrl = match port_ctrl.lock() {
+    let mut ctrl = match port_ctrl.lock() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("port control lock poisoned on drop: {}", e);
@@ -111,10 +120,11 @@ fn do_drop_close(port: u16, protocol: Protocol) {
         }
     };
 
-    if ctrl.weak.upgrade().is_none() {
+    if ctrl.weak.upgrade().is_none() && ctrl.is_open {
         if let Err(e) = close_port(port, protocol) {
             tracing::error!("Failed to close firewall port: {}", e);
         }
+        ctrl.is_open = false;
     }
 }
 
