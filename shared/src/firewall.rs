@@ -82,21 +82,13 @@ impl FirewallGuard {
 
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
-        let port = self.port;
-        let protocol = self.protocol;
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || do_drop_close(port, protocol));
-        } else {
-            std::thread::spawn(move || do_drop_close(port, protocol));
-        }
+        do_drop_close(self.port, self.protocol);
     }
 }
 
-/// Called from a background thread/task: check whether the weak entry
-/// is still alive and, if not, close the port.  Uses only the per-port
-/// lock for the close decision so that operations on other ports are
-/// never blocked.
+/// Check whether the weak entry is still alive and, if not, close the
+/// port.  Uses only the per-port lock for the close decision so that
+/// operations on other ports are never blocked.
 fn do_drop_close(port: u16, protocol: Protocol) {
     let port_ctrl = {
         let map = match guards().lock() {
