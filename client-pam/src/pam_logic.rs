@@ -20,6 +20,7 @@
 
 use crate::ipc_client::IpcClient;
 use crate::logging;
+use crate::pam_messages;
 use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
@@ -42,6 +43,8 @@ use std::time::{Duration, Instant};
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
+
+    let msgs = pam_messages::load();
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
@@ -86,9 +89,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {
-        pam_conv.try_info("TapAuth: Waiting for phone tap (press Enter to skip)...");
+        pam_conv.try_info(msgs.waiting_for_tap_skip);
     } else {
-        pam_conv.try_info("TapAuth: Waiting for phone tap...");
+        pam_conv.try_info(msgs.waiting_for_tap);
     }
 
     // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
@@ -114,14 +117,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
-            pam_conv.try_error("TapAuth: Cannot connect to daemon, trying password...");
+            pam_conv.try_error(msgs.cannot_connect);
             return pam_sys::PAM_IGNORE;
         }
     };
     if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
     {
         tracing::error!("Failed to send authenticate request: {}", e);
-        pam_conv.try_error("TapAuth: Communication error, trying password...");
+        pam_conv.try_error(msgs.communication_error);
         return pam_sys::PAM_IGNORE;
     }
 
@@ -146,7 +149,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
-                                    return map_pam_outcome(&resp, &username, &pam_conv)
+                                    return map_pam_outcome(&resp, &username, &pam_conv, msgs)
                                 }
                                 Ok(None) => {
                                     // No complete frame yet, check for errors
@@ -156,18 +159,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                         tracing::error!(
                                             "Daemon closed connection before sending response"
                                         );
-                                        pam_conv.try_info(
-                                            "TapAuth: Connection lost, trying password...",
-                                        );
+                                        pam_conv.try_info(msgs.connection_lost);
                                         return pam_sys::PAM_IGNORE;
                                     }
                                     continue;
                                 }
                                 Err(e) => {
                                     tracing::error!("IPC read failed: {}", e);
-                                    pam_conv.try_info(
-                                        "TapAuth: Communication error, trying password...",
-                                    );
+                                    pam_conv.try_info(msgs.communication_error);
                                     return pam_sys::PAM_IGNORE;
                                 }
                             }
@@ -176,7 +175,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         {
                             // Hangup/error without any data available
                             tracing::error!("Daemon closed connection or error detected");
-                            pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                            pam_conv.try_info(msgs.connection_lost);
                             return pam_sys::PAM_IGNORE;
                         }
                     }
@@ -188,7 +187,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 }
             }
         }
-        pam_conv.try_info("TapAuth: Timed out, trying password...");
+        pam_conv.try_info(msgs.timed_out);
         return pam_sys::PAM_IGNORE;
     }
 
@@ -219,7 +218,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             if rev.contains(PollFlags::POLLIN) {
                                 match ipc.try_read_response_nonblocking() {
                                     Ok(Some(resp)) => {
-                                        return map_pam_outcome(&resp, &username, &pam_conv)
+                                        return map_pam_outcome(&resp, &username, &pam_conv, msgs)
                                     }
                                     Ok(None) => {
                                         // No complete frame yet, check for errors
@@ -229,18 +228,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                             tracing::error!(
                                                 "Daemon closed connection before sending response"
                                             );
-                                            pam_conv.try_info(
-                                                "TapAuth: Connection lost, trying password...",
-                                            );
+                                            pam_conv.try_info(msgs.connection_lost);
                                             return pam_sys::PAM_IGNORE;
                                         }
                                         continue;
                                     }
                                     Err(e) => {
                                         tracing::error!("IPC read failed: {}", e);
-                                        pam_conv.try_info(
-                                            "TapAuth: Communication error, trying password...",
-                                        );
+                                        pam_conv.try_info(msgs.communication_error);
                                         return pam_sys::PAM_IGNORE;
                                     }
                                 }
@@ -249,7 +244,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             {
                                 // Hangup/error without any data available
                                 tracing::error!("Daemon closed connection or error detected");
-                                pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                                pam_conv.try_info(msgs.connection_lost);
                                 return pam_sys::PAM_IGNORE;
                             }
                         }
@@ -261,7 +256,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     }
                 }
             }
-            pam_conv.try_info("TapAuth: Timed out, trying password...");
+            pam_conv.try_info(msgs.timed_out);
             return pam_sys::PAM_IGNORE;
         }
     };
@@ -301,7 +296,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     // Read data first if available (POLLIN can be set with POLLHUP)
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
-                            Ok(Some(resp)) => return map_pam_outcome(&resp, &username, &pam_conv),
+                            Ok(Some(resp)) => {
+                                return map_pam_outcome(&resp, &username, &pam_conv, msgs)
+                            }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
                                 if rev.contains(PollFlags::POLLHUP)
@@ -310,22 +307,20 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                     tracing::error!(
                                         "Daemon closed connection before sending response"
                                     );
-                                    pam_conv
-                                        .try_info("TapAuth: Connection lost, trying password...");
+                                    pam_conv.try_info(msgs.connection_lost);
                                     return pam_sys::PAM_IGNORE;
                                 }
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {}", e);
-                                pam_conv
-                                    .try_info("TapAuth: Communication error, trying password...");
+                                pam_conv.try_info(msgs.communication_error);
                                 return pam_sys::PAM_IGNORE;
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         // Hangup/error without any data available
                         tracing::error!("Daemon closed connection or error detected");
-                        pam_conv.try_info("TapAuth: Connection lost, trying password...");
+                        pam_conv.try_info(msgs.connection_lost);
                         return pam_sys::PAM_IGNORE;
                     }
                 }
@@ -342,7 +337,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                 if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
-                                pam_conv.try_info("TapAuth: Skipped, trying password...");
+                                pam_conv.try_info(msgs.skipped);
                                 return pam_sys::PAM_IGNORE;
                             }
                             // Non-Enter key: consume and ignore (could be user typing password early)
@@ -358,7 +353,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     }
 
-    pam_conv.try_info("TapAuth: Timed out, trying password...");
+    pam_conv.try_info(msgs.timed_out);
     pam_sys::PAM_IGNORE
 }
 
@@ -410,16 +405,17 @@ fn map_pam_outcome(
     resp: &shared::ipc::pb::PamAuthenticateResponse,
     username: &str,
     pam_conv: &pam_sys::PamConversation,
+    msgs: &pam_messages::PamMessages,
 ) -> c_int {
     match resp.outcome() {
         shared::ipc::pb::PamOutcome::Success => {
             tracing::info!("Authentication successful for user: {}", username);
-            pam_conv.try_info("TapAuth: Authentication successful!");
+            pam_conv.try_info(msgs.auth_successful);
             pam_sys::PAM_SUCCESS
         }
         shared::ipc::pb::PamOutcome::Denied => {
             tracing::info!("Authentication explicitly denied for user: {}", username);
-            pam_conv.try_info("TapAuth: Authentication denied by server");
+            pam_conv.try_info(msgs.auth_denied);
             pam_sys::PAM_PERM_DENIED
         }
         shared::ipc::pb::PamOutcome::Timeout => {
@@ -436,7 +432,7 @@ fn map_pam_outcome(
                 username,
                 resp.detail
             );
-            pam_conv.try_error(&format!("TapAuth: Error - {}", resp.detail));
+            pam_conv.try_error(&msgs.error(&resp.detail));
             pam_sys::PAM_IGNORE
         }
     }

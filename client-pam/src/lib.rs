@@ -33,6 +33,7 @@ mod error;
 mod ipc_client;
 mod logging;
 mod pam_logic;
+mod pam_messages;
 mod pam_sys;
 
 pub use error::PamError;
