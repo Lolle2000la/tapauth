@@ -13,8 +13,9 @@ use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
-#[path = "locales_codegen.rs"]
-mod locales_codegen;
+mod locales_codegen {
+    include!(concat!(env!("OUT_DIR"), "/locales_codegen.rs"));
+}
 
 pub struct PamMessages {
     waiting_for_tap_skip: String,
@@ -81,15 +82,11 @@ impl PamMessages {
 
         let (bundle, fallback) = if locale == "en" {
             (en_bundle, None)
+        } else if let Some(ftl) = locales_codegen::load_ftl(locale) {
+            let lang_id: LanguageIdentifier = locale.parse().unwrap_or_default();
+            (load_bundle(ftl, lang_id), Some(en_bundle))
         } else {
-            let ftl = locales_codegen::load_ftl(locale);
-            // if the locale wasn't found, load_ftl returns English — skip fallback
-            if std::ptr::eq(ftl, en_ftl) {
-                (en_bundle, None)
-            } else {
-                let lang_id: LanguageIdentifier = locale.parse().unwrap_or_default();
-                (load_bundle(ftl, lang_id), Some(en_bundle))
-            }
+            (en_bundle, None)
         };
 
         let tr_val = |key: &str| tr(&bundle, fallback.as_ref(), key);
@@ -144,7 +141,7 @@ impl PamMessages {
 /// Detect locale from POSIX environment variables.
 /// Mirrors the GUI's `detect_locale()` logic.
 pub fn detect_locale() -> &'static str {
-    locales_codegen::detect_locale()
+    shared::l10n::detect_locale(locales_codegen::AVAILABLE_LOCALES)
 }
 
 /// Load PAM messages for the detected locale.

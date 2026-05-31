@@ -4,11 +4,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
-#[path = "locales_codegen.rs"]
-mod locales_codegen;
+mod locales_codegen {
+    include!(concat!(env!("OUT_DIR"), "/locales_codegen.rs"));
+}
 pub use locales_codegen::locale_display_name;
 
-/// List of all available locale codes, discovered at build time.
 pub const AVAILABLE_LOCALES: &[&str] = locales_codegen::AVAILABLE_LOCALES;
 
 #[derive(Clone)]
@@ -26,7 +26,8 @@ impl fmt::Debug for L10n {
 
 impl L10n {
     pub fn new(locale: &str) -> Self {
-        let ftl_str = locales_codegen::load_ftl(locale);
+        let ftl_str =
+            locales_codegen::load_ftl(locale).unwrap_or(include_str!("../locales/en/main.ftl"));
 
         let res = FluentResource::try_new(ftl_str.to_string())
             .expect("Failed to parse static FTL string.");
@@ -88,7 +89,7 @@ impl L10n {
 
 /// Detect system locale respecting POSIX priority rules (LC_ALL > LC_MESSAGES > LANG)
 pub fn detect_locale() -> &'static str {
-    locales_codegen::detect_locale()
+    shared::l10n::detect_locale(AVAILABLE_LOCALES)
 }
 
 fn is_valid_locale(code: &str) -> bool {
