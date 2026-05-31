@@ -6,7 +6,8 @@
 //! time so accessors return `&str` with zero runtime cost.
 //!
 //! When a key is missing in a non-English locale, the English bundle is used
-//! as a fallback — matching the GUI's Fluent Bundle fallback behaviour.
+//! as a fallback.  Fluent parse / resource errors are logged and recovered
+//! from gracefully — PAM modules must never panic.
 
 use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
@@ -49,43 +50,47 @@ fn tr(
     format!("??{}??", key)
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 fn load_bundle(ftl_str: &str, lang_id: LanguageIdentifier) -> FluentBundle<Arc<FluentResource>> {
-    let res = FluentResource::try_new(ftl_str.to_string())
-        .expect("Failed to parse embedded PAM FTL file");
+    let res = match FluentResource::try_new(ftl_str.to_string()) {
+        Ok(r) => r,
+        Err((r, errs)) => {
+            for err in errs {
+                tracing::error!("Fluent parse error in PAM FTL: {:?}", err);
+            }
+            r
+        }
+    };
     let mut bundle = FluentBundle::new(vec![lang_id]);
-    bundle
-        .add_resource(Arc::new(res))
-        .expect("Failed to add FTL resource to PAM bundle");
+    if let Err(errs) = bundle.add_resource(Arc::new(res)) {
+        for err in errs {
+            tracing::error!("Failed to add FTL resource to PAM bundle: {:?}", err);
+        }
+    }
     bundle.set_use_isolating(false);
     bundle
 }
 
 impl PamMessages {
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
     pub fn new(locale: &str) -> Self {
-        let en_str = include_str!("../locales/en/main.ftl");
-        let en_bundle = {
-            let en_lang: LanguageIdentifier = "en".parse().unwrap();
-            load_bundle(en_str, en_lang)
-        };
+        let en_lang: LanguageIdentifier = "en".parse().unwrap_or_default();
+        let en_bundle = load_bundle(include_str!("../locales/en/main.ftl"), en_lang);
 
         let (bundle, fallback) = match locale {
-            "en" => (en_bundle, None),
-            other => {
-                let ftl_str = match other {
-                    "de" => include_str!("../locales/de/main.ftl"),
-                    "ja" => include_str!("../locales/ja/main.ftl"),
-                    _ => en_str,
-                };
-                if std::ptr::eq(ftl_str, en_str) {
-                    (en_bundle, None)
-                } else {
-                    let lang_id: LanguageIdentifier =
-                        other.parse().unwrap_or_else(|_| "en".parse().unwrap());
-                    (load_bundle(ftl_str, lang_id), Some(en_bundle))
-                }
+            "de" => {
+                let lang_id = "de".parse().unwrap_or_default();
+                (
+                    load_bundle(include_str!("../locales/de/main.ftl"), lang_id),
+                    Some(en_bundle),
+                )
             }
+            "ja" => {
+                let lang_id = "ja".parse().unwrap_or_default();
+                (
+                    load_bundle(include_str!("../locales/ja/main.ftl"), lang_id),
+                    Some(en_bundle),
+                )
+            }
+            _ => (en_bundle, None),
         };
 
         let tr_val = |key: &str| tr(&bundle, fallback.as_ref(), key);
@@ -142,11 +147,10 @@ impl PamMessages {
 pub fn detect_locale() -> &'static str {
     for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(val) = std::env::var(var) {
-            let val_lower = val.to_lowercase();
-            if val_lower.starts_with("de") {
+            if val.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("de")) {
                 return "de";
             }
-            if val_lower.starts_with("ja") {
+            if val.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("ja")) {
                 return "ja";
             }
         }
