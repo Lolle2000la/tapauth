@@ -13,6 +13,9 @@ use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
+#[path = "locales_codegen.rs"]
+mod locales_codegen;
+
 pub struct PamMessages {
     waiting_for_tap_skip: String,
     waiting_for_tap: String,
@@ -72,25 +75,21 @@ fn load_bundle(ftl_str: &str, lang_id: LanguageIdentifier) -> FluentBundle<Arc<F
 
 impl PamMessages {
     pub fn new(locale: &str) -> Self {
+        let en_ftl = include_str!("../locales/en/main.ftl");
         let en_lang: LanguageIdentifier = "en".parse().unwrap_or_default();
-        let en_bundle = load_bundle(include_str!("../locales/en/main.ftl"), en_lang);
+        let en_bundle = load_bundle(en_ftl, en_lang);
 
-        let (bundle, fallback) = match locale {
-            "de" => {
-                let lang_id = "de".parse().unwrap_or_default();
-                (
-                    load_bundle(include_str!("../locales/de/main.ftl"), lang_id),
-                    Some(en_bundle),
-                )
+        let (bundle, fallback) = if locale == "en" {
+            (en_bundle, None)
+        } else {
+            let ftl = locales_codegen::load_ftl(locale);
+            // if the locale wasn't found, load_ftl returns English — skip fallback
+            if std::ptr::eq(ftl, en_ftl) {
+                (en_bundle, None)
+            } else {
+                let lang_id: LanguageIdentifier = locale.parse().unwrap_or_default();
+                (load_bundle(ftl, lang_id), Some(en_bundle))
             }
-            "ja" => {
-                let lang_id = "ja".parse().unwrap_or_default();
-                (
-                    load_bundle(include_str!("../locales/ja/main.ftl"), lang_id),
-                    Some(en_bundle),
-                )
-            }
-            _ => (en_bundle, None),
         };
 
         let tr_val = |key: &str| tr(&bundle, fallback.as_ref(), key);
@@ -145,21 +144,7 @@ impl PamMessages {
 /// Detect locale from POSIX environment variables.
 /// Mirrors the GUI's `detect_locale()` logic.
 pub fn detect_locale() -> &'static str {
-    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(val) = std::env::var(var) {
-            let val_lower = val.to_ascii_lowercase();
-            for lang in &["de", "ja"] {
-                if val_lower == *lang
-                    || val_lower
-                        .strip_prefix(lang)
-                        .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
-                {
-                    return lang;
-                }
-            }
-        }
-    }
-    "en"
+    locales_codegen::detect_locale()
 }
 
 /// Load PAM messages for the detected locale.

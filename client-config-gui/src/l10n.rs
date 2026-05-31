@@ -4,6 +4,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
+#[path = "locales_codegen.rs"]
+mod locales_codegen;
+pub use locales_codegen::locale_display_name;
+
+/// List of all available locale codes, discovered at build time.
+pub const AVAILABLE_LOCALES: &[&str] = locales_codegen::AVAILABLE_LOCALES;
+
 #[derive(Clone)]
 pub struct L10n {
     locale: String,
@@ -19,11 +26,7 @@ impl fmt::Debug for L10n {
 
 impl L10n {
     pub fn new(locale: &str) -> Self {
-        let ftl_str = match locale {
-            "de" => include_str!("../locales/de/main.ftl"),
-            "ja" => include_str!("../locales/ja/main.ftl"),
-            _ => include_str!("../locales/en/main.ftl"),
-        };
+        let ftl_str = locales_codegen::load_ftl(locale);
 
         let res = FluentResource::try_new(ftl_str.to_string())
             .expect("Failed to parse static FTL string.");
@@ -85,21 +88,11 @@ impl L10n {
 
 /// Detect system locale respecting POSIX priority rules (LC_ALL > LC_MESSAGES > LANG)
 pub fn detect_locale() -> &'static str {
-    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(val) = std::env::var(var) {
-            let val_lower = val.to_ascii_lowercase();
-            for lang in &["de", "ja"] {
-                if val_lower == *lang
-                    || val_lower
-                        .strip_prefix(lang)
-                        .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
-                {
-                    return lang;
-                }
-            }
-        }
-    }
-    "en"
+    locales_codegen::detect_locale()
+}
+
+fn is_valid_locale(code: &str) -> bool {
+    AVAILABLE_LOCALES.contains(&code)
 }
 
 /// Resolve the effective locale with this precedence:
@@ -108,7 +101,7 @@ pub fn detect_locale() -> &'static str {
 /// 3. System locale detection (LANG/LC_ALL/LC_MESSAGES)
 pub fn resolve_locale(cli_override: Option<&str>, username: &str) -> String {
     if let Some(loc) = cli_override {
-        if matches!(loc, "de" | "ja" | "en") {
+        if is_valid_locale(loc) {
             return loc.to_string();
         }
     }
@@ -135,7 +128,7 @@ fn load_user_locale(username: &str) -> Option<String> {
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| matches!(s.as_str(), "de" | "ja" | "en"))
+        .filter(|s| is_valid_locale(s))
 }
 
 fn user_locale_path(username: &str) -> std::path::PathBuf {
