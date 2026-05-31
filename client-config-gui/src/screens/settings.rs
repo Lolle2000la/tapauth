@@ -10,12 +10,12 @@ use std::sync::LazyLock;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocaleOption {
     code: &'static str,
-    display: String,
+    display: &'static str,
 }
 
 impl std::fmt::Display for LocaleOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.display)
+        f.write_str(self.display)
     }
 }
 
@@ -24,7 +24,7 @@ fn locale_options() -> Vec<LocaleOption> {
         .iter()
         .map(|&code| LocaleOption {
             code,
-            display: l10n::locale_display_name(code).to_string(),
+            display: l10n::locale_display_name(code),
         })
         .collect()
 }
