@@ -4,6 +4,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
+mod locales_codegen {
+    include!(concat!(env!("OUT_DIR"), "/locales_codegen.rs"));
+}
+pub use locales_codegen::locale_display_name;
+
+pub const AVAILABLE_LOCALES: &[&str] = locales_codegen::AVAILABLE_LOCALES;
+
 #[derive(Clone)]
 pub struct L10n {
     locale: String,
@@ -19,11 +26,8 @@ impl fmt::Debug for L10n {
 
 impl L10n {
     pub fn new(locale: &str) -> Self {
-        let ftl_str = match locale {
-            "de" => include_str!("../locales/de/main.ftl"),
-            "ja" => include_str!("../locales/ja/main.ftl"),
-            _ => include_str!("../locales/en/main.ftl"),
-        };
+        let ftl_str =
+            locales_codegen::load_ftl(locale).unwrap_or(include_str!("../locales/en/main.ftl"));
 
         let res = FluentResource::try_new(ftl_str.to_string())
             .expect("Failed to parse static FTL string.");
@@ -85,18 +89,11 @@ impl L10n {
 
 /// Detect system locale respecting POSIX priority rules (LC_ALL > LC_MESSAGES > LANG)
 pub fn detect_locale() -> &'static str {
-    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(val) = std::env::var(var) {
-            let val_lower = val.to_lowercase();
-            if val_lower.starts_with("de") {
-                return "de";
-            }
-            if val_lower.starts_with("ja") {
-                return "ja";
-            }
-        }
-    }
-    "en"
+    shared::l10n::detect_locale(AVAILABLE_LOCALES)
+}
+
+fn is_valid_locale(code: &str) -> bool {
+    AVAILABLE_LOCALES.contains(&code)
 }
 
 /// Resolve the effective locale with this precedence:
@@ -105,7 +102,7 @@ pub fn detect_locale() -> &'static str {
 /// 3. System locale detection (LANG/LC_ALL/LC_MESSAGES)
 pub fn resolve_locale(cli_override: Option<&str>, username: &str) -> String {
     if let Some(loc) = cli_override {
-        if matches!(loc, "de" | "ja" | "en") {
+        if is_valid_locale(loc) {
             return loc.to_string();
         }
     }
@@ -117,7 +114,10 @@ pub fn resolve_locale(cli_override: Option<&str>, username: &str) -> String {
 
 /// Save the user's locale preference to ~/.config/tapauth/locale
 pub fn save_user_locale(username: &str, locale: &str) {
-    let path = user_locale_path(username);
+    let Some(path) = user_locale_path(username) else {
+        tracing::warn!("Cannot determine home directory for {username}, skipping locale save");
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -128,18 +128,33 @@ pub fn save_user_locale(username: &str, locale: &str) {
 
 /// Load the user's persisted locale preference, if any
 fn load_user_locale(username: &str) -> Option<String> {
-    let path = user_locale_path(username);
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| matches!(s.as_str(), "de" | "ja" | "en"))
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = user_locale_path(username)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .ok()?;
+
+    if let Ok(meta) = file.metadata() {
+        if !meta.is_file() {
+            return None;
+        }
+    }
+
+    let mut s = String::new();
+    let mut reader = file.take(16);
+    reader.read_to_string(&mut s).ok()?;
+
+    Some(s.trim().to_string()).filter(|s| is_valid_locale(s))
 }
 
-fn user_locale_path(username: &str) -> std::path::PathBuf {
+fn user_locale_path(username: &str) -> Option<std::path::PathBuf> {
     let home = nix::unistd::User::from_name(username)
         .ok()
         .flatten()
-        .map(|u| u.dir.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    home.join(".config/tapauth/locale")
+        .map(|u| u.dir.to_path_buf())?;
+    Some(home.join(".config/tapauth/locale"))
 }

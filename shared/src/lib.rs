@@ -29,6 +29,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod ipc;
+pub mod l10n;
 pub mod models;
 pub mod network;
 pub mod protocol;

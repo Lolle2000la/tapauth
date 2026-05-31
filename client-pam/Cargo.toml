@@ -29,6 +29,10 @@ getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true
 
+# Localization
+fluent.workspace = true
+unic-langid.workspace = true
+
 [features]
 default = []
 tpm = ["shared/tpm"]

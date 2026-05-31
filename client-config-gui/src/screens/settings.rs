@@ -1,15 +1,11 @@
 use super::ScreenMessage;
 use crate::ipc::GuiIpcError;
-use crate::l10n::L10n;
+use crate::l10n::{self, L10n};
 use iced::{
     widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
     Element, Font, Length, Task,
 };
 use std::sync::LazyLock;
-
-mod locales_list {
-    include!(concat!(env!("OUT_DIR"), "/locales_list.rs"));
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocaleOption {
@@ -24,21 +20,13 @@ impl std::fmt::Display for LocaleOption {
 }
 
 fn locale_options() -> Vec<LocaleOption> {
-    locales_list::AVAILABLE_LOCALES
+    l10n::AVAILABLE_LOCALES
         .iter()
         .map(|&code| LocaleOption {
             code,
-            display: locale_display_name(code),
+            display: l10n::locale_display_name(code),
         })
         .collect()
-}
-
-fn locale_display_name(code: &str) -> &'static str {
-    match code {
-        "de" => "Deutsch",
-        "ja" => "日本語",
-        _ => "English",
-    }
 }
 
 static LOCALE_OPTIONS: LazyLock<Vec<LocaleOption>> = LazyLock::new(locale_options);

@@ -713,6 +713,7 @@ name = "client-pam"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fluent",
  "getrandom 0.4.2",
  "hex",
  "libc",
@@ -725,6 +726,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unic-langid",
 ]
 
 [[package]]
