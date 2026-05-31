@@ -6,7 +6,6 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
 import android.util.Log
-import dev.rourunisen.tapauth.BuildConfig
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -29,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import dev.rourunisen.tapauth.BuildConfig
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.AppConfiguration
 import java.text.DateFormat
