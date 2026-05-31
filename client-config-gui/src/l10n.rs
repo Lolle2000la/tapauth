@@ -114,7 +114,10 @@ pub fn resolve_locale(cli_override: Option<&str>, username: &str) -> String {
 
 /// Save the user's locale preference to ~/.config/tapauth/locale
 pub fn save_user_locale(username: &str, locale: &str) {
-    let path = user_locale_path(username);
+    let Some(path) = user_locale_path(username) else {
+        tracing::warn!("Cannot determine home directory for {username}, skipping locale save");
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -125,18 +128,17 @@ pub fn save_user_locale(username: &str, locale: &str) {
 
 /// Load the user's persisted locale preference, if any
 fn load_user_locale(username: &str) -> Option<String> {
-    let path = user_locale_path(username);
+    let path = user_locale_path(username)?;
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| is_valid_locale(s))
 }
 
-fn user_locale_path(username: &str) -> std::path::PathBuf {
+fn user_locale_path(username: &str) -> Option<std::path::PathBuf> {
     let home = nix::unistd::User::from_name(username)
         .ok()
         .flatten()
-        .map(|u| u.dir.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    home.join(".config/tapauth/locale")
+        .map(|u| u.dir.to_path_buf())?;
+    Some(home.join(".config/tapauth/locale"))
 }

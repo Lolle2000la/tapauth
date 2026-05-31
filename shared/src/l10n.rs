@@ -22,9 +22,10 @@ pub fn detect_locale(available_locales: &[&'static str]) -> &'static str {
 }
 
 fn locale_matches(val: &str, lang: &str) -> bool {
-    let lang_lower = lang.to_ascii_lowercase();
-    *val == lang_lower
-        || val
-            .strip_prefix(&lang_lower)
-            .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
+    let lang_norm = lang.to_ascii_lowercase().replace('_', "-");
+    let val_norm = val.replace('_', "-");
+    val_norm == lang_norm
+        || val_norm
+            .strip_prefix(&lang_norm)
+            .is_some_and(|rest| rest.starts_with(['-', '.', '@']))
 }
