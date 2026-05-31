@@ -34,6 +34,15 @@ fn main() -> iced::Result {
         std::process::exit(1);
     }
 
+    if let Err(_err) = utils::system_check::validate_tapauthd_clients_group() {
+        let _ = DialogBuilder::message()
+            .set_title(bootstrap_l10n.tr("warn-group-missing-title"))
+            .set_text(bootstrap_l10n.tr("warn-group-missing-message"))
+            .set_level(MessageLevel::Warning)
+            .alert()
+            .show();
+    }
+
     tracing::info!("Starting TapAuth Configuration GUI");
     tracing::info!("Running GUI as unprivileged user: {}", original_user);
     tracing::info!("Using locale: {}", locale);

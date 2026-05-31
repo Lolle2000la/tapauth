@@ -65,7 +65,7 @@ settings-csk-rotated = CSK erfolgreich rotiert. Alle Kopplungen wurden gelöscht
 settings-error-prefix = Fehler: {$message}
 settings-invalid-port = Ungültige Portnummer (muss 1-65535 sein)
 
-# ── System Error Dialogs ──
+# ── System Error/Warning Dialogs ──
 error-user-missing-title = Systembenutzer fehlt
 error-user-missing-message = Der Systembenutzer 'tapauthd' wird benötigt, wurde aber nicht gefunden.
 
@@ -77,3 +77,13 @@ error-user-missing-message = Der Systembenutzer 'tapauthd' wird benötigt, wurde
 
     Falls das Problem weiterhin besteht, müssen Sie den Benutzer manuell erstellen:
         sudo useradd --system --no-create-home tapauthd
+
+warn-group-missing-title = Gruppenmitgliedschaft erforderlich
+warn-group-missing-message = Sie sind kein Mitglied der Gruppe 'tapauthd-clients'.
+    Ohne diese Mitgliedschaft können Sie nicht mit dem TapAuth-Daemon kommunizieren.
+
+    Um sich zur Gruppe hinzuzufügen, führen Sie diesen Befehl im Terminal aus:
+        sudo usermod -aG tapauthd-clients $USER
+
+    Melden Sie sich dann ab und wieder an, damit die Änderung wirksam wird.
+    (Sie können auch 'newgrp tapauthd-clients' in Ihrer aktuellen Sitzung ausführen)

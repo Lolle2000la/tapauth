@@ -65,7 +65,7 @@ settings-csk-rotated = CSKが正常にローテーションされました。す
 settings-error-prefix = エラー: {$message}
 settings-invalid-port = 無効なポート番号（1-65535である必要があります）
 
-# ── System Error Dialogs ──
+# ── System Error/Warning Dialogs ──
 error-user-missing-title = システムユーザーが見つかりません
 error-user-missing-message = システムユーザー 'tapauthd' が必要ですが、見つかりませんでした。
 
@@ -77,3 +77,13 @@ error-user-missing-message = システムユーザー 'tapauthd' が必要です
 
     問題が解決しない場合は、手動でユーザーを作成する必要があります：
         sudo useradd --system --no-create-home tapauthd
+
+warn-group-missing-title = グループメンバーシップが必要です
+warn-group-missing-message = 'tapauthd-clients' グループのメンバーではありません。
+    このメンバーシップがないと、TapAuthデーモンと通信できません。
+
+    グループに自分を追加するには、ターミナルで次のコマンドを実行してください：
+        sudo usermod -aG tapauthd-clients $USER
+
+    その後、変更を有効にするためにログアウトして再度ログインしてください。
+    （現在のセッションで 'newgrp tapauthd-clients' を実行することもできます）
