@@ -128,11 +128,26 @@ pub fn save_user_locale(username: &str, locale: &str) {
 
 /// Load the user's persisted locale preference, if any
 fn load_user_locale(username: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let path = user_locale_path(username)?;
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| is_valid_locale(s))
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .ok()?;
+
+    if let Ok(meta) = file.metadata() {
+        if !meta.is_file() {
+            return None;
+        }
+    }
+
+    let mut s = String::new();
+    file.read_to_string(&mut s).ok()?;
+
+    Some(s.trim().to_string()).filter(|s| is_valid_locale(s))
 }
 
 fn user_locale_path(username: &str) -> Option<std::path::PathBuf> {

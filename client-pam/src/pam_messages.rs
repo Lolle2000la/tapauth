@@ -154,15 +154,31 @@ fn resolve_locale(username: &str) -> String {
 }
 
 fn load_user_locale(username: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let home = nix::unistd::User::from_name(username)
         .ok()
         .flatten()
         .map(|u| u.dir.to_path_buf())?;
     let path = home.join(".config/tapauth/locale");
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| locales_codegen::AVAILABLE_LOCALES.contains(&s.as_str()))
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .ok()?;
+
+    if let Ok(meta) = file.metadata() {
+        if !meta.is_file() {
+            return None;
+        }
+    }
+
+    let mut s = String::new();
+    file.read_to_string(&mut s).ok()?;
+
+    Some(s.trim().to_string()).filter(|s| locales_codegen::AVAILABLE_LOCALES.contains(&s.as_str()))
 }
 
 /// Load PAM messages for the given username, respecting any persisted
