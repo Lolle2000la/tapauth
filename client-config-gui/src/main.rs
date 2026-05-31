@@ -24,23 +24,23 @@ fn main() -> iced::Result {
 
     let bootstrap_l10n = l10n::L10n::new(&locale);
 
-    if let Err(_err) = utils::system_check::validate_tapauthd_user() {
-        let _ = DialogBuilder::message()
-            .set_title(bootstrap_l10n.tr("error-user-missing-title"))
-            .set_text(bootstrap_l10n.tr("error-user-missing-message"))
-            .set_level(MessageLevel::Error)
-            .alert()
-            .show();
-        std::process::exit(1);
-    }
-
-    if let Err(_err) = utils::system_check::validate_tapauthd_clients_group() {
-        let _ = DialogBuilder::message()
-            .set_title(bootstrap_l10n.tr("warn-group-missing-title"))
-            .set_text(bootstrap_l10n.tr("warn-group-missing-message"))
-            .set_level(MessageLevel::Warning)
-            .alert()
-            .show();
+    for result in utils::system_check::validate_all() {
+        if let Err(err) = result {
+            let level = if err.is_fatal() {
+                MessageLevel::Error
+            } else {
+                MessageLevel::Warning
+            };
+            let _ = DialogBuilder::message()
+                .set_title(bootstrap_l10n.tr(err.title_key()))
+                .set_text(bootstrap_l10n.tr(err.message_key()))
+                .set_level(level)
+                .alert()
+                .show();
+            if err.is_fatal() {
+                std::process::exit(1);
+            }
+        }
     }
 
     tracing::info!("Starting TapAuth Configuration GUI");

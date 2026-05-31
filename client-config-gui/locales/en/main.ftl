@@ -78,6 +78,18 @@ error-user-missing-message = The 'tapauthd' system user is required but was not 
     If the problem persists, you may need to create the user manually:
         sudo useradd --system --no-create-home tapauthd
 
+error-group-missing-title = System Group Missing
+error-group-missing-message = The 'tapauthd-clients' system group is required but was not found.
+
+    This group should have been created during installation.
+
+    Recommended action:
+    1. Log out and log back in (or restart your system)
+    2. Try launching the application again
+
+    If the problem persists, you may need to create the group manually:
+        sudo groupadd --system tapauthd-clients
+
 warn-group-missing-title = Group Membership Required
 warn-group-missing-message = You are not a member of the 'tapauthd-clients' group.
     Without this membership, you will not be able to communicate with the TapAuth daemon.
