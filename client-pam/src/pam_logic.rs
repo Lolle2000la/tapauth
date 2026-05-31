@@ -148,7 +148,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
-                                    return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                    return map_pam_outcome(&resp, &username, &pam_conv, msgs)
                                 }
                                 Ok(None) => {
                                     // No complete frame yet, check for errors
@@ -217,7 +217,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             if rev.contains(PollFlags::POLLIN) {
                                 match ipc.try_read_response_nonblocking() {
                                     Ok(Some(resp)) => {
-                                        return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                        return map_pam_outcome(&resp, &username, &pam_conv, msgs)
                                     }
                                     Ok(None) => {
                                         // No complete frame yet, check for errors
@@ -296,7 +296,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
-                                return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                return map_pam_outcome(&resp, &username, &pam_conv, msgs)
                             }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
