@@ -1,70 +1,102 @@
-//! Compile-time localized user-facing messages for the PAM module.
+//! Localized user-facing messages for the PAM module.
 //!
-//! The PAM module runs as a lightweight cdylib loaded by the PAM stack.
-//! To avoid pulling in Fluent or doing file I/O, all translated strings
-//! are embedded as Rust constants. Locale detection uses the standard
-//! POSIX environment variables (LC_ALL, LC_MESSAGES, LANG).
+//! Uses the same Fluent (FTL) localization engine as the GUI, matching its
+//! locale detection (LC_ALL → LC_MESSAGES → LANG) and embedding FTL strings
+//! at compile time via `include_str!()`.  All keys are resolved at construction
+//! time so accessors return `&str` with zero runtime cost.
+
+use fluent::{FluentBundle, FluentResource};
+use std::sync::Arc;
+use unic_langid::LanguageIdentifier;
 
 pub struct PamMessages {
-    pub waiting_for_tap_skip: &'static str,
-    pub waiting_for_tap: &'static str,
-    pub cannot_connect: &'static str,
-    pub communication_error: &'static str,
-    pub connection_lost: &'static str,
-    pub timed_out: &'static str,
-    pub skipped: &'static str,
-    pub auth_successful: &'static str,
-    pub auth_denied: &'static str,
-    pub error_prefix: &'static str,
+    waiting_for_tap_skip: String,
+    waiting_for_tap: String,
+    cannot_connect: String,
+    communication_error: String,
+    connection_lost: String,
+    timed_out: String,
+    skipped: String,
+    auth_successful: String,
+    auth_denied: String,
+    error_prefix: String,
+}
+
+fn tr(bundle: &FluentBundle<Arc<FluentResource>>, key: &str) -> String {
+    if let Some(msg) = bundle.get_message(key) {
+        if let Some(pattern) = msg.value() {
+            let mut errors = vec![];
+            return bundle
+                .format_pattern(pattern, None, &mut errors)
+                .to_string();
+        }
+    }
+    format!("??{}??", key)
 }
 
 impl PamMessages {
+    pub fn new(locale: &str) -> Self {
+        let ftl_str = match locale {
+            "de" => include_str!("../locales/de/main.ftl"),
+            "ja" => include_str!("../locales/ja/main.ftl"),
+            _ => include_str!("../locales/en/main.ftl"),
+        };
+
+        let res = FluentResource::try_new(ftl_str.to_string())
+            .expect("Failed to parse embedded PAM FTL file");
+        let lang_id: LanguageIdentifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+        let mut bundle = FluentBundle::new(vec![lang_id]);
+        bundle
+            .add_resource(Arc::new(res))
+            .expect("Failed to add FTL resource to PAM bundle");
+        bundle.set_use_isolating(false);
+
+        Self {
+            waiting_for_tap_skip: tr(&bundle, "pam-waiting-tap-skip"),
+            waiting_for_tap: tr(&bundle, "pam-waiting-tap"),
+            cannot_connect: tr(&bundle, "pam-cannot-connect"),
+            communication_error: tr(&bundle, "pam-communication-error"),
+            connection_lost: tr(&bundle, "pam-connection-lost"),
+            timed_out: tr(&bundle, "pam-timed-out"),
+            skipped: tr(&bundle, "pam-skipped"),
+            auth_successful: tr(&bundle, "pam-auth-successful"),
+            auth_denied: tr(&bundle, "pam-auth-denied"),
+            error_prefix: tr(&bundle, "pam-error-prefix"),
+        }
+    }
+
+    pub fn waiting_for_tap_skip(&self) -> &str {
+        &self.waiting_for_tap_skip
+    }
+    pub fn waiting_for_tap(&self) -> &str {
+        &self.waiting_for_tap
+    }
+    pub fn cannot_connect(&self) -> &str {
+        &self.cannot_connect
+    }
+    pub fn communication_error(&self) -> &str {
+        &self.communication_error
+    }
+    pub fn connection_lost(&self) -> &str {
+        &self.connection_lost
+    }
+    pub fn timed_out(&self) -> &str {
+        &self.timed_out
+    }
+    pub fn skipped(&self) -> &str {
+        &self.skipped
+    }
+    pub fn auth_successful(&self) -> &str {
+        &self.auth_successful
+    }
+    pub fn auth_denied(&self) -> &str {
+        &self.auth_denied
+    }
+
+    /// Build an error message by concatenating the localized prefix with the detail string.
     pub fn error(&self, detail: &str) -> String {
         format!("{}{}", self.error_prefix, detail)
     }
-}
-
-mod strings {
-    use super::PamMessages;
-
-    pub const EN: PamMessages = PamMessages {
-        waiting_for_tap_skip: "TapAuth: Waiting for phone tap (press Enter to skip)...",
-        waiting_for_tap: "TapAuth: Waiting for phone tap...",
-        cannot_connect: "TapAuth: Cannot connect to daemon, trying password...",
-        communication_error: "TapAuth: Communication error, trying password...",
-        connection_lost: "TapAuth: Connection lost, trying password...",
-        timed_out: "TapAuth: Timed out, trying password...",
-        skipped: "TapAuth: Skipped, trying password...",
-        auth_successful: "TapAuth: Authentication successful!",
-        auth_denied: "TapAuth: Authentication denied by server",
-        error_prefix: "TapAuth: Error - ",
-    };
-
-    pub const DE: PamMessages = PamMessages {
-        waiting_for_tap_skip: "TapAuth: Warte auf Tippen am Telefon (Enter zum Überspringen)...",
-        waiting_for_tap: "TapAuth: Warte auf Tippen am Telefon...",
-        cannot_connect: "TapAuth: Keine Verbindung zum Daemon, versuche Passwort...",
-        communication_error: "TapAuth: Kommunikationsfehler, versuche Passwort...",
-        connection_lost: "TapAuth: Verbindung verloren, versuche Passwort...",
-        timed_out: "TapAuth: Zeitüberschreitung, versuche Passwort...",
-        skipped: "TapAuth: Übersprungen, versuche Passwort...",
-        auth_successful: "TapAuth: Authentifizierung erfolgreich!",
-        auth_denied: "TapAuth: Authentifizierung vom Server abgelehnt",
-        error_prefix: "TapAuth: Fehler - ",
-    };
-
-    pub const JA: PamMessages = PamMessages {
-        waiting_for_tap_skip: "TapAuth: スマートフォンのタップを待機中（Enterでスキップ）...",
-        waiting_for_tap: "TapAuth: スマートフォンのタップを待機中...",
-        cannot_connect: "TapAuth: デーモンに接続できません、パスワードを試します...",
-        communication_error: "TapAuth: 通信エラー、パスワードを試します...",
-        connection_lost: "TapAuth: 接続が失われました、パスワードを試します...",
-        timed_out: "TapAuth: タイムアウト、パスワードを試します...",
-        skipped: "TapAuth: スキップしました、パスワードを試します...",
-        auth_successful: "TapAuth: 認証成功！",
-        auth_denied: "TapAuth: サーバーによって認証が拒否されました",
-        error_prefix: "TapAuth: エラー - ",
-    };
 }
 
 /// Detect locale from POSIX environment variables.
@@ -84,12 +116,6 @@ pub fn detect_locale() -> &'static str {
     "en"
 }
 
-/// Load the PAM messages for the detected locale.
-/// Returns a reference to compile-time embedded strings — zero allocation.
-pub fn load() -> &'static PamMessages {
-    match detect_locale() {
-        "de" => &strings::DE,
-        "ja" => &strings::JA,
-        _ => &strings::EN,
-    }
+pub fn load() -> PamMessages {
+    PamMessages::new(detect_locale())
 }

@@ -89,9 +89,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {
-        pam_conv.try_info(msgs.waiting_for_tap_skip);
+        pam_conv.try_info(msgs.waiting_for_tap_skip());
     } else {
-        pam_conv.try_info(msgs.waiting_for_tap);
+        pam_conv.try_info(msgs.waiting_for_tap());
     }
 
     // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
@@ -117,14 +117,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
-            pam_conv.try_error(msgs.cannot_connect);
+            pam_conv.try_error(msgs.cannot_connect());
             return pam_sys::PAM_IGNORE;
         }
     };
     if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
     {
         tracing::error!("Failed to send authenticate request: {}", e);
-        pam_conv.try_error(msgs.communication_error);
+        pam_conv.try_error(msgs.communication_error());
         return pam_sys::PAM_IGNORE;
     }
 
@@ -149,7 +149,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
-                                    return map_pam_outcome(&resp, &username, &pam_conv, msgs)
+                                    return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
                                 }
                                 Ok(None) => {
                                     // No complete frame yet, check for errors
@@ -159,14 +159,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                         tracing::error!(
                                             "Daemon closed connection before sending response"
                                         );
-                                        pam_conv.try_info(msgs.connection_lost);
+                                        pam_conv.try_info(msgs.connection_lost());
                                         return pam_sys::PAM_IGNORE;
                                     }
                                     continue;
                                 }
                                 Err(e) => {
                                     tracing::error!("IPC read failed: {}", e);
-                                    pam_conv.try_info(msgs.communication_error);
+                                    pam_conv.try_info(msgs.communication_error());
                                     return pam_sys::PAM_IGNORE;
                                 }
                             }
@@ -175,7 +175,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         {
                             // Hangup/error without any data available
                             tracing::error!("Daemon closed connection or error detected");
-                            pam_conv.try_info(msgs.connection_lost);
+                            pam_conv.try_info(msgs.connection_lost());
                             return pam_sys::PAM_IGNORE;
                         }
                     }
@@ -187,7 +187,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 }
             }
         }
-        pam_conv.try_info(msgs.timed_out);
+        pam_conv.try_info(msgs.timed_out());
         return pam_sys::PAM_IGNORE;
     }
 
@@ -218,7 +218,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             if rev.contains(PollFlags::POLLIN) {
                                 match ipc.try_read_response_nonblocking() {
                                     Ok(Some(resp)) => {
-                                        return map_pam_outcome(&resp, &username, &pam_conv, msgs)
+                                        return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
                                     }
                                     Ok(None) => {
                                         // No complete frame yet, check for errors
@@ -228,14 +228,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                             tracing::error!(
                                                 "Daemon closed connection before sending response"
                                             );
-                                            pam_conv.try_info(msgs.connection_lost);
+                                            pam_conv.try_info(msgs.connection_lost());
                                             return pam_sys::PAM_IGNORE;
                                         }
                                         continue;
                                     }
                                     Err(e) => {
                                         tracing::error!("IPC read failed: {}", e);
-                                        pam_conv.try_info(msgs.communication_error);
+                                        pam_conv.try_info(msgs.communication_error());
                                         return pam_sys::PAM_IGNORE;
                                     }
                                 }
@@ -244,7 +244,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             {
                                 // Hangup/error without any data available
                                 tracing::error!("Daemon closed connection or error detected");
-                                pam_conv.try_info(msgs.connection_lost);
+                                pam_conv.try_info(msgs.connection_lost());
                                 return pam_sys::PAM_IGNORE;
                             }
                         }
@@ -256,7 +256,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     }
                 }
             }
-            pam_conv.try_info(msgs.timed_out);
+            pam_conv.try_info(msgs.timed_out());
             return pam_sys::PAM_IGNORE;
         }
     };
@@ -297,7 +297,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
-                                return map_pam_outcome(&resp, &username, &pam_conv, msgs)
+                                return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
                             }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
@@ -307,20 +307,20 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                     tracing::error!(
                                         "Daemon closed connection before sending response"
                                     );
-                                    pam_conv.try_info(msgs.connection_lost);
+                                    pam_conv.try_info(msgs.connection_lost());
                                     return pam_sys::PAM_IGNORE;
                                 }
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {}", e);
-                                pam_conv.try_info(msgs.communication_error);
+                                pam_conv.try_info(msgs.communication_error());
                                 return pam_sys::PAM_IGNORE;
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         // Hangup/error without any data available
                         tracing::error!("Daemon closed connection or error detected");
-                        pam_conv.try_info(msgs.connection_lost);
+                        pam_conv.try_info(msgs.connection_lost());
                         return pam_sys::PAM_IGNORE;
                     }
                 }
@@ -337,7 +337,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                 if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                                     let _ = c.send_cancel("tty-skip", &request_id);
                                 }
-                                pam_conv.try_info(msgs.skipped);
+                                pam_conv.try_info(msgs.skipped());
                                 return pam_sys::PAM_IGNORE;
                             }
                             // Non-Enter key: consume and ignore (could be user typing password early)
@@ -353,7 +353,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     }
 
-    pam_conv.try_info(msgs.timed_out);
+    pam_conv.try_info(msgs.timed_out());
     pam_sys::PAM_IGNORE
 }
 
@@ -410,12 +410,12 @@ fn map_pam_outcome(
     match resp.outcome() {
         shared::ipc::pb::PamOutcome::Success => {
             tracing::info!("Authentication successful for user: {}", username);
-            pam_conv.try_info(msgs.auth_successful);
+            pam_conv.try_info(msgs.auth_successful());
             pam_sys::PAM_SUCCESS
         }
         shared::ipc::pb::PamOutcome::Denied => {
             tracing::info!("Authentication explicitly denied for user: {}", username);
-            pam_conv.try_info(msgs.auth_denied);
+            pam_conv.try_info(msgs.auth_denied());
             pam_sys::PAM_PERM_DENIED
         }
         shared::ipc::pb::PamOutcome::Timeout => {
