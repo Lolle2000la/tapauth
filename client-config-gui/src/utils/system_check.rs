@@ -51,7 +51,11 @@ impl ValidationError {
 pub fn validate_tapauthd_user() -> Result<(), ValidationError> {
     match User::from_name("tapauthd") {
         Ok(Some(_)) => Ok(()),
-        Ok(None) | Err(_) => Err(ValidationError::TapauthdUserMissing),
+        Ok(None) => Err(ValidationError::TapauthdUserMissing),
+        Err(err) => {
+            tracing::error!("Failed to lookup 'tapauthd' user: {err}");
+            Err(ValidationError::TapauthdUserMissing)
+        }
     }
 }
 
@@ -68,14 +72,18 @@ pub fn validate_tapauthd_user() -> Result<(), ValidationError> {
 /// not exist, and `NotInTapauthdClientsGroup` (warning) when the current
 /// user is not a member of an existing group.
 pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
+    let group = match Group::from_name("tapauthd-clients") {
+        Ok(Some(g)) => g,
+        Ok(None) => return Err(ValidationError::TapauthdClientsGroupMissing),
+        Err(err) => {
+            tracing::error!("Failed to lookup 'tapauthd-clients' group: {err}");
+            return Err(ValidationError::TapauthdClientsGroupMissing);
+        }
+    };
+
     if nix::unistd::geteuid().is_root() {
         return Ok(());
     }
-
-    let group = match Group::from_name("tapauthd-clients") {
-        Ok(Some(g)) => g,
-        _ => return Err(ValidationError::TapauthdClientsGroupMissing),
-    };
 
     let target_gid = group.gid;
 
@@ -83,7 +91,10 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
         return Ok(());
     }
 
-    let groups = getgroups().map_err(|_| ValidationError::NotInTapauthdClientsGroup)?;
+    let groups = getgroups().map_err(|err| {
+        tracing::error!("Failed to retrieve supplementary groups: {err}");
+        ValidationError::NotInTapauthdClientsGroup
+    })?;
     if groups.contains(&target_gid) {
         return Ok(());
     }
@@ -96,8 +107,5 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
 /// Returns a list of validation results in the order they should be
 /// presented to the user (fatal errors first, then warnings).
 pub fn validate_all() -> Vec<Result<(), ValidationError>> {
-    vec![
-        validate_tapauthd_user(),
-        validate_tapauthd_clients_group(),
-    ]
+    vec![validate_tapauthd_user(), validate_tapauthd_clients_group()]
 }

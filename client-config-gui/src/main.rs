@@ -31,12 +31,18 @@ fn main() -> iced::Result {
             } else {
                 MessageLevel::Warning
             };
-            let _ = DialogBuilder::message()
-                .set_title(bootstrap_l10n.tr(err.title_key()))
-                .set_text(bootstrap_l10n.tr(err.message_key()))
+            let title = bootstrap_l10n.tr(err.title_key());
+            let message = bootstrap_l10n.tr(err.message_key());
+            if let Err(dialog_err) = DialogBuilder::message()
+                .set_title(&title)
+                .set_text(&message)
                 .set_level(level)
                 .alert()
-                .show();
+                .show()
+            {
+                tracing::error!("Failed to show dialog: {dialog_err}");
+                eprintln!("[{level:?}] {title}: {message}");
+            }
             if err.is_fatal() {
                 std::process::exit(1);
             }
