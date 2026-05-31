@@ -352,7 +352,7 @@ jobs:
           pkgdesc="Local smartphone-based authentication framework engine"
           arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
-          license=('Apache-2.0')
+          license=('AGPL-3.0')
           depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf')
           backup=('etc/tapauth/config.toml')
@@ -420,7 +420,7 @@ jobs:
           	url = https://github.com/lolle2000la/tapauth
           	arch = x86_64
           	arch = aarch64
-          	license = Apache-2.0
+          	license = AGPL-3.0
           	install = tapauth.install
           	makedepends = cargo
           	makedepends = rust

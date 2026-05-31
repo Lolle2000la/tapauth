@@ -7,7 +7,7 @@ Version:        %{?pkgversion}%{!?pkgversion:0.1.0}
 Release:        1%{?dist}
 Summary:        Local smartphone-based authentication framework
 
-License:        Apache-2.0
+License:        AGPL-3.0
 URL:            https://github.com/lolle2000la/tapauth
 Source0:        %{name}-%{version}.tar.gz
 
