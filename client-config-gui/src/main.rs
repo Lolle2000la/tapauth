@@ -24,14 +24,32 @@ fn main() -> iced::Result {
 
     let bootstrap_l10n = l10n::L10n::new(&locale);
 
-    if let Err(_err) = utils::system_check::validate_tapauthd_user() {
-        let _ = DialogBuilder::message()
-            .set_title(bootstrap_l10n.tr("error-user-missing-title"))
-            .set_text(bootstrap_l10n.tr("error-user-missing-message"))
-            .set_level(MessageLevel::Error)
+    for err in utils::system_check::validate_all() {
+        let level = if err.is_fatal() {
+            MessageLevel::Error
+        } else {
+            MessageLevel::Warning
+        };
+        let title = bootstrap_l10n.tr(err.title_key());
+        let message = bootstrap_l10n.tr(err.message_key());
+        if err.is_fatal() {
+            tracing::error!("{title}: {message}");
+        } else {
+            tracing::warn!("{title}: {message}");
+        }
+        if let Err(dialog_err) = DialogBuilder::message()
+            .set_title(&title)
+            .set_text(&message)
+            .set_level(level)
             .alert()
-            .show();
-        std::process::exit(1);
+            .show()
+        {
+            tracing::error!("Failed to show dialog: {dialog_err}");
+            eprintln!("[{level:?}] {title}: {message}");
+        }
+        if err.is_fatal() {
+            std::process::exit(1);
+        }
     }
 
     tracing::info!("Starting TapAuth Configuration GUI");
