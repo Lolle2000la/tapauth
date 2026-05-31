@@ -10,7 +10,7 @@
 //! from gracefully — PAM modules must never panic.
 
 use fluent::{FluentBundle, FluentResource};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use unic_langid::LanguageIdentifier;
 
 pub struct PamMessages {
@@ -158,16 +158,10 @@ pub fn detect_locale() -> &'static str {
     "en"
 }
 
-static MSG_EN: OnceLock<PamMessages> = OnceLock::new();
-static MSG_DE: OnceLock<PamMessages> = OnceLock::new();
-static MSG_JA: OnceLock<PamMessages> = OnceLock::new();
-
 /// Load PAM messages for the detected locale.
-/// FTL parsing and allocation happens at most once per locale (lazy static cache).
-pub fn load() -> &'static PamMessages {
-    match detect_locale() {
-        "de" => MSG_DE.get_or_init(|| PamMessages::new("de")),
-        "ja" => MSG_JA.get_or_init(|| PamMessages::new("ja")),
-        _ => MSG_EN.get_or_init(|| PamMessages::new("en")),
-    }
+/// Parsing is lightweight (FTL files are ~10 lines each) and authentication
+/// is infrequent, so parsing per-call is fine.  Using statics would leak on
+/// dlclose since cdylib destructors don't run.
+pub fn load() -> PamMessages {
+    PamMessages::new(detect_locale())
 }
