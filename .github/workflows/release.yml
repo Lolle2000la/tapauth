@@ -563,6 +563,16 @@ jobs:
       - name: Checkout Source Context
         uses: actions/checkout@v6
 
+      - name: Generate Rasterized Assets from Master SVG
+        run: |
+          sudo apt-get update && sudo apt-get install -y librsvg2-bin
+          mkdir -p fdroid/repo/icons
+          mkdir -p fdroid/repo/dev.rourunisen.tapauth/en-US
+
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/icon.png
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/repo/icons/icon.png
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/repo/dev.rourunisen.tapauth/en-US/icon.png
+
       - name: Patch F-Droid Repository URL to Custom Domain
         run: |
           sed -i "s|^repo_url:.*|repo_url: https://tapauth.rourunisen.dev/fdroid/repo|" fdroid/config.yml
