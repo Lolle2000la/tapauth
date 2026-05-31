@@ -1,0 +1,1 @@
+TapAuth is a local-first authentication framework allowing secure biometric authentication to Linux desktops via your smartphone. Uses public-key cryptography over transport layers to authorize PAM requests safely.

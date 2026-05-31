@@ -4,6 +4,8 @@ repo_description: Secure local authentication framework that allows signing into
 
 archive_older: 0
 
+repo_icon: icon.png
+
 keystore: repo-signer.jks
 keystorepass: {env: ANDROID_KEYSTORE_PASSWORD}
 keypass: {env: ANDROID_KEY_PASSWORD}
