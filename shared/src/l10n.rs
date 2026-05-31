@@ -5,8 +5,8 @@
 /// Checks `LC_ALL`, `LC_MESSAGES`, and `LANG` in that order,
 /// returning a `&str` locale code for the first match.
 ///
-/// Uses two-pass matching so regional variants (e.g. "en-us") are preferred
-/// over shorter prefixes (e.g. "en").
+/// Uses two-pass matching: exact match first (e.g. "en-us" matches "en-us"),
+/// then longest prefix match (e.g. "en-us.utf-8" prefers "en-us" over "en").
 ///
 /// `available_locales` should be the list of supported locale codes discovered
 /// at build time.
@@ -24,15 +24,20 @@ pub fn detect_locale(available_locales: &[&'static str]) -> &'static str {
                 }
             }
 
-            // Pass 2: prefix match (e.g. "en-us.utf-8" matches "en")
+            // Pass 2: longest prefix match (e.g. "en-us.utf-8" prefers "en-us" over "en")
+            let mut best_match: Option<&'static str> = None;
             for &lang in available_locales {
                 let lang_norm = lang.to_ascii_lowercase().replace('_', "-");
                 if val_norm
                     .strip_prefix(&lang_norm)
                     .is_some_and(|rest| rest.starts_with(['-', '.', '@']))
+                    && best_match.is_none_or(|best| lang.len() > best.len())
                 {
-                    return lang;
+                    best_match = Some(lang);
                 }
+            }
+            if let Some(lang) = best_match {
+                return lang;
             }
         }
     }
