@@ -53,6 +53,9 @@ fn main() {
 
     fs::write(dest, code).unwrap();
 
+    for (c, _) in &locales {
+        println!("cargo:rerun-if-changed=locales/{}/main.ftl", c);
+    }
     println!("cargo:rerun-if-changed=locales/");
 }
 
