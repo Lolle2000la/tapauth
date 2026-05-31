@@ -76,6 +76,8 @@ android {
         ndkVersion = "30.0.14904198"
 
         testInstrumentationRunner = "dev.rourunisen.tapauth.crypto.TapAuthTestRunner"
+
+        manifestPlaceholders["appName"] = "TapAuth"
     }
 
     buildTypes {
@@ -97,7 +99,7 @@ android {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
 
-            resValue("string", "app_name", "TapAuth (Debug)")
+            manifestPlaceholders["appName"] = "TapAuth (Debug)"
         }
     }
     compileOptions {
@@ -107,6 +109,7 @@ android {
     buildFeatures {
         compose = true
         resValues = true
+        buildConfig = true
     }
 }
 
