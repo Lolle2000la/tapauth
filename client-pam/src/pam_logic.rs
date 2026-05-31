@@ -84,7 +84,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // No explicit root check here; shared config enforces file ownership/permissions.
 
-    let msgs = pam_messages::load();
+    let msgs = pam_messages::load_for_user(&username);
     let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {

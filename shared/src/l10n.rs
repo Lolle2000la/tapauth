@@ -22,8 +22,9 @@ pub fn detect_locale(available_locales: &[&'static str]) -> &'static str {
 }
 
 fn locale_matches(val: &str, lang: &str) -> bool {
-    *val == *lang
+    let lang_lower = lang.to_ascii_lowercase();
+    *val == lang_lower
         || val
-            .strip_prefix(lang)
+            .strip_prefix(&lang_lower)
             .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
 }

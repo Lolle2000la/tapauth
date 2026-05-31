@@ -144,10 +144,29 @@ pub fn detect_locale() -> &'static str {
     shared::l10n::detect_locale(locales_codegen::AVAILABLE_LOCALES)
 }
 
-/// Load PAM messages for the detected locale.
-/// Parsing is lightweight (FTL files are ~10 lines each) and authentication
-/// is infrequent, so parsing per-call is fine.  Using statics would leak on
-/// dlclose since cdylib destructors don't run.
-pub fn load() -> PamMessages {
-    PamMessages::new(detect_locale())
+/// Resolve the effective locale for a user, respecting the GUI's persisted
+/// preference if available.
+fn resolve_locale(username: &str) -> String {
+    if let Some(loc) = load_user_locale(username) {
+        return loc;
+    }
+    detect_locale().to_string()
+}
+
+fn load_user_locale(username: &str) -> Option<String> {
+    let home = nix::unistd::User::from_name(username)
+        .ok()
+        .flatten()
+        .map(|u| u.dir.to_path_buf())?;
+    let path = home.join(".config/tapauth/locale");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| locales_codegen::AVAILABLE_LOCALES.contains(&s.as_str()))
+}
+
+/// Load PAM messages for the given username, respecting any persisted
+/// locale preference from ~/.config/tapauth/locale.
+pub fn load_for_user(username: &str) -> PamMessages {
+    PamMessages::new(&resolve_locale(username))
 }
