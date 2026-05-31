@@ -4,6 +4,9 @@
 //! locale detection (LC_ALL → LC_MESSAGES → LANG) and embedding FTL strings
 //! at compile time via `include_str!()`.  All keys are resolved at construction
 //! time so accessors return `&str` with zero runtime cost.
+//!
+//! When a key is missing in a non-English locale, the English bundle is used
+//! as a fallback — matching the GUI's Fluent Bundle fallback behaviour.
 
 use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
@@ -22,7 +25,11 @@ pub struct PamMessages {
     error_prefix: String,
 }
 
-fn tr(bundle: &FluentBundle<Arc<FluentResource>>, key: &str) -> String {
+fn tr(
+    bundle: &FluentBundle<Arc<FluentResource>>,
+    fallback: Option<&FluentBundle<Arc<FluentResource>>>,
+    key: &str,
+) -> String {
     if let Some(msg) = bundle.get_message(key) {
         if let Some(pattern) = msg.value() {
             let mut errors = vec![];
@@ -31,37 +38,69 @@ fn tr(bundle: &FluentBundle<Arc<FluentResource>>, key: &str) -> String {
                 .to_string();
         }
     }
+    if let Some(fb) = fallback {
+        if let Some(msg) = fb.get_message(key) {
+            if let Some(pattern) = msg.value() {
+                let mut errors = vec![];
+                return fb.format_pattern(pattern, None, &mut errors).to_string();
+            }
+        }
+    }
     format!("??{}??", key)
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn load_bundle(ftl_str: &str, lang_id: LanguageIdentifier) -> FluentBundle<Arc<FluentResource>> {
+    let res = FluentResource::try_new(ftl_str.to_string())
+        .expect("Failed to parse embedded PAM FTL file");
+    let mut bundle = FluentBundle::new(vec![lang_id]);
+    bundle
+        .add_resource(Arc::new(res))
+        .expect("Failed to add FTL resource to PAM bundle");
+    bundle.set_use_isolating(false);
+    bundle
+}
+
 impl PamMessages {
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     pub fn new(locale: &str) -> Self {
-        let ftl_str = match locale {
-            "de" => include_str!("../locales/de/main.ftl"),
-            "ja" => include_str!("../locales/ja/main.ftl"),
-            _ => include_str!("../locales/en/main.ftl"),
+        let en_str = include_str!("../locales/en/main.ftl");
+        let en_bundle = {
+            let en_lang: LanguageIdentifier = "en".parse().unwrap();
+            load_bundle(en_str, en_lang)
         };
 
-        let res = FluentResource::try_new(ftl_str.to_string())
-            .expect("Failed to parse embedded PAM FTL file");
-        let lang_id: LanguageIdentifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
-        let mut bundle = FluentBundle::new(vec![lang_id]);
-        bundle
-            .add_resource(Arc::new(res))
-            .expect("Failed to add FTL resource to PAM bundle");
-        bundle.set_use_isolating(false);
+        let (bundle, fallback) = match locale {
+            "en" => (en_bundle, None),
+            other => {
+                let ftl_str = match other {
+                    "de" => include_str!("../locales/de/main.ftl"),
+                    "ja" => include_str!("../locales/ja/main.ftl"),
+                    _ => en_str,
+                };
+                if std::ptr::eq(ftl_str, en_str) {
+                    (en_bundle, None)
+                } else {
+                    let lang_id: LanguageIdentifier =
+                        other.parse().unwrap_or_else(|_| "en".parse().unwrap());
+                    (load_bundle(ftl_str, lang_id), Some(en_bundle))
+                }
+            }
+        };
+
+        let tr_val = |key: &str| tr(&bundle, fallback.as_ref(), key);
 
         Self {
-            waiting_for_tap_skip: tr(&bundle, "pam-waiting-tap-skip"),
-            waiting_for_tap: tr(&bundle, "pam-waiting-tap"),
-            cannot_connect: tr(&bundle, "pam-cannot-connect"),
-            communication_error: tr(&bundle, "pam-communication-error"),
-            connection_lost: tr(&bundle, "pam-connection-lost"),
-            timed_out: tr(&bundle, "pam-timed-out"),
-            skipped: tr(&bundle, "pam-skipped"),
-            auth_successful: tr(&bundle, "pam-auth-successful"),
-            auth_denied: tr(&bundle, "pam-auth-denied"),
-            error_prefix: tr(&bundle, "pam-error-prefix"),
+            waiting_for_tap_skip: tr_val("pam-waiting-tap-skip"),
+            waiting_for_tap: tr_val("pam-waiting-tap"),
+            cannot_connect: tr_val("pam-cannot-connect"),
+            communication_error: tr_val("pam-communication-error"),
+            connection_lost: tr_val("pam-connection-lost"),
+            timed_out: tr_val("pam-timed-out"),
+            skipped: tr_val("pam-skipped"),
+            auth_successful: tr_val("pam-auth-successful"),
+            auth_denied: tr_val("pam-auth-denied"),
+            error_prefix: tr_val("pam-error-prefix"),
         }
     }
 
@@ -93,7 +132,6 @@ impl PamMessages {
         &self.auth_denied
     }
 
-    /// Build an error message by concatenating the localized prefix with the detail string.
     pub fn error(&self, detail: &str) -> String {
         format!("{}{}", self.error_prefix, detail)
     }
