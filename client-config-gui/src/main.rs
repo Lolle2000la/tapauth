@@ -32,6 +32,11 @@ fn main() -> iced::Result {
         };
         let title = bootstrap_l10n.tr(err.title_key());
         let message = bootstrap_l10n.tr(err.message_key());
+        if err.is_fatal() {
+            tracing::error!("{title}: {message}");
+        } else {
+            tracing::warn!("{title}: {message}");
+        }
         if let Err(dialog_err) = DialogBuilder::message()
             .set_title(&title)
             .set_text(&message)

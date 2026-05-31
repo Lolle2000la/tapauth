@@ -109,7 +109,11 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
 pub fn validate_all() -> Vec<ValidationError> {
     let mut errors = Vec::new();
     if let Err(err) = validate_tapauthd_user() {
+        let fatal = err.is_fatal();
         errors.push(err);
+        if fatal {
+            return errors;
+        }
     }
     if let Err(err) = validate_tapauthd_clients_group() {
         errors.push(err);
