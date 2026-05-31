@@ -84,10 +84,8 @@ error-group-missing-message = Die Systemgruppe 'tapauthd-clients' wird benötigt
     Diese Gruppe sollte während der Installation erstellt worden sein.
 
     Empfohlene Maßnahmen:
-    1. Melden Sie sich ab und wieder an (oder starten Sie das System neu)
-    2. Versuchen Sie, die Anwendung erneut zu starten
-
-    Falls das Problem weiterhin besteht, müssen Sie die Gruppe manuell erstellen:
+    1. Installieren Sie die Anwendung neu, um sicherzustellen, dass die Systemgruppen korrekt eingerichtet sind
+    2. Oder erstellen Sie die Gruppe manuell:
         sudo groupadd --system tapauthd-clients
 
 warn-group-missing-title = Gruppenmitgliedschaft erforderlich
