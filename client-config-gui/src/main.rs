@@ -24,28 +24,26 @@ fn main() -> iced::Result {
 
     let bootstrap_l10n = l10n::L10n::new(&locale);
 
-    for result in utils::system_check::validate_all() {
-        if let Err(err) = result {
-            let level = if err.is_fatal() {
-                MessageLevel::Error
-            } else {
-                MessageLevel::Warning
-            };
-            let title = bootstrap_l10n.tr(err.title_key());
-            let message = bootstrap_l10n.tr(err.message_key());
-            if let Err(dialog_err) = DialogBuilder::message()
-                .set_title(&title)
-                .set_text(&message)
-                .set_level(level)
-                .alert()
-                .show()
-            {
-                tracing::error!("Failed to show dialog: {dialog_err}");
-                eprintln!("[{level:?}] {title}: {message}");
-            }
-            if err.is_fatal() {
-                std::process::exit(1);
-            }
+    for err in utils::system_check::validate_all() {
+        let level = if err.is_fatal() {
+            MessageLevel::Error
+        } else {
+            MessageLevel::Warning
+        };
+        let title = bootstrap_l10n.tr(err.title_key());
+        let message = bootstrap_l10n.tr(err.message_key());
+        if let Err(dialog_err) = DialogBuilder::message()
+            .set_title(&title)
+            .set_text(&message)
+            .set_level(level)
+            .alert()
+            .show()
+        {
+            tracing::error!("Failed to show dialog: {dialog_err}");
+            eprintln!("[{level:?}] {title}: {message}");
+        }
+        if err.is_fatal() {
+            std::process::exit(1);
         }
     }
 

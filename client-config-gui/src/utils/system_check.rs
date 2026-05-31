@@ -104,8 +104,15 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
 
 /// Run all system prerequisite checks.
 ///
-/// Returns a list of validation results in the order they should be
-/// presented to the user (fatal errors first, then warnings).
-pub fn validate_all() -> Vec<Result<(), ValidationError>> {
-    vec![validate_tapauthd_user(), validate_tapauthd_clients_group()]
+/// Returns only the errors/warnings that occurred, in the order they
+/// should be presented to the user (fatal errors first, then warnings).
+pub fn validate_all() -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if let Err(err) = validate_tapauthd_user() {
+        errors.push(err);
+    }
+    if let Err(err) = validate_tapauthd_clients_group() {
+        errors.push(err);
+    }
+    errors
 }
