@@ -108,24 +108,37 @@ pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIden
     match check_polkit(identity).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(PeerIdentityError::AuthorizationDenied),
-        Err(e @ PeerIdentityError::DBusUnavailable(_)) => {
-            tracing::warn!(
-                "PolKit unavailable ({}), falling back to root-only check",
-                e
-            );
-            if identity.uid == 0 {
-                Ok(())
+        Err(e) => {
+            let is_unavailable = match &e {
+                PeerIdentityError::DBusUnavailable(_) => true,
+                PeerIdentityError::PolKitError(s) => {
+                    let s_lower = s.to_lowercase();
+                    s_lower.contains("not found")
+                        || s_lower.contains("no such")
+                        || s_lower.contains("serviceunknown")
+                }
+                _ => false,
+            };
+            if is_unavailable {
+                tracing::warn!(
+                    "PolKit unavailable ({}), falling back to root-only check",
+                    e
+                );
+                if identity.uid == 0 {
+                    Ok(())
+                } else {
+                    Err(PeerIdentityError::PolKitUnavailable {
+                        reason: format!(
+                            "PolKit unavailable ({}) and caller is not root. \
+                             Install PolicyKit or run as root.",
+                            e
+                        ),
+                    })
+                }
             } else {
-                Err(PeerIdentityError::PolKitUnavailable {
-                    reason: format!(
-                        "D-Bus unavailable ({}) and caller is not root. \
-                         Install PolicyKit or run as root.",
-                        e
-                    ),
-                })
+                Err(e)
             }
         }
-        Err(e) => Err(e),
     }
 }
 
