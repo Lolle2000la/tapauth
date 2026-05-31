@@ -30,8 +30,8 @@ hex.workspace = true
 libc.workspace = true
 
 # Localization
-fluent = "0.17"
-unic-langid = "0.9"
+fluent.workspace = true
+unic-langid.workspace = true
 
 [features]
 default = []
