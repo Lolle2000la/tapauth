@@ -163,7 +163,7 @@ fn load_user_locale(username: &str) -> Option<String> {
         .map(|u| u.dir.to_path_buf())?;
     let path = home.join(".config/tapauth/locale");
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
@@ -176,7 +176,8 @@ fn load_user_locale(username: &str) -> Option<String> {
     }
 
     let mut s = String::new();
-    file.read_to_string(&mut s).ok()?;
+    let mut reader = file.take(16);
+    reader.read_to_string(&mut s).ok()?;
 
     Some(s.trim().to_string()).filter(|s| locales_codegen::AVAILABLE_LOCALES.contains(&s.as_str()))
 }

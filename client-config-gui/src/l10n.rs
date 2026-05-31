@@ -132,7 +132,7 @@ fn load_user_locale(username: &str) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = user_locale_path(username)?;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
@@ -145,7 +145,8 @@ fn load_user_locale(username: &str) -> Option<String> {
     }
 
     let mut s = String::new();
-    file.read_to_string(&mut s).ok()?;
+    let mut reader = file.take(16);
+    reader.read_to_string(&mut s).ok()?;
 
     Some(s.trim().to_string()).filter(|s| is_valid_locale(s))
 }
