@@ -65,6 +65,17 @@ settings-csk-rotated = CSK rotated successfully. All pairings have been cleared.
 settings-error-prefix = Error: {$message}
 settings-invalid-port = Invalid port number (must be 1-65535)
 
+# ── IPC Errors ──
+error-ipc-connection-timeout = Connection to daemon timed out. Is tapauthd running?
+error-ipc-connection-failed = Could not connect to daemon: {$detail}
+error-ipc-send-timeout = Request timed out while sending
+error-ipc-send-failed = Failed to send request: {$detail}
+error-ipc-response-timeout = Daemon did not respond in time
+error-ipc-read-failed = Failed to read response: {$detail}
+error-ipc-decode-failed = Failed to decode response: {$detail}
+error-ipc-unexpected-envelope = Daemon returned an unexpected response
+error-ipc-unexpected-response = Unexpected response from daemon
+
 # ── System Error/Warning Dialogs ──
 error-user-missing-title = System User Missing
 error-user-missing-message = The 'tapauthd' system user is required but was not found.

@@ -18,6 +18,24 @@ pub mod ble {
 pub mod pairing {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    #[derive(thiserror::Error, Debug)]
+    pub enum PairingInfoError {
+        #[error("invalid URL scheme")]
+        InvalidScheme,
+        #[error("invalid query parameter")]
+        InvalidQuery,
+        #[error("invalid version number")]
+        InvalidVersion,
+        #[error("invalid port number")]
+        InvalidPort,
+        #[error("invalid IPv4 address")]
+        InvalidIpv4,
+        #[error("invalid IPv6 address")]
+        InvalidIpv6,
+        #[error("missing field: {0}")]
+        MissingField(&'static str),
+    }
+
     /// Generate a pairing URL for QR code
     pub fn generate_pairing_url(
         public_key_hex: &str,
@@ -49,9 +67,9 @@ pub mod pairing {
     }
 
     impl PairingInfo {
-        pub fn parse(url: &str) -> Result<Self, String> {
+        pub fn parse(url: &str) -> Result<Self, PairingInfoError> {
             if !url.starts_with("tapauth://pair?") {
-                return Err("Invalid URL scheme".to_string());
+                return Err(PairingInfoError::InvalidScheme);
             }
 
             let query = &url[15..];
@@ -63,23 +81,30 @@ pub mod pairing {
 
             for pair in query.split('&') {
                 let mut parts = pair.split('=');
-                let key = parts.next().ok_or("Invalid query")?;
-                let value = parts.next().ok_or("Invalid query")?;
+                let key = parts.next().ok_or(PairingInfoError::InvalidQuery)?;
+                let value = parts.next().ok_or(PairingInfoError::InvalidQuery)?;
 
                 match key {
-                    "v" => version = Some(value.parse().map_err(|_| "Invalid version")?),
+                    "v" => {
+                        version = Some(
+                            value
+                                .parse()
+                                .map_err(|_| PairingInfoError::InvalidVersion)?,
+                        )
+                    }
                     "pk" => public_key_hex = Some(value.to_string()),
-                    "p" => port = Some(value.parse().map_err(|_| "Invalid port")?),
-                    "ip4" => ipv4 = Some(value.parse().map_err(|_| "Invalid IPv4")?),
-                    "ip6" => ipv6 = Some(value.parse().map_err(|_| "Invalid IPv6")?),
+                    "p" => port = Some(value.parse().map_err(|_| PairingInfoError::InvalidPort)?),
+                    "ip4" => ipv4 = Some(value.parse().map_err(|_| PairingInfoError::InvalidIpv4)?),
+                    "ip6" => ipv6 = Some(value.parse().map_err(|_| PairingInfoError::InvalidIpv6)?),
                     _ => {}
                 }
             }
 
             Ok(Self {
-                version: version.ok_or("Missing version")?,
-                public_key_hex: public_key_hex.ok_or("Missing public key")?,
-                port: port.ok_or("Missing port")?,
+                version: version.ok_or(PairingInfoError::MissingField("version"))?,
+                public_key_hex: public_key_hex
+                    .ok_or(PairingInfoError::MissingField("public key"))?,
+                port: port.ok_or(PairingInfoError::MissingField("port"))?,
                 ipv4,
                 ipv6,
             })

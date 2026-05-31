@@ -65,6 +65,17 @@ settings-csk-rotated = CSK erfolgreich rotiert. Alle Kopplungen wurden gelöscht
 settings-error-prefix = Fehler: {$message}
 settings-invalid-port = Ungültige Portnummer (muss 1-65535 sein)
 
+# ── IPC Errors ──
+error-ipc-connection-timeout = Zeitüberschreitung bei der Verbindung zum Daemon. Läuft tapauthd?
+error-ipc-connection-failed = Verbindung zum Daemon fehlgeschlagen: {$detail}
+error-ipc-send-timeout = Zeitüberschreitung beim Senden der Anfrage
+error-ipc-send-failed = Anfrage konnte nicht gesendet werden: {$detail}
+error-ipc-response-timeout = Der Daemon hat nicht rechtzeitig geantwortet
+error-ipc-read-failed = Antwort konnte nicht gelesen werden: {$detail}
+error-ipc-decode-failed = Antwort konnte nicht dekodiert werden: {$detail}
+error-ipc-unexpected-envelope = Der Daemon hat eine unerwartete Antwort zurückgegeben
+error-ipc-unexpected-response = Unerwartete Antwort vom Daemon
+
 # ── System Error/Warning Dialogs ──
 error-user-missing-title = Systembenutzer fehlt
 error-user-missing-message = Der Systembenutzer 'tapauthd' wird benötigt, wurde aber nicht gefunden.

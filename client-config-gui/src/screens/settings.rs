@@ -1,4 +1,5 @@
 use super::ScreenMessage;
+use crate::ipc::GuiIpcError;
 use crate::l10n::L10n;
 use iced::{
     widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
@@ -83,7 +84,7 @@ impl SettingsScreen {
             }
             ScreenMessage::CSKRotationFailed(error) => {
                 self.rotating_csk = false;
-                self.error = Some(error);
+                self.error = Some(error.localized(&self.l10n));
                 self.success = None;
                 Task::none()
             }
@@ -120,7 +121,7 @@ impl SettingsScreen {
                 Task::none()
             }
             ScreenMessage::ConfigSaveFailed(error) => {
-                self.error = Some(error);
+                self.error = Some(error.localized(&self.l10n));
                 self.success = None;
                 Task::none()
             }
@@ -256,7 +257,7 @@ impl SettingsScreen {
             .into()
     }
 
-    async fn rotate_csk() -> Result<(), String> {
+    async fn rotate_csk() -> Result<(), GuiIpcError> {
         crate::ipc::rotate_csk().await
     }
 }

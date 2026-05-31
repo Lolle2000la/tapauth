@@ -3,6 +3,30 @@ use zbus::Connection;
 
 const POLKIT_ACTION_ID: &str = "dev.rourunisen.tapauth.config.admin";
 
+#[derive(thiserror::Error, Debug)]
+pub enum PeerIdentityError {
+    #[error("invalid peer PID {0}")]
+    InvalidPid(i32),
+    #[error("failed to resolve peer identity")]
+    ResolveFailed,
+    #[error("cannot read /proc/{pid}/stat: {source}")]
+    ProcStatRead {
+        pid: i32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("malformed /proc/{pid}/stat: {detail}")]
+    ProcStatMalformed { pid: i32, detail: String },
+    #[error("D-Bus connection failed: {0}")]
+    DBusUnavailable(String),
+    #[error("authorization denied by PolKit")]
+    AuthorizationDenied,
+    #[error("PolKit unavailable ({reason}) and caller is not root")]
+    PolKitUnavailable { reason: String },
+    #[error("PolKit authorization failed: {0}")]
+    PolKitError(String),
+}
+
 pub struct PeerIdentity {
     #[allow(dead_code)]
     pub pid: i32,
@@ -12,21 +36,18 @@ pub struct PeerIdentity {
     pub start_time: u64,
 }
 
-pub fn resolve_peer(pid: i32, uid: u32) -> Result<PeerIdentity, String> {
+pub fn resolve_peer(pid: i32, uid: u32) -> Result<PeerIdentity, PeerIdentityError> {
     if pid <= 0 {
-        return Err(format!(
-            "Invalid peer PID {} from SO_PEERCRED — expected positive PID",
-            pid
-        ));
+        return Err(PeerIdentityError::InvalidPid(pid));
     }
     let username = User::from_uid(nix::unistd::Uid::from_raw(uid))
         .map_err(|e| {
             tracing::warn!("Failed to resolve UID: {}", e);
-            "Failed to resolve peer identity".to_string()
+            PeerIdentityError::ResolveFailed
         })?
         .ok_or_else(|| {
             tracing::warn!("No user found for UID {uid}");
-            "Failed to resolve peer identity".to_string()
+            PeerIdentityError::ResolveFailed
         })?
         .name;
 
@@ -40,31 +61,39 @@ pub fn resolve_peer(pid: i32, uid: u32) -> Result<PeerIdentity, String> {
     })
 }
 
-fn read_process_start_time(pid: i32) -> Result<u64, String> {
+fn read_process_start_time(pid: i32) -> Result<u64, PeerIdentityError> {
     let stat_path = format!("/proc/{}/stat", pid);
     let stat_content = std::fs::read_to_string(&stat_path)
-        .map_err(|e| format!("Failed to read {}: {}", stat_path, e))?;
+        .map_err(|e| PeerIdentityError::ProcStatRead { pid, source: e })?;
 
     let comm_end = stat_content
         .rfind(')')
-        .ok_or_else(|| format!("Malformed /proc/{}/stat: no closing parenthesis", pid))?;
+        .ok_or_else(|| PeerIdentityError::ProcStatMalformed {
+            pid,
+            detail: "no closing parenthesis".to_string(),
+        })?;
 
     let after_comm = &stat_content[comm_end + 1..];
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
 
     if fields.len() < 20 {
-        return Err(format!(
-            "Malformed /proc/{}/stat: only {} fields after comm",
+        return Err(PeerIdentityError::ProcStatMalformed {
             pid,
-            fields.len()
-        ));
+            detail: format!("only {} fields after comm", fields.len()),
+        });
     }
 
     fields
         .get(19)
-        .ok_or_else(|| format!("Malformed /proc/{}/stat: too few fields", pid))?
+        .ok_or_else(|| PeerIdentityError::ProcStatMalformed {
+            pid,
+            detail: "too few fields".to_string(),
+        })?
         .parse::<u64>()
-        .map_err(|e| format!("Failed to parse start_time from /proc/{}/stat: {}", pid, e))
+        .map_err(|e| PeerIdentityError::ProcStatMalformed {
+            pid,
+            detail: format!("failed to parse start_time: {}", e),
+        })
 }
 
 /// Authorize an admin IPC caller via PolKit.
@@ -75,36 +104,35 @@ fn read_process_start_time(pid: i32) -> Result<u64, String> {
 /// authorizations for subjects belonging to other identities.
 ///
 /// Falls back to root-only when PolKit is unavailable.
-pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), String> {
+pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIdentityError> {
     match check_polkit(identity).await {
         Ok(true) => Ok(()),
-        Ok(false) => Err("Authorization denied by PolKit".to_string()),
-        Err(e) => {
-            if is_dbus_unavailable(&e) {
-                tracing::warn!(
-                    "PolKit unavailable ({}), falling back to root-only check",
-                    e
-                );
-                if identity.uid == 0 {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "PolKit unavailable ({}) and caller is not root. \
+        Ok(false) => Err(PeerIdentityError::AuthorizationDenied),
+        Err(e @ PeerIdentityError::DBusUnavailable(_)) => {
+            tracing::warn!(
+                "PolKit unavailable ({}), falling back to root-only check",
+                e
+            );
+            if identity.uid == 0 {
+                Ok(())
+            } else {
+                Err(PeerIdentityError::PolKitUnavailable {
+                    reason: format!(
+                        "D-Bus unavailable ({}) and caller is not root. \
                          Install PolicyKit or run as root.",
                         e
-                    ))
-                }
-            } else {
-                Err(format!("PolKit authorization failed: {}", e))
+                    ),
+                })
             }
         }
+        Err(e) => Err(e),
     }
 }
 
-async fn check_polkit(identity: &PeerIdentity) -> Result<bool, String> {
+async fn check_polkit(identity: &PeerIdentity) -> Result<bool, PeerIdentityError> {
     let connection = Connection::system()
         .await
-        .map_err(|e| format!("D-Bus unavailable: {}", e))?;
+        .map_err(|e| PeerIdentityError::DBusUnavailable(format!("{}", e)))?;
 
     let mut details = std::collections::HashMap::new();
     details.insert(
@@ -132,7 +160,7 @@ async fn check_polkit(identity: &PeerIdentity) -> Result<bool, String> {
             ),
         )
         .await
-        .map_err(|e| format!("PolKit call failed: {}", e))?;
+        .map_err(|e| PeerIdentityError::PolKitError(format!("{}", e)))?;
 
     let body = reply.body();
     let (is_authorized, _is_challenge, _details): (
@@ -141,16 +169,7 @@ async fn check_polkit(identity: &PeerIdentity) -> Result<bool, String> {
         std::collections::HashMap<String, String>,
     ) = body
         .deserialize()
-        .map_err(|e| format!("PolKit response parse failed: {}", e))?;
+        .map_err(|e| PeerIdentityError::PolKitError(format!("response parse failed: {}", e)))?;
 
     Ok(is_authorized)
-}
-
-fn is_dbus_unavailable(error: &str) -> bool {
-    let e = error.to_lowercase();
-    e.contains("d-bus unavailable")
-        || e.contains("dbus unavailable")
-        || e.contains("not found")
-        || e.contains("no such")
-        || e.contains("serviceunknown")
 }

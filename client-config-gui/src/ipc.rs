@@ -10,6 +10,55 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
 
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum GuiIpcError {
+    #[error("timed out connecting to daemon socket")]
+    ConnectionTimeout,
+    #[error("failed to connect to daemon: {0}")]
+    ConnectionFailed(String),
+    #[error("timed out sending request")]
+    SendTimeout,
+    #[error("failed to send request: {0}")]
+    SendFailed(String),
+    #[error("timed out waiting for response")]
+    ResponseTimeout,
+    #[error("failed to read response: {0}")]
+    ReadFailed(String),
+    #[error("failed to decode response: {0}")]
+    DecodeFailed(String),
+    #[error("daemon returned unexpected envelope type")]
+    UnexpectedEnvelope,
+    #[error("{0}")]
+    DaemonError(String),
+    #[error("unexpected response type")]
+    UnexpectedResponse,
+}
+
+impl GuiIpcError {
+    pub fn localized(&self, l10n: &crate::l10n::L10n) -> String {
+        match self {
+            GuiIpcError::ConnectionTimeout => l10n.tr("error-ipc-connection-timeout"),
+            GuiIpcError::ConnectionFailed(detail) => {
+                l10n.tr_args("error-ipc-connection-failed", &[("detail", detail)])
+            }
+            GuiIpcError::SendTimeout => l10n.tr("error-ipc-send-timeout"),
+            GuiIpcError::SendFailed(detail) => {
+                l10n.tr_args("error-ipc-send-failed", &[("detail", detail)])
+            }
+            GuiIpcError::ResponseTimeout => l10n.tr("error-ipc-response-timeout"),
+            GuiIpcError::ReadFailed(detail) => {
+                l10n.tr_args("error-ipc-read-failed", &[("detail", detail)])
+            }
+            GuiIpcError::DecodeFailed(detail) => {
+                l10n.tr_args("error-ipc-decode-failed", &[("detail", detail)])
+            }
+            GuiIpcError::UnexpectedEnvelope => l10n.tr("error-ipc-unexpected-envelope"),
+            GuiIpcError::DaemonError(detail) => detail.clone(),
+            GuiIpcError::UnexpectedResponse => l10n.tr("error-ipc-unexpected-response"),
+        }
+    }
+}
+
 fn socket_path() -> String {
     #[cfg(feature = "dev-socket-override")]
     {
@@ -56,22 +105,24 @@ fn err_msg(resp: &ipc::AdminResponse) -> String {
     }
 }
 
-pub async fn send_admin_request(request: ipc::AdminRequest) -> Result<ipc::AdminResponse, String> {
+pub async fn send_admin_request(
+    request: ipc::AdminRequest,
+) -> Result<ipc::AdminResponse, GuiIpcError> {
     send_admin_request_with_read_timeout(request, Duration::from_secs(120)).await
 }
 
 async fn send_admin_request_with_read_timeout(
     request: ipc::AdminRequest,
     read_timeout: Duration,
-) -> Result<ipc::AdminResponse, String> {
+) -> Result<ipc::AdminResponse, GuiIpcError> {
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::AdminRequest(request)),
     };
 
     let mut stream = timeout(Duration::from_secs(10), daemon_socket())
         .await
-        .map_err(|_| "Timed out connecting to daemon socket".to_string())?
-        .map_err(|e| format!("Failed to connect to daemon: {}", e))?;
+        .map_err(|_| GuiIpcError::ConnectionTimeout)?
+        .map_err(|e| GuiIpcError::ConnectionFailed(format!("{}", e)))?;
 
     let req_bytes = envelope.encode_to_vec();
     timeout(
@@ -79,23 +130,23 @@ async fn send_admin_request_with_read_timeout(
         write_framed(&mut stream, &req_bytes),
     )
     .await
-    .map_err(|_| "Timed out sending admin request".to_string())?
-    .map_err(|e| format!("Failed to send admin request: {}", e))?;
+    .map_err(|_| GuiIpcError::SendTimeout)?
+    .map_err(|e| GuiIpcError::SendFailed(format!("{}", e)))?;
 
     let result = timeout(read_timeout, read_framed(&mut stream))
         .await
-        .map_err(|_| "Timed out waiting for admin response".to_string())?
-        .map_err(|e| format!("Failed to read admin response: {}", e))?;
+        .map_err(|_| GuiIpcError::ResponseTimeout)?
+        .map_err(|e| GuiIpcError::ReadFailed(format!("{}", e)))?;
 
     let envelope = ipc::IpcEnvelope::decode(&mut &result[..])
-        .map_err(|e| format!("Failed to decode IPC envelope: {}", e))?;
+        .map_err(|e| GuiIpcError::DecodeFailed(format!("{}", e)))?;
     match envelope.msg {
         Some(ipc::ipc_envelope::Msg::AdminResponse(resp)) => Ok(resp),
-        _ => Err("Daemon returned unexpected envelope type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedEnvelope),
     }
 }
 
-pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, String> {
+pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::GetServers(
             ipc::GetServersRequest {},
@@ -105,16 +156,16 @@ pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, String> 
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     match response.payload {
         Some(ipc::admin_response::Payload::GetServers(resp)) => Ok(resp.servers),
-        _ => Err("Unexpected response type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn start_pairing() -> Result<(String, u16), String> {
+pub async fn start_pairing() -> Result<(String, u16), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::StartPairing(
             ipc::StartPairingRequest {},
@@ -124,16 +175,16 @@ pub async fn start_pairing() -> Result<(String, u16), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     match response.payload {
         Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok((resp.url, resp.port as u16)),
-        _ => Err("Unexpected response type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), String> {
+pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::WaitForPairing(
             ipc::WaitForPairingRequest { port },
@@ -143,18 +194,18 @@ pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), String> {
     let response = send_admin_request_with_read_timeout(request, Duration::from_secs(300)).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     match response.payload {
         Some(ipc::admin_response::Payload::WaitForPairing(resp)) => {
             Ok((resp.sas_code, resp.port as u16))
         }
-        _ => Err("Unexpected response type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn complete_pairing(port: u32) -> Result<String, String> {
+pub async fn complete_pairing(port: u32) -> Result<String, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::CompletePairing(
             ipc::CompletePairingRequest { port },
@@ -164,16 +215,16 @@ pub async fn complete_pairing(port: u32) -> Result<String, String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     match response.payload {
         Some(ipc::admin_response::Payload::CompletePairing(resp)) => Ok(resp.server_hex),
-        _ => Err("Unexpected response type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn remove_device(public_key: String) -> Result<(), String> {
+pub async fn remove_device(public_key: String) -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::RemoveDevice(
             ipc::RemoveDeviceRequest { public_key },
@@ -183,13 +234,13 @@ pub async fn remove_device(public_key: String) -> Result<(), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     Ok(())
 }
 
-pub async fn rotate_csk() -> Result<(), String> {
+pub async fn rotate_csk() -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::RotateCsk(
             ipc::RotateCskRequest {},
@@ -199,13 +250,13 @@ pub async fn rotate_csk() -> Result<(), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     Ok(())
 }
 
-pub async fn save_config(client_hostname: String, udp_port: u16) -> Result<(), String> {
+pub async fn save_config(client_hostname: String, udp_port: u16) -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::SaveConfig(
             ipc::SaveConfigRequest {
@@ -218,14 +269,14 @@ pub async fn save_config(client_hostname: String, udp_port: u16) -> Result<(), S
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     Ok(())
 }
 
 #[allow(dead_code)]
-pub async fn recover_tpm() -> Result<(), String> {
+pub async fn recover_tpm() -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::RecoverTpm(
             ipc::RecoverTpmRequest {},
@@ -235,14 +286,14 @@ pub async fn recover_tpm() -> Result<(), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     Ok(())
 }
 
 #[cfg(feature = "tpm")]
-pub async fn get_daemon_status() -> Result<(bool, String), String> {
+pub async fn get_daemon_status() -> Result<(bool, String), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::GetDaemonStatus(
             ipc::GetDaemonStatusRequest {},
@@ -252,7 +303,7 @@ pub async fn get_daemon_status() -> Result<(bool, String), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     let status = response
@@ -261,12 +312,12 @@ pub async fn get_daemon_status() -> Result<(bool, String), String> {
             ipc::admin_response::Payload::GetDaemonStatus(s) => Some(s),
             _ => None,
         })
-        .ok_or("Daemon returned unexpected response type")?;
+        .ok_or(GuiIpcError::UnexpectedResponse)?;
 
     Ok((status.tpm_enabled, status.tpm_error))
 }
 
-pub async fn get_config() -> Result<(String, u16), String> {
+pub async fn get_config() -> Result<(String, u16), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::GetConfig(
             ipc::GetConfigRequest {},
@@ -276,13 +327,13 @@ pub async fn get_config() -> Result<(String, u16), String> {
     let response = send_admin_request(request).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
-        return Err(err_msg(&response));
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
     }
 
     match response.payload {
         Some(ipc::admin_response::Payload::GetConfig(resp)) => {
             Ok((resp.hostname, resp.udp_port as u16))
         }
-        _ => Err("Unexpected response type".to_string()),
+        _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }

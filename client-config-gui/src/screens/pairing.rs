@@ -1,4 +1,5 @@
 use super::ScreenMessage;
+use crate::ipc::GuiIpcError;
 use crate::l10n::L10n;
 use iced::widget::qr_code::Data as QrData;
 use iced::{
@@ -15,7 +16,7 @@ pub enum PairingState {
     VerifyingSAS { sas: String, port: u16 },
     CompletingPairing,
     Success { device_id: String },
-    Error { message: String },
+    Error { error: GuiIpcError },
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ impl PairingScreen {
                         Ok(qr) => std::rc::Rc::new(qr),
                         Err(_) => {
                             return Task::done(ScreenMessage::PairingFailed(
-                                "Failed to generate QR code".to_string(),
+                                GuiIpcError::DaemonError("Failed to generate QR code".to_string()),
                             ));
                         }
                     };
@@ -116,7 +117,7 @@ impl PairingScreen {
             }
             ScreenMessage::PairingFailed(error) => {
                 self.cancel_wait = None;
-                self.state = PairingState::Error { message: error };
+                self.state = PairingState::Error { error };
                 Task::none()
             }
             ScreenMessage::PairingCancelled => {
@@ -136,7 +137,7 @@ impl PairingScreen {
             PairingState::VerifyingSAS { sas, .. } => self.view_sas_verification(sas),
             PairingState::CompletingPairing => self.view_completing(),
             PairingState::Success { device_id } => self.view_success(device_id),
-            PairingState::Error { message } => self.view_error(message),
+            PairingState::Error { error } => self.view_error(error),
         };
 
         let centered_content = container(content)
@@ -252,10 +253,12 @@ impl PairingScreen {
         .into()
     }
 
-    fn view_error<'a>(&self, message: &'a str) -> Element<'a, ScreenMessage> {
+    fn view_error<'a>(&self, error: &'a GuiIpcError) -> Element<'a, ScreenMessage> {
         let back_button = button(text(self.l10n.tr("btn-back")).size(16))
             .padding(10)
             .on_press(ScreenMessage::NavigateToMainMenu);
+
+        let message = error.localized(&self.l10n);
 
         column![
             row![

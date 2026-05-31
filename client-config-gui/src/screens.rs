@@ -44,7 +44,7 @@ pub enum ScreenMessage {
     // Pairing
     PairingStarted,
     PairingComplete(String), // device_id or SAS
-    PairingFailed(String),   // error message
+    PairingFailed(crate::ipc::GuiIpcError),
     PairingCancelled,
     PairingSASConfirmed, // User confirmed SAS
 
@@ -55,12 +55,12 @@ pub enum ScreenMessage {
     // Settings
     RotateCSK,
     CSKRotated,
-    CSKRotationFailed(String),
+    CSKRotationFailed(crate::ipc::GuiIpcError),
     HostnameChanged(String),
     UdpPortChanged(String),
     SaveConfig,
     ConfigSaved,
-    ConfigSaveFailed(String),
+    ConfigSaveFailed(crate::ipc::GuiIpcError),
     ConfigLoaded(String, u16),
     LocaleChanged(String),
 
@@ -72,7 +72,7 @@ pub enum ScreenMessage {
     #[cfg(feature = "tpm")]
     TPMRecoveryComplete,
     #[cfg(feature = "tpm")]
-    TPMRecoveryFailed(String),
+    TPMRecoveryFailed(crate::ipc::GuiIpcError),
 }
 
 impl Screen {

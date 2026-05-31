@@ -1,4 +1,5 @@
 use super::ScreenMessage;
+use crate::ipc::GuiIpcError;
 use crate::l10n::L10n;
 use crate::utils::identity;
 use iced::{
@@ -29,7 +30,7 @@ pub struct DeviceListScreen {
     devices: HashMap<String, PairedServer>,
     current_username: String,
     loading: bool,
-    error: Option<String>,
+    error: Option<GuiIpcError>,
 }
 
 impl DeviceListScreen {
@@ -197,7 +198,7 @@ impl DeviceListScreen {
         };
 
         let error_display: Element<'_, ScreenMessage> = if let Some(ref error) = self.error {
-            text(error)
+            text(error.localized(&self.l10n))
                 .size(14)
                 .color(iced::Color::from_rgb(0.9, 0.2, 0.2))
                 .into()
@@ -226,7 +227,7 @@ impl DeviceListScreen {
             .into()
     }
 
-    async fn load_devices() -> Result<HashMap<String, PairedServer>, String> {
+    async fn load_devices() -> Result<HashMap<String, PairedServer>, GuiIpcError> {
         tracing::debug!("load_devices() called via IPC");
         let servers = crate::ipc::get_paired_servers().await?;
         let devices: HashMap<String, PairedServer> =
@@ -235,7 +236,7 @@ impl DeviceListScreen {
         Ok(devices)
     }
 
-    async fn remove_device(device_id: String) -> Result<(), String> {
+    async fn remove_device(device_id: String) -> Result<(), GuiIpcError> {
         crate::ipc::remove_device(device_id).await
     }
 }

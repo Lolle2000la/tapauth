@@ -1,4 +1,6 @@
 use super::ScreenMessage;
+#[cfg(feature = "tpm")]
+use crate::ipc::GuiIpcError;
 use crate::l10n::L10n;
 use iced::{
     widget::{button, column, container, text, Space},
@@ -72,9 +74,10 @@ impl MainMenuScreen {
             }
             #[cfg(feature = "tpm")]
             ScreenMessage::TPMRecoveryFailed(error) => {
+                let msg = error.localized(&self.l10n);
                 self.recovery_status = Some(
                     self.l10n
-                        .tr_args("label-recovery-failed", &[("error", &error)]),
+                        .tr_args("label-recovery-failed", &[("error", &msg)]),
                 );
                 Task::none()
             }
@@ -83,7 +86,7 @@ impl MainMenuScreen {
     }
 
     #[cfg(feature = "tpm")]
-    async fn perform_check_tpm_status() -> Result<String, String> {
+    async fn perform_check_tpm_status() -> Result<String, GuiIpcError> {
         crate::ipc::get_daemon_status()
             .await
             .map(|(tpm_enabled, tpm_error)| {
@@ -96,7 +99,7 @@ impl MainMenuScreen {
     }
 
     #[cfg(feature = "tpm")]
-    async fn perform_tpm_recovery() -> Result<(), String> {
+    async fn perform_tpm_recovery() -> Result<(), GuiIpcError> {
         crate::ipc::recover_tpm().await
     }
 

@@ -135,7 +135,7 @@ pub async fn handle_admin_request(
     let daemon = daemon_lock.read().await.clone();
     let identity = match resolve_peer(caller_pid, caller_uid) {
         Ok(id) => id,
-        Err(e) => return err_resp(ipc::AdminStatus::AdminError, e),
+        Err(e) => return err_resp(ipc::AdminStatus::AdminError, e.to_string()),
     };
 
     // Daemon-side PolKit authorization: the daemon calls CheckAuthorization
@@ -144,7 +144,7 @@ pub async fn handle_admin_request(
     // PolKit check.  The tapauthd user must be registered as an action owner
     // via org.freedesktop.policykit.owner in the policy file.
     if let Err(e) = check_authorization(&identity).await {
-        return err_resp(ipc::AdminStatus::AdminUnauthorized, e);
+        return err_resp(ipc::AdminStatus::AdminUnauthorized, e.to_string());
     }
 
     let username = identity.username;
