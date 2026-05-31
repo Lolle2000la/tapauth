@@ -86,7 +86,7 @@ pam-timed-out = TapAuth: タイムアウト、パスワードを試します...
 pam-skipped = TapAuth: スキップしました、パスワードを試します...
 pam-auth-successful = TapAuth: 認証成功！
 pam-auth-denied = TapAuth: サーバーによって認証が拒否されました
-pam-error-prefix = TapAuth: エラー - 
+pam-error-prefix = TapAuth: エラー -
 
 # ── System Error/Warning Dialogs ──
 error-user-missing-title = システムユーザーが見つかりません

@@ -86,7 +86,7 @@ pam-timed-out = TapAuth: Timed out, trying password...
 pam-skipped = TapAuth: Skipped, trying password...
 pam-auth-successful = TapAuth: Authentication successful!
 pam-auth-denied = TapAuth: Authentication denied by server
-pam-error-prefix = TapAuth: Error - 
+pam-error-prefix = TapAuth: Error -
 
 # ── System Error/Warning Dialogs ──
 error-user-missing-title = System User Missing

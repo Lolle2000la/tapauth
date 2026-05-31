@@ -138,7 +138,7 @@ impl PamMessages {
     }
 
     pub fn error(&self, detail: &str) -> String {
-        format!("{}{}", self.error_prefix, detail)
+        format!("{} {}", self.error_prefix, detail)
     }
 }
 
