@@ -44,7 +44,8 @@ A custom, unified F-Droid repository delivers the TapAuth Android companion app 
 **Add the repository to F-Droid:**
 1. Install [F-Droid](https://f-droid.org/) on your Android device.
 2. Open F-Droid, go to **Settings** → **Repositories** → tap the **+** button.
-3. Enter the repository URL containing the pinned cryptographic fingerprint to establish trust automatically without security warnings:
+3. Scan the QR Code or enter the repository URL containing the pinned cryptographic fingerprint to establish trust automatically without security warnings:  
+   ![F-Droid Repository QR Code](docs/fdroid-repo-qr.svg)
    ```
    https://tapauth.rourunisen.dev/fdroid/repo?fingerprint=94084CA00DE1D7163C3105BDFBD318DE6774B239711E8DF4EFC9CD13FCE77CF4
    ```
