@@ -87,12 +87,14 @@ impl L10n {
 pub fn detect_locale() -> &'static str {
     for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(val) = std::env::var(var) {
-            let val_lower = val.to_lowercase();
-            if val_lower.starts_with("de") {
-                return "de";
-            }
-            if val_lower.starts_with("ja") {
-                return "ja";
+            for lang in &["de", "ja"] {
+                if val.eq_ignore_ascii_case(lang)
+                    || val
+                        .strip_prefix(lang)
+                        .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
+                {
+                    return lang;
+                }
             }
         }
     }

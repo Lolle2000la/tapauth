@@ -147,11 +147,14 @@ impl PamMessages {
 pub fn detect_locale() -> &'static str {
     for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(val) = std::env::var(var) {
-            if val.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("de")) {
-                return "de";
-            }
-            if val.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("ja")) {
-                return "ja";
+            for lang in &["de", "ja"] {
+                if val.eq_ignore_ascii_case(lang)
+                    || val
+                        .strip_prefix(lang)
+                        .is_some_and(|rest| rest.starts_with(['_', '-', '.', '@']))
+                {
+                    return lang;
+                }
             }
         }
     }
