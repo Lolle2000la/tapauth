@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import dev.rourunisen.tapauth.BuildConfig
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.AppConfiguration
 import java.text.DateFormat
@@ -161,7 +162,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    InfoRow(stringResource(R.string.settings_app_version), "1.0.0")
+                    InfoRow(stringResource(R.string.settings_app_version), BuildConfig.VERSION_NAME)
                     HorizontalDivider()
                     InfoRow(stringResource(R.string.settings_protocol_version), "1")
                     HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
