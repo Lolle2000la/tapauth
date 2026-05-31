@@ -243,22 +243,19 @@ fn adopt_systemd_socket() -> Result<Option<UnixListener>, Box<dyn std::error::Er
     Ok(None)
 }
 
-fn drop_privileges_to_tapauthd() -> Result<(), String> {
-    // Look up tapauthd user
-    let target_user = User::from_name("tapauthd")
-        .map_err(|e| format!("Failed to query user database: {}", e))?
-        .ok_or_else(|| "User 'tapauthd' not found".to_string())?;
+fn drop_privileges_to_tapauthd() -> Result<(), Box<dyn std::error::Error>> {
+    let target_user =
+        User::from_name("tapauthd").map_err(|e| format!("Failed to query user database: {}", e))?;
+    let user = target_user.ok_or("User 'tapauthd' not found")?;
 
-    let target_uid = Uid::from_raw(target_user.uid.as_raw());
-    let target_gid = Gid::from_raw(target_user.gid.as_raw());
+    let target_uid = Uid::from_raw(user.uid.as_raw());
+    let target_gid = Gid::from_raw(user.gid.as_raw());
 
-    // Check if already running as target user
     let current_euid = nix::unistd::geteuid();
     if current_euid == target_uid {
         return Ok(());
     }
 
-    // Drop group first, then user
     setgid(target_gid).map_err(|e| format!("setgid failed: {}", e))?;
     setuid(target_uid).map_err(|e| format!("setuid failed: {}", e))?;
 

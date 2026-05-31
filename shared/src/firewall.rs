@@ -17,6 +17,18 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum FirewallError {
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String),
+    #[error("iptables command failed: {0}")]
+    Iptables(String),
+    #[error("firewall-cmd failed: {0}")]
+    FirewallCmd(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 pub struct FirewallGuard {
     port: u16,
     protocol: Protocol,
@@ -47,11 +59,11 @@ impl FirewallGuard {
     ///
     /// When the last strong reference is dropped, the port is automatically
     /// closed in a background thread/task — no manual ref-counting needed.
-    pub fn new(port: u16, protocol: Protocol) -> Result<Arc<Self>, String> {
+    pub fn new(port: u16, protocol: Protocol) -> Result<Arc<Self>, FirewallError> {
         let port_ctrl = {
-            let mut map = guards()
-                .lock()
-                .map_err(|e| format!("guard map lock poisoned: {}", e))?;
+            let mut map = guards().lock().map_err(|e| {
+                FirewallError::LockPoisoned(format!("guard map lock poisoned: {}", e))
+            })?;
             map.entry(port)
                 .or_insert_with(|| {
                     Arc::new(Mutex::new(PortControl {
@@ -62,9 +74,9 @@ impl FirewallGuard {
                 .clone()
         };
 
-        let mut ctrl = port_ctrl
-            .lock()
-            .map_err(|e| format!("port control lock poisoned: {}", e))?;
+        let mut ctrl = port_ctrl.lock().map_err(|e| {
+            FirewallError::LockPoisoned(format!("port control lock poisoned: {}", e))
+        })?;
 
         if let Some(existing) = ctrl.weak.upgrade() {
             return Ok(existing);
@@ -120,7 +132,7 @@ fn do_drop_close(port: u16, protocol: Protocol) {
     }
 }
 
-pub fn open_port(port: u16, protocol: Protocol) -> Result<(), String> {
+pub fn open_port(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
     if is_firewalld_running() {
         add_firewalld_rule(port, protocol)?;
         tracing::info!(
@@ -154,24 +166,27 @@ pub fn open_port(port: u16, protocol: Protocol) -> Result<(), String> {
             );
             Ok(())
         }
-        Ok(status) => Err(format!("iptables command failed with status: {}", status)),
+        Ok(status) => Err(FirewallError::Iptables(format!(
+            "command failed with status: {}",
+            status
+        ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
                 "Neither firewalld nor iptables found on host; skipping automated port allocation"
             );
             Ok(())
         }
-        Err(e) => Err(format!("Failed to execute iptables: {}", e)),
+        Err(e) => Err(FirewallError::Io(e)),
     }
 }
 
-pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
+pub fn close_port(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
     if is_firewalld_running() {
         if let Err(e) = remove_firewalld_rule(port, protocol) {
-            return Err(format!(
+            return Err(FirewallError::FirewallCmd(format!(
                 "Failed to close firewall port {}/{}: {}",
                 port, protocol, e
-            ));
+            )));
         } else {
             tracing::info!(
                 "Firewall (firewalld): Closed ephemeral port {}/{}",
@@ -196,9 +211,10 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
         .status();
 
     match result {
-        Ok(status) if !status.success() => {
-            Err(format!("iptables -D failed with exit status: {}", status))
-        }
+        Ok(status) if !status.success() => Err(FirewallError::Iptables(format!(
+            "iptables -D failed with exit status: {}",
+            status
+        ))),
         Ok(_) => {
             tracing::info!(
                 "Firewall (iptables): Closed ephemeral port {}/{}",
@@ -211,7 +227,7 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), String> {
             tracing::warn!("iptables binary not found; skipping automated port cleanup");
             Ok(())
         }
-        Err(e) => Err(format!("Failed to execute iptables -D: {}", e)),
+        Err(e) => Err(FirewallError::Io(e)),
     }
 }
 
@@ -223,28 +239,38 @@ fn is_firewalld_running() -> bool {
         .unwrap_or(false)
 }
 
-fn add_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), String> {
+fn add_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
     let status = Command::new("firewall-cmd")
         .args(["--add-port", &format!("{}/{}", port, protocol)])
         .status()
-        .map_err(|e| format!("Failed to execute firewall-cmd: {}", e))?;
+        .map_err(|e| {
+            FirewallError::FirewallCmd(format!("Failed to execute firewall-cmd: {}", e))
+        })?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("firewall-cmd failed with status: {}", status))
+        Err(FirewallError::FirewallCmd(format!(
+            "firewall-cmd failed with status: {}",
+            status
+        )))
     }
 }
 
-fn remove_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), String> {
+fn remove_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
     let status = Command::new("firewall-cmd")
         .args(["--remove-port", &format!("{}/{}", port, protocol)])
         .status()
-        .map_err(|e| format!("Failed to execute firewall-cmd: {}", e))?;
+        .map_err(|e| {
+            FirewallError::FirewallCmd(format!("Failed to execute firewall-cmd: {}", e))
+        })?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("firewall-cmd failed with status: {}", status))
+        Err(FirewallError::FirewallCmd(format!(
+            "firewall-cmd failed with status: {}",
+            status
+        )))
     }
 }

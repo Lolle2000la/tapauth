@@ -65,6 +65,17 @@ settings-csk-rotated = CSKが正常にローテーションされました。す
 settings-error-prefix = エラー: {$message}
 settings-invalid-port = 無効なポート番号（1-65535である必要があります）
 
+# ── IPC Errors ──
+error-ipc-connection-timeout = デーモンへの接続がタイムアウトしました。tapauthdは実行中ですか？
+error-ipc-connection-failed = デーモンに接続できませんでした: {$detail}
+error-ipc-send-timeout = リクエストの送信がタイムアウトしました
+error-ipc-send-failed = リクエストの送信に失敗しました: {$detail}
+error-ipc-response-timeout = デーモンが時間内に応答しませんでした
+error-ipc-read-failed = 応答の読み取りに失敗しました: {$detail}
+error-ipc-decode-failed = 応答のデコードに失敗しました: {$detail}
+error-ipc-unexpected-envelope = デーモンが予期しない応答を返しました
+error-ipc-unexpected-response = デーモンからの予期しない応答
+
 # ── System Error/Warning Dialogs ──
 error-user-missing-title = システムユーザーが見つかりません
 error-user-missing-message = システムユーザー 'tapauthd' が必要ですが、見つかりませんでした。
