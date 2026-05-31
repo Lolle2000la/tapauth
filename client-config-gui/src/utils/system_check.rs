@@ -26,6 +26,10 @@ pub fn validate_tapauthd_user() -> Result<(), ValidationError> {
 /// this group can connect to the daemon — the GUI checks early so it can
 /// show a helpful warning before the user tries IPC operations.
 pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
+    if nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+
     let group = match Group::from_name("tapauthd-clients") {
         Ok(Some(g)) => g,
         Ok(None) | Err(_) => return Err(ValidationError),
