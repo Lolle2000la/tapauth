@@ -55,17 +55,6 @@ pub fn validate_tapauthd_user() -> Result<(), ValidationError> {
     }
 }
 
-/// Validates that the `tapauthd-clients` system group exists
-///
-/// The daemon socket permissions are gated on this group.  If the group
-/// itself is missing (e.g. botched install), the user can't be added to it.
-pub fn validate_tapauthd_clients_group_exists() -> Result<(), ValidationError> {
-    match Group::from_name("tapauthd-clients") {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) | Err(_) => Err(ValidationError::TapauthdClientsGroupMissing),
-    }
-}
-
 /// Validates that the current user is a member of the `tapauthd-clients` group
 ///
 /// The daemon socket (`/run/tapauthd/tapauthd.sock`) has permissions
@@ -74,8 +63,10 @@ pub fn validate_tapauthd_clients_group_exists() -> Result<(), ValidationError> {
 /// show a helpful warning before the user tries IPC operations.
 ///
 /// Root bypasses this check (socket is owned by root).
-/// If the group itself doesn't exist, silently passes (the separate
-/// `validate_tapauthd_clients_group_exists` check is fatal).
+///
+/// Returns `TapauthdClientsGroupMissing` (fatal) when the group itself does
+/// not exist, and `NotInTapauthdClientsGroup` (warning) when the current
+/// user is not a member of an existing group.
 pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
     if nix::unistd::geteuid().is_root() {
         return Ok(());
@@ -83,7 +74,7 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
 
     let group = match Group::from_name("tapauthd-clients") {
         Ok(Some(g)) => g,
-        _ => return Ok(()),
+        _ => return Err(ValidationError::TapauthdClientsGroupMissing),
     };
 
     let target_gid = group.gid;
@@ -107,7 +98,6 @@ pub fn validate_tapauthd_clients_group() -> Result<(), ValidationError> {
 pub fn validate_all() -> Vec<Result<(), ValidationError>> {
     vec![
         validate_tapauthd_user(),
-        validate_tapauthd_clients_group_exists(),
         validate_tapauthd_clients_group(),
     ]
 }
