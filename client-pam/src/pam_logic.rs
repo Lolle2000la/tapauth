@@ -44,8 +44,6 @@ use std::time::{Duration, Instant};
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
 
-    let msgs = pam_messages::load();
-
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
     if let Some(pam_status) = guard_display_manager_bypass(pamh) {
@@ -86,6 +84,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // No explicit root check here; shared config enforces file ownership/permissions.
 
+    let msgs = pam_messages::load();
     let has_terminal = std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {
