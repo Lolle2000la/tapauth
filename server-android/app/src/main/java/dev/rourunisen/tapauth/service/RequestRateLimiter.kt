@@ -38,43 +38,64 @@ class RequestRateLimiter {
      */
     fun shouldAcceptRequest(clientPublicKey: String): Boolean {
         val now = System.currentTimeMillis()
-        val state = clientBackoffs[clientPublicKey]
 
-        if (state == null) {
-            clientBackoffs[clientPublicKey] = BackoffState(now, INITIAL_BACKOFF_SECONDS)
+        synchronized(clientBackoffs) {
+            val state = clientBackoffs[clientPublicKey]
+
+            if (state == null) {
+                clientBackoffs[clientPublicKey] = BackoffState(now, INITIAL_BACKOFF_SECONDS)
+                return true
+            }
+
+            val timeInBurstWindow = now - state.burstWindowStart
+            if (timeInBurstWindow < BURST_WINDOW_MS && state.requestCount < BURST_MAX) {
+                // Within burst allowance: accept without penalty
+                clientBackoffs[clientPublicKey] =
+                    state.copy(lastRequestTime = now, requestCount = state.requestCount + 1)
+                Log.d(
+                    TAG,
+                    "Burst-accepting request #${state.requestCount + 1} from $clientPublicKey",
+                )
+                return true
+            }
+
+            val timeSinceLastRequest = (now - state.lastRequestTime) / 1000
+
+            if (timeSinceLastRequest < state.backoffSeconds) {
+                val remaining = state.backoffSeconds - timeSinceLastRequest
+                Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
+
+                val newBackoff = min(state.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
+                clientBackoffs[clientPublicKey] =
+                    state.copy(
+                        lastRequestTime = now,
+                        backoffSeconds = newBackoff,
+                        requestCount = BURST_MAX,
+                    )
+
+                return false
+            }
+
+            if (timeInBurstWindow >= BURST_WINDOW_MS) {
+                // Old burst window expired: start a new one (allows future bursts)
+                clientBackoffs[clientPublicKey] =
+                    BackoffState(
+                        lastRequestTime = now,
+                        backoffSeconds = state.backoffSeconds,
+                        requestCount = 1,
+                        burstWindowStart = now,
+                    )
+            } else {
+                // Still within the old burst window but burst exhausted or cooldown satisfied
+                clientBackoffs[clientPublicKey] = state.copy(lastRequestTime = now)
+            }
+
+            Log.d(
+                TAG,
+                "Accepting request from $clientPublicKey, backoff unchanged: ${state.backoffSeconds}s",
+            )
             return true
         }
-
-        val timeInBurstWindow = now - state.burstWindowStart
-        if (timeInBurstWindow < BURST_WINDOW_MS && state.requestCount < BURST_MAX) {
-            // Within burst allowance: accept without penalty
-            clientBackoffs[clientPublicKey] =
-                state.copy(lastRequestTime = now, requestCount = state.requestCount + 1)
-            Log.d(TAG, "Burst-accepting request #${state.requestCount + 1} from $clientPublicKey")
-            return true
-        }
-
-        val timeSinceLastRequest = (now - state.lastRequestTime) / 1000
-
-        if (timeSinceLastRequest < state.backoffSeconds) {
-            val remaining = state.backoffSeconds - timeSinceLastRequest
-            Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
-
-            // Escalate backoff only when a request is actually rejected
-            val newBackoff = min(state.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
-            clientBackoffs[clientPublicKey] = BackoffState(now, newBackoff)
-
-            return false
-        }
-
-        // Cooldown expired: accept but do NOT escalate (no penalty for legitimate retransmissions)
-        clientBackoffs[clientPublicKey] = state.copy(lastRequestTime = now)
-
-        Log.d(
-            TAG,
-            "Accepting request from $clientPublicKey, backoff unchanged: ${state.backoffSeconds}s",
-        )
-        return true
     }
 
     /**
