@@ -14,6 +14,7 @@ Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
+BuildRequires:  clang
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
 %else

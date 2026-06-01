@@ -85,7 +85,19 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // No explicit root check here; shared config enforces file ownership/permissions.
 
     let msgs = pam_messages::load_for_user(&username);
-    let has_terminal = std::fs::File::open("/dev/tty").is_ok();
+
+    // Block terminal polling if running under the Polkit Graphical Helper.
+    // This prevents the PAM module from stealing stdin strings from checking
+    // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
+    // to deadlock during graphical challenge-response dialogs.
+    let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
+    let is_polkit = service == "polkit-1";
+    let tty_file = if !is_polkit {
+        std::fs::File::open("/dev/tty").ok()
+    } else {
+        None
+    };
+    let has_terminal = tty_file.is_some();
 
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
@@ -191,73 +203,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
-    let mut tty = match std::fs::File::open("/dev/tty") {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!(
-                "Could not open /dev/tty: {}, falling back to socket-only",
-                e
-            );
-            let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let mut fds = [PollFd::new(
-                    unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                    PollFlags::POLLIN,
-                )];
-                let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
-                match poll(&mut fds, remain_ms) {
-                    Ok(0) => continue,
-                    Ok(_) => {
-                        if let Some(rev) = fds[0].revents() {
-                            // Read data first if available (POLLIN can be set with POLLHUP)
-                            if rev.contains(PollFlags::POLLIN) {
-                                match ipc.try_read_response_nonblocking() {
-                                    Ok(Some(resp)) => {
-                                        return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
-                                    }
-                                    Ok(None) => {
-                                        // No complete frame yet, check for errors
-                                        if rev.contains(PollFlags::POLLHUP)
-                                            || rev.contains(PollFlags::POLLERR)
-                                        {
-                                            tracing::error!(
-                                                "Daemon closed connection before sending response"
-                                            );
-                                            pam_conv.try_info(msgs.connection_lost());
-                                            return pam_sys::PAM_IGNORE;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("IPC read failed: {}", e);
-                                        pam_conv.try_info(msgs.communication_error());
-                                        return pam_sys::PAM_IGNORE;
-                                    }
-                                }
-                            } else if rev.contains(PollFlags::POLLHUP)
-                                || rev.contains(PollFlags::POLLERR)
-                            {
-                                // Hangup/error without any data available
-                                tracing::error!("Daemon closed connection or error detected");
-                                pam_conv.try_info(msgs.connection_lost());
-                                return pam_sys::PAM_IGNORE;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if e != nix::errno::Errno::EINTR {
-                            tracing::warn!("poll error: {}", e);
-                        }
-                    }
-                }
-            }
-            pam_conv.try_info(msgs.timed_out());
-            return pam_sys::PAM_IGNORE;
-        }
+    //
+    // Safety: at this point has_terminal is true, so tty_file is
+    // guaranteed Some. We still use let-else as a non-panicking
+    // defuse instead of expect()/unwrap().
+    let Some(mut tty) = tty_file else {
+        return pam_sys::PAM_IGNORE;
     };
 
     // Set tty nonblocking to avoid read(1) blocking unexpectedly
@@ -269,6 +220,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     }
 
+    let mut poll_tty = true;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
     let mut kb = [0u8; 4];
     loop {
@@ -287,7 +239,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 PollFlags::POLLIN,
             ),
         ];
-        match poll(&mut fds, remain_ms) {
+
+        let fds_slice = if poll_tty {
+            &mut fds[..2]
+        } else {
+            &mut fds[..1]
+        };
+
+        match poll(fds_slice, remain_ms) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
@@ -323,23 +282,43 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         return pam_sys::PAM_IGNORE;
                     }
                 }
-                // TTY - peek for Enter; don't consume other keys
-                if let Some(rev) = fds[1].revents() {
-                    if rev.contains(PollFlags::POLLIN) {
-                        // Peek at the byte without consuming unless it's Enter
-                        if let Ok(1) = tty.read(&mut kb[..1]) {
-                            let b = kb[0];
-                            if b == b'\n' || b == b'\r' {
-                                tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a new blocking connection with a short
-                                // timeout so the skip is not blocked by an unresponsive daemon.
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                    let _ = c.send_cancel("tty-skip", &request_id);
+                // TTY - read one byte; skip on Enter, discard other keys
+                if poll_tty {
+                    if let Some(rev) = fds[1].revents() {
+                        if rev.contains(PollFlags::POLLIN) {
+                            match tty.read(&mut kb[..1]) {
+                                Ok(1) => {
+                                    let b = kb[0];
+                                    if b == b'\n' || b == b'\r' {
+                                        tracing::info!("User pressed Enter to skip");
+                                        // Best-effort cancel uses a new blocking connection
+                                        // with a short timeout so the skip is not blocked
+                                        // by an unresponsive daemon.
+                                        if let Ok(mut c) =
+                                            IpcClient::connect(Duration::from_millis(100))
+                                        {
+                                            let _ = c.send_cancel("tty-skip", &request_id);
+                                        }
+                                        pam_conv.try_info(msgs.skipped());
+                                        return pam_sys::PAM_IGNORE;
+                                    }
+                                    // Non-Enter key: consume and ignore
                                 }
-                                pam_conv.try_info(msgs.skipped());
-                                return pam_sys::PAM_IGNORE;
+                                Ok(0) => {
+                                    // EOF reached, stop polling TTY to avoid busy loop
+                                    poll_tty = false;
+                                }
+                                Ok(_) => unreachable!("read into 1-byte buffer cannot exceed 1"),
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => {
+                                    // Other error, stop polling TTY
+                                    poll_tty = false;
+                                }
                             }
-                            // Non-Enter key: consume and ignore (could be user typing password early)
+                        } else if rev.contains(PollFlags::POLLHUP)
+                            || rev.contains(PollFlags::POLLERR)
+                        {
+                            poll_tty = false;
                         }
                     }
                 }
