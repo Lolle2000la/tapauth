@@ -190,6 +190,12 @@ pub unsafe fn prompt_user(
     );
 
     if ret != PAM_SUCCESS {
+        if !resp.is_null() {
+            if !(*resp).resp.is_null() {
+                libc::free((*resp).resp as *mut c_void);
+            }
+            libc::free(resp as *mut c_void);
+        }
         return Err(ret);
     }
 
