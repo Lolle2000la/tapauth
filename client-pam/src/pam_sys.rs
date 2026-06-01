@@ -35,7 +35,7 @@ pub const PAM_TEXT_INFO: c_int = 4;
 /// Opaque PAM handle structure
 #[repr(C)]
 pub struct PamHandle {
-    _private: [u8; 0],
+    _opaque: [u8; 0],
 }
 
 /// PAM message structure
@@ -90,14 +90,15 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
     if pamh.is_null() {
         return None;
     }
-    let mut item: *const c_void = std::ptr::null();
-    let ret = pam_get_item(pamh, PAM_SERVICE, &mut item);
+    let mut ptr: *const c_char = std::ptr::null();
+    let ret = pam_get_item(
+        pamh,
+        PAM_SERVICE,
+        &mut ptr as *mut *const c_char as *mut *const c_void,
+    );
 
-    if ret == PAM_SUCCESS && !item.is_null() {
-        CStr::from_ptr(item as *const c_char)
-            .to_str()
-            .ok()
-            .map(|s| s.to_owned())
+    if ret == PAM_SUCCESS && !ptr.is_null() {
+        Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
     } else {
         None
     }
@@ -106,25 +107,33 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
 /// Safe wrapper to get username from PAM
 #[allow(dead_code)]
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
-    let mut item: *const c_void = std::ptr::null();
-    let ret = pam_get_item(pamh, PAM_USER, &mut item);
+    let mut ptr: *const c_char = std::ptr::null();
+    let ret = pam_get_item(
+        pamh,
+        PAM_USER,
+        &mut ptr as *mut *const c_char as *mut *const c_void,
+    );
 
     if ret != PAM_SUCCESS {
         return Err(ret);
     }
 
-    if item.is_null() {
+    if ptr.is_null() {
         // Try RUSER (remote user) as fallback
-        let ret = pam_get_item(pamh, PAM_RUSER, &mut item);
+        let ret = pam_get_item(
+            pamh,
+            PAM_RUSER,
+            &mut ptr as *mut *const c_char as *mut *const c_void,
+        );
         if ret != PAM_SUCCESS {
             return Err(ret);
         }
-        if item.is_null() {
+        if ptr.is_null() {
             return Err(PAM_USER_UNKNOWN);
         }
     }
 
-    let user_cstr = CStr::from_ptr(item as *const c_char);
+    let user_cstr = CStr::from_ptr(ptr);
     Ok(user_cstr
         .to_str()
         .map_err(|_| PAM_USER_UNKNOWN)?
@@ -148,18 +157,18 @@ pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int
 
 /// Get the PAM conversation function
 pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const PamConv, c_int> {
-    let mut item: *const c_void = std::ptr::null();
-    let ret = pam_get_item(pamh, PAM_CONV, &mut item);
+    let mut ptr: *const c_void = std::ptr::null();
+    let ret = pam_get_item(pamh, PAM_CONV, &mut ptr as *mut *const c_void);
 
     if ret != PAM_SUCCESS {
         return Err(ret);
     }
 
-    if item.is_null() {
+    if ptr.is_null() {
         return Err(PAM_CONV_ERR);
     }
 
-    Ok(item as *const PamConv)
+    Ok(ptr as *const PamConv)
 }
 
 /// Send a message to the user via PAM conversation
