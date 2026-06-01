@@ -85,7 +85,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // No explicit root check here; shared config enforces file ownership/permissions.
 
     let msgs = pam_messages::load_for_user(&username);
-    let has_terminal = std::fs::File::open("/dev/tty").is_ok();
+
+    // Block terminal polling if running under the Polkit Graphical Helper.
+    // This prevents the PAM module from stealing stdin strings from checking
+    // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
+    // to deadlock during graphical challenge-response dialogs.
+    let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
+    let is_polkit = service == "polkit-1";
+    let has_terminal = !is_polkit && std::fs::File::open("/dev/tty").is_ok();
 
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());

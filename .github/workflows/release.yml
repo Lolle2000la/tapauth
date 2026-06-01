@@ -138,7 +138,7 @@ jobs:
           Section: admin
           Priority: optional
           Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev
+          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev
           Standards-Version: 4.7.0
 
           Package: tapauth
@@ -354,7 +354,7 @@ jobs:
           url="https://github.com/lolle2000la/tapauth"
           license=('AGPL-3.0')
           depends=('dbus' 'pam')
-          makedepends=('cargo' 'rust' 'protobuf')
+          makedepends=('cargo' 'rust' 'protobuf' 'clang')
           backup=('etc/tapauth/config.toml')
           install=tapauth.install
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
@@ -425,6 +425,7 @@ jobs:
           	makedepends = cargo
           	makedepends = rust
           	makedepends = protobuf
+          	makedepends = clang
           	depends = dbus
           	depends = pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
