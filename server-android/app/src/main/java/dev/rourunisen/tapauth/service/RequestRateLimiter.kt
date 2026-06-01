@@ -67,11 +67,7 @@ class RequestRateLimiter {
                 Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
 
                 val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
-                return@compute existing.copy(
-                    lastRequestTime = now,
-                    backoffSeconds = newBackoff,
-                    requestCount = BURST_MAX,
-                )
+                return@compute existing.copy(backoffSeconds = newBackoff, requestCount = BURST_MAX)
             }
 
             accepted = true
