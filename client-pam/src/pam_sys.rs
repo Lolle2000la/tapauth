@@ -84,7 +84,6 @@ pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int
     let ret = ffi::pam_set_item(pamh, PAM_USER, username_cstring.as_ptr() as *const c_void);
 
     if ret == PAM_SUCCESS {
-        std::mem::forget(username_cstring);
         Ok(())
     } else {
         Err(ret)
