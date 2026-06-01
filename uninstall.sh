@@ -169,9 +169,10 @@ remove_systemd_units_and_daemon() {
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         
-        if [[ -f "/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf" ]]; then
-            show_file_removal "/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf" "Polkit agent helper sandbox override"
-            show_command "rmdir /etc/systemd/system/polkit-agent-helper@.service.d || true" "Remove empty drop-in directory"
+        local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+        if [[ -f "$polkit_dropin" ]]; then
+            show_file_removal "$polkit_dropin" "Polkit agent helper sandbox override"
+            show_command "rmdir $(dirname "$polkit_dropin") || true" "Remove empty drop-in directory"
         fi
         return
     fi
