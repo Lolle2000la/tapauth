@@ -216,7 +216,7 @@ remove_systemd_units_and_daemon() {
         rm -f "$polkit_dropin"
         rmdir "/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload
+            systemctl daemon-reload >/dev/null 2>&1 || true
         fi
     fi
 
