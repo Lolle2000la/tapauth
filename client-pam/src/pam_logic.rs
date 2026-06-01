@@ -92,7 +92,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // to deadlock during graphical challenge-response dialogs.
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
     let is_polkit = service == "polkit-1";
-    let has_terminal = !is_polkit && std::fs::File::open("/dev/tty").is_ok();
+    let tty_file = if !is_polkit {
+        std::fs::File::open("/dev/tty").ok()
+    } else {
+        None
+    };
+    let has_terminal = tty_file.is_some();
 
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
@@ -198,73 +203,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
-    let mut tty = match std::fs::File::open("/dev/tty") {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!(
-                "Could not open /dev/tty: {}, falling back to socket-only",
-                e
-            );
-            let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let mut fds = [PollFd::new(
-                    unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                    PollFlags::POLLIN,
-                )];
-                let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
-                match poll(&mut fds, remain_ms) {
-                    Ok(0) => continue,
-                    Ok(_) => {
-                        if let Some(rev) = fds[0].revents() {
-                            // Read data first if available (POLLIN can be set with POLLHUP)
-                            if rev.contains(PollFlags::POLLIN) {
-                                match ipc.try_read_response_nonblocking() {
-                                    Ok(Some(resp)) => {
-                                        return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
-                                    }
-                                    Ok(None) => {
-                                        // No complete frame yet, check for errors
-                                        if rev.contains(PollFlags::POLLHUP)
-                                            || rev.contains(PollFlags::POLLERR)
-                                        {
-                                            tracing::error!(
-                                                "Daemon closed connection before sending response"
-                                            );
-                                            pam_conv.try_info(msgs.connection_lost());
-                                            return pam_sys::PAM_IGNORE;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("IPC read failed: {}", e);
-                                        pam_conv.try_info(msgs.communication_error());
-                                        return pam_sys::PAM_IGNORE;
-                                    }
-                                }
-                            } else if rev.contains(PollFlags::POLLHUP)
-                                || rev.contains(PollFlags::POLLERR)
-                            {
-                                // Hangup/error without any data available
-                                tracing::error!("Daemon closed connection or error detected");
-                                pam_conv.try_info(msgs.connection_lost());
-                                return pam_sys::PAM_IGNORE;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if e != nix::errno::Errno::EINTR {
-                            tracing::warn!("poll error: {}", e);
-                        }
-                    }
-                }
-            }
-            pam_conv.try_info(msgs.timed_out());
-            return pam_sys::PAM_IGNORE;
-        }
+    let Some(mut tty) = tty_file else {
+        tracing::debug!("Could not open /dev/tty, falling back to socket-only");
+        pam_conv.try_info(msgs.timed_out());
+        return pam_sys::PAM_IGNORE;
     };
 
     // Set tty nonblocking to avoid read(1) blocking unexpectedly
