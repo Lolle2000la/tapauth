@@ -308,10 +308,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                     // EOF reached, stop polling TTY to avoid busy loop
                                     poll_tty = false;
                                 }
-                                Ok(_) => {
-                                    // Impossible (read into 1-byte buffer), but appease
-                                    // exhaustive match
-                                }
+                                Ok(_) => unreachable!("read into 1-byte buffer cannot exceed 1"),
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                 Err(_) => {
                                     // Other error, stop polling TTY
