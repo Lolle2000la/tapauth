@@ -10,11 +10,11 @@ import kotlin.math.min
  * Implements burst-tolerant escalating backoff:
  * - First [BURST_MAX] requests within [BURST_WINDOW_MS] are all accepted without penalty, allowing
  *   concurrent multi-transport delivery (BLE + UDP) and network retransmissions.
- * - After the burst window, requests outside the cooldown period are accepted but do NOT escalate
- *   the backoff. Escalation only happens when a request is *rejected* (i.e. arrives during the
- *   active cooldown).
+ * - After the burst window, every subsequent request (accepted or rejected) escalates the backoff,
+ *   preventing notification spam from malicious or malfunctioning clients.
  * - Escalation sequence: 1s → 2s → 4s → 5s (capped).
- * - Reset: On successful authentication, cancel, or timeout.
+ * - Rejected requests do not reset the cooldown timer, keeping it anchored to the last accepted
+ *   request so legitimate retransmissions can eventually get through.
  *
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
  * legitimate multi-transport or retransmission traffic.
@@ -71,22 +71,17 @@ class RequestRateLimiter {
             }
 
             accepted = true
-            Log.d(
-                TAG,
-                "Accepting request from $clientPublicKey, backoff reset to initial: ${INITIAL_BACKOFF_SECONDS}s",
-            )
+            val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
+            Log.d(TAG, "Accepting request from $clientPublicKey, new backoff: ${newBackoff}s")
             if (timeInBurstWindow >= BURST_WINDOW_MS) {
                 return@compute BackoffState(
                     lastRequestTime = now,
-                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
+                    backoffSeconds = newBackoff,
                     requestCount = 1,
                     burstWindowStart = now,
                 )
             } else {
-                return@compute existing.copy(
-                    lastRequestTime = now,
-                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
-                )
+                return@compute existing.copy(lastRequestTime = now, backoffSeconds = newBackoff)
             }
         }
         return accepted
