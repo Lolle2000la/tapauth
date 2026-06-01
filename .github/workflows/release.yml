@@ -590,7 +590,7 @@ jobs:
           python-version: "3.14"
 
       - name: Initialize F-Droid Server CLI Tooling
-        run: pip install fdroidserver "androguard<4.2.0"
+        run: pip install fdroidserver "androguard<4.1.4"
 
       - name: Determine Releases to Include
         id: select_releases
