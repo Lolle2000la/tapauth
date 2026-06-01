@@ -13,8 +13,9 @@ import kotlin.math.min
  * - After the burst window, every subsequent request (accepted or rejected) escalates the backoff,
  *   preventing notification spam from malicious or malfunctioning clients.
  * - Escalation sequence: 1s → 2s → 4s → 5s (capped).
- * - Rejected requests do not reset the cooldown timer, keeping it anchored to the last accepted
- *   request so legitimate retransmissions can eventually get through.
+ * - The cooldown timer updates on every request (accepted or rejected); a client must stop sending
+ *   requests for the full cooldown duration before the next request is accepted.
+ * - State is fully reset on session end (grant, cancel, deny, timeout).
  *
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
  * legitimate multi-transport or retransmission traffic.
@@ -67,7 +68,11 @@ class RequestRateLimiter {
                 Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
 
                 val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
-                return@compute existing.copy(backoffSeconds = newBackoff, requestCount = BURST_MAX)
+                return@compute existing.copy(
+                    lastRequestTime = now,
+                    backoffSeconds = newBackoff,
+                    requestCount = BURST_MAX,
+                )
             }
 
             accepted = true
