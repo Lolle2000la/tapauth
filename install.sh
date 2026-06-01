@@ -48,8 +48,20 @@ SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
 SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
 SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
+POLKIT_DROPIN_SOURCE="systemd/polkit-agent-helper@.service.d/tapauth.conf"
+POLKIT_DROPIN_DEST_DIR="/etc/systemd/system/polkit-agent-helper@.service.d"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
+
+has_polkit_agent_helper() {
+    [[ -f "$POLKIT_DROPIN_SOURCE" ]] || return 1
+    if command -v systemctl &>/dev/null && systemctl cat polkit-agent-helper@.service &>/dev/null; then
+        return 0
+    fi
+    [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || \
+       -f "/lib/systemd/system/polkit-agent-helper@.service" || \
+       -f "/etc/systemd/system/polkit-agent-helper@.service" ]]
+}
 
 # Print functions
 print_info() {
@@ -766,6 +778,13 @@ install_systemd_units() {
         print_info "[DRY RUN] Would install tapauthd.socket and tapauthd.service"
         show_service_diff "$SOCKET_UNIT_DEST" "$SOCKET_UNIT_SOURCE"
         show_service_diff "$SERVICE_UNIT_DEST" "$SERVICE_UNIT_SOURCE"
+        
+        if has_polkit_agent_helper; then
+            print_info "[DRY RUN] Detected sandboxed Polkit helper template. Would install drop-in override:"
+            echo "  ✓ Create directory: $POLKIT_DROPIN_DEST_DIR"
+            echo "  ✓ Install: $POLKIT_DROPIN_SOURCE → $POLKIT_DROPIN_DEST_DIR/tapauth.conf"
+        fi
+        
         show_command "systemctl daemon-reload" "Reload systemd units"
         show_command "systemctl enable --now tapauthd.socket" "Enable socket activation"
         return
@@ -779,9 +798,18 @@ install_systemd_units() {
     install -m 644 "$SOCKET_UNIT_SOURCE" "$SOCKET_UNIT_DEST"
     install -m 644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_DEST"
     
-    # Restore SELinux contexts if available
+    # Conditional deployment for Polkit un-sandboxing
+    if has_polkit_agent_helper; then
+        print_info "Detected sandboxed Polkit agent helper service. Installing systemd drop-in override..."
+        install -d -m 755 "$POLKIT_DROPIN_DEST_DIR"
+        install -m 644 "$POLKIT_DROPIN_SOURCE" "$POLKIT_DROPIN_DEST_DIR/tapauth.conf"
+    fi
+    
     if command -v restorecon &> /dev/null; then
         restorecon "$SOCKET_UNIT_DEST" "$SERVICE_UNIT_DEST" || true
+        if has_polkit_agent_helper; then
+            restorecon -R "$POLKIT_DROPIN_DEST_DIR" || true
+        fi
     fi
     
     systemctl daemon-reload
@@ -1649,7 +1677,7 @@ main() {
         echo "PAM services to configure:"
         [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (/etc/pam.d/login)" || echo "  ✗ Login (skipped)"
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
-        [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
+        [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
         [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (skipped)"
         [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
         [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)" || echo "  ✗ SDDM (skipped)"

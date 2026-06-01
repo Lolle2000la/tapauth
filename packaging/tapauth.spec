@@ -65,6 +65,9 @@ install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/
 install -m 0644 systemd/tapauthd.service %{buildroot}%{_unitdir}/tapauthd.service
 install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
 
+mkdir -p %{buildroot}%{_unitdir}/polkit-agent-helper@.service.d
+install -m 0644 systemd/polkit-agent-helper@.service.d/tapauth.conf %{buildroot}%{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
+
 # Structural Declarations
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
@@ -93,6 +96,8 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %{_libdir}/security/pam_tapauth.so
 %{_unitdir}/tapauthd.service
 %{_unitdir}/tapauthd.socket
+%dir %{_unitdir}/polkit-agent-helper@.service.d
+%{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
 %doc %{_datadir}/doc/tapauth/pam-config.example

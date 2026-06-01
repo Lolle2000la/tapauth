@@ -187,6 +187,8 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/polkit-1/actions
           	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
           	mkdir -p debian/tapauth/etc/tapauth
+          	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+          	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
           	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
@@ -381,6 +383,7 @@ jobs:
             install -Dm0755 target/release/libclient_pam.so "\$pkgdir/usr/lib/security/pam_tapauth.so"
             install -Dm0644 systemd/tapauthd.service "\$pkgdir/usr/lib/systemd/system/tapauthd.service"
             install -Dm0644 systemd/tapauthd.socket "\$pkgdir/usr/lib/systemd/system/tapauthd.socket"
+            install -Dm0644 systemd/polkit-agent-helper@.service.d/tapauth.conf "\$pkgdir/usr/lib/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
             install -Dm0644 packaging/sysusers.conf "\$pkgdir/usr/lib/sysusers.d/tapauth.conf"
             install -Dm0644 packaging/tmpfiles.conf "\$pkgdir/usr/lib/tmpfiles.d/tapauth.conf"
             install -Dm0644 client-config-gui/tapauth-config.desktop "\$pkgdir/usr/share/applications/tapauth-config.desktop"

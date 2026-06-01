@@ -168,6 +168,12 @@ remove_systemd_units_and_daemon() {
         show_file_removal "$DAEMON_PATH" "TapAuth daemon binary"
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
+        
+        local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+        if [[ -f "$polkit_dropin" ]]; then
+            show_file_removal "$polkit_dropin" "Polkit agent helper sandbox override"
+            show_command "rmdir $(dirname "$polkit_dropin") || true" "Remove empty drop-in directory"
+        fi
         return
     fi
 
@@ -179,6 +185,14 @@ remove_systemd_units_and_daemon() {
     # Remove unit files if present
     [[ -f "$SOCKET_UNIT_DEST" ]] && rm -f "$SOCKET_UNIT_DEST"
     [[ -f "$SERVICE_UNIT_DEST" ]] && rm -f "$SERVICE_UNIT_DEST"
+
+    # Clean up the Polkit helper sandboxing drop-in if it exists
+    local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+    if [[ -f "$polkit_dropin" ]]; then
+        print_info "Removing Polkit agent helper systemd drop-in override..."
+        rm -f "$polkit_dropin"
+        rmdir "/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
+    fi
 
     # Reload systemd to pick up removals
     if command -v systemctl >/dev/null 2>&1; then
