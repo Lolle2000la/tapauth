@@ -282,7 +282,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                         return pam_sys::PAM_IGNORE;
                     }
                 }
-                // TTY - peek for Enter; don't consume other keys
+                // TTY - read one byte; skip on Enter, discard other keys
                 if poll_tty {
                     if let Some(rev) = fds[1].revents() {
                         if rev.contains(PollFlags::POLLIN) {

@@ -109,9 +109,9 @@ pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_i
 
 /// Send a message to the user via the PAM conversation function.
 ///
-/// Allocates a `pam_message` / `pam_response` pair on the stack and
-/// calls the conversation callback.  Any response memory allocated by
-/// `libpam` is freed with `libc::free`.
+/// Allocates a `pam_message` on the stack and calls the conversation
+/// callback.  The `pam_response` is allocated by the conversation
+/// function (`malloc`) and freed here with `libc::free`.
 pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) -> Result<(), c_int> {
     let conv_ptr = get_conv(pamh)?;
     let conv = &*conv_ptr;
