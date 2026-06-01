@@ -124,8 +124,9 @@ class RequestRateLimiter {
         while (iterator.hasNext()) {
             val entry = iterator.next()
             if (now - entry.value.lastRequestTime > CLEANUP_AGE_MS) {
-                iterator.remove()
-                removed++
+                if (clientBackoffs.remove(entry.key, entry.value)) {
+                    removed++
+                }
             }
         }
 
