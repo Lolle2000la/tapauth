@@ -44,6 +44,9 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
 ///
 /// Falls back to `PAM_RUSER` (remote user) when `PAM_USER` is null.
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
+    if pamh.is_null() {
+        return Err(PAM_SYSTEM_ERR);
+    }
     let mut item: *const c_void = std::ptr::null();
     let mut ret = ffi::pam_get_item(pamh, PAM_USER, &mut item);
 
@@ -74,6 +77,9 @@ pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
 /// `libpam` can hold a stable pointer for the session lifetime.
 #[allow(dead_code)]
 pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int> {
+    if pamh.is_null() {
+        return Err(PAM_SYSTEM_ERR);
+    }
     let username_cstring = CString::new(username).map_err(|_| PAM_USER_UNKNOWN)?;
     let ret = ffi::pam_set_item(pamh, PAM_USER, username_cstring.as_ptr() as *const c_void);
 
@@ -87,6 +93,9 @@ pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int
 
 /// Retrieve the PAM conversation function pointer.
 pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_int> {
+    if pamh.is_null() {
+        return Err(PAM_SYSTEM_ERR);
+    }
     let mut item: *const c_void = std::ptr::null();
     let ret = ffi::pam_get_item(pamh, ffi::PAM_CONV, &mut item);
 
