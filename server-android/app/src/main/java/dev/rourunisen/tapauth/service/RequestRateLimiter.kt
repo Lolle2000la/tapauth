@@ -39,63 +39,58 @@ class RequestRateLimiter {
     fun shouldAcceptRequest(clientPublicKey: String): Boolean {
         val now = System.currentTimeMillis()
 
-        synchronized(clientBackoffs) {
-            val state = clientBackoffs[clientPublicKey]
-
-            if (state == null) {
-                clientBackoffs[clientPublicKey] = BackoffState(now, INITIAL_BACKOFF_SECONDS)
-                return true
+        var accepted = false
+        clientBackoffs.compute(clientPublicKey) { _, existing ->
+            if (existing == null) {
+                accepted = true
+                return@compute BackoffState(now, INITIAL_BACKOFF_SECONDS)
             }
 
-            val timeInBurstWindow = now - state.burstWindowStart
-            if (timeInBurstWindow < BURST_WINDOW_MS && state.requestCount < BURST_MAX) {
-                // Within burst allowance: accept without penalty
-                clientBackoffs[clientPublicKey] =
-                    state.copy(lastRequestTime = now, requestCount = state.requestCount + 1)
+            val timeInBurstWindow = now - existing.burstWindowStart
+            if (timeInBurstWindow < BURST_WINDOW_MS && existing.requestCount < BURST_MAX) {
+                accepted = true
                 Log.d(
                     TAG,
-                    "Burst-accepting request #${state.requestCount + 1} from $clientPublicKey",
+                    "Burst-accepting request #${existing.requestCount + 1} from $clientPublicKey",
                 )
-                return true
+                return@compute existing.copy(
+                    lastRequestTime = now,
+                    requestCount = existing.requestCount + 1,
+                )
             }
 
-            val timeSinceLastRequest = (now - state.lastRequestTime) / 1000
+            val timeSinceLastRequest = (now - existing.lastRequestTime) / 1000
 
-            if (timeSinceLastRequest < state.backoffSeconds) {
-                val remaining = state.backoffSeconds - timeSinceLastRequest
+            if (timeSinceLastRequest < existing.backoffSeconds) {
+                accepted = false
+                val remaining = existing.backoffSeconds - timeSinceLastRequest
                 Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
 
-                val newBackoff = min(state.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
-                clientBackoffs[clientPublicKey] =
-                    state.copy(
-                        lastRequestTime = now,
-                        backoffSeconds = newBackoff,
-                        requestCount = BURST_MAX,
-                    )
-
-                return false
+                val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
+                return@compute existing.copy(
+                    lastRequestTime = now,
+                    backoffSeconds = newBackoff,
+                    requestCount = BURST_MAX,
+                )
             }
 
-            if (timeInBurstWindow >= BURST_WINDOW_MS) {
-                // Old burst window expired: start a new one (allows future bursts)
-                clientBackoffs[clientPublicKey] =
-                    BackoffState(
-                        lastRequestTime = now,
-                        backoffSeconds = state.backoffSeconds,
-                        requestCount = 1,
-                        burstWindowStart = now,
-                    )
-            } else {
-                // Still within the old burst window but burst exhausted or cooldown satisfied
-                clientBackoffs[clientPublicKey] = state.copy(lastRequestTime = now)
-            }
-
+            accepted = true
             Log.d(
                 TAG,
-                "Accepting request from $clientPublicKey, backoff unchanged: ${state.backoffSeconds}s",
+                "Accepting request from $clientPublicKey, backoff unchanged: ${existing.backoffSeconds}s",
             )
-            return true
+            if (timeInBurstWindow >= BURST_WINDOW_MS) {
+                return@compute BackoffState(
+                    lastRequestTime = now,
+                    backoffSeconds = existing.backoffSeconds,
+                    requestCount = 1,
+                    burstWindowStart = now,
+                )
+            } else {
+                return@compute existing.copy(lastRequestTime = now)
+            }
         }
+        return accepted
     }
 
     /**
@@ -117,19 +112,24 @@ class RequestRateLimiter {
      */
     fun cleanup() {
         val now = System.currentTimeMillis()
-        val expiredClients = mutableListOf<String>()
+        var removed = 0
 
-        for ((clientKey, state) in clientBackoffs) {
-            val ageSeconds = (now - state.lastRequestTime) / 1000
-            if (ageSeconds > CLEANUP_AGE_SECONDS) {
-                expiredClients.add(clientKey)
+        for (clientKey in clientBackoffs.keys()) {
+            clientBackoffs.compute(clientKey) { _, existing ->
+                if (
+                    existing != null &&
+                        (now - existing.lastRequestTime) / 1000 > CLEANUP_AGE_SECONDS
+                ) {
+                    removed++
+                    null
+                } else {
+                    existing
+                }
             }
         }
 
-        expiredClients.forEach { clientBackoffs.remove(it) }
-
-        if (expiredClients.isNotEmpty()) {
-            Log.d(TAG, "Cleaned up ${expiredClients.size} expired backoff states")
+        if (removed > 0) {
+            Log.d(TAG, "Cleaned up $removed expired backoff states")
         }
     }
 
