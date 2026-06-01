@@ -41,7 +41,7 @@ class RequestRateLimiter {
 
         var accepted = false
         clientBackoffs.compute(clientPublicKey) { _, existing ->
-            if (existing == null) {
+            if (existing == null || now < existing.lastRequestTime) {
                 accepted = true
                 return@compute BackoffState(now, INITIAL_BACKOFF_SECONDS)
             }
@@ -120,7 +120,7 @@ class RequestRateLimiter {
         val iterator = clientBackoffs.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            if ((now - entry.value.lastRequestTime) / 1000 > CLEANUP_AGE_SECONDS) {
+            if (now - entry.value.lastRequestTime > CLEANUP_AGE_MS) {
                 iterator.remove()
                 removed++
             }
@@ -149,5 +149,6 @@ class RequestRateLimiter {
 
         // Remove backoff states older than 5 minutes
         private const val CLEANUP_AGE_SECONDS = 300
+        private const val CLEANUP_AGE_MS = CLEANUP_AGE_SECONDS * 1000L
     }
 }
