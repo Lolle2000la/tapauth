@@ -769,7 +769,7 @@ install_systemd_units() {
         show_service_diff "$SOCKET_UNIT_DEST" "$SOCKET_UNIT_SOURCE"
         show_service_diff "$SERVICE_UNIT_DEST" "$SERVICE_UNIT_SOURCE"
         
-        if [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
+        if [[ -f "$POLKIT_DROPIN_SOURCE" ]] && [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
             print_info "[DRY RUN] Detected sandboxed Polkit helper template. Would install drop-in override:"
             echo "  ✓ Create directory: $POLKIT_DROPIN_DEST_DIR"
             echo "  ✓ Install: $POLKIT_DROPIN_SOURCE → $POLKIT_DROPIN_DEST_DIR/tapauth.conf"
@@ -789,7 +789,7 @@ install_systemd_units() {
     install -m 644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_DEST"
     
     # Conditional deployment for Polkit un-sandboxing
-    if [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
+    if [[ -f "$POLKIT_DROPIN_SOURCE" ]] && [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
         print_info "Detected sandboxed Polkit agent helper service. Installing systemd drop-in override..."
         mkdir -p "$POLKIT_DROPIN_DEST_DIR"
         install -m 644 "$POLKIT_DROPIN_SOURCE" "$POLKIT_DROPIN_DEST_DIR/tapauth.conf"
