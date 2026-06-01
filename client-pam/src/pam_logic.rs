@@ -203,9 +203,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
+    //
+    // Safety: at this point has_terminal is true, so tty_file is
+    // guaranteed Some. We still use let-else as a non-panicking
+    // defuse instead of expect()/unwrap().
     let Some(mut tty) = tty_file else {
-        tracing::debug!("Could not open /dev/tty, falling back to socket-only");
-        pam_conv.try_info(msgs.timed_out());
         return pam_sys::PAM_IGNORE;
     };
 
