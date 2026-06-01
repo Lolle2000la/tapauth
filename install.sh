@@ -48,6 +48,8 @@ SOCKET_UNIT_SOURCE="systemd/tapauthd.socket"
 SERVICE_UNIT_SOURCE="systemd/tapauthd.service"
 SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
+POLKIT_DROPIN_SOURCE="systemd/polkit-agent-helper@.service.d/tapauth.conf"
+POLKIT_DROPIN_DEST_DIR="/etc/systemd/system/polkit-agent-helper@.service.d"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -766,6 +768,13 @@ install_systemd_units() {
         print_info "[DRY RUN] Would install tapauthd.socket and tapauthd.service"
         show_service_diff "$SOCKET_UNIT_DEST" "$SOCKET_UNIT_SOURCE"
         show_service_diff "$SERVICE_UNIT_DEST" "$SERVICE_UNIT_SOURCE"
+        
+        if [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
+            print_info "[DRY RUN] Detected sandboxed Polkit helper template. Would install drop-in override:"
+            echo "  ✓ Create directory: $POLKIT_DROPIN_DEST_DIR"
+            echo "  ✓ Install: $POLKIT_DROPIN_SOURCE → $POLKIT_DROPIN_DEST_DIR/tapauth.conf"
+        fi
+        
         show_command "systemctl daemon-reload" "Reload systemd units"
         show_command "systemctl enable --now tapauthd.socket" "Enable socket activation"
         return
@@ -779,7 +788,17 @@ install_systemd_units() {
     install -m 644 "$SOCKET_UNIT_SOURCE" "$SOCKET_UNIT_DEST"
     install -m 644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_DEST"
     
-    # Restore SELinux contexts if available
+    # Conditional deployment for Polkit un-sandboxing
+    if [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || -f "/etc/systemd/system/polkit-agent-helper@.service" ]]; then
+        print_info "Detected sandboxed Polkit agent helper service. Installing systemd drop-in override..."
+        mkdir -p "$POLKIT_DROPIN_DEST_DIR"
+        install -m 644 "$POLKIT_DROPIN_SOURCE" "$POLKIT_DROPIN_DEST_DIR/tapauth.conf"
+        
+        if command -v restorecon &> /dev/null; then
+            restorecon "$POLKIT_DROPIN_DEST_DIR/tapauth.conf" || true
+        fi
+    fi
+    
     if command -v restorecon &> /dev/null; then
         restorecon "$SOCKET_UNIT_DEST" "$SERVICE_UNIT_DEST" || true
     fi
