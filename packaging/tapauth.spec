@@ -96,6 +96,7 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %{_libdir}/security/pam_tapauth.so
 %{_unitdir}/tapauthd.service
 %{_unitdir}/tapauthd.socket
+%dir %{_unitdir}/polkit-agent-helper@.service.d
 %{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf

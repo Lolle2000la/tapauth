@@ -215,7 +215,9 @@ remove_systemd_units_and_daemon() {
         print_info "Removing Polkit agent helper systemd drop-in override..."
         rm -f "$polkit_dropin"
         rmdir "/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
-        systemctl daemon-reload
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+        fi
     fi
 
     print_success "Daemon and systemd units removed (if present)"
