@@ -220,6 +220,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
     }
 
+    let mut poll_tty = true;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
     let mut kb = [0u8; 4];
     loop {
@@ -238,7 +239,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 PollFlags::POLLIN,
             ),
         ];
-        match poll(&mut fds, remain_ms) {
+
+        let fds_slice = if poll_tty {
+            &mut fds[..2]
+        } else {
+            &mut fds[..1]
+        };
+
+        match poll(fds_slice, remain_ms) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
@@ -275,22 +283,45 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     }
                 }
                 // TTY - peek for Enter; don't consume other keys
-                if let Some(rev) = fds[1].revents() {
-                    if rev.contains(PollFlags::POLLIN) {
-                        // Peek at the byte without consuming unless it's Enter
-                        if let Ok(1) = tty.read(&mut kb[..1]) {
-                            let b = kb[0];
-                            if b == b'\n' || b == b'\r' {
-                                tracing::info!("User pressed Enter to skip");
-                                // Best-effort cancel uses a new blocking connection with a short
-                                // timeout so the skip is not blocked by an unresponsive daemon.
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                    let _ = c.send_cancel("tty-skip", &request_id);
+                if poll_tty {
+                    if let Some(rev) = fds[1].revents() {
+                        if rev.contains(PollFlags::POLLIN) {
+                            match tty.read(&mut kb[..1]) {
+                                Ok(1) => {
+                                    let b = kb[0];
+                                    if b == b'\n' || b == b'\r' {
+                                        tracing::info!("User pressed Enter to skip");
+                                        // Best-effort cancel uses a new blocking connection
+                                        // with a short timeout so the skip is not blocked
+                                        // by an unresponsive daemon.
+                                        if let Ok(mut c) =
+                                            IpcClient::connect(Duration::from_millis(100))
+                                        {
+                                            let _ = c.send_cancel("tty-skip", &request_id);
+                                        }
+                                        pam_conv.try_info(msgs.skipped());
+                                        return pam_sys::PAM_IGNORE;
+                                    }
+                                    // Non-Enter key: consume and ignore
                                 }
-                                pam_conv.try_info(msgs.skipped());
-                                return pam_sys::PAM_IGNORE;
+                                Ok(0) => {
+                                    // EOF reached, stop polling TTY to avoid busy loop
+                                    poll_tty = false;
+                                }
+                                Ok(_) => {
+                                    // Impossible (read into 1-byte buffer), but appease
+                                    // exhaustive match
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => {
+                                    // Other error, stop polling TTY
+                                    poll_tty = false;
+                                }
                             }
-                            // Non-Enter key: consume and ignore (could be user typing password early)
+                        } else if rev.contains(PollFlags::POLLHUP)
+                            || rev.contains(PollFlags::POLLERR)
+                        {
+                            poll_tty = false;
                         }
                     }
                 }
