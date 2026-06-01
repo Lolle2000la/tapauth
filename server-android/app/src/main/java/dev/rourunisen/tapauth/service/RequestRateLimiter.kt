@@ -77,17 +77,20 @@ class RequestRateLimiter {
             accepted = true
             Log.d(
                 TAG,
-                "Accepting request from $clientPublicKey, backoff unchanged: ${existing.backoffSeconds}s",
+                "Accepting request from $clientPublicKey, backoff reset to initial: ${INITIAL_BACKOFF_SECONDS}s",
             )
             if (timeInBurstWindow >= BURST_WINDOW_MS) {
                 return@compute BackoffState(
                     lastRequestTime = now,
-                    backoffSeconds = existing.backoffSeconds,
+                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
                     requestCount = 1,
                     burstWindowStart = now,
                 )
             } else {
-                return@compute existing.copy(lastRequestTime = now)
+                return@compute existing.copy(
+                    lastRequestTime = now,
+                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
+                )
             }
         }
         return accepted
@@ -114,17 +117,12 @@ class RequestRateLimiter {
         val now = System.currentTimeMillis()
         var removed = 0
 
-        for (clientKey in clientBackoffs.keys()) {
-            clientBackoffs.compute(clientKey) { _, existing ->
-                if (
-                    existing != null &&
-                        (now - existing.lastRequestTime) / 1000 > CLEANUP_AGE_SECONDS
-                ) {
-                    removed++
-                    null
-                } else {
-                    existing
-                }
+        val iterator = clientBackoffs.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if ((now - entry.value.lastRequestTime) / 1000 > CLEANUP_AGE_SECONDS) {
+                iterator.remove()
+                removed++
             }
         }
 
