@@ -73,8 +73,8 @@ pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
 
 /// Set the username in the PAM context.
 ///
-/// The CString backing the username is intentionally leaked so that
-/// `libpam` can hold a stable pointer for the session lifetime.
+/// `pam_set_item` duplicates string items internally, so the caller
+/// does not need to keep the passed pointer alive after this call.
 #[allow(dead_code)]
 pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int> {
     if pamh.is_null() {
