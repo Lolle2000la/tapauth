@@ -37,11 +37,11 @@ class RequestRateLimiter {
      * @return true if request should be accepted, false if rate limited
      */
     fun shouldAcceptRequest(clientPublicKey: String): Boolean {
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
 
         var accepted = false
         clientBackoffs.compute(clientPublicKey) { _, existing ->
-            if (existing == null || now < existing.lastRequestTime) {
+            if (existing == null) {
                 accepted = true
                 return@compute BackoffState(now, INITIAL_BACKOFF_SECONDS)
             }
@@ -110,7 +110,7 @@ class RequestRateLimiter {
      * minutes).
      */
     fun cleanup() {
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         var removed = 0
 
         val iterator = clientBackoffs.entries.iterator()
