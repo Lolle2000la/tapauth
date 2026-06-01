@@ -377,7 +377,7 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
     let service_lower = service.to_ascii_lowercase();
     let dm_prefixes = [
         "sddm", "gdm", "gdm3", "lightdm", "lxdm", "slim", "xdm", "kdm", "greetd", "ly", "nodm",
-        "entrance",
+        "entrance", "plasmalogin",
     ];
     if dm_prefixes.iter().any(|p| {
         service_lower == *p
