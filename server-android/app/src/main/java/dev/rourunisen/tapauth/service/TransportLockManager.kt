@@ -37,7 +37,7 @@ class TransportLockManager private constructor() {
      */
     fun tryClaimTransport(challenge: ByteArray, transport: TransportType): Boolean {
         val challengeHex = challenge.toHex()
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
 
         // Clean up expired locks
         cleanupExpiredLocks(now)
@@ -84,7 +84,7 @@ class TransportLockManager private constructor() {
         val lock = challengeLocks[challengeHex] ?: return false
 
         // Check expiry
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         if (now - lock.timestamp > LOCK_EXPIRY_MS) {
             challengeLocks.remove(challengeHex)
             return false

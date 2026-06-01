@@ -87,7 +87,7 @@ class RetransmissionManager {
         val job =
             scope.launch {
                 var attempts = 0
-                val startTime = System.currentTimeMillis()
+                val startTime = android.os.SystemClock.elapsedRealtime()
 
                 while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
                     try {
@@ -102,7 +102,7 @@ class RetransmissionManager {
                         request.socket.send(packet)
                         attempts++
 
-                        val elapsed = System.currentTimeMillis() - startTime
+                        val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
                         Log.d(TAG, "UDP retransmission attempt #$attempts (elapsed=${elapsed}ms)")
 
                         // Check if we've exceeded max duration or attempts
@@ -152,7 +152,7 @@ class RetransmissionManager {
         val job =
             scope.launch {
                 var attempts = 0
-                val startTime = System.currentTimeMillis()
+                val startTime = android.os.SystemClock.elapsedRealtime()
 
                 while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
                     try {
@@ -160,7 +160,7 @@ class RetransmissionManager {
                         request.sendCallback(request.responseData)
                         attempts++
 
-                        val elapsed = System.currentTimeMillis() - startTime
+                        val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
                         Log.d(TAG, "BLE retransmission attempt #$attempts (elapsed=${elapsed}ms)")
 
                         // Check if we've exceeded max duration or attempts

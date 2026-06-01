@@ -1140,12 +1140,12 @@ class BleGattService : Service() {
         response: ByteArray,
         challenge: ByteArray,
     ) {
-        val startTime = System.currentTimeMillis()
+        val startTime = android.os.SystemClock.elapsedRealtime()
         val maxDuration = 10_000L // 10 seconds max retransmission
         var attempt = 0
 
         withContext(Dispatchers.IO) {
-            while (System.currentTimeMillis() - startTime < maxDuration && isActive) {
+            while (android.os.SystemClock.elapsedRealtime() - startTime < maxDuration && isActive) {
                 delay(500) // 500ms interval per spec
                 attempt++
 

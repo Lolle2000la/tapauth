@@ -35,13 +35,13 @@ class AuthRequestManager private constructor() {
     private val cancelledChallenges = ConcurrentHashMap<String, Long>()
     private val CANCEL_TTL_MS = 10_000L // Keep cancellation intent for 10 seconds
 
-    private fun pruneCancelledChallenges(now: Long = System.currentTimeMillis()) {
+    private fun pruneCancelledChallenges(now: Long = android.os.SystemClock.elapsedRealtime()) {
         cancelledChallenges.entries.removeIf { (_, ts) -> now - ts > CANCEL_TTL_MS }
     }
 
     fun markCancelledChallenge(challenge: ByteArray) {
         val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-        cancelledChallenges[key] = System.currentTimeMillis()
+        cancelledChallenges[key] = android.os.SystemClock.elapsedRealtime()
         pruneCancelledChallenges()
         Log.d(TAG, "Marked challenge as cancelled (ttl=${CANCEL_TTL_MS}ms)")
     }
@@ -50,7 +50,7 @@ class AuthRequestManager private constructor() {
         pruneCancelledChallenges()
         val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
         val ts = cancelledChallenges[key] ?: return false
-        val stillValid = (System.currentTimeMillis() - ts) <= CANCEL_TTL_MS
+        val stillValid = (android.os.SystemClock.elapsedRealtime() - ts) <= CANCEL_TTL_MS
         if (!stillValid) {
             cancelledChallenges.remove(key)
         }
