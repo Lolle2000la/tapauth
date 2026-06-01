@@ -801,16 +801,15 @@ install_systemd_units() {
     # Conditional deployment for Polkit un-sandboxing
     if has_polkit_agent_helper; then
         print_info "Detected sandboxed Polkit agent helper service. Installing systemd drop-in override..."
-        mkdir -p "$POLKIT_DROPIN_DEST_DIR"
+        install -d -m 755 "$POLKIT_DROPIN_DEST_DIR"
         install -m 644 "$POLKIT_DROPIN_SOURCE" "$POLKIT_DROPIN_DEST_DIR/tapauth.conf"
-        
-        if command -v restorecon &> /dev/null; then
-            restorecon -R "$POLKIT_DROPIN_DEST_DIR" || true
-        fi
     fi
     
     if command -v restorecon &> /dev/null; then
         restorecon "$SOCKET_UNIT_DEST" "$SERVICE_UNIT_DEST" || true
+        if has_polkit_agent_helper; then
+            restorecon -R "$POLKIT_DROPIN_DEST_DIR" || true
+        fi
     fi
     
     systemctl daemon-reload

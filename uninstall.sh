@@ -172,7 +172,6 @@ remove_systemd_units_and_daemon() {
         if [[ -f "/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf" ]]; then
             show_file_removal "/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf" "Polkit agent helper sandbox override"
             show_command "rmdir /etc/systemd/system/polkit-agent-helper@.service.d || true" "Remove empty drop-in directory"
-            show_command "systemctl daemon-reload" "Reload systemd after drop-in removal"
         fi
         return
     fi
@@ -185,6 +184,14 @@ remove_systemd_units_and_daemon() {
     # Remove unit files if present
     [[ -f "$SOCKET_UNIT_DEST" ]] && rm -f "$SOCKET_UNIT_DEST"
     [[ -f "$SERVICE_UNIT_DEST" ]] && rm -f "$SERVICE_UNIT_DEST"
+
+    # Clean up the Polkit helper sandboxing drop-in if it exists
+    local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+    if [[ -f "$polkit_dropin" ]]; then
+        print_info "Removing Polkit agent helper systemd drop-in override..."
+        rm -f "$polkit_dropin"
+        rmdir "/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
+    fi
 
     # Reload systemd to pick up removals
     if command -v systemctl >/dev/null 2>&1; then
@@ -207,17 +214,6 @@ remove_systemd_units_and_daemon() {
     if [[ -f "$rules_file" ]]; then
         print_info "Removing polkit firewalld authorization rules"
         rm -f "$rules_file"
-    fi
-
-    # Clean up the Polkit helper sandboxing drop-in if it exists
-    local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
-    if [[ -f "$polkit_dropin" ]]; then
-        print_info "Removing Polkit agent helper systemd drop-in override..."
-        rm -f "$polkit_dropin"
-        rmdir "/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload >/dev/null 2>&1 || true
-        fi
     fi
 
     print_success "Daemon and systemd units removed (if present)"
