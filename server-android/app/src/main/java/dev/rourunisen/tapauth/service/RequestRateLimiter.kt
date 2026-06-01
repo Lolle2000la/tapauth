@@ -10,11 +10,12 @@ import kotlin.math.min
  * Implements burst-tolerant escalating backoff:
  * - First [BURST_MAX] requests within [BURST_WINDOW_MS] are all accepted without penalty, allowing
  *   concurrent multi-transport delivery (BLE + UDP) and network retransmissions.
- * - After the burst window, every subsequent request (accepted or rejected) escalates the backoff,
- *   preventing notification spam from malicious or malfunctioning clients.
- * - Escalation sequence: 1s → 2s → 4s → 5s (capped).
+ * - After the burst window, every subsequent request escalates the backoff (1s → 2s → 4s → 5s max).
+ * - If a client has been silent for at least [MAX_BACKOFF_SECONDS], the backoff resets to
+ *   [INITIAL_BACKOFF_SECONDS]. This prevents permanent penalty for infrequent legitimate users
+ *   while still blocking 1Hz spam (spammers never wait 5s).
  * - The cooldown timer updates on every request (accepted or rejected); a client must stop sending
- *   requests for the full cooldown duration before the next request is accepted.
+ *   for the full cooldown duration before the next request is accepted.
  * - State is fully reset on session end (grant, cancel, deny, timeout).
  *
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
@@ -60,11 +61,12 @@ class RequestRateLimiter {
                 )
             }
 
-            val timeSinceLastRequest = (now - existing.lastRequestTime) / 1000
+            val elapsedMs = now - existing.lastRequestTime
+            val backoffMs = existing.backoffSeconds * 1000L
 
-            if (timeSinceLastRequest < existing.backoffSeconds) {
+            if (elapsedMs < backoffMs) {
                 accepted = false
-                val remaining = existing.backoffSeconds - timeSinceLastRequest
+                val remaining = existing.backoffSeconds - (elapsedMs / 1000)
                 Log.w(TAG, "Rate limiting client $clientPublicKey: ${remaining}s remaining")
 
                 val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
@@ -76,7 +78,12 @@ class RequestRateLimiter {
             }
 
             accepted = true
-            val newBackoff = min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
+            val newBackoff =
+                if (elapsedMs >= MAX_BACKOFF_SECONDS * 1000L) {
+                    INITIAL_BACKOFF_SECONDS
+                } else {
+                    min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
+                }
             Log.d(TAG, "Accepting request from $clientPublicKey, new backoff: ${newBackoff}s")
             if (timeInBurstWindow >= BURST_WINDOW_MS) {
                 return@compute BackoffState(
