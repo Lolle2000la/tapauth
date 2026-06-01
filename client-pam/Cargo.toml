@@ -24,7 +24,7 @@ toml = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-appender.workspace = true
+tracing-journald.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true
