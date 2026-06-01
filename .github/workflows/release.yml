@@ -186,10 +186,10 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
           	mkdir -p debian/tapauth/usr/share/polkit-1/actions
           	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
-           	mkdir -p debian/tapauth/etc/tapauth
-           	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
-           	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
-           	cp target/release/tapauthd debian/tapauth/usr/bin/
+          	mkdir -p debian/tapauth/etc/tapauth
+          	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+          	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
+          	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
           	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
           	cp systemd/tapauthd.service debian/tapauth/lib/systemd/system/

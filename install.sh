@@ -1668,7 +1668,7 @@ main() {
         echo "PAM services to configure:"
         [[ "$CONFIGURE_PAM_LOGIN" == true ]] && echo "  ✓ Login (/etc/pam.d/login)" || echo "  ✗ Login (skipped)"
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
-        [[ "$REMOVE_PAM_CONFIG_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
+        [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
         [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (skipped)"
         [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
         [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)" || echo "  ✗ SDDM (skipped)"
