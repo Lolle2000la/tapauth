@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Failed to register mock fprintd D-Bus service: {}. \
                      Desktop lockscreen integration via fingerprint will not be available. \
                      This is often due to missing D-Bus system bus permissions \
-                     (see packaging/net.reactivated.Fprint.tapauth.conf).",
+                     (/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf).",
                     e
                 );
                 None

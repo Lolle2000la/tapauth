@@ -145,8 +145,6 @@ jobs:
           Architecture: any
           Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd, dbus
           Conflicts: fprintd, libpam-fprintd
-          Replaces: fprintd, libpam-fprintd
-          Provides: fprintd, libpam-fprintd
           Recommends: firewalld
           Suggests: iptables
           Description: Local smartphone-based authentication framework
@@ -366,7 +364,6 @@ jobs:
           depends=('dbus' 'pam')
           optdepends=('gdm: GNOME lockscreen fingerprint integration' 'plasma-workspace: KDE lockscreen fingerprint integration' 'firewalld: firewall management')
           makedepends=('cargo' 'rust' 'protobuf' 'clang')
-          provides=('fprintd')
           conflicts=('fprintd' 'fprintd-pam')
           backup=('etc/tapauth/config.toml')
           install=tapauth.install
@@ -448,7 +445,6 @@ jobs:
           	optdepends = gdm: GNOME lockscreen fingerprint integration
           	optdepends = plasma-workspace: KDE lockscreen fingerprint integration
           	optdepends = firewalld: firewall management
-          	provides = fprintd
           	conflicts = fprintd
           	conflicts = fprintd-pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz

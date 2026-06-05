@@ -22,6 +22,7 @@ enum FprintError {
     Internal(String),
     NoEnrolledPrints(String),
     NoActionInProgress(String),
+    PermissionDenied(String),
     #[zbus(error)]
     ZBus(zbus::Error),
 }
@@ -70,6 +71,7 @@ pub struct VirtualFprintDevice {
     auth_state: AuthState,
     connection: zbus::Connection,
     claimed_user: Arc<Mutex<Option<String>>>,
+    claimed_owner: Arc<Mutex<Option<String>>>,
     verifying: Arc<Mutex<bool>>,
     cancel_token: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
@@ -80,6 +82,7 @@ impl VirtualFprintDevice {
             auth_state,
             connection,
             claimed_user: Arc::new(Mutex::new(None)),
+            claimed_owner: Arc::new(Mutex::new(None)),
             verifying: Arc::new(Mutex::new(false)),
             cancel_token: Arc::new(Mutex::new(None)),
         }
@@ -114,8 +117,22 @@ impl VirtualFprintDevice {
         *verifying
     }
 
-    async fn list_enrolled_fingers(&self, username: String) -> Result<Vec<String>, FprintError> {
-        let state = self.auth_state.read().await;
+    async fn list_enrolled_fingers(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        username: String,
+    ) -> Result<Vec<String>, FprintError> {
+        let sender = match header.sender() {
+            Some(s) => s.clone(),
+            None => {
+                return Err(FprintError::Internal(
+                    "Cannot determine caller identity".to_string(),
+                ));
+            }
+        };
+        let caller_uid = resolve_sender_uid(connection, &sender).await?;
+
         let target_user = if username.is_empty() {
             match self.claimed_user.lock().await.clone() {
                 Some(u) => u,
@@ -125,10 +142,27 @@ impl VirtualFprintDevice {
                     ));
                 }
             }
+        } else if caller_uid != 0 {
+            let target_uid = nix::unistd::User::from_name(&username)
+                .map_err(|e| {
+                    FprintError::Internal(format!("Failed to query user database: {}", e))
+                })?
+                .map(|u| u.uid.as_raw())
+                .ok_or_else(|| {
+                    FprintError::ClaimDevice(format!("User '{}' does not exist", username))
+                })?;
+            if caller_uid != target_uid {
+                return Err(FprintError::PermissionDenied(format!(
+                    "Caller is not authorized to list enrolled fingers for '{}'",
+                    username
+                )));
+            }
+            username
         } else {
             username
         };
 
+        let state = self.auth_state.read().await;
         let has_authorized = state
             .paired_servers
             .values()
@@ -201,16 +235,39 @@ impl VirtualFprintDevice {
             ));
         }
         *claimed = Some(target_username);
+        *self.claimed_owner.lock().await = Some(sender.to_string());
         Ok(())
     }
 
-    async fn release(&self) -> Result<(), FprintError> {
+    async fn release(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), FprintError> {
+        let sender = match header.sender() {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(FprintError::Internal(
+                    "Cannot determine caller identity".to_string(),
+                ));
+            }
+        };
+
         let mut claimed = self.claimed_user.lock().await;
         if claimed.is_none() {
             return Err(FprintError::ClaimDevice(
                 "Device was not claimed".to_string(),
             ));
         }
+        let owner = self.claimed_owner.lock().await;
+        if let Some(ref existing_owner) = *owner {
+            if existing_owner != &sender {
+                return Err(FprintError::ClaimDevice(
+                    "Caller is not the owner of the claim".to_string(),
+                ));
+            }
+        }
+        drop(owner);
+
         let v = self.verifying.lock().await;
         if *v {
             return Err(FprintError::AlreadyInUse(
@@ -219,10 +276,40 @@ impl VirtualFprintDevice {
         }
         drop(v);
         *claimed = None;
+        *self.claimed_owner.lock().await = None;
         Ok(())
     }
 
-    async fn verify_start(&self, _finger_name: String) -> Result<(), FprintError> {
+    async fn verify_start(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        _finger_name: String,
+    ) -> Result<(), FprintError> {
+        let sender = match header.sender() {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(FprintError::Internal(
+                    "Cannot determine caller identity".to_string(),
+                ));
+            }
+        };
+
+        let owner = self.claimed_owner.lock().await;
+        match *owner {
+            Some(ref existing_owner) => {
+                if existing_owner != &sender {
+                    return Err(FprintError::ClaimDevice(
+                        "Caller is not the owner of the claim".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(FprintError::ClaimDevice(
+                    "Device must be claimed before starting verification".to_string(),
+                ));
+            }
+        }
+        drop(owner);
         let state = self.auth_state.read().await;
 
         if !state.is_healthy() {
@@ -308,7 +395,35 @@ impl VirtualFprintDevice {
         Ok(())
     }
 
-    async fn verify_stop(&self) -> Result<(), FprintError> {
+    async fn verify_stop(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), FprintError> {
+        let sender = match header.sender() {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(FprintError::Internal(
+                    "Cannot determine caller identity".to_string(),
+                ));
+            }
+        };
+
+        let owner = self.claimed_owner.lock().await;
+        match *owner {
+            Some(ref existing_owner) => {
+                if existing_owner != &sender {
+                    return Err(FprintError::ClaimDevice(
+                        "Caller is not the owner of the claim".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(FprintError::ClaimDevice(
+                    "Device must be claimed before stopping verification".to_string(),
+                ));
+            }
+        }
+        drop(owner);
         {
             let claimed = self.claimed_user.lock().await;
             if claimed.is_none() {
@@ -476,11 +591,12 @@ pub async fn start_fprintd_service(
             FprintManager::new().map_err(|e| format!("fprintd manager init: {}", e))?,
         )
         .map_err(|e| format!("fprintd serve_at manager: {}", e))?
-        .name(FPRINT_BUS_NAME)?
         .build()
         .await
         .map_err(|e| format!("fprintd build: {}", e))?;
 
+    // Register the device object *before* acquiring the well-known name
+    // so there is no window where clients see the name without the device.
     connection
         .object_server()
         .at(
@@ -489,6 +605,11 @@ pub async fn start_fprintd_service(
         )
         .await
         .map_err(|e| format!("fprintd register device: {}", e))?;
+
+    connection
+        .request_name(FPRINT_BUS_NAME)
+        .await
+        .map_err(|e| format!("fprintd request_name: {}", e))?;
 
     tracing::info!(
         "Registered fprintd mock at {} and {}",

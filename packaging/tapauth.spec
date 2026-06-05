@@ -13,8 +13,6 @@ Source0:        %{name}-%{version}.tar.gz
 
 Conflicts:      fprintd
 Conflicts:      fprintd-pam
-Provides:       fprintd
-Obsoletes:      fprintd < %{version}-%{release}
 
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
