@@ -148,7 +148,11 @@ trap cleanup EXIT
 
 # ── Kill any lingering tapauthd from a previous broken run ──
 
-pkill -x "tapauthd" 2>/dev/null || true
+if pgrep -x tapauthd >/dev/null 2>&1; then
+    echo "Warning: a tapauthd process is already running. Skipping kill to avoid"
+    echo "terminating a production instance. Stop it manually if needed:"
+    echo "  sudo pkill tapauthd"
+fi
 sleep 0.2
 
 # ── Workspace & state initialization ──

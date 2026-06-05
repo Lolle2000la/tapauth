@@ -387,9 +387,25 @@ impl VirtualFprintDevice {
         }
 
         tokio::spawn(async move {
+            struct PanicGuard {
+                verifying: Arc<Mutex<bool>>,
+                cancel_token: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+            }
+            impl Drop for PanicGuard {
+                fn drop(&mut self) {
+                    let verifying = self.verifying.clone();
+                    let cancel_token = self.cancel_token.clone();
+                    tokio::spawn(async move {
+                        *verifying.lock().await = false;
+                        *cancel_token.lock().await = None;
+                    });
+                }
+            }
+            let _guard = PanicGuard {
+                verifying,
+                cancel_token,
+            };
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
-            *verifying.lock().await = false;
-            *cancel_token.lock().await = None;
         });
 
         Ok(())
