@@ -160,6 +160,22 @@ impl VirtualFprintDevice {
 
         let caller_uid = resolve_sender_uid(connection, &sender).await?;
 
+        let target_username = if username.is_empty() {
+            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
+                .map_err(|e| {
+                    FprintError::Internal(format!(
+                        "Failed to query caller UID {}: {}",
+                        caller_uid, e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    FprintError::Internal(format!("No user entry for UID {}", caller_uid))
+                })?
+                .name
+        } else {
+            username
+        };
+
         if caller_uid != 0 {
             let caller_name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
                 .ok()
@@ -167,24 +183,24 @@ impl VirtualFprintDevice {
                 .map(|u| u.name)
                 .unwrap_or_else(|| "unknown".to_string());
 
-            if caller_name != username {
+            if caller_name != target_username {
                 return Err(FprintError::ClaimDevice(format!(
-                    "Caller '{}' is not authorized to claim the device for user '{}'",
-                    caller_name, username
+                    "Caller '{}' (UID {}) is not authorized to claim the device for user '{}'",
+                    caller_name, caller_uid, target_username
                 )));
             }
         }
 
         let mut claimed = self.claimed_user.lock().await;
         if let Some(ref existing) = *claimed {
-            if existing == &username {
+            if existing == &target_username {
                 return Ok(());
             }
             return Err(FprintError::AlreadyInUse(
                 "Device is already claimed".to_string(),
             ));
         }
-        *claimed = Some(username);
+        *claimed = Some(target_username);
         Ok(())
     }
 
