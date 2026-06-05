@@ -188,17 +188,23 @@ echo "==> Building tapauthd (release)..."
 
 if [ -n "$SUDO_USER" ]; then
     ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
-    CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
-    if [ ! -x "$CARGO_PATH" ]; then
-        CARGO_PATH="$(sudo -u "$SUDO_USER" command -v cargo 2>/dev/null || true)"
-        if [ -z "$CARGO_PATH" ] || [ ! -x "$CARGO_PATH" ]; then
-            echo "Cargo executable not found for user $SUDO_USER."
-            echo "Ensure Rust is installed (rustup or system package)."
-            cd "$ORIGINAL_DIR"; exit 1
+    CARGO_PATH=""
+    for candidate in \
+        "${ORIGINAL_HOME}/.cargo/bin/cargo" \
+        "/usr/bin/cargo" \
+        "/usr/local/bin/cargo" \
+        "/opt/cargo/bin/cargo"; do
+        if [ -x "$candidate" ]; then
+            CARGO_PATH="$candidate"
+            break
         fi
-        echo "    Using cargo from user PATH: $CARGO_PATH"
+    done
+    if [ -z "$CARGO_PATH" ]; then
+        echo "Cargo executable not found. Ensure Rust is installed (rustup or system package)."
+        echo "Checked: ~/.cargo/bin/cargo, /usr/bin/cargo, /usr/local/bin/cargo"
+        cd "$ORIGINAL_DIR"; exit 1
     fi
-    echo "    Building as $SUDO_USER (NO_BLE=$NO_BLE, fallback-socket enabled)..."
+    echo "    Building as $SUDO_USER (NO_BLE=$NO_BLE, fallback-socket enabled, cargo at $CARGO_PATH)..."
     if [ "$NO_BLE" -eq 1 ]; then
         sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
             --no-default-features --features firewall,fallback-socket \
