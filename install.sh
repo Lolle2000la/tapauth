@@ -28,6 +28,7 @@ CONFIGURE_PAM_GDM=false
 CONFIGURE_PAM_SDDM=false
 CONFIGURE_PAM_LIGHTDM=false
 CONFIGURE_PAM_KDE=false
+CONFIGURE_PAM_FPRINTD=false
 USE_TPM=false
 USE_BLE=true
 BUILD_ONLY=false
@@ -206,6 +207,8 @@ OPTIONS:
     --configure-sddm        Configure PAM for SDDM (Simple Desktop Display Manager)
     --configure-lightdm     Configure PAM for LightDM
     --configure-kde         Configure PAM for KDE (kde, kscreenlocker)
+    --configure-fprintd     Configure fprintd mock (mask fprintd.service,
+                            inject pam_fprintd.so into fingerprint-auth)
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
 
@@ -301,6 +304,10 @@ parse_args() {
                 ;;
             --configure-kde)
                 CONFIGURE_PAM_KDE=true
+                shift
+                ;;
+            --configure-fprintd)
+                CONFIGURE_PAM_FPRINTD=true
                 shift
                 ;;
             --use-tpm)
@@ -1024,7 +1031,7 @@ install_pam() {
 configure_pam() {
         if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SU" == false && "$CONFIGURE_PAM_SU_L" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
             "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
-          "$CONFIGURE_PAM_LIGHTDM" == false && "$CONFIGURE_PAM_KDE" == false ]]; then
+          "$CONFIGURE_PAM_LIGHTDM" == false && "$CONFIGURE_PAM_KDE" == false && "$CONFIGURE_PAM_FPRINTD" == false ]]; then
         print_info "No PAM services selected for configuration"
         return
     fi
@@ -1318,9 +1325,9 @@ configure_pam() {
     # Configure KDE (multiple PAM files)
     if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
         print_info "Configuring PAM for KDE (lock screen)..."
-        
+
         local kde_configured=false
-        
+
         # Configure /etc/pam.d/kde
         if [[ -f /etc/pam.d/kde ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/kde; then
@@ -1332,7 +1339,7 @@ configure_pam() {
                 kde_configured=true
             fi
         fi
-        
+
         # Configure /etc/pam.d/kscreenlocker
         if [[ -f /etc/pam.d/kscreenlocker ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker; then
@@ -1344,7 +1351,7 @@ configure_pam() {
                 kde_configured=true
             fi
         fi
-        
+
         # Configure /etc/pam.d/kde-fingerprint (if it exists)
         if [[ -f /etc/pam.d/kde-fingerprint ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
@@ -1355,7 +1362,7 @@ configure_pam() {
                 print_warning "PAM KDE fingerprint already configured (kde-fingerprint)"
             fi
         fi
-        
+
         # Configure /etc/pam.d/kde-smartcard (if it exists)
         if [[ -f /etc/pam.d/kde-smartcard ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard; then
@@ -1366,9 +1373,50 @@ configure_pam() {
                 print_warning "PAM KDE smartcard already configured (kde-smartcard)"
             fi
         fi
-        
+
         if [[ "$kde_configured" == false ]]; then
             print_warning "No KDE PAM configuration files found (checked /etc/pam.d/kde, kscreenlocker, kde-fingerprint, kde-smartcard)"
+        fi
+    fi
+
+    # Configure fprintd mock integration (masks fprintd.service, injects pam_fprintd.so)
+    if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
+        print_info "Configuring fprintd mock integration..."
+
+        if [[ "$DRY_RUN" == true ]]; then
+            echo ""
+            echo -e "${BLUE}[DRY RUN]${NC} Would configure fprintd mock:"
+            echo "  • systemctl mask fprintd.service"
+            echo "  • Inject pam_fprintd.so into /etc/pam.d/fingerprint-auth"
+            echo ""
+            return
+        fi
+
+        # Mask the real fprintd service so tapauthd owns the D-Bus name
+        systemctl stop fprintd 2>/dev/null || true
+        systemctl mask fprintd 2>/dev/null || true
+        print_success "Masked fprintd.service"
+
+        local fp_file="/etc/pam.d/fingerprint-auth"
+        local fp_line="auth      sufficient     pam_fprintd.so"
+
+        if [[ -f "$fp_file" ]]; then
+            if ! grep -q "pam_fprintd.so" "$fp_file"; then
+                sed -i "1i $fp_line" "$fp_file"
+                print_success "Injected pam_fprintd.so into existing $fp_file"
+            else
+                print_warning "$fp_file already has pam_fprintd.so"
+            fi
+        else
+            cat > "$fp_file" <<'FPEOF'
+#%PAM-1.0
+auth      required       pam_env.so
+auth      sufficient     pam_fprintd.so
+auth      required       pam_deny.so
+account   required       pam_permit.so
+session   required       pam_permit.so
+FPEOF
+            print_success "Created $fp_file with pam_fprintd.so"
         fi
     fi
     
@@ -1410,6 +1458,19 @@ configure_pam() {
         if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
             echo "  • KDE: On next screen lock"
         fi
+    fi
+    
+    if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
+        echo ""
+        print_info "fprintd mock configured"
+        print_info "Changes take effect:"
+        echo "  • fprintd.service masked — tapauthd now owns net.reactivated.Fprint on D-Bus"
+        echo "  • fingerprint-auth PAM stack uses pam_fprintd.so → triggers tapauthd via D-Bus"
+        echo "  • Display managers (GDM/KDE) will offer fingerprint unlock on next login/lock"
+        echo ""
+        print_warning "Ensure fprintd is installed: sudo pacman -S fprintd    (Arch/CachyOS)"
+        echo "                           sudo apt install fprintd     (Debian/Ubuntu)"
+        echo "                           sudo dnf install fprintd     (Fedora)"
     fi
 }
 

@@ -70,6 +70,8 @@ echo ""
 TAPAUTHD_BIN="target/release/tapauthd"
 DBUS_POLICY_SRC="packaging/net.reactivated.Fprint.tapauth.conf"
 DBUS_POLICY_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+DBUS_SERVICE_SRC="packaging/net.reactivated.Fprint.service"
+DBUS_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
 CONFIG_DIR="/var/lib/tapauth"
 SOCK_PATH="/run/tapauthd/tapauthd.sock"
 DAEMON_PID=""
@@ -95,6 +97,8 @@ WAS_FPRINTD_ACTIVE=0
 WAS_FPRINTD_MASKED=0
 HAS_OLD_POLICY=0
 POLICY_INSTALLED=0
+HAS_OLD_SERVICE=0
+SERVICE_INSTALLED=0
 
 if systemctl is-active --quiet fprintd 2>/dev/null; then WAS_FPRINTD_ACTIVE=1; fi
 if systemctl is-enabled fprintd 2>/dev/null | grep -q "masked"; then WAS_FPRINTD_MASKED=1; fi
@@ -102,6 +106,11 @@ if systemctl is-enabled fprintd 2>/dev/null | grep -q "masked"; then WAS_FPRINTD
 if [ -f "$DBUS_POLICY_DEST" ]; then
     HAS_OLD_POLICY=1
     cp "$DBUS_POLICY_DEST" "${DBUS_POLICY_DEST}.bak"
+fi
+
+if [ -f "$DBUS_SERVICE_DEST" ]; then
+    HAS_OLD_SERVICE=1
+    cp "$DBUS_SERVICE_DEST" "${DBUS_SERVICE_DEST}.bak"
 fi
 
 # ── Cleanup engine ──
@@ -129,6 +138,11 @@ cleanup() {
         mv "${DBUS_POLICY_DEST}.bak" "$DBUS_POLICY_DEST"
     elif [ "$POLICY_INSTALLED" -eq 1 ]; then
         rm -f "$DBUS_POLICY_DEST"
+    fi
+    if [ "$HAS_OLD_SERVICE" -eq 1 ]; then
+        mv "${DBUS_SERVICE_DEST}.bak" "$DBUS_SERVICE_DEST"
+    elif [ "$SERVICE_INSTALLED" -eq 1 ]; then
+        rm -f "$DBUS_SERVICE_DEST"
     fi
     if systemctl is-active --quiet dbus-broker 2>/dev/null; then
         systemctl reload dbus-broker 2>/dev/null || true
@@ -177,6 +191,9 @@ chmod 755 /run/tapauthd
 echo "==> Installing D-Bus policy for net.reactivated.Fprint..."
 cp "$DBUS_POLICY_SRC" "$DBUS_POLICY_DEST"
 POLICY_INSTALLED=1
+echo "==> Installing D-Bus service file for net.reactivated.Fprint..."
+cp "$DBUS_SERVICE_SRC" "$DBUS_SERVICE_DEST"
+SERVICE_INSTALLED=1
 # Reload D-Bus config so the policy takes effect.
 # dbus-broker watches /etc/dbus-1/system.d via inotify, but may
 # not have picked up the file yet. Force a reload where possible.
