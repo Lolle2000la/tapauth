@@ -387,11 +387,21 @@ impl VirtualFprintDevice {
             )));
         }
 
-        // All pre-flight checks passed — now mark the device as verifying.
+        // All pre-flight checks passed — now re-acquire the lock and set verifying.
         let cancel_rx = {
             let mut s = self.state.lock().map_err(|e| {
                 FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
             })?;
+            if s.claimed_owner.as_deref() != Some(sender.as_str()) {
+                return Err(FprintError::ClaimDevice(
+                    "Device claim was lost or modified".to_string(),
+                ));
+            }
+            if s.verifying {
+                return Err(FprintError::AlreadyInUse(
+                    "Verification already in progress".to_string(),
+                ));
+            }
             s.verifying = true;
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
             s.cancel_token = Some(cancel_tx);
@@ -426,11 +436,9 @@ impl VirtualFprintDevice {
             }
             impl Drop for VerifyGuard {
                 fn drop(&mut self) {
-                    if std::thread::panicking() {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.verifying = false;
-                            s.cancel_token = None;
-                        }
+                    if let Ok(mut s) = self.state.lock() {
+                        s.verifying = false;
+                        s.cancel_token = None;
                     }
                 }
             }
