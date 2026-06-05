@@ -94,6 +94,7 @@ fi
 WAS_FPRINTD_ACTIVE=0
 WAS_FPRINTD_MASKED=0
 HAS_OLD_POLICY=0
+POLICY_INSTALLED=0
 
 if systemctl is-active --quiet fprintd 2>/dev/null; then WAS_FPRINTD_ACTIVE=1; fi
 if systemctl is-enabled fprintd 2>/dev/null | grep -q "masked"; then WAS_FPRINTD_MASKED=1; fi
@@ -126,7 +127,7 @@ cleanup() {
 
     if [ "$HAS_OLD_POLICY" -eq 1 ]; then
         mv "${DBUS_POLICY_DEST}.bak" "$DBUS_POLICY_DEST"
-    else
+    elif [ "$POLICY_INSTALLED" -eq 1 ]; then
         rm -f "$DBUS_POLICY_DEST"
     fi
     if systemctl is-active --quiet dbus-broker 2>/dev/null; then
@@ -175,6 +176,7 @@ chmod 755 /run/tapauthd
 
 echo "==> Installing D-Bus policy for net.reactivated.Fprint..."
 cp "$DBUS_POLICY_SRC" "$DBUS_POLICY_DEST"
+POLICY_INSTALLED=1
 # Reload D-Bus config so the policy takes effect.
 # dbus-broker watches /etc/dbus-1/system.d via inotify, but may
 # not have picked up the file yet. Force a reload where possible.

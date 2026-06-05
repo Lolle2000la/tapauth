@@ -232,11 +232,41 @@ impl VirtualFprintDevice {
             }
         }
 
+        // If the device is claimed by a dead D-Bus connection, clear the stale claim.
+        {
+            let stale_owner = {
+                let s = self.state.lock().map_err(|e| {
+                    FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+                })?;
+                match s.claimed_owner.clone() {
+                    Some(ref owner) if owner != sender.as_str() => Some(owner.clone()),
+                    _ => None,
+                }
+            };
+
+            if let Some(owner) = stale_owner {
+                if let Ok(unique) = zbus::names::UniqueName::try_from(owner.as_str()) {
+                    if resolve_sender_uid(connection, &unique).await.is_err() {
+                        let mut s = self.state.lock().map_err(|e| {
+                            FprintError::Internal(format!(
+                                "Failed to acquire device state lock: {}",
+                                e
+                            ))
+                        })?;
+                        if s.claimed_owner.as_deref() == Some(owner.as_str()) {
+                            s.claimed_user = None;
+                            s.claimed_owner = None;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut s = self.state.lock().map_err(|e| {
             FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
         })?;
         if let Some(ref existing) = s.claimed_user {
-            if existing == &target_username {
+            if existing == &target_username && s.claimed_owner.as_deref() == Some(sender.as_str()) {
                 return Ok(());
             }
             return Err(FprintError::AlreadyInUse(
@@ -300,8 +330,8 @@ impl VirtualFprintDevice {
             }
         };
 
-        let (username, cancel_rx) = {
-            let mut s = self.state.lock().map_err(|e| {
+        let username = {
+            let s = self.state.lock().map_err(|e| {
                 FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
             })?;
             let owner = s.claimed_owner.as_ref();
@@ -319,20 +349,16 @@ impl VirtualFprintDevice {
                     ));
                 }
             }
-            let username = s.claimed_user.clone().ok_or_else(|| {
-                FprintError::ClaimDevice(
-                    "Device must be claimed before starting verification".to_string(),
-                )
-            })?;
             if s.verifying {
                 return Err(FprintError::AlreadyInUse(
                     "Verification already in progress".to_string(),
                 ));
             }
-            s.verifying = true;
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            s.cancel_token = Some(cancel_tx);
-            (username, cancel_rx)
+            s.claimed_user.clone().ok_or_else(|| {
+                FprintError::ClaimDevice(
+                    "Device must be claimed before starting verification".to_string(),
+                )
+            })?
         };
 
         let state = self.auth_state.read().await;
@@ -360,6 +386,17 @@ impl VirtualFprintDevice {
                 username
             )));
         }
+
+        // All pre-flight checks passed — now mark the device as verifying.
+        let cancel_rx = {
+            let mut s = self.state.lock().map_err(|e| {
+                FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+            })?;
+            s.verifying = true;
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            s.cancel_token = Some(cancel_tx);
+            cancel_rx
+        };
 
         let connection = self.connection.clone();
         let auth_state = self.auth_state.clone();
