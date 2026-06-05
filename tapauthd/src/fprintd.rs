@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -192,12 +193,29 @@ impl VirtualFprintDevice {
 
         let verifying = self.verifying.clone();
         let cancel_token = self.cancel_token.clone();
-        let claimed_user = self.claimed_user.clone();
+
+        let finger_name = if _finger_name == "any" {
+            "right-index-finger".to_string()
+        } else {
+            _finger_name.clone()
+        };
+        if let Err(e) = connection
+            .emit_signal(
+                Option::<&str>::None,
+                FPRINT_DEVICE_PATH,
+                "net.reactivated.Fprint.Device",
+                "VerifyFingerSelected",
+                &finger_name,
+            )
+            .await
+        {
+            tracing::warn!("fprintd: failed to emit VerifyFingerSelected: {}", e);
+        }
+
         tokio::spawn(async move {
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
             *verifying.lock().await = false;
             *cancel_token.lock().await = None;
-            *claimed_user.lock().await = None;
         });
 
         Ok(())
@@ -233,31 +251,23 @@ async fn run_verify(
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let (reg_tx, _) = tokio::sync::oneshot::channel::<()>();
-    {
-        let mut reg = cancel_registry.lock().await;
-        reg.insert("fprintd-verify".to_string(), reg_tx);
-    }
+    let cancel_registry: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let cancel_registry_c = cancel_registry.clone();
     let cancelled_c = cancelled.clone();
-    let cancel_wire = async move {
+    tokio::spawn(async move {
         let _ = cancel_rx.await;
         cancelled_c.store(true, Ordering::SeqCst);
         let mut reg = cancel_registry_c.lock().await;
         if let Some(tx) = reg.remove("fprintd-verify") {
             let _ = tx.send(());
         }
-    };
+    });
 
-    let auth_fut =
-        session.handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry);
-
-    let result = tokio::select! {
-        res = auth_fut => res,
-        () = cancel_wire => Err(crate::auth_handler::AuthHandlerError::Denied),
-    };
+    let result = session
+        .handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry)
+        .await;
 
     if cancelled.load(Ordering::SeqCst) {
         return Ok(());

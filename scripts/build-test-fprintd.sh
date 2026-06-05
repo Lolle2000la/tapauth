@@ -148,7 +148,7 @@ trap cleanup EXIT
 
 # ── Kill any lingering tapauthd from a previous broken run ──
 
-pkill -f "tapauthd" 2>/dev/null || true
+pkill -x "tapauthd" 2>/dev/null || true
 sleep 0.2
 
 # ── Workspace & state initialization ──
