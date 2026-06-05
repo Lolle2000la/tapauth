@@ -143,7 +143,38 @@ impl VirtualFprintDevice {
         Ok(vec!["right-index-finger".to_string()])
     }
 
-    async fn claim(&self, username: String) -> Result<(), FprintError> {
+    async fn claim(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        username: String,
+    ) -> Result<(), FprintError> {
+        let sender = match header.sender() {
+            Some(s) => s.clone(),
+            None => {
+                return Err(FprintError::Internal(
+                    "Cannot determine caller identity".to_string(),
+                ));
+            }
+        };
+
+        let caller_uid = resolve_sender_uid(connection, &sender).await?;
+
+        if caller_uid != 0 {
+            let caller_name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_else(|| "unknown".to_string());
+
+            if caller_name != username {
+                return Err(FprintError::ClaimDevice(format!(
+                    "Caller '{}' is not authorized to claim the device for user '{}'",
+                    caller_name, username
+                )));
+            }
+        }
+
         let mut claimed = self.claimed_user.lock().await;
         if let Some(ref existing) = *claimed {
             if existing == &username {
@@ -391,6 +422,31 @@ async fn emit_status(connection: &zbus::Connection, result: &str, done: bool) {
     {
         tracing::error!("fprintd: failed to emit VerifyStatus signal: {}", e);
     }
+}
+
+// ── Helpers ──
+
+async fn resolve_sender_uid(
+    connection: &zbus::Connection,
+    sender: &zbus::names::UniqueName<'_>,
+) -> Result<u32, FprintError> {
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixUser",
+            &(sender.to_string(),),
+        )
+        .await
+        .map_err(|e| FprintError::Internal(format!("Failed to query caller UID: {}", e)))?;
+
+    let body = reply.body();
+    let uid: u32 = body
+        .deserialize()
+        .map_err(|e| FprintError::Internal(format!("Failed to parse caller UID: {}", e)))?;
+
+    Ok(uid)
 }
 
 // ── Service startup ──
