@@ -129,7 +129,11 @@ cleanup() {
     else
         rm -f "$DBUS_POLICY_DEST"
     fi
-    busctl reload 2>/dev/null || true
+    if command -v systemctl &>/dev/null; then
+        systemctl reload dbus 2>/dev/null || true
+    elif command -v killall &>/dev/null; then
+        killall -HUP dbus-daemon 2>/dev/null || true
+    fi
 
     systemctl unmask fprintd 2>/dev/null || true
     if [ "$WAS_FPRINTD_MASKED" -eq 1 ]; then systemctl mask fprintd 2>/dev/null || true; fi
@@ -164,7 +168,13 @@ chmod 755 /run/tapauthd
 
 echo "==> Installing D-Bus policy for net.reactivated.Fprint..."
 cp "$DBUS_POLICY_SRC" "$DBUS_POLICY_DEST"
-busctl reload
+# Reload D-Bus config so the policy takes effect (non-fatal; dbus-broker
+# watches the directory, dbus-daemon needs SIGHUP but may not be running).
+if command -v systemctl &>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+elif command -v killall &>/dev/null; then
+    killall -HUP dbus-daemon 2>/dev/null || true
+fi
 
 # ── Suppress the real fprintd service ──
 
@@ -180,19 +190,36 @@ if [ -n "$SUDO_USER" ]; then
     ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
     CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
     if [ ! -x "$CARGO_PATH" ]; then
-        echo "Cargo executable not found for user $SUDO_USER at $CARGO_PATH"
-        echo "Ensure Rust is installed correctly for the user who ran sudo."
-        cd "$ORIGINAL_DIR"; exit 1
+        CARGO_PATH="$(command -v cargo 2>/dev/null || true)"
+        if [ -z "$CARGO_PATH" ]; then
+            echo "Cargo executable not found. Ensure Rust is installed."
+            cd "$ORIGINAL_DIR"; exit 1
+        fi
+        echo "    Using system cargo: $CARGO_PATH (no per-user install found)"
     fi
     echo "    Building as $SUDO_USER (NO_BLE=$NO_BLE, fallback-socket enabled)..."
-    if [ "$NO_BLE" -eq 1 ]; then
-        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
-            --no-default-features --features firewall,fallback-socket \
-            || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+    if [ "$CARGO_PATH" = "${ORIGINAL_HOME}/.cargo/bin/cargo" ]; then
+        # Per-user rustup install: run as the original user
+        if [ "$NO_BLE" -eq 1 ]; then
+            sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+                --no-default-features --features firewall,fallback-socket \
+                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+        else
+            sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+                --features fallback-socket \
+                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+        fi
     else
-        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
-            --features fallback-socket \
-            || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+        # System cargo: run directly as root
+        if [ "$NO_BLE" -eq 1 ]; then
+            "$CARGO_PATH" build --release -p tapauthd \
+                --no-default-features --features firewall,fallback-socket \
+                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+        else
+            "$CARGO_PATH" build --release -p tapauthd \
+                --features fallback-socket \
+                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
+        fi
     fi
 else
     if ! command -v cargo &>/dev/null; then
