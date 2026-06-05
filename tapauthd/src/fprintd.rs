@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::RwLock;
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -29,8 +29,6 @@ enum FprintError {
 
 #[derive(Clone)]
 pub struct AuthState {
-    /// Shared daemon state via RwLock so fprintd always sees the latest
-    /// reloaded state after admin mutations (pairing, CSK rotation, etc.).
     pub daemon: Arc<RwLock<Arc<DaemonState>>>,
 }
 
@@ -67,13 +65,18 @@ impl FprintManager {
 
 // ── Device interface ──
 
+/// Single lock protecting all device state — no deadlocks, no partial-state races.
+struct DeviceState {
+    claimed_user: Option<String>,
+    claimed_owner: Option<String>,
+    verifying: bool,
+    cancel_token: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 pub struct VirtualFprintDevice {
     auth_state: AuthState,
     connection: zbus::Connection,
-    claimed_user: Arc<Mutex<Option<String>>>,
-    claimed_owner: Arc<Mutex<Option<String>>>,
-    verifying: Arc<Mutex<bool>>,
-    cancel_token: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    state: Arc<StdMutex<DeviceState>>,
 }
 
 impl VirtualFprintDevice {
@@ -81,10 +84,12 @@ impl VirtualFprintDevice {
         Self {
             auth_state,
             connection,
-            claimed_user: Arc::new(Mutex::new(None)),
-            claimed_owner: Arc::new(Mutex::new(None)),
-            verifying: Arc::new(Mutex::new(false)),
-            cancel_token: Arc::new(Mutex::new(None)),
+            state: Arc::new(StdMutex::new(DeviceState {
+                claimed_user: None,
+                claimed_owner: None,
+                verifying: false,
+                cancel_token: None,
+            })),
         }
     }
 }
@@ -113,8 +118,7 @@ impl VirtualFprintDevice {
 
     #[zbus(property, name = "finger-needed")]
     async fn finger_needed(&self) -> bool {
-        let verifying = self.verifying.lock().await;
-        *verifying
+        self.state.lock().is_ok_and(|s| s.verifying)
     }
 
     async fn list_enrolled_fingers(
@@ -228,9 +232,10 @@ impl VirtualFprintDevice {
             }
         }
 
-        let (mut claimed, mut owner) =
-            tokio::join!(self.claimed_user.lock(), self.claimed_owner.lock(),);
-        if let Some(ref existing) = *claimed {
+        let mut s = self.state.lock().map_err(|e| {
+            FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+        })?;
+        if let Some(ref existing) = s.claimed_user {
             if existing == &target_username {
                 return Ok(());
             }
@@ -238,8 +243,8 @@ impl VirtualFprintDevice {
                 "Device is already claimed".to_string(),
             ));
         }
-        *claimed = Some(target_username);
-        *owner = Some(sender.to_string());
+        s.claimed_user = Some(target_username);
+        s.claimed_owner = Some(sender.to_string());
         Ok(())
     }
 
@@ -256,33 +261,28 @@ impl VirtualFprintDevice {
             }
         };
 
-        let (claimed, owner) = tokio::join!(self.claimed_user.lock(), self.claimed_owner.lock(),);
-        if claimed.is_none() {
+        let mut s = self.state.lock().map_err(|e| {
+            FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+        })?;
+        if s.claimed_user.is_none() {
             return Err(FprintError::ClaimDevice(
                 "Device was not claimed".to_string(),
             ));
         }
-        if let Some(ref existing_owner) = *owner {
+        if let Some(ref existing_owner) = s.claimed_owner {
             if existing_owner != &sender {
                 return Err(FprintError::ClaimDevice(
                     "Caller is not the owner of the claim".to_string(),
                 ));
             }
         }
-        drop(owner);
-
-        let v = self.verifying.lock().await;
-        if *v {
+        if s.verifying {
             return Err(FprintError::AlreadyInUse(
                 "Cannot release while verification is in progress".to_string(),
             ));
         }
-        drop(v);
-
-        let mut claimed = claimed;
-        *claimed = None;
-        drop(claimed);
-        *self.claimed_owner.lock().await = None;
+        s.claimed_user = None;
+        s.claimed_owner = None;
         Ok(())
     }
 
@@ -300,29 +300,47 @@ impl VirtualFprintDevice {
             }
         };
 
-        let owner = self.claimed_owner.lock().await;
-        match *owner {
-            Some(ref existing_owner) => {
-                if existing_owner != &sender {
+        let (username, cancel_rx) = {
+            let mut s = self.state.lock().map_err(|e| {
+                FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+            })?;
+            let owner = s.claimed_owner.as_ref();
+            match owner {
+                Some(existing) => {
+                    if existing != &sender {
+                        return Err(FprintError::ClaimDevice(
+                            "Caller is not the owner of the claim".to_string(),
+                        ));
+                    }
+                }
+                None => {
                     return Err(FprintError::ClaimDevice(
-                        "Caller is not the owner of the claim".to_string(),
+                        "Device must be claimed before starting verification".to_string(),
                     ));
                 }
             }
-            None => {
-                return Err(FprintError::ClaimDevice(
+            let username = s.claimed_user.clone().ok_or_else(|| {
+                FprintError::ClaimDevice(
                     "Device must be claimed before starting verification".to_string(),
+                )
+            })?;
+            if s.verifying {
+                return Err(FprintError::AlreadyInUse(
+                    "Verification already in progress".to_string(),
                 ));
             }
-        }
-        drop(owner);
+            s.verifying = true;
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            s.cancel_token = Some(cancel_tx);
+            (username, cancel_rx)
+        };
+
         let state = self.auth_state.read().await;
 
         if !state.is_healthy() {
             let init_err = state
                 .get_init_error()
                 .unwrap_or("unknown configuration error");
-            tracing::warn!("fprintd verify_start: daemon not healthy: {}", init_err);
             return Err(FprintError::Internal(init_err.to_string()));
         }
 
@@ -331,18 +349,6 @@ impl VirtualFprintDevice {
                 "No paired devices configured".to_string(),
             ));
         }
-
-        let username = {
-            let claimed = self.claimed_user.lock().await;
-            match claimed.clone() {
-                Some(u) => u,
-                None => {
-                    return Err(FprintError::ClaimDevice(
-                        "Device must be claimed before starting verification".to_string(),
-                    ));
-                }
-            }
-        };
 
         let has_authorized = state
             .paired_servers
@@ -357,22 +363,6 @@ impl VirtualFprintDevice {
 
         let connection = self.connection.clone();
         let auth_state = self.auth_state.clone();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-
-        {
-            let mut v = self.verifying.lock().await;
-            if *v {
-                return Err(FprintError::AlreadyInUse(
-                    "Verification already in progress".to_string(),
-                ));
-            }
-            *v = true;
-            let mut token = self.cancel_token.lock().await;
-            *token = Some(cancel_tx);
-        }
-
-        let verifying = self.verifying.clone();
-        let cancel_token = self.cancel_token.clone();
 
         let finger_name = if _finger_name == "any" {
             "right-index-finger".to_string()
@@ -392,27 +382,22 @@ impl VirtualFprintDevice {
             tracing::warn!("fprintd: failed to emit VerifyFingerSelected: {}", e);
         }
 
+        let dev_state = self.state.clone();
         tokio::spawn(async move {
-            struct PanicGuard {
-                verifying: Arc<Mutex<bool>>,
-                cancel_token: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+            struct VerifyGuard {
+                state: Arc<StdMutex<DeviceState>>,
             }
-            impl Drop for PanicGuard {
+            impl Drop for VerifyGuard {
                 fn drop(&mut self) {
                     if std::thread::panicking() {
-                        let verifying = self.verifying.clone();
-                        let cancel_token = self.cancel_token.clone();
-                        tokio::spawn(async move {
-                            *verifying.lock().await = false;
-                            *cancel_token.lock().await = None;
-                        });
+                        if let Ok(mut s) = self.state.lock() {
+                            s.verifying = false;
+                            s.cancel_token = None;
+                        }
                     }
                 }
             }
-            let _guard = PanicGuard {
-                verifying,
-                cancel_token,
-            };
+            let _guard = VerifyGuard { state: dev_state };
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
         });
 
@@ -432,10 +417,13 @@ impl VirtualFprintDevice {
             }
         };
 
-        let owner = self.claimed_owner.lock().await;
-        match *owner {
-            Some(ref existing_owner) => {
-                if existing_owner != &sender {
+        let mut s = self.state.lock().map_err(|e| {
+            FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+        })?;
+        let owner = s.claimed_owner.as_ref();
+        match owner {
+            Some(existing) => {
+                if existing != &sender {
                     return Err(FprintError::ClaimDevice(
                         "Caller is not the owner of the claim".to_string(),
                     ));
@@ -447,29 +435,15 @@ impl VirtualFprintDevice {
                 ));
             }
         }
-        drop(owner);
-        {
-            let claimed = self.claimed_user.lock().await;
-            if claimed.is_none() {
-                return Err(FprintError::ClaimDevice(
-                    "Device must be claimed before stopping verification".to_string(),
-                ));
-            }
-        }
-
-        let mut v = self.verifying.lock().await;
-        if !*v {
+        if !s.verifying {
             return Err(FprintError::NoActionInProgress(
                 "No verification in progress".to_string(),
             ));
         }
-        *v = false;
-
-        let mut token = self.cancel_token.lock().await;
-        if let Some(tx) = token.take() {
+        s.verifying = false;
+        if let Some(tx) = s.cancel_token.take() {
             let _ = tx.send(());
         }
-
         Ok(())
     }
 
@@ -504,8 +478,9 @@ async fn run_verify(
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_registry: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let cancel_registry: Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let cancel_registry_c = cancel_registry.clone();
     let cancelled_c = cancelled.clone();
@@ -529,8 +504,6 @@ async fn run_verify(
     let result = tokio::select! {
         res = &mut auth_fut => Some(res),
         _ = cancel_done_rx => {
-            // Cancel was signaled; grant a 250ms grace period for
-            // background transports to clean up before dropping.
             tokio::select! {
                 res = &mut auth_fut => Some(res),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => None,
@@ -619,8 +592,6 @@ pub async fn start_fprintd_service(
         .await
         .map_err(|e| format!("fprintd build: {}", e))?;
 
-    // Register the device object *before* acquiring the well-known name
-    // so there is no window where clients see the name without the device.
     connection
         .object_server()
         .at(

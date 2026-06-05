@@ -69,7 +69,7 @@ echo ""
 
 TAPAUTHD_BIN="target/release/tapauthd"
 DBUS_POLICY_SRC="packaging/net.reactivated.Fprint.tapauth.conf"
-DBUS_POLICY_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+DBUS_POLICY_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 CONFIG_DIR="/var/lib/tapauth"
 SOCK_PATH="/run/tapauthd/tapauthd.sock"
 DAEMON_PID=""
