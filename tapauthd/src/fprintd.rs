@@ -158,7 +158,7 @@ impl VirtualFprintDevice {
                 })?
                 .map(|u| u.uid.as_raw())
                 .ok_or_else(|| {
-                    FprintError::ClaimDevice(format!("User '{}' does not exist", username))
+                    FprintError::PermissionDenied(format!("User '{}' does not exist", username))
                 })?;
             if caller_uid != target_uid {
                 return Err(FprintError::PermissionDenied(format!(
@@ -328,7 +328,7 @@ impl VirtualFprintDevice {
     async fn verify_start(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        _finger_name: String,
+        finger_name: String,
     ) -> Result<(), FprintError> {
         let sender = match header.sender() {
             Some(s) => s.to_string(),
@@ -421,10 +421,10 @@ impl VirtualFprintDevice {
         let connection = self.connection.clone();
         let auth_state = self.auth_state.clone();
 
-        let finger_name = if _finger_name == "any" {
+        let finger_name = if finger_name == "any" {
             "right-index-finger".to_string()
         } else {
-            _finger_name.clone()
+            finger_name
         };
         if let Err(e) = connection
             .emit_signal(
@@ -599,17 +599,22 @@ async fn run_verify(
 }
 
 async fn emit_status(connection: &zbus::Connection, result: &str, done: bool) {
-    if let Err(e) = connection
-        .emit_signal(
-            Option::<&str>::None,
-            FPRINT_DEVICE_PATH,
-            "net.reactivated.Fprint.Device",
-            "VerifyStatus",
-            &(result, done),
-        )
+    let object_server = connection.object_server();
+    match object_server
+        .interface::<_, VirtualFprintDevice>(FPRINT_DEVICE_PATH)
         .await
     {
-        tracing::error!("fprintd: failed to emit VerifyStatus signal: {}", e);
+        Ok(interface_ref) => {
+            let emitter = interface_ref.signal_emitter();
+            if let Err(e) = VirtualFprintDevice::verify_status(emitter, result, done).await {
+                tracing::error!("fprintd: failed to emit VerifyStatus signal: {}", e);
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                "fprintd: failed to get VirtualFprintDevice interface to emit VerifyStatus"
+            );
+        }
     }
 }
 
@@ -619,23 +624,15 @@ async fn resolve_sender_uid(
     connection: &zbus::Connection,
     sender: &zbus::names::UniqueName<'_>,
 ) -> Result<u32, FprintError> {
-    let reply = connection
-        .call_method(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "GetConnectionUnixUser",
-            &(sender.to_string(),),
-        )
+    let dbus_proxy = zbus::fdo::DBusProxy::new(connection)
         .await
-        .map_err(|e| FprintError::Internal(format!("Failed to query caller UID: {}", e)))?;
+        .map_err(|e| FprintError::Internal(format!("Failed to create DBusProxy: {}", e)))?;
 
-    let body = reply.body();
-    let uid: u32 = body
-        .deserialize()
-        .map_err(|e| FprintError::Internal(format!("Failed to parse caller UID: {}", e)))?;
-
-    Ok(uid)
+    let owned = sender.to_owned();
+    dbus_proxy
+        .get_connection_unix_user(zbus::names::BusName::Unique(owned))
+        .await
+        .map_err(|e| FprintError::Internal(format!("Failed to query caller UID: {}", e)))
 }
 
 // ── Service startup ──
