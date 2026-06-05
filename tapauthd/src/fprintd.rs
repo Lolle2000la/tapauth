@@ -11,6 +11,23 @@ const FPRINT_DEVICE_PATH: &str = "/net/reactivated/Fprint/Device/0";
 
 // ── AuthState: bridge between the D-Bus mock device and the existing auth handler ──
 
+/// D-Bus error types matching the upstream fprintd specification.
+#[derive(zbus::DBusError, Debug)]
+#[zbus(prefix = "net.reactivated.Fprint.Error")]
+enum FprintError {
+    /// The device is already claimed by another caller.
+    AlreadyInUse(String),
+    /// The device was not claimed before calling verify_start.
+    ClaimDevice(String),
+    /// An internal error occurred.
+    Internal(String),
+    /// No enrolled prints for the target user.
+    NoEnrolledPrints(String),
+    /// Wraps a generic zbus error (used by proxy/deserialization path).
+    #[zbus(error)]
+    ZBus(zbus::Error),
+}
+
 #[derive(Clone)]
 pub struct AuthState {
     pub daemon: Arc<DaemonState>,
@@ -91,40 +108,33 @@ impl VirtualFprintDevice {
         *verifying
     }
 
-    async fn list_enrolled_fingers(
-        &self,
-        _username: String,
-    ) -> Result<Vec<String>, zbus::fdo::Error> {
-        let servers = {
-            let arc = self.auth_state.daemon.paired_servers.clone();
-            Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
-        };
-        if servers.is_empty() {
-            return Err(zbus::fdo::Error::Failed(
-                "net.reactivated.Fprint.Error.NoEnrolledPrints".to_string(),
+    async fn list_enrolled_fingers(&self, _username: String) -> Result<Vec<String>, FprintError> {
+        if self.auth_state.daemon.paired_servers.is_empty() {
+            return Err(FprintError::NoEnrolledPrints(
+                "No paired devices configured".to_string(),
             ));
         }
         Ok(vec!["right-index-finger".to_string()])
     }
 
-    async fn claim(&self, username: String) -> Result<(), zbus::fdo::Error> {
+    async fn claim(&self, username: String) -> Result<(), FprintError> {
         let mut claimed = self.claimed_user.lock().await;
         if claimed.is_some() {
-            return Err(zbus::fdo::Error::Failed(
-                "net.reactivated.Fprint.Error.AlreadyInUse".to_string(),
+            return Err(FprintError::AlreadyInUse(
+                "Device is already claimed".to_string(),
             ));
         }
         *claimed = Some(username);
         Ok(())
     }
 
-    async fn release(&self) -> Result<(), zbus::fdo::Error> {
+    async fn release(&self) -> Result<(), FprintError> {
         let mut claimed = self.claimed_user.lock().await;
         *claimed = None;
         Ok(())
     }
 
-    async fn verify_start(&self, _finger_name: String) -> Result<(), zbus::fdo::Error> {
+    async fn verify_start(&self, _finger_name: String) -> Result<(), FprintError> {
         let is_healthy = self.auth_state.daemon.is_healthy();
         if !is_healthy {
             let init_err = self
@@ -133,25 +143,30 @@ impl VirtualFprintDevice {
                 .get_init_error()
                 .unwrap_or("unknown configuration error");
             tracing::warn!("fprintd verify_start: daemon not healthy: {}", init_err);
-            return Err(zbus::fdo::Error::Failed(
-                "net.reactivated.Fprint.Error.Internal".to_string(),
-            ));
-        }
-
-        {
-            let mut v = self.verifying.lock().await;
-            if *v {
-                return Err(zbus::fdo::Error::Failed(
-                    "net.reactivated.Fprint.Error.AlreadyInUse".to_string(),
-                ));
-            }
-            *v = true;
+            return Err(FprintError::Internal(init_err.to_string()));
         }
 
         let username = {
             let claimed = self.claimed_user.lock().await;
-            claimed.clone().unwrap_or_else(|| "default".to_string())
+            match claimed.clone() {
+                Some(u) => u,
+                None => {
+                    return Err(FprintError::ClaimDevice(
+                        "Device must be claimed before starting verification".to_string(),
+                    ));
+                }
+            }
         };
+
+        {
+            let mut v = self.verifying.lock().await;
+            if *v {
+                return Err(FprintError::AlreadyInUse(
+                    "Verification already in progress".to_string(),
+                ));
+            }
+            *v = true;
+        }
 
         let connection = self.connection.clone();
         let auth_state = self.auth_state.clone();
@@ -162,14 +177,18 @@ impl VirtualFprintDevice {
             *token = Some(cancel_tx);
         }
 
+        let verifying = self.verifying.clone();
+        let cancel_token = self.cancel_token.clone();
         tokio::spawn(async move {
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
+            *verifying.lock().await = false;
+            *cancel_token.lock().await = None;
         });
 
         Ok(())
     }
 
-    async fn verify_stop(&self) -> Result<(), zbus::fdo::Error> {
+    async fn verify_stop(&self) -> Result<(), FprintError> {
         let mut v = self.verifying.lock().await;
         *v = false;
 
@@ -198,21 +217,27 @@ async fn run_verify(
     };
 
     let cancel_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<()>();
+    let (reg_tx, _) = tokio::sync::oneshot::channel::<()>();
     {
         let mut reg = cancel_registry.lock().await;
         reg.insert("fprintd-verify".to_string(), reg_tx);
     }
+
+    let cancel_registry_c = cancel_registry.clone();
+    let cancel_wire = async move {
+        let _ = cancel_rx.await;
+        let mut reg = cancel_registry_c.lock().await;
+        if let Some(tx) = reg.remove("fprintd-verify") {
+            let _ = tx.send(());
+        }
+    };
 
     let auth_fut =
         session.handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry);
 
     let result = tokio::select! {
         res = auth_fut => res,
-        _ = cancel_rx => {
-            drop(reg_rx);
-            Err(crate::auth_handler::AuthHandlerError::Denied)
-        }
+        () = cancel_wire => Err(crate::auth_handler::AuthHandlerError::Denied),
     };
 
     let (status, done) = match result {

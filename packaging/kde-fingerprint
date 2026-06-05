@@ -1,6 +1,6 @@
 #%PAM-1.0
 
-auth      requisite      pam_shell.so
+auth      requisite      pam_shells.so
 auth      required       pam_env.so
 auth      sufficient     pam_tapauth.so
 auth      required       pam_deny.so

@@ -96,7 +96,7 @@ WAS_FPRINTD_MASKED=0
 HAS_OLD_POLICY=0
 
 if systemctl is-active --quiet fprintd 2>/dev/null; then WAS_FPRINTD_ACTIVE=1; fi
-if systemctl is-enabled --quiet fprintd 2>/dev/null 2>&1 | grep -q "masked"; then WAS_FPRINTD_MASKED=1; fi
+if systemctl is-enabled fprintd 2>/dev/null | grep -q "masked"; then WAS_FPRINTD_MASKED=1; fi
 
 if [ -f "$DBUS_POLICY_DEST" ]; then
     HAS_OLD_POLICY=1
