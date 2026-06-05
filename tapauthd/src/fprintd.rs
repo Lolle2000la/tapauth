@@ -134,14 +134,17 @@ impl VirtualFprintDevice {
         let caller_uid = resolve_sender_uid(connection, &sender).await?;
 
         let target_user = if username.is_empty() {
-            match self.claimed_user.lock().await.clone() {
-                Some(u) => u,
-                None => {
-                    return Err(FprintError::ClaimDevice(
-                        "Device must be claimed before listing enrolled fingers".to_string(),
-                    ));
-                }
-            }
+            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
+                .map_err(|e| {
+                    FprintError::Internal(format!(
+                        "Failed to query caller UID {}: {}",
+                        caller_uid, e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    FprintError::Internal(format!("No user entry for UID {}", caller_uid))
+                })?
+                .name
         } else if caller_uid != 0 {
             let target_uid = nix::unistd::User::from_name(&username)
                 .map_err(|e| {
@@ -225,7 +228,8 @@ impl VirtualFprintDevice {
             }
         }
 
-        let mut claimed = self.claimed_user.lock().await;
+        let (mut claimed, mut owner) =
+            tokio::join!(self.claimed_user.lock(), self.claimed_owner.lock(),);
         if let Some(ref existing) = *claimed {
             if existing == &target_username {
                 return Ok(());
@@ -235,7 +239,7 @@ impl VirtualFprintDevice {
             ));
         }
         *claimed = Some(target_username);
-        *self.claimed_owner.lock().await = Some(sender.to_string());
+        *owner = Some(sender.to_string());
         Ok(())
     }
 
@@ -252,13 +256,12 @@ impl VirtualFprintDevice {
             }
         };
 
-        let mut claimed = self.claimed_user.lock().await;
+        let (claimed, owner) = tokio::join!(self.claimed_user.lock(), self.claimed_owner.lock(),);
         if claimed.is_none() {
             return Err(FprintError::ClaimDevice(
                 "Device was not claimed".to_string(),
             ));
         }
-        let owner = self.claimed_owner.lock().await;
         if let Some(ref existing_owner) = *owner {
             if existing_owner != &sender {
                 return Err(FprintError::ClaimDevice(
@@ -275,7 +278,10 @@ impl VirtualFprintDevice {
             ));
         }
         drop(v);
+
+        let mut claimed = claimed;
         *claimed = None;
+        drop(claimed);
         *self.claimed_owner.lock().await = None;
         Ok(())
     }
@@ -393,12 +399,14 @@ impl VirtualFprintDevice {
             }
             impl Drop for PanicGuard {
                 fn drop(&mut self) {
-                    let verifying = self.verifying.clone();
-                    let cancel_token = self.cancel_token.clone();
-                    tokio::spawn(async move {
-                        *verifying.lock().await = false;
-                        *cancel_token.lock().await = None;
-                    });
+                    if std::thread::panicking() {
+                        let verifying = self.verifying.clone();
+                        let cancel_token = self.cancel_token.clone();
+                        tokio::spawn(async move {
+                            *verifying.lock().await = false;
+                            *cancel_token.lock().await = None;
+                        });
+                    }
                 }
             }
             let _guard = PanicGuard {
