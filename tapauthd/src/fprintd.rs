@@ -71,6 +71,7 @@ struct DeviceState {
     claimed_owner: Option<String>,
     verifying: bool,
     cancel_token: Option<tokio::sync::oneshot::Sender<()>>,
+    session_id: u64,
 }
 
 pub struct VirtualFprintDevice {
@@ -89,6 +90,7 @@ impl VirtualFprintDevice {
                 claimed_owner: None,
                 verifying: false,
                 cancel_token: None,
+                session_id: 0,
             })),
         }
     }
@@ -225,11 +227,18 @@ impl VirtualFprintDevice {
                 .unwrap_or_else(|| "unknown".to_string());
 
             if caller_name != target_username {
-                return Err(FprintError::ClaimDevice(format!(
+                return Err(FprintError::PermissionDenied(format!(
                     "Caller '{}' (UID {}) is not authorized to claim the device for user '{}'",
                     caller_name, caller_uid, target_username
                 )));
             }
+        } else {
+            nix::unistd::User::from_name(&target_username)
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    FprintError::ClaimDevice(format!("User '{}' does not exist", target_username))
+                })?;
         }
 
         // If the device is claimed by a dead D-Bus connection, clear the stale claim.
@@ -388,7 +397,7 @@ impl VirtualFprintDevice {
         }
 
         // All pre-flight checks passed — now re-acquire the lock and set verifying.
-        let cancel_rx = {
+        let (cancel_rx, session_id) = {
             let mut s = self.state.lock().map_err(|e| {
                 FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
             })?;
@@ -402,10 +411,11 @@ impl VirtualFprintDevice {
                     "Verification already in progress".to_string(),
                 ));
             }
+            s.session_id = s.session_id.wrapping_add(1);
             s.verifying = true;
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
             s.cancel_token = Some(cancel_tx);
-            cancel_rx
+            (cancel_rx, s.session_id)
         };
 
         let connection = self.connection.clone();
@@ -433,16 +443,22 @@ impl VirtualFprintDevice {
         tokio::spawn(async move {
             struct VerifyGuard {
                 state: Arc<StdMutex<DeviceState>>,
+                session_id: u64,
             }
             impl Drop for VerifyGuard {
                 fn drop(&mut self) {
                     if let Ok(mut s) = self.state.lock() {
-                        s.verifying = false;
-                        s.cancel_token = None;
+                        if s.session_id == self.session_id {
+                            s.verifying = false;
+                            s.cancel_token = None;
+                        }
                     }
                 }
             }
-            let _guard = VerifyGuard { state: dev_state };
+            let _guard = VerifyGuard {
+                state: dev_state,
+                session_id,
+            };
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
         });
 
