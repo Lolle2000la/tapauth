@@ -129,7 +129,9 @@ cleanup() {
     else
         rm -f "$DBUS_POLICY_DEST"
     fi
-    if command -v systemctl &>/dev/null; then
+    if systemctl is-active --quiet dbus-broker 2>/dev/null; then
+        systemctl reload dbus-broker 2>/dev/null || true
+    elif systemctl is-active --quiet dbus 2>/dev/null; then
         systemctl reload dbus 2>/dev/null || true
     elif command -v killall &>/dev/null; then
         killall -HUP dbus-daemon 2>/dev/null || true
@@ -168,13 +170,17 @@ chmod 755 /run/tapauthd
 
 echo "==> Installing D-Bus policy for net.reactivated.Fprint..."
 cp "$DBUS_POLICY_SRC" "$DBUS_POLICY_DEST"
-# Reload D-Bus config so the policy takes effect (non-fatal; dbus-broker
-# watches the directory, dbus-daemon needs SIGHUP but may not be running).
-if command -v systemctl &>/dev/null; then
+# Reload D-Bus config so the policy takes effect.
+# dbus-broker watches /etc/dbus-1/system.d via inotify, but may
+# not have picked up the file yet. Force a reload where possible.
+if systemctl is-active --quiet dbus-broker 2>/dev/null; then
+    systemctl reload dbus-broker 2>/dev/null || true
+elif systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
 elif command -v killall &>/dev/null; then
     killall -HUP dbus-daemon 2>/dev/null || true
 fi
+sleep 0.3
 
 # ── Suppress the real fprintd service ──
 
@@ -248,7 +254,7 @@ DAEMON_PID=$!
 
 echo -n "    Awaiting net.reactivated.Fprint on the system bus"
 for i in $(seq 1 50); do
-    if busctl list 2>/dev/null | grep -q "net.reactivated.Fprint"; then
+    if busctl status net.reactivated.Fprint &>/dev/null; then
         echo ""
         echo "    Well-known bus name claimed successfully."
         break
@@ -257,7 +263,7 @@ for i in $(seq 1 50); do
     sleep 0.1
 done
 
-if ! busctl list 2>/dev/null | grep -q "net.reactivated.Fprint"; then
+if ! busctl status net.reactivated.Fprint &>/dev/null; then
     echo ""
     echo "Timeout: Daemon failed to claim net.reactivated.Fprint on the system bus."
     echo "Check daemon logs above for details (missing D-Bus policy, permissions, etc.)."

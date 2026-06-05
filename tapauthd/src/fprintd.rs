@@ -254,20 +254,16 @@ async fn emit_status(connection: &zbus::Connection, result: &str, done: bool) {
 pub async fn start_fprintd_service(
     auth_state: AuthState,
 ) -> Result<zbus::Connection, Box<dyn std::error::Error>> {
-    let connection = zbus::Connection::system().await?;
-    connection
-        .request_name(FPRINT_BUS_NAME)
-        .await
-        .map_err(|e| format!("fprintd request_name: {}", e))?;
-
-    connection
-        .object_server()
-        .at(
+    let connection = zbus::connection::Builder::system()?
+        .serve_at(
             FPRINT_MANAGER_PATH,
             FprintManager::new().map_err(|e| format!("fprintd manager init: {}", e))?,
         )
+        .map_err(|e| format!("fprintd serve_at manager: {}", e))?
+        .name(FPRINT_BUS_NAME)?
+        .build()
         .await
-        .map_err(|e| format!("fprintd register manager: {}", e))?;
+        .map_err(|e| format!("fprintd build: {}", e))?;
 
     connection
         .object_server()
