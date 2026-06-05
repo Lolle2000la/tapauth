@@ -7,6 +7,7 @@
 
 mod admin_handler;
 mod auth_handler;
+mod fprintd;
 mod logging;
 mod peer_identity;
 mod transport;
@@ -14,6 +15,7 @@ mod transport;
 use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
+use fprintd::AuthState;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
@@ -151,6 +153,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::info!("Dropped privileges to tapauthd user");
     }
+
+    // Start the mock fprintd D-Bus service (non-fatal: daemon functions without it)
+    let _fprintd_conn = {
+        let auth_state = AuthState {
+            daemon: daemon_state.clone(),
+        };
+        match fprintd::start_fprintd_service(auth_state).await {
+            Ok(conn) => {
+                tracing::info!("Mock fprintd D-Bus service registered successfully");
+                Some(conn)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to register mock fprintd D-Bus service: {}. \
+                     Desktop lockscreen integration via fingerprint will not be available. \
+                     This is often due to missing D-Bus system bus permissions \
+                     (see packaging/net.reactivated.Fprint.tapauth.conf).",
+                    e
+                );
+                None
+            }
+        }
+    };
 
     let server_state = Arc::new(ServerState {
         daemon: RwLock::new(daemon_state.clone()),

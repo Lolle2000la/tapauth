@@ -143,7 +143,10 @@ jobs:
 
           Package: tapauth
           Architecture: any
-          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
+          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd, dbus
+          Conflicts: fprintd, libpam-fprintd
+          Replaces: fprintd, libpam-fprintd
+          Provides: fprintd, libpam-fprintd
           Recommends: firewalld
           Suggests: iptables
           Description: Local smartphone-based authentication framework
@@ -188,6 +191,8 @@ jobs:
           	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
           	mkdir -p debian/tapauth/etc/tapauth
           	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+          	mkdir -p debian/tapauth/usr/share/dbus-1/system.d
+          	mkdir -p debian/tapauth/usr/share/pam.d
           	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
@@ -201,6 +206,9 @@ jobs:
           	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
           	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
           	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+          	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth/usr/share/dbus-1/system.d/
+          	cp packaging/gdm-fingerprint debian/tapauth/usr/share/pam.d/
+          	cp packaging/kde-fingerprint debian/tapauth/usr/share/pam.d/
           EOF
           chmod +x debian/rules
 
@@ -356,7 +364,10 @@ jobs:
           url="https://github.com/lolle2000la/tapauth"
           license=('AGPL-3.0')
           depends=('dbus' 'pam')
+          optdepends=('gdm: GNOME lockscreen fingerprint integration' 'plasma-workspace: KDE lockscreen fingerprint integration' 'firewalld: firewall management')
           makedepends=('cargo' 'rust' 'protobuf' 'clang')
+          provides=('fprintd')
+          conflicts=('fprintd' 'fprintd-pam')
           backup=('etc/tapauth/config.toml')
           install=tapauth.install
           source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
@@ -390,6 +401,9 @@ jobs:
             install -Dm0644 client-config-gui/assets/tapauth-config.svg "\$pkgdir/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
             install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
             install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+            install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "\$pkgdir/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+            install -Dm0644 packaging/gdm-fingerprint "\$pkgdir/usr/share/pam.d/gdm-fingerprint"
+            install -Dm0644 packaging/kde-fingerprint "\$pkgdir/usr/share/pam.d/kde-fingerprint"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
           }
           EOF
@@ -431,6 +445,12 @@ jobs:
           	makedepends = clang
           	depends = dbus
           	depends = pam
+          	optdepends = gdm: GNOME lockscreen fingerprint integration
+          	optdepends = plasma-workspace: KDE lockscreen fingerprint integration
+          	optdepends = firewalld: firewall management
+          	provides = fprintd
+          	conflicts = fprintd
+          	conflicts = fprintd-pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
           	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
 
