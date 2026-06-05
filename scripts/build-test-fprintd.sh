@@ -190,36 +190,23 @@ if [ -n "$SUDO_USER" ]; then
     ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
     CARGO_PATH="${ORIGINAL_HOME}/.cargo/bin/cargo"
     if [ ! -x "$CARGO_PATH" ]; then
-        CARGO_PATH="$(command -v cargo 2>/dev/null || true)"
-        if [ -z "$CARGO_PATH" ]; then
-            echo "Cargo executable not found. Ensure Rust is installed."
+        CARGO_PATH="$(sudo -u "$SUDO_USER" command -v cargo 2>/dev/null || true)"
+        if [ -z "$CARGO_PATH" ] || [ ! -x "$CARGO_PATH" ]; then
+            echo "Cargo executable not found for user $SUDO_USER."
+            echo "Ensure Rust is installed (rustup or system package)."
             cd "$ORIGINAL_DIR"; exit 1
         fi
-        echo "    Using system cargo: $CARGO_PATH (no per-user install found)"
+        echo "    Using cargo from user PATH: $CARGO_PATH"
     fi
     echo "    Building as $SUDO_USER (NO_BLE=$NO_BLE, fallback-socket enabled)..."
-    if [ "$CARGO_PATH" = "${ORIGINAL_HOME}/.cargo/bin/cargo" ]; then
-        # Per-user rustup install: run as the original user
-        if [ "$NO_BLE" -eq 1 ]; then
-            sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
-                --no-default-features --features firewall,fallback-socket \
-                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
-        else
-            sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
-                --features fallback-socket \
-                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
-        fi
+    if [ "$NO_BLE" -eq 1 ]; then
+        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+            --no-default-features --features firewall,fallback-socket \
+            || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     else
-        # System cargo: run directly as root
-        if [ "$NO_BLE" -eq 1 ]; then
-            "$CARGO_PATH" build --release -p tapauthd \
-                --no-default-features --features firewall,fallback-socket \
-                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
-        else
-            "$CARGO_PATH" build --release -p tapauthd \
-                --features fallback-socket \
-                || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
-        fi
+        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+            --features fallback-socket \
+            || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     fi
 else
     if ! command -v cargo &>/dev/null; then
