@@ -287,7 +287,6 @@ echo ""
 set +e
 fprintd-verify "$TEST_USER"
 VERIFY_EXIT_CODE=$?
-set -e
 
 echo ""
 if [ "$VERIFY_EXIT_CODE" -eq 0 ]; then

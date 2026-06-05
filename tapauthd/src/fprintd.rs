@@ -21,6 +21,7 @@ enum FprintError {
     ClaimDevice(String),
     Internal(String),
     NoEnrolledPrints(String),
+    NoActionInProgress(String),
     #[zbus(error)]
     ZBus(zbus::Error),
 }
@@ -113,12 +114,24 @@ impl VirtualFprintDevice {
         *verifying
     }
 
-    async fn list_enrolled_fingers(&self, _username: String) -> Result<Vec<String>, FprintError> {
+    async fn list_enrolled_fingers(&self, username: String) -> Result<Vec<String>, FprintError> {
         let state = self.auth_state.read().await;
-        if state.paired_servers.is_empty() {
-            return Err(FprintError::NoEnrolledPrints(
-                "No paired devices configured".to_string(),
-            ));
+        let target_user = if username.is_empty() {
+            self.claimed_user.lock().await.clone().unwrap_or(username)
+        } else {
+            username
+        };
+
+        let has_authorized = state
+            .paired_servers
+            .values()
+            .any(|s| s.is_user_allowed(&target_user));
+
+        if !has_authorized {
+            return Err(FprintError::NoEnrolledPrints(format!(
+                "No paired devices configured for user '{}'",
+                target_user
+            )));
         }
         Ok(vec!["right-index-finger".to_string()])
     }
@@ -139,6 +152,11 @@ impl VirtualFprintDevice {
 
     async fn release(&self) -> Result<(), FprintError> {
         let mut claimed = self.claimed_user.lock().await;
+        if claimed.is_none() {
+            return Err(FprintError::ClaimDevice(
+                "Device was not claimed".to_string(),
+            ));
+        }
         *claimed = None;
         Ok(())
     }
@@ -172,6 +190,21 @@ impl VirtualFprintDevice {
             }
         };
 
+        let has_authorized = state
+            .paired_servers
+            .values()
+            .any(|s| s.is_user_allowed(&username));
+        if !has_authorized {
+            return Err(FprintError::NoEnrolledPrints(format!(
+                "No paired devices authorized for user '{}'",
+                username
+            )));
+        }
+
+        let connection = self.connection.clone();
+        let auth_state = self.auth_state.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
         {
             let mut v = self.verifying.lock().await;
             if *v {
@@ -180,13 +213,6 @@ impl VirtualFprintDevice {
                 ));
             }
             *v = true;
-        }
-
-        let connection = self.connection.clone();
-        let auth_state = self.auth_state.clone();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-
-        {
             let mut token = self.cancel_token.lock().await;
             *token = Some(cancel_tx);
         }
@@ -222,7 +248,21 @@ impl VirtualFprintDevice {
     }
 
     async fn verify_stop(&self) -> Result<(), FprintError> {
+        {
+            let claimed = self.claimed_user.lock().await;
+            if claimed.is_none() {
+                return Err(FprintError::ClaimDevice(
+                    "Device must be claimed before stopping verification".to_string(),
+                ));
+            }
+        }
+
         let mut v = self.verifying.lock().await;
+        if !*v {
+            return Err(FprintError::NoActionInProgress(
+                "No verification in progress".to_string(),
+            ));
+        }
         *v = false;
 
         let mut token = self.cancel_token.lock().await;
@@ -256,6 +296,7 @@ async fn run_verify(
 
     let cancel_registry_c = cancel_registry.clone();
     let cancelled_c = cancelled.clone();
+    let (cancel_done_tx, cancel_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = cancel_rx.await;
         cancelled_c.store(true, Ordering::SeqCst);
@@ -263,18 +304,33 @@ async fn run_verify(
         if let Some(tx) = reg.remove("fprintd-verify") {
             let _ = tx.send(());
         }
+        let _ = cancel_done_tx.send(());
     });
 
-    let result = session
-        .handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry)
-        .await;
+    let mut auth_fut = Box::pin(session.handle_authenticate(
+        None,
+        Some("fprintd-verify".to_string()),
+        cancel_registry,
+    ));
+
+    let result = tokio::select! {
+        res = &mut auth_fut => Some(res),
+        _ = cancel_done_rx => {
+            // Cancel was signaled; grant a 250ms grace period for
+            // background transports to clean up before dropping.
+            tokio::select! {
+                res = &mut auth_fut => Some(res),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => None,
+            }
+        }
+    };
 
     if cancelled.load(Ordering::SeqCst) {
         return Ok(());
     }
 
     let (status, done) = match result {
-        Ok(response) => {
+        Some(Ok(response)) => {
             let outcome = shared::ipc::pb::PamOutcome::try_from(response.outcome);
             match outcome {
                 Ok(shared::ipc::pb::PamOutcome::Success) => ("verify-match", true),
@@ -282,9 +338,12 @@ async fn run_verify(
                 _ => ("verify-unknown-error", true),
             }
         }
-        Err(ref e) => {
+        Some(Err(ref e)) => {
             tracing::warn!("fprintd: auth error: {}", e);
             ("verify-unknown-error", true)
+        }
+        None => {
+            return Ok(());
         }
     };
 
