@@ -61,7 +61,7 @@ struct RecentAuthRequest {
 
 /// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
-    daemon: RwLock<Arc<DaemonState>>,
+    daemon: Arc<RwLock<Arc<DaemonState>>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
     pending_pairing: Arc<Mutex<Option<PairingState>>>,
@@ -154,10 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Dropped privileges to tapauthd user");
     }
 
+    // Create shared daemon handle used by both the IPC dispatcher and fprintd.
+    // Wrapped in RwLock so admin reloads are immediately visible to all consumers.
+    let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
+
     // Start the mock fprintd D-Bus service (non-fatal: daemon functions without it)
     let _fprintd_conn = {
         let auth_state = AuthState {
-            daemon: daemon_state.clone(),
+            daemon: shared_daemon.clone(),
         };
         match fprintd::start_fprintd_service(auth_state).await {
             Ok(conn) => {
@@ -178,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let server_state = Arc::new(ServerState {
-        daemon: RwLock::new(daemon_state.clone()),
+        daemon: shared_daemon,
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         recent_requests: Arc::new(Mutex::new(HashMap::new())),
         pending_pairing: Arc::new(Mutex::new(None)),

@@ -193,7 +193,10 @@ echo ""
 echo "==> Building tapauthd (release)..."
 
 if [ -n "$SUDO_USER" ]; then
-    ORIGINAL_HOME=$(eval echo ~$SUDO_USER)
+    ORIGINAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [ -z "$ORIGINAL_HOME" ]; then
+        ORIGINAL_HOME="/home/$SUDO_USER"
+    fi
     CARGO_PATH=""
     for candidate in \
         "${ORIGINAL_HOME}/.cargo/bin/cargo" \

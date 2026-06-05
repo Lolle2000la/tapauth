@@ -61,7 +61,7 @@ mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
 mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
-mkdir -p %{buildroot}%{_datadir}/pam.d
+mkdir -p %{buildroot}%{_sysconfdir}/pam.d
 
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
@@ -84,8 +84,8 @@ install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datad
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-install -m 0644 packaging/gdm-fingerprint %{buildroot}%{_datadir}/pam.d/gdm-fingerprint
-install -m 0644 packaging/kde-fingerprint %{buildroot}%{_datadir}/pam.d/kde-fingerprint
+install -m 0644 packaging/gdm-fingerprint %{buildroot}%{_sysconfdir}/pam.d/gdm-fingerprint
+install -m 0644 packaging/kde-fingerprint %{buildroot}%{_sysconfdir}/pam.d/kde-fingerprint
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -116,5 +116,5 @@ install -m 0644 packaging/kde-fingerprint %{buildroot}%{_datadir}/pam.d/kde-fing
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-%{_datadir}/pam.d/gdm-fingerprint
-%{_datadir}/pam.d/kde-fingerprint
+%config %{_sysconfdir}/pam.d/gdm-fingerprint
+%config %{_sysconfdir}/pam.d/kde-fingerprint

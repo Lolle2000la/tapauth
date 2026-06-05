@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -15,22 +16,25 @@ const FPRINT_DEVICE_PATH: &str = "/net/reactivated/Fprint/Device/0";
 #[derive(zbus::DBusError, Debug)]
 #[zbus(prefix = "net.reactivated.Fprint.Error")]
 enum FprintError {
-    /// The device is already claimed by another caller.
     AlreadyInUse(String),
-    /// The device was not claimed before calling verify_start.
     ClaimDevice(String),
-    /// An internal error occurred.
     Internal(String),
-    /// No enrolled prints for the target user.
     NoEnrolledPrints(String),
-    /// Wraps a generic zbus error (used by proxy/deserialization path).
     #[zbus(error)]
     ZBus(zbus::Error),
 }
 
 #[derive(Clone)]
 pub struct AuthState {
-    pub daemon: Arc<DaemonState>,
+    /// Shared daemon state via RwLock so fprintd always sees the latest
+    /// reloaded state after admin mutations (pairing, CSK rotation, etc.).
+    pub daemon: Arc<RwLock<Arc<DaemonState>>>,
+}
+
+impl AuthState {
+    async fn read(&self) -> Arc<DaemonState> {
+        self.daemon.read().await.clone()
+    }
 }
 
 // ── Manager interface ──
@@ -109,7 +113,8 @@ impl VirtualFprintDevice {
     }
 
     async fn list_enrolled_fingers(&self, _username: String) -> Result<Vec<String>, FprintError> {
-        if self.auth_state.daemon.paired_servers.is_empty() {
+        let state = self.auth_state.read().await;
+        if state.paired_servers.is_empty() {
             return Err(FprintError::NoEnrolledPrints(
                 "No paired devices configured".to_string(),
             ));
@@ -119,7 +124,10 @@ impl VirtualFprintDevice {
 
     async fn claim(&self, username: String) -> Result<(), FprintError> {
         let mut claimed = self.claimed_user.lock().await;
-        if claimed.is_some() {
+        if let Some(ref existing) = *claimed {
+            if existing == &username {
+                return Ok(());
+            }
             return Err(FprintError::AlreadyInUse(
                 "Device is already claimed".to_string(),
             ));
@@ -135,15 +143,20 @@ impl VirtualFprintDevice {
     }
 
     async fn verify_start(&self, _finger_name: String) -> Result<(), FprintError> {
-        let is_healthy = self.auth_state.daemon.is_healthy();
-        if !is_healthy {
-            let init_err = self
-                .auth_state
-                .daemon
+        let state = self.auth_state.read().await;
+
+        if !state.is_healthy() {
+            let init_err = state
                 .get_init_error()
                 .unwrap_or("unknown configuration error");
             tracing::warn!("fprintd verify_start: daemon not healthy: {}", init_err);
             return Err(FprintError::Internal(init_err.to_string()));
+        }
+
+        if state.paired_servers.is_empty() {
+            return Err(FprintError::NoEnrolledPrints(
+                "No paired devices configured".to_string(),
+            ));
         }
 
         let username = {
@@ -179,10 +192,12 @@ impl VirtualFprintDevice {
 
         let verifying = self.verifying.clone();
         let cancel_token = self.cancel_token.clone();
+        let claimed_user = self.claimed_user.clone();
         tokio::spawn(async move {
             let _ = run_verify(connection, auth_state, username, cancel_rx).await;
             *verifying.lock().await = false;
             *cancel_token.lock().await = None;
+            *claimed_user.lock().await = None;
         });
 
         Ok(())
@@ -207,7 +222,8 @@ async fn run_verify(
     username: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session = match crate::auth_handler::AuthSession::new(auth_state.daemon.clone(), username) {
+    let state = auth_state.read().await;
+    let session = match crate::auth_handler::AuthSession::new(state, username) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("fprintd: failed to create auth session: {}", e);
@@ -216,6 +232,7 @@ async fn run_verify(
         }
     };
 
+    let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (reg_tx, _) = tokio::sync::oneshot::channel::<()>();
     {
@@ -224,8 +241,10 @@ async fn run_verify(
     }
 
     let cancel_registry_c = cancel_registry.clone();
+    let cancelled_c = cancelled.clone();
     let cancel_wire = async move {
         let _ = cancel_rx.await;
+        cancelled_c.store(true, Ordering::SeqCst);
         let mut reg = cancel_registry_c.lock().await;
         if let Some(tx) = reg.remove("fprintd-verify") {
             let _ = tx.send(());
@@ -239,6 +258,10 @@ async fn run_verify(
         res = auth_fut => res,
         () = cancel_wire => Err(crate::auth_handler::AuthHandlerError::Denied),
     };
+
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
 
     let (status, done) = match result {
         Ok(response) => {

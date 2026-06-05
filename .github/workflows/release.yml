@@ -192,7 +192,7 @@ jobs:
           	mkdir -p debian/tapauth/etc/tapauth
           	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
           	mkdir -p debian/tapauth/usr/share/dbus-1/system.d
-          	mkdir -p debian/tapauth/usr/share/pam.d
+          	mkdir -p debian/tapauth/etc/pam.d
           	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
           	cp target/release/tapauthd debian/tapauth/usr/bin/
           	cp target/release/tapauth-config debian/tapauth/usr/bin/
@@ -207,8 +207,8 @@ jobs:
           	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
           	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
           	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth/usr/share/dbus-1/system.d/
-          	cp packaging/gdm-fingerprint debian/tapauth/usr/share/pam.d/
-          	cp packaging/kde-fingerprint debian/tapauth/usr/share/pam.d/
+          	cp packaging/gdm-fingerprint debian/tapauth/etc/pam.d/
+          	cp packaging/kde-fingerprint debian/tapauth/etc/pam.d/
           EOF
           chmod +x debian/rules
 
@@ -402,8 +402,8 @@ jobs:
             install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
             install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
             install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "\$pkgdir/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
-            install -Dm0644 packaging/gdm-fingerprint "\$pkgdir/usr/share/pam.d/gdm-fingerprint"
-            install -Dm0644 packaging/kde-fingerprint "\$pkgdir/usr/share/pam.d/kde-fingerprint"
+            install -Dm0644 packaging/gdm-fingerprint "\$pkgdir/etc/pam.d/gdm-fingerprint"
+            install -Dm0644 packaging/kde-fingerprint "\$pkgdir/etc/pam.d/kde-fingerprint"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
           }
           EOF
