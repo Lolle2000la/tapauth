@@ -148,6 +148,11 @@ impl VirtualFprintDevice {
             *v = true;
         }
 
+        let username = {
+            let claimed = self.claimed_user.lock().await;
+            claimed.clone().unwrap_or_else(|| "default".to_string())
+        };
+
         let connection = self.connection.clone();
         let auth_state = self.auth_state.clone();
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -158,7 +163,7 @@ impl VirtualFprintDevice {
         }
 
         tokio::spawn(async move {
-            let _ = run_verify(connection, auth_state, cancel_rx).await;
+            let _ = run_verify(connection, auth_state, username, cancel_rx).await;
         });
 
         Ok(())
@@ -180,22 +185,9 @@ impl VirtualFprintDevice {
 async fn run_verify(
     connection: zbus::Connection,
     auth_state: AuthState,
+    username: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let username = {
-        let arc = auth_state.daemon.paired_servers.clone();
-        let servers = Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone());
-        if let Some(first) = servers.values().next() {
-            first
-                .allowed_users
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "default".to_string())
-        } else {
-            "default".to_string()
-        }
-    };
-
     let session = match crate::auth_handler::AuthSession::new(auth_state.daemon.clone(), username) {
         Ok(s) => s,
         Err(e) => {
