@@ -164,6 +164,7 @@ chown tapauthd:tapauthd "$CONFIG_DIR" 2>/dev/null || true
 chmod 700 "$CONFIG_DIR"
 
 mkdir -p /run/tapauthd
+chown tapauthd:tapauthd /run/tapauthd 2>/dev/null || true
 chmod 755 /run/tapauthd
 
 # ── Install D-Bus policy ──
@@ -260,6 +261,11 @@ for i in $(seq 1 50); do
     if busctl status net.reactivated.Fprint &>/dev/null; then
         echo ""
         echo "    Well-known bus name claimed successfully."
+        break
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo ""
+        echo "Daemon process (PID=$DAEMON_PID) exited unexpectedly."
         break
     fi
     echo -n "."

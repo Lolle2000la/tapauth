@@ -117,7 +117,14 @@ impl VirtualFprintDevice {
     async fn list_enrolled_fingers(&self, username: String) -> Result<Vec<String>, FprintError> {
         let state = self.auth_state.read().await;
         let target_user = if username.is_empty() {
-            self.claimed_user.lock().await.clone().unwrap_or(username)
+            match self.claimed_user.lock().await.clone() {
+                Some(u) => u,
+                None => {
+                    return Err(FprintError::ClaimDevice(
+                        "Device must be claimed before listing enrolled fingers".to_string(),
+                    ));
+                }
+            }
         } else {
             username
         };
@@ -157,6 +164,13 @@ impl VirtualFprintDevice {
                 "Device was not claimed".to_string(),
             ));
         }
+        let v = self.verifying.lock().await;
+        if *v {
+            return Err(FprintError::AlreadyInUse(
+                "Cannot release while verification is in progress".to_string(),
+            ));
+        }
+        drop(v);
         *claimed = None;
         Ok(())
     }
@@ -272,6 +286,19 @@ impl VirtualFprintDevice {
 
         Ok(())
     }
+
+    #[zbus(signal)]
+    async fn verify_finger_selected(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        finger_name: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn verify_status(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        result: &str,
+        done: bool,
+    ) -> zbus::Result<()>;
 }
 
 async fn run_verify(
