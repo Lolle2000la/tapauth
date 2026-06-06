@@ -551,11 +551,12 @@ async fn run_verify(
     let cancel_registry_c = cancel_registry.clone();
     let cancelled_c = cancelled.clone();
     tokio::spawn(async move {
-        let _ = cancel_rx.await;
-        cancelled_c.store(true, Ordering::SeqCst);
-        let mut reg = cancel_registry_c.lock().await;
-        if let Some(tx) = reg.remove("fprintd-verify") {
-            let _ = tx.send(());
+        if cancel_rx.await.is_ok() {
+            cancelled_c.store(true, Ordering::SeqCst);
+            let mut reg = cancel_registry_c.lock().await;
+            if let Some(tx) = reg.remove("fprintd-verify") {
+                let _ = tx.send(());
+            }
         }
     });
 
