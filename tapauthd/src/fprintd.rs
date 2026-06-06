@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 use zbus::interface;
@@ -240,8 +239,9 @@ impl VirtualFprintDevice {
             }
         } else {
             nix::unistd::User::from_name(&target_username)
-                .ok()
-                .flatten()
+                .map_err(|e| {
+                    FprintError::Internal(format!("Failed to query user database: {}", e))
+                })?
                 .ok_or_else(|| {
                     FprintError::ClaimDevice(format!("User '{}' does not exist", target_username))
                 })?;
@@ -543,30 +543,25 @@ async fn run_verify(
         }
     };
 
-    let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_registry: Arc<
         tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let cancel_registry_c = cancel_registry.clone();
-    let cancelled_c = cancelled.clone();
-    tokio::spawn(async move {
-        if cancel_rx.await.is_ok() {
-            cancelled_c.store(true, Ordering::SeqCst);
-            let mut reg = cancel_registry_c.lock().await;
+    let mut cancel_rx = cancel_rx;
+    let result = tokio::select! {
+        res = session.handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry.clone()) => Some(res),
+        _ = &mut cancel_rx => {
+            let mut reg = cancel_registry.lock().await;
             if let Some(tx) = reg.remove("fprintd-verify") {
                 let _ = tx.send(());
             }
+            None
         }
-    });
+    };
 
-    let result = session
-        .handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry)
-        .await;
-
-    if cancelled.load(Ordering::SeqCst) {
+    let Some(result) = result else {
         return Ok(());
-    }
+    };
 
     let (status, done) = match result {
         Ok(response) => {
