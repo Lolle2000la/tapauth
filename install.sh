@@ -521,7 +521,13 @@ detect_pam_directory() {
                 PAM_MODULE_DIR="$dir"
                 PAM_SO_PATH="$dir/$PAM_SO_NAME"
                 print_success "Found PAM directory: $PAM_MODULE_DIR"
-                return
+        if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
+            echo ""
+            echo -e "${BLUE}[DRY RUN]${NC} Would configure fprintd mock:"
+            echo "  • systemctl mask fprintd.service"
+            echo "  • Inject pam_fprintd.so into /etc/pam.d/fingerprint-auth"
+        fi
+        return
             fi
         fi
     done
@@ -1382,15 +1388,6 @@ configure_pam() {
     # Configure fprintd mock integration (masks fprintd.service, injects pam_fprintd.so)
     if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
         print_info "Configuring fprintd mock integration..."
-
-        if [[ "$DRY_RUN" == true ]]; then
-            echo ""
-            echo -e "${BLUE}[DRY RUN]${NC} Would configure fprintd mock:"
-            echo "  • systemctl mask fprintd.service"
-            echo "  • Inject pam_fprintd.so into /etc/pam.d/fingerprint-auth"
-            echo ""
-            return
-        fi
 
         # Mask the real fprintd service so tapauthd owns the D-Bus name
         systemctl stop fprintd 2>/dev/null || true
