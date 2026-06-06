@@ -55,8 +55,8 @@ mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
 mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
-mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
-mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
+mkdir -p %{buildroot}%{_sysconfdir}/dbus-1/system.d
+mkdir -p %{buildroot}%{_sysconfdir}/dbus-1/system-services
 
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
@@ -78,8 +78,8 @@ install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}
 install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rules.d/50-tapauthd.rules
-install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
+install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_sysconfdir}/dbus-1/system-services/net.reactivated.Fprint.service
 
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
@@ -109,5 +109,5 @@ install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
-%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
+%config %{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+%{_sysconfdir}/dbus-1/system-services/net.reactivated.Fprint.service

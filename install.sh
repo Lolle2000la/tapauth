@@ -1414,7 +1414,7 @@ configure_pam() {
 auth      required       pam_env.so
 auth      sufficient     pam_fprintd.so
 auth      required       pam_deny.so
-account   required       pam_permit.so
+account   required       pam_unix.so
 session   required       pam_permit.so
 FPEOF
             print_success "Created $fp_file with pam_fprintd.so"
