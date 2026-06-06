@@ -239,11 +239,11 @@ if [ -n "$SUDO_USER" ]; then
     fi
     echo "    Building as $SUDO_USER (NO_BLE=$NO_BLE, fallback-socket enabled, cargo at $CARGO_PATH)..."
     if [ "$NO_BLE" -eq 1 ]; then
-        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+        sudo -u "$SUDO_USER" env HOME="$ORIGINAL_HOME" "$CARGO_PATH" build --release -p tapauthd \
             --no-default-features --features firewall,fallback-socket \
             || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     else
-        sudo -u "$SUDO_USER" "$CARGO_PATH" build --release -p tapauthd \
+        sudo -u "$SUDO_USER" env HOME="$ORIGINAL_HOME" "$CARGO_PATH" build --release -p tapauthd \
             --features fallback-socket \
             || { echo "tapauthd build failed"; cd "$ORIGINAL_DIR"; exit 1; }
     fi

@@ -521,13 +521,7 @@ detect_pam_directory() {
                 PAM_MODULE_DIR="$dir"
                 PAM_SO_PATH="$dir/$PAM_SO_NAME"
                 print_success "Found PAM directory: $PAM_MODULE_DIR"
-        if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
-            echo ""
-            echo -e "${BLUE}[DRY RUN]${NC} Would configure fprintd mock:"
-            echo "  • systemctl mask fprintd.service"
-            echo "  • Inject pam_fprintd.so into /etc/pam.d/fingerprint-auth"
-        fi
-        return
+                return
             fi
         fi
     done
@@ -1147,6 +1141,12 @@ configure_pam() {
                 echo -e "${YELLOW}[SKIP]${NC} KDE PAM configuration"
                 echo "  → No KDE PAM files found (/etc/pam.d/kde, kscreenlocker, etc.)"
             fi
+        fi
+        if [[ "$CONFIGURE_PAM_FPRINTD" == true ]]; then
+            echo ""
+            echo -e "${BLUE}[DRY RUN]${NC} Would configure fprintd mock:"
+            echo "  • systemctl mask fprintd.service"
+            echo "  • Inject pam_fprintd.so into /etc/pam.d/fingerprint-auth"
         fi
         return
     fi
