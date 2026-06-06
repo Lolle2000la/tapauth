@@ -220,16 +220,22 @@ impl VirtualFprintDevice {
         };
 
         if caller_uid != 0 {
-            let caller_name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
-                .ok()
-                .flatten()
-                .map(|u| u.name)
-                .unwrap_or_else(|| "unknown".to_string());
+            let target_uid = nix::unistd::User::from_name(&target_username)
+                .map_err(|e| {
+                    FprintError::Internal(format!("Failed to query user database: {}", e))
+                })?
+                .map(|u| u.uid.as_raw())
+                .ok_or_else(|| {
+                    FprintError::PermissionDenied(format!(
+                        "User '{}' does not exist",
+                        target_username
+                    ))
+                })?;
 
-            if caller_name != target_username {
+            if caller_uid != target_uid {
                 return Err(FprintError::PermissionDenied(format!(
-                    "Caller '{}' (UID {}) is not authorized to claim the device for user '{}'",
-                    caller_name, caller_uid, target_username
+                    "Caller (UID {}) is not authorized to claim the device for user '{}' (UID {})",
+                    caller_uid, target_username, target_uid
                 )));
             }
         } else {
@@ -426,17 +432,16 @@ impl VirtualFprintDevice {
         } else {
             finger_name
         };
-        if let Err(e) = connection
-            .emit_signal(
-                Option::<&str>::None,
-                FPRINT_DEVICE_PATH,
-                "net.reactivated.Fprint.Device",
-                "VerifyFingerSelected",
-                &finger_name,
-            )
+        if let Ok(interface_ref) = connection
+            .object_server()
+            .interface::<_, VirtualFprintDevice>(FPRINT_DEVICE_PATH)
             .await
         {
-            tracing::warn!("fprintd: failed to emit VerifyFingerSelected: {}", e);
+            let emitter = interface_ref.signal_emitter();
+            if let Err(e) = VirtualFprintDevice::verify_finger_selected(emitter, &finger_name).await
+            {
+                tracing::warn!("fprintd: failed to emit VerifyFingerSelected: {}", e);
+            }
         }
 
         let dev_state = self.state.clone();
@@ -545,7 +550,6 @@ async fn run_verify(
 
     let cancel_registry_c = cancel_registry.clone();
     let cancelled_c = cancelled.clone();
-    let (cancel_done_tx, cancel_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = cancel_rx.await;
         cancelled_c.store(true, Ordering::SeqCst);
@@ -553,31 +557,18 @@ async fn run_verify(
         if let Some(tx) = reg.remove("fprintd-verify") {
             let _ = tx.send(());
         }
-        let _ = cancel_done_tx.send(());
     });
 
-    let mut auth_fut = Box::pin(session.handle_authenticate(
-        None,
-        Some("fprintd-verify".to_string()),
-        cancel_registry,
-    ));
-
-    let result = tokio::select! {
-        res = &mut auth_fut => Some(res),
-        _ = cancel_done_rx => {
-            tokio::select! {
-                res = &mut auth_fut => Some(res),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => None,
-            }
-        }
-    };
+    let result = session
+        .handle_authenticate(None, Some("fprintd-verify".to_string()), cancel_registry)
+        .await;
 
     if cancelled.load(Ordering::SeqCst) {
         return Ok(());
     }
 
     let (status, done) = match result {
-        Some(Ok(response)) => {
+        Ok(response) => {
             let outcome = shared::ipc::pb::PamOutcome::try_from(response.outcome);
             match outcome {
                 Ok(shared::ipc::pb::PamOutcome::Success) => ("verify-match", true),
@@ -585,12 +576,9 @@ async fn run_verify(
                 _ => ("verify-unknown-error", true),
             }
         }
-        Some(Err(ref e)) => {
+        Err(ref e) => {
             tracing::warn!("fprintd: auth error: {}", e);
             ("verify-unknown-error", true)
-        }
-        None => {
-            return Ok(());
         }
     };
 
