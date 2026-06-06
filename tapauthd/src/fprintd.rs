@@ -139,22 +139,15 @@ impl VirtualFprintDevice {
         let caller_uid = resolve_sender_uid(connection, &sender).await?;
 
         let target_user = if username.is_empty() {
-            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
-                .map_err(|e| {
-                    FprintError::Internal(format!(
-                        "Failed to query caller UID {}: {}",
-                        caller_uid, e
-                    ))
-                })?
+            getpwuid(caller_uid)
+                .await?
                 .ok_or_else(|| {
                     FprintError::Internal(format!("No user entry for UID {}", caller_uid))
                 })?
                 .name
         } else if caller_uid != 0 {
-            let target_uid = nix::unistd::User::from_name(&username)
-                .map_err(|e| {
-                    FprintError::Internal(format!("Failed to query user database: {}", e))
-                })?
+            let target_uid = getpwnam(&username)
+                .await?
                 .map(|u| u.uid.as_raw())
                 .ok_or_else(|| {
                     FprintError::PermissionDenied(format!("User '{}' does not exist", username))
@@ -203,13 +196,8 @@ impl VirtualFprintDevice {
         let caller_uid = resolve_sender_uid(connection, &sender).await?;
 
         let target_username = if username.is_empty() {
-            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
-                .map_err(|e| {
-                    FprintError::Internal(format!(
-                        "Failed to query caller UID {}: {}",
-                        caller_uid, e
-                    ))
-                })?
+            getpwuid(caller_uid)
+                .await?
                 .ok_or_else(|| {
                     FprintError::Internal(format!("No user entry for UID {}", caller_uid))
                 })?
@@ -219,10 +207,8 @@ impl VirtualFprintDevice {
         };
 
         if caller_uid != 0 {
-            let target_uid = nix::unistd::User::from_name(&target_username)
-                .map_err(|e| {
-                    FprintError::Internal(format!("Failed to query user database: {}", e))
-                })?
+            let target_uid = getpwnam(&target_username)
+                .await?
                 .map(|u| u.uid.as_raw())
                 .ok_or_else(|| {
                     FprintError::PermissionDenied(format!(
@@ -238,13 +224,9 @@ impl VirtualFprintDevice {
                 )));
             }
         } else {
-            nix::unistd::User::from_name(&target_username)
-                .map_err(|e| {
-                    FprintError::Internal(format!("Failed to query user database: {}", e))
-                })?
-                .ok_or_else(|| {
-                    FprintError::ClaimDevice(format!("User '{}' does not exist", target_username))
-                })?;
+            getpwnam(&target_username).await?.ok_or_else(|| {
+                FprintError::ClaimDevice(format!("User '{}' does not exist", target_username))
+            })?;
         }
 
         // If the device is claimed by a dead D-Bus connection, clear the stale claim.
@@ -604,6 +586,26 @@ async fn emit_status(connection: &zbus::Connection, result: &str, done: bool) {
 
 // ── Helpers ──
 
+async fn getpwuid(uid: u32) -> Result<Option<nix::unistd::User>, FprintError> {
+    tokio::task::spawn_blocking(move || {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+    })
+    .await
+    .map_err(|e| FprintError::Internal(format!("spawn_blocking: {}", e)))
+    .and_then(|r| r.map_err(|e| FprintError::Internal(format!("getpwuid({}): {}", uid, e))))
+}
+
+async fn getpwnam(name: &str) -> Result<Option<nix::unistd::User>, FprintError> {
+    let owned = name.to_string();
+    let name_for_err = owned.clone();
+    tokio::task::spawn_blocking(move || nix::unistd::User::from_name(&owned))
+        .await
+        .map_err(|e| FprintError::Internal(format!("spawn_blocking: {}", e)))
+        .and_then(|r| {
+            r.map_err(|e| FprintError::Internal(format!("getpwnam({}): {}", name_for_err, e)))
+        })
+}
+
 async fn resolve_sender_uid(
     connection: &zbus::Connection,
     sender: &zbus::names::UniqueName<'_>,
@@ -612,9 +614,8 @@ async fn resolve_sender_uid(
         .await
         .map_err(|e| FprintError::Internal(format!("Failed to create DBusProxy: {}", e)))?;
 
-    let owned = sender.to_owned();
     dbus_proxy
-        .get_connection_unix_user(zbus::names::BusName::Unique(owned))
+        .get_connection_unix_user(sender.clone().into())
         .await
         .map_err(|e| FprintError::Internal(format!("Failed to query caller UID: {}", e)))
 }

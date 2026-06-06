@@ -221,17 +221,7 @@ if [ -n "$SUDO_USER" ]; then
     if [ -z "$ORIGINAL_HOME" ]; then
         ORIGINAL_HOME="/home/$SUDO_USER"
     fi
-    CARGO_PATH=""
-    for candidate in \
-        "${ORIGINAL_HOME}/.cargo/bin/cargo" \
-        "/usr/bin/cargo" \
-        "/usr/local/bin/cargo" \
-        "/opt/cargo/bin/cargo"; do
-        if [ -x "$candidate" ]; then
-            CARGO_PATH="$candidate"
-            break
-        fi
-    done
+    CARGO_PATH=$(sudo -u "$SUDO_USER" env PATH="$PATH:${ORIGINAL_HOME}/.cargo/bin" command -v cargo 2>/dev/null)
     if [ -z "$CARGO_PATH" ]; then
         echo "Cargo executable not found. Ensure Rust is installed (rustup or system package)."
         echo "Checked: ~/.cargo/bin/cargo, /usr/bin/cargo, /usr/local/bin/cargo"

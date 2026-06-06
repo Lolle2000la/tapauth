@@ -1400,9 +1400,9 @@ configure_pam() {
         if [[ -f "$fp_file" ]]; then
             if ! grep -q "pam_fprintd.so" "$fp_file"; then
                 if grep -q "^#%PAM-1.0" "$fp_file"; then
-                    sed -i "/^#%PAM-1.0/a $fp_line" "$fp_file"
+                    sed -i --follow-symlinks "/^#%PAM-1.0/a $fp_line" "$fp_file"
                 else
-                    sed -i "1i $fp_line" "$fp_file"
+                    sed -i --follow-symlinks "1i $fp_line" "$fp_file"
                 fi
                 print_success "Injected pam_fprintd.so into existing $fp_file"
             else
