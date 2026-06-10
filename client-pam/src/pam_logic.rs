@@ -64,7 +64,6 @@ struct ThreadContext {
 // forced unwind exceptions (`abi::__forced_unwind`) triggered by
 // `pthread_cancel` can safely propagate through these call frames.
 // `extern "C"` alone would imply `nounwind` and abort the process.
-#[allow(clashing_extern_declarations)]
 extern "C-unwind" {
     #[link_name = "pam_get_authtok"]
     fn pam_get_authtok_unwind(
