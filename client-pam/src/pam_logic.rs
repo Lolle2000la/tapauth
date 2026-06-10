@@ -64,8 +64,9 @@ struct ThreadContext {
 /// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
 /// can pass through this frame without aborting the process.
 ///
-/// Always writes to the self-pipe on exit so the main thread is woken even
-/// when the user dismisses the Polkit dialog without entering a password.
+/// Always writes to the self-pipe on natural completion.  When the thread
+/// is cancelled via `pthread_cancel`, the forced unwind intercepts
+/// execution inside `pam_get_authtok` and the write is cleanly bypassed.
 unsafe extern "C-unwind" fn native_password_worker(
     arg: *mut std::os::raw::c_void,
 ) -> *mut std::os::raw::c_void {
@@ -250,20 +251,27 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // is cancelled via pthread_cancel.
         let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
 
-        // pthread_create expects an `extern "C"` function pointer, but our
-        // worker uses `extern "C-unwind"` so that glibc's forced stack
-        // unwinding passes through cleanly.  The two ABIs are ABI-compatible
-        // on Linux; the only difference is the unwind tables.
-        // Rust forbids transmute/cast directly between C-unwind and C ABI
-        // fn types, so we route through a raw pointer.
-        let worker_routine: extern "C" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void =
-            unsafe { std::mem::transmute(native_password_worker as *const ()) };
+        // Custom FFI binding for pthread_create that accepts the correct
+        // `extern "C-unwind"` function signature.  This avoids the undefined
+        // behaviour of transmuting between C-unwind and C ABIs.
+        extern "C" {
+            #[link_name = "pthread_create"]
+            fn pthread_create_unwind(
+                thread: *mut libc::pthread_t,
+                attr: *const libc::pthread_attr_t,
+                start_routine: unsafe extern "C-unwind" fn(
+                    *mut std::os::raw::c_void,
+                )
+                    -> *mut std::os::raw::c_void,
+                arg: *mut std::os::raw::c_void,
+            ) -> std::os::raw::c_int;
+        }
 
         let spawn_res = unsafe {
-            libc::pthread_create(
+            pthread_create_unwind(
                 pthread_id.as_mut_ptr(),
                 std::ptr::null(),
-                worker_routine,
+                native_password_worker,
                 &ctx as *const ThreadContext as *mut std::os::raw::c_void,
             )
         };
@@ -309,26 +317,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             match poll(&mut fds, remain_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
-                    // Self-pipe: worker finished (password collected or dialog dismissed)
-                    if let Some(rev) = fds[1].revents() {
-                        if rev.contains(PollFlags::POLLIN) {
-                            if ctx.password_entered.load(Ordering::Acquire) {
-                                tracing::info!("Password pipe signalled, exiting poll loop.");
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                    let _ = c.send_cancel("gui-password-skip", &request_id);
-                                }
-                                exit_reason = ExitReason::PasswordEntered;
-                            } else {
-                                tracing::info!(
-                                    "Password dialog closed or failed, yielding to downstream PAM modules."
-                                );
-                                exit_reason = ExitReason::PasswordFailed;
-                            }
-                            break;
-                        }
-                    }
-
-                    // IPC: daemon response or connection error
+                    // Check IPC first: if the daemon response arrives in the
+                    // same poll wakeup as a self-pipe notification, we must
+                    // not drop it by breaking on the pipe first.
                     if let Some(rev) = fds[0].revents() {
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
@@ -363,6 +354,25 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             tracing::error!("Daemon closed connection or error detected");
                             pending_error = Some(msgs.connection_lost());
                             exit_reason = ExitReason::IpcError;
+                            break;
+                        }
+                    }
+
+                    // Self-pipe: worker finished (password collected or dialog dismissed)
+                    if let Some(rev) = fds[1].revents() {
+                        if rev.contains(PollFlags::POLLIN) {
+                            if ctx.password_entered.load(Ordering::Acquire) {
+                                tracing::info!("Password pipe signalled, exiting poll loop.");
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                                    let _ = c.send_cancel("gui-password-skip", &request_id);
+                                }
+                                exit_reason = ExitReason::PasswordEntered;
+                            } else {
+                                tracing::info!(
+                                    "Password dialog closed or failed, yielding to downstream PAM modules."
+                                );
+                                exit_reason = ExitReason::PasswordFailed;
+                            }
                             break;
                         }
                     }
