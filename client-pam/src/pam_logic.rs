@@ -25,10 +25,32 @@ use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Minimal abstraction over the IPC transport so `run_gui_event_loop` can be
+/// tested with a mock backed by real OS file descriptors.
+pub trait IpcResponseReader {
+    fn fd(&self) -> RawFd;
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>;
+}
+
+impl IpcResponseReader for IpcClient {
+    fn fd(&self) -> RawFd {
+        IpcClient::fd(self)
+    }
+
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+        self.try_read_response_nonblocking()
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
 // socket and /dev/tty.  The GUI flow (no TTY) spawns a native POSIX
@@ -139,8 +161,8 @@ unsafe extern "C-unwind" fn native_password_worker(
 /// or error message).  Extracted from the main authentication body so the
 /// multiplexing logic can be unit-tested independently.
 #[allow(clippy::too_many_arguments)]
-fn run_gui_event_loop<'a>(
-    ipc: &mut IpcClient,
+fn run_gui_event_loop<'a, T: IpcResponseReader>(
+    ipc: &mut T,
     pipe_read: libc::c_int,
     deadline: Instant,
     ctx: &ThreadContext,
@@ -727,5 +749,249 @@ mod tests {
     fn test_logging_init() {
         logging::init_logging();
         logging::init_logging();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_arguments,
+    clippy::indexing_slicing
+)]
+mod gui_loop_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    struct MockIpcReader {
+        stream: UnixStream,
+        next_response:
+            Option<Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>>,
+    }
+
+    impl IpcResponseReader for MockIpcReader {
+        fn fd(&self) -> RawFd {
+            AsRawFd::as_raw_fd(&self.stream)
+        }
+
+        fn try_read_response_nonblocking(
+            &mut self,
+        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+            self.next_response.take().unwrap_or(Ok(None))
+        }
+    }
+
+    fn setup_test_pipe_and_ctx() -> (libc::c_int, libc::c_int, ThreadContext) {
+        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+        unsafe {
+            let res = libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC);
+            assert_eq!(res, 0);
+        }
+        let ctx = ThreadContext {
+            pamh: std::ptr::null_mut(),
+            password_entered: AtomicBool::new(false),
+            pipe_write_fd: pipe_fds[1],
+        };
+        (pipe_fds[0], pipe_fds[1], ctx)
+    }
+
+    #[test]
+    fn test_gui_loop_immediate_timeout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::Timeout);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_password_entered_breakout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        ctx.password_entered.store(true, Ordering::Release);
+        let dummy = [1u8];
+        unsafe {
+            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::PasswordEntered);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_password_dialog_failed_breakout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        ctx.password_entered.store(false, Ordering::Release);
+        let dummy = [1u8];
+        unsafe {
+            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::PasswordFailed);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_successful_phone_tap() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+
+        let mut expected_resp = shared::ipc::pb::PamAuthenticateResponse::default();
+        expected_resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
+
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(Some(expected_resp))),
+        };
+
+        server.write_all(&[1]).unwrap();
+
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::IpcResponseReceived);
+        assert_eq!(
+            auth_response.unwrap().outcome(),
+            shared::ipc::pb::PamOutcome::Success
+        );
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_daemon_hangup() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(None)),
+        };
+
+        std::mem::drop(server);
+
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::IpcError);
+        assert!(auth_response.is_none());
+        assert_eq!(pending_error, Some(msgs.connection_lost()));
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
     }
 }
