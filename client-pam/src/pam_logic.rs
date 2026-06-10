@@ -23,15 +23,251 @@ use crate::logging;
 use crate::pam_messages;
 use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::poll::{poll, PollFd, PollFlags};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::Read;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
-use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// No async runtime: PAM modules should avoid multithreading. We use a single-threaded
-// polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
+/// Minimal abstraction over the IPC transport so `run_gui_event_loop` can be
+/// tested with a mock backed by real OS file descriptors.
+pub trait IpcResponseReader {
+    fn fd(&self) -> RawFd;
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>;
+    /// Best-effort cancellation of an in-flight authentication request.
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error>;
+}
+
+impl IpcResponseReader for IpcClient {
+    fn fd(&self) -> RawFd {
+        IpcClient::fd(self)
+    }
+
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+        self.try_read_response_nonblocking()
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error> {
+        self.send_cancel(reason, request_id)
+            .map(|_| ())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
+// The terminal flow below uses a single-threaded poll loop over the IPC
+// socket and /dev/tty.  The GUI flow (no TTY) spawns a native POSIX
+// thread via libc::pthread_create to unblock the Polkit conversation
+// pipeline, then multiplexes the IPC socket and a self-pipe in the main
+// loop.  The native thread uses no Drop-bearing Rust types so that
+// pthread_cancel is safe.
+
+/// Reason the GUI authentication loop exited.  Prevents the "timed out"
+/// message from being displayed on top of an explicit IPC error message.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitReason {
+    Timeout,
+    IpcResponseReceived,
+    IpcError,
+    PasswordEntered,
+    PasswordFailed,
+}
+
+/// Context passed to the raw POSIX worker thread.
+///
+/// # Safety
+///
+/// This lives on the main thread's stack.  The main thread strictly blocks on
+/// `pthread_join` before the context goes out of scope, so the worker thread's
+/// reference to it is valid for the entire worker lifetime.  No `Drop`-bearing
+/// types are placed on the worker's stack frame, making `pthread_cancel` safe.
+struct ThreadContext {
+    pamh: *mut pam_sys::PamHandle,
+    password_entered: AtomicBool,
+    /// Write end of the self-pipe.  The worker writes a single byte here on
+    /// any exit path (success, failure, or dialog dismissal) to instantly
+    /// unblock the main loop's poll set.
+    pipe_write_fd: std::os::raw::c_int,
+}
+
+// `write` is declared `extern "C-unwind"` so that glibc's forced unwind
+// exceptions (`abi::__forced_unwind`) triggered by `pthread_cancel` can
+// safely propagate through this call frame.  `extern "C"` alone would
+// imply `nounwind` and abort the process.
+// `pam_get_authtok` is generated with the correct ABI by bindgen's
+// `.override_abi(bindgen::Abi::CUnwind, ...)` in build.rs.
+extern "C-unwind" {
+    #[link_name = "write"]
+    fn write_unwind(
+        fd: std::os::raw::c_int,
+        buf: *const std::os::raw::c_void,
+        count: usize,
+    ) -> isize;
+}
+
+/// Raw background worker using the `C-unwind` ABI so that glibc's forced
+/// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
+/// can pass through this frame without aborting the process.
+///
+/// Always writes to the self-pipe on natural completion.  When the thread
+/// is cancelled via `pthread_cancel`, the forced unwind intercepts
+/// execution inside `pam_get_authtok` and the write is cleanly bypassed.
+unsafe extern "C-unwind" fn native_password_worker(
+    arg: *mut std::os::raw::c_void,
+) -> *mut std::os::raw::c_void {
+    let ctx = unsafe { &*(arg as *const ThreadContext) };
+    let mut authtok: *const std::os::raw::c_char = std::ptr::null();
+
+    // SAFETY: ctx is valid because the main thread guarantees it outlives
+    // this worker via pthread_join.
+    let res = unsafe {
+        pam_sys::pam_get_authtok(
+            ctx.pamh,
+            pam_sys::PAM_AUTHTOK,
+            &mut authtok,
+            std::ptr::null(),
+        )
+    };
+
+    if res == pam_sys::PAM_SUCCESS && !authtok.is_null() {
+        ctx.password_entered.store(true, Ordering::Release);
+    }
+
+    // Unconditional write: notifies the main thread that the worker exited
+    // regardless of whether a password was collected or the dialog was
+    // cancelled.  Without this, cancel/poll-hang would force the full
+    // timeout.
+    let dummy: [u8; 1] = [1];
+    loop {
+        let written = unsafe {
+            write_unwind(
+                ctx.pipe_write_fd,
+                dummy.as_ptr() as *const std::os::raw::c_void,
+                1,
+            )
+        };
+        if written >= 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error();
+        if err != Some(libc::EINTR) {
+            break;
+        }
+    }
+
+    std::ptr::null_mut()
+}
+
+/// Central event loop for the graphical authentication flow.
+///
+/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns an
+/// `ExitReason` plus whichever side-channel data was collected (auth response
+/// or error message).  Extracted from the main authentication body so the
+/// multiplexing logic can be unit-tested independently.
+#[allow(clippy::too_many_arguments)]
+fn run_gui_event_loop<'a, T: IpcResponseReader>(
+    ipc: &mut T,
+    pipe_read: libc::c_int,
+    deadline: Instant,
+    ctx: &ThreadContext,
+    request_id: &str,
+    msgs: &'a pam_messages::PamMessages,
+    auth_response: &mut Option<shared::ipc::pb::PamAuthenticateResponse>,
+    pending_error: &mut Option<&'a str>,
+) -> ExitReason {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return ExitReason::Timeout;
+        }
+
+        let remain = deadline
+            .checked_duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
+        let mut fds = [
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+                PollFlags::POLLIN,
+            ),
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(pipe_read) },
+                PollFlags::POLLIN,
+            ),
+        ];
+
+        match poll(&mut fds, timeout) {
+            Ok(0) => continue,
+            Ok(_) => {
+                // Priority: user password submission takes absolute
+                // precedence over any concurrent daemon response, so the
+                // user is never locked out of the password fallback.
+                if ctx.password_entered.load(Ordering::Acquire) {
+                    tracing::info!(
+                        "Password entered via Polkit agent. Cancelling TapAuth transaction."
+                    );
+                    let _ = ipc.send_cancel("gui-password-skip", request_id);
+                    return ExitReason::PasswordEntered;
+                }
+
+                // Daemon IPC connection
+                if let Some(rev) = fds[0].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        match ipc.try_read_response_nonblocking() {
+                            Ok(Some(resp)) => {
+                                *auth_response = Some(resp);
+                                return ExitReason::IpcResponseReceived;
+                            }
+                            Ok(None) => {
+                                if rev.contains(PollFlags::POLLHUP)
+                                    || rev.contains(PollFlags::POLLERR)
+                                {
+                                    tracing::error!(
+                                        "Daemon closed connection before sending response"
+                                    );
+                                    *pending_error = Some(msgs.connection_lost());
+                                    return ExitReason::IpcError;
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!("IPC read failed: {e}");
+                                *pending_error = Some(msgs.communication_error());
+                                return ExitReason::IpcError;
+                            }
+                        }
+                    } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
+                        tracing::error!("Daemon closed connection or error detected");
+                        *pending_error = Some(msgs.connection_lost());
+                        return ExitReason::IpcError;
+                    }
+                }
+
+                // Self-pipe: since password_entered was already checked,
+                // readability here means the dialog was dismissed.
+                if let Some(rev) = fds[1].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        tracing::info!("Password dialog dismissed. Releasing transaction.");
+                        let _ = ipc.send_cancel("gui-password-failed", request_id);
+                        return ExitReason::PasswordFailed;
+                    }
+                }
+            }
+            Err(e) => {
+                if e != nix::errno::Errno::EINTR {
+                    tracing::warn!("poll error: {e}");
+                    *pending_error = Some(msgs.communication_error());
+                    return ExitReason::IpcError;
+                }
+            }
+        }
+    }
+}
 
 /// Main PAM authentication entry point.
 ///
@@ -139,67 +375,151 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_IGNORE;
     }
 
-    // GUI (no TTY): poll only the socket until response or timeout
+    // GUI context (no TTY): offload blocking credential collection to a
+    // native background thread so the Polkit graphical helper can process
+    // window events, then multiplex loop events using a secure
+    // close-on-exec self-pipe.
     if !has_terminal {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
+        // O_CLOEXEC prevents the pipe fds from leaking to child processes
+        // started by the long-running privileged host (sudo, gdm, polkitd).
+        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::error!("Failed to create secure self-pipe: {err}");
+            // Best-effort cancel so the phone doesn't keep buzzing.
+            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                let _ = c.send_cancel("gui-pipe2-fail", &request_id);
             }
-            let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
-            let mut fds = [PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                PollFlags::POLLIN,
-            )];
-            match poll(&mut fds, remain_ms) {
-                Ok(0) => continue,
-                Ok(_) => {
-                    if let Some(rev) = fds[0].revents() {
-                        // Read data first if available (POLLIN can be set with POLLHUP)
-                        if rev.contains(PollFlags::POLLIN) {
-                            match ipc.try_read_response_nonblocking() {
-                                Ok(Some(resp)) => {
-                                    return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
-                                }
-                                Ok(None) => {
-                                    // No complete frame yet, check for errors
-                                    if rev.contains(PollFlags::POLLHUP)
-                                        || rev.contains(PollFlags::POLLERR)
-                                    {
-                                        tracing::error!(
-                                            "Daemon closed connection before sending response"
-                                        );
-                                        pam_conv.try_info(msgs.connection_lost());
-                                        return pam_sys::PAM_IGNORE;
-                                    }
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::error!("IPC read failed: {}", e);
-                                    pam_conv.try_info(msgs.communication_error());
-                                    return pam_sys::PAM_IGNORE;
-                                }
-                            }
-                        } else if rev.contains(PollFlags::POLLHUP)
-                            || rev.contains(PollFlags::POLLERR)
-                        {
-                            // Hangup/error without any data available
-                            tracing::error!("Daemon closed connection or error detected");
-                            pam_conv.try_info(msgs.connection_lost());
-                            return pam_sys::PAM_IGNORE;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e != nix::errno::Errno::EINTR {
-                        tracing::warn!("poll error: {}", e);
-                    }
+            return pam_sys::PAM_IGNORE;
+        }
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
+
+        let ctx = ThreadContext {
+            pamh,
+            password_entered: AtomicBool::new(false),
+            pipe_write_fd: pipe_write,
+        };
+
+        // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
+        // paths below unconditionally call pthread_join, which blocks until
+        // the worker has been fully reaped by the kernel.  Therefore the
+        // reference passed to the worker remains valid for its entire
+        // execution, regardless of whether the worker completes normally or
+        // is cancelled via pthread_cancel.
+        let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+
+        // Custom FFI binding for pthread_create that accepts the correct
+        // `extern "C-unwind"` function signature.  This avoids the undefined
+        // behaviour of transmuting between C-unwind and C ABIs.
+        extern "C" {
+            #[link_name = "pthread_create"]
+            fn pthread_create_unwind(
+                thread: *mut libc::pthread_t,
+                attr: *const libc::pthread_attr_t,
+                start_routine: unsafe extern "C-unwind" fn(
+                    *mut std::os::raw::c_void,
+                )
+                    -> *mut std::os::raw::c_void,
+                arg: *mut std::os::raw::c_void,
+            ) -> std::os::raw::c_int;
+        }
+
+        let spawn_res = unsafe {
+            pthread_create_unwind(
+                pthread_id.as_mut_ptr(),
+                std::ptr::null(),
+                native_password_worker,
+                &ctx as *const ThreadContext as *mut std::os::raw::c_void,
+            )
+        };
+
+        if spawn_res != 0 {
+            let err = std::io::Error::from_raw_os_error(spawn_res);
+            tracing::error!("Failed to create native password thread: {err}");
+            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                let _ = c.send_cancel("gui-thread-spawn-fail", &request_id);
+            }
+            unsafe {
+                libc::close(pipe_read);
+                libc::close(pipe_write);
+            }
+            return pam_sys::PAM_IGNORE;
+        }
+
+        let pthread_id = unsafe { pthread_id.assume_init() };
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+
+        let mut final_outcome = pam_sys::PAM_IGNORE;
+        let mut auth_response = None;
+        let mut pending_error: Option<&str> = None;
+
+        let exit_reason = run_gui_event_loop(
+            &mut ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            &request_id,
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        // Cancel the worker if it hasn't already exited on its own.
+        //
+        // NOTE: pthread_cancel carries a theoretical risk of deadlocking the
+        // parent process if the cancellation signal arrives while the worker
+        // holds an internal libc lock (e.g. inside a malloc arena entered by
+        // pam_get_authtok).  This is an accepted architectural trade-off;
+        // fully isolating the conversation pipe would require a separate
+        // helper process, as Howdy does with its Python subprocess.
+        if exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed {
+            unsafe {
+                let cancel_res = libc::pthread_cancel(pthread_id);
+                // ESRCH is benign: the thread already exited naturally during
+                // a race between password entry and the phone tap response.
+                if cancel_res != 0 && cancel_res != libc::ESRCH {
+                    let err = std::io::Error::from_raw_os_error(cancel_res);
+                    tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
                 }
             }
         }
-        pam_conv.try_info(msgs.timed_out());
-        return pam_sys::PAM_IGNORE;
+
+        // SAFETY: if pthread_join fails the worker thread may still be
+        // running with a dangling &ctx reference into our stack frame.
+        // Aborting is the only safe response.
+        unsafe {
+            let join_res = libc::pthread_join(pthread_id, std::ptr::null_mut());
+            if join_res != 0 {
+                let err = std::io::Error::from_raw_os_error(join_res);
+                tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
+                std::process::abort();
+            }
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+
+        // The worker is fully reaped.  It is now safe to touch the PAM
+        // conversation function without racing the background thread.
+        //
+        // &username is a stack-allocated Rust String reference passed to
+        // map_pam_outcome.  This is sound because map_pam_outcome only uses
+        // it for tracing log messages and immediately returns a PAM status
+        // code; it never stores the reference or passes it to C via
+        // pam_set_item.  No CString allocation is needed here.
+        if let Some(err_msg) = pending_error {
+            pam_conv.try_info(err_msg);
+        }
+
+        if let Some(resp) = auth_response {
+            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
+        }
+
+        if exit_reason == ExitReason::Timeout {
+            pam_conv.try_info(msgs.timed_out());
+        }
+
+        return final_outcome;
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
@@ -228,7 +548,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+        let remain = deadline
+            .checked_duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -246,7 +569,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             &mut fds[..1]
         };
 
-        match poll(fds_slice, remain_ms) {
+        match poll(fds_slice, timeout) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
@@ -436,5 +759,254 @@ mod tests {
     fn test_logging_init() {
         logging::init_logging();
         logging::init_logging();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_arguments,
+    clippy::indexing_slicing
+)]
+mod gui_loop_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    struct MockIpcReader {
+        stream: UnixStream,
+        next_response:
+            Option<Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>>,
+    }
+
+    impl IpcResponseReader for MockIpcReader {
+        fn fd(&self) -> RawFd {
+            AsRawFd::as_raw_fd(&self.stream)
+        }
+
+        fn try_read_response_nonblocking(
+            &mut self,
+        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+            self.next_response.take().unwrap_or(Ok(None))
+        }
+
+        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    fn setup_test_pipe_and_ctx() -> (libc::c_int, libc::c_int, ThreadContext) {
+        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+        unsafe {
+            let res = libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC);
+            assert_eq!(res, 0);
+        }
+        let ctx = ThreadContext {
+            pamh: std::ptr::null_mut(),
+            password_entered: AtomicBool::new(false),
+            pipe_write_fd: pipe_fds[1],
+        };
+        (pipe_fds[0], pipe_fds[1], ctx)
+    }
+
+    #[test]
+    fn test_gui_loop_immediate_timeout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::Timeout);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_password_entered_breakout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        ctx.password_entered.store(true, Ordering::Release);
+        let dummy = [1u8];
+        unsafe {
+            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::PasswordEntered);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_password_dialog_failed_breakout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+
+        ctx.password_entered.store(false, Ordering::Release);
+        let dummy = [1u8];
+        unsafe {
+            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::PasswordFailed);
+        assert!(auth_response.is_none());
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_successful_phone_tap() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+
+        let mut expected_resp = shared::ipc::pb::PamAuthenticateResponse::default();
+        expected_resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
+
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(Some(expected_resp))),
+        };
+
+        server.write_all(&[1]).unwrap();
+
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::IpcResponseReceived);
+        assert_eq!(
+            auth_response.unwrap().outcome(),
+            shared::ipc::pb::PamOutcome::Success
+        );
+        assert!(pending_error.is_none());
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    #[test]
+    fn test_gui_loop_daemon_hangup() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(None)),
+        };
+
+        std::mem::drop(server);
+
+        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
+        let msgs = pam_messages::load_for_user("testuser");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut auth_response = None;
+        let mut pending_error = None;
+
+        let reason = run_gui_event_loop(
+            &mut mock_ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            "req-123",
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
+
+        assert_eq!(reason, ExitReason::IpcError);
+        assert!(auth_response.is_none());
+        assert_eq!(pending_error, Some(msgs.connection_lost()));
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
     }
 }
