@@ -391,6 +391,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                 tracing::info!(
                                     "Password dialog closed or failed, yielding to downstream PAM modules."
                                 );
+                                // Cancel the daemon request so the phone stops buzzing.
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                                    let _ = c.send_cancel("gui-password-failed", &request_id);
+                                }
                                 exit_reason = ExitReason::PasswordFailed;
                             }
                             break;
