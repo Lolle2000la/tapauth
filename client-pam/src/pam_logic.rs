@@ -30,8 +30,12 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// No async runtime: PAM modules should avoid multithreading. We use a single-threaded
-// polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
+// The terminal flow below uses a single-threaded poll loop over the IPC
+// socket and /dev/tty.  The GUI flow (no TTY) spawns a native POSIX
+// thread via libc::pthread_create to unblock the Polkit conversation
+// pipeline, then multiplexes the IPC socket and a self-pipe in the main
+// loop.  The native thread uses no Drop-bearing Rust types so that
+// pthread_cancel is safe.
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
 /// message from being displayed on top of an explicit IPC error message.
@@ -404,6 +408,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 Err(e) => {
                     if e != nix::errno::Errno::EINTR {
                         tracing::warn!("poll error: {e}");
+                        pending_error = Some(msgs.communication_error());
+                        exit_reason = ExitReason::IpcError;
+                        break;
                     }
                 }
             }
