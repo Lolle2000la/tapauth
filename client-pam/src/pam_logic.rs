@@ -28,10 +28,46 @@ use std::io::Read;
 use std::os::fd::BorrowedFd;
 use std::os::raw::c_int;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // No async runtime: PAM modules should avoid multithreading. We use a single-threaded
 // polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
+
+/// Context passed to the raw POSIX worker thread.
+///
+/// # Safety
+///
+/// This lives on the main thread's stack.  The main thread strictly blocks on
+/// `pthread_join` before the context goes out of scope, so the worker thread's
+/// reference to it is valid for the entire worker lifetime.  No `Drop`-bearing
+/// types are placed on the worker's stack frame, making `pthread_cancel` safe.
+struct ThreadContext {
+    pamh: *mut pam_sys::PamHandle,
+    password_entered: AtomicBool,
+}
+
+/// Plain C-compatible worker that calls `pam_get_authtok` to unblock the
+/// Polkit conversation pipeline.  Contains no `Drop` types, so it is safe to
+/// cancel via `pthread_cancel` without leaking Rust resources.
+extern "C" fn native_password_worker(arg: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void {
+    let ctx = unsafe { &*(arg as *const ThreadContext) };
+    let mut authtok: *const std::os::raw::c_char = std::ptr::null();
+
+    // SAFETY: ctx is valid because the main thread guarantees it outlives
+    // this worker via pthread_join.
+    unsafe {
+        pam_sys::pam_get_authtok(
+            ctx.pamh,
+            pam_sys::PAM_AUTHTOK,
+            &mut authtok,
+            std::ptr::null(),
+        );
+    }
+
+    ctx.password_entered.store(true, Ordering::SeqCst);
+    std::ptr::null_mut()
+}
 
 /// Main PAM authentication entry point.
 ///
@@ -139,31 +175,76 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_IGNORE;
     }
 
-    // GUI (no TTY): poll only the socket until response or timeout
+    // GUI (no TTY): offload password collection to a native background thread
+    // so the Polkit graphical agent can pump its event loop, then poll the IPC
+    // socket in the foreground.  We use raw pthreads rather than
+    // std::thread::spawn so that pthread_cancel does not leak the Rust
+    // closure box or Arc reference counts.
     if !has_terminal {
+        let ctx = ThreadContext {
+            pamh,
+            password_entered: AtomicBool::new(false),
+        };
+
+        // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
+        // paths below unconditionally call pthread_join, which blocks until
+        // the worker has been fully reaped by the kernel.  Therefore the
+        // reference passed to the worker remains valid for its entire
+        // execution, regardless of whether the worker completes normally or
+        // is cancelled via pthread_cancel.
+        let mut pthread_id: libc::pthread_t = unsafe { std::mem::zeroed() };
+        let spawn_res = unsafe {
+            libc::pthread_create(
+                &mut pthread_id,
+                std::ptr::null(),
+                native_password_worker,
+                &ctx as *const ThreadContext as *mut std::os::raw::c_void,
+            )
+        };
+
+        if spawn_res != 0 {
+            tracing::error!("Failed to create native password thread, error code: {spawn_res}");
+            return pam_sys::PAM_IGNORE;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+        let mut final_outcome = pam_sys::PAM_IGNORE;
+        let mut auth_response = None;
+
         loop {
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
+
+            if ctx.password_entered.load(Ordering::SeqCst) {
+                tracing::info!("Password entered via Polkit agent, skipping TapAuth.");
+                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                    let _ = c.send_cancel("gui-password-skip", &request_id);
+                }
+                unsafe {
+                    libc::pthread_join(pthread_id, std::ptr::null_mut());
+                }
+                return pam_sys::PAM_IGNORE;
+            }
+
             let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                 PollFlags::POLLIN,
             )];
+
             match poll(&mut fds, remain_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
                     if let Some(rev) = fds[0].revents() {
-                        // Read data first if available (POLLIN can be set with POLLHUP)
                         if rev.contains(PollFlags::POLLIN) {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
-                                    return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                    auth_response = Some(resp);
+                                    break;
                                 }
                                 Ok(None) => {
-                                    // No complete frame yet, check for errors
                                     if rev.contains(PollFlags::POLLHUP)
                                         || rev.contains(PollFlags::POLLERR)
                                     {
@@ -171,23 +252,22 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                             "Daemon closed connection before sending response"
                                         );
                                         pam_conv.try_info(msgs.connection_lost());
-                                        return pam_sys::PAM_IGNORE;
+                                        break;
                                     }
                                     continue;
                                 }
                                 Err(e) => {
                                     tracing::error!("IPC read failed: {}", e);
                                     pam_conv.try_info(msgs.communication_error());
-                                    return pam_sys::PAM_IGNORE;
+                                    break;
                                 }
                             }
                         } else if rev.contains(PollFlags::POLLHUP)
                             || rev.contains(PollFlags::POLLERR)
                         {
-                            // Hangup/error without any data available
                             tracing::error!("Daemon closed connection or error detected");
                             pam_conv.try_info(msgs.connection_lost());
-                            return pam_sys::PAM_IGNORE;
+                            break;
                         }
                     }
                 }
@@ -198,8 +278,43 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 }
             }
         }
-        pam_conv.try_info(msgs.timed_out());
-        return pam_sys::PAM_IGNORE;
+
+        // Phone tap completed first (or timeout): cancel the worker if still
+        // running, then join to reap the thread.
+        //
+        // POSIX thread cancellation is asynchronous: the signal is delivered
+        // at the next cancellation point inside the worker (the blocking read
+        // within pam_get_authtok).  It is theoretically possible for
+        // pthread_cancel to be delivered just as pam_get_authtok returns,
+        // causing the worker to skip cancellation and set password_entered
+        // before exiting normally.  Regardless, the unconditional
+        // pthread_join below blocks until the worker is fully reaped, so &ctx
+        // cannot be dropped while the worker still references it.
+        if !ctx.password_entered.load(Ordering::SeqCst) {
+            unsafe {
+                libc::pthread_cancel(pthread_id);
+            }
+        }
+        unsafe {
+            libc::pthread_join(pthread_id, std::ptr::null_mut());
+        }
+
+        // The worker is fully reaped.  It is now safe to touch the PAM
+        // conversation function without racing the background thread.
+        //
+        // &username is a stack-allocated Rust String reference passed to
+        // map_pam_outcome.  This is sound because map_pam_outcome only uses
+        // it for tracing log messages and immediately returns a PAM status
+        // code; it never stores the reference or passes it to C via
+        // pam_set_item.  No CString allocation is needed here.
+        if let Some(resp) = auth_response {
+            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
+        }
+
+        if final_outcome == pam_sys::PAM_IGNORE {
+            pam_conv.try_info(msgs.timed_out());
+        }
+        return final_outcome;
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
