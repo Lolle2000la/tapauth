@@ -80,7 +80,7 @@ extern "C" fn native_password_worker(arg: *mut std::os::raw::c_void) -> *mut std
     };
 
     if res == pam_sys::PAM_SUCCESS && !authtok.is_null() {
-        ctx.password_entered.store(true, Ordering::SeqCst);
+        ctx.password_entered.store(true, Ordering::Release);
     }
 
     std::ptr::null_mut()
@@ -238,7 +238,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 break;
             }
 
-            if ctx.password_entered.load(Ordering::SeqCst) {
+            if ctx.password_entered.load(Ordering::Acquire) {
                 tracing::info!("Password entered via Polkit agent, skipping TapAuth.");
                 if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                     let _ = c.send_cancel("gui-password-skip", &request_id);
@@ -248,12 +248,17 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             }
 
             let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+            // Cap the poll sleep to 100ms so the loop wakes frequently
+            // enough to observe the password_entered flag.  A full
+            // remain_ms block (up to 120s) would freeze the UI until a
+            // phone tap or full timeout expires.
+            let poll_chunk_ms = remain_ms.min(100u16);
             let mut fds = [PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
                 PollFlags::POLLIN,
             )];
 
-            match poll(&mut fds, remain_ms) {
+            match poll(&mut fds, poll_chunk_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
                     if let Some(rev) = fds[0].revents() {
@@ -315,7 +320,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // helper process, as Howdy does with its Python subprocess.
         if exit_reason != ExitReason::PasswordEntered {
             unsafe {
-                libc::pthread_cancel(pthread_id);
+                let cancel_res = libc::pthread_cancel(pthread_id);
+                if cancel_res != 0 {
+                    tracing::error!(
+                        "pthread_cancel returned {cancel_res}; worker may not have terminated"
+                    );
+                }
             }
         }
         unsafe {
