@@ -37,6 +37,8 @@ pub trait IpcResponseReader {
     fn try_read_response_nonblocking(
         &mut self,
     ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>;
+    /// Best-effort cancellation of an in-flight authentication request.
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error>;
 }
 
 impl IpcResponseReader for IpcClient {
@@ -48,6 +50,12 @@ impl IpcResponseReader for IpcClient {
         &mut self,
     ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
         self.try_read_response_nonblocking()
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error> {
+        self.send_cancel(reason, request_id)
+            .map(|_| ())
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
@@ -81,8 +89,9 @@ enum ExitReason {
 struct ThreadContext {
     pamh: *mut pam_sys::PamHandle,
     password_entered: AtomicBool,
-    /// Write end of the self-pipe.  The worker writes a single byte here when
-    /// a password is collected, so the main loop's poll set wakes instantly.
+    /// Write end of the self-pipe.  The worker writes a single byte here on
+    /// any exit path (success, failure, or dialog dismissal) to instantly
+    /// unblock the main loop's poll set.
     pipe_write_fd: std::os::raw::c_int,
 }
 
@@ -194,9 +203,18 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
         match poll(&mut fds, remain_ms) {
             Ok(0) => continue,
             Ok(_) => {
-                // Check IPC first: if the daemon response arrives in the
-                // same poll wakeup as a self-pipe notification, we must
-                // not drop it by breaking on the pipe first.
+                // Priority: user password submission takes absolute
+                // precedence over any concurrent daemon response, so the
+                // user is never locked out of the password fallback.
+                if ctx.password_entered.load(Ordering::Acquire) {
+                    tracing::info!(
+                        "Password entered via Polkit agent. Cancelling TapAuth transaction."
+                    );
+                    let _ = ipc.send_cancel("gui-password-skip", request_id);
+                    return ExitReason::PasswordEntered;
+                }
+
+                // Daemon IPC connection
                 if let Some(rev) = fds[0].revents() {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
@@ -229,25 +247,13 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
                     }
                 }
 
-                // Self-pipe: worker finished (password collected or dialog dismissed)
+                // Self-pipe: since password_entered was already checked,
+                // readability here means the dialog was dismissed.
                 if let Some(rev) = fds[1].revents() {
                     if rev.contains(PollFlags::POLLIN) {
-                        if ctx.password_entered.load(Ordering::Acquire) {
-                            tracing::info!("Password pipe signalled, exiting poll loop.");
-                            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                let _ = c.send_cancel("gui-password-skip", request_id);
-                            }
-                            return ExitReason::PasswordEntered;
-                        } else {
-                            tracing::info!(
-                                "Password dialog closed or failed, yielding to downstream PAM modules."
-                            );
-                            // Cancel the daemon request so the phone stops buzzing.
-                            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                let _ = c.send_cancel("gui-password-failed", request_id);
-                            }
-                            return ExitReason::PasswordFailed;
-                        }
+                        tracing::info!("Password dialog dismissed. Releasing transaction.");
+                        let _ = ipc.send_cancel("gui-password-failed", request_id);
+                        return ExitReason::PasswordFailed;
                     }
                 }
             }
@@ -780,6 +786,10 @@ mod gui_loop_tests {
             &mut self,
         ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
             self.next_response.take().unwrap_or(Ok(None))
+        }
+
+        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
+            Ok(())
         }
     }
 
