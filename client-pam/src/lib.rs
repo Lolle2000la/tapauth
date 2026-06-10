@@ -5,6 +5,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+#![allow(clashing_extern_declarations)]
 //!
 //! Linux PAM authentication module that enables phone-tap-based authentication.
 //! Integrates with the system authentication stack to provide passwordless login

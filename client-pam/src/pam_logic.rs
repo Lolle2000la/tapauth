@@ -60,6 +60,28 @@ struct ThreadContext {
     pipe_write_fd: std::os::raw::c_int,
 }
 
+// Deeper FFI bindings declared with `extern "C-unwind"` so that glibc's
+// forced unwind exceptions (`abi::__forced_unwind`) triggered by
+// `pthread_cancel` can safely propagate through these call frames.
+// `extern "C"` alone would imply `nounwind` and abort the process.
+#[allow(clashing_extern_declarations)]
+extern "C-unwind" {
+    #[link_name = "pam_get_authtok"]
+    fn pam_get_authtok_unwind(
+        pamh: *mut pam_sys::PamHandle,
+        item_type: std::os::raw::c_int,
+        authtok: *mut *const std::os::raw::c_char,
+        prompt: *const std::os::raw::c_char,
+    ) -> std::os::raw::c_int;
+
+    #[link_name = "write"]
+    fn write_unwind(
+        fd: std::os::raw::c_int,
+        buf: *const std::os::raw::c_void,
+        count: usize,
+    ) -> isize;
+}
+
 /// Raw background worker using the `C-unwind` ABI so that glibc's forced
 /// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
 /// can pass through this frame without aborting the process.
@@ -76,7 +98,7 @@ unsafe extern "C-unwind" fn native_password_worker(
     // SAFETY: ctx is valid because the main thread guarantees it outlives
     // this worker via pthread_join.
     let res = unsafe {
-        pam_sys::pam_get_authtok(
+        pam_get_authtok_unwind(
             ctx.pamh,
             pam_sys::PAM_AUTHTOK,
             &mut authtok,
@@ -95,7 +117,7 @@ unsafe extern "C-unwind" fn native_password_worker(
     let dummy: [u8; 1] = [1];
     loop {
         let written = unsafe {
-            libc::write(
+            write_unwind(
                 ctx.pipe_write_fd,
                 dummy.as_ptr() as *const std::os::raw::c_void,
                 1,
@@ -228,10 +250,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
         if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            tracing::error!(
-                "Failed to create secure self-pipe, errno: {}",
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            tracing::error!("Failed to create secure self-pipe: {err}");
+            // Best-effort cancel so the phone doesn't keep buzzing.
+            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                let _ = c.send_cancel("gui-pipe2-fail", &request_id);
+            }
             return pam_sys::PAM_IGNORE;
         }
         let pipe_read = pipe_fds[0];
@@ -277,7 +301,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         };
 
         if spawn_res != 0 {
-            tracing::error!("Failed to create native password thread, error code: {spawn_res}");
+            let err = std::io::Error::from_raw_os_error(spawn_res);
+            tracing::error!("Failed to create native password thread: {err}");
             if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                 let _ = c.send_cancel("gui-thread-spawn-fail", &request_id);
             }
@@ -302,6 +327,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 break;
             }
 
+            // nix 0.31 PollTimeout is capped at u16::MAX ms (~65.5s).
+            // For timeouts beyond that we would need libc::poll directly.
             let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [
                 PollFd::new(
@@ -399,9 +426,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 // ESRCH is benign: the thread already exited naturally during
                 // a race between password entry and the phone tap response.
                 if cancel_res != 0 && cancel_res != libc::ESRCH {
-                    tracing::error!(
-                        "pthread_cancel returned {cancel_res}; worker may not have terminated"
-                    );
+                    let err = std::io::Error::from_raw_os_error(cancel_res);
+                    tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
                 }
             }
         }
@@ -412,9 +438,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         unsafe {
             let join_res = libc::pthread_join(pthread_id, std::ptr::null_mut());
             if join_res != 0 {
-                tracing::error!(
-                    "pthread_join failed with code {join_res}; aborting to defend stack safety"
-                );
+                let err = std::io::Error::from_raw_os_error(join_res);
+                tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
                 std::process::abort();
             }
             libc::close(pipe_read);
