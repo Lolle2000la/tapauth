@@ -25,7 +25,7 @@ use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -38,9 +38,10 @@ use std::time::{Duration, Instant};
 #[derive(Debug, PartialEq, Eq)]
 enum ExitReason {
     Timeout,
-    TapSuccess,
+    IpcResponseReceived,
     IpcError,
     PasswordEntered,
+    PasswordFailed,
 }
 
 /// Context passed to the raw POSIX worker thread.
@@ -63,8 +64,8 @@ struct ThreadContext {
 /// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
 /// can pass through this frame without aborting the process.
 ///
-/// Writes a byte to the self-pipe when a valid password is collected, waking
-/// the main thread's poll set with zero CPU polling overhead.
+/// Always writes to the self-pipe on exit so the main thread is woken even
+/// when the user dismisses the Polkit dialog without entering a password.
 unsafe extern "C-unwind" fn native_password_worker(
     arg: *mut std::os::raw::c_void,
 ) -> *mut std::os::raw::c_void {
@@ -84,15 +85,28 @@ unsafe extern "C-unwind" fn native_password_worker(
 
     if res == pam_sys::PAM_SUCCESS && !authtok.is_null() {
         ctx.password_entered.store(true, Ordering::Release);
+    }
 
-        let dummy: [u8; 1] = [1];
-        let _ = unsafe {
+    // Unconditional write: notifies the main thread that the worker exited
+    // regardless of whether a password was collected or the dialog was
+    // cancelled.  Without this, cancel/poll-hang would force the full
+    // timeout.
+    let dummy: [u8; 1] = [1];
+    loop {
+        let written = unsafe {
             libc::write(
                 ctx.pipe_write_fd,
                 dummy.as_ptr() as *const std::os::raw::c_void,
                 1,
             )
         };
+        if written >= 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error();
+        if err != Some(libc::EINTR) {
+            break;
+        }
     }
 
     std::ptr::null_mut()
@@ -204,28 +218,28 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_IGNORE;
     }
 
-    // GUI (no TTY): offload password collection to a native background thread
-    // so the Polkit graphical agent can pump its event loop, then poll the IPC
-    // socket alongside a self-pipe so the worker can wake us instantly when a
-    // password is entered (no CPU polling overhead).
+    // GUI context (no TTY): offload blocking credential collection to a
+    // native background thread so the Polkit graphical helper can process
+    // window events, then multiplex loop events using a secure
+    // close-on-exec self-pipe.
     if !has_terminal {
-        // Self-pipe: the worker writes a byte when password_entered is set,
-        // so we can include the read end in our poll set.
+        // O_CLOEXEC prevents the pipe fds from leaking to child processes
+        // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             tracing::error!(
-                "Failed to create self-pipe, errno: {}",
+                "Failed to create secure self-pipe, errno: {}",
                 std::io::Error::last_os_error()
             );
             return pam_sys::PAM_IGNORE;
         }
-        let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
-        let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
 
         let ctx = ThreadContext {
             pamh,
             password_entered: AtomicBool::new(false),
-            pipe_write_fd: pipe_write.as_raw_fd(),
+            pipe_write_fd: pipe_write,
         };
 
         // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
@@ -256,10 +270,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
         if spawn_res != 0 {
             tracing::error!("Failed to create native password thread, error code: {spawn_res}");
-            // Best-effort cancel of the in-flight daemon authentication
-            // request so the phone does not keep buzzing.
             if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                 let _ = c.send_cancel("gui-thread-spawn-fail", &request_id);
+            }
+            unsafe {
+                libc::close(pipe_read);
+                libc::close(pipe_write);
             }
             return pam_sys::PAM_IGNORE;
         }
@@ -278,15 +294,6 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 break;
             }
 
-            if ctx.password_entered.load(Ordering::Acquire) {
-                tracing::info!("Password entered via Polkit agent, skipping TapAuth.");
-                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                    let _ = c.send_cancel("gui-password-skip", &request_id);
-                }
-                exit_reason = ExitReason::PasswordEntered;
-                break;
-            }
-
             let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
             let mut fds = [
                 PollFd::new(
@@ -294,7 +301,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     PollFlags::POLLIN,
                 ),
                 PollFd::new(
-                    unsafe { BorrowedFd::borrow_raw(pipe_read.as_raw_fd()) },
+                    unsafe { BorrowedFd::borrow_raw(pipe_read) },
                     PollFlags::POLLIN,
                 ),
             ];
@@ -302,16 +309,21 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             match poll(&mut fds, remain_ms) {
                 Ok(0) => continue,
                 Ok(_) => {
-                    // Self-pipe: the worker signalled a password entry
+                    // Self-pipe: worker finished (password collected or dialog dismissed)
                     if let Some(rev) = fds[1].revents() {
-                        if rev.contains(PollFlags::POLLIN)
-                            && ctx.password_entered.load(Ordering::Acquire)
-                        {
-                            tracing::info!("Password pipe signalled, exiting poll loop.");
-                            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                let _ = c.send_cancel("gui-password-skip", &request_id);
+                        if rev.contains(PollFlags::POLLIN) {
+                            if ctx.password_entered.load(Ordering::Acquire) {
+                                tracing::info!("Password pipe signalled, exiting poll loop.");
+                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                                    let _ = c.send_cancel("gui-password-skip", &request_id);
+                                }
+                                exit_reason = ExitReason::PasswordEntered;
+                            } else {
+                                tracing::info!(
+                                    "Password dialog closed or failed, yielding to downstream PAM modules."
+                                );
+                                exit_reason = ExitReason::PasswordFailed;
                             }
-                            exit_reason = ExitReason::PasswordEntered;
                             break;
                         }
                     }
@@ -322,7 +334,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
                                     auth_response = Some(resp);
-                                    exit_reason = ExitReason::TapSuccess;
+                                    exit_reason = ExitReason::IpcResponseReceived;
                                     break;
                                 }
                                 Ok(None) => {
@@ -363,10 +375,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             }
         }
 
-        // Cancel the worker if a password was not already entered (the cancel
-        // targets the synchronous cancellation point inside
-        // pam_get_authtok).  In the PasswordEntered case the worker has
-        // already returned and signals that fact through the flag.
+        // Cancel the worker if it hasn't already exited on its own.
         //
         // NOTE: pthread_cancel carries a theoretical risk of deadlocking the
         // parent process if the cancellation signal arrives while the worker
@@ -374,7 +383,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // pam_get_authtok).  This is an accepted architectural trade-off;
         // fully isolating the conversation pipe would require a separate
         // helper process, as Howdy does with its Python subprocess.
-        if exit_reason != ExitReason::PasswordEntered {
+        if exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed {
             unsafe {
                 let cancel_res = libc::pthread_cancel(pthread_id);
                 // ESRCH is benign: the thread already exited naturally during
@@ -398,6 +407,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 );
                 std::process::abort();
             }
+            libc::close(pipe_read);
+            libc::close(pipe_write);
         }
 
         // The worker is fully reaped.  It is now safe to touch the PAM
@@ -420,8 +431,6 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             pam_conv.try_info(msgs.timed_out());
         }
 
-        // pipe_write (OwnedFd) is dropped here, closing the write end.
-        // pipe_read (OwnedFd) is dropped here, closing the read end.
         return final_outcome;
     }
 
