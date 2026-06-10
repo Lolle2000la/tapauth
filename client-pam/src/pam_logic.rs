@@ -23,7 +23,7 @@ use crate::logging;
 use crate::pam_messages;
 use crate::pam_sys::{self, PAM_IGNORE};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::poll::{poll, PollFd, PollFlags};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
@@ -186,9 +186,8 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
             return ExitReason::Timeout;
         }
 
-        // nix 0.31 PollTimeout is capped at u16::MAX ms (~65.5s).
-        // For timeouts beyond that we would need libc::poll directly.
-        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+        let remain_ms = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
+        let timeout = PollTimeout::try_from(remain_ms).unwrap_or(PollTimeout::MAX);
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -200,7 +199,7 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
             ),
         ];
 
-        match poll(&mut fds, remain_ms) {
+        match poll(&mut fds, timeout) {
             Ok(0) => continue,
             Ok(_) => {
                 // Priority: user password submission takes absolute
@@ -547,7 +546,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+        let remain_ms = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
+        let timeout = PollTimeout::try_from(remain_ms).unwrap_or(PollTimeout::MAX);
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -565,7 +565,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             &mut fds[..1]
         };
 
-        match poll(fds_slice, remain_ms) {
+        match poll(fds_slice, timeout) {
             Ok(0) => {}
             Ok(_) => {
                 // IPC
