@@ -132,6 +132,114 @@ unsafe extern "C-unwind" fn native_password_worker(
     std::ptr::null_mut()
 }
 
+/// Central event loop for the graphical authentication flow.
+///
+/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns an
+/// `ExitReason` plus whichever side-channel data was collected (auth response
+/// or error message).  Extracted from the main authentication body so the
+/// multiplexing logic can be unit-tested independently.
+#[allow(clippy::too_many_arguments)]
+fn run_gui_event_loop<'a>(
+    ipc: &mut IpcClient,
+    pipe_read: libc::c_int,
+    deadline: Instant,
+    ctx: &ThreadContext,
+    request_id: &str,
+    msgs: &'a pam_messages::PamMessages,
+    auth_response: &mut Option<shared::ipc::pb::PamAuthenticateResponse>,
+    pending_error: &mut Option<&'a str>,
+) -> ExitReason {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return ExitReason::Timeout;
+        }
+
+        // nix 0.31 PollTimeout is capped at u16::MAX ms (~65.5s).
+        // For timeouts beyond that we would need libc::poll directly.
+        let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
+        let mut fds = [
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+                PollFlags::POLLIN,
+            ),
+            PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(pipe_read) },
+                PollFlags::POLLIN,
+            ),
+        ];
+
+        match poll(&mut fds, remain_ms) {
+            Ok(0) => continue,
+            Ok(_) => {
+                // Check IPC first: if the daemon response arrives in the
+                // same poll wakeup as a self-pipe notification, we must
+                // not drop it by breaking on the pipe first.
+                if let Some(rev) = fds[0].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        match ipc.try_read_response_nonblocking() {
+                            Ok(Some(resp)) => {
+                                *auth_response = Some(resp);
+                                return ExitReason::IpcResponseReceived;
+                            }
+                            Ok(None) => {
+                                if rev.contains(PollFlags::POLLHUP)
+                                    || rev.contains(PollFlags::POLLERR)
+                                {
+                                    tracing::error!(
+                                        "Daemon closed connection before sending response"
+                                    );
+                                    *pending_error = Some(msgs.connection_lost());
+                                    return ExitReason::IpcError;
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!("IPC read failed: {e}");
+                                *pending_error = Some(msgs.communication_error());
+                                return ExitReason::IpcError;
+                            }
+                        }
+                    } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
+                        tracing::error!("Daemon closed connection or error detected");
+                        *pending_error = Some(msgs.connection_lost());
+                        return ExitReason::IpcError;
+                    }
+                }
+
+                // Self-pipe: worker finished (password collected or dialog dismissed)
+                if let Some(rev) = fds[1].revents() {
+                    if rev.contains(PollFlags::POLLIN) {
+                        if ctx.password_entered.load(Ordering::Acquire) {
+                            tracing::info!("Password pipe signalled, exiting poll loop.");
+                            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                                let _ = c.send_cancel("gui-password-skip", request_id);
+                            }
+                            return ExitReason::PasswordEntered;
+                        } else {
+                            tracing::info!(
+                                "Password dialog closed or failed, yielding to downstream PAM modules."
+                            );
+                            // Cancel the daemon request so the phone stops buzzing.
+                            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                                let _ = c.send_cancel("gui-password-failed", request_id);
+                            }
+                            return ExitReason::PasswordFailed;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e != nix::errno::Errno::EINTR {
+                    tracing::warn!("poll error: {e}");
+                    *pending_error = Some(msgs.communication_error());
+                    return ExitReason::IpcError;
+                }
+            }
+        }
+    }
+}
+
 /// Main PAM authentication entry point.
 ///
 /// ## Returns
@@ -316,105 +424,17 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         let mut final_outcome = pam_sys::PAM_IGNORE;
         let mut auth_response = None;
         let mut pending_error: Option<&str> = None;
-        let mut exit_reason = ExitReason::Timeout;
 
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-
-            // nix 0.31 PollTimeout is capped at u16::MAX ms (~65.5s).
-            // For timeouts beyond that we would need libc::poll directly.
-            let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
-            let mut fds = [
-                PollFd::new(
-                    unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                    PollFlags::POLLIN,
-                ),
-                PollFd::new(
-                    unsafe { BorrowedFd::borrow_raw(pipe_read) },
-                    PollFlags::POLLIN,
-                ),
-            ];
-
-            match poll(&mut fds, remain_ms) {
-                Ok(0) => continue,
-                Ok(_) => {
-                    // Check IPC first: if the daemon response arrives in the
-                    // same poll wakeup as a self-pipe notification, we must
-                    // not drop it by breaking on the pipe first.
-                    if let Some(rev) = fds[0].revents() {
-                        if rev.contains(PollFlags::POLLIN) {
-                            match ipc.try_read_response_nonblocking() {
-                                Ok(Some(resp)) => {
-                                    auth_response = Some(resp);
-                                    exit_reason = ExitReason::IpcResponseReceived;
-                                    break;
-                                }
-                                Ok(None) => {
-                                    if rev.contains(PollFlags::POLLHUP)
-                                        || rev.contains(PollFlags::POLLERR)
-                                    {
-                                        tracing::error!(
-                                            "Daemon closed connection before sending response"
-                                        );
-                                        pending_error = Some(msgs.connection_lost());
-                                        exit_reason = ExitReason::IpcError;
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::error!("IPC read failed: {e}");
-                                    pending_error = Some(msgs.communication_error());
-                                    exit_reason = ExitReason::IpcError;
-                                    break;
-                                }
-                            }
-                        } else if rev.contains(PollFlags::POLLHUP)
-                            || rev.contains(PollFlags::POLLERR)
-                        {
-                            tracing::error!("Daemon closed connection or error detected");
-                            pending_error = Some(msgs.connection_lost());
-                            exit_reason = ExitReason::IpcError;
-                            break;
-                        }
-                    }
-
-                    // Self-pipe: worker finished (password collected or dialog dismissed)
-                    if let Some(rev) = fds[1].revents() {
-                        if rev.contains(PollFlags::POLLIN) {
-                            if ctx.password_entered.load(Ordering::Acquire) {
-                                tracing::info!("Password pipe signalled, exiting poll loop.");
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                    let _ = c.send_cancel("gui-password-skip", &request_id);
-                                }
-                                exit_reason = ExitReason::PasswordEntered;
-                            } else {
-                                tracing::info!(
-                                    "Password dialog closed or failed, yielding to downstream PAM modules."
-                                );
-                                // Cancel the daemon request so the phone stops buzzing.
-                                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                                    let _ = c.send_cancel("gui-password-failed", &request_id);
-                                }
-                                exit_reason = ExitReason::PasswordFailed;
-                            }
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e != nix::errno::Errno::EINTR {
-                        tracing::warn!("poll error: {e}");
-                        pending_error = Some(msgs.communication_error());
-                        exit_reason = ExitReason::IpcError;
-                        break;
-                    }
-                }
-            }
-        }
+        let exit_reason = run_gui_event_loop(
+            &mut ipc,
+            pipe_read,
+            deadline,
+            &ctx,
+            &request_id,
+            &msgs,
+            &mut auth_response,
+            &mut pending_error,
+        );
 
         // Cancel the worker if it hasn't already exited on its own.
         //
