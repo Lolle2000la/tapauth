@@ -60,19 +60,13 @@ struct ThreadContext {
     pipe_write_fd: std::os::raw::c_int,
 }
 
-// Deeper FFI bindings declared with `extern "C-unwind"` so that glibc's
-// forced unwind exceptions (`abi::__forced_unwind`) triggered by
-// `pthread_cancel` can safely propagate through these call frames.
-// `extern "C"` alone would imply `nounwind` and abort the process.
+// `write` is declared `extern "C-unwind"` so that glibc's forced unwind
+// exceptions (`abi::__forced_unwind`) triggered by `pthread_cancel` can
+// safely propagate through this call frame.  `extern "C"` alone would
+// imply `nounwind` and abort the process.
+// `pam_get_authtok` is generated with the correct ABI by bindgen's
+// `.override_abi(bindgen::Abi::CUnwind, ...)` in build.rs.
 extern "C-unwind" {
-    #[link_name = "pam_get_authtok"]
-    fn pam_get_authtok_unwind(
-        pamh: *mut pam_sys::PamHandle,
-        item_type: std::os::raw::c_int,
-        authtok: *mut *const std::os::raw::c_char,
-        prompt: *const std::os::raw::c_char,
-    ) -> std::os::raw::c_int;
-
     #[link_name = "write"]
     fn write_unwind(
         fd: std::os::raw::c_int,
@@ -97,7 +91,7 @@ unsafe extern "C-unwind" fn native_password_worker(
     // SAFETY: ctx is valid because the main thread guarantees it outlives
     // this worker via pthread_join.
     let res = unsafe {
-        pam_get_authtok_unwind(
+        pam_sys::pam_get_authtok(
             ctx.pamh,
             pam_sys::PAM_AUTHTOK,
             &mut authtok,

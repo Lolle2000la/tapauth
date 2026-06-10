@@ -54,7 +54,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .allowlist_function("pam_.*")
-        .blocklist_function("pam_get_authtok")
+        .override_abi(bindgen::Abi::CUnwind, "^pam_get_authtok$")
         .allowlist_type("pam_.*")
         .allowlist_var("PAM_.*")
         .opaque_type("pam_handle")
