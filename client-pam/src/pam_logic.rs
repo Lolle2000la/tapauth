@@ -186,8 +186,10 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
             return ExitReason::Timeout;
         }
 
-        let remain_ms = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
-        let timeout = PollTimeout::try_from(remain_ms).unwrap_or(PollTimeout::MAX);
+        let remain = deadline
+            .checked_duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -546,8 +548,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         if now >= deadline {
             break;
         }
-        let remain_ms = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
-        let timeout = PollTimeout::try_from(remain_ms).unwrap_or(PollTimeout::MAX);
+        let remain = deadline
+            .checked_duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -769,6 +773,7 @@ mod tests {
 mod gui_loop_tests {
     use super::*;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
 
     struct MockIpcReader {
