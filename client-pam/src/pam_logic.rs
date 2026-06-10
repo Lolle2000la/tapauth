@@ -34,6 +34,16 @@ use std::time::{Duration, Instant};
 // No async runtime: PAM modules should avoid multithreading. We use a single-threaded
 // polling loop (poll/select) over the IPC socket and optional /dev/tty to detect skip.
 
+/// Reason the GUI authentication loop exited.  Prevents the "timed out"
+/// message from being displayed on top of an explicit IPC error message.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitReason {
+    Timeout,
+    TapSuccess,
+    IpcError,
+    PasswordEntered,
+}
+
 /// Context passed to the raw POSIX worker thread.
 ///
 /// # Safety
@@ -50,22 +60,29 @@ struct ThreadContext {
 /// Plain C-compatible worker that calls `pam_get_authtok` to unblock the
 /// Polkit conversation pipeline.  Contains no `Drop` types, so it is safe to
 /// cancel via `pthread_cancel` without leaking Rust resources.
+///
+/// Only signals `password_entered` when `pam_get_authtok` returns
+/// `PAM_SUCCESS` with a non-null token pointer, avoiding a false-positive
+/// short-circuit when the user hits "Cancel" in the graphical dialog.
 extern "C" fn native_password_worker(arg: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void {
     let ctx = unsafe { &*(arg as *const ThreadContext) };
     let mut authtok: *const std::os::raw::c_char = std::ptr::null();
 
     // SAFETY: ctx is valid because the main thread guarantees it outlives
     // this worker via pthread_join.
-    unsafe {
+    let res = unsafe {
         pam_sys::pam_get_authtok(
             ctx.pamh,
             pam_sys::PAM_AUTHTOK,
             &mut authtok,
             std::ptr::null(),
-        );
+        )
+    };
+
+    if res == pam_sys::PAM_SUCCESS && !authtok.is_null() {
+        ctx.password_entered.store(true, Ordering::SeqCst);
     }
 
-    ctx.password_entered.store(true, Ordering::SeqCst);
     std::ptr::null_mut()
 }
 
@@ -192,10 +209,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // reference passed to the worker remains valid for its entire
         // execution, regardless of whether the worker completes normally or
         // is cancelled via pthread_cancel.
-        let mut pthread_id: libc::pthread_t = unsafe { std::mem::zeroed() };
+        let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
         let spawn_res = unsafe {
             libc::pthread_create(
-                &mut pthread_id,
+                pthread_id.as_mut_ptr(),
                 std::ptr::null(),
                 native_password_worker,
                 &ctx as *const ThreadContext as *mut std::os::raw::c_void,
@@ -207,9 +224,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             return pam_sys::PAM_IGNORE;
         }
 
+        let pthread_id = unsafe { pthread_id.assume_init() };
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+
         let mut final_outcome = pam_sys::PAM_IGNORE;
         let mut auth_response = None;
+        let mut pending_error: Option<&str> = None;
+        let mut exit_reason = ExitReason::Timeout;
 
         loop {
             let now = Instant::now();
@@ -222,10 +243,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                     let _ = c.send_cancel("gui-password-skip", &request_id);
                 }
-                unsafe {
-                    libc::pthread_join(pthread_id, std::ptr::null_mut());
-                }
-                return pam_sys::PAM_IGNORE;
+                exit_reason = ExitReason::PasswordEntered;
+                break;
             }
 
             let remain_ms = (deadline - now).as_millis().min(u16::MAX as u128) as u16;
@@ -242,6 +261,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             match ipc.try_read_response_nonblocking() {
                                 Ok(Some(resp)) => {
                                     auth_response = Some(resp);
+                                    exit_reason = ExitReason::TapSuccess;
                                     break;
                                 }
                                 Ok(None) => {
@@ -251,14 +271,16 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                         tracing::error!(
                                             "Daemon closed connection before sending response"
                                         );
-                                        pam_conv.try_info(msgs.connection_lost());
+                                        pending_error = Some(msgs.connection_lost());
+                                        exit_reason = ExitReason::IpcError;
                                         break;
                                     }
                                     continue;
                                 }
                                 Err(e) => {
                                     tracing::error!("IPC read failed: {}", e);
-                                    pam_conv.try_info(msgs.communication_error());
+                                    pending_error = Some(msgs.communication_error());
+                                    exit_reason = ExitReason::IpcError;
                                     break;
                                 }
                             }
@@ -266,7 +288,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                             || rev.contains(PollFlags::POLLERR)
                         {
                             tracing::error!("Daemon closed connection or error detected");
-                            pam_conv.try_info(msgs.connection_lost());
+                            pending_error = Some(msgs.connection_lost());
+                            exit_reason = ExitReason::IpcError;
                             break;
                         }
                     }
@@ -279,18 +302,18 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             }
         }
 
-        // Phone tap completed first (or timeout): cancel the worker if still
-        // running, then join to reap the thread.
+        // Cancel the worker if a password was not already entered (the cancel
+        // targets the synchronous cancellation point inside
+        // pam_get_authtok).  In the PasswordEntered case the worker has
+        // already returned and signals that fact through the flag.
         //
-        // POSIX thread cancellation is asynchronous: the signal is delivered
-        // at the next cancellation point inside the worker (the blocking read
-        // within pam_get_authtok).  It is theoretically possible for
-        // pthread_cancel to be delivered just as pam_get_authtok returns,
-        // causing the worker to skip cancellation and set password_entered
-        // before exiting normally.  Regardless, the unconditional
-        // pthread_join below blocks until the worker is fully reaped, so &ctx
-        // cannot be dropped while the worker still references it.
-        if !ctx.password_entered.load(Ordering::SeqCst) {
+        // NOTE: pthread_cancel carries a theoretical risk of deadlocking the
+        // parent process if the cancellation signal arrives while the worker
+        // holds an internal libc lock (e.g. inside a malloc arena entered by
+        // pam_get_authtok).  This is an accepted architectural trade-off;
+        // fully isolating the conversation pipe would require a separate
+        // helper process, as Howdy does with its Python subprocess.
+        if exit_reason != ExitReason::PasswordEntered {
             unsafe {
                 libc::pthread_cancel(pthread_id);
             }
@@ -307,13 +330,18 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         // it for tracing log messages and immediately returns a PAM status
         // code; it never stores the reference or passes it to C via
         // pam_set_item.  No CString allocation is needed here.
+        if let Some(err_msg) = pending_error {
+            pam_conv.try_info(err_msg);
+        }
+
         if let Some(resp) = auth_response {
             final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
         }
 
-        if final_outcome == pam_sys::PAM_IGNORE {
+        if exit_reason == ExitReason::Timeout {
             pam_conv.try_info(msgs.timed_out());
         }
+
         return final_outcome;
     }
 
