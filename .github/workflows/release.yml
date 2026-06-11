@@ -158,18 +158,14 @@ jobs:
           #!/usr/bin/make -f
 
           DEB_HOST_MULTIARCH ?= \$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
-          # On jammy/noble, cargo-1.91 supplies /usr/bin/cargo-1.91 (not cargo).
-          # On resolute, the default cargo >= 1.93 is fine as-is.
           CARGO := \$(shell which cargo-1.91 2>/dev/null || which cargo)
           RUSTC := \$(shell which rustc-1.91 2>/dev/null || which rustc)
+          DISTRO_SERIES := \$(shell dpkg-parsechangelog -S Distribution)
 
           %:
           	dh \$@
 
           override_dh_clean:
-          	# dh_clean deletes *.orig files by default, which breaks
-          	# vendored crates that ship legitimate .orig assets.
-          	# Exclude the entire vendor directory from cleanup.
           	dh_clean -Xvendor/
 
           override_dh_auto_build:
@@ -201,6 +197,11 @@ jobs:
           	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
           	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
           	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+          	
+          	if [ "\$(DISTRO_SERIES)" = "jammy" ]; then \
+          		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
+          		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \
+          	fi
           EOF
           chmod +x debian/rules
 
