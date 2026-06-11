@@ -46,7 +46,7 @@ tasks.named("preBuild") { dependsOn("cargoBuild") }
 
 android {
     namespace = "dev.rourunisen.tapauth"
-    compileSdk { version = release(36) }
+    compileSdk { version = release(37) }
 
     // Dynamically resolve NDK path from environment when available
     // (e.g. CI/CD runners, direct NDK installations).
@@ -70,7 +70,7 @@ android {
     defaultConfig {
         applicationId = "dev.rourunisen.tapauth"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 37
         versionCode = (System.getenv("VERSION_CODE")?.toIntOrNull() ?: 1)
         versionName = (System.getenv("VERSION_NAME") ?: "1.0")
         ndkVersion = "30.0.14904198"
