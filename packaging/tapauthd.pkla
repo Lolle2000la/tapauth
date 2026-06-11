@@ -1,0 +1,6 @@
+[TapAuth Daemon Firewalld Permissions]
+Identity=unix-user:tapauthd
+Action=org.fedoraproject.FirewallD1.all
+ResultAny=yes
+ResultInactive=yes
+ResultActive=yes
