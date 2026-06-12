@@ -21,6 +21,7 @@ import java.net.InetAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
+import java.security.MessageDigest
 import kotlinx.coroutines.*
 
 /**
@@ -745,8 +746,11 @@ class AuthenticationService : Service() {
             Log.d(TAG, "Handling AuthenticationRequest from device: ${device.displayName}")
 
             // Post-authentication rate limiting
-            // Check if we should accept this request from this device
-            if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex())) {
+            // Use a hash of the message payload as request identifier for de-duplication.
+            // Retransmissions and multi-transport deliveries of the same request will have
+            // identical wrapperMessage bytes after decryption, so they produce the same hash.
+            val requestId = MessageDigest.getInstance("SHA-256").digest(wrapperMessage).toHex()
+            if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex(), requestId)) {
                 Log.w(TAG, "Rate limiting auth request from device: ${device.displayName}")
                 return
             }
