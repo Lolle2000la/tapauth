@@ -49,7 +49,13 @@ class RequestDeduplicator {
      */
     fun record(requestIdentifier: String, accepted: Boolean) {
         val now = android.os.SystemClock.elapsedRealtime()
-        recentRequests[requestIdentifier] = DeduplicationEntry(now, accepted)
+        recentRequests.compute(requestIdentifier) { _, existing ->
+            if (existing != null && existing.accepted && !accepted) {
+                existing
+            } else {
+                DeduplicationEntry(now, accepted)
+            }
+        }
     }
 
     /**
