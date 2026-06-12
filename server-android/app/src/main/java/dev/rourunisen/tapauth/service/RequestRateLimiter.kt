@@ -45,8 +45,9 @@ class RequestRateLimiter {
      * @return true if request should be accepted, false if rate limited
      */
     fun shouldAcceptRequest(clientPublicKey: String, requestIdentifier: String? = null): Boolean {
-        if (requestIdentifier != null) {
-            val cached = deduplicator.checkDuplicate(requestIdentifier)
+        val dedupKey = requestIdentifier?.let { "$clientPublicKey:$it" }
+        if (dedupKey != null) {
+            val cached = deduplicator.checkDuplicate(dedupKey)
             if (cached != null) {
                 return cached
             }
@@ -109,8 +110,8 @@ class RequestRateLimiter {
             }
         }
 
-        if (requestIdentifier != null) {
-            deduplicator.record(requestIdentifier, accepted)
+        if (dedupKey != null) {
+            deduplicator.record(dedupKey, accepted)
         }
 
         return accepted

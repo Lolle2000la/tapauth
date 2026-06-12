@@ -30,9 +30,13 @@ class RequestDeduplicator {
     fun checkDuplicate(requestIdentifier: String): Boolean? {
         val now = android.os.SystemClock.elapsedRealtime()
         val existing = recentRequests[requestIdentifier]
-        if (existing != null && (now - existing.timestamp) < DEDUP_WINDOW_MS) {
-            Log.d(TAG, "De-duplicate hit for request $requestIdentifier: ${existing.accepted}")
-            return existing.accepted
+        if (existing != null) {
+            if ((now - existing.timestamp) < DEDUP_WINDOW_MS) {
+                Log.d(TAG, "De-duplicate hit for request $requestIdentifier: ${existing.accepted}")
+                return existing.accepted
+            } else {
+                recentRequests.remove(requestIdentifier, existing)
+            }
         }
         return null
     }
