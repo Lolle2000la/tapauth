@@ -12,11 +12,9 @@ import kotlin.math.min
  *   concurrent multi-transport delivery (BLE + UDP) and network retransmissions.
  * - Duplicate requests (same [requestIdentifier]) are handled by [RequestDeduplicator]: they return
  *   the cached result without affecting backoff state.
- * - After the burst window, every subsequent new request escalates the backoff (1s → 2s → 4s → 5s
- *   max).
- * - If a client has been silent for at least [MAX_BACKOFF_SECONDS], the backoff resets to
- *   [INITIAL_BACKOFF_SECONDS]. This prevents permanent penalty for infrequent legitimate users
- *   while still blocking 1Hz spam (spammers never wait 5s).
+ * - Backoff only escalates when a request is *rejected* (sent while cooldown is active). Accepted
+ *   requests after cooldown expiry reset the backoff to [INITIAL_BACKOFF_SECONDS], since paired
+ *   clients are trusted and the rate limiter targets third-party replay/DoS attacks only.
  * - State is fully reset on session end (grant, cancel, deny, timeout).
  *
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
@@ -91,23 +89,16 @@ class RequestRateLimiter {
             }
 
             accepted = true
-            val newBackoff =
-                if (elapsedMs >= MAX_BACKOFF_SECONDS * 1000L) {
-                    INITIAL_BACKOFF_SECONDS
-                } else {
-                    min(existing.backoffSeconds * 2, MAX_BACKOFF_SECONDS)
-                }
-            Log.d(TAG, "Accepting request from $clientPublicKey, new backoff: ${newBackoff}s")
-            if (timeInBurstWindow >= BURST_WINDOW_MS) {
-                return@compute BackoffState(
-                    lastRequestTime = now,
-                    backoffSeconds = newBackoff,
-                    requestCount = 1,
-                    burstWindowStart = now,
-                )
-            } else {
-                return@compute existing.copy(lastRequestTime = now, backoffSeconds = newBackoff)
-            }
+            Log.d(
+                TAG,
+                "Accepting request from $clientPublicKey, backoff resets to ${INITIAL_BACKOFF_SECONDS}s",
+            )
+            return@compute BackoffState(
+                lastRequestTime = now,
+                backoffSeconds = INITIAL_BACKOFF_SECONDS,
+                requestCount = 1,
+                burstWindowStart = now,
+            )
         }
 
         if (dedupKey != null) {
