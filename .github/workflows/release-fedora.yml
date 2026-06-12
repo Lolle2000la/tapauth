@@ -1,0 +1,71 @@
+name: "Release: Fedora COPR"
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-fedora-copr:
+    name: Fedora COPR Build Delivery
+    runs-on: ubuntu-latest
+    environment: release
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Initialize System Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm python3-pip
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Validate COPR Authentication Token
+        run: |
+          mkdir -p ~/.config
+          echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          pip install copr-cli
+          if ! copr-cli whoami; then
+            echo "::error:: COPR authentication failed — token may be expired or invalid."
+            exit 1
+          fi
+
+      - name: Build and Transmit Source RPM (SRPM)
+        run: |
+          mkdir -p rpmbuild/{SOURCES,SRPMS,SPECS,BUILD}
+          cp packaging/tapauth.spec rpmbuild/SPECS/tapauth.spec
+
+          # Hardcode the release version into the spec so COPR's SRPM
+          # rebuild sees it; the conditional pkgversion macro doesn't
+          # survive COPR's dist-git extraction.
+          sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
+
+          # Dynamically append changelog entries
+          CURRENT_DATE=$(date +"%a %b %d %Y")
+          echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
+
+          # Strip the ./ prefix before adding the versioned directory so
+          # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths
+          tar --transform "s|^\./|tapauth-${{ steps.version_vars.outputs.VERSION }}/|" -czf rpmbuild/SOURCES/tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz --exclude=./rpmbuild --exclude=./.git --exclude=./target .
+          rpmbuild -bs rpmbuild/SPECS/tapauth.spec --define "_topdir $(pwd)/rpmbuild"
+
+          copr-cli build --nowait lolle2000la/tapauth rpmbuild/SRPMS/*.src.rpm

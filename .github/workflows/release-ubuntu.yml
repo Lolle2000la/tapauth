@@ -1,0 +1,238 @@
+name: "Release: Ubuntu PPA"
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-ubuntu-ppa:
+    name: Ubuntu Launchpad PPA Source Delivery
+    runs-on: ubuntu-latest
+    environment: release
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
+    env:
+      DEBEMAIL: "lolle2000.la+tapauth@gmail.com"
+      DEBFULLNAME: "Luca Auer"
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Initialize System Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts debhelper dput distro-info
+
+      - name: Initialize Verified Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Configure GPG Verification Keyring
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_FPR=$(gpg --with-colons --list-secret-keys --keyid-format LONG | grep '^sec:' | cut -d: -f5)
+          echo "GPG_KEY_FPR=${GPG_KEY_FPR}" >> "$GITHUB_ENV"
+          # Configure GPG for headless (non-TTY) signing
+          mkdir -p ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent || true
+
+      - name: Construct Offline-Isolated Source Tarball (Vendor Sandbox)
+        run: |
+          mkdir -p .cargo
+          if [ -f .cargo/config.toml ]; then
+            cp .cargo/config.toml .cargo/config.toml.bak
+            cargo vendor >> .cargo/config.toml
+          else
+            cargo vendor > .cargo/config.toml
+          fi
+
+      - name: Build Signed Debian Source Manifest Asset
+        run: |
+          VERSION="${{ steps.version_vars.outputs.VERSION }}"
+          mkdir -p debian/source
+          echo "3.0 (quilt)" > debian/source/format
+
+          cat > debian/control <<EOF
+          Source: tapauth
+          Section: admin
+          Priority: optional
+          Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
+          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev
+          Standards-Version: 4.7.0
+
+          Package: tapauth
+          Architecture: any
+          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
+          Recommends: firewalld
+          Suggests: iptables
+          Description: Local smartphone-based authentication framework
+           A modern, privacy-preserving local-first authentication system
+           using Rust PAM modules, systemd system daemons, and low-level
+           communication links. Provides phone-based biometric
+           verification for Linux desktop login, sudo, and polkit
+           authentication via UDP and BLE transport layers.
+          EOF
+
+          cat > debian/rules <<EOF
+          #!/usr/bin/make -f
+
+          DEB_HOST_MULTIARCH ?= \$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+          CARGO := \$(shell which cargo-1.91 2>/dev/null || which cargo)
+          RUSTC := \$(shell which rustc-1.91 2>/dev/null || which rustc)
+          DISTRO_SERIES := \$(shell dpkg-parsechangelog -S Distribution)
+
+          %:
+          	dh \$@
+
+          override_dh_clean:
+          	dh_clean -Xvendor/
+
+          override_dh_auto_build:
+          	\$(CARGO) build --workspace --release --offline --frozen
+
+          override_dh_auto_install:
+          	mkdir -p debian/tapauth/usr/bin
+          	mkdir -p debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security
+          	mkdir -p debian/tapauth/lib/systemd/system
+          	mkdir -p debian/tapauth/usr/lib/sysusers.d
+          	mkdir -p debian/tapauth/usr/lib/tmpfiles.d
+          	mkdir -p debian/tapauth/usr/share/pam-configs
+          	mkdir -p debian/tapauth/usr/share/applications
+          	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
+          	mkdir -p debian/tapauth/usr/share/polkit-1/actions
+          	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
+          	mkdir -p debian/tapauth/etc/tapauth
+          	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+          	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
+          	cp target/release/tapauthd debian/tapauth/usr/bin/
+          	cp target/release/tapauth-config debian/tapauth/usr/bin/
+          	cp target/release/libclient_pam.so debian/tapauth/lib/\$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
+          	cp systemd/tapauthd.service debian/tapauth/lib/systemd/system/
+          	cp systemd/tapauthd.socket debian/tapauth/lib/systemd/system/
+          	cp packaging/sysusers.conf debian/tapauth/usr/lib/sysusers.d/tapauth.conf
+          	cp packaging/tmpfiles.conf debian/tapauth/usr/lib/tmpfiles.d/tapauth.conf
+          	cp packaging/debian.pam-config debian/tapauth/usr/share/pam-configs/tapauth
+          	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
+          	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
+          	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
+          	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+          	
+          	if [ "\$(DISTRO_SERIES)" = "jammy" ]; then \
+          		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
+          		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \
+          	fi
+          EOF
+          chmod +x debian/rules
+
+          # Include safety guards and mandatory #DEBHELPER# hooks for system service registrations
+          cat > debian/postinst <<EOF
+          #!/bin/sh
+          set -e
+          if [ "\$1" = "configure" ]; then
+          	systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+          	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+          	if command -v pam-auth-update >/dev/null 2>&1; then
+          		pam-auth-update --package
+          	fi
+          fi
+          #DEBHELPER#
+          exit 0
+          EOF
+
+          cat > debian/postrm <<EOF
+          #!/bin/sh
+          set -e
+          if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
+          	if command -v pam-auth-update >/dev/null 2>&1; then
+          		pam-auth-update --package
+          	fi
+          fi
+          if [ "\$1" = "purge" ]; then
+          	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf || true
+          fi
+          #DEBHELPER#
+          exit 0
+          EOF
+          chmod +x debian/postinst debian/postrm
+
+          # Build and upload per target series so Launchpad rebuilds for each
+          PARENT_DIR=$(basename $(pwd))
+          cd ..
+          tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" --exclude="${PARENT_DIR}/rpmbuild" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
+
+          # dpkg-buildpackage requires the working directory to match the source-version scheme
+          ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
+          cd "tapauth-${VERSION}"
+
+          ACTIVE_SERIES=""
+          for SERIES in $(ubuntu-distro-info --supported 2>/dev/null); do
+            if REL_VER=$(ubuntu-distro-info -r --series="${SERIES}" 2>/dev/null) && [ -n "$REL_VER" ]; then
+              CLEAN_VER="${REL_VER%% *}"
+              if dpkg --compare-versions "${CLEAN_VER}" ge "22.04" 2>/dev/null; then
+                ACTIVE_SERIES="${ACTIVE_SERIES} ${SERIES}"
+              fi
+            fi
+          done
+          echo "Dynamically targeting Ubuntu series: ${ACTIVE_SERIES}"
+
+          FIRST=1
+          FIRST_UPLOAD_DONE=0
+          for SERIES in ${ACTIVE_SERIES}; do
+            rm -f debian/changelog
+            dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
+            dpkg-buildpackage -S -us -uc -d
+
+            # The orig tarball is identical across series — Launchpad
+            # rejects duplicate uploads, so strip it before signing
+            if [ "${FIRST}" != "1" ]; then
+              sed -i '/\.orig\.tar\.gz/d' ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            fi
+            FIRST=0
+
+            GPG_ARGS="--batch --pinentry-mode loopback --yes --no-tty"
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              printf '%s' "${GPG_PASSPHRASE}" > /tmp/gpg-passphrase
+              chmod 600 /tmp/gpg-passphrase
+              GPG_ARGS="${GPG_ARGS} --passphrase-file /tmp/gpg-passphrase"
+            fi
+            debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            rm -f /tmp/gpg-passphrase
+
+            # dput can receive 550 internal-server errors when
+            # consecutive uploads for different series arrive before
+            # Launchpad's queue has ingested the first one. Wait 90s
+            # before first attempt on any series after the first, then
+            # retry with escalating backoff.
+            if [ "${FIRST_UPLOAD_DONE}" = "1" ]; then
+              sleep 90
+            fi
+            for ATTEMPT in 1 2 3; do
+              if dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes; then
+                echo "dput succeeded on attempt ${ATTEMPT}"
+                break
+              fi
+              echo "dput failed on attempt ${ATTEMPT} (exit $?), retrying..."
+              sleep $((2 ** (3 + ATTEMPT)))
+            done
+            FIRST_UPLOAD_DONE=1
+          done

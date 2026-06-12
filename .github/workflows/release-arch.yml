@@ -1,0 +1,154 @@
+name: "Release: Arch AUR"
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-arch-aur:
+    name: Arch User Repository (AUR) Sync
+    runs-on: ubuntu-latest
+    environment: release
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch Remote Release Tarball Checksum
+        id: calc_sha
+        run: |
+          TARBALL_URL="https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz"
+          curl -sL "$TARBALL_URL" -o release.tar.gz
+          SHA256_HASH=$(sha256sum release.tar.gz | cut -d' ' -f1)
+          echo "SHA256=${SHA256_HASH}" >> "$GITHUB_OUTPUT"
+          echo "Release archive verified hash: ${SHA256_HASH}"
+
+      - name: Synchronize and Push Metadata Changes to the AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_aur
+          chmod 600 ~/.ssh/id_aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_aur
+
+          git config --global user.name "AUR Deployment Pipeline"
+          git config --global user.email "lolle2000.la+tapauth@gmail.com"
+
+          git clone aur@aur.archlinux.org:tapauth.git aur-repo
+          cd aur-repo
+
+          # Added aarch64 to arch layout matrix, removed self-conflicting references
+          cat > PKGBUILD <<EOF
+          pkgname=tapauth
+          pkgver=${{ steps.version_vars.outputs.VERSION }}
+          pkgrel=1
+          pkgdesc="Local smartphone-based authentication framework engine"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/lolle2000la/tapauth"
+          license=('AGPL-3.0')
+          depends=('dbus' 'pam')
+          makedepends=('cargo' 'rust' 'protobuf' 'clang')
+          backup=('etc/tapauth/config.toml')
+          install=tapauth.install
+          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
+          sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
+
+          prepare() {
+            cd "\$srcdir/\$pkgname-\$pkgver"
+            export CARGO_HOME="\${srcdir}/cargo-home"
+            cargo fetch --locked --target "\$CARCH-unknown-linux-gnu"
+          }
+
+          build() {
+            cd "\$srcdir/\$pkgname-\$pkgver"
+            export CARGO_HOME="\${srcdir}/cargo-home"
+            export CARGO_PROFILE_RELEASE_STRIP=true
+            cargo build --frozen --workspace --release
+          }
+
+          package() {
+            cd "\$srcdir/\$pkgname-\$pkgver"
+            install -dm0755 "\$pkgdir/etc/tapauth"
+            install -Dm0755 target/release/tapauthd "\$pkgdir/usr/bin/tapauthd"
+            install -Dm0755 target/release/tapauth-config "\$pkgdir/usr/bin/tapauth-config"
+            install -Dm0755 target/release/libclient_pam.so "\$pkgdir/usr/lib/security/pam_tapauth.so"
+            install -Dm0644 systemd/tapauthd.service "\$pkgdir/usr/lib/systemd/system/tapauthd.service"
+            install -Dm0644 systemd/tapauthd.socket "\$pkgdir/usr/lib/systemd/system/tapauthd.socket"
+            install -Dm0644 systemd/polkit-agent-helper@.service.d/tapauth.conf "\$pkgdir/usr/lib/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+            install -Dm0644 packaging/sysusers.conf "\$pkgdir/usr/lib/sysusers.d/tapauth.conf"
+            install -Dm0644 packaging/tmpfiles.conf "\$pkgdir/usr/lib/tmpfiles.d/tapauth.conf"
+            install -Dm0644 client-config-gui/tapauth-config.desktop "\$pkgdir/usr/share/applications/tapauth-config.desktop"
+            install -Dm0644 client-config-gui/assets/tapauth-config.svg "\$pkgdir/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
+            install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
+            install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+            install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+          EOF
+
+          cat > tapauth.install <<EOF
+          post_install() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl enable --now tapauthd.socket
+          }
+
+          post_upgrade() {
+            systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+            systemctl daemon-reload
+            systemctl reenable tapauthd.socket
+            systemctl restart tapauthd.socket
+          }
+
+          pre_remove() {
+            systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
+          }
+          EOF
+
+          cat > .SRCINFO <<EOF
+          pkgbase = tapauth
+          	pkgdesc = Local smartphone-based authentication framework engine
+          	pkgver = ${{ steps.version_vars.outputs.VERSION }}
+          	pkgrel = 1
+          	url = https://github.com/lolle2000la/tapauth
+          	arch = x86_64
+          	arch = aarch64
+          	license = AGPL-3.0
+          	install = tapauth.install
+          	makedepends = cargo
+          	makedepends = rust
+          	makedepends = protobuf
+          	makedepends = clang
+          	depends = dbus
+          	depends = pam
+          	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
+          	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
+
+          pkgname = tapauth
+          EOF
+
+          git add PKGBUILD .SRCINFO tapauth.install
+          git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
+          git push origin master

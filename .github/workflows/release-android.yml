@@ -1,0 +1,245 @@
+name: "Release: Android & F-Droid"
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-android-apk:
+    name: Android APK Build and Release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Extract Dynamic Version Context
+        id: version_vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases?per_page=1" --jq '.[0] | {tag_name, prerelease}')
+            TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VER="${TAG_NAME#v}"
+          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          # Derive unique, monotonic versionCode from semver.
+          # Stable releases use patch*100 + 99 (always highest).
+          # Prerelease builds encode the prerelease number in the last
+          # two digits so beta1 < beta2 < ... < stable for the same semver.
+          SEMVER="${CLEAN_VER%%-*}"
+          PREREL="${CLEAN_VER#*-}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
+          BASE=$((MAJOR * 1000000 + MINOR * 10000 + PATCH * 100))
+          if [ "${PREREL}" != "${CLEAN_VER}" ]; then
+            PREREL_NUM="${PREREL##*[!0-9]}"
+            PREREL_NUM="${PREREL_NUM:-0}"
+            VERSION_CODE=$((BASE + PREREL_NUM))
+          else
+            VERSION_CODE=$((BASE + 99))
+          fi
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust toolchain with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-release-${{ hashFiles('server-android/**/*.gradle*', 'server-android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-release-
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;30.0.14904198"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/30.0.14904198" >> "$GITHUB_ENV"
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x server-android/gradlew
+
+      - name: Decode release keystore
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_B64:-}" ]; then
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > server-android/release.keystore
+          else
+            echo "::warning:: ANDROID_KEYSTORE_B64 not set — APK will be unsigned"
+          fi
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+
+      - name: Build release APK
+        run: |
+          export VERSION_NAME="${{ steps.version_vars.outputs.VERSION }}"
+          export VERSION_CODE="${{ steps.version_vars.outputs.VERSION_CODE }}"
+          cd server-android && ./gradlew assembleRelease
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload APK to GitHub Release
+        run: |
+          APK_PATH=$(find server-android/app/build/outputs/apk/release -name "*.apk" -not -name "*unsigned*" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH="server-android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          fi
+          APK_NAME="tapauth-v${{ steps.version_vars.outputs.VERSION }}.apk"
+          cp "$APK_PATH" "$APK_NAME"
+          gh release upload "${{ steps.version_vars.outputs.TAG_NAME }}" "$APK_NAME" --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  release-fdroid-repo:
+    name: F-Droid Custom Repository Delivery
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [release-android-apk]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v6
+
+      - name: Generate Rasterized Assets from Master SVG
+        run: |
+          sudo apt-get update && sudo apt-get install -y librsvg2-bin
+          mkdir -p fdroid/repo/icons
+          mkdir -p fdroid/repo/dev.rourunisen.tapauth/en-US
+
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/icon.png
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/repo/icons/icon.png
+          rsvg-convert -w 512 -h 512 -f png tapauth-icon.svg -o fdroid/repo/dev.rourunisen.tapauth/en-US/icon.png
+
+      - name: Patch F-Droid Repository URL to Custom Domain
+        run: |
+          sed -i "s|^repo_url:.*|repo_url: https://tapauth.rourunisen.dev/fdroid/repo|" fdroid/config.yml
+
+      - name: Setup Android SDK (provides apksigner for repo signing)
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Initialize F-Droid Server CLI Tooling
+        run: pip install "fdroidserver==2.4.4" "androguard<4.1.4"
+
+      - name: Determine Releases to Include
+        id: select_releases
+        run: |
+          set -euo pipefail
+          RELEASES=$(gh api "repos/${{ github.repository }}/releases" --jq '[.[] | select(.draft == false) | {tag_name, prerelease}]')
+
+          STABLE=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == false) | .tag_name) // ""')
+          echo "stable_tag=${STABLE}" >> "$GITHUB_OUTPUT"
+
+          PREVIEW=$(echo "$RELEASES" | jq -r 'first(.[] | select(.prerelease == true) | .tag_name) // ""')
+          echo "preview_tag=${PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          INCLUDE_PREVIEW="false"
+          if [ -n "${PREVIEW}" ]; then
+            if [ -z "${STABLE}" ]; then
+              INCLUDE_PREVIEW="true"
+            else
+              STABLE_VER="${STABLE#v}"
+              PREVIEW_VER="${PREVIEW#v}"
+              HIGHER=$(printf '%s\n%s\n' "${STABLE_VER}" "${PREVIEW_VER}" | sort -V | tail -1)
+              if [ "${HIGHER}" = "${PREVIEW_VER}" ]; then
+                INCLUDE_PREVIEW="true"
+              fi
+            fi
+          fi
+          echo "include_preview=${INCLUDE_PREVIEW}" >> "$GITHUB_OUTPUT"
+
+          echo "Stable: ${STABLE:-none}, Preview: ${PREVIEW:-none}, IncludePreview: ${INCLUDE_PREVIEW}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch Selected Release APKs
+        run: |
+          mkdir -p fdroid/repo
+
+          STABLE_TAG="${{ steps.select_releases.outputs.stable_tag }}"
+          if [ -n "${STABLE_TAG}" ]; then
+            STABLE_VER="${STABLE_TAG#v}"
+            gh release download "${STABLE_TAG}" --pattern "tapauth-v${STABLE_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded stable APK: ${STABLE_TAG}"
+          fi
+
+          if [ "${{ steps.select_releases.outputs.include_preview }}" = "true" ]; then
+            PREVIEW_TAG="${{ steps.select_releases.outputs.preview_tag }}"
+            PREVIEW_VER="${PREVIEW_TAG#v}"
+            gh release download "${PREVIEW_TAG}" --pattern "tapauth-v${PREVIEW_VER}.apk" --dir fdroid/repo --clobber
+            echo "Downloaded preview APK: ${PREVIEW_TAG}"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Decode F-Droid Repository Signing Keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > fdroid/repo-signer.jks
+
+      - name: Construct Unsigned Metadata Indexes
+        run: fdroid update --nosign --create-metadata
+        working-directory: fdroid
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Cryptographically Sign F-Droid Repository Entry Points
+        run: fdroid signindex
+        working-directory: fdroid
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Assemble Static Pages Workspace
+        run: |
+          mkdir -p dist/fdroid/repo
+          cp -r fdroid/repo/* dist/fdroid/repo/
+
+      - name: Upload Static Web Site Artifacts
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./dist
+
+      - name: Deploy Artifact Directly to GitHub Pages Hosted Edge
+        id: deployment
+        uses: actions/deploy-pages@v5
