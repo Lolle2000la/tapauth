@@ -58,6 +58,8 @@ class AuthenticationService : Service() {
         private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff02::1")
         // Debounce delay for multicast rejoin operations (milliseconds)
         private const val REJOIN_DEBOUNCE_MS = 500L
+        // Prototype for SHA-256 hashing; clone() for thread-safe per-use instances
+        private val SHA256_PROTOTYPE: MessageDigest = MessageDigest.getInstance("SHA-256")
 
         // Broadcast actions for BLE communication
         const val ACTION_CANCEL_BLE_CONNECTION =
@@ -749,7 +751,8 @@ class AuthenticationService : Service() {
             // Use a hash of the message payload as request identifier for de-duplication.
             // Retransmissions and multi-transport deliveries of the same request will have
             // identical wrapperMessage bytes after decryption, so they produce the same hash.
-            val requestId = MessageDigest.getInstance("SHA-256").digest(wrapperMessage).toHex()
+            val requestId =
+                (SHA256_PROTOTYPE.clone() as MessageDigest).digest(wrapperMessage).toHex()
             if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex(), requestId)) {
                 Log.w(TAG, "Rate limiting auth request from device: ${device.displayName}")
                 return

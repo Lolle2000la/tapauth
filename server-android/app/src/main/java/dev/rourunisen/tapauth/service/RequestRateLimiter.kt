@@ -95,19 +95,12 @@ class RequestRateLimiter {
                 TAG,
                 "Accepting request from $clientPublicKey, backoff stays at ${INITIAL_BACKOFF_SECONDS}s",
             )
-            if (timeInBurstWindow >= BURST_WINDOW_MS) {
-                return@compute BackoffState(
-                    lastRequestTime = now,
-                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
-                    requestCount = 1,
-                    burstWindowStart = now,
-                )
-            } else {
-                return@compute existing.copy(
-                    lastRequestTime = now,
-                    backoffSeconds = INITIAL_BACKOFF_SECONDS,
-                )
-            }
+            return@compute BackoffState(
+                lastRequestTime = now,
+                backoffSeconds = INITIAL_BACKOFF_SECONDS,
+                requestCount = 1,
+                burstWindowStart = now,
+            )
         }
 
         if (dedupKey != null) {
