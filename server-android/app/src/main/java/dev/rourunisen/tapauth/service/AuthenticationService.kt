@@ -211,30 +211,33 @@ class AuthenticationService : Service() {
             try {
                 oldSocket?.close()
             } catch (_: Exception) {}
-            udpSocket = null
+
+            val newSocket: MulticastSocket
+            try {
+                newSocket = MulticastSocket(appConfig.udpPort)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to bind MulticastSocket", e)
+                udpSocket = null
+                return
+            }
+            udpSocket = newSocket
+
             listenerJob =
                 serviceScope.launch {
                     oldJob?.cancelAndJoin()
-                    var socket: MulticastSocket? = null
                     try {
-                        val s = MulticastSocket(appConfig.udpPort)
-                        socket = s
                         if (!isActive || !isRunning) {
                             return@launch
                         }
-                        udpSocket = s
 
-                        // Enable broadcast reception (for IPv4 255.255.255.255)
-                        s.broadcast = true
+                        newSocket.broadcast = true
 
-                        // Join IPv6 multicast group ff02::1 (all nodes on local segment)
                         try {
-                            // Join the multicast group on all available network interfaces
                             NetworkInterface.getNetworkInterfaces()?.toList()?.forEach {
                                 networkInterface ->
                                 if (networkInterface.isUp && networkInterface.supportsMulticast()) {
                                     try {
-                                        s.joinGroup(
+                                        newSocket.joinGroup(
                                             java.net.InetSocketAddress(
                                                 IPV6_MULTICAST_GROUP,
                                                 appConfig.udpPort,
@@ -261,7 +264,6 @@ class AuthenticationService : Service() {
                         Log.d(TAG, "  - IPv4 broadcast: enabled")
                         Log.d(TAG, "  - IPv6 multicast: ff02::1")
 
-                        // Mark UDP as running once we've successfully opened the socket
                         try {
                             dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning(
                                 { applicationContext },
@@ -276,7 +278,7 @@ class AuthenticationService : Service() {
                             try {
                                 val packet = DatagramPacket(buffer, buffer.size)
 
-                                s.receive(packet)
+                                newSocket.receive(packet)
 
                                 val data = packet.data.copyOf(packet.length)
                                 val senderAddress = packet.address
@@ -291,10 +293,8 @@ class AuthenticationService : Service() {
                                     "Will respond to ${senderAddress.hostAddress}:${appConfig.udpPort} (configured port)",
                                 )
 
-                                // Process authentication request
                                 launch { handleIncomingPacket(data, senderAddress, senderPort) }
                             } catch (e: SocketException) {
-                                // Socket was closed by stopListening() or startListening() teardown
                                 break
                             } catch (e: Exception) {
                                 if (isActive && isRunning) {
@@ -308,8 +308,8 @@ class AuthenticationService : Service() {
                             stopListening()
                         }
                     } finally {
-                        socket?.close()
-                        if (udpSocket === socket) {
+                        newSocket.close()
+                        if (udpSocket === newSocket) {
                             udpSocket = null
                         }
                     }
