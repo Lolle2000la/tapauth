@@ -2,8 +2,10 @@ package dev.rourunisen.tapauth.service
 
 import android.Manifest
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -11,6 +13,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.TapAuthApplication
@@ -20,7 +23,7 @@ import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
-import java.net.SocketTimeoutException
+import java.net.SocketException
 import kotlinx.coroutines.*
 
 /**
@@ -47,12 +50,26 @@ class AuthenticationService : Service() {
     private val multicastLockLock = Any()
     @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
+    private val screenStateReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> {
+                        Log.d(TAG, "Screen on - acquiring multicast lock")
+                        acquireMulticastLock()
+                    }
+                    Intent.ACTION_SCREEN_OFF -> {
+                        Log.d(TAG, "Screen off - releasing multicast lock")
+                        releaseMulticastLock()
+                    }
+                }
+            }
+        }
+
     companion object {
         private const val TAG = "AuthenticationService"
         // Use the global shared notification ID to avoid duplicate notifications
         private const val NOTIFICATION_ID = TapAuthApplication.FOREGROUND_NOTIFICATION_ID
-        // Socket timeout to prevent indefinite blocking (5 seconds)
-        private const val SOCKET_TIMEOUT_MS = 5000
         // Cached IPv6 multicast address to avoid repeated DNS lookups
         private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff02::1")
         // Debounce delay for multicast rejoin operations (milliseconds)
@@ -149,6 +166,9 @@ class AuthenticationService : Service() {
         // Register network callback to handle connectivity changes
         registerNetworkCallback()
 
+        // Register screen state receiver for multicast lock power management
+        registerScreenStateReceiver()
+
         Log.d(TAG, "Authentication service created")
     }
 
@@ -166,6 +186,7 @@ class AuthenticationService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        unregisterScreenStateReceiver()
         unregisterNetworkCallback()
         stopListening()
         retransmissionManager.stopAll()
@@ -179,32 +200,9 @@ class AuthenticationService : Service() {
 
     private fun startListening() {
         isRunning = true
-        synchronized(multicastLockLock) {
-            if (multicastLock == null) {
-                try {
-                    val wifiManager =
-                        applicationContext.getSystemService(Context.WIFI_SERVICE)
-                            as? android.net.wifi.WifiManager
-                    multicastLock =
-                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
-                            setReferenceCounted(false)
-                            acquire()
-                        }
-                    if (multicastLock != null) {
-                        Log.d(
-                            TAG,
-                            "Acquired Wifi MulticastLock for UDP broadcast/multicast reception",
-                        )
-                    } else {
-                        Log.w(
-                            TAG,
-                            "Failed to acquire Wifi MulticastLock: WifiManager is null or createMulticastLock failed",
-                        )
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
-                }
-            }
+        val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (powerManager?.isInteractive == true) {
+            acquireMulticastLock()
         }
 
         val oldJob = listenerJob
@@ -223,11 +221,6 @@ class AuthenticationService : Service() {
                         return@launch
                     }
                     udpSocket = s
-
-                    // Set socket timeout to prevent indefinite blocking
-                    // This allows the loop to periodically check isActive/isRunning flags
-                    // and respond to network state changes
-                    s.soTimeout = SOCKET_TIMEOUT_MS
 
                     // Enable broadcast reception (for IPv4 255.255.255.255)
                     s.broadcast = true
@@ -298,12 +291,10 @@ class AuthenticationService : Service() {
 
                             // Process authentication request
                             launch { handleIncomingPacket(data, senderAddress, senderPort) }
-                        } catch (e: SocketTimeoutException) {
-                            // Expected timeout - allows loop to check isActive/isRunning flags
-                            // and handle network state changes gracefully
-                            continue
+                        } catch (e: SocketException) {
+                            // Socket was closed by stopListening() or startListening() teardown
+                            break
                         } catch (e: Exception) {
-                            // Ignore "Socket closed" exception when service is stopping
                             if (isActive && isRunning) {
                                 Log.e(TAG, "Error receiving packet", e)
                             }
@@ -326,19 +317,7 @@ class AuthenticationService : Service() {
     private fun stopListening() {
         isRunning = false
 
-        synchronized(multicastLockLock) {
-            try {
-                multicastLock?.let {
-                    if (it.isHeld) {
-                        it.release()
-                        Log.d(TAG, "Released Wifi MulticastLock")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
-            }
-            multicastLock = null
-        }
+        releaseMulticastLock()
 
         listenerJob?.cancel()
         listenerJob = null
@@ -371,6 +350,63 @@ class AuthenticationService : Service() {
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false)
         } catch (_: Exception) {}
+    }
+
+    private fun acquireMulticastLock() {
+        synchronized(multicastLockLock) {
+            if (multicastLock == null) {
+                try {
+                    val wifiManager =
+                        applicationContext.getSystemService(Context.WIFI_SERVICE)
+                            as? android.net.wifi.WifiManager
+                    multicastLock =
+                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
+                            setReferenceCounted(false)
+                            acquire()
+                        }
+                    if (multicastLock != null) {
+                        Log.d(TAG, "Acquired Wifi MulticastLock for UDP multicast reception")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        synchronized(multicastLockLock) {
+            try {
+                multicastLock?.let {
+                    if (it.isHeld) {
+                        it.release()
+                        Log.d(TAG, "Released Wifi MulticastLock")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
+            }
+            multicastLock = null
+        }
+    }
+
+    private fun registerScreenStateReceiver() {
+        val filter =
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
+        registerReceiver(screenStateReceiver, filter)
+        Log.d(TAG, "Registered screen state receiver")
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        try {
+            unregisterReceiver(screenStateReceiver)
+            Log.d(TAG, "Unregistered screen state receiver")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister screen state receiver: ${e.message}")
+        }
     }
 
     /**
@@ -435,63 +471,20 @@ class AuthenticationService : Service() {
     }
 
     /**
-     * Re-join IPv6 multicast groups on all available network interfaces. This is called when
-     * network connectivity changes to ensure we continue receiving multicast traffic after Wi-Fi
-     * reconnects or network switches.
+     * Re-establish UDP multicast connectivity after a network change. Performs a complete teardown
+     * and recreation of the socket to avoid stale file descriptors that can occur after Wi-Fi
+     * low-power state transitions.
      *
-     * Uses debouncing to prevent overlapping rejoin operations when multiple network callbacks fire
-     * in quick succession (e.g., onAvailable followed by onCapabilitiesChanged).
+     * Uses debouncing to prevent overlapping operations when multiple network callbacks fire in
+     * quick succession (e.g., onAvailable followed by onCapabilitiesChanged).
      */
     private fun rejoinMulticastGroups() {
-        val socket = udpSocket ?: return
-
-        // Cancel any pending rejoin operation to debounce rapid callbacks
         rejoinJob?.cancel()
-
         rejoinJob =
             serviceScope.launch {
-                // Debounce: wait before actually rejoining to coalesce rapid callbacks
                 delay(REJOIN_DEBOUNCE_MS)
-
-                try {
-                    // Re-join the multicast group on all available network interfaces
-                    NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-                        if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                            try {
-                                // Try to leave first (ignore errors if not joined)
-                                try {
-                                    socket.leaveGroup(
-                                        java.net.InetSocketAddress(
-                                            IPV6_MULTICAST_GROUP,
-                                            appConfig.udpPort,
-                                        ),
-                                        networkInterface,
-                                    )
-                                } catch (_: Exception) {}
-
-                                // Then join
-                                socket.joinGroup(
-                                    java.net.InetSocketAddress(
-                                        IPV6_MULTICAST_GROUP,
-                                        appConfig.udpPort,
-                                    ),
-                                    networkInterface,
-                                )
-                                Log.d(
-                                    TAG,
-                                    "Re-joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
-                                )
-                            } catch (e: Exception) {
-                                Log.w(
-                                    TAG,
-                                    "Failed to re-join multicast on ${networkInterface.name}: ${e.message}",
-                                )
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to re-join IPv6 multicast groups: ${e.message}")
-                }
+                Log.d(TAG, "Recreating UDP socket after network change")
+                startListening()
             }
     }
 
