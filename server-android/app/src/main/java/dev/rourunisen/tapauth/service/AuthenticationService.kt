@@ -318,41 +318,43 @@ class AuthenticationService : Service() {
     }
 
     private fun stopListening() {
-        isRunning = false
+        synchronized(multicastLockLock) {
+            isRunning = false
 
-        releaseMulticastLock()
+            releaseMulticastLock()
 
-        listenerJob?.cancel()
-        listenerJob = null
+            listenerJob?.cancel()
+            listenerJob = null
 
-        // Cancel any pending rejoin operation
-        rejoinJob?.cancel()
-        rejoinJob = null
+            // Cancel any pending rejoin operation
+            rejoinJob?.cancel()
+            rejoinJob = null
 
-        // Leave IPv6 multicast group before closing socket
-        try {
-            NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-                if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                    try {
-                        udpSocket?.leaveGroup(
-                            java.net.InetSocketAddress(IPV6_MULTICAST_GROUP, appConfig.udpPort),
-                            networkInterface,
-                        )
-                    } catch (e: Exception) {
-                        // Ignore errors on cleanup
+            // Leave IPv6 multicast group before closing socket
+            try {
+                NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
+                    if (networkInterface.isUp && networkInterface.supportsMulticast()) {
+                        try {
+                            udpSocket?.leaveGroup(
+                                java.net.InetSocketAddress(IPV6_MULTICAST_GROUP, appConfig.udpPort),
+                                networkInterface,
+                            )
+                        } catch (e: Exception) {
+                            // Ignore errors on cleanup
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                // Ignore errors on cleanup
             }
-        } catch (e: Exception) {
-            // Ignore errors on cleanup
-        }
 
-        udpSocket?.close()
-        udpSocket = null
-        Log.d(TAG, "Stopped listening")
-        try {
-            dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false)
-        } catch (_: Exception) {}
+            udpSocket?.close()
+            udpSocket = null
+            Log.d(TAG, "Stopped listening")
+            try {
+                dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false)
+            } catch (_: Exception) {}
+        }
     }
 
     private fun acquireMulticastLock() {

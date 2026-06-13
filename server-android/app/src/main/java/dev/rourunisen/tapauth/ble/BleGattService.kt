@@ -125,7 +125,7 @@ class BleGattService : Service() {
         }
 
     // Map of temporal IDs to device CSKs for quick lookup
-    private val temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val cacheMutex = kotlinx.coroutines.sync.Mutex()
     private var cacheUpdateJob: Job? = null
     @Volatile private var bleLastComputedWindow: Long = -1
@@ -445,7 +445,7 @@ class BleGattService : Service() {
         if (currentWindow != bleLastComputedWindow) {
             cacheMutex.withLock {
                 if (currentWindow != bleLastComputedWindow) {
-                    temporalIdCache.clear()
+                    val newCache = java.util.concurrent.ConcurrentHashMap<String, String>()
                     val pairedDevices = deviceRepository.getAllPairedDevices()
                     val currentTimestampSeconds = (currentWindow * 60_000L) / 1000
                     val previousTimestampSeconds = currentTimestampSeconds - 60
@@ -464,8 +464,8 @@ class BleGattService : Service() {
                                 )
 
                             val cskHex = device.csk.toHex()
-                            temporalIdCache[currentId.toHex()] = cskHex
-                            temporalIdCache[previousId.toHex()] = cskHex
+                            newCache[currentId.toHex()] = cskHex
+                            newCache[previousId.toHex()] = cskHex
                         } catch (e: Exception) {
                             Log.e(
                                 TAG,
@@ -474,6 +474,7 @@ class BleGattService : Service() {
                             )
                         }
                     }
+                    temporalIdCache = newCache
                     bleLastComputedWindow = currentWindow
                 }
             }
