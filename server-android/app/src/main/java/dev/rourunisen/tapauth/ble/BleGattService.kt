@@ -1159,6 +1159,8 @@ class BleGattService : Service() {
                         break
                     }
 
+                    confirmationValues.remove(address)
+
                     if (gatt.readCharacteristic(confirmationChar)) {
                         var confirmationBytes: ByteArray? = null
                         val pollStart = android.os.SystemClock.elapsedRealtime()
