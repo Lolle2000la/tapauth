@@ -545,7 +545,11 @@ class BleGattService : Service() {
         }
 
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
-        device.connectGatt(this, false, gattCallback)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(this, false, gattCallback)
+        }
     }
 
     private suspend fun handleIncomingBleMessage(gatt: BluetoothGatt, data: ByteArray) {
@@ -1104,7 +1108,6 @@ class BleGattService : Service() {
                 delay(500) // 500ms interval per spec
                 attempt++
 
-                // Try to read confirmation characteristic
                 if (
                     ActivityCompat.checkSelfPermission(
                         this@BleGattService,
@@ -1114,45 +1117,39 @@ class BleGattService : Service() {
                     break
                 }
 
-                // Read confirmation - this is synchronous in older Android APIs
-                if (gatt.readCharacteristic(confirmationChar)) {
-                    // Wait a bit for the read to complete
-                    delay(100)
+                try {
+                    if (gatt.readCharacteristic(confirmationChar)) {
+                        delay(100)
 
-                    // Use new API for Android 13+ (API 33+), fallback to deprecated API
-                    val confirmationBytes =
+                        val confirmationBytes = @Suppress("DEPRECATION") confirmationChar.value
+
+                        if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
+                            Log.d(TAG, "Received confirmation, stopping retransmission")
+                            break
+                        }
+                    }
+
+                    val retransmitSuccess =
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            // For API 33+, value is read via onCharacteristicRead callback
-                            // We'll check in the callback, so read current cached value here
-                            @Suppress("DEPRECATION") confirmationChar.value
+                            gatt.writeCharacteristic(
+                                responseChar,
+                                response,
+                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                            ) == BluetoothStatusCodes.SUCCESS
                         } else {
-                            @Suppress("DEPRECATION") confirmationChar.value
+                            @Suppress("DEPRECATION")
+                            responseChar.value = response
+                            @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
                         }
 
-                    if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
-                        Log.d(TAG, "Received confirmation, stopping retransmission")
+                    if (retransmitSuccess) {
+                        Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
+                    } else {
+                        Log.w(TAG, "Failed to retransmit BLE response - channel may be closing")
                         break
                     }
-                }
-
-                // Retransmit using new API for Android 13+ (API 33+)
-                val retransmitSuccess =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(
-                            responseChar,
-                            response,
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                        ) == BluetoothStatusCodes.SUCCESS
-                    } else {
-                        @Suppress("DEPRECATION")
-                        responseChar.value = response
-                        @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
-                    }
-
-                if (retransmitSuccess) {
-                    Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
-                } else {
-                    Log.w(TAG, "Failed to retransmit BLE response")
+                } catch (e: Exception) {
+                    Log.w(TAG, "BLE retransmission interrupted: ${e.message}")
                     break
                 }
             }
