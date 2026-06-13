@@ -44,9 +44,6 @@ class BleGattService : Service() {
             dev.rourunisen.tapauth.TapAuthApplication.FOREGROUND_NOTIFICATION_ID
 
         const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
-        const val EXTRA_DEVICE = "device"
-        const val EXTRA_TEMPORAL_ID = "temporal_id"
-        const val EXTRA_RSSI = "rssi"
 
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
@@ -517,14 +514,26 @@ class BleGattService : Service() {
                 .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
                 .build()
 
-        val intent = android.content.Intent(this, BleScanReceiver::class.java)
+        val intent =
+            android.content.Intent(this, BleGattService::class.java).apply {
+                action = ACTION_SCAN_RESULT
+            }
         val pi =
-            PendingIntent.getBroadcast(
-                this,
-                0,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    this,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+            } else {
+                PendingIntent.getService(
+                    this,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+            }
         scanPendingIntent = pi
 
         bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, pi)
@@ -1175,16 +1184,42 @@ class BleGattService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        BleScanReceiver.serviceRef = java.lang.ref.WeakReference(this)
         if (intent?.action == ACTION_SCAN_RESULT) {
             handleScanResultIntent(intent)
         }
         return START_STICKY
     }
 
-    fun handleScanResult(device: BluetoothDevice, temporalId: ByteArray, rssi: Int) {
-        if (temporalId.size != 10) return
+    private fun handleScanResultIntent(intent: Intent) {
+        val errorCode =
+            intent.getIntExtra(android.bluetooth.le.BluetoothLeScanner.EXTRA_ERROR_CODE, -1)
+        if (errorCode != -1) {
+            Log.e(TAG, "BLE scan failed with error: $errorCode")
+            return
+        }
 
+        val scanResults: List<android.bluetooth.le.ScanResult>? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(
+                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
+                    android.bluetooth.le.ScanResult::class.java,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra(
+                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT
+                )
+            }
+
+        scanResults?.forEach { result ->
+            val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+            if (serviceData != null && serviceData.size == 10) {
+                handleScanResult(result.device, serviceData, result.rssi)
+            }
+        }
+    }
+
+    private fun handleScanResult(device: BluetoothDevice, temporalId: ByteArray, rssi: Int) {
         val temporalIdHex = temporalId.toHex()
         Log.i(TAG, "Scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)")
 
@@ -1199,25 +1234,10 @@ class BleGattService : Service() {
         }
     }
 
-    private fun handleScanResultIntent(intent: Intent) {
-        val device: BluetoothDevice? =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(EXTRA_DEVICE, BluetoothDevice::class.java)
-            } else {
-                @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_DEVICE)
-            }
-        val temporalId = intent.getByteArrayExtra(EXTRA_TEMPORAL_ID)
-        val rssi = intent.getIntExtra(EXTRA_RSSI, 0)
-
-        if (device == null || temporalId == null || temporalId.size != 10) return
-        handleScanResult(device, temporalId, rssi)
-    }
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
-        BleScanReceiver.serviceRef = null
 
         // Unregister broadcast receiver
         try {

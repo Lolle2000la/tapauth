@@ -90,8 +90,6 @@
       android:exported="false"
       android:foregroundServiceType="connectedDevice"
     />
-    <!-- BLE scan result receiver for hardware-offloaded PendingIntent scanning -->
-    <receiver android:name=".ble.BleScanReceiver" android:exported="false" />
     <!-- Receiver to restart services after device boot -->
     <receiver android:name=".BootReceiver" android:exported="false">
       <intent-filter>
