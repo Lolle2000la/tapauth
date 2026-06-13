@@ -41,6 +41,11 @@ class BleScanReceiver : BroadcastReceiver() {
                 if (service != null) {
                     service.handleScanResult(result.device, serviceData, result.rssi)
                 } else {
+                    val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                    if (!config.bleRunning) {
+                        Log.d(TAG, "BLE service disabled by user, ignoring scan result")
+                        return
+                    }
                     val serviceIntent =
                         Intent(context, BleGattService::class.java).apply {
                             action = BleGattService.ACTION_SCAN_RESULT
