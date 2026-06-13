@@ -236,7 +236,13 @@ class AuthenticationService : Service() {
                         return@launch
                     }
                     val newSocket = tempSocket
-                    udpSocket = newSocket
+                    synchronized(multicastLockLock) {
+                        if (!isRunning || !isActive) {
+                            newSocket.close()
+                            return@launch
+                        }
+                        udpSocket = newSocket
+                    }
 
                     try {
                         newSocket.broadcast = true
