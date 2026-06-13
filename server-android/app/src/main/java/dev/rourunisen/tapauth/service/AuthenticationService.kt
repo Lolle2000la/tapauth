@@ -211,31 +211,27 @@ class AuthenticationService : Service() {
             try {
                 oldSocket?.close()
             } catch (_: Exception) {}
-
-            val newSocket: MulticastSocket
-            try {
-                newSocket = MulticastSocket(appConfig.udpPort)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to bind MulticastSocket, scheduling retry...", e)
-                udpSocket = null
-                serviceScope.launch {
-                    delay(5000)
-                    if (isRunning) {
-                        startListening()
-                    }
-                }
-                return
-            }
-            udpSocket = newSocket
+            udpSocket = null
 
             listenerJob =
                 serviceScope.launch {
                     oldJob?.cancelAndJoin()
-                    try {
-                        if (!isActive || !isRunning) {
-                            return@launch
-                        }
+                    if (!isActive || !isRunning) return@launch
 
+                    val newSocket: MulticastSocket
+                    try {
+                        newSocket = MulticastSocket(appConfig.udpPort)
+                        udpSocket = newSocket
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to bind MulticastSocket, scheduling retry...", e)
+                        delay(5000)
+                        if (isRunning) {
+                            startListening()
+                        }
+                        return@launch
+                    }
+
+                    try {
                         newSocket.broadcast = true
 
                         try {
