@@ -339,25 +339,11 @@ class AuthenticationService : Service() {
             rejoinJob?.cancel()
             rejoinJob = null
 
-            // Leave IPv6 multicast group before closing socket
             try {
-                NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-                    if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                        try {
-                            udpSocket?.leaveGroup(
-                                java.net.InetSocketAddress(IPV6_MULTICAST_GROUP, appConfig.udpPort),
-                                networkInterface,
-                            )
-                        } catch (e: Exception) {
-                            // Ignore errors on cleanup
-                        }
-                    }
-                }
+                udpSocket?.close()
             } catch (e: Exception) {
-                // Ignore errors on cleanup
+                Log.w(TAG, "Error closing socket: ${e.message}")
             }
-
-            udpSocket?.close()
             udpSocket = null
             Log.d(TAG, "Stopped listening")
             try {
@@ -411,6 +397,11 @@ class AuthenticationService : Service() {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
             }
+        // RECEIVER_EXPORTED is used intentionally: while AOSP documents that system broadcasts
+        // bypass the export flag, some OEM implementations (Samsung, Xiaomi, etc.) have been
+        // observed to not deliver ACTION_SCREEN_ON/OFF to NOT_EXPORTED receivers. Since these
+        // are protected broadcasts that only the system can send, spoofing is already prevented
+        // at the framework level regardless of the export flag.
         androidx.core.content.ContextCompat.registerReceiver(
             this,
             screenStateReceiver,
