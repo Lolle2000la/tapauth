@@ -32,20 +32,24 @@ class BleScanReceiver : BroadcastReceiver() {
                 intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
             }
 
+        val service = serviceRef?.get()
+        val isBleEnabled =
+            service != null ||
+                dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context).bleRunning
+
+        if (!isBleEnabled) {
+            Log.d(TAG, "BLE service disabled by user, ignoring scan results")
+            return
+        }
+
         scanResults?.forEach { result ->
             val serviceData =
                 result.scanRecord?.getServiceData(ParcelUuid(BleGattService.SERVICE_UUID))
             if (serviceData?.size == 10) {
                 Log.d(TAG, "Forwarding scan result to BleGattService")
-                val service = serviceRef?.get()
                 if (service != null) {
                     service.handleScanResult(result.device, serviceData, result.rssi)
                 } else {
-                    val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
-                    if (!config.bleRunning) {
-                        Log.d(TAG, "BLE service disabled by user, ignoring scan result")
-                        return
-                    }
                     val serviceIntent =
                         Intent(context, BleGattService::class.java).apply {
                             action = BleGattService.ACTION_SCAN_RESULT

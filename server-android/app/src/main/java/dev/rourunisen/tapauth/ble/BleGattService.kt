@@ -101,6 +101,9 @@ class BleGattService : Service() {
     private val activeConnectionsByChallenge =
         java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
 
+    // Store confirmation characteristic values from onCharacteristicRead callback (API 33+)
+    private val confirmationValues = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
     // BroadcastReceiver for handling cancellation requests
     private val cancelReceiver =
         object : android.content.BroadcastReceiver() {
@@ -214,14 +217,19 @@ class BleGattService : Service() {
                 value: ByteArray,
                 status: Int,
             ) {
-                if (
-                    status == BluetoothGatt.GATT_SUCCESS &&
-                        characteristic.uuid == CLIENT_COMMAND_CHAR_UUID
-                ) {
-                    Log.d(TAG, "Read authentication request from client: ${value.size} bytes")
-
-                    // Handle the incoming message (could be AuthRequest or AuthCancel)
-                    serviceScope.launch { handleIncomingBleMessage(gatt, value) }
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    when (characteristic.uuid) {
+                        CLIENT_COMMAND_CHAR_UUID -> {
+                            Log.d(
+                                TAG,
+                                "Read authentication request from client: ${value.size} bytes",
+                            )
+                            serviceScope.launch { handleIncomingBleMessage(gatt, value) }
+                        }
+                        CLIENT_CONFIRMATION_CHAR_UUID -> {
+                            confirmationValues[gatt.device.address] = value
+                        }
+                    }
                 }
             }
 
@@ -1118,10 +1126,13 @@ class BleGattService : Service() {
                 }
 
                 try {
+                    confirmationValues.remove(gatt.device.address)
                     if (gatt.readCharacteristic(confirmationChar)) {
                         delay(100)
 
-                        val confirmationBytes = @Suppress("DEPRECATION") confirmationChar.value
+                        val confirmationBytes =
+                            confirmationValues[gatt.device.address]
+                                ?: @Suppress("DEPRECATION") confirmationChar.value
 
                         if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
                             Log.d(TAG, "Received confirmation, stopping retransmission")
