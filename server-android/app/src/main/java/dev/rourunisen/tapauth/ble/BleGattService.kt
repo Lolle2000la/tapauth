@@ -125,6 +125,7 @@ class BleGattService : Service() {
 
     // Map of temporal IDs to device CSKs for quick lookup
     private val temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val cacheMutex = kotlinx.coroutines.sync.Mutex()
     private var cacheUpdateJob: Job? = null
     @Volatile private var bleLastComputedWindow: Long = -1
 
@@ -441,49 +442,61 @@ class BleGattService : Service() {
         val currentWindow = now / 60_000L
 
         if (currentWindow != bleLastComputedWindow) {
-            synchronized(temporalIdCache) {
+            cacheMutex.lock()
+            try {
                 if (currentWindow != bleLastComputedWindow) {
                     temporalIdCache.clear()
                     bleLastComputedWindow = currentWindow
                 }
+            } finally {
+                cacheMutex.unlock()
             }
         }
 
         val cached = temporalIdCache[temporalIdHex]
         if (cached != null) return cached
 
-        val pairedDevices = deviceRepository.getAllPairedDevices()
-        val currentTimestampSeconds = now / 1000
-        val previousTimestampSeconds = currentTimestampSeconds - 60
+        cacheMutex.lock()
+        try {
+            val doubleCheck = temporalIdCache[temporalIdHex]
+            if (doubleCheck != null) return doubleCheck
 
-        for (device in pairedDevices) {
-            try {
-                val currentId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        currentTimestampSeconds,
-                    )
-                val previousId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        previousTimestampSeconds,
-                    )
+            val pairedDevices = deviceRepository.getAllPairedDevices()
+            val currentTimestampSeconds = now / 1000
+            val previousTimestampSeconds = currentTimestampSeconds - 60
 
-                val cskHex = device.csk.toHex()
-                val currentIdHex = currentId.toHex()
-                val previousIdHex = previousId.toHex()
+            var matchedCsk: String? = null
+            for (device in pairedDevices) {
+                try {
+                    val currentId =
+                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                            device.csk,
+                            currentTimestampSeconds,
+                        )
+                    val previousId =
+                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                            device.csk,
+                            previousTimestampSeconds,
+                        )
 
-                temporalIdCache[currentIdHex] = cskHex
-                temporalIdCache[previousIdHex] = cskHex
+                    val cskHex = device.csk.toHex()
+                    val currentIdHex = currentId.toHex()
+                    val previousIdHex = previousId.toHex()
 
-                if (currentIdHex == temporalIdHex || previousIdHex == temporalIdHex) {
-                    return cskHex
+                    temporalIdCache[currentIdHex] = cskHex
+                    temporalIdCache[previousIdHex] = cskHex
+
+                    if (currentIdHex == temporalIdHex || previousIdHex == temporalIdHex) {
+                        matchedCsk = cskHex
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to verify temporal ID for device ${device.deviceId}", e)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to verify temporal ID for device ${device.deviceId}", e)
             }
+            return matchedCsk
+        } finally {
+            cacheMutex.unlock()
         }
-        return null
     }
 
     private fun startScanning() {
