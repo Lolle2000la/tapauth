@@ -490,13 +490,15 @@ class AuthenticationService : Service() {
      * quick succession (e.g., onAvailable followed by onCapabilitiesChanged).
      */
     private fun rejoinMulticastGroups() {
-        rejoinJob?.cancel()
-        rejoinJob =
-            serviceScope.launch {
-                delay(REJOIN_DEBOUNCE_MS)
-                Log.d(TAG, "Recreating UDP socket after network change")
-                startListening()
-            }
+        synchronized(multicastLockLock) {
+            rejoinJob?.cancel()
+            rejoinJob =
+                serviceScope.launch {
+                    delay(REJOIN_DEBOUNCE_MS)
+                    Log.d(TAG, "Recreating UDP socket after network change")
+                    startListening()
+                }
+        }
     }
 
     /** Handle incoming packet and route to appropriate handler based on message type */
