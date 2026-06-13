@@ -1128,11 +1128,16 @@ class BleGattService : Service() {
                 try {
                     confirmationValues.remove(gatt.device.address)
                     if (gatt.readCharacteristic(confirmationChar)) {
-                        delay(100)
-
-                        val confirmationBytes =
-                            confirmationValues[gatt.device.address]
-                                ?: @Suppress("DEPRECATION") confirmationChar.value
+                        var confirmationBytes: ByteArray? = null
+                        val pollStart = android.os.SystemClock.elapsedRealtime()
+                        while (android.os.SystemClock.elapsedRealtime() - pollStart < 300) {
+                            confirmationBytes = confirmationValues[gatt.device.address]
+                            if (confirmationBytes != null) break
+                            delay(20)
+                        }
+                        if (confirmationBytes == null) {
+                            confirmationBytes = @Suppress("DEPRECATION") confirmationChar.value
+                        }
 
                         if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
                             Log.d(TAG, "Received confirmation, stopping retransmission")
