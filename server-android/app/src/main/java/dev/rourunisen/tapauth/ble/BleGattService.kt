@@ -432,6 +432,7 @@ class BleGattService : Service() {
             }
         }
 
+        bleLastComputedWindow = System.currentTimeMillis() / 60_000L
         Log.i(
             TAG,
             "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
