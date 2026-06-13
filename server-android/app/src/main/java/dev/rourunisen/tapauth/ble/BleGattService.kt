@@ -1,13 +1,11 @@
 package dev.rourunisen.tapauth.ble
 
 import android.Manifest
-import android.app.Notification
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.*
 import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
@@ -24,6 +22,7 @@ import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import dev.rourunisen.tapauth.service.TransportLockManager
 import java.util.UUID
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
 
 /**
  * BLE GATT Service - Scanner/Central Role
@@ -43,6 +42,8 @@ class BleGattService : Service() {
         // Use the global shared notification ID to avoid duplicate notifications
         private const val NOTIFICATION_ID =
             dev.rourunisen.tapauth.TapAuthApplication.FOREGROUND_NOTIFICATION_ID
+
+        const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
 
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
@@ -97,6 +98,9 @@ class BleGattService : Service() {
     private val activeConnectionsByChallenge =
         java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
 
+    // Store confirmation characteristic values from onCharacteristicRead callback (API 33+)
+    private val confirmationValues = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
     // BroadcastReceiver for handling cancellation requests
     private val cancelReceiver =
         object : android.content.BroadcastReceiver() {
@@ -121,69 +125,12 @@ class BleGattService : Service() {
         }
 
     // Map of temporal IDs to device CSKs for quick lookup
-    private val temporalIdCache = mutableMapOf<String, String>()
+    @Volatile private var temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val cacheMutex = kotlinx.coroutines.sync.Mutex()
     private var cacheUpdateJob: Job? = null
+    @Volatile private var bleLastComputedWindow: Long = -1
 
-    // Track scan start time for latency measurement
-    private var scanStartTimeMillis: Long = 0
-
-    // Scan callback to discover client advertisements
-    private val scanCallback =
-        object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                super.onScanResult(callbackType, result)
-
-                val discoveryLatencyMs =
-                    if (scanStartTimeMillis > 0) {
-                        System.currentTimeMillis() - scanStartTimeMillis
-                    } else {
-                        -1L
-                    }
-
-                // Thanks to hardware filtering, we only receive advertisements with TapAuth
-                // service
-                // data
-                val scanRecord = result.scanRecord ?: return
-
-                // Extract the 10-byte temporal identifier from service data
-                val serviceData = scanRecord.getServiceData(ParcelUuid(SERVICE_UUID))
-                if (serviceData == null || serviceData.size != 10) {
-                    Log.w(
-                        TAG,
-                        "Received filtered result but service data is invalid (size: ${serviceData?.size})",
-                    )
-                    return
-                }
-
-                val temporalIdHex = serviceData.toHex()
-                Log.i(
-                    TAG,
-                    "Found TapAuth advertisement with temporal ID: ${temporalIdHex.take(20)}... (discovery latency: ${discoveryLatencyMs}ms, RSSI: ${result.rssi}dBm)",
-                )
-
-                // Check if this temporal ID matches any of our paired devices (from cache)
-                serviceScope.launch {
-                    val matchedCsk = temporalIdCache[temporalIdHex]
-                    if (matchedCsk != null) {
-                        Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                        connectToClient(result.device, matchedCsk)
-                    } else {
-                        Log.d(TAG, "Temporal ID does not match any paired device")
-                    }
-                }
-            }
-
-            override fun onScanFailed(errorCode: Int) {
-                super.onScanFailed(errorCode)
-                Log.e(TAG, "BLE scan failed with error: $errorCode")
-                dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning(
-                    { this@BleGattService },
-                    false,
-                )
-                updateNotification()
-                stopSelf()
-            }
-        }
+    private var scanPendingIntent: PendingIntent? = null
 
     // GATT client callback for connecting to client's GATT server
     private val gattCallback =
@@ -204,6 +151,8 @@ class BleGattService : Service() {
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         val deviceAddress = gatt.device.address
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
+
+                        confirmationValues.remove(deviceAddress)
 
                         // Cancel any pending authentication requests from this device
                         val authRequestManager =
@@ -267,14 +216,31 @@ class BleGattService : Service() {
                 value: ByteArray,
                 status: Int,
             ) {
-                if (
-                    status == BluetoothGatt.GATT_SUCCESS &&
-                        characteristic.uuid == CLIENT_COMMAND_CHAR_UUID
-                ) {
-                    Log.d(TAG, "Read authentication request from client: ${value.size} bytes")
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    when (characteristic.uuid) {
+                        CLIENT_COMMAND_CHAR_UUID -> {
+                            Log.d(
+                                TAG,
+                                "Read authentication request from client: ${value.size} bytes",
+                            )
+                            serviceScope.launch { handleIncomingBleMessage(gatt, value) }
+                        }
+                        CLIENT_CONFIRMATION_CHAR_UUID -> {
+                            confirmationValues[gatt.device.address] = value
+                        }
+                    }
+                }
+            }
 
-                    // Handle the incoming message (could be AuthRequest or AuthCancel)
-                    serviceScope.launch { handleIncomingBleMessage(gatt, value) }
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
+                    onCharacteristicRead(gatt, characteristic, value, status)
                 }
             }
 
@@ -453,20 +419,8 @@ class BleGattService : Service() {
     }
 
     private fun startTemporalIdCache() {
-        // Build cache of valid temporal IDs for all paired devices
         cacheUpdateJob?.cancel()
-        cacheUpdateJob =
-            serviceScope.launch {
-                while (isActive) {
-                    updateTemporalIdCache()
-
-                    // Wait until next 60-second boundary to update cache
-                    val now = System.currentTimeMillis()
-                    val nextBoundary = ((now / 60_000) + 1) * 60_000
-                    val delayMs = nextBoundary - now
-                    delay(delayMs)
-                }
-            }
+        cacheUpdateJob = serviceScope.launch { updateTemporalIdCache() }
     }
 
     private suspend fun updateTemporalIdCache() {
@@ -474,11 +428,10 @@ class BleGattService : Service() {
 
         val pairedDevices = deviceRepository.getAllPairedDevices()
         val currentTimestampSeconds = System.currentTimeMillis() / 1000
-        val previousTimestampSeconds = currentTimestampSeconds - 60 // Previous 60-second window
+        val previousTimestampSeconds = currentTimestampSeconds - 60
 
         for (device in pairedDevices) {
             try {
-                // Generate both current and previous temporal IDs (10 bytes for BLE)
                 val currentId =
                     dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
                         device.csk,
@@ -490,21 +443,64 @@ class BleGattService : Service() {
                         previousTimestampSeconds,
                     )
 
-                // Store CSK as hex string for later retrieval
                 val cskHex = device.csk.toHex()
                 temporalIdCache[currentId.toHex()] = cskHex
                 temporalIdCache[previousId.toHex()] = cskHex
-
-                Log.d(TAG, "Cached temporal IDs for device: ${device.displayName}")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to generate temporal ID for device ${device.deviceId}", e)
             }
         }
 
+        bleLastComputedWindow = System.currentTimeMillis() / 60_000L
         Log.i(
             TAG,
             "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
         )
+    }
+
+    private suspend fun matchTemporalIdOnDemand(temporalIdHex: String): String? {
+        val now = System.currentTimeMillis()
+        val currentWindow = now / 60_000L
+
+        if (currentWindow != bleLastComputedWindow) {
+            cacheMutex.withLock {
+                if (currentWindow != bleLastComputedWindow) {
+                    val newCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+                    val pairedDevices = deviceRepository.getAllPairedDevices()
+                    val currentTimestampSeconds = (currentWindow * 60_000L) / 1000
+                    val previousTimestampSeconds = currentTimestampSeconds - 60
+
+                    for (device in pairedDevices) {
+                        try {
+                            val currentId =
+                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                    device.csk,
+                                    currentTimestampSeconds,
+                                )
+                            val previousId =
+                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                    device.csk,
+                                    previousTimestampSeconds,
+                                )
+
+                            val cskHex = device.csk.toHex()
+                            newCache[currentId.toHex()] = cskHex
+                            newCache[previousId.toHex()] = cskHex
+                        } catch (e: Exception) {
+                            Log.e(
+                                TAG,
+                                "Failed to generate temporal ID for device ${device.deviceId}",
+                                e,
+                            )
+                        }
+                    }
+                    temporalIdCache = newCache
+                    bleLastComputedWindow = currentWindow
+                }
+            }
+        }
+
+        return temporalIdCache[temporalIdHex]
     }
 
     private fun startScanning() {
@@ -518,55 +514,44 @@ class BleGattService : Service() {
             return
         }
 
-        Log.i(TAG, "BLUETOOTH_SCAN permission granted")
-
-        // Use hardware-level filtering to only receive advertisements with TapAuth service data
-        // This dramatically reduces battery consumption by filtering at the Bluetooth chip level
-        //
-        // We filter for devices advertising service data with the TapAuth Service UUID.
-        // Since the temporal ID value changes every 60 seconds, we use a mask of all zeros
-        // which means "match any value" - we only care that the service data UUID is present.
-        // The actual temporal ID matching happens in the callback against our cache.
-        val filterData = ByteArray(10) { 0x00 } // 10-byte placeholder (matches any temporal ID)
-        val filterMask = ByteArray(10) { 0x00 } // All zeros = wildcard (don't care about value)
+        val filterData = ByteArray(10) { 0x00 }
+        val filterMask = ByteArray(10) { 0x00 }
 
         val scanFilter =
             ScanFilter.Builder()
                 .setServiceData(ParcelUuid(SERVICE_UUID), filterData, filterMask)
                 .build()
 
-        val scanFilters = listOf(scanFilter)
-
-        // Balanced scan settings for battery efficiency with reasonable discovery speed
-        // - SCAN_MODE_BALANCED: Good balance between battery and latency (~50% duty cycle)
-        //   Discovery time: 1-5 seconds (vs <500ms with LOW_LATENCY, but uses ~50% less battery)
-        // - CALLBACK_TYPE_ALL_MATCHES: Report every advertisement immediately
-        // - MATCH_MODE_AGGRESSIVE: Report after few sightings (faster)
-        // - MATCH_NUM_MAX_ADVERTISEMENT: Deliver maximum callbacks per filter match
-        // - setReportDelay(0L): No batching - immediate reporting
-        //
-        // For truly low latency (<500ms), use SCAN_MODE_LOW_LATENCY, but be aware:
-        // - It uses ~100% BLE radio duty cycle = significant battery drain
-        // - Only recommended if battery life is not a concern or scan is brief
         val scanSettings =
             ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
                 .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                .setReportDelay(0L) // Report immediately, no batching
                 .build()
 
-        Log.i(TAG, "Scanner object: $bluetoothLeScanner")
-        Log.i(TAG, "Callback object: $scanCallback")
-        Log.i(TAG, "Starting BLE scanning with service data filter (UUID: $SERVICE_UUID)")
+        val intent =
+            android.content.Intent(this, BleGattService::class.java).apply {
+                action = ACTION_SCAN_RESULT
+            }
+        val pi =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    this,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+            } else {
+                PendingIntent.getService(
+                    this,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                )
+            }
+        scanPendingIntent = pi
 
-        // Track scan start time for discovery latency measurement
-        scanStartTimeMillis = System.currentTimeMillis()
-
-        // Start scan with hardware-level filter
-        bluetoothLeScanner?.startScan(scanFilters, scanSettings, scanCallback)
-        Log.i(TAG, "BLE scanning started with hardware filter at ${scanStartTimeMillis}ms")
+        bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, pi)
+        Log.i(TAG, "BLE PendingIntent scanning started (hardware-offloaded)")
     }
 
     private fun stopScanning() {
@@ -574,9 +559,10 @@ class BleGattService : Service() {
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) ==
                 PackageManager.PERMISSION_GRANTED
         ) {
-            bluetoothLeScanner?.stopScan(scanCallback)
+            scanPendingIntent?.let { bluetoothLeScanner?.stopScan(it) }
             Log.i(TAG, "BLE scanning stopped")
         }
+        scanPendingIntent = null
         cacheUpdateJob?.cancel()
     }
 
@@ -590,7 +576,11 @@ class BleGattService : Service() {
         }
 
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
-        device.connectGatt(this, false, gattCallback)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(this, false, gattCallback)
+        }
     }
 
     private suspend fun handleIncomingBleMessage(gatt: BluetoothGatt, data: ByteArray) {
@@ -1149,7 +1139,6 @@ class BleGattService : Service() {
                 delay(500) // 500ms interval per spec
                 attempt++
 
-                // Try to read confirmation characteristic
                 if (
                     ActivityCompat.checkSelfPermission(
                         this@BleGattService,
@@ -1159,56 +1148,116 @@ class BleGattService : Service() {
                     break
                 }
 
-                // Read confirmation - this is synchronous in older Android APIs
-                if (gatt.readCharacteristic(confirmationChar)) {
-                    // Wait a bit for the read to complete
-                    delay(100)
-
-                    // Use new API for Android 13+ (API 33+), fallback to deprecated API
-                    val confirmationBytes =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            // For API 33+, value is read via onCharacteristicRead callback
-                            // We'll check in the callback, so read current cached value here
-                            @Suppress("DEPRECATION") confirmationChar.value
-                        } else {
-                            @Suppress("DEPRECATION") confirmationChar.value
-                        }
-
-                    if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
-                        Log.d(TAG, "Received confirmation, stopping retransmission")
+                try {
+                    val address = gatt.device.address
+                    if (attempt == 1) {
+                        confirmationValues.remove(address)
+                    }
+                    val earlyConfirmation = confirmationValues[address]
+                    if (earlyConfirmation != null && earlyConfirmation.isNotEmpty()) {
+                        Log.d(TAG, "Received confirmation (early check), stopping retransmission")
                         break
                     }
-                }
 
-                // Retransmit using new API for Android 13+ (API 33+)
-                val retransmitSuccess =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(
-                            responseChar,
-                            response,
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                        ) == BluetoothStatusCodes.SUCCESS
-                    } else {
-                        @Suppress("DEPRECATION")
-                        responseChar.value = response
-                        @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
+                    confirmationValues.remove(address)
+
+                    if (gatt.readCharacteristic(confirmationChar)) {
+                        var confirmationBytes: ByteArray? = null
+                        val pollStart = android.os.SystemClock.elapsedRealtime()
+                        while (android.os.SystemClock.elapsedRealtime() - pollStart < 300) {
+                            confirmationBytes = confirmationValues[address]
+                            if (confirmationBytes != null) break
+                            delay(20)
+                        }
+                        if (confirmationBytes == null) {
+                            confirmationBytes = @Suppress("DEPRECATION") confirmationChar.value
+                        }
+
+                        if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
+                            Log.d(TAG, "Received confirmation, stopping retransmission")
+                            break
+                        }
                     }
 
-                if (retransmitSuccess) {
-                    Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
-                } else {
-                    Log.w(TAG, "Failed to retransmit BLE response")
+                    val retransmitSuccess =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(
+                                responseChar,
+                                response,
+                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                            ) == BluetoothStatusCodes.SUCCESS
+                        } else {
+                            @Suppress("DEPRECATION")
+                            responseChar.value = response
+                            @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
+                        }
+
+                    if (retransmitSuccess) {
+                        Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
+                    } else {
+                        Log.w(TAG, "Failed to retransmit BLE response - channel may be closing")
+                        break
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "BLE retransmission interrupted: ${e.message}")
                     break
                 }
             }
 
             Log.d(TAG, "BLE retransmission ended after $attempt attempts")
+            confirmationValues.remove(gatt.device.address)
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "BLE GATT Service started (Scanner/Central mode)")
+        if (intent?.action == ACTION_SCAN_RESULT) {
+            handleScanResultIntent(intent)
+        }
         return START_STICKY
+    }
+
+    private fun handleScanResultIntent(intent: Intent) {
+        val errorCode =
+            intent.getIntExtra(android.bluetooth.le.BluetoothLeScanner.EXTRA_ERROR_CODE, -1)
+        if (errorCode != -1) {
+            Log.e(TAG, "BLE scan failed with error: $errorCode")
+            return
+        }
+
+        val scanResults: List<android.bluetooth.le.ScanResult>? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(
+                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
+                    android.bluetooth.le.ScanResult::class.java,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra(
+                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT
+                )
+            }
+
+        scanResults?.forEach { result ->
+            val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+            if (serviceData != null && serviceData.size == 10) {
+                handleScanResult(result.device, serviceData, result.rssi)
+            }
+        }
+    }
+
+    private fun handleScanResult(device: BluetoothDevice, temporalId: ByteArray, rssi: Int) {
+        val temporalIdHex = temporalId.toHex()
+        Log.i(TAG, "Scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)")
+
+        serviceScope.launch {
+            val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
+            if (matchedCsk != null) {
+                Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                withContext(Dispatchers.Main) { connectToClient(device, matchedCsk) }
+            } else {
+                Log.d(TAG, "Temporal ID does not match any paired device")
+            }
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -24,6 +24,7 @@
   <!-- Foreground service permission for authentication listener -->
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
   <!-- Allow app to start services after device boot so background listeners resume -->
   <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -80,7 +81,7 @@
       android:name=".service.AuthenticationService"
       android:enabled="true"
       android:exported="false"
-      android:foregroundServiceType="connectedDevice"
+      android:foregroundServiceType="remoteMessaging"
     />
     <!-- BLE GATT Service -->
     <service
