@@ -1149,12 +1149,21 @@ class BleGattService : Service() {
                 }
 
                 try {
-                    confirmationValues.remove(gatt.device.address)
+                    val address = gatt.device.address
+                    if (attempt == 1) {
+                        confirmationValues.remove(address)
+                    }
+                    val earlyConfirmation = confirmationValues[address]
+                    if (earlyConfirmation != null && earlyConfirmation.isNotEmpty()) {
+                        Log.d(TAG, "Received confirmation (early check), stopping retransmission")
+                        break
+                    }
+
                     if (gatt.readCharacteristic(confirmationChar)) {
                         var confirmationBytes: ByteArray? = null
                         val pollStart = android.os.SystemClock.elapsedRealtime()
                         while (android.os.SystemClock.elapsedRealtime() - pollStart < 300) {
-                            confirmationBytes = confirmationValues[gatt.device.address]
+                            confirmationBytes = confirmationValues[address]
                             if (confirmationBytes != null) break
                             delay(20)
                         }
