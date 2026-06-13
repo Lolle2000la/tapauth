@@ -207,6 +207,7 @@ class AuthenticationService : Service() {
             }
 
             val oldJob = listenerJob
+            oldJob?.cancel()
             val oldSocket = udpSocket
             try {
                 oldSocket?.close()
@@ -215,12 +216,18 @@ class AuthenticationService : Service() {
 
             listenerJob =
                 serviceScope.launch {
-                    oldJob?.cancelAndJoin()
+                    try {
+                        oldJob?.join()
+                    } catch (_: Exception) {}
                     if (!isActive || !isRunning) return@launch
 
                     val newSocket: MulticastSocket
                     try {
                         newSocket = MulticastSocket(appConfig.udpPort)
+                        if (!isActive) {
+                            newSocket.close()
+                            return@launch
+                        }
                         udpSocket = newSocket
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to bind MulticastSocket, scheduling retry...", e)
