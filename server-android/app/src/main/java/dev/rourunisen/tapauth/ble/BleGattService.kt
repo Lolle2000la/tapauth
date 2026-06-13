@@ -22,6 +22,7 @@ import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import dev.rourunisen.tapauth.service.TransportLockManager
 import java.util.UUID
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
 
 /**
  * BLE GATT Service - Scanner/Central Role
@@ -442,61 +443,43 @@ class BleGattService : Service() {
         val currentWindow = now / 60_000L
 
         if (currentWindow != bleLastComputedWindow) {
-            cacheMutex.lock()
-            try {
+            cacheMutex.withLock {
                 if (currentWindow != bleLastComputedWindow) {
                     temporalIdCache.clear()
+                    val pairedDevices = deviceRepository.getAllPairedDevices()
+                    val currentTimestampSeconds = (currentWindow * 60_000L) / 1000
+                    val previousTimestampSeconds = currentTimestampSeconds - 60
+
+                    for (device in pairedDevices) {
+                        try {
+                            val currentId =
+                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                    device.csk,
+                                    currentTimestampSeconds,
+                                )
+                            val previousId =
+                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
+                                    device.csk,
+                                    previousTimestampSeconds,
+                                )
+
+                            val cskHex = device.csk.toHex()
+                            temporalIdCache[currentId.toHex()] = cskHex
+                            temporalIdCache[previousId.toHex()] = cskHex
+                        } catch (e: Exception) {
+                            Log.e(
+                                TAG,
+                                "Failed to generate temporal ID for device ${device.deviceId}",
+                                e,
+                            )
+                        }
+                    }
                     bleLastComputedWindow = currentWindow
                 }
-            } finally {
-                cacheMutex.unlock()
             }
         }
 
-        val cached = temporalIdCache[temporalIdHex]
-        if (cached != null) return cached
-
-        cacheMutex.lock()
-        try {
-            val doubleCheck = temporalIdCache[temporalIdHex]
-            if (doubleCheck != null) return doubleCheck
-
-            val pairedDevices = deviceRepository.getAllPairedDevices()
-            val currentTimestampSeconds = now / 1000
-            val previousTimestampSeconds = currentTimestampSeconds - 60
-
-            var matchedCsk: String? = null
-            for (device in pairedDevices) {
-                try {
-                    val currentId =
-                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                            device.csk,
-                            currentTimestampSeconds,
-                        )
-                    val previousId =
-                        dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                            device.csk,
-                            previousTimestampSeconds,
-                        )
-
-                    val cskHex = device.csk.toHex()
-                    val currentIdHex = currentId.toHex()
-                    val previousIdHex = previousId.toHex()
-
-                    temporalIdCache[currentIdHex] = cskHex
-                    temporalIdCache[previousIdHex] = cskHex
-
-                    if (currentIdHex == temporalIdHex || previousIdHex == temporalIdHex) {
-                        matchedCsk = cskHex
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to verify temporal ID for device ${device.deviceId}", e)
-                }
-            }
-            return matchedCsk
-        } finally {
-            cacheMutex.unlock()
-        }
+        return temporalIdCache[temporalIdHex]
     }
 
     private fun startScanning() {

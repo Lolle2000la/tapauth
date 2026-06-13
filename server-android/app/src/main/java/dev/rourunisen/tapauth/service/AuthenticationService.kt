@@ -404,7 +404,7 @@ class AuthenticationService : Service() {
             this,
             screenStateReceiver,
             filter,
-            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+            androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
         )
         Log.d(TAG, "Registered screen state receiver")
     }
