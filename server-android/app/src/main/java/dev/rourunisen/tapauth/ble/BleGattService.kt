@@ -152,6 +152,8 @@ class BleGattService : Service() {
                         val deviceAddress = gatt.device.address
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
+                        confirmationValues.remove(deviceAddress)
+
                         // Cancel any pending authentication requests from this device
                         val authRequestManager =
                             dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
@@ -227,6 +229,18 @@ class BleGattService : Service() {
                             confirmationValues[gatt.device.address] = value
                         }
                     }
+                }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
+                    onCharacteristicRead(gatt, characteristic, value, status)
                 }
             }
 
@@ -1180,6 +1194,7 @@ class BleGattService : Service() {
             }
 
             Log.d(TAG, "BLE retransmission ended after $attempt attempts")
+            confirmationValues.remove(gatt.device.address)
         }
     }
 
@@ -1227,7 +1242,7 @@ class BleGattService : Service() {
             val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
             if (matchedCsk != null) {
                 Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                connectToClient(device, matchedCsk)
+                withContext(Dispatchers.Main) { connectToClient(device, matchedCsk) }
             } else {
                 Log.d(TAG, "Temporal ID does not match any paired device")
             }
