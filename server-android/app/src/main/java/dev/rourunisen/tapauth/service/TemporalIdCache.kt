@@ -26,7 +26,7 @@ class TemporalIdCache(
 ) {
 
     // Maps temporal_id (hex string) -> client device ID
-    private val validIds = ConcurrentHashMap<String, String>()
+    @Volatile private var validIds = ConcurrentHashMap<String, String>()
 
     @Volatile private var cachedDevices: List<CachedDevice> = emptyList()
     @Volatile private var lastComputedWindow: Long = -1
@@ -37,7 +37,7 @@ class TemporalIdCache(
 
     fun start() {
         stop()
-        scope.launch { refreshDeviceList() }
+        deviceRefreshJob = scope.launch { refreshDeviceList() }
         Log.d(TAG, "Started temporal ID cache")
     }
 
@@ -82,7 +82,11 @@ class TemporalIdCache(
         val currentWindow = now / TIME_WINDOW_MS
 
         if (currentWindow != lastComputedWindow) {
-            recomputeCache(currentWindow)
+            synchronized(this) {
+                if (currentWindow != lastComputedWindow) {
+                    recomputeCache(currentWindow)
+                }
+            }
         }
     }
 
@@ -94,26 +98,27 @@ class TemporalIdCache(
         }
 
         val previousWindow = currentWindow - 1
-        validIds.clear()
+        val newIds = ConcurrentHashMap<String, String>()
 
         for (device in devices) {
             try {
                 val currentIdHex =
                     generateTemporalIdentifier(device.csk, currentWindow * TIME_WINDOW_MS)
-                validIds[currentIdHex] = device.deviceId
+                newIds[currentIdHex] = device.deviceId
 
                 val previousIdHex =
                     generateTemporalIdentifier(device.csk, previousWindow * TIME_WINDOW_MS)
-                validIds[previousIdHex] = device.deviceId
+                newIds[previousIdHex] = device.deviceId
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
             }
         }
 
+        validIds = newIds
         lastComputedWindow = currentWindow
         Log.d(
             TAG,
-            "Recomputed cache on-demand: ${validIds.size} valid IDs for ${devices.size} devices",
+            "Recomputed cache on-demand: ${newIds.size} valid IDs for ${devices.size} devices",
         )
     }
 

@@ -206,8 +206,9 @@ class AuthenticationService : Service() {
         }
 
         val oldJob = listenerJob
+        val oldSocket = udpSocket
         try {
-            udpSocket?.close()
+            oldSocket?.close()
         } catch (_: Exception) {}
         udpSocket = null
         listenerJob =
@@ -353,6 +354,7 @@ class AuthenticationService : Service() {
     }
 
     private fun acquireMulticastLock() {
+        if (!isRunning) return
         synchronized(multicastLockLock) {
             if (multicastLock == null) {
                 try {
@@ -396,7 +398,12 @@ class AuthenticationService : Service() {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
             }
-        registerReceiver(screenStateReceiver, filter)
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            screenStateReceiver,
+            filter,
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         Log.d(TAG, "Registered screen state receiver")
     }
 
