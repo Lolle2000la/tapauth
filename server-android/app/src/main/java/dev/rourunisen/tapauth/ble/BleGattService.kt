@@ -126,6 +126,7 @@ class BleGattService : Service() {
     // Map of temporal IDs to device CSKs for quick lookup
     private val temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var cacheUpdateJob: Job? = null
+    @Volatile private var bleLastComputedWindow: Long = -1
 
     private var scanPendingIntent: PendingIntent? = null
 
@@ -436,11 +437,23 @@ class BleGattService : Service() {
     }
 
     private suspend fun matchTemporalIdOnDemand(temporalIdHex: String): String? {
+        val now = System.currentTimeMillis()
+        val currentWindow = now / 60_000L
+
+        if (currentWindow != bleLastComputedWindow) {
+            synchronized(temporalIdCache) {
+                if (currentWindow != bleLastComputedWindow) {
+                    temporalIdCache.clear()
+                    bleLastComputedWindow = currentWindow
+                }
+            }
+        }
+
         val cached = temporalIdCache[temporalIdHex]
         if (cached != null) return cached
 
         val pairedDevices = deviceRepository.getAllPairedDevices()
-        val currentTimestampSeconds = System.currentTimeMillis() / 1000
+        val currentTimestampSeconds = now / 1000
         val previousTimestampSeconds = currentTimestampSeconds - 60
 
         for (device in pairedDevices) {
@@ -457,9 +470,13 @@ class BleGattService : Service() {
                     )
 
                 val cskHex = device.csk.toHex()
-                if (currentId.toHex() == temporalIdHex || previousId.toHex() == temporalIdHex) {
-                    temporalIdCache[currentId.toHex()] = cskHex
-                    temporalIdCache[previousId.toHex()] = cskHex
+                val currentIdHex = currentId.toHex()
+                val previousIdHex = previousId.toHex()
+
+                temporalIdCache[currentIdHex] = cskHex
+                temporalIdCache[previousIdHex] = cskHex
+
+                if (currentIdHex == temporalIdHex || previousIdHex == temporalIdHex) {
                     return cskHex
                 }
             } catch (e: Exception) {

@@ -125,9 +125,12 @@ class TemporalIdCache(
     suspend fun refreshDeviceList() {
         try {
             val pairedDevices = deviceRepository.getAllPairedDevices()
-            cachedDevices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
-            lastComputedWindow = -1
-            ensureCacheIsCurrent()
+            val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
+            synchronized(this) {
+                cachedDevices = mapped
+                lastComputedWindow = -1
+                ensureCacheIsCurrent()
+            }
             Log.d(TAG, "Refreshed device list: ${cachedDevices.size} paired devices")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to refresh device list", e)
