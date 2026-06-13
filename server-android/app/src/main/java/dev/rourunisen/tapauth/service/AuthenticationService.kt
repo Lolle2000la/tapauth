@@ -216,8 +216,14 @@ class AuthenticationService : Service() {
             try {
                 newSocket = MulticastSocket(appConfig.udpPort)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to bind MulticastSocket", e)
+                Log.e(TAG, "Failed to bind MulticastSocket, scheduling retry...", e)
                 udpSocket = null
+                serviceScope.launch {
+                    delay(5000)
+                    if (isRunning) {
+                        startListening()
+                    }
+                }
                 return
             }
             udpSocket = newSocket
