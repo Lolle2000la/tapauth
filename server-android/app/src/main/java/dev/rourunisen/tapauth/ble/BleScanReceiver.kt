@@ -8,11 +8,13 @@ import android.content.Intent
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import java.lang.ref.WeakReference
 
 class BleScanReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "BleScanReceiver"
+        @Volatile var serviceRef: WeakReference<BleGattService>? = null
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -35,17 +37,26 @@ class BleScanReceiver : BroadcastReceiver() {
                 result.scanRecord?.getServiceData(ParcelUuid(BleGattService.SERVICE_UUID))
             if (serviceData?.size == 10) {
                 Log.d(TAG, "Forwarding scan result to BleGattService")
-                val serviceIntent =
-                    Intent(context, BleGattService::class.java).apply {
-                        action = BleGattService.ACTION_SCAN_RESULT
-                        putExtra(BleGattService.EXTRA_DEVICE, result.device)
-                        putExtra(BleGattService.EXTRA_TEMPORAL_ID, serviceData)
-                        putExtra(BleGattService.EXTRA_RSSI, result.rssi)
-                    }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(serviceIntent)
+                val service = serviceRef?.get()
+                if (service != null) {
+                    service.handleScanResult(result.device, serviceData, result.rssi)
                 } else {
-                    context.startService(serviceIntent)
+                    val serviceIntent =
+                        Intent(context, BleGattService::class.java).apply {
+                            action = BleGattService.ACTION_SCAN_RESULT
+                            putExtra(BleGattService.EXTRA_DEVICE, result.device)
+                            putExtra(BleGattService.EXTRA_TEMPORAL_ID, serviceData)
+                            putExtra(BleGattService.EXTRA_RSSI, result.rssi)
+                        }
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            context.startForegroundService(serviceIntent)
+                        } else {
+                            context.startService(serviceIntent)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start BleGattService from background", e)
+                    }
                 }
             }
         }

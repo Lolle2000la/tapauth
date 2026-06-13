@@ -124,7 +124,7 @@ class BleGattService : Service() {
         }
 
     // Map of temporal IDs to device CSKs for quick lookup
-    private val temporalIdCache = mutableMapOf<String, String>()
+    private val temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var cacheUpdateJob: Job? = null
 
     private var scanPendingIntent: PendingIntent? = null
@@ -1147,10 +1147,28 @@ class BleGattService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        BleScanReceiver.serviceRef = java.lang.ref.WeakReference(this)
         if (intent?.action == ACTION_SCAN_RESULT) {
             handleScanResultIntent(intent)
         }
         return START_STICKY
+    }
+
+    fun handleScanResult(device: BluetoothDevice, temporalId: ByteArray, rssi: Int) {
+        if (temporalId.size != 10) return
+
+        val temporalIdHex = temporalId.toHex()
+        Log.i(TAG, "Scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)")
+
+        serviceScope.launch {
+            val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
+            if (matchedCsk != null) {
+                Log.i(TAG, "Temporal ID matches paired device, connecting...")
+                connectToClient(device, matchedCsk)
+            } else {
+                Log.d(TAG, "Temporal ID does not match any paired device")
+            }
+        }
     }
 
     private fun handleScanResultIntent(intent: Intent) {
@@ -1164,28 +1182,14 @@ class BleGattService : Service() {
         val rssi = intent.getIntExtra(EXTRA_RSSI, 0)
 
         if (device == null || temporalId == null || temporalId.size != 10) return
-
-        val temporalIdHex = temporalId.toHex()
-        Log.i(
-            TAG,
-            "PendingIntent scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)",
-        )
-
-        serviceScope.launch {
-            val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
-            if (matchedCsk != null) {
-                Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                connectToClient(device, matchedCsk)
-            } else {
-                Log.d(TAG, "Temporal ID does not match any paired device")
-            }
-        }
+        handleScanResult(device, temporalId, rssi)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
+        BleScanReceiver.serviceRef = null
 
         // Unregister broadcast receiver
         try {

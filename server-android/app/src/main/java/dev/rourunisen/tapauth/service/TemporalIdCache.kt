@@ -93,7 +93,7 @@ class TemporalIdCache(
     private fun recomputeCache(currentWindow: Long) {
         val devices = cachedDevices
         if (devices.isEmpty()) {
-            scope.launch { refreshDeviceList() }
+            lastComputedWindow = currentWindow
             return
         }
 
