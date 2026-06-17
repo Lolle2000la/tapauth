@@ -71,7 +71,9 @@ mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/local/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
-    [ "$filename" = "system-auth" ] || [ "$filename" = "password-auth" ] || [ "$filename" = "README" ] && continue
+    case "$filename" in
+        system-auth|password-auth|README) continue ;;
+    esac
     ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
@@ -90,7 +92,9 @@ mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
 for f in %{_datadir}/authselect/default/sssd/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
-    [ "$filename" = "system-auth" ] || [ "$filename" = "password-auth" ] || [ "$filename" = "README" ] && continue
+    case "$filename" in
+        system-auth|password-auth|README) continue ;;
+    esac
     ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
@@ -136,7 +140,7 @@ if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
         target_profile="local"
         [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
         features=$(authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
-        authselect select "$target_profile" $features --force
+        authselect select "$target_profile" $features --force || true
     fi
 fi
 %endif
