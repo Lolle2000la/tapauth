@@ -20,6 +20,8 @@ sudo dnf install tapauth
   # For environments using SSSD (FreeIPA, Active Directory, LDAP):
   sudo authselect select vendor/tapauth-sssd
   ```
+  > **Warning:** Switching profiles will reset any currently enabled authselect features (e.g., fingerprint reader, smartcard, or MFA). To preserve them, check your active features first with `authselect current` and append them to the command (for example: `sudo authselect select vendor/tapauth with-fingerprint`).
+
   You can verify the available profiles with `authselect list` after installation. To revert to the default Fedora profile, run `sudo authselect select local` (or `sssd` if that was your previous profile).
 
 ### 2. Ubuntu
