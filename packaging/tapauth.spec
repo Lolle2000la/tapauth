@@ -74,7 +74,8 @@ for f in %{_datadir}/authselect/default/local/*; do
     ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
 rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
-cp -p %{_datadir}/authselect/default/local/system-auth %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/
+install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
@@ -88,7 +89,8 @@ for f in %{_datadir}/authselect/default/sssd/*; do
     ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
 rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
-cp -p %{_datadir}/authselect/default/sssd/system-auth %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/
+install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
 if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth; then
     sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 else
