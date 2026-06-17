@@ -15,6 +15,10 @@ ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  clang
+%if 0%{?fedora} || 0%{?rhel}
+BuildRequires:  authselect
+Requires:       authselect
+%endif
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
 %else
@@ -61,6 +65,51 @@ install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
 install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
 install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
 
+%if 0%{?fedora} || 0%{?rhel}
+# Authselect Vendor Profile Generation
+mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
+for f in %{_datadir}/authselect/default/local/*; do
+    [ -e "$f" ] || continue
+    filename=$(basename "$f")
+    case "$filename" in
+        system-auth|password-auth|README) continue ;;
+    esac
+    ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
+done
+install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth; then
+    sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+else
+    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+fi
+sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth || exit 1
+printf "TapAuth Local Authentication\n\nThis profile extends the default local profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
+
+mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
+for f in %{_datadir}/authselect/default/sssd/*; do
+    [ -e "$f" ] || continue
+    filename=$(basename "$f")
+    case "$filename" in
+        system-auth|password-auth|README) continue ;;
+    esac
+    ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
+done
+install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth; then
+    sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+else
+    sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+fi
+sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth || exit 1
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth || exit 1
+printf "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
+%endif
+
 # System Services
 install -m 0644 systemd/tapauthd.service %{buildroot}%{_unitdir}/tapauthd.service
 install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
@@ -84,6 +133,17 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
+%if 0%{?fedora} || 0%{?rhel}
+if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
+    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
+    if [ "$current_profile" = "vendor/tapauth" ] || [ "$current_profile" = "vendor/tapauth-sssd" ]; then
+        target_profile="local"
+        [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
+        features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
+        authselect select "$target_profile" $features --force || true
+    fi
+fi
+%endif
 
 %postun
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
@@ -105,3 +165,7 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
+%if 0%{?fedora} || 0%{?rhel}
+%{_datadir}/authselect/vendor/tapauth
+%{_datadir}/authselect/vendor/tapauth-sssd
+%endif

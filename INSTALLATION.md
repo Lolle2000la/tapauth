@@ -12,7 +12,17 @@ Packages are built and tracked using Fedora COPR.
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
 ```
-* **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. A reference PAM config is installed at `/usr/share/doc/tapauth/pam-config.example`. To integrate TapAuth, create a custom authselect profile based on your current setup and add `auth sufficient pam_tapauth.so` to the profile's system-auth template.
+* **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. The package ships ready-made authselect vendor profiles that you can enable with a single command:
+  ```bash
+  # For standard workstations (local accounts, Fedora 40+):
+  sudo authselect select vendor/tapauth
+
+  # For environments using SSSD (FreeIPA, Active Directory, LDAP):
+  sudo authselect select vendor/tapauth-sssd
+  ```
+  > **Warning:** Switching profiles will reset any currently enabled authselect features (e.g., fingerprint reader, smartcard, or MFA). To preserve them, check your active features first with `authselect current` and append them to the command (for example: `sudo authselect select vendor/tapauth with-fingerprint`).
+
+  You can verify the available profiles with `authselect list` after installation. To revert to the default Fedora profile, run `sudo authselect select local` (or `sssd` if that was your previous profile).
 
 ### 2. Ubuntu
 Packages are published via a Launchpad Personal Package Archive (PPA).
