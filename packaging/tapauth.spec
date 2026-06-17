@@ -71,9 +71,9 @@ mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/local/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
+    [ "$filename" = "system-auth" ] || [ "$filename" = "password-auth" ] || [ "$filename" = "README" ] && continue
     ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
-rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
 install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
@@ -86,17 +86,17 @@ mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
 for f in %{_datadir}/authselect/default/sssd/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
+    [ "$filename" = "system-auth" ] || [ "$filename" = "password-auth" ] || [ "$filename" = "README" ] && continue
     ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
-rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
 install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
 if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth; then
     sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 else
-    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+    sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 fi
-sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth || exit 1
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth || exit 1
 printf "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
