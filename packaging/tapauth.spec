@@ -76,7 +76,11 @@ for f in %{_datadir}/authselect/default/local/*; do
 done
 install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
-sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth; then
+    sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+else
+    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+fi
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth || exit 1
@@ -127,10 +131,12 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %systemd_preun tapauthd.service tapauthd.socket
 %if 0%{?fedora} || 0%{?rhel}
 if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
-    if authselect current | grep -q "vendor/tapauth-sssd"; then
-        authselect select sssd --force
-    elif authselect current | grep -q "vendor/tapauth"; then
-        authselect select local --force
+    current_profile=$(authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
+    if [ "$current_profile" = "vendor/tapauth" ] || [ "$current_profile" = "vendor/tapauth-sssd" ]; then
+        target_profile="local"
+        [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
+        features=$(authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
+        authselect select "$target_profile" $features --force
     fi
 fi
 %endif
