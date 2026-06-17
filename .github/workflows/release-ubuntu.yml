@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Initialize System Build Dependencies
         run: |
@@ -39,8 +41,20 @@ jobs:
           else
             TAG_NAME="${GITHUB_REF_NAME}"
           fi
-          CLEAN_VER="${TAG_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          BASE_VER="${TAG_NAME#v}"
+          
+          GIT_DESC=$(git describe --long --tags --match "v*" 2>/dev/null || echo "v0.1.0-0-g$(git rev-parse --short HEAD)")
+          COMMIT_COUNT=$(echo "$GIT_DESC" | sed -E 's/v[0-9.]+-([0-9]+)-.*/\1/')
+          SHORT_SHA=$(echo "$GIT_DESC" | sed -E 's/v[0-9.]+-[0-9]+-g(.*)/\1/')
+          
+          if [ "$COMMIT_COUNT" -eq "0" ]; then
+            DEB_VERSION="${BASE_VER}"
+          else
+            DEB_VERSION="${BASE_VER}+git${COMMIT_COUNT}.${SHORT_SHA}"
+          fi
+          
+          echo "VERSION=${BASE_VER}" >> "$GITHUB_OUTPUT"
+          echo "DEB_VERSION=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,7 +82,7 @@ jobs:
 
       - name: Build Signed Debian Source Manifest Asset
         run: |
-          VERSION="${{ steps.version_vars.outputs.VERSION }}"
+          DEB_VER="${{ steps.version_vars.outputs.DEB_VERSION }}"
           mkdir -p debian/source
           echo "3.0 (quilt)" > debian/source/format
 
@@ -178,11 +192,11 @@ jobs:
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))
           cd ..
-          tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" --exclude="${PARENT_DIR}/rpmbuild" -czf tapauth_${VERSION}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${VERSION}/"
+          tar --exclude="${PARENT_DIR}/debian" --exclude="${PARENT_DIR}/.git" --exclude="${PARENT_DIR}/target" --exclude="${PARENT_DIR}/rpmbuild" -czf tapauth_${DEB_VER}.orig.tar.gz "${PARENT_DIR}" --transform "s/^${PARENT_DIR}/tapauth-${DEB_VER}/"
 
           # dpkg-buildpackage requires the working directory to match the source-version scheme
-          ln -s "${PARENT_DIR}" "tapauth-${VERSION}"
-          cd "tapauth-${VERSION}"
+          ln -s "${PARENT_DIR}" "tapauth-${DEB_VER}"
+          cd "tapauth-${DEB_VER}"
 
           ACTIVE_SERIES=""
           for SERIES in $(ubuntu-distro-info --supported 2>/dev/null); do
@@ -199,13 +213,13 @@ jobs:
           FIRST_UPLOAD_DONE=0
           for SERIES in ${ACTIVE_SERIES}; do
             rm -f debian/changelog
-            dch --create --package tapauth -v "${VERSION}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated production packaging update."
+            dch --create --package tapauth -v "${DEB_VER}-1~ppa1~${SERIES}1" --distribution "${SERIES}" "Automated packaging update."
             dpkg-buildpackage -S -us -uc -d
 
             # The orig tarball is identical across series — Launchpad
             # rejects duplicate uploads, so strip it before signing
             if [ "${FIRST}" != "1" ]; then
-              sed -i '/\.orig\.tar\.gz/d' ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+              sed -i "/\.orig\.tar\.gz/d" ../tapauth_${DEB_VER}-1~ppa1~${SERIES}1_source.changes
             fi
             FIRST=0
 
@@ -215,7 +229,7 @@ jobs:
               chmod 600 /tmp/gpg-passphrase
               GPG_ARGS="${GPG_ARGS} --passphrase-file /tmp/gpg-passphrase"
             fi
-            debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes
+            debsign -p "gpg ${GPG_ARGS}" -k "${GPG_KEY_FPR}" ../tapauth_${DEB_VER}-1~ppa1~${SERIES}1_source.changes
             rm -f /tmp/gpg-passphrase
 
             # dput can receive 550 internal-server errors when
@@ -227,7 +241,7 @@ jobs:
               sleep 90
             fi
             for ATTEMPT in 1 2 3; do
-              if dput ppa:lolle2000la/tapauth ../tapauth_${VERSION}-1~ppa1~${SERIES}1_source.changes; then
+              if dput ppa:lolle2000la/tapauth ../tapauth_${DEB_VER}-1~ppa1~${SERIES}1_source.changes; then
                 echo "dput succeeded on attempt ${ATTEMPT}"
                 break
               fi

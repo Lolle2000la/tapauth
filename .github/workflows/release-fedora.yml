@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Initialize System Build Dependencies
         run: |
@@ -32,8 +34,20 @@ jobs:
           else
             TAG_NAME="${GITHUB_REF_NAME}"
           fi
-          CLEAN_VER="${TAG_NAME#v}"
-          echo "VERSION=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          BASE_VER="${TAG_NAME#v}"
+          
+          GIT_DESC=$(git describe --long --tags --match "v*" 2>/dev/null || echo "v0.1.0-0-g$(git rev-parse --short HEAD)")
+          COMMIT_COUNT=$(echo "$GIT_DESC" | sed -E 's/v[0-9.]+-([0-9]+)-.*/\1/')
+          SHORT_SHA=$(echo "$GIT_DESC" | sed -E 's/v[0-9.]+-[0-9]+-g(.*)/\1/')
+          
+          if [ "$COMMIT_COUNT" -eq "0" ]; then
+            RELEASE_STR="1"
+          else
+            RELEASE_STR="1.git${COMMIT_COUNT}.${SHORT_SHA}"
+          fi
+          
+          echo "VERSION=${BASE_VER}" >> "$GITHUB_OUTPUT"
+          echo "RELEASE=${RELEASE_STR}" >> "$GITHUB_OUTPUT"
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,10 +72,11 @@ jobs:
           # rebuild sees it; the conditional pkgversion macro doesn't
           # survive COPR's dist-git extraction.
           sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
+          sed -i "s/Release:        1%{?dist}/Release:        ${{ steps.version_vars.outputs.RELEASE }}%{?dist}/g" rpmbuild/SPECS/tapauth.spec
 
           # Dynamically append changelog entries
           CURRENT_DATE=$(date +"%a %b %d %Y")
-          echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-1\n- Automated production release build for v${{ steps.version_vars.outputs.VERSION }}." >> rpmbuild/SPECS/tapauth.spec
+          echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-${{ steps.version_vars.outputs.RELEASE }}\n- Automated build." >> rpmbuild/SPECS/tapauth.spec
 
           # Strip the ./ prefix before adding the versioned directory so
           # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths
