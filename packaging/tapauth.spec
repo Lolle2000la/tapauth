@@ -125,6 +125,15 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
+%if 0%{?fedora} || 0%{?rhel}
+if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
+    if authselect current | grep -q "vendor/tapauth-sssd"; then
+        authselect select sssd --force
+    elif authselect current | grep -q "vendor/tapauth"; then
+        authselect select local --force
+    fi
+fi
+%endif
 
 %postun
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
