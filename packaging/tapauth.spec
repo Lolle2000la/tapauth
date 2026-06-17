@@ -69,11 +69,12 @@ install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/
 # Authselect Vendor Profile Generation
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/local/*; do
+    [ -e "$f" ] || continue
     filename=$(basename "$f")
-    ln -s "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
+    ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
-rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth/{system-auth,password-auth,README}
-cp -p %{_datadir}/authselect/default/local/{system-auth,password-auth} %{buildroot}%{_datadir}/authselect/vendor/tapauth/
+rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
+cp -p %{_datadir}/authselect/default/local/system-auth %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
@@ -82,11 +83,12 @@ printf "TapAuth Local Authentication\n\nThis profile extends the default local p
 
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
 for f in %{_datadir}/authselect/default/sssd/*; do
+    [ -e "$f" ] || continue
     filename=$(basename "$f")
-    ln -s "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
+    ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
-rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/{system-auth,password-auth,README}
-cp -p %{_datadir}/authselect/default/sssd/{system-auth,password-auth} %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/
+rm -f %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
+cp -p %{_datadir}/authselect/default/sssd/system-auth %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/
 sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth || exit 1
