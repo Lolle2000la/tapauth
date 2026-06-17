@@ -15,6 +15,7 @@ ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  clang
+BuildRequires:  authselect
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
 %else
@@ -61,6 +62,19 @@ install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
 install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
 install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
 
+# Authselect Vendor Profile Generation
+mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
+cp -r /usr/share/authselect/default/local/* %{buildroot}%{_datadir}/authselect/vendor/tapauth/
+sed -i '/^auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+sed -i '/^auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+echo -e "TapAuth Local Authentication\n\nThis profile extends the default local profile with smartphone-based TapAuth authentication." > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
+
+mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
+cp -r /usr/share/authselect/default/sssd/* %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/
+sed -i '/^auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
+sed -i '/^auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+echo -e "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication." > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
+
 # System Services
 install -m 0644 systemd/tapauthd.service %{buildroot}%{_unitdir}/tapauthd.service
 install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
@@ -105,3 +119,5 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
+%{_datadir}/authselect/vendor/tapauth
+%{_datadir}/authselect/vendor/tapauth-sssd
