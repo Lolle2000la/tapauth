@@ -16,7 +16,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) }}
     steps:
       - name: Checkout Source Context
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Extract Dynamic Version Context
         id: version_vars
