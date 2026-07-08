@@ -462,8 +462,9 @@ class MainActivity : FragmentActivity() {
                         grantResults[0] == PackageManager.PERMISSION_GRANTED
             }
             REQUEST_BLUETOOTH -> {
-                bluetoothGranted.value =
-                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                bluetoothGranted.value = grantResults.all {
+                    it == PackageManager.PERMISSION_GRANTED
+                }
             }
             REQUEST_LOCATION -> {
                 locationGranted.value =
@@ -555,7 +556,8 @@ fun TapAuthApp() {
             PairingScreen(
                 pairingUrl = screen.url,
                 onPairingComplete = { currentScreen = AppScreen.Home },
-                onPairingFailed = { /* Handle error specifically if necessary (currently this callback is unused) */
+                onPairingFailed = {
+                    /* Handle error specifically if necessary (currently this callback is unused) */
                 },
                 onBack = { currentScreen = AppScreen.Home },
             )
