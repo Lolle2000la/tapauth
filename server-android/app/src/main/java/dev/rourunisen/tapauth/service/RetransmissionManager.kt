@@ -84,58 +84,57 @@ class RetransmissionManager {
 
         Log.d(TAG, "Starting UDP retransmission for challenge ${challengeKey.take(16)}...")
 
-        val job =
-            scope.launch {
-                var attempts = 0
-                val startTime = android.os.SystemClock.elapsedRealtime()
+        val job = scope.launch {
+            var attempts = 0
+            val startTime = android.os.SystemClock.elapsedRealtime()
 
-                while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
-                    try {
-                        // Send the response
-                        val packet =
-                            DatagramPacket(
-                                request.responseData,
-                                request.responseData.size,
-                                request.destinationAddress,
-                                request.destinationPort,
-                            )
-                        request.socket.send(packet)
-                        attempts++
+            while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
+                try {
+                    // Send the response
+                    val packet =
+                        DatagramPacket(
+                            request.responseData,
+                            request.responseData.size,
+                            request.destinationAddress,
+                            request.destinationPort,
+                        )
+                    request.socket.send(packet)
+                    attempts++
 
-                        val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
-                        Log.d(TAG, "UDP retransmission attempt #$attempts (elapsed=${elapsed}ms)")
+                    val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
+                    Log.d(TAG, "UDP retransmission attempt #$attempts (elapsed=${elapsed}ms)")
 
-                        // Check if we've exceeded max duration or attempts
-                        if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
-                            Log.w(TAG, "UDP retransmission timeout after ${elapsed}ms, stopping")
-                            break
-                        }
-
-                        if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
-                            Log.w(
-                                TAG,
-                                "UDP retransmission max attempts reached ($attempts), stopping",
-                            )
-                            break
-                        }
-
-                        // Wait for the fixed interval
-                        delay(RETRANSMISSION_INTERVAL_MS)
-                    } catch (e: Exception) {
-                        if (isActive) {
-                            Log.e(TAG, "Error during UDP retransmission", e)
-                        }
+                    // Check if we've exceeded max duration or attempts
+                    if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
+                        Log.w(TAG, "UDP retransmission timeout after ${elapsed}ms, stopping")
                         break
                     }
-                }
 
-                // Clean up
-                activeRetransmissions.remove(challengeKey)
-                Log.d(
-                    TAG,
-                    "UDP retransmission completed for challenge ${challengeKey.take(16)}... (attempts=$attempts)",
-                )
+                    if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
+                        Log.w(
+                            TAG,
+                            "UDP retransmission max attempts reached ($attempts), stopping",
+                        )
+                        break
+                    }
+
+                    // Wait for the fixed interval
+                    delay(RETRANSMISSION_INTERVAL_MS)
+                } catch (e: Exception) {
+                    if (isActive) {
+                        Log.e(TAG, "Error during UDP retransmission", e)
+                    }
+                    break
+                }
             }
+
+            // Clean up
+            activeRetransmissions.remove(challengeKey)
+            Log.d(
+                TAG,
+                "UDP retransmission completed for challenge ${challengeKey.take(16)}... (attempts=$attempts)",
+            )
+        }
 
         activeRetransmissions[challengeKey] = job
     }
@@ -149,51 +148,50 @@ class RetransmissionManager {
 
         Log.d(TAG, "Starting BLE retransmission for challenge ${challengeKey.take(16)}...")
 
-        val job =
-            scope.launch {
-                var attempts = 0
-                val startTime = android.os.SystemClock.elapsedRealtime()
+        val job = scope.launch {
+            var attempts = 0
+            val startTime = android.os.SystemClock.elapsedRealtime()
 
-                while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
-                    try {
-                        // Send the response via callback
-                        request.sendCallback(request.responseData)
-                        attempts++
+            while (isActive && attempts < MAX_RETRANSMISSION_ATTEMPTS) {
+                try {
+                    // Send the response via callback
+                    request.sendCallback(request.responseData)
+                    attempts++
 
-                        val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
-                        Log.d(TAG, "BLE retransmission attempt #$attempts (elapsed=${elapsed}ms)")
+                    val elapsed = android.os.SystemClock.elapsedRealtime() - startTime
+                    Log.d(TAG, "BLE retransmission attempt #$attempts (elapsed=${elapsed}ms)")
 
-                        // Check if we've exceeded max duration or attempts
-                        if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
-                            Log.w(TAG, "BLE retransmission timeout after ${elapsed}ms, stopping")
-                            break
-                        }
-
-                        if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
-                            Log.w(
-                                TAG,
-                                "BLE retransmission max attempts reached ($attempts), stopping",
-                            )
-                            break
-                        }
-
-                        // Wait for the fixed interval
-                        delay(RETRANSMISSION_INTERVAL_MS)
-                    } catch (e: Exception) {
-                        if (isActive) {
-                            Log.e(TAG, "Error during BLE retransmission", e)
-                        }
+                    // Check if we've exceeded max duration or attempts
+                    if (elapsed >= MAX_RETRANSMISSION_DURATION_MS) {
+                        Log.w(TAG, "BLE retransmission timeout after ${elapsed}ms, stopping")
                         break
                     }
-                }
 
-                // Clean up
-                activeRetransmissions.remove(challengeKey)
-                Log.d(
-                    TAG,
-                    "BLE retransmission completed for challenge ${challengeKey.take(16)}... (attempts=$attempts)",
-                )
+                    if (attempts >= MAX_RETRANSMISSION_ATTEMPTS) {
+                        Log.w(
+                            TAG,
+                            "BLE retransmission max attempts reached ($attempts), stopping",
+                        )
+                        break
+                    }
+
+                    // Wait for the fixed interval
+                    delay(RETRANSMISSION_INTERVAL_MS)
+                } catch (e: Exception) {
+                    if (isActive) {
+                        Log.e(TAG, "Error during BLE retransmission", e)
+                    }
+                    break
+                }
             }
+
+            // Clean up
+            activeRetransmissions.remove(challengeKey)
+            Log.d(
+                TAG,
+                "BLE retransmission completed for challenge ${challengeKey.take(16)}... (attempts=$attempts)",
+            )
+        }
 
         activeRetransmissions[challengeKey] = job
     }

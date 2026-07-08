@@ -197,7 +197,9 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors =
-                CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
         ) {
             Text(
                 text = sas,
