@@ -142,7 +142,8 @@ class AuthRequestManager private constructor() {
                     flags =
                         Intent.FLAG_ACTIVITY_NEW_TASK or
                             Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-                            Intent.FLAG_ACTIVITY_NO_HISTORY
+                            Intent.FLAG_ACTIVITY_NO_HISTORY or
+                            Intent.FLAG_ACTIVITY_NO_USER_ACTION
                 }
 
             // Use bytes-derived stable notification ID (already computed at function start)
@@ -164,7 +165,8 @@ class AuthRequestManager private constructor() {
                     flags =
                         Intent.FLAG_ACTIVITY_NEW_TASK or
                             Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-                            Intent.FLAG_ACTIVITY_NO_HISTORY
+                            Intent.FLAG_ACTIVITY_NO_HISTORY or
+                            Intent.FLAG_ACTIVITY_NO_USER_ACTION
                 }
             val approvePending =
                 PendingIntent.getActivity(
