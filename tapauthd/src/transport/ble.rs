@@ -129,6 +129,7 @@ impl BleTransport {
     }
 
     /// Create a GrantConfirmation message
+    #[cfg_attr(test, allow(dead_code))] // test targets don't resolve trait dispatch call paths
     fn create_confirmation(&self, request_packet: &EncryptedPacket) -> Result<Vec<u8>, AuthError> {
         // Create GrantConfirmation with challenge signature
         let confirmation = create_grant_confirmation(&self.challenge)
@@ -174,7 +175,7 @@ impl BleTransport {
 
         let adapter_clone = adapter.clone();
 
-        for (addr, _device_in_map) in devices_to_disconnect.iter() {
+        for addr in devices_to_disconnect.keys() {
             tracing::debug!("Attempting to explicitly disconnect device {}", addr);
 
             match adapter_clone.device(*addr) {
