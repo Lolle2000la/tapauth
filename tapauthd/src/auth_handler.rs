@@ -944,7 +944,7 @@ impl AuthSession {
         wrapper: &shared::protocol::pb::WrapperMessage,
         paired_servers: &HashMap<String, PairedServer>,
     ) -> Result<bool, AuthHandlerError> {
-        for (_id, server) in paired_servers.iter() {
+        for server in paired_servers.values() {
             if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
                 if pub_key_bytes.len() == 32 {
                     let mut pub_key = [0u8; 32];
