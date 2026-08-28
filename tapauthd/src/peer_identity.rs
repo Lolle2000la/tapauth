@@ -116,6 +116,7 @@ pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIden
                     s_lower.contains("not found")
                         || s_lower.contains("no such")
                         || s_lower.contains("serviceunknown")
+                        || s_lower.contains("not registered")
                 }
                 _ => false,
             };

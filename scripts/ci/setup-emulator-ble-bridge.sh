@@ -30,9 +30,9 @@ if ! pgrep -x bluetoothd > /dev/null; then
 fi
 
 # Verify bumble is available
-if ! command -v bumble-hci-bridge &> /dev/null && ! python3 -m bumble.apps.hci_bridge --help &> /dev/null; then
+if ! python3 -c "import bumble" 2>/dev/null && ! sudo python3 -c "import bumble" 2>/dev/null; then
     echo "    Installing Bumble Python package..."
-    pip install --break-system-packages --user bumble || pip install bumble || true
+    sudo pip install --break-system-packages bumble || sudo pip3 install --break-system-packages bumble || pip install --break-system-packages bumble || true
 fi
 
 # Capture existing hci devices to detect the newly created one
@@ -42,11 +42,13 @@ EXISTING_HCI=$(hciconfig 2>/dev/null | grep -o '^hci[0-9]*' || true)
 echo "    Starting bumble-hci-bridge (android-netsim:localhost:8554 <-> vhci)..."
 BUMBLE_LOG="/tmp/bumble-bridge.log"
 
+USER_SITE=$(python3 -c 'import site; print(":".join(site.getsitepackages() + [site.getusersitepackages()]))' 2>/dev/null || true)
+
 if command -v bumble-hci-bridge &> /dev/null; then
-    sudo env PATH="$PATH" bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+    sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
     BUMBLE_PID=$!
 else
-    sudo env PATH="$PATH" python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+    sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
     BUMBLE_PID=$!
 fi
 

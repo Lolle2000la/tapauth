@@ -83,11 +83,24 @@ cleanup() {
         kill "$(cat /tmp/udp-reflector.pid)" 2>/dev/null || true
         rm -f /tmp/udp-reflector.pid
     fi
+    if [ "$INSTALLED_POLKIT" = true ]; then
+        sudo rm -f "$POLKIT_POLICY_DEST" 2>/dev/null || true
+    fi
     sudo rm -f "$PAM_CONFIG_PATH" 2>/dev/null || true
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
 trap cleanup EXIT INT TERM
+
+# Step 0: Register PolKit policy for daemon admin authorization
+POLKIT_POLICY_SRC="${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy"
+POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
+INSTALLED_POLKIT=false
+if [ -d "/usr/share/polkit-1/actions" ] && [ -f "$POLKIT_POLICY_SRC" ] && [ ! -f "$POLKIT_POLICY_DEST" ]; then
+    echo "    Registering PolKit policy for testing..."
+    sudo cp "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST" 2>/dev/null || true
+    INSTALLED_POLKIT=true
+fi
 
 # Step 1: Build necessary Linux binaries
 echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
