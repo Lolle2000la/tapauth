@@ -38,7 +38,7 @@ fi
 # Verify bumble is available
 if ! python3 -c "import bumble" 2>/dev/null && ! sudo python3 -c "import bumble" 2>/dev/null; then
     echo "    Installing Bumble Python package..."
-    sudo pip install --break-system-packages bumble || sudo pip3 install --break-system-packages bumble || pip install --break-system-packages bumble || true
+    sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
 fi
 
 # Capture existing hci devices to detect the newly created one

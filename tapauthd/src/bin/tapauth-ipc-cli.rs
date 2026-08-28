@@ -231,11 +231,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let cfg_req = ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::GetConfig(
+                    ipc::GetConfigRequest {},
+                )),
+            };
+            let cfg_resp = send_admin(cfg_req, Duration::from_secs(10)).await?;
+            let (hostname, udp_port) = match cfg_resp.payload {
+                Some(ipc::admin_response::Payload::GetConfig(c)) => (c.hostname, c.udp_port),
+                _ => ("".to_string(), 36692),
+            };
+
             let req = ipc::AdminRequest {
                 payload: Some(ipc::admin_request::Payload::SaveConfig(
                     ipc::SaveConfigRequest {
-                        hostname: "".to_string(),
-                        udp_port: 0,
+                        hostname,
+                        udp_port,
                         enable_ble: ble,
                         enable_network: network,
                     },

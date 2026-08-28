@@ -148,7 +148,7 @@ jobs:
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
             "linux-modules-extra-$(uname -r)" || true
-          sudo pip install --break-system-packages bumble || sudo pip3 install --break-system-packages bumble || pip install bumble || true
+          sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
           sudo modprobe hci_vhci || true
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
