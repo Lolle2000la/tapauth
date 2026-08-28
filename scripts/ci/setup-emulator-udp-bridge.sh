@@ -14,80 +14,62 @@ if ! command -v adb &> /dev/null; then
     done
 fi
 
-# Find running emulator serial / console port
+# Find running emulator serial
 EMULATOR_SERIAL=$(adb devices | grep -m1 'emulator-[0-9]*' | awk '{print $1}' || true)
 if [ -z "$EMULATOR_SERIAL" ]; then
     echo "❌ Error: No running Android emulator found via adb."
     exit 1
 fi
 
-CONSOLE_PORT=$(echo "$EMULATOR_SERIAL" | sed 's/emulator-//')
-echo "    Found emulator: $EMULATOR_SERIAL (Console Port: $CONSOLE_PORT)"
+echo "    Configuring UDP redirection (host:36692 -> guest:36692)..."
+adb emu redir add udp:36692:36692 || true
+echo "    Active port redirections:"
+adb emu redir list || true
 
-# Set up port redirection via emulator console
-AUTH_TOKEN=""
-if [ -f "$HOME/.emulator_console_auth_token" ]; then
-    AUTH_TOKEN=$(cat "$HOME/.emulator_console_auth_token")
-fi
-
-echo "    Configuring UDP redirection on port 36692..."
-
-cat << 'EOF' > /tmp/setup_udp_redir.py
-import socket, sys, time
-
-console_port = int(sys.argv[1])
-auth_token = sys.argv[2] if len(sys.argv) > 2 else ""
-
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(('127.0.0.1', console_port))
-    banner = s.recv(1024).decode(errors='ignore')
-    if auth_token:
-        s.sendall(f"auth {auth_token}\n".encode())
-        resp = s.recv(1024).decode(errors='ignore')
-    
-    # Add UDP redirection: redir add udp:guest_port:host_port
-    s.sendall(b"redir add udp:36692:36692\n")
-    resp = s.recv(1024).decode(errors='ignore')
-    print(f"    Emulator console response: {resp.strip()}")
-    s.sendall(b"quit\n")
-    s.close()
-    print("✅ Port redirect udp:36692:36692 configured.")
-except Exception as e:
-    print(f"⚠️ Console redirect warning: {e}")
-EOF
-
-python3 /tmp/setup_udp_redir.py "$CONSOLE_PORT" "$AUTH_TOKEN"
-rm -f /tmp/setup_udp_redir.py
-
-# Spawn background UDP broadcast reflector (mirrors 255.255.255.255 / local subnet broadcasts to 127.0.0.1:36692)
+# Spawn background UDP broadcast reflector
+# Mirrors 255.255.255.255 / local subnet broadcasts to 127.0.0.1:36692
 echo "    Starting background UDP broadcast reflector..."
 
 cat << 'EOF' > /tmp/udp_reflector.py
-import socket, sys
+import socket, sys, time
+
+SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 15)
 
 try:
-    # Listener for broadcast
+    # Listener for broadcast on 0.0.0.0:36692
     sock_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock_in.setsockopt(socket.SOL_SOCKET, SO_REUSEPORT, 1)
+    except Exception:
+        pass
     sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock_in.bind(('', 36692))
     
-    # Forwarder
+    # Forwarder to emulator host redirection
     sock_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    print("UDP broadcast reflector running on port 36692...")
-    sys.stdout.flush()
+    print("UDP broadcast reflector running on port 36692...", flush=True)
     
+    seen = {}
     while True:
-        data, addr = sock_in.recvfrom(4096)
-        # Avoid forwarding packets that came from loopback itself to prevent loops
-        if addr[0] != '127.0.0.1':
+        data, addr = sock_in.recvfrom(65535)
+        now = time.time()
+        # Clean expired keys
+        seen = {k: v for k, v in seen.items() if now - v < 2.0}
+        
+        # Don't forward loopback traffic or duplicated packets
+        key = (data[:32], addr[1])
+        if key in seen:
+            continue
+        seen[key] = now
+        
+        try:
             sock_out.sendto(data, ('127.0.0.1', 36692))
+        except Exception as e:
+            print(f"Forward error: {e}", flush=True)
 except Exception as e:
-    print(f"Reflector exited: {e}")
-    sys.stdout.flush()
+    print(f"Reflector error: {e}", flush=True)
 EOF
 
 python3 /tmp/udp_reflector.py > /tmp/udp-reflector.log 2>&1 &
