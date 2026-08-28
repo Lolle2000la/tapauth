@@ -126,6 +126,13 @@ if [ -f "server-android/app/build/outputs/apk/androidTest/debug/app-debug-androi
     adb install -r -t server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk || true
 fi
 
+echo "==> Granting runtime permissions to Android app..."
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_SCAN 2>/dev/null || true
+
 # Step 3: Setup Bridges and Virtual Transport Layers
 echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 "$SCRIPT_DIR/ci/setup-emulator-ble-bridge.sh"
@@ -210,14 +217,9 @@ if [ "$SERVERS_COUNT" -lt 1 ]; then
 fi
 echo "✅ Verified 1 paired Android device registered."
 
-# Step 5b: Ensure runtime permissions and launch Android app/background services
-echo "==> Ensuring Android permissions and launching app services..."
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.POST_NOTIFICATIONS 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_SCAN 2>/dev/null || true
-
+# Step 5b: Ensure runtime permissions and start Android app/background services
+echo "==> Starting Android foreground services for authentication..."
+adb shell am force-stop dev.rourunisen.tapauth.debug 2>/dev/null || true
 adb shell am start -n dev.rourunisen.tapauth.debug/dev.rourunisen.tapauth.MainActivity
 sleep 2
 

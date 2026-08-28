@@ -416,7 +416,12 @@ pub async fn receive_udp_packet(
             }),
         };
 
-        if is_local_ip(&src_ip) {
+        #[cfg(any(feature = "dev-state-override", test))]
+        let skip_local_filter = std::env::var("TAPAUTH_DEV_MODE").is_ok();
+        #[cfg(not(any(feature = "dev-state-override", test)))]
+        let skip_local_filter = false;
+
+        if !skip_local_filter && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-sent UDP packet from {}", addr);
             // drop and continue waiting for next packet
             continue;

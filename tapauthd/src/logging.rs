@@ -14,6 +14,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 fn make_stdout_layer() -> impl Layer<tracing_subscriber::Registry> {
     let filter = std::env::var("TAPAUTH_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .and_then(|level| EnvFilter::try_new(&level).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
