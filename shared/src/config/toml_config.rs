@@ -149,9 +149,30 @@ impl Default for TapAuthConfig {
 }
 
 impl TapAuthConfig {
-    /// Load configuration from the default path, using defaults for missing fields.
+    /// Load configuration, checking TAPAUTH_CONFIG_FILE, TAPAUTH_STATE_DIR, or DEFAULT_CONFIG_PATH.
     pub fn load() -> Self {
+        if let Ok(config_path) = std::env::var("TAPAUTH_CONFIG_FILE") {
+            return Self::load_from_path(config_path);
+        }
+        if let Ok(state_dir) = std::env::var("TAPAUTH_STATE_DIR") {
+            let config_path = std::path::Path::new(&state_dir).join("config.toml");
+            if config_path.exists() {
+                return Self::load_from_path(config_path);
+            }
+        }
         Self::load_from_path(DEFAULT_CONFIG_PATH)
+    }
+
+    /// Save configuration, checking TAPAUTH_CONFIG_FILE, TAPAUTH_STATE_DIR, or DEFAULT_CONFIG_PATH.
+    pub fn save(&self) -> std::io::Result<()> {
+        if let Ok(config_path) = std::env::var("TAPAUTH_CONFIG_FILE") {
+            return self.save_to_path(config_path);
+        }
+        if let Ok(state_dir) = std::env::var("TAPAUTH_STATE_DIR") {
+            let config_path = std::path::Path::new(&state_dir).join("config.toml");
+            return self.save_to_path(config_path);
+        }
+        self.save_to_path(DEFAULT_CONFIG_PATH)
     }
 
     /// Load configuration from a specific path, using defaults for missing fields.

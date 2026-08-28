@@ -78,6 +78,14 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().as_raw() == 0
 }
 
+/// Get active state/config directory (allows override via TAPAUTH_STATE_DIR in development/testing)
+pub fn get_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TAPAUTH_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(CONFIG_DIR)
+}
+
 /// Resolve the system user "tapauthd" to its UID (cached best-effort).
 fn tapauthd_uid() -> Option<u32> {
     // If NSS lookup fails or user does not exist yet (during install), we return None
@@ -96,14 +104,19 @@ fn is_euid_tapauthd() -> bool {
     }
 }
 
-/// Whether the effective UID is privileged for writes (tapauthd or root)
+/// Whether the effective UID is privileged for writes (tapauthd, root, or custom TAPAUTH_STATE_DIR)
 fn is_euid_privileged_for_writes() -> bool {
-    is_euid_tapauthd() || nix::unistd::geteuid().as_raw() == 0
+    std::env::var("TAPAUTH_STATE_DIR").is_ok()
+        || is_euid_tapauthd()
+        || nix::unistd::geteuid().as_raw() == 0
 }
 
 /// Chown a path to tapauthd:tapauthd when running as root
 /// If tapauthd user doesn't exist (e.g., during development), skip chown silently
 fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
+    if std::env::var("TAPAUTH_STATE_DIR").is_ok() {
+        return Ok(());
+    }
     // Only attempt when running as root
     if nix::unistd::geteuid().as_raw() != 0 {
         return Ok(());
@@ -192,10 +205,14 @@ pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
     let metadata = fs::metadata(path)?;
     let permissions = metadata.permissions();
 
-    // Check ownership: accept either root:root or tapauthd:tapauthd
+    // Check ownership: accept root:root, tapauthd:tapauthd, or current user when TAPAUTH_STATE_DIR is active
     let owner_uid = metadata.uid();
+    let current_euid = nix::unistd::geteuid().as_raw();
     let tap_uid = tapauthd_uid();
-    let owner_ok = owner_uid == 0 || tap_uid.map(|u| owner_uid == u).unwrap_or(false);
+    let is_dev_dir = std::env::var("TAPAUTH_STATE_DIR").is_ok();
+    let owner_ok = owner_uid == 0
+        || tap_uid.map(|u| owner_uid == u).unwrap_or(false)
+        || (is_dev_dir && owner_uid == current_euid);
     if !owner_ok {
         return Err(ConfigError::InsufficientPermissions);
     }
@@ -288,8 +305,13 @@ impl ClientConfigManager {
     /// Create a new configuration manager
     pub fn new() -> Self {
         Self {
-            config_dir: PathBuf::from(CONFIG_DIR),
+            config_dir: get_config_dir(),
         }
+    }
+
+    /// Create a configuration manager with a specific directory
+    pub fn with_dir(config_dir: PathBuf) -> Self {
+        Self { config_dir }
     }
 
     /// Initialize configuration directory

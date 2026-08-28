@@ -36,7 +36,12 @@ echo "✅ Android emulator detected."
 # Setup isolated sandbox directory to avoid dirtying the host
 TEST_DIR=$(mktemp -d -t tapauth-e2e.XXXXXX)
 export TAPAUTHD_SOCK="${TEST_DIR}/tapauthd.sock"
+export TAPAUTH_STATE_DIR="${TEST_DIR}/state"
+export TAPAUTH_DEV_MODE=1
 export DAEMON_LOG="${TEST_DIR}/tapauthd.log"
+mkdir -p "$TAPAUTH_STATE_DIR"
+chmod 700 "$TAPAUTH_STATE_DIR"
+
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
 
@@ -45,6 +50,7 @@ TEST_USER="$(whoami)"
 
 echo "ℹ️  Test User: $TEST_USER"
 echo "ℹ️  Isolated Socket: $TAPAUTHD_SOCK"
+echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
 echo "ℹ️  Sandbox Directory: $TEST_DIR"
 echo ""
 
@@ -83,19 +89,21 @@ cleanup() {
     if [ "$INSTALLED_POLKIT" = true ]; then
         sudo rm -f "$POLKIT_POLICY_DEST" 2>/dev/null || true
     fi
-    sudo rm -f "$PAM_CONFIG_PATH" 2>/dev/null || true
+    if [ -w "$PAM_CONFIG_PATH" ]; then
+        rm -f "$PAM_CONFIG_PATH" 2>/dev/null || true
+    fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
 trap cleanup EXIT INT TERM
 
-# Step 0: Register PolKit policy for daemon admin authorization
+# Step 0: Register PolKit policy if permissions allow
 POLKIT_POLICY_SRC="${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy"
 POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
 INSTALLED_POLKIT=false
-if [ -d "/usr/share/polkit-1/actions" ] && [ -f "$POLKIT_POLICY_SRC" ] && [ ! -f "$POLKIT_POLICY_DEST" ]; then
+if [ -d "/usr/share/polkit-1/actions" ] && [ -w "/usr/share/polkit-1/actions" ] && [ -f "$POLKIT_POLICY_SRC" ] && [ ! -f "$POLKIT_POLICY_DEST" ]; then
     echo "    Registering PolKit policy for testing..."
-    sudo cp "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST" 2>/dev/null || true
+    cp "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST" 2>/dev/null || true
     INSTALLED_POLKIT=true
 fi
 

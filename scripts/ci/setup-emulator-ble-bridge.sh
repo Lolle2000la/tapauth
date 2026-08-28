@@ -7,29 +7,37 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 
-# Ensure vhci module is loaded and /dev/vhci node exists
-if ! lsmod | grep -q hci_vhci; then
-    echo "    Loading hci_vhci kernel module..."
-    sudo modprobe hci_vhci 2>/dev/null || {
-        echo "ℹ️  Notice: Failed to modprobe hci_vhci."
-    }
+# Ensure vhci module is loaded and /dev/vhci node exists if running with privileges
+if ! lsmod 2>/dev/null | grep -q hci_vhci; then
+    if [ -w /dev ]; then
+        modprobe hci_vhci 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo modprobe hci_vhci 2>/dev/null || true
+    fi
 fi
 
 if [ ! -c /dev/vhci ]; then
-    echo "    Creating /dev/vhci character device node..."
-    sudo mknod /dev/vhci c 10 137 2>/dev/null || true
-    sudo chmod 666 /dev/vhci 2>/dev/null || true
+    if [ -w /dev ]; then
+        mknod /dev/vhci c 10 137 2>/dev/null || true
+        chmod 666 /dev/vhci 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo mknod /dev/vhci c 10 137 2>/dev/null || true
+        sudo chmod 666 /dev/vhci 2>/dev/null || true
+    fi
 fi
 
-# Check if /dev/vhci is actually accessible by kernel
+# Check if /dev/vhci is actually accessible
 VHCI_SUPPORTED=false
-if sudo python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+    VHCI_SUPPORTED=true
+elif command -v sudo >/dev/null 2>&1 && sudo -n python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
     VHCI_SUPPORTED=true
 fi
 
 if [ "$VHCI_SUPPORTED" != "true" ]; then
-    echo "ℹ️  Virtual HCI (/dev/vhci) is not supported by the host kernel in this environment."
-    echo "    BLE virtual controller emulation will be disabled."
+    echo "ℹ️  Virtual HCI (/dev/vhci) is not writable by current user."
+    echo "    To enable BLE testing locally, run once: sudo chmod 666 /dev/vhci"
+    echo "    (Continuing test suite with BLE disabled...)"
     echo "false" > /tmp/ble-available.txt
     exit 0
 fi
@@ -38,22 +46,24 @@ echo "true" > /tmp/ble-available.txt
 
 # Ensure D-Bus system bus is running
 if ! pgrep -x dbus-daemon > /dev/null && ! pgrep -x dbus-broker > /dev/null; then
-    echo "    Starting D-Bus..."
-    sudo mkdir -p /var/run/dbus
-    sudo dbus-daemon --system --fork 2>/dev/null || sudo systemctl start dbus || true
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo mkdir -p /var/run/dbus
+        sudo dbus-daemon --system --fork 2>/dev/null || sudo systemctl start dbus || true
+    fi
 fi
 
-# Ensure bluetoothd is running with experimental flag (required for BLE GATT peripheral mode)
+# Ensure bluetoothd is running
 if ! pgrep -x bluetoothd > /dev/null; then
-    echo "    Starting BlueZ bluetoothd..."
-    sudo bluetoothd --experimental &
-    sleep 1
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo bluetoothd --experimental &
+        sleep 1
+    fi
 fi
 
 # Verify bumble is available
-if ! python3 -c "import bumble" 2>/dev/null && ! sudo python3 -c "import bumble" 2>/dev/null; then
+if ! python3 -c "import bumble" 2>/dev/null; then
     echo "    Installing Bumble Python package..."
-    sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
+    pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf 2>/dev/null || pip install "bumble[android-netsim]" grpcio protobuf || true
 fi
 
 # Capture existing hci devices to detect the newly created one
@@ -65,12 +75,22 @@ BUMBLE_LOG="/tmp/bumble-bridge.log"
 
 USER_SITE=$(python3 -c 'import site; print(":".join(site.getsitepackages() + [site.getusersitepackages()]))' 2>/dev/null || true)
 
-if command -v bumble-hci-bridge &> /dev/null; then
-    sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
-    BUMBLE_PID=$!
+if [ -w /dev/vhci ]; then
+    if command -v bumble-hci-bridge &> /dev/null; then
+        bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        BUMBLE_PID=$!
+    else
+        python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        BUMBLE_PID=$!
+    fi
 else
-    sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
-    BUMBLE_PID=$!
+    if command -v bumble-hci-bridge &> /dev/null; then
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        BUMBLE_PID=$!
+    else
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        BUMBLE_PID=$!
+    fi
 fi
 
 echo "$BUMBLE_PID" > /tmp/bumble-bridge.pid
@@ -96,8 +116,8 @@ done
 
 if [ -n "$NEW_HCI" ]; then
     echo "✅ Virtual Bluetooth adapter detected: $NEW_HCI"
-    sudo hciconfig "$NEW_HCI" up || true
-    sudo bluetoothctl --adapter "$NEW_HCI" power on || true
+    hciconfig "$NEW_HCI" up 2>/dev/null || (command -v sudo >/dev/null 2>&1 && sudo -n hciconfig "$NEW_HCI" up 2>/dev/null) || true
+    bluetoothctl --adapter "$NEW_HCI" power on 2>/dev/null || true
 else
     echo "⚠️  No new HCI adapter detected yet. BlueZ will automatically bind when emulator Netsim connects."
 fi
