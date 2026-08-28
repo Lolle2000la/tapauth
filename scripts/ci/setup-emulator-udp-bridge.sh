@@ -25,9 +25,9 @@ fi
 adb emu redir del udp:36692 2>/dev/null || true
 adb emu redir del udp:36695 2>/dev/null || true
 
-# Map host port 36695 to guest port 36692 (syntax: redir add udp:guest_port:host_port)
+# Map host port 36695 to guest port 36692 (syntax: redir add udp:host_port:guest_port)
 echo "    Configuring UDP redirection (host:36695 -> guest:36692)..."
-adb emu redir add udp:36692:36695 || true
+adb emu redir add udp:36695:36692 || true
 echo "    Active port redirections:"
 adb emu redir list || true
 

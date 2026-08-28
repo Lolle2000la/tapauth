@@ -12,17 +12,6 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-fn make_stdout_layer() -> impl Layer<tracing_subscriber::Registry> {
-    let filter = std::env::var("TAPAUTH_LOG_LEVEL")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .ok()
-        .and_then(|level| EnvFilter::try_new(&level).ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
-    tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stdout)
-        .with_filter(filter)
-}
 
 pub fn init_logging() {
     let stdout_filter = std::env::var("TAPAUTH_LOG_LEVEL")
