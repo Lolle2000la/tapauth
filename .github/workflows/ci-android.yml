@@ -6,6 +6,9 @@ on:
     paths:
       - 'server-android/**'
       - 'shared/**'
+      - 'tapauthd/**'
+      - 'client-pam/**'
+      - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
       - '.github/workflows/ci-android.yml'
@@ -14,6 +17,9 @@ on:
     paths:
       - 'server-android/**'
       - 'shared/**'
+      - 'tapauthd/**'
+      - 'client-pam/**'
+      - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
       - '.github/workflows/ci-android.yml'
@@ -131,8 +137,33 @@ jobs:
           path: server-android/app/build/reports/androidTests/
           retention-days: 7
 
-      - name: Build Android APK (Debug)
-        run: cd server-android && ./gradlew assembleDebug --stacktrace
+      - name: Build Android Debug APK and Test APK
+        run: cd server-android && ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
+
+      - name: Install Host E2E Dependencies & Bumble
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bluez bluez-tools dbus \
+            libpam0g-dev pamtester \
+            libdbus-1-dev pkg-config
+          pip install --break-system-packages bumble || pip install bumble || true
+          sudo modprobe hci_vhci || true
+
+      - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
+        run: |
+          cargo build --release -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
+          cargo build --release -p client-pam --features dev-socket-override
+
+      - name: Run Full Real-Android E2E Tests (Pairing + UDP + BLE)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          arch: x86_64
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: sudo ./scripts/test-e2e.sh
 
       - name: Check Kotlin formatting with Spotless
         run: cd server-android && ./gradlew spotlessCheck
