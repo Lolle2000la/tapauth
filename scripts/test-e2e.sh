@@ -166,14 +166,15 @@ WAIT_LOG="${TEST_DIR}/wait_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT" > "$WAIT_LOG" 2>&1 &
 WAIT_PID=$!
 
-# Trigger Android PairingClient via Instrumentation Test
+# Trigger Android PairingClient via Instrumentation Test in background
 echo "==> Triggering PairingClient inside Android Emulator..."
-sleep 0.5
+AM_LOG="${TEST_DIR}/am_pairing.log"
 adb shell am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
     -e pairing_host 10.0.2.2 \
     -e pairing_port "$PORT" \
-    dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
+    dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner > "$AM_LOG" 2>&1 &
+AM_PID=$!
 
 wait "$WAIT_PID" || {
     echo "❌ wait-for-pairing failed. Log:"
@@ -188,6 +189,14 @@ echo "==> Completing pairing handshake..."
 COMPLETE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT")
 SERVER_HEX=$(echo "$COMPLETE_OUTPUT" | grep 'SERVER_HEX=' | cut -d'=' -f2)
 echo "✅ Device pairing finalized successfully! Server Key: $SERVER_HEX"
+
+# Wait for Android pairing test to finish successfully
+wait "$AM_PID" || {
+    echo "❌ Android pairing instrumentation test failed. Log:"
+    cat "$AM_LOG"
+    exit 1
+}
+cat "$AM_LOG"
 
 # Verify paired servers in daemon
 SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
