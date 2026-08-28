@@ -16,6 +16,24 @@ pam_operation_timeout_secs = 120
 # Default: 36692
 udp_port = 36692
 
+# Local Network Transport
+# Enable authentication over the local network (UDP broadcast/multicast).
+# When disabled, the daemon will not broadcast authentication requests over
+# UDP and will not open the firewall port for authentication attempts.
+# Can also be toggled at runtime via the tapauth-config GUI (requires admin
+# authorization) without restarting the daemon.
+# Default: true
+enable_network = true
+
+# Bluetooth (BLE) Transport
+# Enable authentication over Bluetooth Low Energy.
+# Only effective when the daemon is compiled with the 'ble' feature.
+# When disabled, the daemon will not advertise over BLE during
+# authentication. Can also be toggled at runtime via the tapauth-config GUI
+# (requires admin authorization).
+# Default: true
+enable_ble = true
+
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.
 # When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).

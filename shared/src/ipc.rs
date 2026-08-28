@@ -4,3 +4,52 @@
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/tapauth.ipc.rs"));
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::pb::*;
+    use prost::Message;
+
+    /// Transport toggles use explicit presence (`optional`) so that clients
+    /// predating these fields leave the current settings unchanged instead of
+    /// forcing both transports off.
+    #[test]
+    fn save_config_transport_toggles_have_presence() {
+        let req = SaveConfigRequest {
+            hostname: "host".to_string(),
+            udp_port: 36692,
+            enable_ble: None,
+            enable_network: None,
+        };
+
+        let decoded = SaveConfigRequest::decode(req.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.enable_ble, None);
+        assert_eq!(decoded.enable_network, None);
+
+        let req = SaveConfigRequest {
+            enable_ble: Some(false),
+            enable_network: Some(true),
+            ..req
+        };
+
+        let decoded = SaveConfigRequest::decode(req.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.enable_ble, Some(false));
+        assert_eq!(decoded.enable_network, Some(true));
+    }
+
+    /// GetConfigResponse always carries the toggles (implicit presence).
+    #[test]
+    fn get_config_response_carries_transport_toggles() {
+        let resp = GetConfigResponse {
+            hostname: "host".to_string(),
+            udp_port: 1234,
+            enable_ble: true,
+            enable_network: false,
+        };
+
+        let decoded = GetConfigResponse::decode(resp.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.enable_ble);
+        assert!(!decoded.enable_network);
+    }
+}

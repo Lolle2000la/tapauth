@@ -21,6 +21,9 @@ const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 /// Default UDP port for authentication
 const DEFAULT_UDP_PORT: u16 = 36692;
 
+/// Transports are enabled by default
+const DEFAULT_TRANSPORT_ENABLED: bool = true;
+
 /// TPM PCR sealing policy - determines which Platform Configuration Registers
 /// are used to seal the authentication keys.
 ///
@@ -99,6 +102,21 @@ pub struct TapAuthConfig {
     /// UDP port for authentication (default: 36692)
     pub udp_port: u16,
 
+    /// Whether the Local Network (UDP broadcast/multicast) transport may be
+    /// used for authentication attempts (default: true).
+    ///
+    /// When disabled, the daemon will not broadcast authentication requests
+    /// over UDP and will not open the firewall port for them.
+    pub enable_network: bool,
+
+    /// Whether the Bluetooth Low Energy (BLE) transport may be used for
+    /// authentication attempts (default: true).
+    ///
+    /// Only effective when the daemon is compiled with the `ble` feature.
+    /// When disabled, the daemon will not advertise over BLE during
+    /// authentication.
+    pub enable_ble: bool,
+
     /// Whether to use TPM for key storage
     /// Requires TPM 2.0 hardware and tpm2-tools installed
     #[cfg(feature = "tpm")]
@@ -120,6 +138,8 @@ impl Default for TapAuthConfig {
         Self {
             pam_operation_timeout_secs: DEFAULT_PAM_TIMEOUT_SECS,
             udp_port: DEFAULT_UDP_PORT,
+            enable_network: DEFAULT_TRANSPORT_ENABLED,
+            enable_ble: DEFAULT_TRANSPORT_ENABLED,
             #[cfg(feature = "tpm")]
             use_tpm: false,
             #[cfg(feature = "tpm")]
@@ -156,19 +176,23 @@ impl TapAuthConfig {
             Ok(config) => {
                 #[cfg(feature = "tpm")]
                 tracing::info!(
-                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}, use_tpm={}, tpm_pcr_policy={:?}",
+                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}, enable_network={}, enable_ble={}, use_tpm={}, tpm_pcr_policy={:?}",
                     path,
                     config.pam_operation_timeout_secs,
                     config.udp_port,
+                    config.enable_network,
+                    config.enable_ble,
                     config.use_tpm,
                     config.tpm_pcr_policy
                 );
                 #[cfg(not(feature = "tpm"))]
                 tracing::info!(
-                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}",
+                    "Loaded config from {:?}: pam_timeout={}s, udp_port={}, enable_network={}, enable_ble={}",
                     path,
                     config.pam_operation_timeout_secs,
                     config.udp_port,
+                    config.enable_network,
+                    config.enable_ble,
                 );
                 config
             }
@@ -229,6 +253,8 @@ mod tests {
         let config = TapAuthConfig::default();
         assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.udp_port, 36692);
+        assert!(config.enable_network);
+        assert!(config.enable_ble);
         #[cfg(feature = "tpm")]
         {
             assert!(!config.use_tpm);
@@ -243,6 +269,8 @@ mod tests {
         let toml = r#"
             pam_operation_timeout_secs = 5
             udp_port = 12345
+            enable_network = false
+            enable_ble = false
             use_tpm = true
             tpm_pcr_policy = "paranoid"
         "#;
@@ -250,11 +278,15 @@ mod tests {
         let toml = r#"
             pam_operation_timeout_secs = 5
             udp_port = 12345
+            enable_network = false
+            enable_ble = false
         "#;
 
         let config: TapAuthConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 5);
         assert_eq!(config.udp_port, 12345);
+        assert!(!config.enable_network);
+        assert!(!config.enable_ble);
         #[cfg(feature = "tpm")]
         {
             assert!(config.use_tpm);
@@ -276,6 +308,8 @@ mod tests {
         let config: TapAuthConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.udp_port, 36692);
+        assert!(config.enable_network);
+        assert!(config.enable_ble);
         #[cfg(feature = "tpm")]
         {
             assert!(config.use_tpm);
@@ -288,6 +322,8 @@ mod tests {
         let config = TapAuthConfig {
             pam_operation_timeout_secs: 10,
             udp_port: 54321,
+            enable_network: false,
+            enable_ble: true,
             #[cfg(feature = "tpm")]
             use_tpm: true,
             #[cfg(feature = "tpm")]
@@ -302,6 +338,8 @@ mod tests {
             config.pam_operation_timeout_secs
         );
         assert_eq!(parsed.udp_port, config.udp_port);
+        assert_eq!(parsed.enable_network, config.enable_network);
+        assert_eq!(parsed.enable_ble, config.enable_ble);
         #[cfg(feature = "tpm")]
         {
             assert_eq!(parsed.use_tpm, config.use_tpm);

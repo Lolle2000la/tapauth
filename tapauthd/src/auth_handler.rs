@@ -40,8 +40,39 @@ pub enum AuthHandlerError {
     ExplicitDenial,
     #[error("No paired devices")]
     NoPairedDevices,
+    #[error("Transport disabled by configuration")]
+    TransportDisabled,
     #[error("BLE error: {0}")]
     BleError(String),
+}
+
+/// Which transports may be used for an authentication attempt.
+///
+/// Read from the TOML configuration at the start of each attempt so that
+/// toggling BLE / Local Network connectivity takes effect without a daemon
+/// restart.
+#[derive(Debug, Clone, Copy)]
+struct TransportsEnabled {
+    /// Local Network (UDP broadcast/multicast) transport
+    network: bool,
+    /// Bluetooth Low Energy transport (always false when the daemon is
+    /// built without the `ble` feature)
+    ble: bool,
+}
+
+impl TransportsEnabled {
+    fn from_config() -> Self {
+        let config = shared::config::TapAuthConfig::load();
+        Self {
+            network: config.enable_network,
+            ble: cfg!(feature = "ble") && config.enable_ble,
+        }
+    }
+
+    /// Whether at least one transport can be used.
+    fn any(self) -> bool {
+        self.network || self.ble
+    }
 }
 
 /// Type alias for transport task handles
@@ -201,6 +232,9 @@ pub struct AuthSession {
     state: Arc<DaemonState>,
     username: String,
     challenge: [u8; 32],
+    /// Transports enabled for this attempt (read from config when the
+    /// attempt starts)
+    transports: TransportsEnabled,
     #[allow(dead_code)] // Used in select! macro via cancel_rx local variable
     cancel_rx: Option<oneshot::Receiver<()>>,
     cancel_registry: Option<CancelRegistry>,
@@ -217,6 +251,10 @@ impl AuthSession {
             state,
             username,
             challenge,
+            transports: TransportsEnabled {
+                network: true,
+                ble: cfg!(feature = "ble"),
+            },
             cancel_rx: None,
             cancel_registry: None,
             request_id: None,
@@ -233,6 +271,19 @@ impl AuthSession {
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
         self.cancel_registry = Some(cancel_registry);
+
+        // Read transport toggles fresh from the TOML config so that changes
+        // made via the GUI/admin IPC take effect without a daemon restart.
+        self.transports = TransportsEnabled::from_config();
+        if !self.transports.any() {
+            tracing::info!("All transports (BLE and Local Network) are disabled by configuration");
+            return Ok(ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Ignore as i32,
+                detail: "All transports (BLE and Local Network) are disabled".to_string(),
+                challenge: self.challenge.to_vec(),
+            });
+        }
+
         // Check if we have any paired devices first — if not, return Ignore
         // silently so PAM falls through to other methods without noisy errors.
         let paired_servers = self.state.paired_servers.clone();
@@ -284,6 +335,7 @@ impl AuthSession {
         // Open firewall port for the duration of this authentication attempt.
         // The guard auto-closes the port when dropped (i.e. when auth finishes,
         // times out, or is cancelled), keeping the port closed when idle.
+        // Only needed when the Local Network (UDP) transport is in use.
         let port = match self.state.udp_socket.local_addr() {
             Ok(addr) => addr.port(),
             Err(e) => {
@@ -291,7 +343,7 @@ impl AuthSession {
                 shared::config::TapAuthConfig::load().udp_port
             }
         };
-        let _fw_guard =
+        let _fw_guard = if self.transports.network {
             match tokio::task::spawn_blocking(move || FirewallGuard::new(port, FwProtocol::Udp))
                 .await
             {
@@ -310,7 +362,11 @@ impl AuthSession {
                     );
                     None
                 }
-            };
+            }
+        } else {
+            tracing::debug!("Local Network transport disabled - not opening firewall port");
+            None
+        };
 
         // Create the authentication request
         let request = create_auth_request_with_challenge(
@@ -369,13 +425,15 @@ impl AuthSession {
                 tracing::warn!("Authentication timeout for user {}", self.username);
                 // Broadcast AuthenticationCancel so servers stop retransmitting
                 if let Ok(cancel_packet) = self.create_cancel_packet() {
-                    let udp_socket = self.state.udp_socket.clone();
-                    let toml_config = shared::config::TapAuthConfig::load();
-                    let port = toml_config.udp_port;
-                    tokio::spawn(async move {
-                        let transport = UdpTransport::from_socket(udp_socket, port);
-                        let _ = transport.send_cancel(&cancel_packet).await;
-                    });
+                    if self.transports.network {
+                        let udp_socket = self.state.udp_socket.clone();
+                        let toml_config = shared::config::TapAuthConfig::load();
+                        let port = toml_config.udp_port;
+                        tokio::spawn(async move {
+                            let transport = UdpTransport::from_socket(udp_socket, port);
+                            let _ = transport.send_cancel(&cancel_packet).await;
+                        });
+                    }
                 }
                 Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Timeout as i32,
@@ -464,7 +522,11 @@ impl AuthSession {
             .unwrap_or_else(|| unreachable!("csk checked in health check"));
         let challenge = self.challenge;
 
-        let ble_transport =
+        // Skip BLE entirely when disabled by configuration
+        let ble_transport = if !self.transports.ble {
+            tracing::debug!("BLE transport disabled by configuration");
+            None
+        } else {
             match BleTransport::new(temporal_id, timeout, csk, keypair, challenge).await {
                 Ok(ble) => Some(Arc::new(ble)),
                 Err(e) => {
@@ -474,7 +536,8 @@ impl AuthSession {
                     );
                     None
                 }
-            };
+            }
+        };
 
         Ok((Arc::new(udp_transport), ble_transport))
     }
@@ -533,10 +596,10 @@ impl AuthSession {
                     .await
             })
         } else {
-            tokio::spawn(async { Err(AuthHandlerError::BleError("BLE disabled".into())) })
+            tokio::spawn(async { Err(AuthHandlerError::TransportDisabled) })
         };
 
-        let udp_handle = {
+        let udp_handle = if self.transports.network {
             let packet = packet.clone();
             let csk = self
                 .state
@@ -557,6 +620,8 @@ impl AuthSession {
                 Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, servers)
                     .await
             })
+        } else {
+            tokio::spawn(async { Err(AuthHandlerError::TransportDisabled) })
         };
 
         (ble_handle, udp_handle)
@@ -739,7 +804,9 @@ impl AuthSession {
                 let _ = ble.finalize().await;
             });
         }
-        let _ = udp_transport.send_cancel(cancel_packet).await;
+        if self.transports.network {
+            let _ = udp_transport.send_cancel(cancel_packet).await;
+        }
     }
 
     #[cfg(feature = "ble")]
@@ -755,7 +822,9 @@ impl AuthSession {
                 let _ = ble.finalize().await;
             });
         }
-        let _ = udp_transport.send_cancel(cancel_packet).await;
+        if self.transports.network {
+            let _ = udp_transport.send_cancel(cancel_packet).await;
+        }
     }
 
     #[cfg(feature = "ble")]
@@ -774,11 +843,13 @@ impl AuthSession {
             rid
         );
 
-        tracing::info!("Broadcasting AuthenticationCancel over UDP");
-        if let Err(e) = udp_transport.send_cancel(cancel_packet).await {
-            tracing::warn!("UDP cancel broadcast failed: {}", e);
-        } else {
-            tracing::debug!("UDP cancel broadcast sent");
+        if self.transports.network {
+            tracing::info!("Broadcasting AuthenticationCancel over UDP");
+            if let Err(e) = udp_transport.send_cancel(cancel_packet).await {
+                tracing::warn!("UDP cancel broadcast failed: {}", e);
+            } else {
+                tracing::debug!("UDP cancel broadcast sent");
+            }
         }
 
         // Disconnect BLE clients (non-blocking)

@@ -178,7 +178,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
-- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false)
+- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
 
 ## Docker Dev Environment
 ```bash

@@ -75,7 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let toml_config = shared::config::TapAuthConfig::load();
     let udp_port = toml_config.udp_port;
 
-    // Create global UDP socket for the daemon's lifetime
+    if !toml_config.enable_network {
+        tracing::info!("Local Network (UDP) transport disabled by configuration");
+    }
+    if !toml_config.enable_ble {
+        tracing::info!("BLE transport disabled by configuration");
+    }
+
+    // Create global UDP socket for the daemon's lifetime.
+    // Created even when the Local Network transport is disabled so that
+    // re-enabling it at runtime does not require a daemon restart.
     let udp_socket = shared::network::create_broadcast_socket(udp_port).await?;
     tracing::info!("Created global UDP socket on port {}", udp_port);
 
