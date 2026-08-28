@@ -80,6 +80,7 @@ pub fn is_root() -> bool {
 
 /// Get active state/config directory (allows override via TAPAUTH_STATE_DIR in development/testing)
 pub fn get_config_dir() -> PathBuf {
+    #[cfg(any(feature = "dev-state-override", test))]
     if let Ok(dir) = std::env::var("TAPAUTH_STATE_DIR") {
         return PathBuf::from(dir);
     }
@@ -106,14 +107,17 @@ fn is_euid_tapauthd() -> bool {
 
 /// Whether the effective UID is privileged for writes (tapauthd, root, or custom TAPAUTH_STATE_DIR)
 fn is_euid_privileged_for_writes() -> bool {
-    std::env::var("TAPAUTH_STATE_DIR").is_ok()
-        || is_euid_tapauthd()
-        || nix::unistd::geteuid().as_raw() == 0
+    #[cfg(any(feature = "dev-state-override", test))]
+    if std::env::var("TAPAUTH_STATE_DIR").is_ok() {
+        return true;
+    }
+    is_euid_tapauthd() || nix::unistd::geteuid().as_raw() == 0
 }
 
 /// Chown a path to tapauthd:tapauthd when running as root
 /// If tapauthd user doesn't exist (e.g., during development), skip chown silently
 fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
+    #[cfg(any(feature = "dev-state-override", test))]
     if std::env::var("TAPAUTH_STATE_DIR").is_ok() {
         return Ok(());
     }
@@ -209,7 +213,11 @@ pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
     let owner_uid = metadata.uid();
     let current_euid = nix::unistd::geteuid().as_raw();
     let tap_uid = tapauthd_uid();
+    #[cfg(any(feature = "dev-state-override", test))]
     let is_dev_dir = std::env::var("TAPAUTH_STATE_DIR").is_ok();
+    #[cfg(not(any(feature = "dev-state-override", test)))]
+    let is_dev_dir = false;
+
     let owner_ok = owner_uid == 0
         || tap_uid.map(|u| owner_uid == u).unwrap_or(false)
         || (is_dev_dir && owner_uid == current_euid);

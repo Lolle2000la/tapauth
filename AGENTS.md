@@ -62,17 +62,17 @@ cd server-android && ./gradlew connectedDebugAndroidTest
 
 | Crate | Default | Features |
 |-------|---------|----------|
-| `shared` | `[]` | `jni`, `tpm`, `firewall` |
-| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket` |
+| `shared` | `[]` | `jni`, `tpm`, `firewall`, `dev-state-override` |
+| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override` |
 | `client-pam` | `[]` | `tpm`, `dev-socket-override` |
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
 
 **Gotchas:**
 - `--all-features` **may not work locally** — it pulls in `jni` which requires `libjvm`/JDK headers. If you have a JDK installed, it should compile; otherwise use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
-- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Without this, the daemon errors out with "Systemd socket activation required."
+- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Automatically pulls in `dev-state-override`.
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
-- **`dev-socket-override`** on `client-pam` and `client-config-gui`: enables `TAPAUTHD_SOCK` env var to override the default IPC socket path.  This is for development/testing only — production builds must NOT enable this feature, as it would allow environment-controlled socket redirection.
+- **`dev-socket-override`** on `client-pam` and `client-config-gui` and **`dev-state-override`** on `shared`/`tapauthd`: enables `TAPAUTHD_SOCK` and `TAPAUTH_STATE_DIR`/`TAPAUTH_CONFIG_FILE` env vars. These are for development/testing only — production builds must NOT enable these features, as they would allow environment-controlled socket/state redirection.
 
 ## Development Quick Start
 ```bash

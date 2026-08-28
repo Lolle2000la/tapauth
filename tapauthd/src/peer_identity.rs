@@ -105,8 +105,7 @@ fn read_process_start_time(pid: i32) -> Result<u64, PeerIdentityError> {
 ///
 /// Falls back to root-only when PolKit is unavailable.
 pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIdentityError> {
-    // In development / test sandbox mode with isolated state or dev socket,
-    // allow the owner UID who launched the daemon to perform admin operations.
+    #[cfg(any(feature = "dev-state-override", feature = "fallback-socket", test))]
     if std::env::var("TAPAUTH_DEV_MODE").is_ok()
         || std::env::var("TAPAUTH_STATE_DIR").is_ok()
         || std::env::var("TAPAUTHD_SOCK").is_ok()

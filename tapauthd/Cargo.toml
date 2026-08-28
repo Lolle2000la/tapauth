@@ -39,4 +39,6 @@ ble = ["bluer"]
 tpm = ["shared/tpm"]
 firewall = ["shared/firewall"]
 fallback-socket = [
+    "shared/dev-state-override",
 ] # Enable manual socket binding for development/testing (production uses systemd socket activation)
+dev-state-override = ["shared/dev-state-override"]

@@ -63,5 +63,8 @@ prost-build.workspace = true
 default = []
 jni = ["dep:jni"]
 tpm = [] # TPM 2.0 support (requires tpm2-tools on system)
-firewall = [
-] # Firewall management support (requires iptables/nftables on system)
+firewall = [] # Firewall management support (requires iptables/nftables on system)
+# dev-state-override: enables TAPAUTH_STATE_DIR and TAPAUTH_CONFIG_FILE env vars
+# to override persistent state and configuration directories. For testing/dev only.
+# Production builds must NOT enable this feature.
+dev-state-override = []
