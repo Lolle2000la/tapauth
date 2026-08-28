@@ -7,12 +7,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 
-# Ensure vhci module is loaded
+# Ensure vhci module is loaded and /dev/vhci node exists
 if ! lsmod | grep -q hci_vhci; then
     echo "    Loading hci_vhci kernel module..."
-    sudo modprobe hci_vhci || {
-        echo "⚠️ Warning: Failed to modprobe hci_vhci. Ensure kernel headers and vhci support are enabled."
+    sudo modprobe hci_vhci 2>/dev/null || {
+        echo "⚠️ Warning: Failed to modprobe hci_vhci."
     }
+fi
+
+if [ ! -c /dev/vhci ]; then
+    echo "    Creating /dev/vhci character device node..."
+    sudo mknod /dev/vhci c 10 137 2>/dev/null || true
+    sudo chmod 666 /dev/vhci 2>/dev/null || true
 fi
 
 # Ensure D-Bus system bus is running

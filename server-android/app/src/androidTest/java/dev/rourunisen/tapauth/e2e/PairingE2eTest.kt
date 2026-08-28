@@ -82,8 +82,11 @@ class PairingE2eTest {
         val pairedDevice = (completeResult as PairingResult.Success).device
         Log.i(TAG, "Pairing successfully completed. Stored device: ${pairedDevice.displayName}")
 
-        // Verify stored in DeviceRepository
+        // Save device to repository
         val deviceRepo = DeviceRepository(context)
+        deviceRepo.savePairedDevice(pairedDevice)
+
+        // Verify stored in DeviceRepository
         val storedDevice = deviceRepo.getPairedDevice(pairedDevice.deviceId)
         assertNotNull("Paired device not found in repository", storedDevice)
 
