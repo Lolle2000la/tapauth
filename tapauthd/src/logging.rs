@@ -25,27 +25,28 @@ fn make_stdout_layer() -> impl Layer<tracing_subscriber::Registry> {
 }
 
 pub fn init_logging() {
-    let journald_level =
-        std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let stdout_filter = std::env::var("TAPAUTH_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .and_then(|level| EnvFilter::try_new(&level).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
 
-    if let Ok(journald_layer) = tracing_journald::layer() {
-        if std::env::var("JOURNAL_STREAM").is_ok() {
+    if std::env::var("JOURNAL_STREAM").is_ok() {
+        let journald_level =
+            std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        if let Ok(journald_layer) = tracing_journald::layer() {
             let filter =
                 EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
                 .with(journald_layer.with_filter(filter))
                 .init();
-        } else {
-            let filter =
-                EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(make_stdout_layer())
-                .with(journald_layer.with_filter(filter))
-                .init();
+            return;
         }
-    } else {
-        tracing_subscriber::registry()
-            .with(make_stdout_layer())
-            .init();
     }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(stdout_filter)
+        .with_target(false)
+        .with_writer(std::io::stdout)
+        .init();
 }

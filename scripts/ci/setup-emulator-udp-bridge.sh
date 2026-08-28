@@ -21,13 +21,18 @@ if [ -z "$EMULATOR_SERIAL" ]; then
     exit 1
 fi
 
-echo "    Configuring UDP redirection (host:36692 -> guest:36692)..."
-adb emu redir add udp:36692:36692 || true
+# Remove any stale port redirections
+adb emu redir del udp:36692 2>/dev/null || true
+adb emu redir del udp:36695 2>/dev/null || true
+
+# Map host port 36695 to guest port 36692 (syntax: redir add udp:guest_port:host_port)
+echo "    Configuring UDP redirection (host:36695 -> guest:36692)..."
+adb emu redir add udp:36692:36695 || true
 echo "    Active port redirections:"
 adb emu redir list || true
 
 # Spawn background UDP broadcast reflector
-# Mirrors 255.255.255.255 / local subnet broadcasts to 127.0.0.1:36692
+# Mirrors 255.255.255.255 / local subnet broadcasts on port 36692 to 127.0.0.1:36695
 echo "    Starting background UDP broadcast reflector..."
 
 cat << 'EOF' > /tmp/udp_reflector.py
@@ -36,7 +41,7 @@ import socket, sys, time
 SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 15)
 
 try:
-    # Listener for broadcast on 0.0.0.0:36692
+    # Listener for broadcast on 0.0.0.0:36692 (shares port 36692 with tapauthd)
     sock_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -46,26 +51,17 @@ try:
     sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock_in.bind(('', 36692))
     
-    # Forwarder to emulator host redirection
+    # Forwarder to emulator guest via host redirection port 36695
     sock_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    print("UDP broadcast reflector running on port 36692...", flush=True)
+    print("UDP broadcast reflector listening on 36692, forwarding to 127.0.0.1:36695...", flush=True)
     
-    seen = {}
     while True:
         data, addr = sock_in.recvfrom(65535)
-        now = time.time()
-        # Clean expired keys
-        seen = {k: v for k, v in seen.items() if now - v < 2.0}
-        
-        # Don't forward loopback traffic or duplicated packets
-        key = (data[:32], addr[1])
-        if key in seen:
-            continue
-        seen[key] = now
-        
+        # Forward to emulator redirection port
         try:
-            sock_out.sendto(data, ('127.0.0.1', 36692))
+            sock_out.sendto(data, ('127.0.0.1', 36695))
+            print(f"Reflected {len(data)} bytes from {addr} to 127.0.0.1:36695", flush=True)
         except Exception as e:
             print(f"Forward error: {e}", flush=True)
 except Exception as e:

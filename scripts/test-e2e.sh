@@ -68,10 +68,20 @@ cleanup() {
         cat "$DAEMON_LOG"
         echo "======================="
     fi
+    if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/udp-reflector.log ]; then
+        echo "=== UDP REFLECTOR LOG DUMP ==="
+        cat /tmp/udp-reflector.log
+        echo "=============================="
+    fi
     if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/bumble-bridge.log ]; then
         echo "=== BUMBLE LOG DUMP ==="
         cat /tmp/bumble-bridge.log
         echo "======================="
+    fi
+    if [ "$EXIT_CODE" -ne 0 ]; then
+        echo "=== ANDROID LOGCAT DUMP ==="
+        adb logcat -d -v time -s AuthenticationService:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* 2>/dev/null || true
+        echo "==========================="
     fi
     if [ -n "$DAEMON_PID" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
