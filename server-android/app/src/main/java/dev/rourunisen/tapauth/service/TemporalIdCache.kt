@@ -69,7 +69,22 @@ class TemporalIdCache(
 
         ensureCacheIsCurrent()
 
-        val deviceId = validIds[idHex]
+        var deviceId = validIds[idHex]
+        if (deviceId == null) {
+            // If not found in cache, reload devices in case a new pairing occurred
+            synchronized(this) {
+                try {
+                    val pairedDevices = deviceRepository.getAllPairedDevices()
+                    cachedDevices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
+                    val now = System.currentTimeMillis()
+                    recomputeCache(now / TIME_WINDOW_MS)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to reload devices on cache miss", e)
+                }
+            }
+            deviceId = validIds[idHex]
+        }
+
         return if (deviceId != null) {
             Pair(true, deviceId)
         } else {
@@ -81,9 +96,9 @@ class TemporalIdCache(
         val now = System.currentTimeMillis()
         val currentWindow = now / TIME_WINDOW_MS
 
-        if (currentWindow != lastComputedWindow) {
+        if (currentWindow != lastComputedWindow || cachedDevices.isEmpty()) {
             synchronized(this) {
-                if (currentWindow != lastComputedWindow) {
+                if (currentWindow != lastComputedWindow || cachedDevices.isEmpty()) {
                     recomputeCache(currentWindow)
                 }
             }
@@ -91,7 +106,17 @@ class TemporalIdCache(
     }
 
     private fun recomputeCache(currentWindow: Long) {
-        val devices = cachedDevices
+        var devices = cachedDevices
+        if (devices.isEmpty()) {
+            try {
+                val pairedDevices = deviceRepository.getAllPairedDevices()
+                devices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
+                cachedDevices = devices
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to load devices during recompute", e)
+            }
+        }
+
         if (devices.isEmpty()) {
             lastComputedWindow = currentWindow
             return

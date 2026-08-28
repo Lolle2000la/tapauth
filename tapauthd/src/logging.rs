@@ -12,7 +12,6 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-
 pub fn init_logging() {
     let stdout_filter = std::env::var("TAPAUTH_LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
