@@ -70,12 +70,22 @@ fn complete_pairing_success(server_hex: String) -> ipc::AdminResponse {
     }
 }
 
-fn get_config_success(hostname: String, udp_port: u32) -> ipc::AdminResponse {
+fn get_config_success(
+    hostname: String,
+    udp_port: u32,
+    enable_ble: bool,
+    enable_network: bool,
+) -> ipc::AdminResponse {
     ipc::AdminResponse {
         status: ipc::AdminStatus::AdminSuccess as i32,
         error_message: String::new(),
         payload: Some(ipc::admin_response::Payload::GetConfig(
-            ipc::GetConfigResponse { hostname, udp_port },
+            ipc::GetConfigResponse {
+                hostname,
+                udp_port,
+                enable_ble,
+                enable_network,
+            },
         )),
     }
 }
@@ -633,6 +643,10 @@ async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
 /// before ClientConfig (hostname, takes effect immediately).
 /// If TOML save fails, nothing is written. If ClientConfig save fails,
 /// the port change is still persisted (correct, just needs restart).
+///
+/// Transport toggles (BLE / Local Network) are only written when the request
+/// carries them (explicit presence), so older clients cannot accidentally
+/// disable transports.
 async fn handle_save_config(
     daemon: &Arc<DaemonState>,
     req: ipc::SaveConfigRequest,
@@ -651,6 +665,12 @@ async fn handle_save_config(
 
     let mut toml_config = shared::config::TapAuthConfig::load();
     toml_config.udp_port = port;
+    if let Some(enable_ble) = req.enable_ble {
+        toml_config.enable_ble = enable_ble;
+    }
+    if let Some(enable_network) = req.enable_network {
+        toml_config.enable_network = enable_network;
+    }
     if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
         return err_resp(
             ipc::AdminStatus::AdminError,
@@ -668,6 +688,11 @@ async fn handle_save_config(
     tracing::info!(
         "UDP port changed to {} — will take effect on next daemon restart",
         port
+    );
+    tracing::info!(
+        "Transports: BLE={}, LocalNetwork={} — takes effect on next authentication attempt",
+        toml_config.enable_ble,
+        toml_config.enable_network
     );
 
     empty_success()
@@ -697,7 +722,12 @@ async fn handle_recover_tpm(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
 async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
     let client_config = daemon.config_manager.load_config().unwrap_or_default();
     let toml_config = shared::config::TapAuthConfig::load();
-    get_config_success(client_config.hostname, toml_config.udp_port as u32)
+    get_config_success(
+        client_config.hostname,
+        toml_config.udp_port as u32,
+        toml_config.enable_ble,
+        toml_config.enable_network,
+    )
 }
 
 async fn handle_get_daemon_status(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {

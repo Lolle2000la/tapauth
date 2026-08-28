@@ -2,7 +2,9 @@ use super::ScreenMessage;
 use crate::ipc::GuiIpcError;
 use crate::l10n::{self, L10n};
 use iced::{
-    widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
+    widget::{
+        button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Space,
+    },
     Element, Font, Length, Task,
 };
 use std::sync::LazyLock;
@@ -39,6 +41,8 @@ pub struct SettingsScreen {
     success: Option<String>,
     hostname_input: String,
     udp_port_input: String,
+    ble_enabled: bool,
+    network_enabled: bool,
 }
 
 impl SettingsScreen {
@@ -50,6 +54,8 @@ impl SettingsScreen {
             success: None,
             hostname_input: String::new(),
             udp_port_input: String::new(),
+            ble_enabled: true,
+            network_enabled: true,
         }
     }
 
@@ -84,6 +90,14 @@ impl SettingsScreen {
                 self.udp_port_input = port_str.clone();
                 Task::none()
             }
+            ScreenMessage::BleEnabledChanged(enabled) => {
+                self.ble_enabled = enabled;
+                Task::none()
+            }
+            ScreenMessage::NetworkEnabledChanged(enabled) => {
+                self.network_enabled = enabled;
+                Task::none()
+            }
             ScreenMessage::SaveConfig => {
                 self.error = None;
                 self.success = None;
@@ -95,8 +109,10 @@ impl SettingsScreen {
                         return Task::none();
                     }
                 };
+                let ble_enabled = self.ble_enabled;
+                let network_enabled = self.network_enabled;
                 Task::perform(
-                    crate::ipc::save_config(hostname, udp_port),
+                    crate::ipc::save_config(hostname, udp_port, ble_enabled, network_enabled),
                     |result| match result {
                         Ok(_) => ScreenMessage::ConfigSaved,
                         Err(e) => ScreenMessage::ConfigSaveFailed(e),
@@ -113,9 +129,11 @@ impl SettingsScreen {
                 self.success = None;
                 Task::none()
             }
-            ScreenMessage::ConfigLoaded(hostname, port) => {
-                self.hostname_input = hostname;
-                self.udp_port_input = port.to_string();
+            ScreenMessage::ConfigLoaded(config) => {
+                self.hostname_input = config.hostname;
+                self.udp_port_input = config.udp_port.to_string();
+                self.ble_enabled = config.enable_ble;
+                self.network_enabled = config.enable_network;
                 Task::none()
             }
             _ => Task::none(),
@@ -159,6 +177,24 @@ impl SettingsScreen {
         .on_input(ScreenMessage::UdpPortChanged)
         .padding(10)
         .width(Length::Fixed(400.0));
+
+        let connectivity_title = text(self.l10n.tr("settings-connectivity-section")).size(18);
+
+        let network_checkbox = checkbox(self.network_enabled)
+            .label(self.l10n.tr("settings-enable-network"))
+            .on_toggle(ScreenMessage::NetworkEnabledChanged)
+            .size(20)
+            .text_size(16)
+            .width(Length::Fixed(400.0));
+
+        let ble_checkbox = checkbox(self.ble_enabled)
+            .label(self.l10n.tr("settings-enable-ble"))
+            .on_toggle(ScreenMessage::BleEnabledChanged)
+            .size(20)
+            .text_size(16)
+            .width(Length::Fixed(400.0));
+
+        let connectivity_note = text(self.l10n.tr("settings-connectivity-note")).size(12);
 
         let save_button = button(text(self.l10n.tr("btn-save-config")).size(16))
             .padding(15)
@@ -209,6 +245,13 @@ impl SettingsScreen {
             Space::new().height(Length::Fixed(15.0)),
             udp_port_label,
             udp_port_input,
+            Space::new().height(Length::Fixed(20.0)),
+            connectivity_title,
+            Space::new().height(Length::Fixed(10.0)),
+            network_checkbox,
+            ble_checkbox,
+            Space::new().height(Length::Fixed(5.0)),
+            connectivity_note,
             Space::new().height(Length::Fixed(20.0)),
             save_button,
             Space::new().height(Length::Fixed(40.0)),

@@ -737,6 +737,9 @@ create_initial_config() {
     if [[ -f "$config_file" ]]; then
         print_info "Configuration file already exists, skipping creation"
         print_info "To enable/disable TPM, edit $config_file manually"
+        # The daemon (tapauthd) is the single writer of this file (SaveConfig
+        # admin op persists hostname/port/transport toggles) — grant it ownership
+        chown tapauthd:tapauthd "$config_file" || true
         return
     fi
     
@@ -761,7 +764,12 @@ udp_port = 36692
 use_tpm = $([[ "$USE_TPM" == true ]] && echo "true" || echo "false")
 EOF
     
-    # Set permissions (readable by all, writable only by root)
+    # Ownership: the daemon (tapauthd) is the single writer of this file —
+    # SaveConfig persists hostname, port and transport toggles at runtime.
+    # It stays world-readable so the PAM module can read its settings.
+    chown tapauthd:tapauthd "$config_file"
+
+    # Set permissions (readable by all, writable by the daemon)
     chmod 644 "$config_file"
     
     print_success "Configuration file created"

@@ -58,10 +58,12 @@ pub enum ScreenMessage {
     CSKRotationFailed(crate::ipc::GuiIpcError),
     HostnameChanged(String),
     UdpPortChanged(String),
+    BleEnabledChanged(bool),
+    NetworkEnabledChanged(bool),
     SaveConfig,
     ConfigSaved,
     ConfigSaveFailed(crate::ipc::GuiIpcError),
-    ConfigLoaded(String, u16),
+    ConfigLoaded(crate::ipc::ClientConfigValues),
     LocaleChanged(String),
 
     // TPM Recovery
@@ -98,11 +100,16 @@ impl Screen {
             ScreenMessage::NavigateToSettings => {
                 *self = Screen::Settings(SettingsScreen::new(l10n.clone()));
                 Task::perform(crate::ipc::get_config(), |result| match result {
-                    Ok((hostname, port)) => ScreenMessage::ConfigLoaded(hostname, port),
+                    Ok(config) => ScreenMessage::ConfigLoaded(config),
                     Err(_) => {
                         let default_config = shared::config::ClientConfig::default();
                         let default_toml = shared::config::TapAuthConfig::load();
-                        ScreenMessage::ConfigLoaded(default_config.hostname, default_toml.udp_port)
+                        ScreenMessage::ConfigLoaded(crate::ipc::ClientConfigValues {
+                            hostname: default_config.hostname,
+                            udp_port: default_toml.udp_port,
+                            enable_ble: default_toml.enable_ble,
+                            enable_network: default_toml.enable_network,
+                        })
                     }
                 })
             }

@@ -256,12 +256,19 @@ pub async fn rotate_csk() -> Result<(), GuiIpcError> {
     Ok(())
 }
 
-pub async fn save_config(client_hostname: String, udp_port: u16) -> Result<(), GuiIpcError> {
+pub async fn save_config(
+    client_hostname: String,
+    udp_port: u16,
+    enable_ble: bool,
+    enable_network: bool,
+) -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::SaveConfig(
             ipc::SaveConfigRequest {
                 hostname: client_hostname,
                 udp_port: udp_port as u32,
+                enable_ble: Some(enable_ble),
+                enable_network: Some(enable_network),
             },
         )),
     };
@@ -317,7 +324,18 @@ pub async fn get_daemon_status() -> Result<(bool, String), GuiIpcError> {
     Ok((status.tpm_enabled, status.tpm_error))
 }
 
-pub async fn get_config() -> Result<(String, u16), GuiIpcError> {
+/// Client configuration values exchanged with the daemon via admin IPC.
+#[derive(Debug, Clone)]
+pub struct ClientConfigValues {
+    pub hostname: String,
+    pub udp_port: u16,
+    /// Whether the BLE transport may be used for authentication
+    pub enable_ble: bool,
+    /// Whether the Local Network (UDP) transport may be used for authentication
+    pub enable_network: bool,
+}
+
+pub async fn get_config() -> Result<ClientConfigValues, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::GetConfig(
             ipc::GetConfigRequest {},
@@ -331,9 +349,12 @@ pub async fn get_config() -> Result<(String, u16), GuiIpcError> {
     }
 
     match response.payload {
-        Some(ipc::admin_response::Payload::GetConfig(resp)) => {
-            Ok((resp.hostname, resp.udp_port as u16))
-        }
+        Some(ipc::admin_response::Payload::GetConfig(resp)) => Ok(ClientConfigValues {
+            hostname: resp.hostname,
+            udp_port: resp.udp_port as u16,
+            enable_ble: resp.enable_ble,
+            enable_network: resp.enable_network,
+        }),
         _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
