@@ -57,8 +57,19 @@ REFLECTOR_PID=""
 BIO_PID=""
 
 cleanup() {
+    EXIT_CODE=$?
     echo ""
-    echo "==> Cleaning up test environment..."
+    echo "==> Cleaning up test environment (exit code: $EXIT_CODE)..."
+    if [ "$EXIT_CODE" -ne 0 ] && [ -n "$DAEMON_LOG" ] && [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
+    fi
+    if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/bumble-bridge.log ]; then
+        echo "=== BUMBLE LOG DUMP ==="
+        cat /tmp/bumble-bridge.log
+        echo "======================="
+    fi
     if [ -n "$DAEMON_PID" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true

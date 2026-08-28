@@ -2,6 +2,16 @@
 # Helper script to manage automated biometric verification on the Android Emulator
 set -e
 
+# Ensure adb is in PATH
+if ! command -v adb &> /dev/null; then
+    for p in "/usr/local/lib/android/sdk/platform-tools" "$ANDROID_HOME/platform-tools" "$ANDROID_SDK_ROOT/platform-tools" "$HOME/Android/Sdk/platform-tools"; do
+        if [ -x "$p/adb" ]; then
+            export PATH="$PATH:$p"
+            break
+        fi
+    done
+fi
+
 ACTION="${1:-setup}"
 
 case "$ACTION" in
@@ -31,18 +41,17 @@ case "$ACTION" in
     start-auto-grant)
         echo "==> Starting background biometric auto-grant listener..."
         LOGCAT_LOG="/tmp/bio-auto-grant.log"
-        python3 - << 'PY' > "$LOGCAT_LOG" 2>&1 &
+
+        cat << 'EOF' > /tmp/bio_auto_grant.py
 import subprocess, time, sys
 
 print("Biometric auto-grant daemon started...")
 sys.stdout.flush()
 
-# Monitor logcat for BiometricPrompt or AuthenticationRequest
 proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', 'AuthenticationService:D', 'BleGattService:D', 'BiometricPrompt:D', '*:S'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 try:
     for line in iter(proc.stdout.readline, ''):
-        # When request or prompt detected, trigger finger touch after a brief delay
         if 'Handling AuthenticationRequest' in line or 'Showing biometric prompt' in line or 'BiometricPrompt' in line:
             time.sleep(0.3)
             subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
@@ -50,7 +59,9 @@ try:
             sys.stdout.flush()
 finally:
     proc.terminate()
-PY
+EOF
+
+        python3 /tmp/bio_auto_grant.py > "$LOGCAT_LOG" 2>&1 &
         BIO_PID=$!
         echo "$BIO_PID" > /tmp/bio-auto-grant.pid
         echo "    Auto-grant daemon running with PID $BIO_PID (logs: $LOGCAT_LOG)"

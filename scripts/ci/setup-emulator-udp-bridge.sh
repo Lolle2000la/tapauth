@@ -4,6 +4,16 @@ set -e
 
 echo "==> Configuring UDP Network Bridge for Android Emulator..."
 
+# Ensure adb is in PATH
+if ! command -v adb &> /dev/null; then
+    for p in "/usr/local/lib/android/sdk/platform-tools" "$ANDROID_HOME/platform-tools" "$ANDROID_SDK_ROOT/platform-tools" "$HOME/Android/Sdk/platform-tools"; do
+        if [ -x "$p/adb" ]; then
+            export PATH="$PATH:$p"
+            break
+        fi
+    done
+fi
+
 # Find running emulator serial / console port
 EMULATOR_SERIAL=$(adb devices | grep -m1 'emulator-[0-9]*' | awk '{print $1}' || true)
 if [ -z "$EMULATOR_SERIAL" ]; then
@@ -21,18 +31,20 @@ if [ -f "$HOME/.emulator_console_auth_token" ]; then
 fi
 
 echo "    Configuring UDP redirection on port 36692..."
-python3 - << PY || {
-    echo "⚠️ Failed to configure via Python telnet; trying direct netcat..."
-}
-import socket, time
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
+cat << 'EOF' > /tmp/setup_udp_redir.py
+import socket, sys, time
+
+console_port = int(sys.argv[1])
+auth_token = sys.argv[2] if len(sys.argv) > 2 else ""
+
 try:
-    s.connect(('127.0.0.1', int("$CONSOLE_PORT")))
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(('127.0.0.1', console_port))
     banner = s.recv(1024).decode(errors='ignore')
-    if "$AUTH_TOKEN":
-        s.sendall(f"auth $AUTH_TOKEN\n".encode())
+    if auth_token:
+        s.sendall(f"auth {auth_token}\n".encode())
         resp = s.recv(1024).decode(errors='ignore')
     
     # Add UDP redirection: redir add udp:guest_port:host_port
@@ -44,11 +56,15 @@ try:
     print("✅ Port redirect udp:36692:36692 configured.")
 except Exception as e:
     print(f"⚠️ Console redirect warning: {e}")
-PY
+EOF
+
+python3 /tmp/setup_udp_redir.py "$CONSOLE_PORT" "$AUTH_TOKEN"
+rm -f /tmp/setup_udp_redir.py
 
 # Spawn background UDP broadcast reflector (mirrors 255.255.255.255 / local subnet broadcasts to 127.0.0.1:36692)
 echo "    Starting background UDP broadcast reflector..."
-python3 - << 'EOF' > /tmp/udp-reflector.log 2>&1 &
+
+cat << 'EOF' > /tmp/udp_reflector.py
 import socket, sys
 
 try:
@@ -73,6 +89,8 @@ except Exception as e:
     print(f"Reflector exited: {e}")
     sys.stdout.flush()
 EOF
+
+python3 /tmp/udp_reflector.py > /tmp/udp-reflector.log 2>&1 &
 REFLECTOR_PID=$!
 echo "$REFLECTOR_PID" > /tmp/udp-reflector.pid
 echo "    UDP broadcast reflector running with PID $REFLECTOR_PID"
