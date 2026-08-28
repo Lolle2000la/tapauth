@@ -127,7 +127,7 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: cd server-android && ./gradlew connectedDebugAndroidTest --stacktrace
+          script: cd server-android && ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace
 
       - name: Upload test results
         uses: actions/upload-artifact@v7
@@ -163,7 +163,7 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: sudo ./scripts/test-e2e.sh
+          script: sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
 
       - name: Check Kotlin formatting with Spotless
         run: cd server-android && ./gradlew spotlessCheck

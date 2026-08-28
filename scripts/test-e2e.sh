@@ -14,6 +14,16 @@ echo "║      (TCP Pairing + UDP Network + BLE GATT Authentication)   ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
+# Ensure adb is in PATH
+if ! command -v adb &> /dev/null; then
+    for p in "/usr/local/lib/android/sdk/platform-tools" "$ANDROID_HOME/platform-tools" "$ANDROID_SDK_ROOT/platform-tools" "$HOME/Android/Sdk/platform-tools"; do
+        if [ -x "$p/adb" ]; then
+            export PATH="$PATH:$p"
+            break
+        fi
+    done
+fi
+
 # Check for running Android emulator
 if ! adb devices | grep -q 'emulator-[0-9]*'; then
     echo "❌ ERROR: No active Android emulator detected."
