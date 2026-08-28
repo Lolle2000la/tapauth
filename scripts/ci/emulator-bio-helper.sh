@@ -43,17 +43,25 @@ case "$ACTION" in
         LOGCAT_LOG="/tmp/bio-auto-grant.log"
 
         cat << 'EOF' > /tmp/bio_auto_grant.py
-import subprocess, time, sys
+import subprocess, time, sys, threading
 
 print("Biometric auto-grant daemon started...")
 sys.stdout.flush()
 
-proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', 'AuthenticationService:D', 'BleGattService:D', 'BiometricPrompt:D', '*:S'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def periodic_touch():
+    while True:
+        time.sleep(1.0)
+        subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
+
+t = threading.Thread(target=periodic_touch, daemon=True)
+t.start()
+
+proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', '*:V'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 try:
     for line in iter(proc.stdout.readline, ''):
-        if 'Handling AuthenticationRequest' in line or 'Showing biometric prompt' in line or 'BiometricPrompt' in line:
-            time.sleep(0.3)
+        if any(k in line for k in ['Handling AuthenticationRequest', 'Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Processing packet']):
+            time.sleep(0.2)
             subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
             print(f"Auto-granted fingerprint touch for: {line.strip()}")
             sys.stdout.flush()

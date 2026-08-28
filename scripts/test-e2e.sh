@@ -36,6 +36,7 @@ echo "✅ Android emulator detected."
 # Setup isolated sandbox directory to avoid dirtying the host
 TEST_DIR=$(mktemp -d -t tapauth-e2e.XXXXXX)
 export TAPAUTHD_SOCK="${TEST_DIR}/tapauthd.sock"
+export DAEMON_LOG="${TEST_DIR}/tapauthd.log"
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
 
@@ -202,6 +203,17 @@ if [ "$SERVERS_COUNT" -lt 1 ]; then
 fi
 echo "✅ Verified 1 paired Android device registered."
 
+# Step 5b: Ensure runtime permissions and launch Android app/background services
+echo "==> Ensuring Android permissions and launching app services..."
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
+adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_SCAN 2>/dev/null || true
+
+adb shell am start -n dev.rourunisen.tapauth.debug/dev.rourunisen.tapauth.MainActivity
+sleep 2
+
 # Start background biometric auto-grant listener for auth tests
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
 sleep 1
@@ -216,14 +228,18 @@ echo "==> Setting transport config: UDP enabled, BLE disabled..."
 "$CLI_BIN" set-transports --ble false --network true
 
 echo "==> Requesting authentication for user '$TEST_USER'..."
-UDP_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
+UDP_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
 echo "$UDP_AUTH_OUTPUT"
 
 if echo "$UDP_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
     echo "✅ Local Network (UDP) Authentication PASSED!"
 else
     echo "❌ Local Network (UDP) Authentication FAILED."
-    cat "$DAEMON_LOG"
+    if [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
+    fi
     exit 1
 fi
 
@@ -243,14 +259,18 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
     "$CLI_BIN" set-transports --ble true --network false
 
     echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
+    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
     echo "$BLE_AUTH_OUTPUT"
 
     if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
         echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
     else
         echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED."
-        cat "$DAEMON_LOG"
+        if [ -f "$DAEMON_LOG" ]; then
+            echo "=== DAEMON LOG DUMP ==="
+            cat "$DAEMON_LOG"
+            echo "======================="
+        fi
         exit 1
     fi
 else
@@ -267,7 +287,7 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
     echo "==> Setting transport config: Both BLE and UDP enabled..."
     "$CLI_BIN" set-transports --ble true --network true
 
-    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
+    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
     echo "$PARALLEL_OUTPUT"
 
     if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
