@@ -11,7 +11,7 @@ echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 if ! lsmod | grep -q hci_vhci; then
     echo "    Loading hci_vhci kernel module..."
     sudo modprobe hci_vhci 2>/dev/null || {
-        echo "⚠️ Warning: Failed to modprobe hci_vhci."
+        echo "ℹ️  Notice: Failed to modprobe hci_vhci."
     }
 fi
 
@@ -20,6 +20,21 @@ if [ ! -c /dev/vhci ]; then
     sudo mknod /dev/vhci c 10 137 2>/dev/null || true
     sudo chmod 666 /dev/vhci 2>/dev/null || true
 fi
+
+# Check if /dev/vhci is actually accessible by kernel
+VHCI_SUPPORTED=false
+if sudo python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+    VHCI_SUPPORTED=true
+fi
+
+if [ "$VHCI_SUPPORTED" != "true" ]; then
+    echo "ℹ️  Virtual HCI (/dev/vhci) is not supported by the host kernel in this environment."
+    echo "    BLE virtual controller emulation will be disabled."
+    echo "false" > /tmp/ble-available.txt
+    exit 0
+fi
+
+echo "true" > /tmp/ble-available.txt
 
 # Ensure D-Bus system bus is running
 if ! pgrep -x dbus-daemon > /dev/null && ! pgrep -x dbus-broker > /dev/null; then

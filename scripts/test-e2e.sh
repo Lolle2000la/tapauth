@@ -39,12 +39,8 @@ export TAPAUTHD_SOCK="${TEST_DIR}/tapauthd.sock"
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_CONFIG_PATH="/etc/pam.d/${PAM_SERVICE_NAME}"
 
-# Detect test username
-if [ -n "$SUDO_USER" ]; then
-    TEST_USER="$SUDO_USER"
-else
-    TEST_USER="$(whoami)"
-fi
+# Detect test username (matches caller UID for daemon IPC authorization)
+TEST_USER="$(whoami)"
 
 echo "ℹ️  Test User: $TEST_USER"
 echo "ℹ️  Isolated Socket: $TAPAUTHD_SOCK"
@@ -237,19 +233,28 @@ echo "╔═══════════════════════�
 echo "║  PHASE 3: Bluetooth Low Energy (BLE) Authentication           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-echo "==> Setting transport config: BLE enabled, UDP disabled..."
-"$CLI_BIN" set-transports --ble true --network false
+BLE_AVAILABLE="true"
+if [ -f /tmp/ble-available.txt ]; then
+    BLE_AVAILABLE=$(cat /tmp/ble-available.txt)
+fi
 
-echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
-echo "$BLE_AUTH_OUTPUT"
+if [ "$BLE_AVAILABLE" = "true" ]; then
+    echo "==> Setting transport config: BLE enabled, UDP disabled..."
+    "$CLI_BIN" set-transports --ble true --network false
 
-if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
-    echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
+    echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
+    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
+    echo "$BLE_AUTH_OUTPUT"
+
+    if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
+        echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
+    else
+        echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED."
+        cat "$DAEMON_LOG"
+        exit 1
+    fi
 else
-    echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED."
-    cat "$DAEMON_LOG"
-    exit 1
+    echo "ℹ️  BLE Authentication test skipped (/dev/vhci not supported on this host kernel)."
 fi
 
 # Step 8: Phase 4 - Parallel Discovery Race (Both Enabled)
@@ -258,17 +263,21 @@ echo "╔═══════════════════════�
 echo "║  PHASE 4: Parallel Discovery Race (UDP + BLE Simultaneous)    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-echo "==> Setting transport config: Both BLE and UDP enabled..."
-"$CLI_BIN" set-transports --ble true --network true
+if [ "$BLE_AVAILABLE" = "true" ]; then
+    echo "==> Setting transport config: Both BLE and UDP enabled..."
+    "$CLI_BIN" set-transports --ble true --network true
 
-PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
-echo "$PARALLEL_OUTPUT"
+    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20)
+    echo "$PARALLEL_OUTPUT"
 
-if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
-    echo "✅ Parallel Discovery Race Authentication PASSED!"
+    if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
+        echo "✅ Parallel Discovery Race Authentication PASSED!"
+    else
+        echo "❌ Parallel Discovery Race Authentication FAILED."
+        exit 1
+    fi
 else
-    echo "❌ Parallel Discovery Race Authentication FAILED."
-    exit 1
+    echo "ℹ️  Parallel Race test skipped (virtual BLE not supported on this host kernel)."
 fi
 
 # Step 9: Phase 5 - Denial Testing
