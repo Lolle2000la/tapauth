@@ -119,6 +119,9 @@ cargo build --manifest-path client-pam/Cargo.toml
 - Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
 - Wraps all IPC messages in `IpcEnvelope`, unwraps `PamResponse` from envelope
 - Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
+- **GUI (no-TTY) contexts use one of two flows**:
+  - `polkit-1`: password is collected on a background thread while the main thread waits for the phone (polkit-agent-helper-1's conversation is a plain fd fed by a separate process — thread-safe)
+  - All other TTY-less services (e.g. KDE lock screen `kscreenlocker_worker`): the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread for `pam_gui_timeout_secs` (default 30s, clamped to `pam_operation_timeout_secs`), then falls through to password. Driving the conversation from a thread there deadlocks the host's event loop (see `run_sequential_event_loop` docs in `pam_logic.rs`)
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`

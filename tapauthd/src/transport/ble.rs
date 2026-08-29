@@ -285,6 +285,33 @@ impl Transport for BleTransport {
                     let error_msg = e.to_string();
                     let is_busy = error_msg.contains("Busy") || error_msg.contains("0x0a");
 
+                    // Deterministic failure: BlueZ refuses advertisement
+                    // registration outright.  The dominant cause is a
+                    // BlueZ/kernel version mismatch — bluetoothd < 5.87 sends
+                    // extra bytes in MGMT "Add Extended Advertising Data",
+                    // which kernels with strict length validation reject with
+                    // "Invalid Parameters", surfacing here as
+                    // org.bluez.Error.Failed "Failed to register
+                    // advertisement".  Retrying cannot succeed, so bail out
+                    // immediately with an actionable message.
+                    if e.kind == bluer::ErrorKind::Failed
+                        && e.message.contains("register advertisement")
+                    {
+                        tracing::warn!(
+                            "BLE advertising is unavailable on this system: {} \
+                             (known BlueZ/kernel incompatibility, see \
+                             docs/ble-advertisement-bluez-kernel-mismatch.md). \
+                             Fix: upgrade BlueZ to >= 5.87 or boot an older kernel. \
+                             Falling back to UDP-only for authentication.",
+                            e
+                        );
+                        return Err(AuthError::BleError(format!(
+                            "Failed to start BLE advertising: {} \
+                             (see docs/ble-advertisement-bluez-kernel-mismatch.md)",
+                            e
+                        )));
+                    }
+
                     if attempt < MAX_ATTEMPTS {
                         if is_busy {
                             tracing::warn!(

@@ -9,6 +9,7 @@ use std::path::Path;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -24,12 +25,24 @@ pub struct PamConfig {
     /// Must be at least as long as the transport-level timeout so the daemon has
     /// time to complete BLE/UDP discovery and receive the phone's response.
     pub pam_operation_timeout_secs: u64,
+    /// Authentication timeout for GUI contexts without a usable conversation.
+    /// Default: 30 seconds
+    ///
+    /// Some graphical PAM hosts (e.g. KDE's kscreenlocker worker) cannot have
+    /// their conversation function driven while TapAuth waits for the phone,
+    /// so no concurrent password entry is possible there (see
+    /// `pam_logic::run_sequential_event_loop`). To keep the lock screen
+    /// responsive, the TapAuth wait in those contexts is capped at this
+    /// duration before falling through to password authentication. It is
+    /// additionally clamped to `pam_operation_timeout_secs`.
+    pub pam_gui_timeout_secs: u64,
 }
 
 impl Default for PamConfig {
     fn default() -> Self {
         Self {
             pam_operation_timeout_secs: DEFAULT_PAM_TIMEOUT_SECS,
+            pam_gui_timeout_secs: DEFAULT_PAM_GUI_TIMEOUT_SECS,
         }
     }
 }
@@ -61,9 +74,10 @@ impl PamConfig {
         match toml::from_str::<PamConfig>(&contents) {
             Ok(config) => {
                 tracing::info!(
-                    "Loaded PAM config from {:?}: operation_timeout={}s",
+                    "Loaded PAM config from {:?}: operation_timeout={}s gui_timeout={}s",
                     path,
-                    config.pam_operation_timeout_secs
+                    config.pam_operation_timeout_secs,
+                    config.pam_gui_timeout_secs
                 );
                 config
             }
@@ -88,6 +102,7 @@ mod tests {
     fn test_default_config() {
         let config = PamConfig::default();
         assert_eq!(config.pam_operation_timeout_secs, 120);
+        assert_eq!(config.pam_gui_timeout_secs, 30);
     }
 
     #[test]

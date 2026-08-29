@@ -61,11 +61,23 @@ impl IpcResponseReader for IpcClient {
 }
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
-// socket and /dev/tty.  The GUI flow (no TTY) spawns a native POSIX
-// thread via libc::pthread_create to unblock the Polkit conversation
-// pipeline, then multiplexes the IPC socket and a self-pipe in the main
-// loop.  The native thread uses no Drop-bearing Rust types so that
-// pthread_cancel is safe.
+// socket and /dev/tty.  The GUI flow (no TTY) comes in two variants:
+//
+// * `polkit-1` (polkit-agent-helper-1): the conversation is a plain blocking
+//   socket fd fed by the *separate* agent process, so it can safely be driven
+//   from a background thread.  A native POSIX thread collects the password
+//   while the main thread waits for the phone, and the main loop multiplexes
+//   the IPC socket and a self-pipe (`run_gui_event_loop`).
+//
+// * All other TTY-less hosts (notably KDE's `kscreenlocker_worker`): the
+//   conversation is a synchronous round-trip that must be dispatched by the
+//   host's own event loop on the thread that called `pam_authenticate`.
+//   Blocking that thread (or driving the conversation from a second thread)
+//   deadlocks the host, so the main thread simply waits for the daemon on its
+//   own and never touches the conversation (`run_sequential_event_loop`).
+//
+// The native password thread used by the polkit variant uses no Drop-bearing
+// Rust types so that pthread_cancel is safe.
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
 /// message from being displayed on top of an explicit IPC error message.
@@ -269,6 +281,91 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
     }
 }
 
+/// Event loop for GUI contexts whose conversation function must not be driven
+/// while TapAuth waits for the phone.
+///
+/// Some graphical PAM hosts — most importantly KDE's lock screen, which runs
+/// the PAM stack inside `kscreenlocker_worker` — implement the conversation as
+/// a synchronous D-Bus round-trip that can only be answered by the event loop
+/// running on the very thread that called `pam_authenticate`.  For those
+/// hosts:
+///
+/// 1. collecting the password from a background thread deadlocks: the
+///    conversation reply is queued for the blocked host event loop and can
+///    never be dispatched, so password entry stops working entirely, and
+/// 2. `pthread_cancel`-ing that background thread (as the polkit flow does)
+///    would force-unwind through the host's non-Rust frames, which can
+///    `abort()` the host process and take the lock screen down with it.
+///
+/// The safe pattern is to leave the conversation completely alone: block on
+/// the daemon IPC socket on the calling thread, return the result, and let
+/// the PAM stack fall through to the password module afterwards (whose own
+/// conversation then runs on the host's terms).  The cost is that password
+/// entry is only possible *after* the (shorter) GUI timeout, which is why
+/// `pam_gui_timeout_secs` exists.
+///
+/// Returns the exit reason plus the daemon response, if one was received.
+fn run_sequential_event_loop<T: IpcResponseReader>(
+    ipc: &mut T,
+    deadline: Instant,
+) -> (ExitReason, Option<shared::ipc::pb::PamAuthenticateResponse>) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return (ExitReason::Timeout, None);
+        }
+
+        let remain = deadline
+            .checked_duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
+        let mut fds = [PollFd::new(
+            unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
+            PollFlags::POLLIN,
+        )];
+
+        match poll(&mut fds, timeout) {
+            Ok(0) => continue,
+            Ok(_) => {
+                let Some(rev) = fds[0].revents() else {
+                    continue;
+                };
+
+                // Read data first: POLLIN can arrive together with POLLHUP.
+                if rev.contains(PollFlags::POLLIN) {
+                    match ipc.try_read_response_nonblocking() {
+                        Ok(Some(resp)) => {
+                            return (ExitReason::IpcResponseReceived, Some(resp));
+                        }
+                        Ok(None) => {
+                            // No complete frame yet; check for hangup.
+                            if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR)
+                            {
+                                tracing::error!("Daemon closed connection before sending response");
+                                return (ExitReason::IpcError, None);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("IPC read failed: {e}");
+                            return (ExitReason::IpcError, None);
+                        }
+                    }
+                } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
+                    tracing::error!("Daemon closed connection or error detected");
+                    return (ExitReason::IpcError, None);
+                }
+            }
+            Err(e) => {
+                if e != nix::errno::Errno::EINTR {
+                    tracing::warn!("poll error: {e}");
+                    return (ExitReason::IpcError, None);
+                }
+            }
+        }
+    }
+}
+
 /// Main PAM authentication entry point.
 ///
 /// ## Returns
@@ -328,6 +425,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // to deadlock during graphical challenge-response dialogs.
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
     let is_polkit = service == "polkit-1";
+    // Only hosts whose conversation is a plain blocking fd fed by a separate
+    // process (polkit-agent-helper-1) can safely run the conversation from a
+    // background thread while this thread waits for the daemon.  Event-loop
+    // based hosts (e.g. kscreenlocker_worker) deadlock instead — see
+    // `run_sequential_event_loop`.
+    let supports_threaded_conversation = is_polkit;
     let tty_file = if !is_polkit {
         std::fs::File::open("/dev/tty").ok()
     } else {
@@ -349,15 +452,36 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
     let request_id = hex::encode(rid_bytes);
     // Use the configured PAM operation timeout for both the local poll deadline
-    // and the daemon's authentication timeout, so they stay in sync.
+    // and the daemon's authentication timeout, so they stay in sync.  GUI
+    // contexts without a usable conversation get the shorter GUI deadline so
+    // password fallback remains close at hand.
+    let effective_timeout_secs = if !has_terminal && !supports_threaded_conversation {
+        config
+            .pam_gui_timeout_secs
+            .min(config.pam_operation_timeout_secs)
+    } else {
+        config.pam_operation_timeout_secs
+    };
     let timeout_secs = {
-        let secs = config.pam_operation_timeout_secs;
+        let secs = effective_timeout_secs;
         if secs > u64::from(u32::MAX) {
             u32::MAX
         } else {
             secs as u32
         }
     };
+    let context = if has_terminal {
+        "terminal"
+    } else if supports_threaded_conversation {
+        "gui-threaded (polkit)"
+    } else {
+        "gui-sequential"
+    };
+    tracing::debug!(
+        "Authentication deadline: {}s (context: {})",
+        timeout_secs,
+        context
+    );
 
     // Establish nonblocking IPC connection and send authenticate request
     let mut ipc = match IpcClient::connect_nonblocking() {
@@ -375,10 +499,42 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_IGNORE;
     }
 
-    // GUI context (no TTY): offload blocking credential collection to a
-    // native background thread so the Polkit graphical helper can process
-    // window events, then multiplex loop events using a secure
-    // close-on-exec self-pipe.
+    // GUI contexts without a usable conversation (e.g. the KDE lock screen's
+    // kscreenlocker_worker): wait for the daemon on this thread and never
+    // touch the conversation.  Password fallback happens after this returns,
+    // when the next PAM module runs its own conversation.
+    if !has_terminal && !supports_threaded_conversation {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+        let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline);
+
+        return match exit_reason {
+            ExitReason::IpcResponseReceived => match auth_response {
+                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs),
+                None => pam_sys::PAM_IGNORE,
+            },
+            ExitReason::Timeout => {
+                // The daemon runs on the same deadline and broadcasts its own
+                // AuthenticationCancel, so no client-side cancel is needed.
+                pam_conv.try_info(msgs.timed_out());
+                pam_sys::PAM_IGNORE
+            }
+            _ => {
+                // IPC error: the request may still be in flight daemon-side.
+                // Best-effort cancel uses a new blocking connection with a
+                // short timeout so the phone doesn't keep buzzing.
+                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                    let _ = c.send_cancel("gui-ipc-error", &request_id);
+                }
+                pam_conv.try_error(msgs.communication_error());
+                pam_sys::PAM_IGNORE
+            }
+        };
+    }
+
+    // GUI context with a threaded-conversation-capable host (polkit-1 only):
+    // offload blocking credential collection to a native background thread so
+    // the Polkit graphical helper can process window events, then multiplex
+    // loop events using a secure close-on-exec self-pipe.
     if !has_terminal {
         // O_CLOEXEC prevents the pipe fds from leaking to child processes
         // started by the long-running privileged host (sudo, gdm, polkitd).
@@ -1008,5 +1164,61 @@ mod gui_loop_tests {
             libc::close(pipe_read);
             libc::close(pipe_write);
         }
+    }
+
+    #[test]
+    fn test_sequential_loop_immediate_timeout() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: None,
+        };
+
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
+
+        assert_eq!(reason, ExitReason::Timeout);
+        assert!(auth_response.is_none());
+    }
+
+    #[test]
+    fn test_sequential_loop_receives_response() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+
+        let mut expected_resp = shared::ipc::pb::PamAuthenticateResponse::default();
+        expected_resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
+
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(Some(expected_resp))),
+        };
+
+        server.write_all(&[1]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
+
+        assert_eq!(reason, ExitReason::IpcResponseReceived);
+        assert_eq!(
+            auth_response.map(|r| r.outcome()),
+            Some(shared::ipc::pb::PamOutcome::Success)
+        );
+    }
+
+    #[test]
+    fn test_sequential_loop_daemon_hangup() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut mock_ipc = MockIpcReader {
+            stream: client,
+            next_response: Some(Ok(None)),
+        };
+
+        std::mem::drop(server);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
+
+        assert_eq!(reason, ExitReason::IpcError);
+        assert!(auth_response.is_none());
     }
 }
