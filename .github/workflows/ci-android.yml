@@ -37,6 +37,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Setup Virtual Bluetooth Kernel Module (hci_vhci fail-fast)
+        run: ./scripts/ci/build-kernel-vhci.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -146,10 +149,7 @@ jobs:
           sudo apt-get install -y \
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
-            libdbus-1-dev pkg-config \
-            linux-modules-extra-azure "linux-modules-extra-$(uname -r)" || true
-          sudo depmod -a "$(uname -r)" || sudo depmod -a || true
-          ./scripts/ci/build-kernel-vhci.sh
+            libdbus-1-dev pkg-config
           sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
