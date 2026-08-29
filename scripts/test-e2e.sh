@@ -220,10 +220,16 @@ wait "$AM_PID" || {
 cat "$AM_LOG"
 
 # Verify SAS matching between Desktop and Android
-ANDROID_SAS=$(adb shell cat /data/local/tmp/android_derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
+ANDROID_SAS=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$AM_LOG" | head -n1 | cut -d'=' -f2 || true)
+if [ -z "$ANDROID_SAS" ]; then
+    ANDROID_SAS=$(adb shell run-as dev.rourunisen.tapauth.debug cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
+fi
+if [ -z "$ANDROID_SAS" ]; then
+    ANDROID_SAS=$(adb logcat -d | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
+fi
 echo "    Android Derived SAS: $ANDROID_SAS"
 
-if [ -n "$SAS_CODE" ] && [ "$ANDROID_SAS" = "$SAS_CODE" ]; then
+if [ -n "$SAS_CODE" ] && [ -n "$ANDROID_SAS" ] && [ "$ANDROID_SAS" = "$SAS_CODE" ]; then
     echo "✅ SAS Anti-MITM Verification PASSED! Both sides derived identical code: $SAS_CODE"
 else
     echo "❌ ERROR: SAS Anti-MITM verification mismatch! Desktop=$SAS_CODE, Android=$ANDROID_SAS"

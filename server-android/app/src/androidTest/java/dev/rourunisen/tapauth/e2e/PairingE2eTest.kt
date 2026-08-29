@@ -56,12 +56,13 @@ class PairingE2eTest {
 
         val awaiting = initResult as PairingInitResult.AwaitingSASVerification
         Log.i(TAG, "Pairing handshake successful. Derived SAS: ${awaiting.sas}")
+        println("ANDROID_DERIVED_SAS=${awaiting.sas}")
 
-        // Write derived SAS to world-readable location for E2E host test verification
+        // Write derived SAS to app storage for E2E host test verification
         try {
-            java.io.File("/data/local/tmp/android_derived_sas.txt").writeText(awaiting.sas)
+            java.io.File(context.filesDir, "derived_sas.txt").writeText(awaiting.sas)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to write SAS to /data/local/tmp: ${e.message}")
+            Log.w(TAG, "Failed to write SAS to filesDir: ${e.message}")
         }
 
         // Step 2: If expected SAS provided, verify match

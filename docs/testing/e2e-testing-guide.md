@@ -157,4 +157,6 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo chmod 666 /dev/vhci
 ```
 
-If `/dev/vhci` is not writable, `test-e2e.sh` will automatically log a notice and run the complete TCP pairing, UDP authentication, Denial, and Unpairing test phases while gracefully skipping virtual BLE.
+> [!NOTE]
+> Standard Linux developer workstations (running generic Linux kernels with `hci_vhci` module support) execute all phases including Phase 3 (BLE) and Phase 4 (Parallel Race).
+> Cloud CI runners (such as GitHub Actions Ubuntu Azure VM runners) run cloud-optimized kernels (`linux-azure`) without Bluetooth subsystem drivers (`CONFIG_BT=n`, `hci_vhci` not compiled), where `test-e2e.sh` automatically detects kernel capabilities and runs all TCP pairing, SAS verification, UDP authentication, PAM module, Denial, Timeout, and Lifecycle phases.
