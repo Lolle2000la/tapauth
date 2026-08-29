@@ -32,9 +32,8 @@ case "$ACTION" in
         ;;
 
     grant)
-        echo "    Triggering biometric grant (finger touch 1 / dev-approve broadcast)..."
+        echo "    Triggering biometric grant (finger touch 1)..."
         adb emu finger touch 1 2>/dev/null || true
-        adb shell am broadcast -p dev.rourunisen.tapauth.debug -a dev.rourunisen.tapauth.ACTION_DEV_APPROVE 2>/dev/null || adb shell am broadcast -p dev.rourunisen.tapauth -a dev.rourunisen.tapauth.ACTION_DEV_APPROVE 2>/dev/null || true
         ;;
 
     deny)
@@ -52,28 +51,18 @@ case "$ACTION" in
         LOGCAT_LOG="/tmp/bio-auto-grant.log"
 
         cat << 'EOF' > /tmp/bio_auto_grant.py
-import subprocess, time, sys, threading
+import subprocess, time, sys
 
 print("Biometric auto-grant daemon started...")
 sys.stdout.flush()
-
-def periodic_touch():
-    while True:
-        time.sleep(0.3)
-        subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
-        subprocess.run(['adb', 'shell', 'am', 'broadcast', '-p', 'dev.rourunisen.tapauth.debug', '-a', 'dev.rourunisen.tapauth.ACTION_DEV_APPROVE'], capture_output=True)
-
-t = threading.Thread(target=periodic_touch, daemon=True)
-t.start()
 
 proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', '*:V'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 try:
     for line in iter(proc.stdout.readline, ''):
-        if any(k in line for k in ['Handling AuthenticationRequest', 'Parsed auth request', 'Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Posting auth notification', 'Processing packet']):
+        if any(k in line for k in ['Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Biometric availability']):
             subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
-            subprocess.run(['adb', 'shell', 'am', 'broadcast', '-p', 'dev.rourunisen.tapauth.debug', '-a', 'dev.rourunisen.tapauth.ACTION_DEV_APPROVE'], capture_output=True)
-            print(f"Auto-granted fingerprint/broadcast for: {line.strip()}")
+            print(f"Auto-granted fingerprint touch for prompt: {line.strip()}")
             sys.stdout.flush()
 finally:
     proc.terminate()

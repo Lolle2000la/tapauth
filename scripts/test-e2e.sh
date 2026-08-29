@@ -204,7 +204,7 @@ wait "$WAIT_PID" || {
 }
 
 SAS_CODE=$(grep 'SAS=' "$WAIT_LOG" | cut -d'=' -f2)
-echo "✅ SAS Code generated & verified: $SAS_CODE"
+echo "    Desktop Derived SAS: $SAS_CODE"
 
 echo "==> Completing pairing handshake..."
 COMPLETE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT")
@@ -218,6 +218,17 @@ wait "$AM_PID" || {
     exit 1
 }
 cat "$AM_LOG"
+
+# Verify SAS matching between Desktop and Android
+ANDROID_SAS=$(adb shell cat /data/local/tmp/android_derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
+echo "    Android Derived SAS: $ANDROID_SAS"
+
+if [ -n "$SAS_CODE" ] && [ "$ANDROID_SAS" = "$SAS_CODE" ]; then
+    echo "✅ SAS Anti-MITM Verification PASSED! Both sides derived identical code: $SAS_CODE"
+else
+    echo "❌ ERROR: SAS Anti-MITM verification mismatch! Desktop=$SAS_CODE, Android=$ANDROID_SAS"
+    exit 1
+fi
 
 # Verify paired servers in daemon
 SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)

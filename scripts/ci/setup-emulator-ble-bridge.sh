@@ -9,12 +9,14 @@ echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 
 # Ensure vhci module is loaded and /dev/vhci node exists with write permissions
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo depmod -a "$(uname -r)" 2>/dev/null || sudo depmod -a 2>/dev/null || true
     sudo modprobe hci_vhci 2>/dev/null || true
     if [ ! -c /dev/vhci ]; then
         sudo mknod /dev/vhci c 10 137 2>/dev/null || true
     fi
     sudo chmod 666 /dev/vhci 2>/dev/null || true
 else
+    depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
     modprobe hci_vhci 2>/dev/null || true
     if [ ! -c /dev/vhci ]; then
         mknod /dev/vhci c 10 137 2>/dev/null || true

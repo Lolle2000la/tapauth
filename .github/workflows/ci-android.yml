@@ -148,10 +148,12 @@ jobs:
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
             linux-modules-extra-azure "linux-modules-extra-$(uname -r)" || true
-          sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
+          sudo depmod -a "$(uname -r)" || sudo depmod -a || true
+          sudo modinfo hci_vhci || true
           sudo modprobe hci_vhci || true
           if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137 || true; fi
           sudo chmod 666 /dev/vhci || true
+          sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
         run: |
@@ -182,5 +184,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: native-libraries
-          path: server-android/app/src/main/jniLibs/
+          path: server-android/app/build/rustJniLibs/android/
+          if-no-files-found: ignore
           retention-days: 30

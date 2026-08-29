@@ -15,37 +15,12 @@ class AuthActionReceiver : BroadcastReceiver() {
     companion object {
         const val TAG = "AuthActionReceiver"
         const val ACTION_NOTIFICATION_ACTION = "dev.rourunisen.tapauth.ACTION_NOTIFICATION_ACTION"
-        const val ACTION_DEV_APPROVE = "dev.rourunisen.tapauth.ACTION_DEV_APPROVE"
+        /** Debug-only action to simulate explicit denial from automated test runners. */
         const val ACTION_DEV_DENY = "dev.rourunisen.tapauth.ACTION_DEV_DENY"
     }
 
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent == null) return
-        if (intent.action == ACTION_DEV_APPROVE && dev.rourunisen.tapauth.BuildConfig.DEBUG) {
-            Log.d(TAG, "Handling dev explicit approval broadcast")
-            val manager = AuthRequestManager.getInstance()
-            try {
-                val keypairRepo = KeypairRepository(context!!)
-                val privateKey = keypairRepo.getPrivateKey()
-                for (reqId in manager.getActiveRequestIds()) {
-                    val req = manager.getPendingRequest(reqId)
-                    if (req != null) {
-                        val signed =
-                            dev.rourunisen.tapauth.crypto.signData(privateKey, req.challenge)
-                        Log.d(TAG, "Applying dev explicit approval to request $reqId")
-                        manager.handleResponse(
-                            reqId,
-                            approved = true,
-                            signedChallenge = signed,
-                            explicitDenial = false,
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to apply dev approval: ${e.message}")
-            }
-            return
-        }
         if (intent.action == ACTION_DEV_DENY && dev.rourunisen.tapauth.BuildConfig.DEBUG) {
             Log.d(TAG, "Handling dev explicit denial broadcast")
             val manager = AuthRequestManager.getInstance()
