@@ -51,6 +51,9 @@ rm -f Makefile
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> if needed
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
+# Compatibility: patch sock_i_uid -> sock_net_uid for seq_file output
+sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
+
 # Top-level Kbuild
 cat << 'EOF' > Kbuild
 obj-m += net/bluetooth/
