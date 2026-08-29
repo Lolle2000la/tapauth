@@ -28,19 +28,23 @@ class DeviceRepository(context: Context) {
             prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
         }
 
+    fun getAllPairedDevicesSync(): List<PairedDevice> {
+        val devicesJson = prefs.getString(KEY_DEVICES, null) ?: return emptyList()
+
+        val jsonArray = JSONArray(devicesJson)
+        val devices = mutableListOf<PairedDevice>()
+
+        for (i in 0 until jsonArray.length()) {
+            val json = jsonArray.getJSONObject(i)
+            devices.add(jsonToDevice(json))
+        }
+
+        return devices
+    }
+
     suspend fun getAllPairedDevices(): List<PairedDevice> =
         withContext(Dispatchers.IO) {
-            val devicesJson = prefs.getString(KEY_DEVICES, null) ?: return@withContext emptyList()
-
-            val jsonArray = JSONArray(devicesJson)
-            val devices = mutableListOf<PairedDevice>()
-
-            for (i in 0 until jsonArray.length()) {
-                val json = jsonArray.getJSONObject(i)
-                devices.add(jsonToDevice(json))
-            }
-
-            devices
+            getAllPairedDevicesSync()
         }
 
     suspend fun getPairedDevice(deviceId: String): PairedDevice? =

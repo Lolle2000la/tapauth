@@ -74,7 +74,7 @@ class TemporalIdCache(
             // If not found in cache, reload devices in case a new pairing occurred
             synchronized(this) {
                 try {
-                    val pairedDevices = deviceRepository.getAllPairedDevices()
+                    val pairedDevices = deviceRepository.getAllPairedDevicesSync()
                     cachedDevices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
                     val now = System.currentTimeMillis()
                     recomputeCache(now / TIME_WINDOW_MS)
@@ -109,7 +109,7 @@ class TemporalIdCache(
         var devices = cachedDevices
         if (devices.isEmpty()) {
             try {
-                val pairedDevices = deviceRepository.getAllPairedDevices()
+                val pairedDevices = deviceRepository.getAllPairedDevicesSync()
                 devices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
                 cachedDevices = devices
             } catch (e: Exception) {
