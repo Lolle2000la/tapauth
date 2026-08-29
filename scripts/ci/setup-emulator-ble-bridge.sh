@@ -37,7 +37,7 @@ fi
 
 # Ensure BlueZ packages are installed and bluetoothd is running
 sudo apt-get update -qq
-sudo apt-get install -y -qq bluez
+sudo apt-get install -y -qq bluez bluez-tools
 
 if ! pgrep -x bluetoothd > /dev/null; then
     sudo systemctl start bluetooth 2>/dev/null || { sudo bluetoothd -n -d >/tmp/bluetoothd.log 2>&1 & sleep 2; }
@@ -52,32 +52,35 @@ fi
 # Capture existing hci devices to detect the newly created one
 EXISTING_HCI=$(hciconfig 2>/dev/null | grep -o '^hci[0-9]*' || true)
 
-# Launch bumble-hci-bridge connecting emulator netsim gRPC (default port 8554) to /dev/vhci
-echo "    Starting bumble-hci-bridge (android-netsim:localhost:8554 <-> vhci)..."
+# Launch bumble-hci-bridge connecting emulator netsim to /dev/vhci
+echo "    Starting bumble-hci-bridge (android-netsim <-> vhci)..."
 BUMBLE_LOG="/tmp/bumble-bridge.log"
 
 USER_SITE=$(python3 -c 'import site; print(":".join(site.getsitepackages() + [site.getusersitepackages()]))' 2>/dev/null || true)
 
 if [ -w /dev/vhci ]; then
     if command -v bumble-hci-bridge &> /dev/null; then
-        bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        bumble-hci-bridge "android-netsim" "vhci:" > "$BUMBLE_LOG" 2>&1 &
         BUMBLE_PID=$!
     else
-        python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        python3 -m bumble.apps.hci_bridge "android-netsim" "vhci:" > "$BUMBLE_LOG" 2>&1 &
         BUMBLE_PID=$!
     fi
 else
     if command -v bumble-hci-bridge &> /dev/null; then
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "bumble-hci-bridge 'android-netsim:localhost:8554,mode=controller' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "bumble-hci-bridge 'android-netsim' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
         BUMBLE_PID=$!
     else
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "python3 -m bumble.apps.hci_bridge 'android-netsim:localhost:8554,mode=controller' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "python3 -m bumble.apps.hci_bridge 'android-netsim' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
         BUMBLE_PID=$!
     fi
 fi
 
 echo "$BUMBLE_PID" > /tmp/bumble-bridge.pid
 echo "    bumble-hci-bridge running with PID $BUMBLE_PID (logs: $BUMBLE_LOG)"
+
+# Give Bumble and kernel time to perform the initial vendor handshake and register the adapter
+sleep 5
 
 # Wait for new virtual HCI adapter to appear (up to 10s)
 NEW_HCI=""
@@ -100,15 +103,23 @@ done
 if [ -n "$NEW_HCI" ]; then
     echo "✅ Virtual Bluetooth adapter detected: $NEW_HCI"
     INDEX=$(echo "$NEW_HCI" | sed 's/hci//')
-    sudo btmgmt --index "$INDEX" power on 2>/dev/null || sudo btmgmt power on 2>/dev/null || true
-    bluetoothctl power on 2>/dev/null || true
-    sudo hciconfig "$NEW_HCI" up 2>/dev/null || true
-    sleep 1
+    
+    # Power on adapter with retries
+    for attempt in {1..10}; do
+        sudo btmgmt --index "$INDEX" power on 2>/dev/null || sudo btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+        sudo hciconfig "$NEW_HCI" up 2>/dev/null || true
+        if sudo btmgmt info 2>/dev/null | grep -q "current settings:.*powered"; then
+            echo "✅ $NEW_HCI powered on successfully."
+            break
+        fi
+        sleep 1
+    done
+
     echo "--- Adapter details ---"
     sudo btmgmt info 2>/dev/null || true
     bluetoothctl show 2>/dev/null || true
 else
-    echo "⚠️  No new HCI adapter detected yet. BlueZ will automatically bind when emulator Netsim connects."
+    echo "⚠️  No new HCI adapter detected yet."
 fi
 
 echo "✅ Virtual BLE bridge setup completed."
