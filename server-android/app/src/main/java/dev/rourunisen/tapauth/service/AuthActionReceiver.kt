@@ -21,7 +21,7 @@ class AuthActionReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent == null) return
-        if (intent.action == ACTION_DEV_DENY && dev.rourunisen.tapauth.BuildConfig.DEBUG) {
+        if (intent.action == ACTION_DEV_DENY && dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
             Log.d(TAG, "Handling dev explicit denial broadcast")
             val manager = AuthRequestManager.getInstance()
             for (reqId in manager.getActiveRequestIds()) {

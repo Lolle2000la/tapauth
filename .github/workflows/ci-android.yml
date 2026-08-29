@@ -85,8 +85,8 @@ jobs:
       - name: Build native libraries (fail-fast)
         run: cd server-android && ./gradlew cargoBuild
 
-      - name: Build Android Debug APK and Test APK
-        run: cd server-android && ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
+      - name: Build Android Debug APK, E2E APK, and Test APK
+        run: cd server-android && ./gradlew assembleDebug assembleE2e assembleDebugAndroidTest --stacktrace
 
       - name: Install Host E2E Dependencies & Bumble
         run: |
@@ -166,8 +166,8 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: tapauth-debug-apk
-          path: server-android/app/build/outputs/apk/debug/*.apk
+          name: tapauth-apks
+          path: server-android/app/build/outputs/apk/**/*.apk
           retention-days: 30
 
       - name: Upload native libraries artifact

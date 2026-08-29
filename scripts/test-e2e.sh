@@ -128,20 +128,30 @@ PAM_LIB="${PROJECT_ROOT}/target/debug/libclient_pam.so"
 
 # Step 2: Install Android App and Test Runner on Emulator
 echo "==> Step 2: Ensuring Android App and Instrumentation Tests are installed..."
-# If APKs exist, install them; otherwise build via gradle if local environment permits
-if [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+APP_PKG="dev.rourunisen.tapauth.e2e"
+TEST_PKG="dev.rourunisen.tapauth.debug.test"
+
+if [ -f "server-android/app/build/outputs/apk/e2e/app-e2e.apk" ]; then
+    adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
+elif [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+    APP_PKG="dev.rourunisen.tapauth.debug"
     adb install -r -t server-android/app/build/outputs/apk/debug/app-debug.apk || true
 fi
+
 if [ -f "server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" ]; then
+    TEST_PKG="dev.rourunisen.tapauth.debug.test"
     adb install -r -t server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk || true
+elif [ -f "server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk" ]; then
+    TEST_PKG="dev.rourunisen.tapauth.e2e.test"
+    adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
 fi
 
-echo "==> Granting runtime permissions to Android app..."
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.POST_NOTIFICATIONS 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
-adb shell pm grant dev.rourunisen.tapauth.debug android.permission.BLUETOOTH_SCAN 2>/dev/null || true
+echo "==> Granting runtime permissions to Android app ($APP_PKG)..."
+adb shell pm grant "$APP_PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+adb shell pm grant "$APP_PKG" android.permission.ACCESS_FINE_LOCATION 2>/dev/null || true
+adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
+adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
+adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_SCAN 2>/dev/null || true
 
 # Step 3: Setup Bridges and Virtual Transport Layers
 echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
@@ -194,7 +204,7 @@ adb shell am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
     -e pairing_host 10.0.2.2 \
     -e pairing_port "$PORT" \
-    dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner > "$AM_LOG" 2>&1 &
+    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_LOG" 2>&1 &
 AM_PID=$!
 
 wait "$WAIT_PID" || {
@@ -222,7 +232,7 @@ cat "$AM_LOG"
 # Verify SAS matching between Desktop and Android
 ANDROID_SAS=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$AM_LOG" | head -n1 | cut -d'=' -f2 || true)
 if [ -z "$ANDROID_SAS" ]; then
-    ANDROID_SAS=$(adb shell run-as dev.rourunisen.tapauth.debug cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
+    ANDROID_SAS=$(adb shell run-as "$APP_PKG" cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
 fi
 if [ -z "$ANDROID_SAS" ]; then
     ANDROID_SAS=$(adb logcat -d | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
@@ -246,8 +256,8 @@ echo "✅ Verified 1 paired Android device registered."
 
 # Step 5b: Ensure runtime permissions and start Android app/background services
 echo "==> Starting Android foreground services for authentication..."
-adb shell am force-stop dev.rourunisen.tapauth.debug 2>/dev/null || true
-adb shell am start -n dev.rourunisen.tapauth.debug/dev.rourunisen.tapauth.MainActivity
+adb shell am force-stop "$APP_PKG" 2>/dev/null || true
+adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity"
 sleep 2
 
 # Start background biometric auto-grant listener for auth tests
@@ -425,7 +435,7 @@ echo "╚═══════════════════════�
 
 sleep 1
 # Stop the Android app so that no server responds to the broadcast, verifying daemon timeout handling
-adb shell am force-stop dev.rourunisen.tapauth.debug 2>/dev/null || true
+adb shell am force-stop "$APP_PKG" 2>/dev/null || true
 sleep 1
 
 echo "==> Requesting authentication with 2s timeout and no response..."

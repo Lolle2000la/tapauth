@@ -41,7 +41,7 @@ case "$ACTION" in
         # Finger 2 is not enrolled, causing biometric failure
         adb emu finger touch 2 2>/dev/null || true
         # Send explicit denial broadcast to dev receiver with package targeting
-        adb shell am broadcast -p dev.rourunisen.tapauth.debug -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || adb shell am broadcast -p dev.rourunisen.tapauth -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
+        adb shell am broadcast -p dev.rourunisen.tapauth.e2e -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || adb shell am broadcast -p dev.rourunisen.tapauth.debug -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || adb shell am broadcast -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
         # Also simulate negative / cancel button if prompt is active
         adb shell input keyevent KEYCODE_BACK 2>/dev/null || true
         ;;

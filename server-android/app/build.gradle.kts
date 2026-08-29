@@ -92,6 +92,7 @@ android {
             if (ciReleaseSigning != null) {
                 signingConfig = ciReleaseSigning
             }
+            buildConfigField("Boolean", "E2E_TESTING", "false")
         }
         debug {
             // Use different application ID suffix for debug builds
@@ -100,6 +101,16 @@ android {
             versionNameSuffix = "-debug"
 
             manifestPlaceholders["appName"] = "TapAuth (Debug)"
+            buildConfigField("Boolean", "E2E_TESTING", "false")
+        }
+        create("e2e") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+            applicationIdSuffix = ".e2e"
+            versionNameSuffix = "-e2e"
+
+            manifestPlaceholders["appName"] = "TapAuth (E2E)"
+            buildConfigField("Boolean", "E2E_TESTING", "true")
         }
     }
     compileOptions {

@@ -130,10 +130,11 @@ The test runner is designed to run completely unprivileged without `sudo` by usi
    ```bash
    emulator @<your_avd_name>
    ```
-2. Build Android debug APKs:
+2. Build Android E2E APKs:
    ```bash
-   cd server-android && ./gradlew assembleDebug assembleDebugAndroidTest
+   cd server-android && ./gradlew assembleE2e assembleDebugAndroidTest
    ```
+   *(Note: The `e2e` build variant enables automated headless auto-approval and denial simulation; standard `debug` and `release` builds require real physical/biometric user interaction).*
 
 #### Run Test Suite
 ```bash

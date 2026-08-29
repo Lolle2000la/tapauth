@@ -259,17 +259,18 @@ class MainActivity : FragmentActivity() {
             // Show biometric prompt
             currentAuthRequest = authRequest
             showBiometricPrompt(authRequest)
-        } else if (BuildConfig.DEBUG) {
-            // In debug/test environments without enrolled biometrics, wait briefly for explicit
+        } else if (BuildConfig.E2E_TESTING) {
+            // In dedicated E2E automated test environments without enrolled biometrics, wait
+            // briefly for explicit
             // denial broadcast, then auto-approve if still pending
             Log.i(
                 TAG,
-                "Biometrics not enrolled in debug mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
+                "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
             )
             CoroutineScope(Dispatchers.Main).launch {
                 delay(AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
-                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in debug mode")
+                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
                     AuthRequestManager.approveRequest(this@MainActivity, authRequest)
                 }
             }
