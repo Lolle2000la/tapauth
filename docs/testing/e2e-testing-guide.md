@@ -132,7 +132,7 @@ The test runner is designed to run completely unprivileged without `sudo` by usi
    ```
 2. Build Android E2E APKs:
    ```bash
-   cd server-android && ./gradlew assembleE2e assembleDebugAndroidTest
+   cd server-android && ./gradlew assembleE2e assembleE2eAndroidTest
    ```
    *(Note: The `e2e` build variant enables automated headless auto-approval and denial simulation; standard `debug` and `release` builds require real physical/biometric user interaction).*
 
@@ -160,5 +160,5 @@ sudo chmod 666 /dev/vhci
 ```
 
 > [!NOTE]
-> Standard Linux developer workstations (running generic Linux kernels with `hci_vhci` module support) execute all phases including Phase 3 (BLE) and Phase 4 (Parallel Race).
-> Cloud CI runners (such as GitHub Actions Ubuntu Azure VM runners) run cloud-optimized kernels (`linux-azure`) without Bluetooth subsystem drivers (`CONFIG_BT=n`, `hci_vhci` not compiled), where `test-e2e.sh` automatically detects kernel capabilities and runs all TCP pairing, SAS verification, UDP authentication, PAM module, Denial, Timeout, and Lifecycle phases.
+> - **In GitHub Actions CI**: The workflow dynamically builds and loads the `hci_vhci` kernel module directly against the runner's exact kernel headers, launching Google Bumble to bridge Android Netsim with BlueZ so all 8 phases (including Phase 3 BLE and Phase 4 Parallel Race) run for real.
+> - **Local Workstations**: Running standard Linux distribution kernels (`linux-generic`, `linux-zen`, `arch`, etc.) already include `hci_vhci` out of the box. Running `./scripts/test-e2e.sh` executes the full suite.
