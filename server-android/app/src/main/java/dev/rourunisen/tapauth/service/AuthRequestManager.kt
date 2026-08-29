@@ -221,6 +221,7 @@ class AuthRequestManager private constructor() {
                     .setContentTitle("Authentication request")
                     .setContentText("${deviceName}: ${username}@${hostname}")
                     .setContentIntent(pendingIntent)
+                    .setFullScreenIntent(pendingIntent, true)
                     .addAction(
                         dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground,
                         "Approve",
@@ -236,6 +237,16 @@ class AuthRequestManager private constructor() {
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setTimeoutAfter(remainingTimeout)
                     .build()
+
+            try {
+                context.startActivity(biometricIntent)
+                Log.d(TAG, "Directly launched BiometricPromptActivity for request $requestId")
+            } catch (e: Exception) {
+                Log.d(
+                    TAG,
+                    "Direct activity launch not permitted from current context: ${e.message}",
+                )
+            }
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
             Log.d(

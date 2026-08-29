@@ -19,8 +19,15 @@ case "$ACTION" in
         echo "==> Enrolling test biometric credentials in Android Emulator..."
         # Set lock screen PIN
         adb shell locksettings set-pin 1234 2>/dev/null || true
-        # Touch enrolled finger 1
-        adb emu finger touch 1 2>/dev/null || true
+        # Enroll fingerprint 1
+        adb shell cmd fingerprint enroll 0 2>/dev/null &
+        ENROLL_PID=$!
+        sleep 0.5
+        for i in {1..10}; do
+            adb emu finger touch 1 2>/dev/null || true
+            sleep 0.2
+        done
+        wait $ENROLL_PID 2>/dev/null || true
         echo "✅ Test biometric profile enrolled (Finger 1)."
         ;;
 
@@ -50,7 +57,7 @@ sys.stdout.flush()
 
 def periodic_touch():
     while True:
-        time.sleep(1.0)
+        time.sleep(0.5)
         subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
 
 t = threading.Thread(target=periodic_touch, daemon=True)
@@ -60,8 +67,8 @@ proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', '*:V'], stdout=subproce
 
 try:
     for line in iter(proc.stdout.readline, ''):
-        if any(k in line for k in ['Handling AuthenticationRequest', 'Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Processing packet']):
-            time.sleep(0.2)
+        if any(k in line for k in ['Handling AuthenticationRequest', 'Parsed auth request', 'Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Posting auth notification', 'Processing packet']):
+            time.sleep(0.1)
             subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
             print(f"Auto-granted fingerprint touch for: {line.strip()}")
             sys.stdout.flush()
