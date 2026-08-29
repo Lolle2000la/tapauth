@@ -88,11 +88,6 @@ jobs:
       - name: Build Android Debug APK and Test APK
         run: cd server-android && ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
 
-      - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
-        run: |
-          cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
-          cargo build -p client-pam --features dev-socket-override
-
       - name: Install Host E2E Dependencies & Bumble
         run: |
           sudo apt-get update
@@ -101,6 +96,11 @@ jobs:
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config
           sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
+
+      - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
+        run: |
+          cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
+          cargo build -p client-pam --features dev-socket-override
 
       - name: Free disk space for emulator
         run: |
