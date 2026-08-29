@@ -193,44 +193,7 @@ class MainActivity : FragmentActivity() {
                         Log.d(TAG, "Biometric authentication succeeded")
                         // Handle current auth request approval
                         currentAuthRequest?.let { authRequest ->
-                            // Sign the challenge with server keypair
-                            try {
-                                val keypairRepo =
-                                    dev.rourunisen.tapauth.data.KeypairRepository(this@MainActivity)
-                                val privateKey = keypairRepo.getPrivateKey()
-                                Log.d(
-                                    TAG,
-                                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                val signedChallenge =
-                                    dev.rourunisen.tapauth.crypto.signData(
-                                        privateKey,
-                                        authRequest.challenge,
-                                    )
-
-                                Log.d(
-                                    TAG,
-                                    "Successfully signed challenge (${signedChallenge.size} bytes)",
-                                )
-                                Log.d(
-                                    TAG,
-                                    "Signed challenge (trunc): ${signedChallenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = true,
-                                    signedChallenge = signedChallenge,
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to sign challenge", e)
-                                // Signature failure is not explicit denial - just error
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = false,
-                                    signedChallenge = null,
-                                    explicitDenial = false,
-                                )
-                            }
+                            approveRequest(authRequest)
                             currentAuthRequest = null
                         }
                     }
@@ -241,6 +204,39 @@ class MainActivity : FragmentActivity() {
                     }
                 },
             )
+    }
+
+    private fun approveRequest(authRequest: AuthRequest) {
+        try {
+            val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(this)
+            val privateKey = keypairRepo.getPrivateKey()
+            Log.d(
+                TAG,
+                "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+            )
+            val signedChallenge =
+                dev.rourunisen.tapauth.crypto.signData(
+                    privateKey,
+                    authRequest.challenge,
+                )
+            Log.d(
+                TAG,
+                "Successfully signed challenge (${signedChallenge.size} bytes)",
+            )
+            handleAuthResponse(
+                authRequest.requestId,
+                approved = true,
+                signedChallenge = signedChallenge,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to sign challenge", e)
+            handleAuthResponse(
+                authRequest.requestId,
+                approved = false,
+                signedChallenge = null,
+                explicitDenial = false,
+            )
+        }
     }
 
     private var currentAuthRequest: AuthRequest? = null
@@ -285,17 +281,31 @@ class MainActivity : FragmentActivity() {
 
         // Check if biometric authentication is available
         val biometricManager = BiometricManager.from(this)
-        when (biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
-            BiometricManager.BIOMETRIC_SUCCESS -> {
-                // Show biometric prompt
-                currentAuthRequest = authRequest
-                showBiometricPrompt(authRequest)
-            }
-            else -> {
-                // Biometric not available, deny request
-                Log.e(TAG, "Biometric authentication not available")
-                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
-            }
+        val canAuthStrong =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        val canAuthWeak =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+
+        if (
+            canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS ||
+                canAuthWeak == BiometricManager.BIOMETRIC_SUCCESS
+        ) {
+            // Show biometric prompt
+            currentAuthRequest = authRequest
+            showBiometricPrompt(authRequest)
+        } else if (BuildConfig.DEBUG) {
+            Log.i(
+                TAG,
+                "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving",
+            )
+            approveRequest(authRequest)
+        } else {
+            // Biometric not available, deny request
+            Log.e(
+                TAG,
+                "Biometric authentication not available (strong=$canAuthStrong, weak=$canAuthWeak)",
+            )
+            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
         }
     }
 

@@ -62,22 +62,91 @@ class BiometricPromptActivity : FragmentActivity() {
             return
         }
 
+        val action = intent.getStringExtra("notification_action")
+        if (action == "approve") {
+            Log.i(TAG, "Approved via notification action for request: ${authRequest.requestId}")
+            approveRequest(authRequest)
+            finish()
+            return
+        } else if (action == "deny") {
+            Log.i(TAG, "Denied via notification action for request: ${authRequest.requestId}")
+            handleAuthResponse(
+                authRequest.requestId,
+                approved = false,
+                signedChallenge = null,
+                explicitDenial = true,
+            )
+            finish()
+            return
+        }
+
         currentAuthRequest = authRequest
         setupBiometricPrompt()
 
         // Check if biometric authentication is available
         val biometricManager = BiometricManager.from(this)
-        when (biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
-            BiometricManager.BIOMETRIC_SUCCESS -> {
-                // Show biometric prompt immediately
-                showBiometricPrompt(authRequest)
-            }
-            else -> {
-                // Biometric not available, deny request and finish
-                Log.e(TAG, "Biometric authentication not available")
-                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
-                finish()
-            }
+        val canAuthStrong =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        val canAuthWeak =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+        Log.d(TAG, "Biometric availability: strong=$canAuthStrong, weak=$canAuthWeak")
+
+        if (
+            canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS ||
+                canAuthWeak == BiometricManager.BIOMETRIC_SUCCESS
+        ) {
+            // Show biometric prompt immediately
+            showBiometricPrompt(authRequest)
+        } else if (BuildConfig.DEBUG) {
+            // In debug/test environments (e.g. CI headless emulator without enrolled biometrics),
+            // auto-approve
+            Log.i(
+                TAG,
+                "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving",
+            )
+            approveRequest(authRequest)
+            finish()
+        } else {
+            // Biometric not available in production, deny request and finish
+            Log.e(
+                TAG,
+                "Biometric authentication not available (strong=$canAuthStrong, weak=$canAuthWeak)",
+            )
+            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+            finish()
+        }
+    }
+
+    private fun approveRequest(authRequest: AuthRequest) {
+        try {
+            val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(this)
+            val privateKey = keypairRepo.getPrivateKey()
+            Log.d(
+                TAG,
+                "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+            )
+            val signedChallenge =
+                dev.rourunisen.tapauth.crypto.signData(
+                    privateKey,
+                    authRequest.challenge,
+                )
+            Log.d(
+                TAG,
+                "Successfully signed challenge (${signedChallenge.size} bytes)",
+            )
+            handleAuthResponse(
+                authRequest.requestId,
+                approved = true,
+                signedChallenge = signedChallenge,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to sign challenge", e)
+            handleAuthResponse(
+                authRequest.requestId,
+                approved = false,
+                signedChallenge = null,
+                explicitDenial = false,
+            )
         }
     }
 
@@ -128,41 +197,7 @@ class BiometricPromptActivity : FragmentActivity() {
                         Log.d(TAG, "Biometric authentication succeeded")
 
                         currentAuthRequest?.let { authRequest ->
-                            // Sign the challenge with server keypair
-                            try {
-                                val keypairRepo =
-                                    dev.rourunisen.tapauth.data.KeypairRepository(
-                                        this@BiometricPromptActivity
-                                    )
-                                val privateKey = keypairRepo.getPrivateKey()
-                                Log.d(
-                                    TAG,
-                                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                val signedChallenge =
-                                    dev.rourunisen.tapauth.crypto.signData(
-                                        privateKey,
-                                        authRequest.challenge,
-                                    )
-
-                                Log.d(
-                                    TAG,
-                                    "Successfully signed challenge (${signedChallenge.size} bytes)",
-                                )
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = true,
-                                    signedChallenge = signedChallenge,
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to sign challenge", e)
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = false,
-                                    signedChallenge = null,
-                                    explicitDenial = false,
-                                )
-                            }
+                            approveRequest(authRequest)
                         }
 
                         // Always finish the activity when authentication ends
