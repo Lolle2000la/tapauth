@@ -86,7 +86,7 @@ jobs:
         run: cd server-android && ./gradlew cargoBuild
 
       - name: Build Android Debug APK, E2E APK, and Test APK
-        run: cd server-android && ./gradlew assembleDebug assembleE2e assembleE2eAndroidTest --stacktrace
+        run: cd server-android && ./gradlew assembleDebug assembleE2e assembleDebugAndroidTest --stacktrace
 
       - name: Install Host E2E Dependencies & Bumble
         run: |
@@ -149,7 +149,7 @@ jobs:
           disable-animations: true
           script: |
             # Run JNI crypto instrumentation tests (on device/emulator). Note: Full E2E pairing & auth flow is executed below via test-e2e.sh.
-            (cd server-android && ./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
+            (cd server-android && ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
             sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
 
       - name: Upload test results

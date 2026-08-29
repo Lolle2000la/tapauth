@@ -578,11 +578,36 @@ class BleGattService : Service() {
 
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
         try {
+            @Suppress("DEPRECATION")
             val gatt =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-                } else {
-                    @Suppress("DEPRECATION") device.connectGatt(this, false, gattCallback)
+                when {
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                        device.connectGatt(
+                            this,
+                            false,
+                            gattCallback,
+                            BluetoothDevice.TRANSPORT_LE,
+                            BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK,
+                            null,
+                        )
+                    }
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.O -> {
+                        @Suppress("DEPRECATION")
+                        device.connectGatt(
+                            this,
+                            false,
+                            gattCallback,
+                            BluetoothDevice.TRANSPORT_LE,
+                            BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK,
+                        )
+                    }
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
+                        @Suppress("DEPRECATION")
+                        device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                    }
+                    else -> {
+                        @Suppress("DEPRECATION") device.connectGatt(this, false, gattCallback)
+                    }
                 }
             if (gatt == null) {
                 connectingOrConnectedDevices.remove(device.address)
