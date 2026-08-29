@@ -46,6 +46,21 @@ impl UdpTransport {
     }
 }
 
+#[cfg(any(feature = "dev-state-override", test))]
+fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
+    if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+        use prost::Message;
+        let data = packet.encode_to_vec();
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.send_to(&data, "127.0.0.1:36695");
+            tracing::debug!(
+                "Directly forwarded {} bytes to emulator on 127.0.0.1:36695",
+                data.len()
+            );
+        }
+    }
+}
+
 impl Transport for UdpTransport {
     async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         // Send broadcast on IPv4
@@ -54,11 +69,7 @@ impl Transport for UdpTransport {
         }
 
         #[cfg(any(feature = "dev-state-override", test))]
-        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
-            use prost::Message;
-            let data = packet.encode_to_vec();
-            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
-        }
+        send_to_emulator_if_dev_mode(packet);
 
         // Send multicast on IPv6 (on all available interfaces)
         if is_ipv6_available() {
@@ -93,11 +104,7 @@ impl Transport for UdpTransport {
         send_udp_broadcast(&self.socket, self.port, packet).await?;
 
         #[cfg(any(feature = "dev-state-override", test))]
-        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
-            use prost::Message;
-            let data = packet.encode_to_vec();
-            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
-        }
+        send_to_emulator_if_dev_mode(packet);
 
         if is_ipv6_available() {
             let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
@@ -111,11 +118,7 @@ impl Transport for UdpTransport {
         send_udp_broadcast(&self.socket, self.port, packet).await?;
 
         #[cfg(any(feature = "dev-state-override", test))]
-        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
-            use prost::Message;
-            let data = packet.encode_to_vec();
-            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
-        }
+        send_to_emulator_if_dev_mode(packet);
 
         if is_ipv6_available() {
             let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
