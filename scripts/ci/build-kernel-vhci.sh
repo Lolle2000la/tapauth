@@ -39,48 +39,57 @@ MINOR=$(echo "$KVER" | cut -d'.' -f2)
 BASE_VER="v${MAJOR}.${MINOR}"
 echo "    Fetching kernel Bluetooth sources for $BASE_VER..."
 
-mkdir -p net/bluetooth drivers/bluetooth include/net/bluetooth
+mkdir -p net/bluetooth drivers/bluetooth
 
 RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/${BASE_VER}"
 if ! curl -sfI "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" >/dev/null; then
     RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
+    BASE_VER="master"
 fi
 
 echo "    Downloading Bluetooth source files from ${RAW_BASE}..."
+curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c || true
 
-# List of source files for net/bluetooth and drivers/bluetooth
-BT_FILES=(
-    "drivers/bluetooth/hci_vhci.c"
-    "net/bluetooth/af_bluetooth.c"
-    "net/bluetooth/hci_core.c"
-    "net/bluetooth/hci_conn.c"
-    "net/bluetooth/hci_event.c"
-    "net/bluetooth/mgmt.c"
-    "net/bluetooth/hci_sock.c"
-    "net/bluetooth/hci_sysfs.c"
-    "net/bluetooth/l2cap_core.c"
-    "net/bluetooth/l2cap_sock.c"
-    "net/bluetooth/smp.c"
-    "net/bluetooth/lib.c"
-    "net/bluetooth/ecdh_helper.c"
-    "net/bluetooth/hci_request.c"
-    "net/bluetooth/mgmt_util.c"
-    "net/bluetooth/mgmt_config.c"
-    "net/bluetooth/hci_sync.c"
-    "net/bluetooth/aosp.c"
-    "net/bluetooth/eir.c"
-    "net/bluetooth/smp.h"
-    "net/bluetooth/mgmt_util.h"
-    "net/bluetooth/hci_request.h"
-    "net/bluetooth/aosp.h"
-    "net/bluetooth/eir.h"
-    "net/bluetooth/ecdh_helper.h"
-    "net/bluetooth/mgmt_config.h"
-)
+python3 - << PYEOF
+import urllib.request, json, os
 
-for file in "${BT_FILES[@]}"; do
-    curl -sSfL "${RAW_BASE}/${file}" -o "$file" 2>/dev/null || true
-done
+net_dir = "net/bluetooth"
+os.makedirs(net_dir, exist_ok=True)
+
+# Try fetching entire directory listing from GitHub API
+api_url = "https://api.github.com/repos/torvalds/linux/contents/net/bluetooth?ref=${BASE_VER}"
+headers = {"User-Agent": "curl/7.88"}
+success = False
+try:
+    req = urllib.request.Request(api_url, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        files = json.loads(resp.read().decode())
+        for f in files:
+            name = f["name"]
+            if name.endswith((".c", ".h")):
+                download_url = f["download_url"]
+                urllib.request.urlretrieve(download_url, os.path.join(net_dir, name))
+        success = True
+        print("    Downloaded net/bluetooth sources via GitHub API.")
+except Exception as e:
+    print(f"    GitHub API unavailable ({e}), downloading known file list...")
+
+if not success:
+    known_files = [
+        "af_bluetooth.c", "hci_core.c", "hci_conn.c", "hci_event.c", "mgmt.c",
+        "hci_sock.c", "hci_sysfs.c", "l2cap_core.c", "l2cap_sock.c", "smp.c",
+        "lib.c", "ecdh_helper.c", "hci_request.c", "mgmt_util.c", "mgmt_config.c",
+        "hci_sync.c", "aosp.c", "eir.c", "leds.c", "leds.h", "smp.h",
+        "mgmt_util.h", "hci_request.h", "aosp.h", "eir.h", "ecdh_helper.h",
+        "mgmt_config.h", "hci_codec.c", "hci_codec.h", "iso.c", "selftest.c", "selftest.h"
+    ]
+    for f in known_files:
+        url = f"${RAW_BASE}/net/bluetooth/{f}"
+        try:
+            urllib.request.urlretrieve(url, os.path.join(net_dir, f))
+        except Exception:
+            pass
+PYEOF
 
 # Check if essential files were downloaded
 if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
@@ -98,16 +107,14 @@ EOF
 # net/bluetooth Makefile
 cat << 'EOF' > net/bluetooth/Makefile
 obj-m += bluetooth.o
-bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
-	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
-	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
-	aosp.o eir.o
+bluetooth-y := $(patsubst $(src)/%.c,%.o,$(wildcard $(src)/*.c))
+ccflags-y += -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_DEBUGFS
 EOF
 
 # drivers/bluetooth Makefile
 cat << 'EOF' > drivers/bluetooth/Makefile
 obj-m += hci_vhci.o
-ccflags-y += -I$(src)/../../net/bluetooth
+ccflags-y += -I$(src)/../../net/bluetooth -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
 EOF
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
