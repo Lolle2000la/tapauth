@@ -254,16 +254,6 @@ class BleGattService : Service() {
                 } else {
                     Log.e(TAG, "Failed to write response to client, status: $status")
                 }
-
-                // Disconnect after writing response
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
-                }
             }
         }
 
