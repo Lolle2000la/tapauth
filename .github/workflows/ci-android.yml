@@ -153,8 +153,8 @@ jobs:
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
         run: |
-          cargo build --release -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
-          cargo build --release -p client-pam --features dev-socket-override
+          cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
+          cargo build -p client-pam --features dev-socket-override
 
       - name: Run Full Real-Android E2E Tests (Pairing + UDP + BLE)
         uses: reactivecircus/android-emulator-runner@v2

@@ -119,12 +119,12 @@ fi
 
 # Step 1: Build necessary Linux binaries
 echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
-cargo build --release -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
-cargo build --release -p client-pam --features dev-socket-override
+cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
+cargo build -p client-pam --features dev-socket-override
 
-TAPAUTHD_BIN="${PROJECT_ROOT}/target/release/tapauthd"
-CLI_BIN="${PROJECT_ROOT}/target/release/tapauth-ipc-cli"
-PAM_LIB="${PROJECT_ROOT}/target/release/libclient_pam.so"
+TAPAUTHD_BIN="${PROJECT_ROOT}/target/debug/tapauthd"
+CLI_BIN="${PROJECT_ROOT}/target/debug/tapauth-ipc-cli"
+PAM_LIB="${PROJECT_ROOT}/target/debug/libclient_pam.so"
 
 # Step 2: Install Android App and Test Runner on Emulator
 echo "==> Step 2: Ensuring Android App and Instrumentation Tests are installed..."
