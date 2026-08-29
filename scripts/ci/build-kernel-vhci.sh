@@ -35,15 +35,10 @@ fi
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-KVER=$(uname -r | cut -d'-' -f1)
-MAJOR=$(echo "$KVER" | cut -d'.' -f1)
-MINOR=$(echo "$KVER" | cut -d'.' -f2)
-TAG="v${MAJOR}.${MINOR}"
-
-echo "    Cloning exact matching Bluetooth subsystem tree for tag $TAG..."
-if ! git clone --depth 1 --branch "$TAG" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR" 2>/dev/null; then
-    echo "    Tag $TAG not found on remote, falling back to v6.8..."
-    git clone --depth 1 --branch "v6.8" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
+echo "    Cloning Bluetooth subsystem for Linux v6.11..."
+if ! git clone --depth 1 --branch "v6.11" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR" 2>/dev/null; then
+    echo "    v6.11 not available, cloning v6.12..."
+    git clone --depth 1 --branch "v6.12" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
 fi
 
 cd "$WORK_DIR"
