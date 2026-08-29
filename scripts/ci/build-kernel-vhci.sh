@@ -35,24 +35,20 @@ fi
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "    Cloning Bluetooth subsystem for Linux v6.12..."
-if ! git clone --depth 1 --branch "v6.12" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR" 2>/dev/null; then
-    echo "    v6.12 not available, cloning master..."
-    git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
-fi
-
+echo "    Cloning Bluetooth subsystem for Linux master (6.13+ matching 4-arg prototypes)..."
+git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
 cd "$WORK_DIR"
 git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile
 git checkout
-
-# Compatibility: patch sock_i_uid -> sock_net_uid in af_bluetooth.c for 6.12+ uidgid.h
-sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
 
 # Remove root Linux Makefile so Kbuild treats this purely as an out-of-tree module
 rm -f Makefile
 
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> if needed
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
+
+# Compatibility: replace kzalloc_obj with standard kzalloc for 6.11/6.12/6.17 headers
+sed -i 's|kzalloc_obj(\*data)|kzalloc(sizeof(*data), GFP_KERNEL)|g' drivers/bluetooth/hci_vhci.c 2>/dev/null || true
 
 # Top-level Kbuild
 cat << 'EOF' > Kbuild
