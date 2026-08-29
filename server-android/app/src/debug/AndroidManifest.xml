@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+  <application>
+    <!-- Debug-only receiver declaration to allow adb broadcast simulation of explicit user denial in CI/test runners -->
+    <receiver
+        android:name=".service.AuthActionReceiver"
+        android:exported="true"
+        tools:replace="android:exported"
+        tools:node="merge">
+      <intent-filter>
+        <action android:name="dev.rourunisen.tapauth.ACTION_DEV_DENY" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>

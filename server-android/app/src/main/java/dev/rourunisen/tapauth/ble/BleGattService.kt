@@ -160,6 +160,13 @@ class BleGattService : Service() {
                         connectingOrConnectedDevices.remove(deviceAddress)
                         confirmationValues.remove(deviceAddress)
 
+                        // Note: We intentionally do NOT cancel pending authentication requests on
+                        // disconnect. Authentication prompts are user-driven and governed by
+                        // daemon/PAM
+                        // timeouts; premature cancellation would break user approvals during
+                        // transient
+                        // GATT reconnections or duplicate connection drops.
+
                         gatt.close()
                     }
                 }
@@ -570,10 +577,19 @@ class BleGattService : Service() {
         }
 
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(this, false, gattCallback)
+        try {
+            val gatt =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    @Suppress("DEPRECATION") device.connectGatt(this, false, gattCallback)
+                }
+            if (gatt == null) {
+                connectingOrConnectedDevices.remove(device.address)
+            }
+        } catch (e: Exception) {
+            connectingOrConnectedDevices.remove(device.address)
+            Log.e(TAG, "Failed to initiate connectGatt to ${device.address}: ${e.message}", e)
         }
     }
 

@@ -671,7 +671,7 @@ async fn handle_save_config(
     if let Some(enable_network) = req.enable_network {
         toml_config.enable_network = enable_network;
     }
-    if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
+    if let Err(e) = toml_config.save() {
         return err_resp(
             ipc::AdminStatus::AdminError,
             format!("Failed to save TOML config: {}", e),

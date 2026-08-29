@@ -484,13 +484,8 @@ echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
 else
 echo "║  Phase 2b: Real PAM Module (pamtester):          SKIPPED      ║"
 fi
-if [ "$BLE_AVAILABLE" = "true" ]; then
 echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
 echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
-else
-echo "║  Phase 3: Bluetooth Low Energy (BLE):            SKIPPED (VM) ║"
-echo "║  Phase 4: Parallel Race (UDP + BLE):             SKIPPED (VM) ║"
-fi
 echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
 echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
 echo "║  Phase 6: Device Removal & PAM_IGNORE:           PASSED       ║"

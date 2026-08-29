@@ -98,5 +98,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
+      - name: Run clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run clippy (with fallback-socket / dev-state-override)
+        run: cargo clippy -p tapauthd --features fallback-socket --all-targets -- -D warnings

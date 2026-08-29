@@ -197,7 +197,7 @@ class MainActivity : FragmentActivity() {
                         Log.d(TAG, "Biometric authentication succeeded")
                         // Handle current auth request approval
                         currentAuthRequest?.let { authRequest ->
-                            approveRequest(authRequest)
+                            AuthRequestManager.approveRequest(this@MainActivity, authRequest)
                             currentAuthRequest = null
                         }
                     }
@@ -208,39 +208,6 @@ class MainActivity : FragmentActivity() {
                     }
                 },
             )
-    }
-
-    private fun approveRequest(authRequest: AuthRequest) {
-        try {
-            val keypairRepo = dev.rourunisen.tapauth.data.KeypairRepository(this)
-            val privateKey = keypairRepo.getPrivateKey()
-            Log.d(
-                TAG,
-                "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
-            )
-            val signedChallenge =
-                dev.rourunisen.tapauth.crypto.signData(
-                    privateKey,
-                    authRequest.challenge,
-                )
-            Log.d(
-                TAG,
-                "Successfully signed challenge (${signedChallenge.size} bytes)",
-            )
-            handleAuthResponse(
-                authRequest.requestId,
-                approved = true,
-                signedChallenge = signedChallenge,
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to sign challenge", e)
-            handleAuthResponse(
-                authRequest.requestId,
-                approved = false,
-                signedChallenge = null,
-                explicitDenial = false,
-            )
-        }
     }
 
     private var currentAuthRequest: AuthRequest? = null
@@ -283,17 +250,12 @@ class MainActivity : FragmentActivity() {
     private fun handleAuthRequest(authRequest: AuthRequest) {
         Log.d(TAG, "Received auth request for ${authRequest.username}@${authRequest.hostname}")
 
-        // Check if biometric authentication is available
+        // Check if biometric authentication is available (Class 3 BIOMETRIC_STRONG required)
         val biometricManager = BiometricManager.from(this)
         val canAuthStrong =
             biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-        val canAuthWeak =
-            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
 
-        if (
-            canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS ||
-                canAuthWeak == BiometricManager.BIOMETRIC_SUCCESS
-        ) {
+        if (canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS) {
             // Show biometric prompt
             currentAuthRequest = authRequest
             showBiometricPrompt(authRequest)
@@ -302,20 +264,20 @@ class MainActivity : FragmentActivity() {
             // denial broadcast, then auto-approve if still pending
             Log.i(
                 TAG,
-                "Biometrics not enrolled in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period if not denied",
+                "Biometrics not enrolled in debug mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
             )
             CoroutineScope(Dispatchers.Main).launch {
-                delay(3500)
+                delay(AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(TAG, "Auto-approving request ${authRequest.requestId} in debug mode")
-                    approveRequest(authRequest)
+                    AuthRequestManager.approveRequest(this@MainActivity, authRequest)
                 }
             }
         } else {
             // Biometric not available, deny request
             Log.e(
                 TAG,
-                "Biometric authentication not available (strong=$canAuthStrong, weak=$canAuthWeak)",
+                "Biometric authentication not available (strong=$canAuthStrong)",
             )
             handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
         }

@@ -515,8 +515,6 @@ class AuthRequestManager private constructor() {
         const val ACTION_AUTH_REQUEST = "dev.rourunisen.tapauth.AUTH_REQUEST"
         const val ACTION_AUTH_RESPONSE = "dev.rourunisen.tapauth.AUTH_RESPONSE"
         const val EXTRA_AUTH_REQUEST = "auth_request"
-        const val EXTRA_REQUEST_ID = "request_id"
-        const val EXTRA_APPROVED = "approved"
         const val EXTRA_SIGNED_CHALLENGE = "signed_challenge"
 
         @Volatile private var instance: AuthRequestManager? = null
@@ -548,6 +546,45 @@ class AuthRequestManager private constructor() {
             } catch (_: Exception) {
                 // Fallback: use Kotlin contentHashCode masked to positive
                 (challenge.contentHashCode() and 0x7FFFFFFF)
+            }
+        }
+
+        /** Delay in ms before debug auto-approval fires when no biometrics are enrolled. */
+        const val DEBUG_AUTO_APPROVE_DELAY_MS = 1000L
+
+        /**
+         * Signs the auth challenge using the device's private key and submits an approved response
+         * through AuthRequestManager.
+         */
+        fun approveRequest(context: Context, authRequest: AuthRequest) {
+            try {
+                val keypairRepo = KeypairRepository(context)
+                val privateKey = keypairRepo.getPrivateKey()
+                Log.d(
+                    TAG,
+                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                )
+                val signedChallenge =
+                    dev.rourunisen.tapauth.crypto.signData(
+                        privateKey,
+                        authRequest.challenge,
+                    )
+                Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
+                getInstance()
+                    .handleResponse(
+                        authRequest.requestId,
+                        approved = true,
+                        signedChallenge = signedChallenge,
+                    )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to sign challenge", e)
+                getInstance()
+                    .handleResponse(
+                        authRequest.requestId,
+                        approved = false,
+                        signedChallenge = null,
+                        explicitDenial = false,
+                    )
             }
         }
     }

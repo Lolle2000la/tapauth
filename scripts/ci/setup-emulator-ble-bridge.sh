@@ -25,16 +25,6 @@ if [ "$VHCI_SUPPORTED" != "true" ]; then
     exit 1
 fi
 
-echo "true" > /tmp/ble-available.txt
-
-# Ensure D-Bus system bus is running
-if ! pgrep -x dbus-daemon > /dev/null && ! pgrep -x dbus-broker > /dev/null; then
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo mkdir -p /var/run/dbus
-        sudo dbus-daemon --system --fork 2>/dev/null || sudo systemctl start dbus || true
-    fi
-fi
-
 # Ensure BlueZ packages are installed and bluetoothd is running
 sudo apt-get update -qq
 sudo apt-get install -y -qq bluez bluez-tools
@@ -46,7 +36,7 @@ fi
 # Verify bumble is available
 if ! python3 -c "import bumble" 2>/dev/null; then
     echo "    Installing Bumble Python package..."
-    pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf 2>/dev/null || pip install "bumble[android-netsim]" grpcio protobuf || true
+    pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf
 fi
 
 # Capture existing hci devices to detect the newly created one
@@ -118,8 +108,16 @@ if [ -n "$NEW_HCI" ]; then
     echo "--- Adapter details ---"
     sudo btmgmt info 2>/dev/null || true
     bluetoothctl show 2>/dev/null || true
+    echo "true" > /tmp/ble-available.txt
 else
-    echo "⚠️  No new HCI adapter detected yet."
+    echo "❌ ERROR: No virtual Bluetooth adapter (HCI) detected after bridge launch."
+    echo "false" > /tmp/ble-available.txt
+    if [ -f "$BUMBLE_LOG" ]; then
+        echo "=== BUMBLE BRIDGE LOG ==="
+        cat "$BUMBLE_LOG"
+        echo "========================="
+    fi
+    exit 1
 fi
 
 echo "✅ Virtual BLE bridge setup completed."

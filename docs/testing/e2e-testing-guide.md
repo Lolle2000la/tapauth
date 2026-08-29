@@ -88,8 +88,9 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 4. `tapauthd` returns `DENIED` outcome to PAM module.
 
 ### Phase 5b: Authentication Timeout Verification
-1. Authentication is requested with a 3-second timeout and no user response.
-2. `tapauthd` detects timeout, broadcasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
+1. Android app is paused/stopped so no device responds to the auth broadcast.
+2. Authentication is requested with a 2-second timeout.
+3. `tapauthd` detects deadline expiry, broadcasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
 
 ### Phase 6: Device Removal / Un-pairing
 1. Desktop invokes `remove-device <server_public_key>` via admin IPC.
@@ -122,7 +123,7 @@ E2E testing runs automatically in `.github/workflows/ci-android.yml` on every pu
 The test runner is designed to run completely unprivileged without `sudo` by using isolated sandbox directories:
 - `TAPAUTH_STATE_DIR`: Isolated state directory (`/tmp/tapauth-e2e.XXXXXX/state`).
 - `TAPAUTHD_SOCK`: Isolated Unix socket (`/tmp/tapauth-e2e.XXXXXX/tapauthd.sock`).
-- `TAPAUTH_DEV_MODE=1`: Bypasses system PolKit daemon and authorizes the process owner.
+- `TAPAUTH_DEV_MODE=1`: Bypasses system PolKit daemon for same-UID/root callers on the isolated dev socket, authorizing the process owner for test automation. (Note: Production daemon runs with full PolKit authorization enforcement).
 
 #### Prerequisites
 1. Have an Android emulator running (API 33 to 36):

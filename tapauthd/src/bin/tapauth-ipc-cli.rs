@@ -220,10 +220,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--ble" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing value for --ble");
+                            std::process::exit(1);
+                        }
                         ble = Some(args[i + 1].parse::<bool>()?);
                         i += 2;
                     }
                     "--network" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing value for --network");
+                            std::process::exit(1);
+                        }
                         network = Some(args[i + 1].parse::<bool>()?);
                         i += 2;
                     }
@@ -289,13 +297,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 30
             };
             let resp = send_pam_auth(user, timeout_secs).await?;
-            let outcome_name = match resp.outcome {
-                0 => "SUCCESS",
-                1 => "DENIED",
-                2 => "TIMEOUT",
-                3 => "IGNORE",
-                4 => "ERROR",
-                _ => "UNKNOWN",
+            let outcome_name = match ipc::PamOutcome::try_from(resp.outcome) {
+                Ok(ipc::PamOutcome::Success) => "SUCCESS",
+                Ok(ipc::PamOutcome::Denied) => "DENIED",
+                Ok(ipc::PamOutcome::Timeout) => "TIMEOUT",
+                Ok(ipc::PamOutcome::Ignore) => "IGNORE",
+                Ok(ipc::PamOutcome::Error) => "ERROR",
+                Err(_) => "UNKNOWN",
             };
             println!("OUTCOME={}", outcome_name);
             println!("DETAIL={}", resp.detail);
