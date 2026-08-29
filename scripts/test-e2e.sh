@@ -328,21 +328,34 @@ echo "╚═══════════════════════�
 # Stop auto-grant watcher
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
 
+echo "==> Setting transport config: UDP enabled, BLE disabled..."
+"$CLI_BIN" set-transports --ble false --network true
+
 echo "==> Initiating auth and simulating biometric rejection..."
-DENIAL_OUT=""
-set +e
-DENIAL_OUT=$("$CLI_BIN" pam-auth "$TEST_USER" 5 &)
+DENIAL_OUT_LOG="${TEST_DIR}/denial-cli.log"
+"$CLI_BIN" pam-auth "$TEST_USER" 10 > "$DENIAL_OUT_LOG" 2>&1 &
 DENIAL_CLI_PID=$!
-sleep 0.5
+
+sleep 0.8
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny
+
+set +e
 wait "$DENIAL_CLI_PID"
 DENIAL_EXIT=$?
 set -e
 
-if [ "$DENIAL_EXIT" -ne 0 ]; then
-    echo "✅ Explicit Denial correctly rejected (exit code: $DENIAL_EXIT)."
+cat "$DENIAL_OUT_LOG"
+
+if [ "$DENIAL_EXIT" -ne 0 ] && grep -q "OUTCOME=DENIED" "$DENIAL_OUT_LOG"; then
+    echo "✅ Explicit Denial correctly rejected with OUTCOME=DENIED (exit code: $DENIAL_EXIT)."
 else
-    echo "⚠️ Warning: Expected denial exit != 0, got $DENIAL_EXIT."
+    echo "❌ ERROR: Expected explicit denial with OUTCOME=DENIED, but got exit code $DENIAL_EXIT."
+    if [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
+    fi
+    exit 1
 fi
 
 # Step 10: Phase 6 - Device Removal / Un-pairing

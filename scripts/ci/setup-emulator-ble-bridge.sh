@@ -7,30 +7,24 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 
-# Ensure vhci module is loaded and /dev/vhci node exists if running with privileges
-if ! lsmod 2>/dev/null | grep -q hci_vhci; then
-    if [ -w /dev ]; then
-        modprobe hci_vhci 2>/dev/null || true
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo modprobe hci_vhci 2>/dev/null || true
-    fi
-fi
-
-if [ ! -c /dev/vhci ]; then
-    if [ -w /dev ]; then
-        mknod /dev/vhci c 10 137 2>/dev/null || true
-        chmod 666 /dev/vhci 2>/dev/null || true
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+# Ensure vhci module is loaded and /dev/vhci node exists with write permissions
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo modprobe hci_vhci 2>/dev/null || true
+    if [ ! -c /dev/vhci ]; then
         sudo mknod /dev/vhci c 10 137 2>/dev/null || true
-        sudo chmod 666 /dev/vhci 2>/dev/null || true
     fi
+    sudo chmod 666 /dev/vhci 2>/dev/null || true
+else
+    modprobe hci_vhci 2>/dev/null || true
+    if [ ! -c /dev/vhci ]; then
+        mknod /dev/vhci c 10 137 2>/dev/null || true
+    fi
+    chmod 666 /dev/vhci 2>/dev/null || true
 fi
 
 # Check if /dev/vhci is actually accessible
 VHCI_SUPPORTED=false
 if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
-    VHCI_SUPPORTED=true
-elif command -v sudo >/dev/null 2>&1 && sudo -n python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
     VHCI_SUPPORTED=true
 fi
 

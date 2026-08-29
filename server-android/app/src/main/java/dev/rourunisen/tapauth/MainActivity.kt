@@ -53,6 +53,10 @@ import dev.rourunisen.tapauth.ui.pairing.PairingScreen
 import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
 
@@ -294,11 +298,16 @@ class MainActivity : FragmentActivity() {
             currentAuthRequest = authRequest
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.DEBUG) {
-            Log.i(
-                TAG,
-                "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving",
-            )
-            approveRequest(authRequest)
+            CoroutineScope(Dispatchers.Main).launch {
+                delay(600)
+                if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
+                    Log.i(
+                        TAG,
+                        "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period",
+                    )
+                    approveRequest(authRequest)
+                }
+            }
         } else {
             // Biometric not available, deny request
             Log.e(

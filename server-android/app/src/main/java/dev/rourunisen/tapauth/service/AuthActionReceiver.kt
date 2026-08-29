@@ -15,10 +15,25 @@ class AuthActionReceiver : BroadcastReceiver() {
     companion object {
         const val TAG = "AuthActionReceiver"
         const val ACTION_NOTIFICATION_ACTION = "dev.rourunisen.tapauth.ACTION_NOTIFICATION_ACTION"
+        const val ACTION_DEV_DENY = "dev.rourunisen.tapauth.ACTION_DEV_DENY"
     }
 
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent == null) return
+        if (intent.action == ACTION_DEV_DENY && dev.rourunisen.tapauth.BuildConfig.DEBUG) {
+            Log.d(TAG, "Handling dev explicit denial broadcast")
+            val manager = AuthRequestManager.getInstance()
+            for (reqId in manager.getActiveRequestIds()) {
+                Log.d(TAG, "Applying dev explicit denial to request $reqId")
+                manager.handleResponse(
+                    reqId,
+                    approved = false,
+                    signedChallenge = null,
+                    explicitDenial = true,
+                )
+            }
+            return
+        }
         if (intent.action != ACTION_NOTIFICATION_ACTION) return
 
         val notifAction = intent.getStringExtra("notification_action")

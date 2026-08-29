@@ -37,10 +37,11 @@ case "$ACTION" in
         ;;
 
     deny)
-        echo "    Triggering biometric denial (finger touch 2 / cancel)..."
+        echo "    Triggering biometric denial (finger touch 2 / cancel / dev-deny broadcast)..."
         # Finger 2 is not enrolled, causing biometric failure
         adb emu finger touch 2 2>/dev/null || true
-        sleep 0.5
+        # Send explicit denial broadcast to dev receiver
+        adb shell am broadcast -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
         # Also simulate negative / cancel button if prompt is active
         adb shell input keyevent KEYCODE_BACK 2>/dev/null || true
         ;;

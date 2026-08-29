@@ -10,6 +10,10 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.service.AuthRequestManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Transparent activity that shows the biometric prompt directly from a notification. This activity
@@ -99,13 +103,18 @@ class BiometricPromptActivity : FragmentActivity() {
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.DEBUG) {
             // In debug/test environments (e.g. CI headless emulator without enrolled biometrics),
-            // auto-approve
-            Log.i(
-                TAG,
-                "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving",
-            )
-            approveRequest(authRequest)
-            finish()
+            // wait briefly to allow potential explicit denial broadcast before auto-approving
+            CoroutineScope(Dispatchers.Main).launch {
+                delay(600)
+                if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
+                    Log.i(
+                        TAG,
+                        "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period",
+                    )
+                    approveRequest(authRequest)
+                }
+                finish()
+            }
         } else {
             // Biometric not available in production, deny request and finish
             Log.e(

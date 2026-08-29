@@ -386,6 +386,12 @@ class AuthRequestManager private constructor() {
         return pendingRequests[requestId]?.authRequest
     }
 
+    /** Check if a pending request exists by ID */
+    fun hasPendingRequest(requestId: String): Boolean = pendingRequests.containsKey(requestId)
+
+    /** Get all active request IDs */
+    fun getActiveRequestIds(): Set<String> = pendingRequests.keys.toSet()
+
     /** Get count of pending requests */
     fun getPendingCount(): Int = pendingRequests.size
 
