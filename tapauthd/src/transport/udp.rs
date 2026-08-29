@@ -53,6 +53,13 @@ impl Transport for UdpTransport {
             tracing::warn!("Failed to send IPv4 broadcast: {}", e);
         }
 
+        #[cfg(any(feature = "dev-state-override", test))]
+        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+            use prost::Message;
+            let data = packet.encode_to_vec();
+            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
+        }
+
         // Send multicast on IPv6 (on all available interfaces)
         if is_ipv6_available() {
             match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await {
@@ -84,6 +91,14 @@ impl Transport for UdpTransport {
     async fn send_confirmation(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         // Send on both IPv4 and IPv6
         send_udp_broadcast(&self.socket, self.port, packet).await?;
+
+        #[cfg(any(feature = "dev-state-override", test))]
+        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+            use prost::Message;
+            let data = packet.encode_to_vec();
+            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
+        }
+
         if is_ipv6_available() {
             let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
         }
@@ -94,6 +109,13 @@ impl Transport for UdpTransport {
     async fn send_cancel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
         // Send on both IPv4 and IPv6
         send_udp_broadcast(&self.socket, self.port, packet).await?;
+
+        #[cfg(any(feature = "dev-state-override", test))]
+        if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+            use prost::Message;
+            let data = packet.encode_to_vec();
+            let _ = self.socket.send_to(&data, "127.0.0.1:36695").await;
+        }
 
         if is_ipv6_available() {
             let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
