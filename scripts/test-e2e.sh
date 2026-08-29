@@ -423,10 +423,14 @@ echo "╔═══════════════════════�
 echo "║  PHASE 5b: Authentication Timeout Verification                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-sleep 2
-echo "==> Requesting authentication with 3s timeout and no response..."
+sleep 1
+# Stop the Android app so that no server responds to the broadcast, verifying daemon timeout handling
+adb shell am force-stop dev.rourunisen.tapauth.debug 2>/dev/null || true
+sleep 1
+
+echo "==> Requesting authentication with 2s timeout and no response..."
 TIMEOUT_OUT_LOG="${TEST_DIR}/timeout-cli.log"
-"$CLI_BIN" pam-auth "$TEST_USER" 3 > "$TIMEOUT_OUT_LOG" 2>&1 || true
+"$CLI_BIN" pam-auth "$TEST_USER" 2 > "$TIMEOUT_OUT_LOG" 2>&1 || true
 
 cat "$TIMEOUT_OUT_LOG"
 
