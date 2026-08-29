@@ -42,41 +42,89 @@ echo "    Fetching kernel Bluetooth sources for $BASE_VER..."
 mkdir -p net/bluetooth drivers/bluetooth include/net/bluetooth
 
 RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/${BASE_VER}"
-# If v6.17 or custom tag doesn't exist, fallback to master
 if ! curl -sfI "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" >/dev/null; then
     RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
 fi
 
-echo "    Downloading source files from ${RAW_BASE}..."
-curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c || true
+echo "    Downloading Bluetooth source files from ${RAW_BASE}..."
 
-# Check if hci_vhci was downloaded
-if [ ! -s drivers/bluetooth/hci_vhci.c ]; then
-    echo "⚠️ Failed to download hci_vhci.c source. Skipping out-of-tree build."
+# List of source files for net/bluetooth and drivers/bluetooth
+BT_FILES=(
+    "drivers/bluetooth/hci_vhci.c"
+    "net/bluetooth/af_bluetooth.c"
+    "net/bluetooth/hci_core.c"
+    "net/bluetooth/hci_conn.c"
+    "net/bluetooth/hci_event.c"
+    "net/bluetooth/mgmt.c"
+    "net/bluetooth/hci_sock.c"
+    "net/bluetooth/hci_sysfs.c"
+    "net/bluetooth/l2cap_core.c"
+    "net/bluetooth/l2cap_sock.c"
+    "net/bluetooth/smp.c"
+    "net/bluetooth/lib.c"
+    "net/bluetooth/ecdh_helper.c"
+    "net/bluetooth/hci_request.c"
+    "net/bluetooth/mgmt_util.c"
+    "net/bluetooth/mgmt_config.c"
+    "net/bluetooth/hci_sync.c"
+    "net/bluetooth/aosp.c"
+    "net/bluetooth/eir.c"
+    "net/bluetooth/smp.h"
+    "net/bluetooth/mgmt_util.h"
+    "net/bluetooth/hci_request.h"
+    "net/bluetooth/aosp.h"
+    "net/bluetooth/eir.h"
+    "net/bluetooth/ecdh_helper.h"
+    "net/bluetooth/mgmt_config.h"
+)
+
+for file in "${BT_FILES[@]}"; do
+    curl -sSfL "${RAW_BASE}/${file}" -o "$file" 2>/dev/null || true
+done
+
+# Check if essential files were downloaded
+if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
+    echo "⚠️ Failed to download essential Bluetooth source files. Skipping out-of-tree build."
     rm -rf "$WORK_DIR"
     exit 0
 fi
 
-# Create Kbuild Makefile for hci_vhci
-cat << 'EOF' > drivers/bluetooth/Makefile
-obj-m += hci_vhci.o
+# Top-level Kbuild Makefile
+cat << 'EOF' > Makefile
+obj-m += net/bluetooth/
+obj-m += drivers/bluetooth/
 EOF
 
-# Build hci_vhci
-echo "    Compiling hci_vhci.ko against $BUILD_DIR..."
-if make -C "$BUILD_DIR" M="$WORK_DIR/drivers/bluetooth" modules > "$WORK_DIR/build.log" 2>&1; then
-    echo "    Module compiled successfully. Loading module..."
+# net/bluetooth Makefile
+cat << 'EOF' > net/bluetooth/Makefile
+obj-m += bluetooth.o
+bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
+	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
+	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
+	aosp.o eir.o
+EOF
+
+# drivers/bluetooth Makefile
+cat << 'EOF' > drivers/bluetooth/Makefile
+obj-m += hci_vhci.o
+ccflags-y += -I$(src)/../../net/bluetooth
+EOF
+
+echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
+if make -C "$BUILD_DIR" M="$WORK_DIR" modules > "$WORK_DIR/build.log" 2>&1; then
+    echo "    Modules compiled successfully. Inserting modules..."
+    sudo insmod "$WORK_DIR/net/bluetooth/bluetooth.ko" 2>/dev/null || true
     sudo insmod "$WORK_DIR/drivers/bluetooth/hci_vhci.ko" 2>/dev/null || true
     if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137 2>/dev/null || true; fi
     sudo chmod 666 /dev/vhci 2>/dev/null || true
     if [ -w /dev/vhci ]; then
-        echo "✅ Successfully built and loaded hci_vhci module! /dev/vhci is now active."
+        echo "✅ Successfully built and loaded bluetooth + hci_vhci modules! /dev/vhci is now active."
     else
-        echo "⚠️ Module loaded but /dev/vhci is not accessible."
+        echo "⚠️ Modules loaded but /dev/vhci is not accessible."
     fi
 else
-    echo "⚠️ Out-of-tree build failed (often due to missing bluetooth.ko in kernel core):"
-    tail -n 20 "$WORK_DIR/build.log" || true
+    echo "⚠️ Out-of-tree build failed. Build log:"
+    tail -n 25 "$WORK_DIR/build.log" || true
 fi
 
 rm -rf "$WORK_DIR"
