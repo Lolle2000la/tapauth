@@ -21,13 +21,10 @@ import org.junit.runner.RunWith
 /**
  * End-to-end instrumentation test for device pairing.
  *
- * Can be executed via adb:
- * adb shell am instrument -w \
- *   -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
- *   -e pairing_host 10.0.2.2 \
- *   -e pairing_port 36693 \
- *   -e expected_sas 123456 \
- *   dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
+ * Can be executed via adb: adb shell am instrument -w \ -e class
+ * dev.rourunisen.tapauth.e2e.PairingE2eTest \ -e pairing_host 10.0.2.2 \ -e pairing_port 36693 \ -e
+ * expected_sas 123456 \
+ * dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
  */
 @RunWith(AndroidJUnit4::class)
 class PairingE2eTest {
@@ -66,13 +63,14 @@ class PairingE2eTest {
         }
 
         // Step 3: Complete pairing (CSK exchange & storage)
-        val completeResult = client.completePairing(
-            socket = awaiting.socket,
-            psk = awaiting.psk,
-            clientEd25519Key = awaiting.clientEd25519Key,
-            clientDeviceName = awaiting.clientDeviceName,
-            sasConfirmed = true,
-        )
+        val completeResult =
+            client.completePairing(
+                socket = awaiting.socket,
+                psk = awaiting.psk,
+                clientEd25519Key = awaiting.clientEd25519Key,
+                clientDeviceName = awaiting.clientDeviceName,
+                sasConfirmed = true,
+            )
 
         assertTrue(
             "Pairing completion failed with error: ${(completeResult as? PairingResult.Error)?.message}",

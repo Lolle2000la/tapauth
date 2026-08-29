@@ -25,7 +25,7 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
         }
 
     fun getAllPairedDevicesSync(): List<PairedDevice> {
@@ -57,7 +57,7 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
         }
 
     /**
@@ -92,7 +92,7 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
 
             return@withContext updatedUsers.isEmpty()
         }
