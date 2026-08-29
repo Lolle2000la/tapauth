@@ -79,10 +79,10 @@ if [ -w /dev/vhci ]; then
     fi
 else
     if command -v bumble-hci-bridge &> /dev/null; then
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" bumble-hci-bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "bumble-hci-bridge 'android-netsim:localhost:8554,mode=controller' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
         BUMBLE_PID=$!
     else
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" python3 -m bumble.apps.hci_bridge "android-netsim:localhost:8554,mode=controller" "vhci:" > "$BUMBLE_LOG" 2>&1 &
+        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "python3 -m bumble.apps.hci_bridge 'android-netsim:localhost:8554,mode=controller' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
         BUMBLE_PID=$!
     fi
 fi

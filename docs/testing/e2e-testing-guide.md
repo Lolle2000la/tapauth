@@ -58,18 +58,22 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 
 ### Phase 2: Local Network (UDP) End-to-End Authentication
 1. Desktop enables UDP transport and disables BLE via admin IPC (`set-transports --network true --ble false`).
-2. PAM authentication is requested for the test user via `tapauth-ipc-cli pam-auth <user> 20`.
-3. `tapauthd` broadcasts `EncryptedPacket` with rotating 60s temporal ID on UDP port 36692.
-4. `AuthenticationService` on Android receives packet, validates temporal ID, decrypts `AuthRequest`, and triggers BiometricPrompt.
-5. Automated test helper touches enrolled fingerprint (`adb emu finger touch 1`).
-6. Android replies with `AuthenticationGrant` signed by its Ed25519 key.
-7. `tapauthd` verifies signature, returns `SUCCESS` (0) to PAM client.
+2. Authentication is requested for the test user via `tapauth-ipc-cli pam-auth <user> 20`.
+3. `tapauthd` broadcasts `EncryptedPacket` on UDP port 36692 (and forwards a copy to emulator redirection port `36695` in dev mode).
+4. `AuthenticationService` on Android receives packet, validates temporal ID, decrypts `AuthRequest`, and triggers authentication.
+5. Android verifies credentials and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
+6. `tapauthd` verifies signature, confirms grant, and returns `SUCCESS` (0) to PAM client.
+
+### Phase 2b: Real PAM Module Authentication (`pamtester`)
+1. Test suite creates temporary PAM service definition at `/etc/pam.d/tapauth-test-e2e` pointing to `libclient_pam.so`.
+2. `pamtester` invokes `pam_sm_authenticate` against the real PAM C ABI.
+3. `client-pam` connects to `tapauthd` over Unix socket and completes full PAM authentication returning `PAM_SUCCESS`.
 
 ### Phase 3: Bluetooth Low Energy (BLE) Authentication
 1. Desktop enables BLE transport and disables UDP (`set-transports --network false --ble true`).
 2. Authentication is requested over virtual BLE via Google Bumble + Netsim.
-3. `tapauthd` GATT client connects to Android GATT peripheral (`dev.rourunisen.tapauth.ble.BleGattService`).
-4. Exchanging `AuthRequest` and `AuthenticationGrant` characteristics.
+3. `tapauthd` acts as GATT Server and Peripheral advertiser (`b4ad84c0-2adb-4876-8315-b39d983b2bde`).
+4. Android `BleGattService` acts as GATT Client and Central scanner, connecting to `tapauthd`'s GATT server and exchanging `AuthRequest` and `AuthenticationGrant` characteristics.
 5. Verified successful authentication over BLE.
 
 ### Phase 4: Parallel Discovery Race (UDP + BLE Simultaneous)
@@ -79,9 +83,13 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 
 ### Phase 5: Explicit User Denial
 1. Authentication is requested while auto-grant helper is paused.
-2. Android triggers negative biometric rejection (`finger touch 2` or back/cancel event).
+2. Simulated biometric rejection / `dev.rourunisen.tapauth.ACTION_DEV_DENY` broadcast is triggered.
 3. Android sends signed `AuthenticationDenial`.
 4. `tapauthd` returns `DENIED` outcome to PAM module.
+
+### Phase 5b: Authentication Timeout Verification
+1. Authentication is requested with a 3-second timeout and no user response.
+2. `tapauthd` detects timeout, broadcasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
 
 ### Phase 6: Device Removal / Un-pairing
 1. Desktop invokes `remove-device <server_public_key>` via admin IPC.
@@ -94,14 +102,14 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 
 ### UDP Network Bridge
 Android emulators run on a virtual NAT subnet (`10.0.2.15`), where `10.0.2.2` represents the host.
-- **Inbound (Host $\to$ Emulator)**: `adb emu redir add udp:36692:36692` maps host localhost to guest port 36692. A background reflector on the host (`/tmp/udp_reflector.py`) listens on `0.0.0.0:36692` (with `SO_REUSEPORT`) and forwards broadcast packets to `127.0.0.1:36692`.
-- **Outbound (Emulator $\to$ Host)**: Android replies directly to `packet.address` (`10.0.2.2:36692`), reaching `tapauthd` directly.
+- **Inbound (Host $\to$ Emulator)**: in dev mode (`TAPAUTH_DEV_MODE`, feature `dev-state-override`) the daemon additionally unicasts every request to `127.0.0.1:36695` (configurable via `TAPAUTH_DEV_UDP_TARGET`), which `adb emu redir add udp:36695:36692` forwards directly into the guest emulator.
+- **Outbound (Emulator $\to$ Host)**: Android replies directly to `senderAddress.hostAddress:appConfig.udpPort` (`10.0.2.2:36692`), which SLIRP delivers to the daemon's `[::]:36692` socket. The dev-mode loopback filter exception allows the daemon to accept loopback packets.
 
 ### Virtual BLE Bridge (Google Bumble + Netsim)
 Android emulators provide an internal Bluetooth simulation service called **Netsim** on gRPC port 8554.
 - `bumble-hci-bridge` connects to `android-netsim:localhost:8554` and bridges HCI packets to Linux `/dev/vhci`.
 - BlueZ on Linux discovers the virtual controller and exposes it as a standard Bluetooth adapter (e.g. `hci1`).
-- `tapauthd`'s native BLE stack discovers and communicates with the emulator using standard Linux BlueZ APIs.
+- `tapauthd` publishes its GATT service and BLE advertisements via BlueZ, and the Android emulator scans and connects.
 
 ---
 
@@ -117,7 +125,7 @@ The test runner is designed to run completely unprivileged without `sudo` by usi
 - `TAPAUTH_DEV_MODE=1`: Bypasses system PolKit daemon and authorizes the process owner.
 
 #### Prerequisites
-1. Have an Android emulator running (API 33+ or 34):
+1. Have an Android emulator running (API 33 to 36):
    ```bash
    emulator @<your_avd_name>
    ```

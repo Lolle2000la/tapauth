@@ -262,6 +262,39 @@ else
     exit 1
 fi
 
+# Step 6b: Phase 2b - Real PAM Module Authentication (pamtester)
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2b: Real PAM Module Authentication (pamtester)         ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+PAM_TESTABLE="false"
+if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
+    PAM_TESTABLE="true"
+fi
+
+if [ "$PAM_TESTABLE" = "true" ]; then
+    echo "==> Configuring temporary PAM service at /etc/pam.d/tapauth-test-e2e..."
+    printf 'auth required %s\naccount required pam_permit.so\n' "$PAM_LIB" > /etc/pam.d/tapauth-test-e2e
+
+    echo "==> Executing pamtester for user '$TEST_USER'..."
+    set +e
+    TAPAUTHD_SOCK="$TAPAUTHD_SOCK" pamtester tapauth-test-e2e "$TEST_USER" authenticate
+    PAM_EXIT=$?
+    set -e
+
+    rm -f /etc/pam.d/tapauth-test-e2e
+
+    if [ "$PAM_EXIT" -eq 0 ]; then
+        echo "✅ Real PAM Module Authentication PASSED (exit code: $PAM_EXIT)!"
+    else
+        echo "❌ Real PAM Module Authentication FAILED (exit code: $PAM_EXIT)."
+        exit 1
+    fi
+else
+    echo "ℹ️  Real PAM module testing skipped (/etc/pam.d not writable or pamtester missing)."
+fi
+
 # Step 7: Phase 3 - Bluetooth Low Energy (BLE) Authentication
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -356,6 +389,27 @@ else
         cat "$DAEMON_LOG"
         echo "======================="
     fi
+    exit 1
+fi
+
+# Step 9b: Phase 5b - Authentication Timeout Verification
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 5b: Authentication Timeout Verification                ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+sleep 2
+echo "==> Requesting authentication with 3s timeout and no response..."
+TIMEOUT_OUT_LOG="${TEST_DIR}/timeout-cli.log"
+"$CLI_BIN" pam-auth "$TEST_USER" 3 > "$TIMEOUT_OUT_LOG" 2>&1 || true
+
+cat "$TIMEOUT_OUT_LOG"
+
+if grep -q "OUTCOME=TIMEOUT" "$TIMEOUT_OUT_LOG"; then
+    echo "✅ Authentication Timeout correctly detected OUTCOME=TIMEOUT!"
+else
+    echo "❌ ERROR: Expected OUTCOME=TIMEOUT, but got:"
+    cat "$TIMEOUT_OUT_LOG"
     exit 1
 fi
 

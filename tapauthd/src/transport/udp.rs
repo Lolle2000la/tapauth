@@ -47,15 +47,33 @@ impl UdpTransport {
 }
 
 #[cfg(any(feature = "dev-state-override", test))]
+fn dev_udp_target() -> Option<&'static str> {
+    static TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+                Some(
+                    std::env::var("TAPAUTH_DEV_UDP_TARGET")
+                        .unwrap_or_else(|_| "127.0.0.1:36695".to_string()),
+                )
+            } else {
+                None
+            }
+        })
+        .as_deref()
+}
+
+#[cfg(any(feature = "dev-state-override", test))]
 fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
-    if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+    if let Some(target) = dev_udp_target() {
         use prost::Message;
         let data = packet.encode_to_vec();
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            let _ = sock.send_to(&data, "127.0.0.1:36695");
+            let _ = sock.send_to(&data, target);
             tracing::debug!(
-                "Directly forwarded {} bytes to emulator on 127.0.0.1:36695",
-                data.len()
+                "Directly forwarded {} bytes to dev target on {}",
+                data.len(),
+                target
             );
         }
     }

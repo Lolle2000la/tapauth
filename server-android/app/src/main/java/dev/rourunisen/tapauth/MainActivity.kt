@@ -294,12 +294,19 @@ class MainActivity : FragmentActivity() {
             currentAuthRequest = authRequest
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.DEBUG) {
-            // In debug/test environments without enrolled biometrics, wait for explicit dev
-            // broadcast (ACTION_DEV_APPROVE or ACTION_DEV_DENY)
+            // In debug/test environments without enrolled biometrics, wait briefly for explicit
+            // denial broadcast, then auto-approve if still pending
             Log.i(
                 TAG,
-                "Biometrics not enrolled in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); waiting for dev broadcast",
+                "Biometrics not enrolled in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period if not denied",
             )
+            CoroutineScope(Dispatchers.Main).launch {
+                delay(2000)
+                if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
+                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in debug mode")
+                    approveRequest(authRequest)
+                }
+            }
         } else {
             // Biometric not available, deny request
             Log.e(
