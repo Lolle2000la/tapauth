@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds and loads bluetooth.ko and hci_vhci.ko kernel modules for virtual BLE testing
 # when running on cloud VM kernels (such as Azure/GitHub Actions) where CONFIG_BT is omitted.
-set -e
+set -euo pipefail
 
 echo "==> Setting up Linux kernel virtual Bluetooth (hci_vhci)..."
 
@@ -10,11 +10,11 @@ if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDW
     exit 0
 fi
 
-# Try modprobe first
+# Try modprobe first (works on kernels that ship hci_vhci)
 if sudo modprobe hci_vhci 2>/dev/null; then
     if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137 2>/dev/null || true; fi
     sudo chmod 666 /dev/vhci 2>/dev/null || true
-    if [ -w /dev/vhci ]; then
+    if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
         echo "✅ hci_vhci module loaded via modprobe."
         exit 0
     fi
@@ -22,9 +22,24 @@ fi
 
 echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modules for $(uname -r)..."
 
-# Ensure build essentials and kernel headers are installed
+# Ensure build essentials, kernel headers, and patchutils are installed
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" linux-headers-azure git
+sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" patchutils wget
+
+HDRS="linux-headers-$(uname -r)"
+SRCPKG=$(apt-cache show "$HDRS" 2>/dev/null | sed -n 's/^Source: \([^ ]*\).*/\1/p' | head -1 || true)
+SRCVER=$(apt-cache show "$HDRS" 2>/dev/null | sed -n 's/^Source: [^ ]* (\([^)]*\)).*/\1/p' | head -1 || true)
+if [ -z "$SRCVER" ]; then
+    SRCVER=$(apt-cache show "$HDRS" 2>/dev/null | sed -n 's/^Version: \([^ ]*\).*/\1/p' | head -1 || true)
+fi
+
+if [ -z "$SRCPKG" ] || [ -z "$SRCVER" ]; then
+    echo "❌ ERROR: Cannot determine source package for $HDRS via apt-cache."
+    exit 1
+fi
+
+UPSTREAM="${SRCVER%%-*}"
+echo "    Kernel source package: $SRCPKG $SRCVER (upstream: $UPSTREAM)"
 
 BUILD_DIR="/lib/modules/$(uname -r)/build"
 if [ ! -d "$BUILD_DIR" ]; then
@@ -34,63 +49,70 @@ fi
 
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 trap 'rm -rf "$WORK_DIR"' EXIT
-
-echo "    Cloning Bluetooth subsystem for Linux master (6.13+ matching 4-arg prototypes)..."
-git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
 cd "$WORK_DIR"
-git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile
-git checkout
 
-# Remove root Linux Makefile so Kbuild treats this purely as an out-of-tree module
-rm -f Makefile
+BASE="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$SRCPKG/$SRCVER"
+ORIG="${SRCPKG}_${UPSTREAM}.orig.tar.gz"
+DIFF="${SRCPKG}_${SRCVER}.diff.gz"
 
-# Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> if needed
-find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
+echo "    Downloading $ORIG and $DIFF from Launchpad..."
+wget -q "$BASE/$ORIG"
+wget -q "$BASE/$DIFF"
 
-# Compatibility: replace kzalloc_obj with standard kzalloc for 6.11/6.12/6.17 headers
-sed -i 's|kzalloc_obj(\*data)|kzalloc(sizeof(*data), GFP_KERNEL)|g' drivers/bluetooth/hci_vhci.c 2>/dev/null || true
+TOPDIR=$(tar tzf "$ORIG" 2>/dev/null | head -1 | cut -d/ -f1 || true)
+if [ -z "$TOPDIR" ]; then
+    echo "❌ ERROR: Could not determine top-level directory of $ORIG."
+    exit 1
+fi
 
-# Top-level Kbuild
-cat << 'EOF' > Kbuild
-obj-m += net/bluetooth/
-obj-m += drivers/bluetooth/
-EOF
+echo "    Extracting Bluetooth sources from $ORIG..."
+tar xzf "$ORIG" \
+    "$TOPDIR/net/bluetooth" \
+    "$TOPDIR/include/net/bluetooth" \
+    "$TOPDIR/drivers/bluetooth/hci_vhci.c"
 
-# net/bluetooth Makefile (force obj-m instead of CONFIG_BT conditional)
-cat << 'EOF' > net/bluetooth/Makefile
-obj-m += bluetooth.o
-bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
-	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
-	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
-	eir.o leds.o hci_codec.o iso.o msft.o aosp.o selftest.o
-ccflags-y += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
-EXTRA_CFLAGS += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
-EOF
+echo "    Applying distro Bluetooth patch hunks..."
+zcat "$DIFF" | filterdiff -i '*/net/bluetooth/*' -i '*/include/net/bluetooth/*' -i '*/drivers/bluetooth/hci_vhci.c' > bt.diff || true
+if [ -s bt.diff ]; then
+    patch -p1 -d "$TOPDIR" --forward < bt.diff >/dev/null 2>&1 || true
+fi
 
-# Ensure drivers/bluetooth Makefile builds hci_vhci.o with proper flags
-cat << 'EOF' > drivers/bluetooth/Makefile
-obj-m += hci_vhci.o
-EXTRA_CFLAGS += -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
-ccflags-y += -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
-EOF
+# Prepare flat module directory
+MOD_DIR="$WORK_DIR/bt-module"
+mkdir -p "$MOD_DIR/include/net"
+
+cp "$WORK_DIR/$TOPDIR"/net/bluetooth/*.c "$MOD_DIR/"
+cp "$WORK_DIR/$TOPDIR"/net/bluetooth/*.h "$MOD_DIR/"
+cp -r "$WORK_DIR/$TOPDIR/include/net/bluetooth" "$MOD_DIR/include/net/"
+cp "$WORK_DIR/$TOPDIR/drivers/bluetooth/hci_vhci.c" "$MOD_DIR/"
+
+{
+    echo '# Generated by build-kernel-vhci.sh'
+    echo 'CONFIG_BT_BREDR=y'
+    echo 'CONFIG_BT_LE=y'
+    echo 'CONFIG_BT_DEBUGFS=y'
+    echo 'CONFIG_BT_MSFTEXT=y'
+    echo 'CONFIG_BT_AOSPEXT=y'
+    echo 'ccflags-y += -I$(src)/include -DCONFIG_BT_BREDR=1 -DCONFIG_BT_LE=1 -DCONFIG_BT_DEBUGFS=1 -DCONFIG_BT_MSFTEXT=1 -DCONFIG_BT_AOSPEXT=1'
+    echo 'obj-m += bluetooth.o hci_vhci.o'
+    sed -E '/^obj-\$\(CONFIG_BT_/d' "$WORK_DIR/$TOPDIR/net/bluetooth/Makefile" | grep -vE '^obj-' || true
+} > "$MOD_DIR/Kbuild"
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
-if ! make -C "$BUILD_DIR" M="$WORK_DIR" modules > "$WORK_DIR/build.log" 2>&1; then
+if ! make -C "$BUILD_DIR" M="$MOD_DIR" modules -j"$(nproc)" > "$WORK_DIR/build.log" 2>&1; then
     echo "❌ ERROR: Out-of-tree kernel module compilation failed. Full build log:"
     cat "$WORK_DIR/build.log"
     exit 1
 fi
 
-echo "    Modules compiled successfully. Inserting modules..."
-sudo insmod "$WORK_DIR/net/bluetooth/bluetooth.ko" || {
-    echo "❌ ERROR: Failed to insert bluetooth.ko module."
-    dmesg | tail -n 20
-    exit 1
-}
-sudo insmod "$WORK_DIR/drivers/bluetooth/hci_vhci.ko" || {
-    echo "❌ ERROR: Failed to insert hci_vhci.ko module."
-    dmesg | tail -n 20
-    exit 1
+echo "    Modules compiled successfully. Installing and loading modules..."
+sudo mkdir -p "/lib/modules/$(uname -r)/kernel/drivers/bluetooth"
+sudo cp "$MOD_DIR"/*.ko "/lib/modules/$(uname -r)/kernel/drivers/bluetooth/"
+sudo depmod -a
+sudo modprobe -v hci_vhci || {
+    echo "    modprobe failed, falling back to direct insmod..."
+    sudo insmod "$MOD_DIR/bluetooth.ko"
+    sudo insmod "$MOD_DIR/hci_vhci.ko"
 }
 
 if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137; fi
