@@ -80,6 +80,8 @@ android {
         manifestPlaceholders["appName"] = "TapAuth"
     }
 
+    testBuildType = "e2e"
+
     buildTypes {
         release {
             isMinifyEnabled = false

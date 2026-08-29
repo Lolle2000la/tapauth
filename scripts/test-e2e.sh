@@ -138,12 +138,12 @@ elif [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
     adb install -r -t server-android/app/build/outputs/apk/debug/app-debug.apk || true
 fi
 
-if [ -f "server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" ]; then
-    TEST_PKG="dev.rourunisen.tapauth.debug.test"
-    adb install -r -t server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk || true
-elif [ -f "server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk" ]; then
+if [ -f "server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk" ]; then
     TEST_PKG="dev.rourunisen.tapauth.e2e.test"
     adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
+elif [ -f "server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" ]; then
+    TEST_PKG="dev.rourunisen.tapauth.debug.test"
+    adb install -r -t server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk || true
 fi
 
 echo "==> Granting runtime permissions to Android app ($APP_PKG)..."
