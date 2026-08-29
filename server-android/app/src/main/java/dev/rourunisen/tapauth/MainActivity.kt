@@ -53,6 +53,10 @@ import dev.rourunisen.tapauth.ui.pairing.PairingScreen
 import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
 
