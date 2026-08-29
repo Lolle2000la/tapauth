@@ -35,12 +35,12 @@ if ! pgrep -x dbus-daemon > /dev/null && ! pgrep -x dbus-broker > /dev/null; the
     fi
 fi
 
-# Ensure bluetoothd is running
+# Ensure BlueZ packages are installed and bluetoothd is running
+sudo apt-get update -qq
+sudo apt-get install -y -qq bluez
+
 if ! pgrep -x bluetoothd > /dev/null; then
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo bluetoothd --experimental &
-        sleep 1
-    fi
+    sudo systemctl start bluetooth 2>/dev/null || { sudo bluetoothd -n -d >/tmp/bluetoothd.log 2>&1 & sleep 2; }
 fi
 
 # Verify bumble is available
@@ -99,8 +99,14 @@ done
 
 if [ -n "$NEW_HCI" ]; then
     echo "✅ Virtual Bluetooth adapter detected: $NEW_HCI"
-    hciconfig "$NEW_HCI" up 2>/dev/null || (command -v sudo >/dev/null 2>&1 && sudo -n hciconfig "$NEW_HCI" up 2>/dev/null) || true
-    bluetoothctl --adapter "$NEW_HCI" power on 2>/dev/null || true
+    INDEX=$(echo "$NEW_HCI" | sed 's/hci//')
+    sudo btmgmt --index "$INDEX" power on 2>/dev/null || sudo btmgmt power on 2>/dev/null || true
+    bluetoothctl power on 2>/dev/null || true
+    sudo hciconfig "$NEW_HCI" up 2>/dev/null || true
+    sleep 1
+    echo "--- Adapter details ---"
+    sudo btmgmt info 2>/dev/null || true
+    bluetoothctl show 2>/dev/null || true
 else
     echo "⚠️  No new HCI adapter detected yet. BlueZ will automatically bind when emulator Netsim connects."
 fi
