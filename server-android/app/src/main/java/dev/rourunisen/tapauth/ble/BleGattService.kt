@@ -98,6 +98,11 @@ class BleGattService : Service() {
     private val activeConnectionsByChallenge =
         java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
 
+    // Track in-flight or active GATT connections by device address to prevent duplicate concurrent
+    // connections
+    private val connectingOrConnectedDevices =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     // Store confirmation characteristic values from onCharacteristicRead callback (API 33+)
     private val confirmationValues = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
@@ -152,17 +157,8 @@ class BleGattService : Service() {
                         val deviceAddress = gatt.device.address
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
+                        connectingOrConnectedDevices.remove(deviceAddress)
                         confirmationValues.remove(deviceAddress)
-
-                        // Cancel any pending authentication requests from this device
-                        val authRequestManager =
-                            dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
-                        if (authRequestManager.cancelRequestsByBleDisconnection(deviceAddress)) {
-                            Log.d(
-                                TAG,
-                                "Cancelled pending requests for disconnected device $deviceAddress",
-                            )
-                        }
 
                         gatt.close()
                     }
@@ -562,6 +558,14 @@ class BleGattService : Service() {
                 PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "BLUETOOTH_CONNECT permission not granted")
+            return
+        }
+
+        if (!connectingOrConnectedDevices.add(device.address)) {
+            Log.d(
+                TAG,
+                "Already connecting or connected to ${device.address}, ignoring duplicate scan result",
+            )
             return
         }
 
@@ -1281,6 +1285,7 @@ class BleGattService : Service() {
             }
         }
         activeConnectionsByChallenge.clear()
+        connectingOrConnectedDevices.clear()
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
