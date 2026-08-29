@@ -41,11 +41,14 @@ cd "$WORK_DIR"
 git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile include/net/bluetooth
 git checkout
 
+# Remove root Linux Makefile so Kbuild treats this purely as an out-of-tree module
+rm -f Makefile
+
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h>
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
-# Top-level Kbuild Makefile
-cat << 'EOF' > Makefile
+# Top-level Kbuild
+cat << 'EOF' > Kbuild
 obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
 EOF
