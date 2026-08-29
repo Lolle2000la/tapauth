@@ -1,6 +1,7 @@
 package dev.rourunisen.tapauth.service
 
 import android.util.Log
+import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.crypto.generateTemporalId
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
@@ -90,7 +91,7 @@ class TemporalIdCache(
             val devices = cachedDevices
             for (dev in devices) {
                 try {
-                    if (dev.rourunisen.tapauth.crypto.TapAuthCrypto.verifyTemporalId(temporalId, dev.csk)) {
+                    if (TapAuthCrypto.verifyTemporalId(temporalId, dev.csk)) {
                         Log.d(TAG, "Temporal ID verified via JNI fallback for device: ${dev.deviceId}")
                         validIds[idHex] = dev.deviceId
                         deviceId = dev.deviceId
