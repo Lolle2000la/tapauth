@@ -105,7 +105,7 @@ class BiometricPromptActivity : FragmentActivity() {
             // In debug/test environments (e.g. CI headless emulator without enrolled biometrics),
             // wait briefly to allow potential explicit denial broadcast before auto-approving
             CoroutineScope(Dispatchers.Main).launch {
-                delay(600)
+                delay(1200)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(
                         TAG,

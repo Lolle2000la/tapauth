@@ -327,6 +327,7 @@ echo "╚═══════════════════════�
 
 # Stop auto-grant watcher
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+sleep 2
 
 echo "==> Setting transport config: UDP enabled, BLE disabled..."
 "$CLI_BIN" set-transports --ble false --network true
@@ -336,7 +337,7 @@ DENIAL_OUT_LOG="${TEST_DIR}/denial-cli.log"
 "$CLI_BIN" pam-auth "$TEST_USER" 10 > "$DENIAL_OUT_LOG" 2>&1 &
 DENIAL_CLI_PID=$!
 
-sleep 0.8
+sleep 0.5
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny
 
 set +e

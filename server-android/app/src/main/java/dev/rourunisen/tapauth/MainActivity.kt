@@ -299,7 +299,7 @@ class MainActivity : FragmentActivity() {
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.DEBUG) {
             CoroutineScope(Dispatchers.Main).launch {
-                delay(600)
+                delay(1200)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(
                         TAG,
