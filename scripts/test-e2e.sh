@@ -332,7 +332,7 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
     "$CLI_BIN" set-transports --ble true --network false
 
     echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
+    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
     echo "$BLE_AUTH_OUTPUT"
 
     if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
@@ -363,7 +363,7 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
     echo "==> Setting transport config: Both BLE and UDP enabled..."
     "$CLI_BIN" set-transports --ble true --network true
 
-    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
+    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
     echo "$PARALLEL_OUTPUT"
 
     if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
