@@ -109,7 +109,7 @@ class BiometricPromptActivity : FragmentActivity() {
                 "Biometrics not enrolled in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period if not denied",
             )
             CoroutineScope(Dispatchers.Main).launch {
-                delay(2000)
+                delay(3500)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(TAG, "Auto-approving request ${authRequest.requestId} in debug mode")
                     approveRequest(authRequest)
