@@ -36,7 +36,7 @@ cd "$WORK_DIR"
 # Check for Ubuntu's linux-source archive in /usr/src
 SOURCE_TAR=$(ls /usr/src/linux-source-*.tar.bz2 /usr/src/linux-source-*.tar.xz 2>/dev/null | head -n1 || true)
 if [ -n "$SOURCE_TAR" ] && [ -f "$SOURCE_TAR" ]; then
-    echo "    Extracting exact matching kernel Bluetooth sources from $SOURCE_TAR..."
+    echo "    Extracting kernel Bluetooth sources from $SOURCE_TAR..."
     tar -xf "$SOURCE_TAR" --wildcards --strip-components=1 "*/net/bluetooth" "*/drivers/bluetooth/hci_vhci.c" 2>/dev/null || true
 fi
 
@@ -83,6 +83,9 @@ if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c 
     exit 0
 fi
 
+# Compatibility patch for socket UID macro across 6.8 -> 6.11+ kernel transitions
+sed -i '1i#include <net/sock.h>\n#ifndef sock_i_uid\n#define sock_i_uid(sk) sock_net_uid(sock_net(sk), sk)\n#endif' net/bluetooth/af_bluetooth.c 2>/dev/null || true
+
 # Top-level Kbuild Makefile
 cat << 'EOF' > Makefile
 obj-m += net/bluetooth/
@@ -96,13 +99,15 @@ bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
 	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
 	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
 	eir.o leds.o
-ccflags-y += -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -Wno-error
+EXTRA_CFLAGS += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS
+ccflags-y += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS
 EOF
 
 # drivers/bluetooth Makefile
 cat << 'EOF' > drivers/bluetooth/Makefile
 obj-m += hci_vhci.o
-ccflags-y += -I$(src)/../../net/bluetooth -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -Wno-error
+EXTRA_CFLAGS += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
+ccflags-y += -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
 EOF
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
