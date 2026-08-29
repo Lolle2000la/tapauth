@@ -20,9 +20,9 @@ fi
 
 echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modules for $(uname -r)..."
 
-# Ensure build essentials and kernel headers are installed
+# Ensure build essentials, kernel headers, and source are installed
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" linux-headers-azure 2>/dev/null || true
+sudo apt-get install -y -qq build-essential linux-source "linux-headers-$(uname -r)" linux-headers-azure 2>/dev/null || true
 
 BUILD_DIR="/lib/modules/$(uname -r)/build"
 if [ ! -d "$BUILD_DIR" ]; then
@@ -33,33 +33,36 @@ fi
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 cd "$WORK_DIR"
 
-KVER=$(uname -r | cut -d'-' -f1)
-MAJOR=$(echo "$KVER" | cut -d'.' -f1)
-MINOR=$(echo "$KVER" | cut -d'.' -f2)
-BASE_VER="v${MAJOR}.${MINOR}"
-echo "    Fetching kernel Bluetooth sources for $BASE_VER..."
-
-mkdir -p net/bluetooth drivers/bluetooth
-
-RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/${BASE_VER}"
-if ! curl -sfI "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" >/dev/null; then
-    RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
-    BASE_VER="master"
+# Check for Ubuntu's linux-source archive in /usr/src
+SOURCE_TAR=$(ls /usr/src/linux-source-*.tar.bz2 /usr/src/linux-source-*.tar.xz 2>/dev/null | head -n1 || true)
+if [ -n "$SOURCE_TAR" ] && [ -f "$SOURCE_TAR" ]; then
+    echo "    Extracting exact matching kernel Bluetooth sources from $SOURCE_TAR..."
+    tar -xf "$SOURCE_TAR" --wildcards --strip-components=1 "*/net/bluetooth" "*/drivers/bluetooth/hci_vhci.c" 2>/dev/null || true
 fi
 
-echo "    Downloading Bluetooth source files from ${RAW_BASE}..."
-curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c || true
+# If linux-source was not found or failed, fallback to GitHub source fetch
+if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
+    mkdir -p net/bluetooth drivers/bluetooth
+    KVER=$(uname -r | cut -d'-' -f1)
+    MAJOR=$(echo "$KVER" | cut -d'.' -f1)
+    MINOR=$(echo "$KVER" | cut -d'.' -f2)
+    BASE_VER="v${MAJOR}.${MINOR}"
+    echo "    Fallback: Fetching kernel Bluetooth sources from GitHub for $BASE_VER..."
 
-python3 - << PYEOF
+    RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/${BASE_VER}"
+    if ! curl -sfI "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" >/dev/null; then
+        RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
+        BASE_VER="master"
+    fi
+
+    curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c || true
+
+    python3 - << PYEOF
 import urllib.request, json, os
-
 net_dir = "net/bluetooth"
 os.makedirs(net_dir, exist_ok=True)
-
-# Try fetching entire directory listing from GitHub API
 api_url = "https://api.github.com/repos/torvalds/linux/contents/net/bluetooth?ref=${BASE_VER}"
 headers = {"User-Agent": "curl/7.88"}
-success = False
 try:
     req = urllib.request.Request(api_url, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -67,33 +70,15 @@ try:
         for f in files:
             name = f["name"]
             if name.endswith((".c", ".h")):
-                download_url = f["download_url"]
-                urllib.request.urlretrieve(download_url, os.path.join(net_dir, name))
-        success = True
-        print("    Downloaded net/bluetooth sources via GitHub API.")
+                urllib.request.urlretrieve(f["download_url"], os.path.join(net_dir, name))
 except Exception as e:
-    print(f"    GitHub API unavailable ({e}), downloading known file list...")
-
-if not success:
-    known_files = [
-        "af_bluetooth.c", "hci_core.c", "hci_conn.c", "hci_event.c", "mgmt.c",
-        "hci_sock.c", "hci_sysfs.c", "l2cap_core.c", "l2cap_sock.c", "smp.c",
-        "lib.c", "ecdh_helper.c", "hci_request.c", "mgmt_util.c", "mgmt_config.c",
-        "hci_sync.c", "eir.c", "leds.c", "leds.h", "smp.h",
-        "mgmt_util.h", "hci_request.h", "aosp.h", "eir.h", "ecdh_helper.h",
-        "mgmt_config.h", "hci_codec.h", "selftest.h"
-    ]
-    for f in known_files:
-        url = f"${RAW_BASE}/net/bluetooth/{f}"
-        try:
-            urllib.request.urlretrieve(url, os.path.join(net_dir, f))
-        except Exception:
-            pass
+    print(f"    API fallback error: {e}")
 PYEOF
+fi
 
-# Check if essential files were downloaded
+# Check if essential files are present
 if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
-    echo "⚠️ Failed to download essential Bluetooth source files. Skipping out-of-tree build."
+    echo "⚠️ Failed to acquire Bluetooth source files. Skipping out-of-tree build."
     rm -rf "$WORK_DIR"
     exit 0
 fi
@@ -104,7 +89,7 @@ obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
 EOF
 
-# net/bluetooth Makefile (standard core modules only, excluding vendor extensions aosp/msft/iso)
+# net/bluetooth Makefile (standard core modules)
 cat << 'EOF' > net/bluetooth/Makefile
 obj-m += bluetooth.o
 bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
