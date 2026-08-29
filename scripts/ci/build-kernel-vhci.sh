@@ -24,7 +24,7 @@ echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modu
 
 # Ensure build essentials, kernel headers, and source are installed
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential linux-source "linux-headers-$(uname -r)" linux-headers-azure
+sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" linux-headers-azure
 
 BUILD_DIR="/lib/modules/$(uname -r)/build"
 if [ ! -d "$BUILD_DIR" ]; then
@@ -36,61 +36,65 @@ WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 trap 'rm -rf "$WORK_DIR"' EXIT
 cd "$WORK_DIR"
 
-# Check for Ubuntu's linux-source archive in /usr/src
-SOURCE_TAR=$(ls /usr/src/linux-source-*.tar.bz2 /usr/src/linux-source-*.tar.xz 2>/dev/null | head -n1 || true)
-if [ -n "$SOURCE_TAR" ] && [ -f "$SOURCE_TAR" ]; then
-    echo "    Extracting kernel Bluetooth sources from $SOURCE_TAR..."
-    tar -xf "$SOURCE_TAR" --wildcards --strip-components=1 "*/net/bluetooth" "*/drivers/bluetooth/hci_vhci.c" 2>/dev/null || true
+mkdir -p net/bluetooth drivers/bluetooth include/net/bluetooth include/asm
+
+# Use Linux 6.11 / master consistent tree
+RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
+
+echo "    Downloading matching Bluetooth subsystem source and headers..."
+curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c
+
+python3 - << PYEOF
+import urllib.request, json, os
+
+def fetch_dir(api_path, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    api_url = f"https://api.github.com/repos/torvalds/linux/contents/{api_path}?ref=master"
+    headers = {"User-Agent": "curl/7.88"}
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            files = json.loads(resp.read().decode())
+            for f in files:
+                name = f["name"]
+                if name.endswith((".c", ".h")):
+                    urllib.request.urlretrieve(f["download_url"], os.path.join(out_dir, name))
+            return True
+    except Exception as e:
+        print(f"    API fallback for {api_path}: {e}")
+        return False
+
+# Fetch all files in net/bluetooth and include/net/bluetooth
+fetch_dir("net/bluetooth", "net/bluetooth")
+fetch_dir("include/net/bluetooth", "include/net/bluetooth")
+PYEOF
+
+# Fallback direct download if API rate limited
+if [ ! -s include/net/bluetooth/hci_core.h ]; then
+    echo "    Fetching essential headers directly..."
+    for h in bluetooth.h hci.h hci_core.h hci_mon.h l2cap.h mgmt.h; do
+        curl -sSfL "${RAW_BASE}/include/net/bluetooth/${h}" -o "include/net/bluetooth/${h}" || true
+    done
 fi
 
-# If linux-source was not found or failed, fallback to GitHub source fetch
-if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
-    mkdir -p net/bluetooth drivers/bluetooth
-    KVER=$(uname -r | cut -d'-' -f1)
-    MAJOR=$(echo "$KVER" | cut -d'.' -f1)
-    MINOR=$(echo "$KVER" | cut -d'.' -f2)
-    BASE_VER="v${MAJOR}.${MINOR}"
-    echo "    Fallback: Fetching kernel Bluetooth sources from GitHub for $BASE_VER..."
-
-    RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/${BASE_VER}"
-    if ! curl -sfI "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" >/dev/null; then
-        RAW_BASE="https://raw.githubusercontent.com/torvalds/linux/master"
-        BASE_VER="master"
-    fi
-
-    curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c
-
-    python3 - << PYEOF
-import urllib.request, json, os
-net_dir = "net/bluetooth"
-os.makedirs(net_dir, exist_ok=True)
-api_url = "https://api.github.com/repos/torvalds/linux/contents/net/bluetooth?ref=${BASE_VER}"
-headers = {"User-Agent": "curl/7.88"}
-try:
-    req = urllib.request.Request(api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        files = json.loads(resp.read().decode())
-        for f in files:
-            name = f["name"]
-            if name.endswith((".c", ".h")):
-                urllib.request.urlretrieve(f["download_url"], os.path.join(net_dir, name))
-except Exception as e:
-    print(f"    API fallback error: {e}")
-PYEOF
+if [ ! -s net/bluetooth/hci_core.c ]; then
+    echo "    Fetching essential source files directly..."
+    for s in af_bluetooth.c hci_core.c hci_conn.c hci_event.c mgmt.c hci_sock.c hci_sysfs.c l2cap_core.c l2cap_sock.c smp.c lib.c ecdh_helper.c hci_request.c mgmt_util.c mgmt_config.c hci_sync.c eir.c leds.c leds.h smp.h mgmt_util.h hci_request.h eir.h ecdh_helper.h mgmt_config.h; do
+        curl -sSfL "${RAW_BASE}/net/bluetooth/${s}" -o "net/bluetooth/${s}" || true
+    done
 fi
 
 # Check if essential files are present
-if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
-    echo "❌ ERROR: Failed to acquire Bluetooth source files."
+if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/hci_core.c ] || [ ! -s include/net/bluetooth/hci_core.h ]; then
+    echo "❌ ERROR: Failed to acquire Bluetooth source files and headers."
     exit 1
 fi
 
-# Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> (kernel 6.7+ transition)
-mkdir -p include/asm
+# Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h>
 echo '#include <linux/unaligned.h>' > include/asm/unaligned.h
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
-# Compatibility: patch for socket UID macro across 6.8 -> 6.11+ kernel transitions
+# Compatibility: patch for socket UID macro across kernel versions
 sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
 
 # Top-level Kbuild Makefile
@@ -99,7 +103,7 @@ obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
 EOF
 
-# net/bluetooth Makefile (standard core modules)
+# net/bluetooth Makefile (standard core modules, excluding vendor extensions aosp/msft/iso)
 cat << 'EOF' > net/bluetooth/Makefile
 obj-m += bluetooth.o
 bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
