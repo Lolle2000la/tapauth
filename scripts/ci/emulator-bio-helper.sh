@@ -32,8 +32,9 @@ case "$ACTION" in
         ;;
 
     grant)
-        echo "    Triggering biometric grant (finger touch 1)..."
-        adb emu finger touch 1
+        echo "    Triggering biometric grant (finger touch 1 / dev-approve broadcast)..."
+        adb emu finger touch 1 2>/dev/null || true
+        adb shell am broadcast -a dev.rourunisen.tapauth.ACTION_DEV_APPROVE 2>/dev/null || true
         ;;
 
     deny)
@@ -58,8 +59,9 @@ sys.stdout.flush()
 
 def periodic_touch():
     while True:
-        time.sleep(0.5)
+        time.sleep(0.3)
         subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
+        subprocess.run(['adb', 'shell', 'am', 'broadcast', '-a', 'dev.rourunisen.tapauth.ACTION_DEV_APPROVE'], capture_output=True)
 
 t = threading.Thread(target=periodic_touch, daemon=True)
 t.start()
@@ -69,9 +71,9 @@ proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', '*:V'], stdout=subproce
 try:
     for line in iter(proc.stdout.readline, ''):
         if any(k in line for k in ['Handling AuthenticationRequest', 'Parsed auth request', 'Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Posting auth notification', 'Processing packet']):
-            time.sleep(0.1)
             subprocess.run(['adb', 'emu', 'finger', 'touch', '1'], capture_output=True)
-            print(f"Auto-granted fingerprint touch for: {line.strip()}")
+            subprocess.run(['adb', 'shell', 'am', 'broadcast', '-a', 'dev.rourunisen.tapauth.ACTION_DEV_APPROVE'], capture_output=True)
+            print(f"Auto-granted fingerprint/broadcast for: {line.strip()}")
             sys.stdout.flush()
 finally:
     proc.terminate()

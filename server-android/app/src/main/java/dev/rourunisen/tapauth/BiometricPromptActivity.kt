@@ -102,17 +102,14 @@ class BiometricPromptActivity : FragmentActivity() {
             // Show biometric prompt immediately
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.DEBUG) {
-            // In debug/test environments (e.g. CI headless emulator without enrolled biometrics),
-            // wait briefly to allow potential explicit denial broadcast before auto-approving
+            // In debug/test environments without enrolled biometrics, wait for explicit dev
+            // broadcast (ACTION_DEV_APPROVE or ACTION_DEV_DENY)
+            Log.i(
+                TAG,
+                "Biometrics not enrolled in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); waiting for dev broadcast",
+            )
             CoroutineScope(Dispatchers.Main).launch {
-                delay(1200)
-                if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
-                    Log.i(
-                        TAG,
-                        "Biometrics not enrolled/available in debug mode (strong=$canAuthStrong, weak=$canAuthWeak); auto-approving after grace period",
-                    )
-                    approveRequest(authRequest)
-                }
+                delay(30000)
                 finish()
             }
         } else {

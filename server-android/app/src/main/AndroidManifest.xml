@@ -101,6 +101,7 @@
     <receiver android:name=".service.AuthActionReceiver" android:exported="true">
       <intent-filter>
         <action android:name="dev.rourunisen.tapauth.ACTION_NOTIFICATION_ACTION" />
+        <action android:name="dev.rourunisen.tapauth.ACTION_DEV_APPROVE" />
         <action android:name="dev.rourunisen.tapauth.ACTION_DEV_DENY" />
       </intent-filter>
     </receiver>
