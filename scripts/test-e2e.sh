@@ -347,7 +347,8 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
         exit 1
     fi
 else
-    echo "ℹ️  BLE Authentication test skipped (/dev/vhci not supported on this host kernel)."
+    echo "❌ ERROR: Virtual BLE (/dev/vhci) is required for E2E testing but is not available!"
+    exit 1
 fi
 
 # Step 8: Phase 4 - Parallel Discovery Race (Both Enabled)
@@ -372,7 +373,8 @@ if [ "$BLE_AVAILABLE" = "true" ]; then
         exit 1
     fi
 else
-    echo "ℹ️  Parallel Race test skipped (virtual BLE not supported on this host kernel)."
+    echo "❌ ERROR: Virtual BLE (/dev/vhci) is required for Parallel Race testing but is not available!"
+    exit 1
 fi
 
 # Step 9: Phase 5 - Denial Testing

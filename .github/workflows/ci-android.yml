@@ -149,7 +149,7 @@ jobs:
             libdbus-1-dev pkg-config \
             linux-modules-extra-azure "linux-modules-extra-$(uname -r)" || true
           sudo depmod -a "$(uname -r)" || sudo depmod -a || true
-          ./scripts/ci/build-kernel-vhci.sh || true
+          ./scripts/ci/build-kernel-vhci.sh
           sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf || true
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
@@ -157,7 +157,7 @@ jobs:
           cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
           cargo build -p client-pam --features dev-socket-override
 
-      - name: Run Real-Android E2E Tests (Pairing + UDP + PAM)
+      - name: Run Full Real-Android E2E Tests (Pairing + UDP + BLE + PAM)
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36

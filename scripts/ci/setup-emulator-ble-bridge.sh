@@ -10,7 +10,7 @@ echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 # Ensure vhci module is loaded and /dev/vhci node exists with write permissions
 if [ ! -w /dev/vhci ] || ! python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
     if [ -f "$SCRIPT_DIR/build-kernel-vhci.sh" ]; then
-        bash "$SCRIPT_DIR/build-kernel-vhci.sh" || true
+        bash "$SCRIPT_DIR/build-kernel-vhci.sh"
     fi
 fi
 
@@ -21,11 +21,8 @@ if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDW
 fi
 
 if [ "$VHCI_SUPPORTED" != "true" ]; then
-    echo "ℹ️  Virtual HCI (/dev/vhci) is not writable by current user."
-    echo "    To enable BLE testing locally, run once: sudo chmod 666 /dev/vhci"
-    echo "    (Continuing test suite with BLE disabled...)"
-    echo "false" > /tmp/ble-available.txt
-    exit 0
+    echo "❌ ERROR: Virtual HCI (/dev/vhci) is not writable by current user."
+    exit 1
 fi
 
 echo "true" > /tmp/ble-available.txt

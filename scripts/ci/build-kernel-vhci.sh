@@ -3,6 +3,8 @@
 # when running on cloud VM kernels (such as Azure/GitHub Actions) where CONFIG_BT is omitted.
 set -e
 
+echo "==> Setting up Linux kernel virtual Bluetooth (hci_vhci)..."
+
 if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
     echo "✅ /dev/vhci is already available and writable."
     exit 0
@@ -22,15 +24,16 @@ echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modu
 
 # Ensure build essentials, kernel headers, and source are installed
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential linux-source "linux-headers-$(uname -r)" linux-headers-azure 2>/dev/null || true
+sudo apt-get install -y -qq build-essential linux-source "linux-headers-$(uname -r)" linux-headers-azure
 
 BUILD_DIR="/lib/modules/$(uname -r)/build"
 if [ ! -d "$BUILD_DIR" ]; then
-    echo "⚠️ Kernel build headers directory not found at $BUILD_DIR. Cannot build out-of-tree module."
-    exit 0
+    echo "❌ ERROR: Kernel build headers directory not found at $BUILD_DIR."
+    exit 1
 fi
 
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
+trap 'rm -rf "$WORK_DIR"' EXIT
 cd "$WORK_DIR"
 
 # Check for Ubuntu's linux-source archive in /usr/src
@@ -55,7 +58,7 @@ if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c 
         BASE_VER="master"
     fi
 
-    curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c || true
+    curl -sSfL "${RAW_BASE}/drivers/bluetooth/hci_vhci.c" -o drivers/bluetooth/hci_vhci.c
 
     python3 - << PYEOF
 import urllib.request, json, os
@@ -65,7 +68,7 @@ api_url = "https://api.github.com/repos/torvalds/linux/contents/net/bluetooth?re
 headers = {"User-Agent": "curl/7.88"}
 try:
     req = urllib.request.Request(api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=15) as resp:
         files = json.loads(resp.read().decode())
         for f in files:
             name = f["name"]
@@ -78,9 +81,8 @@ fi
 
 # Check if essential files are present
 if [ ! -s drivers/bluetooth/hci_vhci.c ] || [ ! -s net/bluetooth/af_bluetooth.c ]; then
-    echo "⚠️ Failed to acquire Bluetooth source files. Skipping out-of-tree build."
-    rm -rf "$WORK_DIR"
-    exit 0
+    echo "❌ ERROR: Failed to acquire Bluetooth source files."
+    exit 1
 fi
 
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> (kernel 6.7+ transition)
@@ -89,7 +91,7 @@ echo '#include <linux/unaligned.h>' > include/asm/unaligned.h
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
 # Compatibility: patch for socket UID macro across 6.8 -> 6.11+ kernel transitions
-sed -i '1i#include <net/sock.h>\n#ifndef sock_i_uid\n#define sock_i_uid(sk) sock_net_uid(sock_net(sk), sk)\n#endif' net/bluetooth/af_bluetooth.c 2>/dev/null || true
+sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
 
 # Top-level Kbuild Makefile
 cat << 'EOF' > Makefile
@@ -116,20 +118,31 @@ ccflags-y += -I$(src)/../include -I$(src)/../../include -I$(src)/../../net/bluet
 EOF
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
-if make -C "$BUILD_DIR" M="$WORK_DIR" modules > "$WORK_DIR/build.log" 2>&1; then
-    echo "    Modules compiled successfully. Inserting modules..."
-    sudo insmod "$WORK_DIR/net/bluetooth/bluetooth.ko" 2>/dev/null || true
-    sudo insmod "$WORK_DIR/drivers/bluetooth/hci_vhci.ko" 2>/dev/null || true
-    if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137 2>/dev/null || true; fi
-    sudo chmod 666 /dev/vhci 2>/dev/null || true
-    if [ -w /dev/vhci ]; then
-        echo "✅ Successfully built and loaded bluetooth + hci_vhci modules! /dev/vhci is now active."
-    else
-        echo "⚠️ Modules loaded but /dev/vhci is not accessible."
-    fi
-else
-    echo "⚠️ Out-of-tree build failed. Build log:"
-    tail -n 25 "$WORK_DIR/build.log" || true
+if ! make -C "$BUILD_DIR" M="$WORK_DIR" modules > "$WORK_DIR/build.log" 2>&1; then
+    echo "❌ ERROR: Out-of-tree kernel module compilation failed. Full build log:"
+    cat "$WORK_DIR/build.log"
+    exit 1
 fi
 
-rm -rf "$WORK_DIR"
+echo "    Modules compiled successfully. Inserting modules..."
+sudo insmod "$WORK_DIR/net/bluetooth/bluetooth.ko" || {
+    echo "❌ ERROR: Failed to insert bluetooth.ko module."
+    dmesg | tail -n 20
+    exit 1
+}
+sudo insmod "$WORK_DIR/drivers/bluetooth/hci_vhci.ko" || {
+    echo "❌ ERROR: Failed to insert hci_vhci.ko module."
+    dmesg | tail -n 20
+    exit 1
+}
+
+if [ ! -c /dev/vhci ]; then sudo mknod /dev/vhci c 10 137; fi
+sudo chmod 666 /dev/vhci
+
+if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+    echo "✅ Successfully built and loaded bluetooth + hci_vhci modules! /dev/vhci is now active and writable."
+else
+    echo "❌ ERROR: /dev/vhci exists but is not writable."
+    ls -la /dev/vhci
+    exit 1
+fi
