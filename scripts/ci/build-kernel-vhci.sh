@@ -35,14 +35,14 @@ fi
 WORK_DIR=$(mktemp -d /tmp/bt-vhci-build.XXXXXX)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "    Cloning Bluetooth subsystem for Linux v6.11..."
-if ! git clone --depth 1 --branch "v6.11" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR" 2>/dev/null; then
-    echo "    v6.11 not available, cloning master..."
+echo "    Cloning Bluetooth subsystem for Linux v6.12..."
+if ! git clone --depth 1 --branch "v6.12" --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR" 2>/dev/null; then
+    echo "    v6.12 not available, cloning master..."
     git clone --depth 1 --filter=blob:none --no-checkout https://github.com/torvalds/linux.git "$WORK_DIR"
 fi
 
 cd "$WORK_DIR"
-git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile include/net/bluetooth
+git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile
 git checkout
 
 # Remove root Linux Makefile so Kbuild treats this purely as an out-of-tree module
@@ -51,12 +51,8 @@ rm -f Makefile
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h> if needed
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
-# Compatibility: patch sock_i_uid -> sock_net_uid for seq_file output if needed
-sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
-
-# Top-level Kbuild with LINUXINCLUDE shadowing
+# Top-level Kbuild
 cat << 'EOF' > Kbuild
-LINUXINCLUDE := -I$(M)/include $(LINUXINCLUDE)
 obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
 EOF
@@ -67,16 +63,16 @@ obj-m += bluetooth.o
 bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
 	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
 	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
-	eir.o leds.o
-ccflags-y += -I$(M)/include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS
-EXTRA_CFLAGS += -I$(M)/include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS
+	eir.o leds.o hci_codec.o iso.o msft.o aosp.o selftest.o
+ccflags-y += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
+EXTRA_CFLAGS += -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
 EOF
 
 # Ensure drivers/bluetooth Makefile builds hci_vhci.o with proper flags
 cat << 'EOF' > drivers/bluetooth/Makefile
 obj-m += hci_vhci.o
-EXTRA_CFLAGS += -I$(M)/include -I$(M)/net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
-ccflags-y += -I$(M)/include -I$(M)/net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
+EXTRA_CFLAGS += -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
+ccflags-y += -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
 EOF
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
