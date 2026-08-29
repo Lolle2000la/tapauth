@@ -243,31 +243,25 @@ fn is_firewalld_running() -> bool {
 }
 
 fn add_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
-    // Capture output: firewall-cmd prints "success" on stdout, which systemd
-    // would otherwise forward to the journal under the tapauthd unit name.
-    let output = Command::new("firewall-cmd")
-        .args(["--add-port", &format!("{}/{}", port, protocol)])
-        .output()
-        .map_err(|e| {
-            FirewallError::FirewallCmd(format!("Failed to execute firewall-cmd: {}", e))
-        })?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(FirewallError::FirewallCmd(format!(
-            "firewall-cmd failed with status: {} — stdout: {} — stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim_end(),
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        )))
-    }
+    run_firewalld_port_action("--add-port", port, protocol)
 }
 
 fn remove_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
-    // Capture output (see add_firewalld_rule).
+    run_firewalld_port_action("--remove-port", port, protocol)
+}
+
+/// Run a firewall-cmd port action and capture its output.
+///
+/// Output is captured (never inherited): firewall-cmd prints "success" on
+/// stdout, which systemd would otherwise forward to the journal under the
+/// tapauthd unit name.
+fn run_firewalld_port_action(
+    action_flag: &str,
+    port: u16,
+    protocol: Protocol,
+) -> Result<(), FirewallError> {
     let output = Command::new("firewall-cmd")
-        .args(["--remove-port", &format!("{}/{}", port, protocol)])
+        .args([action_flag, &format!("{}/{}", port, protocol)])
         .output()
         .map_err(|e| {
             FirewallError::FirewallCmd(format!("Failed to execute firewall-cmd: {}", e))
@@ -277,7 +271,8 @@ fn remove_firewalld_rule(port: u16, protocol: Protocol) -> Result<(), FirewallEr
         Ok(())
     } else {
         Err(FirewallError::FirewallCmd(format!(
-            "firewall-cmd failed with status: {} — stdout: {} — stderr: {}",
+            "firewall-cmd {} failed with status: {} — stdout: {} — stderr: {}",
+            action_flag,
             output.status,
             String::from_utf8_lossy(&output.stdout).trim_end(),
             String::from_utf8_lossy(&output.stderr).trim_end()

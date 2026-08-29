@@ -535,7 +535,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // offload blocking credential collection to a native background thread so
     // the Polkit graphical helper can process window events, then multiplex
     // loop events using a secure close-on-exec self-pipe.
-    if !has_terminal {
+    if !has_terminal && supports_threaded_conversation {
         // O_CLOEXEC prevents the pipe fds from leaking to child processes
         // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
