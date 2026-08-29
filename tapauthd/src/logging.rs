@@ -19,7 +19,7 @@ pub fn init_logging() {
         .and_then(|level| EnvFilter::try_new(&level).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
 
-    if std::env::var("JOURNAL_STREAM").is_ok() {
+    if std::env::var("JOURNAL_STREAM").is_ok() && std::env::var("TAPAUTH_DEV_MODE").is_err() {
         let journald_level =
             std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         if let Ok(journald_layer) = tracing_journald::layer() {
