@@ -58,6 +58,9 @@ try:
     
     while True:
         data, addr = sock_in.recvfrom(65535)
+        # Only reflect local network broadcasts (ignore loopback / emulator responses)
+        if addr[0] == '127.0.0.1' or addr[1] == 36695:
+            continue
         # Forward to emulator redirection port
         try:
             sock_out.sendto(data, ('127.0.0.1', 36695))

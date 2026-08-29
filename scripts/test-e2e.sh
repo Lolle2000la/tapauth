@@ -151,7 +151,7 @@ echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 
 # Step 4: Launch tapauthd daemon in test mode
 echo "==> Step 4: Launching tapauthd daemon..."
-env TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
+env TAPAUTH_DEV_MODE="1" TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
 echo -n "    Waiting for daemon socket"
