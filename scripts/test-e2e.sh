@@ -268,6 +268,8 @@ echo "╔═══════════════════════�
 echo "║  PHASE 2b: Real PAM Module Authentication (pamtester)         ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
+sleep 2
+
 PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
     PAM_TESTABLE="true"
@@ -300,6 +302,8 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  PHASE 3: Bluetooth Low Energy (BLE) Authentication           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
+
+sleep 2
 
 BLE_AVAILABLE="true"
 if [ -f /tmp/ble-available.txt ]; then
@@ -334,6 +338,8 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  PHASE 4: Parallel Discovery Race (UDP + BLE Simultaneous)    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
+
+sleep 2
 
 if [ "$BLE_AVAILABLE" = "true" ]; then
     echo "==> Setting transport config: Both BLE and UDP enabled..."
