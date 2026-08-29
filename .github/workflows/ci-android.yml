@@ -148,8 +148,8 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
-            cd server-android && ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace
-            cd .. && sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
+            (cd server-android && ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
+            sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
 
       - name: Upload test results
         uses: actions/upload-artifact@v7
