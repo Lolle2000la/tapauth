@@ -79,9 +79,9 @@ if not success:
         "af_bluetooth.c", "hci_core.c", "hci_conn.c", "hci_event.c", "mgmt.c",
         "hci_sock.c", "hci_sysfs.c", "l2cap_core.c", "l2cap_sock.c", "smp.c",
         "lib.c", "ecdh_helper.c", "hci_request.c", "mgmt_util.c", "mgmt_config.c",
-        "hci_sync.c", "aosp.c", "eir.c", "leds.c", "leds.h", "smp.h",
+        "hci_sync.c", "eir.c", "leds.c", "leds.h", "smp.h",
         "mgmt_util.h", "hci_request.h", "aosp.h", "eir.h", "ecdh_helper.h",
-        "mgmt_config.h", "hci_codec.c", "hci_codec.h", "iso.c", "selftest.c", "selftest.h"
+        "mgmt_config.h", "hci_codec.h", "selftest.h"
     ]
     for f in known_files:
         url = f"${RAW_BASE}/net/bluetooth/{f}"
@@ -104,17 +104,20 @@ obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
 EOF
 
-# net/bluetooth Makefile
+# net/bluetooth Makefile (standard core modules only, excluding vendor extensions aosp/msft/iso)
 cat << 'EOF' > net/bluetooth/Makefile
 obj-m += bluetooth.o
-bluetooth-y := $(patsubst $(src)/%.c,%.o,$(wildcard $(src)/*.c))
-ccflags-y += -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_DEBUGFS
+bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
+	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
+	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
+	eir.o leds.o
+ccflags-y += -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -Wno-error
 EOF
 
 # drivers/bluetooth Makefile
 cat << 'EOF' > drivers/bluetooth/Makefile
 obj-m += hci_vhci.o
-ccflags-y += -I$(src)/../../net/bluetooth -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
+ccflags-y += -I$(src)/../../net/bluetooth -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -Wno-error
 EOF
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
