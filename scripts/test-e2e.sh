@@ -453,7 +453,41 @@ else
     exit 1
 fi
 
+sleep 2
+echo "==> Verifying authentication returns PAM_IGNORE when no devices are configured..."
+UNPAIRED_AUTH_LOG="${TEST_DIR}/unpaired-cli.log"
+"$CLI_BIN" pam-auth "$TEST_USER" 5 > "$UNPAIRED_AUTH_LOG" 2>&1 || true
+cat "$UNPAIRED_AUTH_LOG"
+
+if grep -q "OUTCOME=IGNORE" "$UNPAIRED_AUTH_LOG"; then
+    echo "✅ Un-paired authentication correctly returns OUTCOME=IGNORE (password fallback enabled)!"
+else
+    echo "❌ ERROR: Expected OUTCOME=IGNORE after device removal, but got:"
+    cat "$UNPAIRED_AUTH_LOG"
+    exit 1
+fi
+
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  🎉 ALL REAL-ANDROID END-TO-END TESTS PASSED SUCCESSFULLY!    ║"
+echo "║  E2E TEST MATRIX SUMMARY                                      ║"
+echo "╠═══════════════════════════════════════════════════════════════╣"
+echo "║  Phase 1: Real TCP Pairing & SAS Anti-MITM:      PASSED       ║"
+echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
+if [ "$PAM_TESTABLE" = "true" ]; then
+echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
+else
+echo "║  Phase 2b: Real PAM Module (pamtester):          SKIPPED      ║"
+fi
+if [ "$BLE_AVAILABLE" = "true" ]; then
+echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
+echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
+else
+echo "║  Phase 3: Bluetooth Low Energy (BLE):            SKIPPED (VM) ║"
+echo "║  Phase 4: Parallel Race (UDP + BLE):             SKIPPED (VM) ║"
+fi
+echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
+echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
+echo "║  Phase 6: Device Removal & PAM_IGNORE:           PASSED       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
+echo ""
+echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"

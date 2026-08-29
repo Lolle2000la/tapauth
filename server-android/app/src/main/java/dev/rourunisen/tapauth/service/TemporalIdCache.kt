@@ -1,7 +1,6 @@
 package dev.rourunisen.tapauth.service
 
 import android.util.Log
-import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.crypto.generateTemporalId
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
@@ -38,11 +37,15 @@ class TemporalIdCache(
 
     fun start() {
         stop()
+        DeviceRepository.setOnDevicesChangedListener {
+            scope.launch { refreshDeviceList() }
+        }
         deviceRefreshJob = scope.launch { refreshDeviceList() }
         Log.d(TAG, "Started temporal ID cache")
     }
 
     fun stop() {
+        DeviceRepository.setOnDevicesChangedListener(null)
         deviceRefreshJob?.cancel()
         deviceRefreshJob = null
         validIds.clear()
@@ -54,8 +57,8 @@ class TemporalIdCache(
     /**
      * Check if the given temporal identifier is valid.
      *
-     * Uses on-demand computation: if the cached map doesn't contain the ID (e.g. after Doze),
-     * recomputes temporal IDs for the current time window before returning.
+     * Uses in-memory O(1) cache lookup across precomputed current and previous time windows for all
+     * paired devices, providing instantaneous verification without disk I/O or JNI overhead.
      *
      * @param temporalId The 16-byte temporal identifier from the packet
      * @return Pair of (isValid, deviceId) - deviceId is null if invalid
@@ -67,52 +70,12 @@ class TemporalIdCache(
         }
 
         val idHex = temporalId.toHex()
-
         ensureCacheIsCurrent()
 
-        var deviceId = validIds[idHex]
-        if (deviceId == null) {
-            // If not found in cache, reload devices in case a new pairing occurred
-            synchronized(this) {
-                try {
-                    val pairedDevices = deviceRepository.getAllPairedDevicesSync()
-                    cachedDevices = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
-                    val now = System.currentTimeMillis()
-                    recomputeCache(now / TIME_WINDOW_MS)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to reload devices on cache miss", e)
-                }
-            }
-            deviceId = validIds[idHex]
-        }
-
-        // Direct JNI verification fallback across paired devices
-        if (deviceId == null) {
-            val devices = deviceRepository.getAllPairedDevicesSync()
-            for (dev in devices) {
-                try {
-                    if (TapAuthCrypto.verifyTemporalId(temporalId, dev.csk)) {
-                        Log.d(
-                            TAG,
-                            "Temporal ID verified via JNI fallback for device: ${dev.deviceId}",
-                        )
-                        validIds[idHex] = dev.deviceId
-                        deviceId = dev.deviceId
-                        break
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error in JNI verifyTemporalId for device: ${dev.deviceId}", e)
-                }
-            }
-        }
-
+        val deviceId = validIds[idHex]
         return if (deviceId != null) {
             Pair(true, deviceId)
         } else {
-            Log.w(
-                TAG,
-                "Temporal ID $idHex not matched against ${cachedDevices.size} paired devices",
-            )
             Pair(false, null)
         }
     }

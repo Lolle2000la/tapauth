@@ -160,7 +160,7 @@ jobs:
           cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
           cargo build -p client-pam --features dev-socket-override
 
-      - name: Run Full Real-Android E2E Tests (Pairing + UDP + BLE)
+      - name: Run Real-Android E2E Tests (Pairing + UDP + PAM)
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36

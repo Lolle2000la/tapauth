@@ -16,6 +16,15 @@ class DeviceRepository(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("tapauth_devices", Context.MODE_PRIVATE)
 
+    companion object {
+        private const val KEY_DEVICES = "paired_devices"
+        @Volatile private var changeListener: (() -> Unit)? = null
+
+        fun setOnDevicesChangedListener(listener: (() -> Unit)?) {
+            changeListener = listener
+        }
+    }
+
     suspend fun savePairedDevice(device: PairedDevice) =
         withContext(Dispatchers.IO) {
             val devices = getAllPairedDevices().toMutableList()
@@ -26,6 +35,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            changeListener?.invoke()
         }
 
     fun getAllPairedDevicesSync(): List<PairedDevice> {
@@ -58,6 +68,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            changeListener?.invoke()
         }
 
     /**
@@ -78,14 +89,13 @@ class DeviceRepository(context: Context) {
             val device = devices[deviceIndex]
             val updatedUsers = device.allowedUsers.filter { it != username }
 
-            if (updatedUsers.isEmpty()) {
+            val entirelyRemoved = updatedUsers.isEmpty()
+            if (entirelyRemoved) {
                 // No users left, remove entire device
                 devices.removeAt(deviceIndex)
-                true
             } else {
                 // Update device with new user list
                 devices[deviceIndex] = device.copy(allowedUsers = updatedUsers)
-                false
             }
 
             // Save updated list
@@ -93,8 +103,9 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            changeListener?.invoke()
 
-            return@withContext updatedUsers.isEmpty()
+            return@withContext entirelyRemoved
         }
 
     private fun deviceToJson(device: PairedDevice): JSONObject {
@@ -127,9 +138,5 @@ class DeviceRepository(context: Context) {
             pairedAt = json.getLong("pairedAt"),
             allowedUsers = allowedUsers,
         )
-    }
-
-    companion object {
-        private const val KEY_DEVICES = "paired_devices"
     }
 }
