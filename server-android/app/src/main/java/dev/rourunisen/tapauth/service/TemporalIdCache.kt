@@ -85,9 +85,27 @@ class TemporalIdCache(
             deviceId = validIds[idHex]
         }
 
+        // Direct JNI verification fallback across paired devices
+        if (deviceId == null) {
+            val devices = cachedDevices
+            for (dev in devices) {
+                try {
+                    if (dev.rourunisen.tapauth.crypto.TapAuthCrypto.verifyTemporalId(temporalId, dev.csk)) {
+                        Log.d(TAG, "Temporal ID verified via JNI fallback for device: ${dev.deviceId}")
+                        validIds[idHex] = dev.deviceId
+                        deviceId = dev.deviceId
+                        break
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error in JNI verifyTemporalId for device: ${dev.deviceId}", e)
+                }
+            }
+        }
+
         return if (deviceId != null) {
             Pair(true, deviceId)
         } else {
+            Log.w(TAG, "Temporal ID $idHex not matched against ${cachedDevices.size} paired devices")
             Pair(false, null)
         }
     }
