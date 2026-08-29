@@ -45,6 +45,9 @@ cd "$WORK_DIR"
 git sparse-checkout set net/bluetooth drivers/bluetooth/hci_vhci.c drivers/bluetooth/Makefile
 git checkout
 
+# Compatibility: patch sock_i_uid -> sock_net_uid in af_bluetooth.c for 6.12+ uidgid.h
+sed -i 's|sock_i_uid(sk)|sock_net_uid(sock_net(sk), sk)|g' net/bluetooth/af_bluetooth.c 2>/dev/null || true
+
 # Remove root Linux Makefile so Kbuild treats this purely as an out-of-tree module
 rm -f Makefile
 
