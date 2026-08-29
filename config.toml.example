@@ -10,6 +10,13 @@
 # Default: 120
 pam_operation_timeout_secs = 120
 
+# Timeout for graphical PAM contexts that cannot collect a password while
+# TapAuth is waiting (e.g. the KDE lock screen). In those contexts the wait
+# is capped at this duration before falling through to password entry.
+# Clamped to pam_operation_timeout_secs.
+# Default: 30
+pam_gui_timeout_secs = 30
+
 # Network Settings
 # UDP port for the authentication protocol.
 # Both the daemon and Android app must use the same port.
