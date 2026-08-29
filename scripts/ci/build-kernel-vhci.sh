@@ -47,10 +47,24 @@ rm -f Makefile
 # Compatibility: redirect deprecated <asm/unaligned.h> to <linux/unaligned.h>
 find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's|<asm/unaligned.h>|<linux/unaligned.h>|g' {} + 2>/dev/null || true
 
+# Compatibility: replace kzalloc_obj with standard kzalloc for 6.11/6.12 headers
+sed -i 's|kzalloc_obj(\*data)|kzalloc(sizeof(*data), GFP_KERNEL)|g' drivers/bluetooth/hci_vhci.c 2>/dev/null || true
+
 # Top-level Kbuild
 cat << 'EOF' > Kbuild
 obj-m += net/bluetooth/
 obj-m += drivers/bluetooth/
+EOF
+
+# net/bluetooth Makefile (force obj-m instead of CONFIG_BT conditional)
+cat << 'EOF' > net/bluetooth/Makefile
+obj-m += bluetooth.o
+bluetooth-y := af_bluetooth.o hci_core.o hci_conn.o hci_event.o mgmt.o \
+	hci_sock.o hci_sysfs.o l2cap_core.o l2cap_sock.o smp.o lib.o \
+	ecdh_helper.o hci_request.o mgmt_util.o mgmt_config.o hci_sync.o \
+	eir.o leds.o hci_codec.o iso.o msft.o aosp.o selftest.o
+ccflags-y += -I$(src)/../include -I$(src)/../../include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
+EXTRA_CFLAGS += -I$(src)/../include -I$(src)/../../include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS -DCONFIG_BT_MSFTEXT -DCONFIG_BT_AOSPEXT -DCONFIG_BT_DEBUGFS
 EOF
 
 # Ensure drivers/bluetooth Makefile builds hci_vhci.o with proper flags
@@ -59,10 +73,6 @@ obj-m += hci_vhci.o
 EXTRA_CFLAGS += -I$(src)/../include -I$(src)/../../include -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
 ccflags-y += -I$(src)/../include -I$(src)/../../include -I$(src)/../../net/bluetooth -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE
 EOF
-
-# Add include shadowing to net/bluetooth Makefile
-echo "EXTRA_CFLAGS += -I\$(src)/../include -I\$(src)/../../include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS" >> net/bluetooth/Makefile
-echo "ccflags-y += -I\$(src)/../include -I\$(src)/../../include -Wno-error -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -DCONFIG_BT -DCONFIG_BT_BREDR -DCONFIG_BT_LE -DCONFIG_BT_LEDS" >> net/bluetooth/Makefile
 
 echo "    Compiling bluetooth.ko + hci_vhci.ko against $BUILD_DIR..."
 if ! make -C "$BUILD_DIR" M="$WORK_DIR" modules > "$WORK_DIR/build.log" 2>&1; then
