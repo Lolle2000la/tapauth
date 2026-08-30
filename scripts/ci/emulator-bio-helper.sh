@@ -19,7 +19,14 @@ case "$ACTION" in
         echo "==> Enrolling test biometric credentials in Android Emulator..."
         # Set lock screen PIN
         adb shell locksettings set-pin 1234 2>/dev/null || true
-        # Enroll fingerprint 1
+        # Configure Android Virtual Biometrics HAL (Android 14/15/16)
+        adb shell settings put secure biometric_virtual_enabled 1 2>/dev/null || true
+        adb shell setprop persist.vendor.fingerprint.virtual.type rear 2>/dev/null || true
+        adb shell setprop persist.vendor.fingerprint.virtual.enrollments 1 2>/dev/null || true
+        adb shell setprop vendor.fingerprint.virtual.enrollments 1 2>/dev/null || true
+        adb shell cmd fingerprint reset 2>/dev/null || true
+        adb shell cmd fingerprint sync 2>/dev/null || true
+        # Enroll fingerprint 1 (for both virtual HAL and traditional emulator HAL)
         adb shell cmd fingerprint enroll 0 2>/dev/null &
         ENROLL_PID=$!
         sleep 0.5
@@ -28,7 +35,7 @@ case "$ACTION" in
             sleep 0.2
         done
         wait $ENROLL_PID 2>/dev/null || true
-        echo "✅ Test biometric profile enrolled (Finger 1)."
+        echo "✅ Test biometric profile enrolled (Finger 1 / Virtual Biometrics HAL)."
         ;;
 
     grant)
