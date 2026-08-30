@@ -116,10 +116,12 @@ BIO_PID=""
 # Env prefix for pamtester invocations: dev mode points the PAM module (and CLI,
 # which honors TAPAUTHD_SOCK unconditionally) at the sandbox socket; systemd
 # mode must NOT set the variable so the production socket path is used.
+# TAPAUTH_LOG_LEVEL=debug makes the module's tracing visible in the CI log so
+# PAM-phase failures are diagnosable.
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
-    PAM_ENV=(env "TAPAUTHD_SOCK=${TAPAUTHD_SOCK}")
+    PAM_ENV=(env "TAPAUTHD_SOCK=${TAPAUTHD_SOCK}" TAPAUTH_LOG_LEVEL=debug)
 else
-    PAM_ENV=(env -u TAPAUTHD_SOCK)
+    PAM_ENV=(env -u TAPAUTHD_SOCK TAPAUTH_LOG_LEVEL=debug)
 fi
 
 cleanup() {
