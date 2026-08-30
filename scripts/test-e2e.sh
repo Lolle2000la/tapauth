@@ -660,22 +660,30 @@ if [ "$CAPTURE_OK" = "1" ]; then
     sleep 1
 
     # Timing note: with no biometrics enrolled, the E2E app build auto-approves
-    # a request ~1.2-1.4s after it is issued. All injections and the cancel
-    # below deliberately land inside that window so the session is still
-    # pending when each adversarial packet arrives.
+    # a request ~1.05s after the daemon issues it. Injections and the cancel
+    # below deliberately land inside that window while the session is still
+    # pending.
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     REPLAY_REQUEST_ID="e2e-replay-$$"
     echo "==> Starting auth session (request id $REPLAY_REQUEST_ID) with no grant expected..."
     REPLAY_LOG="${TEST_DIR}/replay-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$REPLAY_REQUEST_ID" > "$REPLAY_LOG" 2>&1 &
     REPLAY_CLI_PID=$!
-    sleep 0.4
+    sleep 0.3
 
     echo "==> Injecting captured grant from an OLD session (challenge mismatch expected)..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
     sleep 0.2
     echo "==> Re-injecting the SAME grant (same-session nonce cache expected)..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
+    sleep 0.1
+
+    echo "==> Cancelling the pending session via IPC before the app's auto-approval fires..."
+    "$CLI_BIN" pam-cancel "$REPLAY_REQUEST_ID" "e2e-test" | tee "${TEST_DIR}/cancel.log"
+    if ! grep -q "DETAIL=Cancel forwarded" "${TEST_DIR}/cancel.log"; then
+        echo "❌ ERROR: daemon did not accept the cancel (no matching pending request)."
+        exit 1
+    fi
     # Give the journal follower time to deliver the daemon's audit lines.
     sleep 1
 
@@ -684,13 +692,7 @@ if [ "$CAPTURE_OK" = "1" ]; then
     assert_log_since "$LOG_BASE" "Replayed packet detected" \
         "Daemon nonce cache detected the duplicate packet"
 
-    echo "==> Cancelling the pending session via IPC (pam-cancel)..."
     CANCEL_START=$SECONDS
-    "$CLI_BIN" pam-cancel "$REPLAY_REQUEST_ID" "e2e-test" | tee "${TEST_DIR}/cancel.log"
-    if ! grep -q "DETAIL=Cancel forwarded" "${TEST_DIR}/cancel.log"; then
-        echo "❌ ERROR: daemon did not accept the cancel (no matching pending request)."
-        exit 1
-    fi
     set +e
     wait_pid_with_timeout "$REPLAY_CLI_PID" 15
     REPLAY_EXIT=$?
@@ -699,9 +701,9 @@ if [ "$CAPTURE_OK" = "1" ]; then
 
     cat "$REPLAY_LOG"
     if [ "$REPLAY_EXIT" -ne 0 ] && grep -q "OUTCOME=IGNORE" "$REPLAY_LOG"; then
-        echo "✅ Pending authentication was cancelled via IPC in ${CANCEL_ELAPSED}s (OUTCOME=IGNORE)."
+        echo "✅ Pending authentication was cancelled via IPC (OUTCOME=IGNORE, waited ${CANCEL_ELAPSED}s for the process)."
     else
-        echo "❌ ERROR: expected cancelled session to exit quickly with OUTCOME=IGNORE (rc=$REPLAY_EXIT)."
+        echo "❌ ERROR: expected cancelled session to exit with OUTCOME=IGNORE (rc=$REPLAY_EXIT)."
         exit 1
     fi
 
