@@ -611,16 +611,15 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
     # PAM_IGNORE must fall through to pam_unix, and a grant must skip it.
     #
-    # NOTE: the module deliberately yields as soon as an authtok is available
+    # NOTE 1: the module deliberately yields as soon as an authtok is available
     # ("password submission takes absolute precedence over any concurrent
-    # daemon response"), and a dialog EOF cancels the transaction. So the
-    # grant path below holds stdin open WITHOUT data: no authtok is offered
-    # and the credential dialog stays alive until the phone grant arrives,
-    # which must then bypass pam_unix via the [success=1] jump. The fallback
-    # path itself (password present) is exercised in Phase 6b.
+    # daemon response"), so the grant path below holds stdin open WITHOUT data.
+    # NOTE 2: the [success=1] jump MUST land on the trailing pam_permit line —
+    # a jump that overshoots the end of the stack makes Linux-PAM return
+    # PAM_PERM_DENIED even though the module succeeded.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
-    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
+    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
     "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 30)
@@ -938,7 +937,9 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
 
     if [ ! -f "$PAM_MIXED_CONFIG_PATH" ]; then
-        printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
+        # Same stack shape as Phase 2e (trailing pam_permit so the
+        # [success=1] jump can never overshoot the stack).
+        printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
     fi
 
     set +e
