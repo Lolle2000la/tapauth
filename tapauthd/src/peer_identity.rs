@@ -110,10 +110,7 @@ pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIden
     // over the isolated dev socket without requiring interactive GUI PolKit prompts on headless runners.
     // Unprivileged callers with different UIDs continue to be evaluated and denied by PolKit / fallback.
     #[cfg(any(feature = "dev-state-override", feature = "fallback-socket", test))]
-    if std::env::var("TAPAUTH_DEV_MODE").is_ok()
-        || std::env::var("TAPAUTH_STATE_DIR").is_ok()
-        || std::env::var("TAPAUTHD_SOCK").is_ok()
-    {
+    if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
         let my_uid = nix::unistd::geteuid().as_raw();
         if identity.uid == my_uid || identity.uid == 0 {
             return Ok(());

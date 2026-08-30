@@ -71,7 +71,7 @@ The master test runner (`scripts/test-e2e.sh`) executes the following test phase
 
 ### Phase 2e: Mixed-Stack PAM Semantics
 1. A "real world" PAM stack is installed: `auth [success=1 default=ignore] pam_tapauth.so` followed by `pam_unix.so`.
-2. **Grant path**: with the device still paired, `pamtester` authenticates while feeding a deliberately wrong password on stdin — `pam_sm_authenticate` must return `PAM_SUCCESS` and the `[success=1]` jump must skip the password module entirely.
+2. **Grant path**: with the device still paired, `pamtester` authenticates with stdin held open without data — `pam_sm_authenticate` returns `PAM_SUCCESS` upon phone grant and the `[success=1]` jump skips the password module entirely.
 3. **Fallback path** (Phase 6b, after un-pairing): `TapAuth` returns `PAM_IGNORE`, so `pam_unix` decides — a correct password must succeed and a wrong password must be rejected.
 
 ### Phase 2c: Adversarial UDP — Replay & Cancel

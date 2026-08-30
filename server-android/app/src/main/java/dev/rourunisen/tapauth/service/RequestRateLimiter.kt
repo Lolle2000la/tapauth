@@ -20,7 +20,9 @@ import kotlin.math.min
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
  * legitimate multi-transport or retransmission traffic.
  */
-class RequestRateLimiter {
+class RequestRateLimiter(
+    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+) {
 
     private data class BackoffState(
         val lastRequestTime: Long,
@@ -30,7 +32,7 @@ class RequestRateLimiter {
     )
 
     private val clientBackoffs = ConcurrentHashMap<String, BackoffState>()
-    private val deduplicator = RequestDeduplicator()
+    private val deduplicator = RequestDeduplicator(timeProvider)
 
     /**
      * Check if a request from the given client should be accepted.
@@ -51,7 +53,7 @@ class RequestRateLimiter {
             }
         }
 
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = timeProvider()
         var accepted = false
         clientBackoffs.compute(clientPublicKey) { _, existing ->
             if (existing == null) {
@@ -126,7 +128,7 @@ class RequestRateLimiter {
      * periodically (e.g., every 5 minutes).
      */
     fun cleanup() {
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = timeProvider()
         var removed = 0
 
         val iterator = clientBackoffs.entries.iterator()

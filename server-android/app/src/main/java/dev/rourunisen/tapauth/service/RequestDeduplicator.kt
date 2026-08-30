@@ -13,7 +13,9 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Thread-safe: backed by [ConcurrentHashMap].
  */
-class RequestDeduplicator {
+class RequestDeduplicator(
+    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+) {
 
     private data class DeduplicationEntry(val timestamp: Long, val accepted: Boolean)
 
@@ -28,7 +30,7 @@ class RequestDeduplicator {
      *   is a new request that should be evaluated normally.
      */
     fun checkDuplicate(requestIdentifier: String): Boolean? {
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = timeProvider()
         val existing = recentRequests[requestIdentifier]
         if (existing != null) {
             if ((now - existing.timestamp) < DEDUP_WINDOW_MS) {
@@ -48,7 +50,7 @@ class RequestDeduplicator {
      * @param accepted Whether the request was accepted or rejected by the rate limiter.
      */
     fun record(requestIdentifier: String, accepted: Boolean) {
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = timeProvider()
         recentRequests.compute(requestIdentifier) { _, existing ->
             if (existing != null && existing.accepted && !accepted) {
                 existing
@@ -65,7 +67,7 @@ class RequestDeduplicator {
      * @return The number of entries removed.
      */
     fun cleanup(): Int {
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = timeProvider()
         var removed = 0
 
         val iterator = recentRequests.entries.iterator()

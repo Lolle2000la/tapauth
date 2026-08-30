@@ -35,15 +35,29 @@ class PairingE2eTest {
 
     @Test
     fun testRealDevicePairing() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        val rejectSas = args.getString("reject_sas")?.toBoolean() ?: false
+        runPairingHandshake(rejectSas = rejectSas)
+    }
+
+    @Test
+    fun testPairingSasRejection() = runBlocking {
+        runPairingHandshake(rejectSas = true)
+    }
+
+    private suspend fun runPairingHandshake(rejectSas: Boolean) {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val args = InstrumentationRegistry.getArguments()
 
         val host = args.getString("pairing_host") ?: "10.0.2.2"
         val port = args.getString("pairing_port")?.toIntOrNull() ?: 36693
         val expectedSas = args.getString("expected_sas")
-        val startServices = args.getString("start_services")?.toBoolean() ?: true
+        val startServices = args.getString("start_services")?.toBoolean() ?: (!rejectSas)
 
-        Log.i(TAG, "Starting E2E Pairing Test: host=$host, port=$port, expectedSas=$expectedSas")
+        Log.i(
+            TAG,
+            "Starting E2E Pairing Test: host=$host, port=$port, expectedSas=$expectedSas, rejectSas=$rejectSas",
+        )
 
         val client = PairingClient(context)
 
@@ -68,6 +82,30 @@ class PairingE2eTest {
         // Step 2: If expected SAS provided, verify match
         if (!expectedSas.isNullOrEmpty()) {
             assertEquals("SAS mismatch between desktop and Android", expectedSas, awaiting.sas)
+        }
+
+        if (rejectSas) {
+            // Negative test: User rejects SAS verification or SAS mismatch detected
+            val rejectResult =
+                client.completePairing(
+                    socket = awaiting.socket,
+                    psk = awaiting.psk,
+                    clientEd25519Key = awaiting.clientEd25519Key,
+                    clientDeviceName = awaiting.clientDeviceName,
+                    sasConfirmed = false,
+                )
+            assertTrue(
+                "Pairing completion should fail on SAS rejection, got $rejectResult",
+                rejectResult is PairingResult.Error,
+            )
+            val errorMsg = (rejectResult as PairingResult.Error).message
+            assertTrue(
+                "Error message should mention rejection: $errorMsg",
+                errorMsg.contains("rejected", ignoreCase = true) ||
+                    errorMsg.contains("SAS", ignoreCase = true),
+            )
+            Log.i(TAG, "Negative pairing test passed: SAS rejected, connection closed.")
+            return
         }
 
         // Step 3: Complete pairing (CSK exchange & storage)

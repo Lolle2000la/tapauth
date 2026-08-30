@@ -393,7 +393,38 @@ echo "╔═══════════════════════�
 echo "║  PHASE 1: Real TCP Pairing & SAS Anti-MITM Verification       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-echo "==> Initiating pairing from desktop daemon..."
+echo "==> Step 1a: Negative pairing test (SAS mismatch / user rejection)..."
+START_NEG_OUTPUT=$("$CLI_BIN" start-pairing)
+PORT_NEG=$(echo "$START_NEG_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+WAIT_NEG_LOG="${TEST_DIR}/wait_neg_pairing.log"
+"$CLI_BIN" wait-for-pairing "$PORT_NEG" > "$WAIT_NEG_LOG" 2>&1 &
+WAIT_NEG_PID=$!
+
+AM_NEG_LOG="${TEST_DIR}/am_neg_pairing.log"
+adb shell am instrument -w \
+    -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
+    -e pairing_host 10.0.2.2 \
+    -e pairing_port "$PORT_NEG" \
+    -e reject_sas true \
+    -e start_services false \
+    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_NEG_LOG" 2>&1 || true
+
+wait "$WAIT_NEG_PID" || true
+
+set +e
+"$CLI_BIN" complete-pairing "$PORT_NEG" > /dev/null 2>&1
+COMPLETE_NEG_EXIT=$?
+set -e
+
+NEG_SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
+if [ "$NEG_SERVERS_COUNT" -eq 0 ]; then
+    echo "✅ Negative pairing test PASSED: SAS rejection aborted handshake; 0 paired devices stored."
+else
+    echo "❌ ERROR: negative pairing stored a device ($NEG_SERVERS_COUNT devices registered)!"
+    exit 1
+fi
+
+echo "==> Step 1b: Legitimate pairing handshake..."
 START_OUTPUT=$("$CLI_BIN" start-pairing)
 PORT=$(echo "$START_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
 PAIR_URL=$(echo "$START_OUTPUT" | grep 'URL=' | cut -d'=' -f2)

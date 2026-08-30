@@ -935,7 +935,7 @@ impl AuthSession {
                     Err(e) => {
                         // Audit log: an authenticated-looking packet failed AEAD verification.
                         // This is the expected outcome for tampered/corrupted datagrams.
-                        // NOTE: This exact log phrase ("Failed to decrypt response packet") is asserted by E2E test Phase 2c.
+                        // NOTE: This exact log phrase ("Failed to decrypt response packet") is asserted by E2E test Phase 2d.
                         tracing::warn!(
                             "Failed to decrypt response packet from {} ({} ciphertext bytes): {}; rejecting it",
                             server_addr,

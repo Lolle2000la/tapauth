@@ -106,6 +106,7 @@ class TemporalIdCache(
         }
 
         if (devices.isEmpty()) {
+            validIds.clear()
             lastComputedWindow = currentWindow
             return
         }
