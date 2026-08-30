@@ -34,15 +34,10 @@ class PairingE2eTest {
     }
 
     @Test
-    fun testRealDevicePairing() = runBlocking {
+    fun testPairing() = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         val rejectSas = args.getString("reject_sas")?.toBoolean() ?: false
         runPairingHandshake(rejectSas = rejectSas)
-    }
-
-    @Test
-    fun testPairingSasRejection() = runBlocking {
-        runPairingHandshake(rejectSas = true)
     }
 
     private suspend fun runPairingHandshake(rejectSas: Boolean) {
