@@ -29,6 +29,7 @@ import argparse
 import socket
 import struct
 import sys
+import time
 
 # pcap linktype values we know how to parse
 LT_EN10MB = 1  # Ethernet, 14-byte header
@@ -118,6 +119,65 @@ def looks_like_encrypted_packet(payload: bytes) -> bool:
     return len(payload) >= MIN_ENCRYPTED_PACKET_LEN and payload[0] == 0x0A and payload[1] == 0x10
 
 
+def sniff(port: int, duration: float) -> int:
+    """Capture server->client EncryptedPacket datagrams via AF_PACKET.
+
+    Opens one raw socket per network interface (lo included) and prints one
+    hex-encoded UDP payload per line (flushed immediately) for every datagram
+    whose destination port matches and that is not a broadcast or multicast.
+    Requires root (CAP_NET_RAW). This deliberately replaces tcpdump in the
+    E2E: tcpdump's -Z privilege drop plus per-run buffering behaved
+    nondeterministically on CI runners (occasionally writing only the 24-byte
+    pcap header).
+    """
+    import select
+
+    try:
+        sockets = []
+        for _if_index, if_name in socket.if_nameindex():
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            try:
+                s.bind((if_name, 0))
+            except OSError:
+                continue  # interface went away or cannot be captured on
+            s.setblocking(False)
+            sockets.append(s)
+    except PermissionError:
+        print("ERROR: AF_PACKET capture requires root", file=sys.stderr)
+        return 1
+    if not sockets:
+        print("ERROR: no capturable interfaces found", file=sys.stderr)
+        return 1
+
+    deadline = time.time() + duration
+    try:
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select(sockets, [], [], min(0.5, remaining))
+            for s in readable:
+                frame = s.recv(65535)
+                # On AF_PACKET, loopback frames carry a synthesized 14-byte
+                # Ethernet header, so link-layer parsing matches EN10MB.
+                l3 = extract_l3(LT_EN10MB, frame)
+                if l3 is None:
+                    continue
+                parsed = parse_ipv4(l3) or parse_ipv6(l3)
+                if parsed is None:
+                    continue
+                _src, dst, _sport, dport, payload = parsed
+                if dport != port or is_broadcast_dst(dst):
+                    continue
+                if not looks_like_encrypted_packet(payload):
+                    continue
+                print(payload.hex(), flush=True)
+    finally:
+        for s in sockets:
+            s.close()
+    return 0
+
+
 def is_broadcast_dst(dst: str) -> bool:
     return dst in ("255.255.255.255", "ff02::1") or dst.endswith(".255")
 
@@ -186,6 +246,10 @@ def main() -> int:
     p_send.add_argument("--host", default="127.0.0.1")
     p_send.add_argument("--port", type=int, default=36692)
 
+    p_sniff = sub.add_parser("sniff", help="capture server->client payloads live (requires root)")
+    p_sniff.add_argument("--port", type=int, default=36692)
+    p_sniff.add_argument("--duration", type=float, default=30.0)
+
     args = parser.parse_args()
     if args.command == "extract-grants":
         grants = extract_grants(args.pcap, args.port)
@@ -195,6 +259,8 @@ def main() -> int:
         for grant in grants:
             print(grant)
         return 0
+    if args.command == "sniff":
+        return sniff(args.port, args.duration)
     if args.command == "send":
         send_packet(args.hex_payload, args.host, args.port, args.corrupt)
         return 0

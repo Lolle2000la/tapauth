@@ -73,7 +73,6 @@ fi
 # Sandbox directory for logs, captures and (dev mode) state redirection
 TEST_DIR=$(mktemp -d -t tapauth-e2e.XXXXXX)
 DAEMON_LOG="${TEST_DIR}/tapauthd.log"
-CAPTURE_PCAP="${TEST_DIR}/grants.pcap"
 
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_MIXED_SERVICE_NAME="tapauth-mixed-stack"
@@ -520,11 +519,14 @@ fi
 
 # Capture UDP traffic while the legitimate grant is exchanged; the adversarial
 # phases (2c/2d) replay/tamper this captured grant against a fresh session.
+# The capture is a passive AF_PACKET sniffer (root-only) — see udp_attack.py
+# sniff for why this replaces tcpdump.
 CAPTURE_MANDATORY=0
-if command -v tcpdump >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+if [ "$(id -u)" -eq 0 ]; then
     CAPTURE_MANDATORY=1
-    echo "==> Starting UDP packet capture (tcpdump)..."
-    tcpdump -U -n -i any -w "$CAPTURE_PCAP" 'udp dst port 36692' > /dev/null 2>&1 &
+    echo "==> Starting UDP packet capture (AF_PACKET sniffer)..."
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" sniff --port 36692 --duration 30 \
+        > "$TEST_DIR/grants.hex" 2> "$TEST_DIR/sniff.err" &
     CAPTURE_PID=$!
 fi
 
@@ -544,14 +546,13 @@ else
     exit 1
 fi
 
-# Stop capture and extract the server grant packet
+# Stop capture and take the first captured server grant packet
 CAPTURE_OK=0
 GRANT_HEX=""
 if [ -n "$CAPTURE_PID" ]; then
     kill "$CAPTURE_PID" 2>/dev/null || true
     wait "$CAPTURE_PID" 2>/dev/null || true
     CAPTURE_PID=""
-    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" extract-grants "$CAPTURE_PCAP" > "$TEST_DIR/grants.hex" 2> "$TEST_DIR/extract.err" || true
     GRANT_HEX=$(head -n1 "$TEST_DIR/grants.hex" 2>/dev/null || true)
     [ -n "$GRANT_HEX" ] && CAPTURE_OK=1
 fi
@@ -559,18 +560,13 @@ fi
 if [ "$CAPTURE_OK" = "1" ]; then
     echo "✅ Captured a server grant packet (${#GRANT_HEX} hex chars) for adversarial phases."
 elif [ "$CAPTURE_MANDATORY" = "1" ]; then
-    echo "❌ ERROR: tcpdump capture produced no server grant packet — cannot run adversarial phases."
-    echo "   (This is mandatory when running as root with tcpdump available, e.g. CI.)"
-    ls -la "$CAPTURE_PCAP" 2>/dev/null || true
-    echo "--- extraction stderr:"; cat "$TEST_DIR/extract.err" 2>/dev/null || true
-    echo "--- capture diagnostics (first packets):"
-    tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | head -8 || true
-    echo "--- packet count: $(tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | wc -l)"
-    echo "--- source/destination breakdown:"
-    tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | grep -oE 'IP6? [^:]+ > [^:]+:' | sed 's/^[^ ]* //' | sort | uniq -c | sort -rn | head -8 || true
+    echo "❌ ERROR: packet capture produced no server grant packet — cannot run adversarial phases."
+    echo "   (This is mandatory when running as root, e.g. CI.)"
+    echo "--- sniffer stderr:"; cat "$TEST_DIR/sniff.err" 2>/dev/null || true
+    echo "--- captured lines: $(wc -l < "$TEST_DIR/grants.hex" 2>/dev/null || echo 0)"
     exit 1
 else
-    echo "ℹ️  Adversarial UDP phases will be skipped (tcpdump unavailable or not root)."
+    echo "ℹ️  Adversarial UDP phases will be skipped (not running as root)."
 fi
 
 # Step 6b: Phase 2b - Real PAM Module Authentication (pamtester)

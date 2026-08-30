@@ -95,7 +95,7 @@ jobs:
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
-            tcpdump policykit-1
+            policykit-1
           sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)

@@ -75,7 +75,7 @@ The master test runner (`scripts/test-e2e.sh`) executes the following test phase
 3. **Fallback path** (Phase 6b, after un-pairing): `TapAuth` returns `PAM_IGNORE`, so `pam_unix` decides — a correct password must succeed and a wrong password must be rejected.
 
 ### Phase 2c: Adversarial UDP — Replay & Cancel
-1. The legitimate `AuthenticationGrant` from Phase 2 is captured with `tcpdump` and re-injected (via `scripts/ci/udp_attack.py`) while a **fresh** auth session is pending.
+1. The legitimate `AuthenticationGrant` from Phase 2 is captured with a passive AF_PACKET sniffer (`scripts/ci/udp_attack.py sniff`, root-only) and re-injected while a **fresh** auth session is pending.
 2. The daemon must reject the stale-session grant (challenge mismatch audit log) and detect the immediate duplicate via its per-session nonce cache ("Replayed packet detected").
 3. The pending session is then cancelled via the `pam-cancel` IPC command; the blocked PAM client must exit promptly with `OUTCOME=IGNORE` (never `SUCCESS`).
 
