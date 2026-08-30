@@ -590,9 +590,10 @@ if [ "$PAM_TESTABLE" = "true" ]; then
 
     echo "==> Executing pamtester for user '$TEST_USER'..."
     set +e
-    # stdin=/dev/null: no authtok may be available, otherwise the module would
-    # yield to the password path by design (see Phase 2e note below).
-    "${PAM_ENV[@]}" pamtester "$PAM_SERVICE_NAME" "$TEST_USER" authenticate < /dev/null
+    # stdin = an open pipe that never delivers data: the module's credential
+    # dialog must stay ALIVE for the phone-grant path to run. An EOF (e.g.
+    # /dev/null) dismisses the dialog and cancels the transaction by design.
+    "${PAM_ENV[@]}" pamtester "$PAM_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 30)
     PAM_EXIT=$?
     set -e
 
@@ -610,15 +611,17 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     #
     # NOTE: the module deliberately yields as soon as an authtok is available
     # ("password submission takes absolute precedence over any concurrent
-    # daemon response"), so the grant path below MUST run with no password on
-    # stdin — otherwise the module cancels the phone transaction by design and
-    # defers to pam_unix. The fallback path itself is exercised in Phase 6b.
+    # daemon response"), and a dialog EOF cancels the transaction. So the
+    # grant path below holds stdin open WITHOUT data: no authtok is offered
+    # and the credential dialog stays alive until the phone grant arrives,
+    # which must then bypass pam_unix via the [success=1] jump. The fallback
+    # path itself (password present) is exercised in Phase 6b.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
-    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < /dev/null
+    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 30)
     MIXED_GRANT_EXIT=$?
     set -e
 
