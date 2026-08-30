@@ -993,7 +993,20 @@ impl AuthSession {
                     return Ok(None);
                 }
 
-                let wrapper = decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet)?;
+                let wrapper = match decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet) {
+                    Ok(wrapper) => wrapper,
+                    Err(e) => {
+                        // Audit log: an authenticated-looking packet failed AEAD verification.
+                        // This is the expected outcome for tampered/corrupted datagrams.
+                        tracing::warn!(
+                            "Failed to decrypt response packet from {} ({} ciphertext bytes): {}; rejecting it",
+                            server_addr,
+                            response_packet.ciphertext.len(),
+                            e
+                        );
+                        return Err(e.into());
+                    }
+                };
                 let addr_str = server_addr.to_string();
                 tracing::debug!("Received message from {}", addr_str);
 

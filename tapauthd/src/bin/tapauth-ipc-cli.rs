@@ -80,6 +80,7 @@ async fn send_admin(
 async fn send_pam_auth(
     username: String,
     timeout_secs: u32,
+    request_id: String,
 ) -> Result<ipc::PamAuthenticateResponse, Box<dyn std::error::Error>> {
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(
@@ -87,7 +88,7 @@ async fn send_pam_auth(
                 username,
                 tty_present: false,
                 timeout_seconds: timeout_secs,
-                request_id: format!("test-{}", std::process::id()),
+                request_id,
             },
         )),
     };
@@ -96,6 +97,34 @@ async fn send_pam_auth(
     match resp_envelope.msg {
         Some(ipc::ipc_envelope::Msg::PamResponse(resp)) => Ok(resp),
         _ => Err("Unexpected envelope type in response".into()),
+    }
+}
+
+async fn send_pam_cancel(
+    request_id: String,
+    reason: String,
+) -> Result<ipc::PamAuthenticateResponse, Box<dyn std::error::Error>> {
+    let envelope = ipc::IpcEnvelope {
+        msg: Some(ipc::ipc_envelope::Msg::PamCancel(ipc::PamCancelRequest {
+            reason,
+            request_id,
+        })),
+    };
+    let resp_envelope = send_envelope(envelope, Duration::from_secs(10)).await?;
+    match resp_envelope.msg {
+        Some(ipc::ipc_envelope::Msg::PamResponse(resp)) => Ok(resp),
+        _ => Err("Unexpected envelope type in response".into()),
+    }
+}
+
+fn outcome_name(outcome: i32) -> &'static str {
+    match ipc::PamOutcome::try_from(outcome) {
+        Ok(ipc::PamOutcome::Success) => "SUCCESS",
+        Ok(ipc::PamOutcome::Denied) => "DENIED",
+        Ok(ipc::PamOutcome::Timeout) => "TIMEOUT",
+        Ok(ipc::PamOutcome::Ignore) => "IGNORE",
+        Ok(ipc::PamOutcome::Error) => "ERROR",
+        Err(_) => "UNKNOWN",
     }
 }
 
@@ -112,7 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  remove-device <public_key_hex>");
         eprintln!("  set-transports --ble <true|false> --network <true|false>");
         eprintln!("  get-config");
-        eprintln!("  pam-auth <username> [timeout_secs]");
+        eprintln!("  pam-auth <username> [timeout_secs] [request_id]");
+        eprintln!("  pam-cancel <request_id> [reason]");
         std::process::exit(1);
     }
 
@@ -287,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "pam-auth" => {
             if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs]");
+                eprintln!("Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs] [request_id]");
                 std::process::exit(1);
             }
             let user = args[2].clone();
@@ -296,20 +326,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 30
             };
-            let resp = send_pam_auth(user, timeout_secs).await?;
-            let outcome_name = match ipc::PamOutcome::try_from(resp.outcome) {
-                Ok(ipc::PamOutcome::Success) => "SUCCESS",
-                Ok(ipc::PamOutcome::Denied) => "DENIED",
-                Ok(ipc::PamOutcome::Timeout) => "TIMEOUT",
-                Ok(ipc::PamOutcome::Ignore) => "IGNORE",
-                Ok(ipc::PamOutcome::Error) => "ERROR",
-                Err(_) => "UNKNOWN",
+            let request_id = if args.len() >= 5 {
+                args[4].clone()
+            } else {
+                format!("test-{}", std::process::id())
             };
-            println!("OUTCOME={}", outcome_name);
+            // Print the request id before blocking so orchestrators can cancel it.
+            println!("REQUEST_ID={}", request_id);
+            let resp = send_pam_auth(user, timeout_secs, request_id).await?;
+            println!("OUTCOME={}", outcome_name(resp.outcome));
             println!("DETAIL={}", resp.detail);
             if resp.outcome != 0 {
                 std::process::exit(resp.outcome);
             }
+        }
+        "pam-cancel" => {
+            if args.len() < 3 {
+                eprintln!("Usage: tapauth-ipc-cli pam-cancel <request_id> [reason]");
+                std::process::exit(1);
+            }
+            let request_id = args[2].clone();
+            let reason = if args.len() >= 4 {
+                args[3].clone()
+            } else {
+                "cli-cancel".to_string()
+            };
+            let resp = send_pam_cancel(request_id, reason).await?;
+            println!("OUTCOME={}", outcome_name(resp.outcome));
+            println!("DETAIL={}", resp.detail);
         }
         other => {
             eprintln!("Unknown command: {}", other);

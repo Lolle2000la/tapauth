@@ -154,6 +154,13 @@ pub async fn handle_admin_request(
     // PolKit check.  The tapauthd user must be registered as an action owner
     // via org.freedesktop.policykit.owner in the policy file.
     if let Err(e) = check_authorization(&identity).await {
+        tracing::warn!(
+            "Unauthorized admin request from uid={} (pid={}, user={}): {}",
+            identity.uid,
+            identity.pid,
+            identity.username,
+            e
+        );
         return err_resp(ipc::AdminStatus::AdminUnauthorized, e.to_string());
     }
 

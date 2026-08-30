@@ -94,13 +94,20 @@ jobs:
           sudo apt-get install -y \
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
-            libdbus-1-dev pkg-config
+            libdbus-1-dev pkg-config \
+            tcpdump policykit-1
           sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
         run: |
-          cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
-          cargo build -p client-pam --features dev-socket-override
+          # Production-style build used by the E2E: systemd socket activation
+          # (fallback-socket stays OFF). dev-state-override is compiled in ONLY
+          # for the emulator UDP delivery shim (TAPAUTH_DEV_UDP_TARGET); all
+          # state/config paths remain the real production paths, and PolKit
+          # authorization stays enforced for non-root callers (asserted by the
+          # E2E's Phase 7).
+          cargo build -p tapauthd --no-default-features --features ble,dev-state-override --bin tapauthd --bin tapauth-ipc-cli
+          cargo build -p client-pam
 
       - name: Free disk space for emulator
         run: |
@@ -163,12 +170,23 @@ jobs:
       - name: Check Kotlin formatting with Spotless
         run: cd server-android && ./gradlew spotlessCheck
 
-      - name: Upload APK artifact
+      - name: Upload debug APK artifact (safe for manual testing)
         uses: actions/upload-artifact@v7
         with:
-          name: tapauth-apks
-          path: server-android/app/build/outputs/apk/**/*.apk
+          name: tapauth-debug-apk
+          path: server-android/app/build/outputs/apk/debug/*.apk
           retention-days: 30
+
+      # The E2E build variant auto-approves authentication requests when no
+      # biometrics are enrolled and exports a test-only denial receiver. It is
+      # uploaded under an explicit name and short retention so it can never be
+      # mistaken for a distributable app build.
+      - name: Upload E2E variant APK artifact (UNSAFE — auto-approves, do not install)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tapauth-e2e-apk-UNSAFE-auto-approves
+          path: server-android/app/build/outputs/apk/e2e/*.apk
+          retention-days: 7
 
       - name: Upload native libraries artifact
         uses: actions/upload-artifact@v7

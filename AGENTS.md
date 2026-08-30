@@ -54,8 +54,9 @@ cd server-android && ./gradlew spotlessCheck
 # Unit tests (JVM):
 cd server-android && ./gradlew test
 
-# Instrumentation tests (requires emulator + native libs built):
-cd server-android && ./gradlew connectedDebugAndroidTest
+# Instrumentation tests (requires emulator + native libs built; the e2e build
+# variant is used for instrumented tests, see testBuildType in build.gradle.kts):
+cd server-android && ./gradlew connectedE2eAndroidTest
 ```
 
 ## Feature Flags (critical)

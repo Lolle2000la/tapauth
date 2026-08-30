@@ -43,7 +43,7 @@ The E2E test stack validates the real cryptographic protocols, daemon state mach
 
 ## 2. Test Lifecycle Phases
 
-The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test phases:
+The master test runner (`scripts/test-e2e.sh`) executes the following test phases (2c/2d run whenever a UDP grant packet could be captured, 2e/2e' whenever `pamtester` is available, and 7 in systemd mode):
 
 ### Phase 1: Real TCP Pairing & SAS Anti-MITM Verification
 1. `tapauthd` generates a dynamic TCP listener port and ephemeral X25519 pairing keypair.
@@ -68,6 +68,20 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 1. Test suite creates temporary PAM service definition at `/etc/pam.d/tapauth-test-e2e` pointing to `libclient_pam.so`.
 2. `pamtester` invokes `pam_sm_authenticate` against the real PAM C ABI.
 3. `client-pam` connects to `tapauthd` over Unix socket and completes full PAM authentication returning `PAM_SUCCESS`.
+
+### Phase 2e: Mixed-Stack PAM Semantics
+1. A "real world" PAM stack is installed: `auth [success=1 default=ignore] pam_tapauth.so` followed by `pam_unix.so`.
+2. **Grant path**: with the device still paired, `pamtester` authenticates while feeding a deliberately wrong password on stdin — `pam_sm_authenticate` must return `PAM_SUCCESS` and the `[success=1]` jump must skip the password module entirely.
+3. **Fallback path** (Phase 6b, after un-pairing): `TapAuth` returns `PAM_IGNORE`, so `pam_unix` decides — a correct password must succeed and a wrong password must be rejected.
+
+### Phase 2c: Adversarial UDP — Replay & Cancel
+1. The legitimate `AuthenticationGrant` from Phase 2 is captured with `tcpdump` and re-injected (via `scripts/ci/udp_attack.py`) while a **fresh** auth session is pending.
+2. The daemon must reject the stale-session grant (challenge mismatch audit log) and detect the immediate duplicate via its per-session nonce cache ("Replayed packet detected").
+3. The pending session is then cancelled via the `pam-cancel` IPC command; the blocked PAM client must exit promptly with `OUTCOME=IGNORE` (never `SUCCESS`).
+
+### Phase 2d: Adversarial UDP — Tampered Ciphertext
+1. The captured grant is re-injected with one flipped bit inside the AES-256-GCM tag (protobuf framing and temporal identifier stay intact).
+2. The daemon must fail AEAD verification, abort the session fail-closed (`OUTCOME=IGNORE` → PAM password fallback, never a grant), and log the decryption failure.
 
 ### Phase 3: Bluetooth Low Energy (BLE) Authentication
 1. Desktop enables BLE transport and disables UDP (`set-transports --network false --ble true`).
@@ -96,6 +110,12 @@ The master test runner (`scripts/test-e2e.sh`) executes 6 comprehensive test pha
 1. Desktop invokes `remove-device <server_public_key>` via admin IPC.
 2. `tapauthd` purges keys and refreshes in-memory state.
 3. Subsequent auth requests properly return `IGNORE` ("No paired devices configured").
+4. Phase 6b proves the mixed-stack password fallback end-to-end (see Phase 2e).
+
+### Phase 7: Admin IPC Authorization Enforcement (systemd mode)
+1. An unprivileged user **in** the `tapauthd-clients` group (i.e. past the socket permission gate) sends an admin request — the daemon must deny it via PolKit (`auth_admin`, no interactive agent) and log the attempt.
+2. A user **outside** `tapauthd-clients` must not even be able to connect to `/run/tapauthd/tapauthd.sock`.
+3. Together with the on-disk assertions (`/var/lib/tapauth` mode 700 `tapauthd:tapauthd`, key files 600, IPC socket 660 `root:tapauthd-clients`, `/etc/tapauth/config.toml` 644 `tapauthd:tapauthd`) this covers the daemon's core security properties.
 
 ---
 
@@ -118,12 +138,17 @@ Android emulators provide an internal Bluetooth simulation service called **Nets
 
 ### In CI (GitHub Actions)
 E2E testing runs automatically in `.github/workflows/ci-android.yml` on every pull request and push to `main`.
+CI runs in **systemd mode**: the daemon is the production-style build (systemd socket activation, no `fallback-socket`), installed as the real `tapauthd.service`/`tapauthd.socket` units, running as the unprivileged `tapauthd` user with state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`. The only E2E-specific knob is the `TAPAUTH_DEV_UDP_TARGET` emulator delivery shim (enabled via the `TAPAUTH_DEV_MODE` environment on the unit), because a hosted runner cannot deliver LAN broadcasts into the Android emulator.
+
+CI artifacts: `tapauth-debug-apk` contains the safe debug build; the E2E variant is uploaded separately as `tapauth-e2e-apk-UNSAFE-auto-approves` — **never install that one**, it auto-approves authentication requests when no biometrics are enrolled.
 
 ### Locally (Unprivileged / No `sudo`)
-The test runner is designed to run completely unprivileged without `sudo` by using isolated sandbox directories:
+The test runner falls back to **dev mode** when not running as root under systemd, using isolated sandbox directories:
 - `TAPAUTH_STATE_DIR`: Isolated state directory (`/tmp/tapauth-e2e.XXXXXX/state`).
 - `TAPAUTHD_SOCK`: Isolated Unix socket (`/tmp/tapauth-e2e.XXXXXX/tapauthd.sock`).
 - `TAPAUTH_DEV_MODE=1`: Bypasses system PolKit daemon for same-UID/root callers on the isolated dev socket, authorizing the process owner for test automation. (Note: Production daemon runs with full PolKit authorization enforcement).
+
+Running locally **as root under systemd** (or with `TAPAUTH_E2E_DAEMON_MODE=systemd`) exercises the full production wiring instead — including the Phase 7 authorization checks — but mutates real system paths (`/usr/bin/tapauthd`, `/etc/tapauth`, `/var/lib/tapauth`, systemd units).
 
 #### Prerequisites
 1. Have an Android emulator running (API 33 to 36):
