@@ -17,8 +17,6 @@ use tokio::sync::{oneshot, Mutex};
 use crate::transport::BleTransport;
 #[cfg(feature = "ble")]
 use shared::crypto::generate_current_temporal_identifier_ble;
-#[cfg(feature = "ble")]
-use tokio::select;
 
 use shared::ipc::pb as ipc;
 
@@ -627,6 +625,14 @@ impl AuthSession {
         (ble_handle, udp_handle)
     }
 
+    /// Wait for the first transport to finish, for both transports to fail,
+    /// or for a PAM cancel.
+    ///
+    /// The cancel branch must stay armed across transport fallbacks: when BLE
+    /// is disabled (or its task fails immediately, e.g. transport disabled by
+    /// configuration) the remaining transport is awaited HERE, and a nested
+    /// plain `.await` would silently drop `PamCancelRequest` until the session
+    /// timed out.
     #[cfg(feature = "ble")]
     async fn await_auth_result(&self, params: AwaitAuthParams<'_>) -> Result<(), AuthHandlerError> {
         let AwaitAuthParams {
@@ -640,153 +646,78 @@ impl AuthSession {
             cancel_packet,
         } = params;
 
-        select! {
-            result = &mut ble_handle => {
-                self.handle_ble_result(result, udp_handle, udp_abort, ble_transport, udp_transport, cancel_packet).await
-            }
-            result = &mut udp_handle => {
-                self.handle_udp_result(result, ble_handle, ble_abort, ble_transport, udp_transport, cancel_packet).await
-            }
-            _ = &mut cancel_rx => {
-                self.handle_cancellation(ble_abort, udp_abort, ble_transport, udp_transport, cancel_packet).await
-            }
-        }
-    }
+        // Non-terminal transport failures (disabled by configuration, timeouts,
+        // panics) hand control to the remaining transport; the loop keeps the
+        // cancel branch live throughout.
+        let mut ble_failed = false;
+        let mut udp_failed = false;
 
-    #[cfg(feature = "ble")]
-    async fn handle_ble_result(
-        &self,
-        result: Result<Result<(), AuthHandlerError>, tokio::task::JoinError>,
-        udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        udp_abort: tokio::task::AbortHandle,
-        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
-        udp_transport: &Arc<crate::transport::UdpTransport>,
-        cancel_packet: &EncryptedPacket,
-    ) -> Result<(), AuthHandlerError> {
-        match result {
-            Ok(Ok(())) => {
-                tracing::info!("BLE authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                udp_abort.abort();
-                Ok(())
-            }
-            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                tracing::warn!("BLE authentication explicitly denied by user");
-                udp_abort.abort();
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Err(AuthHandlerError::ExplicitDenial)
-            }
-            Ok(Err(e)) => {
-                tracing::debug!("BLE authentication failed: {}", e);
-                self.handle_udp_fallback(udp_handle, ble_transport, udp_transport, cancel_packet)
-                    .await
-            }
-            Err(_) => {
-                tracing::error!("BLE task panicked");
-                match udp_handle.await {
-                    Ok(Ok(())) => Ok(()),
-                    _ => Err(AuthHandlerError::Denied),
+        loop {
+            tokio::select! {
+                result = &mut ble_handle, if !ble_failed => {
+                    match result {
+                        Ok(Ok(())) => {
+                            tracing::info!("BLE authentication succeeded");
+                            udp_abort.abort();
+                            self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                                .await;
+                            return Ok(());
+                        }
+                        Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                            tracing::warn!("BLE authentication explicitly denied by user");
+                            udp_abort.abort();
+                            self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                                .await;
+                            return Err(AuthHandlerError::ExplicitDenial);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("BLE authentication failed: {}", e);
+                            ble_failed = true;
+                        }
+                        Err(_) => {
+                            tracing::error!("BLE task panicked");
+                            ble_failed = true;
+                        }
+                    }
                 }
-            }
-        }
-    }
-
-    #[cfg(feature = "ble")]
-    async fn handle_udp_result(
-        &self,
-        result: Result<Result<(), AuthHandlerError>, tokio::task::JoinError>,
-        ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        ble_abort: tokio::task::AbortHandle,
-        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
-        udp_transport: &Arc<crate::transport::UdpTransport>,
-        cancel_packet: &EncryptedPacket,
-    ) -> Result<(), AuthHandlerError> {
-        match result {
-            Ok(Ok(())) => {
-                tracing::info!("UDP authentication succeeded");
-                ble_abort.abort();
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Ok(())
-            }
-            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                tracing::warn!("UDP authentication explicitly denied by user");
-                ble_abort.abort();
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Err(AuthHandlerError::ExplicitDenial)
-            }
-            Ok(Err(e)) => {
-                tracing::debug!("UDP authentication failed: {}", e);
-                self.handle_ble_fallback(ble_handle, ble_transport, udp_transport, cancel_packet)
-                    .await
-            }
-            Err(_) => {
-                tracing::error!("UDP task panicked");
-                match ble_handle.await {
-                    Ok(Ok(())) => Ok(()),
-                    _ => Err(AuthHandlerError::Denied),
+                result = &mut udp_handle, if !udp_failed => {
+                    match result {
+                        Ok(Ok(())) => {
+                            tracing::info!("UDP authentication succeeded");
+                            ble_abort.abort();
+                            self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                                .await;
+                            return Ok(());
+                        }
+                        Ok(Err(AuthHandlerError::ExplicitDenial)) => {
+                            tracing::warn!("UDP authentication explicitly denied by user");
+                            ble_abort.abort();
+                            self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
+                                .await;
+                            return Err(AuthHandlerError::ExplicitDenial);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("UDP authentication failed: {}", e);
+                            udp_failed = true;
+                        }
+                        Err(_) => {
+                            tracing::error!("UDP task panicked");
+                            udp_failed = true;
+                        }
+                    }
                 }
+                _ = &mut cancel_rx => {
+                    return self
+                        .handle_cancellation(ble_abort, udp_abort, ble_transport, udp_transport, cancel_packet)
+                        .await;
+                }
+                else => break,
             }
         }
-    }
 
-    #[cfg(feature = "ble")]
-    async fn handle_udp_fallback(
-        &self,
-        udp_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
-        udp_transport: &Arc<crate::transport::UdpTransport>,
-        cancel_packet: &EncryptedPacket,
-    ) -> Result<(), AuthHandlerError> {
-        match udp_handle.await {
-            Ok(Ok(())) => {
-                tracing::info!("UDP authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Ok(())
-            }
-            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Err(AuthHandlerError::ExplicitDenial)
-            }
-            Ok(Err(e)) => {
-                tracing::error!("UDP authentication also failed: {}", e);
-                Err(AuthHandlerError::Denied)
-            }
-            Err(_) => Err(AuthHandlerError::Denied),
-        }
-    }
-
-    #[cfg(feature = "ble")]
-    async fn handle_ble_fallback(
-        &self,
-        ble_handle: tokio::task::JoinHandle<Result<(), AuthHandlerError>>,
-        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
-        udp_transport: &Arc<crate::transport::UdpTransport>,
-        cancel_packet: &EncryptedPacket,
-    ) -> Result<(), AuthHandlerError> {
-        match ble_handle.await {
-            Ok(Ok(())) => {
-                tracing::info!("BLE authentication succeeded");
-                self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Ok(())
-            }
-            Ok(Err(AuthHandlerError::ExplicitDenial)) => {
-                self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                    .await;
-                Err(AuthHandlerError::ExplicitDenial)
-            }
-            Ok(Err(e)) => {
-                tracing::error!("BLE authentication also failed: {}", e);
-                Err(AuthHandlerError::Denied)
-            }
-            Err(_) => Err(AuthHandlerError::Denied),
-        }
+        // Both transports failed with non-terminal errors and no cancel
+        // arrived.
+        Err(AuthHandlerError::Denied)
     }
 
     #[cfg(feature = "ble")]
