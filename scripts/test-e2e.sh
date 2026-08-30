@@ -676,7 +676,8 @@ if [ "$CAPTURE_OK" = "1" ]; then
     sleep 0.2
     echo "==> Re-injecting the SAME grant (same-session nonce cache expected)..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
-    sleep 0.2
+    # Give the journal follower time to deliver the daemon's audit lines.
+    sleep 1
 
     assert_log_since "$LOG_BASE" "Grant challenge verification failed" \
         "Daemon rejected a grant whose challenge belongs to another session"
@@ -737,6 +738,8 @@ if [ "$CAPTURE_OK" = "1" ]; then
     wait_pid_with_timeout "$TAMPER_CLI_PID" 15
     TAMPER_EXIT=$?
     set -e
+    # Give the journal follower time to deliver the daemon's audit lines.
+    sleep 1
     cat "$TAMPER_LOG"
 
     # The daemon maps any authentication error to OUTCOME=IGNORE so that PAM
