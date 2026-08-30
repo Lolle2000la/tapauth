@@ -551,7 +551,8 @@ if [ -n "$CAPTURE_PID" ]; then
     kill "$CAPTURE_PID" 2>/dev/null || true
     wait "$CAPTURE_PID" 2>/dev/null || true
     CAPTURE_PID=""
-    GRANT_HEX=$("$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" extract-grants "$CAPTURE_PCAP" 2>/dev/null | head -n1 || true)
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" extract-grants "$CAPTURE_PCAP" > "$TEST_DIR/grants.hex" 2> "$TEST_DIR/extract.err" || true
+    GRANT_HEX=$(head -n1 "$TEST_DIR/grants.hex" 2>/dev/null || true)
     [ -n "$GRANT_HEX" ] && CAPTURE_OK=1
 fi
 
@@ -561,6 +562,12 @@ elif [ "$CAPTURE_MANDATORY" = "1" ]; then
     echo "❌ ERROR: tcpdump capture produced no server grant packet — cannot run adversarial phases."
     echo "   (This is mandatory when running as root with tcpdump available, e.g. CI.)"
     ls -la "$CAPTURE_PCAP" 2>/dev/null || true
+    echo "--- extraction stderr:"; cat "$TEST_DIR/extract.err" 2>/dev/null || true
+    echo "--- capture diagnostics (first packets):"
+    tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | head -8 || true
+    echo "--- packet count: $(tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | wc -l)"
+    echo "--- source/destination breakdown:"
+    tcpdump -n -r "$CAPTURE_PCAP" 2>/dev/null | grep -oE 'IP6? [^:]+ > [^:]+:' | sed 's/^[^ ]* //' | sort | uniq -c | sort -rn | head -8 || true
     exit 1
 else
     echo "ℹ️  Adversarial UDP phases will be skipped (tcpdump unavailable or not root)."
