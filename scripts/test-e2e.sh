@@ -637,6 +637,18 @@ else
     echo "ℹ️  Real PAM module testing skipped (/etc/pam.d not writable or pamtester missing)."
 fi
 
+# Helper: assert a pattern is present in the daemon log AFTER a given line
+# offset (window-scoped, so stale matches from earlier phases don't count).
+assert_log_since() {
+    local base=$1 pattern=$2 label=$3
+    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
+        echo "✅ ${label}"
+    else
+        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
+        exit 1
+    fi
+}
+
 # Step 6c: Phase 2c - Adversarial UDP: Replay of a captured grant + PamCancel
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -647,32 +659,29 @@ if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     sleep 1
 
+    # Timing note: with no biometrics enrolled, the E2E app build auto-approves
+    # a request ~1.2-1.4s after it is issued. All injections and the cancel
+    # below deliberately land inside that window so the session is still
+    # pending when each adversarial packet arrives.
+    LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     REPLAY_REQUEST_ID="e2e-replay-$$"
     echo "==> Starting auth session (request id $REPLAY_REQUEST_ID) with no grant expected..."
     REPLAY_LOG="${TEST_DIR}/replay-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$REPLAY_REQUEST_ID" > "$REPLAY_LOG" 2>&1 &
     REPLAY_CLI_PID=$!
-    sleep 1
+    sleep 0.4
 
     echo "==> Injecting captured grant from an OLD session (challenge mismatch expected)..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
-    sleep 1
+    sleep 0.2
     echo "==> Re-injecting the SAME grant (same-session nonce cache expected)..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
-    sleep 1
+    sleep 0.2
 
-    if grep -q "Grant challenge verification failed" "$DAEMON_LOG"; then
-        echo "✅ Daemon rejected a grant whose challenge belongs to another session."
-    else
-        echo "❌ ERROR: daemon did not log challenge-mismatch rejection for replayed grant."
-        exit 1
-    fi
-    if grep -q "Replayed packet detected" "$DAEMON_LOG"; then
-        echo "✅ Daemon nonce cache detected the duplicate packet."
-    else
-        echo "❌ ERROR: daemon did not detect the same-session replay."
-        exit 1
-    fi
+    assert_log_since "$LOG_BASE" "Grant challenge verification failed" \
+        "Daemon rejected a grant whose challenge belongs to another session"
+    assert_log_since "$LOG_BASE" "Replayed packet detected" \
+        "Daemon nonce cache detected the duplicate packet"
 
     echo "==> Cancelling the pending session via IPC (pam-cancel)..."
     CANCEL_START=$SECONDS
@@ -712,12 +721,14 @@ if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     sleep 1
 
+    LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     TAMPER_REQUEST_ID="e2e-tamper-$$"
     echo "==> Starting auth session (request id $TAMPER_REQUEST_ID) with no grant expected..."
     TAMPER_LOG="${TEST_DIR}/tamper-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$TAMPER_REQUEST_ID" > "$TAMPER_LOG" 2>&1 &
     TAMPER_CLI_PID=$!
-    sleep 1
+    # Inject inside the pre-grant window (the E2E app auto-approves at ~1.2-1.4s).
+    sleep 0.4
 
     echo "==> Injecting grant with a flipped AES-GCM tag byte..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --corrupt
@@ -746,12 +757,8 @@ if [ "$CAPTURE_OK" = "1" ]; then
         echo "❌ ERROR: expected DETAIL=Authentication failed... (got the output above)."
         exit 1
     fi
-    if grep -q "Failed to decrypt response packet" "$DAEMON_LOG"; then
-        echo "✅ Daemon logged the decryption failure (audit trail present)."
-    else
-        echo "❌ ERROR: daemon did not log the tampered-packet decryption failure."
-        exit 1
-    fi
+    assert_log_since "$LOG_BASE" "Failed to decrypt response packet" \
+        "Daemon logged the decryption failure (audit trail present)"
     if [ "$TAMPER_EXIT" -ne 0 ]; then
         echo "✅ Exit code non-zero ($TAMPER_EXIT) — no successful authentication."
     else
@@ -978,6 +985,7 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     fi
     usermod -aG tapauthd-clients "$ADMIN_DENY_USER"
 
+    LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     echo "==> Admin request as unprivileged user (must be denied by the daemon)..."
     set +e
     runuser -u "$ADMIN_DENY_USER" -- /usr/local/bin/tapauth-ipc-cli get-servers > "${TEST_DIR}/deny-admin.log" 2>&1
@@ -992,12 +1000,8 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
         exit 1
     fi
     sleep 1
-    if grep -q "Unauthorized admin request" "$DAEMON_LOG"; then
-        echo "✅ Daemon logged the unauthorized attempt (audit trail present)."
-    else
-        echo "❌ ERROR: daemon did not log the unauthorized admin attempt."
-        exit 1
-    fi
+    assert_log_since "$LOG_BASE" "Unauthorized admin request" \
+        "Daemon logged the unauthorized attempt (audit trail present)"
 
     echo "==> Socket access gate: user outside 'tapauthd-clients' must not connect..."
     set +e
