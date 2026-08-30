@@ -594,7 +594,9 @@ if [ "$PAM_TESTABLE" = "true" ]; then
 
     echo "==> Executing pamtester for user '$TEST_USER'..."
     set +e
-    "${PAM_ENV[@]}" pamtester "$PAM_SERVICE_NAME" "$TEST_USER" authenticate
+    # stdin=/dev/null: no authtok may be available, otherwise the module would
+    # yield to the password path by design (see Phase 2e note below).
+    "${PAM_ENV[@]}" pamtester "$PAM_SERVICE_NAME" "$TEST_USER" authenticate < /dev/null
     PAM_EXIT=$?
     set -e
 
@@ -609,12 +611,18 @@ if [ "$PAM_TESTABLE" = "true" ]; then
 
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
     # PAM_IGNORE must fall through to pam_unix, and a grant must skip it.
+    #
+    # NOTE: the module deliberately yields as soon as an authtok is available
+    # ("password submission takes absolute precedence over any concurrent
+    # daemon response"), so the grant path below MUST run with no password on
+    # stdin — otherwise the module cancels the phone transaction by design and
+    # defers to pam_unix. The fallback path itself is exercised in Phase 6b.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
-    echo "DEFINITELY-WRONG-PASSWORD" | "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate
+    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < /dev/null
     MIXED_GRANT_EXIT=$?
     set -e
 
