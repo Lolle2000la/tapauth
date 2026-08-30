@@ -8,10 +8,9 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.service.AuthRequestManager
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -67,12 +66,7 @@ class BiometricPromptActivity : FragmentActivity() {
         }
 
         val action = intent.getStringExtra("notification_action")
-        if (action == "approve") {
-            Log.i(TAG, "Approved via notification action for request: ${authRequest.requestId}")
-            AuthRequestManager.approveRequest(this, authRequest)
-            finish()
-            return
-        } else if (action == "deny") {
+        if (action == "deny") {
             Log.i(TAG, "Denied via notification action for request: ${authRequest.requestId}")
             handleAuthResponse(
                 authRequest.requestId,
@@ -104,7 +98,7 @@ class BiometricPromptActivity : FragmentActivity() {
                 TAG,
                 "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
             )
-            CoroutineScope(Dispatchers.Main).launch {
+            lifecycleScope.launch {
                 delay(AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")

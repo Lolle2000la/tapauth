@@ -105,6 +105,10 @@ fn read_process_start_time(pid: i32) -> Result<u64, PeerIdentityError> {
 ///
 /// Falls back to root-only when PolKit is unavailable.
 pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIdentityError> {
+    // In development and isolated test automation environments (dev-state-override / fallback-socket),
+    // allow same-UID callers (the user running the test harness / daemon) or root to administer the daemon
+    // over the isolated dev socket without requiring interactive GUI PolKit prompts on headless runners.
+    // Unprivileged callers with different UIDs continue to be evaluated and denied by PolKit / fallback.
     #[cfg(any(feature = "dev-state-override", feature = "fallback-socket", test))]
     if std::env::var("TAPAUTH_DEV_MODE").is_ok()
         || std::env::var("TAPAUTH_STATE_DIR").is_ok()

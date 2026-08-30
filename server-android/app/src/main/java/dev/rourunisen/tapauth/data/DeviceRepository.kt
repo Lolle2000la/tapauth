@@ -18,10 +18,23 @@ class DeviceRepository(context: Context) {
 
     companion object {
         private const val KEY_DEVICES = "paired_devices"
-        @Volatile private var changeListener: (() -> Unit)? = null
+        private val changeListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+        fun addOnDevicesChangedListener(listener: () -> Unit) {
+            changeListeners.add(listener)
+        }
+
+        fun removeOnDevicesChangedListener(listener: () -> Unit) {
+            changeListeners.remove(listener)
+        }
 
         fun setOnDevicesChangedListener(listener: (() -> Unit)?) {
-            changeListener = listener
+            changeListeners.clear()
+            listener?.let { changeListeners.add(it) }
+        }
+
+        private fun notifyListeners() {
+            changeListeners.forEach { it.invoke() }
         }
     }
 
@@ -35,7 +48,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            changeListener?.invoke()
+            notifyListeners()
         }
 
     fun getAllPairedDevicesSync(): List<PairedDevice> {
@@ -68,7 +81,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            changeListener?.invoke()
+            notifyListeners()
         }
 
     /**
@@ -103,7 +116,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            changeListener?.invoke()
+            notifyListeners()
 
             return@withContext entirelyRemoved
         }

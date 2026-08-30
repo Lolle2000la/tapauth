@@ -925,6 +925,7 @@ impl AuthSession {
                     data
                 };
                 if !nonce_cache.insert(nonce_fingerprint) {
+                    // NOTE: This exact log phrase is asserted by E2E test Phase 2d (nonce replay check).
                     tracing::warn!("Replayed packet detected from {}, ignoring", server_addr);
                     return Ok(None);
                 }
@@ -934,6 +935,7 @@ impl AuthSession {
                     Err(e) => {
                         // Audit log: an authenticated-looking packet failed AEAD verification.
                         // This is the expected outcome for tampered/corrupted datagrams.
+                        // NOTE: This exact log phrase ("Failed to decrypt response packet") is asserted by E2E test Phase 2c.
                         tracing::warn!(
                             "Failed to decrypt response packet from {} ({} ciphertext bytes): {}; rejecting it",
                             server_addr,

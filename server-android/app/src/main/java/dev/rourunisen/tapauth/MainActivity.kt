@@ -44,6 +44,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
@@ -53,8 +54,6 @@ import dev.rourunisen.tapauth.ui.pairing.PairingScreen
 import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -267,7 +266,7 @@ class MainActivity : FragmentActivity() {
                 TAG,
                 "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
             )
-            CoroutineScope(Dispatchers.Main).launch {
+            lifecycleScope.launch {
                 delay(AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
                     Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")

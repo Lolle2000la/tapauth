@@ -156,12 +156,11 @@ class AuthRequestManager private constructor() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
 
-            // Action: Approve -> show biometric prompt directly (same as tapping notification body)
+            // Action: Approve -> opens BiometricPromptActivity to prompt for biometric verification
             val approveIntent =
                 Intent(context, dev.rourunisen.tapauth.BiometricPromptActivity::class.java).apply {
                     action = ACTION_AUTH_REQUEST
                     putExtra(EXTRA_AUTH_REQUEST, authRequest)
-                    putExtra("notification_action", "approve")
                     flags =
                         Intent.FLAG_ACTIVITY_NEW_TASK or
                             Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
