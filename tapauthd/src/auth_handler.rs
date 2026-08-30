@@ -653,6 +653,11 @@ impl AuthSession {
         let mut udp_failed = false;
 
         loop {
+            if ble_failed && udp_failed {
+                // Both transports failed with non-terminal errors and no
+                // cancel arrived: the session cannot succeed.
+                return Err(AuthHandlerError::Denied);
+            }
             tokio::select! {
                 result = &mut ble_handle, if !ble_failed => {
                     match result {
