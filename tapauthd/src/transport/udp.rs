@@ -11,38 +11,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// UDP transport using broadcast (IPv4) and multicast (IPv6)
+///
+/// Always wraps a socket owned by `DaemonState`; it never closes the socket
+/// itself.
 pub struct UdpTransport {
     socket: Arc<tokio::net::UdpSocket>,
     port: u16,
-    owned: bool,
 }
 
 impl UdpTransport {
-    /// Create a new UDP transport with its own socket
-    ///
-    /// # Arguments
-    /// * `port` - The UDP port to bind and send to
-    #[allow(dead_code)] // Used in tests
-    pub async fn new(port: u16) -> Result<Self, AuthError> {
-        let socket = shared::network::create_broadcast_socket(port).await?;
-        Ok(Self {
-            socket: Arc::new(socket),
-            port,
-            owned: true,
-        })
-    }
-
     /// Create a UDP transport from an existing shared socket
     ///
     /// # Arguments
     /// * `socket` - Shared reference to an existing UDP socket
     /// * `port` - The UDP port the socket is bound to
     pub fn from_socket(socket: Arc<tokio::net::UdpSocket>, port: u16) -> Self {
-        Self {
-            socket,
-            port,
-            owned: false,
-        }
+        Self { socket, port }
     }
 }
 
@@ -70,9 +54,13 @@ fn dev_udp_target() -> Option<&'static str> {
 #[cfg(any(feature = "dev-udp-loopback", test))]
 fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
     if let Some(target) = dev_udp_target() {
-        use prost::Message;
-        let data = packet.encode_to_vec();
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        // One ephemeral socket for the lifetime of the process instead of a fresh
+        // bind per packet (this fires on every request/confirmation/denial/cancel).
+        static DEV_SOCK: std::sync::OnceLock<Option<std::net::UdpSocket>> =
+            std::sync::OnceLock::new();
+        if let Some(sock) = DEV_SOCK.get_or_init(|| std::net::UdpSocket::bind("0.0.0.0:0").ok()) {
+            use prost::Message;
+            let data = packet.encode_to_vec();
             let _ = sock.send_to(&data, target);
             tracing::debug!(
                 "Directly forwarded {} bytes to dev target on {}",
@@ -147,14 +135,5 @@ impl Transport for UdpTransport {
         }
 
         Ok(())
-    }
-}
-
-impl Drop for UdpTransport {
-    fn drop(&mut self) {
-        if self.owned {
-            tracing::debug!("UDP transport (owned) explicitly closed");
-        }
-        // Shared sockets are not closed here - they're managed by DaemonState
     }
 }

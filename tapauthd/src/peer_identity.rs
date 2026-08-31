@@ -28,9 +28,7 @@ pub enum PeerIdentityError {
 }
 
 pub struct PeerIdentity {
-    #[allow(dead_code)]
     pub pid: i32,
-    #[allow(dead_code)]
     pub uid: u32,
     pub username: String,
     pub start_time: u64,

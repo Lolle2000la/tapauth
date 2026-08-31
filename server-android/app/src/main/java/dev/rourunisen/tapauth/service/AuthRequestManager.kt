@@ -7,6 +7,8 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.KeypairRepository
@@ -27,7 +29,6 @@ class AuthRequestManager private constructor() {
 
     // Index challenges (Base64) to request IDs for fast cancel-by-challenge
     private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
-    // Debug registry removed: no longer tracking posted notification IDs
 
     // Track recently cancelled challenges to handle out-of-order cancel vs request arrival
     private val cancelledChallenges = ConcurrentHashMap<String, Long>()
@@ -479,6 +480,35 @@ class AuthRequestManager private constructor() {
         const val DEBUG_AUTO_APPROVE_DELAY_MS = 1000L
 
         /**
+         * E2E-build-only auto-approval used when no biometrics are enrolled.
+         *
+         * Called from the `BuildConfig.E2E_TESTING` branch of the biometric availability checks in
+         * [dev.rourunisen.tapauth.MainActivity] and
+         * [dev.rourunisen.tapauth.BiometricPromptActivity] (which pass their own
+         * `onGracePeriodElapsed`). Waits [DEBUG_AUTO_APPROVE_DELAY_MS] so the E2E harness can
+         * inject an explicit denial broadcast first, then approves if the request is still pending.
+         */
+        fun autoApproveInE2e(
+            activity: FragmentActivity,
+            authRequest: AuthRequest,
+            canAuthStrong: Int,
+            onGracePeriodElapsed: () -> Unit = {},
+        ) {
+            Log.i(
+                TAG,
+                "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
+            )
+            activity.lifecycleScope.launch {
+                delay(DEBUG_AUTO_APPROVE_DELAY_MS)
+                if (getInstance().hasPendingRequest(authRequest.requestId)) {
+                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
+                    approveRequest(activity, authRequest)
+                }
+                onGracePeriodElapsed()
+            }
+        }
+
+        /**
          * Signs the auth challenge using the device's private key and submits an approved response
          * through AuthRequestManager.
          */
@@ -514,8 +544,6 @@ class AuthRequestManager private constructor() {
             }
         }
     }
-
-    // Debug helper methods removed
 }
 
 private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {

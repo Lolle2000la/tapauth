@@ -8,11 +8,8 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.service.AuthRequestManager
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 /**
  * Transparent activity that shows the biometric prompt directly from a notification. This activity
@@ -78,21 +75,7 @@ class BiometricPromptActivity : FragmentActivity() {
             // Show biometric prompt immediately
             showBiometricPrompt(authRequest)
         } else if (BuildConfig.E2E_TESTING) {
-            // In dedicated E2E automated test environments without enrolled biometrics, wait
-            // briefly for explicit
-            // denial broadcast, then auto-approve if still pending
-            Log.i(
-                TAG,
-                "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
-            )
-            lifecycleScope.launch {
-                delay(AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS)
-                if (AuthRequestManager.getInstance().hasPendingRequest(authRequest.requestId)) {
-                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
-                    AuthRequestManager.approveRequest(this@BiometricPromptActivity, authRequest)
-                }
-                finish()
-            }
+            AuthRequestManager.autoApproveInE2e(this, authRequest, canAuthStrong) { finish() }
         } else {
             // Biometric not available in production, deny request and finish
             Log.e(

@@ -233,8 +233,6 @@ pub struct AuthSession {
     /// Transports enabled for this attempt (read from config when the
     /// attempt starts)
     transports: TransportsEnabled,
-    #[allow(dead_code)] // Used in select! macro via cancel_rx local variable
-    cancel_rx: Option<oneshot::Receiver<()>>,
     cancel_registry: Option<CancelRegistry>,
     request_id: Option<String>,
 }
@@ -253,7 +251,6 @@ impl AuthSession {
                 network: true,
                 ble: cfg!(feature = "ble"),
             },
-            cancel_rx: None,
             cancel_registry: None,
             request_id: None,
         })
