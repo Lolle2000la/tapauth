@@ -43,12 +43,18 @@ if ! pgrep -x bluetoothd > /dev/null; then
         || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
 fi
 
-# Bumble provides the netsim <-> vhci bridge; --break-system-packages only exists
-# on pip >= 23.0, hence the plain retry.
+# Bumble provides the netsim <-> vhci bridge. Install into the invoking user's
+# site-packages: this runner's system Python owns a typing-extensions copy that
+# pip is not allowed to replace, and --user sidesteps that (and needs no sudo).
+# The second form is for pip releases older than 23.0, which lack the flag.
 if ! python3 -c "import bumble" 2>/dev/null; then
     echo "    Installing Bumble (android-netsim extra)..."
-    $SUDO python3 -m pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf \
-        || $SUDO python3 -m pip install "bumble[android-netsim]" grpcio protobuf
+    python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
+        || python3 -m pip install "bumble[android-netsim]" grpcio protobuf \
+        || {
+            echo "❌ ERROR: could not install Bumble (both pip forms failed)."
+            exit 1
+        }
 fi
 
 # Capture existing hci devices to detect the newly created one

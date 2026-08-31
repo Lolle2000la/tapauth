@@ -109,7 +109,13 @@ jobs:
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
             policykit-1
-          sudo python3 -m pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf
+          # The runner image ships typing-extensions as a Debian-owned package with
+          # no RECORD file, so a system-wide install of bumble aborts on it. A
+          # user-site install avoids that; the plain form is kept as the last resort
+          # because it is what actually succeeded historically (pip auto-selects a
+          # user install when system site-packages is not writable).
+          python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
+            || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
         run: |
