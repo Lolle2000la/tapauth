@@ -106,11 +106,11 @@ jobs:
       - name: Run clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run clippy (dev sandbox: fallback-socket)
+      - name: "Run clippy (dev sandbox, fallback-socket)"
         run: cargo clippy -p tapauthd --features fallback-socket --all-targets -- -D warnings
 
-      - name: Run clippy (E2E CI build: UDP loopback shim + PolKit bypass)
+      - name: "Run clippy (E2E build, UDP loopback + PolKit bypass)"
         run: cargo clippy -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --all-targets -- -D warnings
 
-      - name: Run clippy (state-dir override only)
+      - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
