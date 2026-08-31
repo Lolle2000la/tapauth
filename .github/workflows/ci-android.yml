@@ -11,6 +11,10 @@ on:
       - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
+      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
+      - 'systemd/**'
+      - 'packaging/**'
+      - 'create-dev-users.sh'
       - '.github/workflows/ci-android.yml'
   pull_request:
     branches: [main]
@@ -22,6 +26,10 @@ on:
       - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
+      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
+      - 'systemd/**'
+      - 'packaging/**'
+      - 'create-dev-users.sh'
       - '.github/workflows/ci-android.yml'
 
 env:
@@ -85,6 +93,11 @@ jobs:
       - name: Build native libraries (fail-fast)
         run: cd server-android && ./gradlew cargoBuild
 
+      - name: Run Android JVM unit tests
+        # Rate limiter, replay cache and retransmission semantics are pure JVM
+        # logic; these run without an emulator and must not sit unexecuted.
+        run: cd server-android && ./gradlew test --stacktrace
+
       - name: Build Android Debug APK, E2E APK, and Test APK
         run: cd server-android && ./gradlew assembleDebug assembleE2e assembleE2eAndroidTest --stacktrace
 
@@ -96,17 +109,20 @@ jobs:
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
             policykit-1
-          sudo pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || sudo pip3 install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf
+          sudo python3 -m pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf
 
       - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
         run: |
-          # Production-style build used by the E2E: systemd socket activation
-          # (fallback-socket stays OFF). dev-state-override is compiled in ONLY
-          # for the emulator UDP delivery shim (TAPAUTH_DEV_UDP_TARGET); all
-          # state/config paths remain the real production paths, and PolKit
-          # authorization stays enforced for non-root callers (asserted by the
-          # E2E's Phase 7).
-          cargo build -p tapauthd --no-default-features --features ble,dev-state-override --bin tapauthd --bin tapauth-ipc-cli
+          # Build used by the E2E: systemd socket activation (fallback-socket OFF)
+          # and NO dev-state-override, so every state/config/socket path is the real
+          # production one. Only two dev knobs are compiled in, both still requiring
+          # TAPAUTH_DEV_MODE at runtime:
+          #   dev-udp-loopback   - the emulator UDP delivery shim (a hosted runner
+          #                        has no LAN broadcast path into the emulator)
+          #   dev-polkit-bypass  - lets the root test harness administer the daemon
+          #                        without an authentication agent; PolKit is still
+          #                        enforced for non-root callers (asserted by Phase 7)
+          cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
           cargo build -p client-pam
 
       - name: Free disk space for emulator
@@ -193,5 +209,7 @@ jobs:
         with:
           name: native-libraries
           path: server-android/app/build/rustJniLibs/android/
-          if-no-files-found: ignore
+          # `ignore` here would let the plugin's output directory move silently and
+          # drop the artifact; a missing directory should fail the job instead.
+          if-no-files-found: error
           retention-days: 30
