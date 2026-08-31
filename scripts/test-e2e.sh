@@ -262,15 +262,12 @@ wait_pid_with_timeout() {
     return 99
 }
 
-# Step 0: Register PolKit policy if permissions allow
-POLKIT_POLICY_SRC="${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy"
+# PolKit policy bookkeeping: the policy itself is only ever installed by the
+# systemd-mode setup block below (the dev sandbox's dev-polkit-bypass makes an
+# installed policy unnecessary, and Phase 7 runs in systemd mode only). These
+# defaults keep cleanup() safe if the suite aborts before that block runs.
 POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
 INSTALLED_POLKIT=false
-if [ -d "/usr/share/polkit-1/actions" ] && [ -w "/usr/share/polkit-1/actions" ] && [ -f "$POLKIT_POLICY_SRC" ] && [ ! -f "$POLKIT_POLICY_DEST" ]; then
-    echo "    Registering PolKit policy for testing..."
-    cp "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST" 2>/dev/null || true
-    INSTALLED_POLKIT=true
-fi
 
 # Step 1: Build necessary Linux binaries
 echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
@@ -346,7 +343,7 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     # what it registered, and removing a pre-existing production policy would
     # break the host's real installation.
     if [ ! -f "$POLKIT_POLICY_DEST" ]; then
-        install -Dm0644 "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST"
+        install -Dm0644 "${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy" "$POLKIT_POLICY_DEST"
         INSTALLED_POLKIT=true
     fi
 
@@ -1154,13 +1151,15 @@ fi
 if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
 echo "║  Phase 7: Admin IPC Authorization (PolKit):      PASSED       ║"
 echo "║  Daemon mode: systemd socket activation (prod)   ✔            ║"
+else
+echo "║  Daemon mode: dev sandbox (fallback-socket)      ✔            ║"
+fi
+# Phase 6b runs whenever the PAM stack is testable and the suite is root —
+# which includes a root-forced dev-mode run — so report it mode-independently.
 if [ "$PAM_FALLBACK_OK" = "1" ]; then
 echo "║  Phase 6b: Mixed-stack PAM password fallback:    PASSED       ║"
 else
 echo "║  Phase 6b: Mixed-stack PAM password fallback:    SKIPPED      ║"
-fi
-else
-echo "║  Daemon mode: dev sandbox (fallback-socket)      ✔            ║"
 fi
 echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
 echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"

@@ -275,9 +275,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
             };
             let cfg_resp = send_admin(cfg_req, Duration::from_secs(10)).await?;
+            if cfg_resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+                // Refusing to fall back to defaults here: SaveConfig persists the
+                // whole config, so guessing hostname/udp_port could clobber the
+                // daemon's real values.
+                eprintln!(
+                    "ERROR: could not read current config: {}",
+                    cfg_resp.error_message
+                );
+                std::process::exit(1);
+            }
             let (hostname, udp_port) = match cfg_resp.payload {
                 Some(ipc::admin_response::Payload::GetConfig(c)) => (c.hostname, c.udp_port),
-                _ => ("".to_string(), 36692),
+                _ => {
+                    eprintln!("ERROR: unexpected response payload from get-config");
+                    std::process::exit(1);
+                }
             };
 
             let req = ipc::AdminRequest {

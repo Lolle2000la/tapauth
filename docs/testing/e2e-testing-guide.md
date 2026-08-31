@@ -150,9 +150,11 @@ In addition to end-to-end integration flows, core protocol defenses are verified
 - **`RetransmissionManagerTest`**:
   - 500ms fixed interval retransmission for `AuthenticationGrant` and `AuthenticationDenial`.
   - Immediate cancellation when `GrantConfirmation` is received.
-- **`TemporalIdCache`**:
-  - On-demand O(1) pre-authentication filter across current and previous 60s windows.
-  - Immediate cache clearance on empty device list upon un-pairing.
+
+`TemporalIdCache` (O(1) pre-authentication filter across current and previous 60s windows, with
+immediate cache clearance when the paired-device list becomes empty) has no dedicated JVM unit
+test; its behavior is exercised end-to-end by Phases 2–4, where every inbound packet must pass
+its filter before decryption.
 
 ---
 

@@ -365,19 +365,11 @@ class AuthRequestManager private constructor() {
         }
     }
 
-    /** Get a pending request by ID */
-    fun getPendingRequest(requestId: String): AuthRequest? {
-        return pendingRequests[requestId]?.authRequest
-    }
-
     /** Check if a pending request exists by ID */
     fun hasPendingRequest(requestId: String): Boolean = pendingRequests.containsKey(requestId)
 
     /** Get all active request IDs */
     fun getActiveRequestIds(): Set<String> = pendingRequests.keys.toSet()
-
-    /** Get count of pending requests */
-    fun getPendingCount(): Int = pendingRequests.size
 
     /**
      * Cancel all pending requests that match the given challenge This is used when an
@@ -449,9 +441,7 @@ class AuthRequestManager private constructor() {
         // individually dismissed.
 
         const val ACTION_AUTH_REQUEST = "dev.rourunisen.tapauth.AUTH_REQUEST"
-        const val ACTION_AUTH_RESPONSE = "dev.rourunisen.tapauth.AUTH_RESPONSE"
         const val EXTRA_AUTH_REQUEST = "auth_request"
-        const val EXTRA_SIGNED_CHALLENGE = "signed_challenge"
 
         @Volatile private var instance: AuthRequestManager? = null
 

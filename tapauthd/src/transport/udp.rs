@@ -53,6 +53,10 @@ fn dev_udp_target() -> Option<&'static str> {
         .get_or_init(|| {
             if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
                 Some(
+                    // Default must stay in sync with DEV_HOST_PORT in
+                    // scripts/test-e2e.sh (exported to the bridge helpers as
+                    // TAPAUTH_E2E_DEV_HOST_PORT); the suite always sets this
+                    // env var explicitly, so this only matters for bare dev runs.
                     std::env::var("TAPAUTH_DEV_UDP_TARGET")
                         .unwrap_or_else(|_| "127.0.0.1:36695".to_string()),
                 )
