@@ -433,12 +433,12 @@ pub async fn receive_udp_packet(
             continue;
         }
 
-        #[cfg(any(feature = "dev-state-override", test))]
+        #[cfg(any(feature = "dev-udp-loopback", test))]
         let skip_local_filter = {
             static DEV_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *DEV_MODE.get_or_init(|| std::env::var("TAPAUTH_DEV_MODE").is_ok())
         };
-        #[cfg(not(any(feature = "dev-state-override", test)))]
+        #[cfg(not(any(feature = "dev-udp-loopback", test)))]
         let skip_local_filter = false;
 
         if !skip_local_filter && is_local_ip(&src_ip) {

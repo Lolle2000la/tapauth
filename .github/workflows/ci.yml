@@ -9,6 +9,7 @@ on:
       - 'client-pam/**'
       - 'client-config-gui/**'
       - 'proto/**'
+      - 'scripts/ci/check-production-build.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -20,6 +21,7 @@ on:
       - 'client-pam/**'
       - 'client-config-gui/**'
       - 'proto/**'
+      - 'scripts/ci/check-production-build.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -80,6 +82,9 @@ jobs:
       - name: Build all workspace members
         run: cargo build --workspace --verbose
 
+      - name: Verify production binaries contain no dev/test overrides
+        run: ./scripts/ci/check-production-build.sh
+
       - name: Run tests for shared library
         run: cargo test --manifest-path shared/Cargo.toml --verbose
 
@@ -101,5 +106,11 @@ jobs:
       - name: Run clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run clippy (with fallback-socket / dev-state-override)
+      - name: Run clippy (dev sandbox: fallback-socket)
         run: cargo clippy -p tapauthd --features fallback-socket --all-targets -- -D warnings
+
+      - name: Run clippy (E2E CI build: UDP loopback shim + PolKit bypass)
+        run: cargo clippy -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --all-targets -- -D warnings
+
+      - name: Run clippy (state-dir override only)
+        run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings

@@ -46,7 +46,7 @@ impl UdpTransport {
     }
 }
 
-#[cfg(any(feature = "dev-state-override", test))]
+#[cfg(any(feature = "dev-udp-loopback", test))]
 fn dev_udp_target() -> Option<&'static str> {
     static TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     TARGET
@@ -63,7 +63,7 @@ fn dev_udp_target() -> Option<&'static str> {
         .as_deref()
 }
 
-#[cfg(any(feature = "dev-state-override", test))]
+#[cfg(any(feature = "dev-udp-loopback", test))]
 fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
     if let Some(target) = dev_udp_target() {
         use prost::Message;
@@ -86,7 +86,7 @@ impl Transport for UdpTransport {
             tracing::warn!("Failed to send IPv4 broadcast: {}", e);
         }
 
-        #[cfg(any(feature = "dev-state-override", test))]
+        #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
         // Send multicast on IPv6 (on all available interfaces)
@@ -121,7 +121,7 @@ impl Transport for UdpTransport {
         // Send on both IPv4 and IPv6
         send_udp_broadcast(&self.socket, self.port, packet).await?;
 
-        #[cfg(any(feature = "dev-state-override", test))]
+        #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
         if is_ipv6_available() {
@@ -135,7 +135,7 @@ impl Transport for UdpTransport {
         // Send on both IPv4 and IPv6
         send_udp_broadcast(&self.socket, self.port, packet).await?;
 
-        #[cfg(any(feature = "dev-state-override", test))]
+        #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
         if is_ipv6_available() {

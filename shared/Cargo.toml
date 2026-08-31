@@ -64,7 +64,11 @@ default = []
 jni = ["dep:jni"]
 tpm = [] # TPM 2.0 support (requires tpm2-tools on system)
 firewall = [] # Firewall management support (requires iptables/nftables on system)
-# dev-state-override: enables TAPAUTH_STATE_DIR and TAPAUTH_CONFIG_FILE env vars
-# to override persistent state and configuration directories. For testing/dev only.
+# dev-state-override: enables the TAPAUTH_STATE_DIR env var to relocate the
+# persistent state directory and the config file inside it. For testing/dev only.
 # Production builds must NOT enable this feature.
 dev-state-override = []
+# dev-udp-loopback: lets the UDP receive path accept peer packets from local
+# addresses (loopback/NAT) so a daemon can be tested against a locally emulated
+# peer. For testing/dev only; production builds must NOT enable it.
+dev-udp-loopback = []
