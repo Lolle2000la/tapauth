@@ -16,12 +16,13 @@
 #     Builds the feature-gated daemon (fallback-socket) and redirects state via
 #     TAPAUTH_STATE_DIR / TAPAUTHD_SOCK into a temporary sandbox directory.
 #
-# NOTE on the systemd-mode build: `dev-state-override` is compiled in ONLY to
-# use the emulator UDP delivery shim (TAPAUTH_DEV_UDP_TARGET) — a hosted CI
-# runner has no LAN broadcast path into the Android emulator. The PolKit admin
-# authorization remains fully enforced for non-root callers (Phase 7 asserts
-# this), and no TAPAUTH_STATE_DIR/TAPAUTH_CONFIG_FILE redirection is active,
-# so all state/config paths are the real production paths.
+# NOTE on the systemd-mode build: it enables ONLY `dev-udp-loopback` (the
+# emulator UDP delivery shim, TAPAUTH_DEV_UDP_TARGET) and `dev-polkit-bypass`
+# (so headless runners need no authentication agent). A hosted CI runner has no
+# LAN broadcast path into the Android emulator, hence the shim. `dev-state-override`
+# stays OFF in this mode, so no TAPAUTH_STATE_DIR/TAPAUTHD_SOCK redirection is
+# compiled in at all: every state and config path is the real production path.
+# PolKit is still evaluated for every non-root caller (Phase 7 asserts this).
 
 set -e
 
@@ -36,6 +37,18 @@ echo "╚═══════════════════════�
 echo ""
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# ── Ports ─────────────────────────────────────────────────────────────────────
+# UDP_PORT      the daemon's port (written to the config file, used for packet
+#               capture and for injecting adversarial packets).
+# DEV_HOST_PORT host-side port of the emulator UDP redirection
+#               (adb emu redir add udp:$DEV_HOST_PORT:$UDP_PORT); the daemon
+#               unicasts to it when the dev-udp-loopback feature is compiled in.
+UDP_PORT="${TAPAUTH_E2E_UDP_PORT:-36692}"
+DEV_HOST_PORT="${TAPAUTH_E2E_DEV_HOST_PORT:-36695}"
+# Exported so the bridge helpers stay in sync with this suite's port choices.
+export TAPAUTH_E2E_UDP_PORT="$UDP_PORT"
+export TAPAUTH_E2E_DEV_HOST_PORT="$DEV_HOST_PORT"
 
 # Ensure adb is in PATH
 if ! command -v adb &> /dev/null; then
@@ -99,6 +112,7 @@ TEST_USER="$(whoami)"
 
 echo "ℹ️  Daemon mode:    $E2E_DAEMON_MODE"
 echo "ℹ️  Test User:      $TEST_USER"
+echo "ℹ️  UDP port:       $UDP_PORT (emulator shim: 127.0.0.1:$DEV_HOST_PORT)"
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     echo "ℹ️  Isolated Socket: $TAPAUTHD_SOCK"
     echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
@@ -106,12 +120,19 @@ fi
 echo "ℹ️  Sandbox Dir:    $TEST_DIR"
 echo ""
 
+# Background processes this suite owns directly; the BLE/biometric helpers track
+# their own PIDs in /tmp and are torn down through their own subcommands.
 DAEMON_PID=""
 JOURNAL_PID=""
 CAPTURE_PID=""
-BUMBLE_PID=""
-REFLECTOR_PID=""
-BIO_PID=""
+
+# systemd-mode teardown bookkeeping: only undo what this run actually installed.
+# (Set for real in the systemd setup block below; defaults keep cleanup() safe if
+# the suite aborts earlier.)
+E2E_OWNED_STATE=false
+CREATED_CONFIG=false
+UNITS_PREEXISTED=false
+BINARY_PREEXISTED=false
 
 # Env prefix for pamtester invocations: dev mode points the PAM module (and CLI,
 # which honors TAPAUTHD_SOCK unconditionally) at the sandbox socket; systemd
@@ -132,11 +153,6 @@ cleanup() {
         echo "=== DAEMON LOG DUMP ==="
         cat "$DAEMON_LOG"
         echo "======================="
-    fi
-    if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/udp-reflector.log ]; then
-        echo "=== UDP REFLECTOR LOG DUMP ==="
-        cat /tmp/udp-reflector.log
-        echo "=============================="
     fi
     if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/bumble-bridge.log ]; then
         echo "=== BUMBLE LOG DUMP ==="
@@ -170,12 +186,34 @@ cleanup() {
         kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
         rm -f /tmp/bumble-bridge.pid
     fi
-    if [ -f /tmp/udp-reflector.pid ]; then
-        kill "$(cat /tmp/udp-reflector.pid)" 2>/dev/null || true
-        rm -f /tmp/udp-reflector.pid
-    fi
     if [ "$INSTALLED_POLKIT" = true ]; then
         sudo rm -f "$POLKIT_POLICY_DEST" 2>/dev/null || true
+    fi
+    # systemd mode installed a real daemon on this host; put the machine back the
+    # way we found it. Without this, `sudo ./scripts/test-e2e.sh` would leave a
+    # debug binary plus an E2E drop-in (TAPAUTH_DEV_MODE=1 + UDP shim) enabled on
+    # the developer's machine. Files that already existed are never deleted.
+    if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
+        rm -f /etc/systemd/system/tapauthd.service.d/e2e.conf 2>/dev/null || true
+        rmdir /etc/systemd/system/tapauthd.service.d 2>/dev/null || true
+        if [ "$UNITS_PREEXISTED" != true ]; then
+            rm -f /etc/systemd/system/tapauthd.service /etc/systemd/system/tapauthd.socket 2>/dev/null || true
+        fi
+        if [ "$BINARY_PREEXISTED" != true ]; then
+            rm -f /usr/bin/tapauthd /usr/local/bin/tapauth-ipc-cli 2>/dev/null || true
+        fi
+        systemctl daemon-reload 2>/dev/null || true
+        if [ "$CREATED_CONFIG" = true ]; then
+            rm -f "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+        fi
+        if [ "$E2E_OWNED_STATE" = true ]; then
+            find /var/lib/tapauth -mindepth 1 -delete 2>/dev/null || true
+        fi
+        if [ "$UNITS_PREEXISTED" = true ] || [ "$BINARY_PREEXISTED" = true ]; then
+            echo "⚠️  WARNING: this run replaced pre-existing TapAuth units/binaries with"
+            echo "   the E2E debug build and left them in place. Reinstall (e.g."
+            echo "   ./install.sh or your distro package) before using TapAuth again."
+        fi
     fi
     if [ -w "$PAM_CONFIG_PATH" ]; then
         rm -f "$PAM_CONFIG_PATH" 2>/dev/null || true
@@ -211,8 +249,8 @@ assert_stat() {
 # Helper: wait for a background process to exit, with a timeout (seconds).
 # Returns the process' exit status, or 99 on timeout (after SIGKILL).
 wait_pid_with_timeout() {
-    local pid=$1 timeout_secs=$2 i
-    for i in $(seq 1 $((timeout_secs * 10))); do
+    local pid=$1 timeout_secs=$2
+    for _ in $(seq 1 $((timeout_secs * 10))); do
         if ! kill -0 "$pid" 2>/dev/null; then
             wait "$pid"
             return $?
@@ -240,9 +278,11 @@ echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-p
 # regardless of any user-level CARGO_TARGET_DIR override (~/.cargo/config.toml).
 export CARGO_TARGET_DIR="${PROJECT_ROOT}/target"
 if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
-    # Production-style build: systemd socket activation (fallback-socket OFF).
-    # dev-state-override is only needed for the emulator UDP shim; see header.
-    cargo build -p tapauthd --no-default-features --features ble,dev-state-override --bin tapauthd --bin tapauth-ipc-cli
+    # Production-style build: systemd socket activation (fallback-socket OFF) and
+    # no dev-state-override, so state/config/socket paths are production. Only the
+    # emulator UDP shim and the headless PolKit bypass are compiled in, both still
+    # requiring TAPAUTH_DEV_MODE at runtime.
+    cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
     cargo build -p client-pam
 else
     cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
@@ -258,6 +298,42 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     echo ""
     echo "==> Step 1b: Installing production systemd environment (units, users, config)..."
 
+    # This mode installs over a REAL system installation (/usr/bin/tapauthd, the
+    # systemd units, /etc/tapauth, /var/lib/tapauth). On CI the runner is
+    # disposable; on a developer workstation that is someone's live pairing state,
+    # so refuse unless the caller opts in explicitly.
+    PREEXISTING=""
+    if [ -x /usr/bin/tapauthd ]; then
+        PREEXISTING="/usr/bin/tapauthd"
+    fi
+    if [ -n "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
+        PREEXISTING="${PREEXISTING:+$PREEXISTING, }/var/lib/tapauth (non-empty)"
+    fi
+    if [ -n "$PREEXISTING" ] && [ "${TAPAUTH_E2E_ALLOW_DESTRUCTIVE:-0}" != "1" ]; then
+        echo "❌ ERROR: systemd mode would overwrite an existing TapAuth installation: $PREEXISTING"
+        echo "   Run as root inside a disposable VM/container, or set"
+        echo "   TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 to accept that pairing state and"
+        echo "   binaries under /var/lib/tapauth, /etc/tapauth and /usr/bin are replaced."
+        exit 1
+    fi
+    # We only remove state/config files that we know were absent before this run.
+    E2E_OWNED_STATE=false
+    if [ ! -d /var/lib/tapauth ] || [ -z "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
+        E2E_OWNED_STATE=true
+    fi
+    CREATED_CONFIG=false
+    # Same for the units and binaries: with TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 on a
+    # host that already has TapAuth installed, overwrite them for the duration of
+    # the run but never delete the pre-existing files afterwards.
+    UNITS_PREEXISTED=false
+    if [ -e /etc/systemd/system/tapauthd.service ] || [ -e /etc/systemd/system/tapauthd.socket ]; then
+        UNITS_PREEXISTED=true
+    fi
+    BINARY_PREEXISTED=false
+    if [ -e /usr/bin/tapauthd ] || [ -e /usr/local/bin/tapauth-ipc-cli ]; then
+        BINARY_PREEXISTED=true
+    fi
+
     # 1. System users/groups exactly as install.sh creates them
     "$PROJECT_ROOT/create-dev-users.sh"
 
@@ -266,8 +342,13 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     install -Dm0755 "$CLI_BIN" /usr/local/bin/tapauth-ipc-cli
     install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.service" /etc/systemd/system/tapauthd.service
     install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.socket" /etc/systemd/system/tapauthd.socket
-    install -Dm0644 "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST"
-    INSTALLED_POLKIT=true
+    # Only register the policy if it is not already installed: cleanup() deletes
+    # what it registered, and removing a pre-existing production policy would
+    # break the host's real installation.
+    if [ ! -f "$POLKIT_POLICY_DEST" ]; then
+        install -Dm0644 "$POLKIT_POLICY_SRC" "$POLKIT_POLICY_DEST"
+        INSTALLED_POLKIT=true
+    fi
 
     # 3. Runtime/state/config directories exactly as packaging does
     systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
@@ -276,25 +357,29 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     chown tapauthd:tapauthd /etc/tapauth
     chmod 700 /etc/tapauth
     if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
+        CREATED_CONFIG=true
         cat > "$CONFIG_ASSERT_FILE" <<EOF
 # TapAuth Configuration (created by the E2E suite, mirrors install.sh)
 pam_operation_timeout_secs = 120
-udp_port = 36692
+udp_port = ${UDP_PORT}
 use_tpm = false
 EOF
         chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE"
         chmod 644 "$CONFIG_ASSERT_FILE"
     fi
 
-    # 4. E2E-only unit override: emulator UDP delivery shim + debug logging.
-    #    This is the ONLY non-production knob; it exists because a CI runner
-    #    cannot deliver LAN broadcasts into the Android emulator.
+    # 4. E2E-only unit override. These are the ONLY non-production knobs: the
+    #    emulator UDP delivery shim (a CI runner cannot deliver LAN broadcasts
+    #    into the Android emulator), the headless PolKit bypass, and debug logs.
+    #    State/config paths and socket activation stay production; the binary is
+    #    built WITHOUT dev-state-override, so TAPAUTH_STATE_DIR cannot redirect
+    #    anything even if it were set in the environment.
     mkdir -p /etc/systemd/system/tapauthd.service.d
     cat > /etc/systemd/system/tapauthd.service.d/e2e.conf <<EOF
 # E2E-only override (not shipped in production packages)
 [Service]
 Environment=TAPAUTH_DEV_MODE=1
-Environment=TAPAUTH_DEV_UDP_TARGET=127.0.0.1:36695
+Environment=TAPAUTH_DEV_UDP_TARGET=127.0.0.1:${DEV_HOST_PORT}
 Environment=TAPAUTH_LOG_LEVEL=debug
 Environment=RUST_LOG=debug
 EOF
@@ -344,7 +429,6 @@ elif [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
 fi
 
 if [ -f "server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk" ]; then
-    TEST_PKG="dev.rourunisen.tapauth.e2e.test"
     adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
 elif [ -f "server-android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" ]; then
     TEST_PKG="dev.rourunisen.tapauth.debug.test"
@@ -371,7 +455,7 @@ if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     DAEMON_PID=$!
 
     echo -n "    Waiting for daemon socket"
-    for i in {1..50}; do
+    for _ in {1..50}; do
         if [ -S "$TAPAUTHD_SOCK" ]; then break; fi
         echo -n "."; sleep 0.1
     done
@@ -406,21 +490,21 @@ adb shell am instrument -w \
     -e pairing_host 10.0.2.2 \
     -e pairing_port "$PORT_NEG" \
     -e reject_sas true \
-    -e start_services false \
     "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_NEG_LOG" 2>&1 || true
 
 wait "$WAIT_NEG_PID" || true
 
 set +e
-"$CLI_BIN" complete-pairing "$PORT_NEG" > /dev/null 2>&1
+"$CLI_BIN" complete-pairing "$PORT_NEG" > "${TEST_DIR}/complete_neg_pairing.log" 2>&1
 COMPLETE_NEG_EXIT=$?
 set -e
 
 NEG_SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
-if [ "$NEG_SERVERS_COUNT" -eq 0 ]; then
-    echo "✅ Negative pairing test PASSED: SAS rejection aborted handshake; 0 paired devices stored."
+if [ "$COMPLETE_NEG_EXIT" -ne 0 ] && [ "$NEG_SERVERS_COUNT" -eq 0 ]; then
+    echo "✅ Negative pairing test PASSED: SAS rejection aborted the handshake (complete-pairing exit $COMPLETE_NEG_EXIT), 0 paired devices stored."
 else
-    echo "❌ ERROR: negative pairing stored a device ($NEG_SERVERS_COUNT devices registered)!"
+    echo "❌ ERROR: negative pairing did not abort cleanly (complete-pairing exit=$COMPLETE_NEG_EXIT, devices=$NEG_SERVERS_COUNT)!"
+    cat "${TEST_DIR}/complete_neg_pairing.log" || true
     exit 1
 fi
 
@@ -558,7 +642,7 @@ CAPTURE_MANDATORY=0
 if [ "$(id -u)" -eq 0 ]; then
     CAPTURE_MANDATORY=1
     echo "==> Starting UDP packet capture (AF_PACKET sniffer)..."
-    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" sniff --port 36692 --duration 30 \
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" sniff --port "$UDP_PORT" --duration 30 \
         > "$TEST_DIR/grants.hex" 2> "$TEST_DIR/sniff.err" &
     CAPTURE_PID=$!
 fi
@@ -690,10 +774,10 @@ if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     sleep 1
 
-    # Timing note: with no biometrics enrolled, the E2E app build auto-approves
-    # a request ~1.05s after the daemon issues it. Injections and the cancel
-    # below deliberately land inside that window while the session is still
-    # pending.
+    # Timing note: with no biometrics enrolled, the E2E app build auto-approves a
+    # request after AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS (1s) plus prompt
+    # overhead. Injections and the cancel below deliberately land inside that
+    # window while the session is still pending.
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     REPLAY_REQUEST_ID="e2e-replay-$$"
     echo "==> Starting auth session (request id $REPLAY_REQUEST_ID) with no grant expected..."
@@ -703,10 +787,10 @@ if [ "$CAPTURE_OK" = "1" ]; then
     sleep 0.3
 
     echo "==> Injecting captured grant from an OLD session (challenge mismatch expected)..."
-    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --port "$UDP_PORT"
     sleep 0.2
     echo "==> Re-injecting the SAME grant (same-session nonce cache expected)..."
-    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX"
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --port "$UDP_PORT"
     sleep 0.1
 
     echo "==> Cancelling the pending session via IPC before the app's auto-approval fires..."
@@ -761,11 +845,11 @@ if [ "$CAPTURE_OK" = "1" ]; then
     TAMPER_LOG="${TEST_DIR}/tamper-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$TAMPER_REQUEST_ID" > "$TAMPER_LOG" 2>&1 &
     TAMPER_CLI_PID=$!
-    # Inject inside the pre-grant window (the E2E app auto-approves at ~1.2-1.4s).
+    # Inject inside the pre-grant window (DEBUG_AUTO_APPROVE_DELAY_MS is 1s).
     sleep 0.4
 
     echo "==> Injecting grant with a flipped AES-GCM tag byte..."
-    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --corrupt
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --port "$UDP_PORT" --corrupt
 
     set +e
     wait_pid_with_timeout "$TAMPER_CLI_PID" 15
@@ -817,32 +901,25 @@ echo "╚═══════════════════════�
 
 sleep 2
 
-BLE_AVAILABLE="true"
-if [ -f /tmp/ble-available.txt ]; then
-    BLE_AVAILABLE=$(cat /tmp/ble-available.txt)
-fi
+# Virtual BLE is a hard requirement: setup-emulator-ble-bridge.sh exits non-zero
+# (aborting this suite under `set -e`) when no HCI adapter appears, so reaching
+# this point means the bridge is up.
+echo "==> Setting transport config: BLE enabled, UDP disabled..."
+"$CLI_BIN" set-transports --ble true --network false
 
-if [ "$BLE_AVAILABLE" = "true" ]; then
-    echo "==> Setting transport config: BLE enabled, UDP disabled..."
-    "$CLI_BIN" set-transports --ble true --network false
+echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
+BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
+echo "$BLE_AUTH_OUTPUT"
 
-    echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-    BLE_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
-    echo "$BLE_AUTH_OUTPUT"
-
-    if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
-        echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
-    else
-        echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED."
-        if [ -f "$DAEMON_LOG" ]; then
-            echo "=== DAEMON LOG DUMP ==="
-            cat "$DAEMON_LOG"
-            echo "======================="
-        fi
-        exit 1
-    fi
+if echo "$BLE_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
+    echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
 else
-    echo "❌ ERROR: Virtual BLE (/dev/vhci) is required for E2E testing but is not available!"
+    echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED."
+    if [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
+    fi
     exit 1
 fi
 
@@ -854,21 +931,16 @@ echo "╚═══════════════════════�
 
 sleep 2
 
-if [ "$BLE_AVAILABLE" = "true" ]; then
-    echo "==> Setting transport config: Both BLE and UDP enabled..."
-    "$CLI_BIN" set-transports --ble true --network true
+echo "==> Setting transport config: Both BLE and UDP enabled..."
+"$CLI_BIN" set-transports --ble true --network true
 
-    PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
-    echo "$PARALLEL_OUTPUT"
+PARALLEL_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
+echo "$PARALLEL_OUTPUT"
 
-    if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
-        echo "✅ Parallel Discovery Race Authentication PASSED!"
-    else
-        echo "❌ Parallel Discovery Race Authentication FAILED."
-        exit 1
-    fi
+if echo "$PARALLEL_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
+    echo "✅ Parallel Discovery Race Authentication PASSED!"
 else
-    echo "❌ ERROR: Virtual BLE (/dev/vhci) is required for Parallel Race testing but is not available!"
+    echo "❌ Parallel Discovery Race Authentication FAILED."
     exit 1
 fi
 
@@ -891,7 +963,7 @@ DENIAL_OUT_LOG="${TEST_DIR}/denial-cli.log"
 DENIAL_CLI_PID=$!
 
 sleep 0.5
-"$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny
+"$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny "$APP_PKG"
 
 set +e
 wait "$DENIAL_CLI_PID"

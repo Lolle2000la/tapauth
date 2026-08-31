@@ -57,7 +57,7 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
   1. Desktop starts an ephemeral TCP pairing listener.
   2. Android connects via `PairingE2eTest -e reject_sas true`.
   3. Ephemeral ECDH exchange completes and derives the SAS, but Android rejects the SAS confirmation and closes the TCP connection.
-  4. Desktop's `complete-pairing` fails, and the test asserts that `get-servers` records 0 paired devices on disk.
+  4. Desktop's `complete-pairing` fails: the suite asserts both its non-zero exit code and that `get-servers` records 0 paired devices on disk.
 - **Phase 1b (Legitimate Pairing Handshake)**:
   1. `tapauthd` generates a dynamic TCP listener port and ephemeral X25519 pairing keypair.
   2. Android emulator runs `PairingE2eTest` connecting to host `10.0.2.2:<port>`.
@@ -160,7 +160,7 @@ In addition to end-to-end integration flows, core protocol defenses are verified
 
 ### UDP Network Bridge
 Android emulators run on a virtual NAT subnet (`10.0.2.15`), where `10.0.2.2` represents the host.
-- **Inbound (Host $\to$ Emulator)**: In dev mode (`TAPAUTH_DEV_MODE`, feature `dev-state-override`), the daemon unicasts every request to `127.0.0.1:36695` (configured via `TAPAUTH_DEV_UDP_TARGET`), which `adb emu redir add udp:36695:36692` forwards directly to the guest emulator.
+- **Inbound (Host $\to$ Emulator)**: In dev mode (`TAPAUTH_DEV_MODE`, feature `dev-udp-loopback`), the daemon unicasts every request to `127.0.0.1:36695` (configured via `TAPAUTH_DEV_UDP_TARGET`), which `adb emu redir add udp:36695:36692` forwards directly to the guest emulator. The same feature makes the receiver accept locally-sourced replies, which the production filter would otherwise drop as self-sent.
 - **Outbound (Emulator $\to$ Host)**: Android replies directly to `senderAddress.hostAddress:appConfig.udpPort` (`10.0.2.2:36692`), which SLIRP delivers to the daemon's socket.
 
 ### Virtual BLE Bridge (Google Bumble + Netsim)
@@ -180,7 +180,19 @@ Android emulators provide an internal Bluetooth simulation service called **Nets
 
 ### In CI (GitHub Actions)
 E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and push to `main`.
-CI runs in **systemd mode**: the daemon is built production-style (systemd socket activation, no `fallback-socket`), installed as the real `tapauthd.service`/`tapauthd.socket` units, running as the unprivileged `tapauthd` user with state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`.
+
+CI runs in **systemd mode**: the daemon is installed as the real `tapauthd.service`/`tapauthd.socket`
+units, is socket-activated (no `fallback-socket`), runs as the unprivileged `tapauthd` user, and keeps
+state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`. The binary enables only two dev
+features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN broadcast path into the
+emulator) and `dev-polkit-bypass` (so the root harness needs no authentication agent). `dev-state-override`
+is **off**, so `TAPAUTH_STATE_DIR` is not compiled in at all and every path is the production one. Phase 7
+therefore proves that PolKit still denies unprivileged non-owner callers; it does not prove anything about
+the root path, which is bypassed by design in this build.
+
+Other CI steps that back this suite:
+- `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
+- `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.
 
 **CI Artifacts**:
 - `tapauth-debug-apk`: Standard safe debug build.
@@ -190,9 +202,15 @@ CI runs in **systemd mode**: the daemon is built production-style (systemd socke
 The test runner automatically selects **dev mode** when run unprivileged:
 - `TAPAUTH_STATE_DIR`: Isolated state directory (`/tmp/tapauth-e2e.XXXXXX/state`).
 - `TAPAUTHD_SOCK`: Isolated Unix socket (`/tmp/tapauth-e2e.XXXXXX/tapauthd.sock`).
-- `TAPAUTH_DEV_MODE=1`: Enables same-UID PolKit test bypass on the isolated dev socket.
+- `TAPAUTH_DEV_MODE=1`: Enables the dev sandbox (same-UID PolKit bypass on the isolated socket).
 
-Running locally as root with `TAPAUTH_E2E_DAEMON_MODE=systemd` exercises full production wiring against `/etc/tapauth` and `/var/lib/tapauth`.
+Running locally as root with `TAPAUTH_E2E_DAEMON_MODE=systemd` exercises full production wiring against
+`/etc/tapauth` and `/var/lib/tapauth`. Because that mode installs over a real system installation
+(`/usr/bin/tapauthd`, the systemd units, `/etc/tapauth`, `/var/lib/tapauth`), it **refuses to run** when it
+finds an existing daemon binary or a non-empty state directory; set `TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1` to
+acknowledge that your own pairing state and binaries will be replaced. Whatever the suite installs it also
+removes again on exit (units, drop-in, binaries, registered PolKit policy, created config), and it never
+deletes files that already existed.
 
 #### Prerequisites
 1. Have an Android emulator running (API 33 to 36):
@@ -207,6 +225,10 @@ Running locally as root with `TAPAUTH_E2E_DAEMON_MODE=systemd` exercises full pr
    ```bash
    ./scripts/test-e2e.sh
    ```
+
+> **Virtual BLE is mandatory.** `scripts/ci/setup-emulator-ble-bridge.sh` builds/loads `hci_vhci` when the
+> kernel lacks it and exits non-zero if no virtual adapter appears; the suite then aborts rather than
+> skipping Phases 3 and 4.
 
 ---
 
