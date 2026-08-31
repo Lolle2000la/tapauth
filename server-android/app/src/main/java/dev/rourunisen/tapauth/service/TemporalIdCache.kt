@@ -31,6 +31,16 @@ class TemporalIdCache(
     @Volatile private var cachedDevices: List<CachedDevice> = emptyList()
     @Volatile private var lastComputedWindow: Long = -1
 
+    /**
+     * Whether the paired-device list has been successfully read at least once.
+     *
+     * Distinguishes "not loaded yet" (retry the disk read when a packet arrives) from "loaded and
+     * genuinely empty" (trust the [DeviceRepository] change listener for additions and never touch
+     * disk on the packet path — otherwise every packet against a device with zero paired devices
+     * would trigger a SharedPreferences read + JSON parse).
+     */
+    @Volatile private var devicesLoaded = false
+
     private data class CachedDevice(val deviceId: String, val csk: ByteArray)
 
     fun start() {
@@ -47,6 +57,7 @@ class TemporalIdCache(
         validIds.clear()
         cachedDevices = emptyList()
         lastComputedWindow = -1
+        devicesLoaded = false
         Log.d(TAG, "Stopped temporal ID cache")
     }
 
@@ -80,9 +91,9 @@ class TemporalIdCache(
         val now = System.currentTimeMillis()
         val currentWindow = now / TIME_WINDOW_MS
 
-        if (currentWindow != lastComputedWindow || cachedDevices.isEmpty()) {
+        if (currentWindow != lastComputedWindow || !devicesLoaded) {
             synchronized(this) {
-                if (currentWindow != lastComputedWindow || cachedDevices.isEmpty()) {
+                if (currentWindow != lastComputedWindow || !devicesLoaded) {
                     recomputeCache(currentWindow)
                 }
             }
@@ -91,19 +102,17 @@ class TemporalIdCache(
 
     private fun recomputeCache(currentWindow: Long) {
         var devices = cachedDevices
-        if (devices.isEmpty()) {
+        if (!devicesLoaded) {
             // Lazy-path reload: the first packet can arrive before start()'s initial
-            // refreshDeviceList() completes, so load the paired devices here as well.
+            // refreshDeviceList() completes, so load the paired devices here as well. Only a
+            // successful load (or a refreshDeviceList() call) sets devicesLoaded; a load failure
+            // returns early without advancing lastComputedWindow so the next packet retries.
             devices =
-                try {
-                    deviceRepository.getAllPairedDevicesSync().map {
-                        CachedDevice(it.deviceId, it.csk)
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to load devices during recompute", e)
-                    emptyList()
+                deviceRepository.getAllPairedDevicesSync().map {
+                    CachedDevice(it.deviceId, it.csk)
                 }
             cachedDevices = devices
+            devicesLoaded = true
         }
 
         validIds = computeValidIds(devices, currentWindow)
@@ -120,6 +129,7 @@ class TemporalIdCache(
             val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
             synchronized(this) {
                 cachedDevices = mapped
+                devicesLoaded = true
                 val currentWindow = System.currentTimeMillis() / TIME_WINDOW_MS
                 validIds = computeValidIds(mapped, currentWindow)
                 lastComputedWindow = currentWindow
