@@ -219,13 +219,12 @@ class AuthRequestManager private constructor() {
             val timeElapsed = currentTime - timestamp
             val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
 
-            val notification =
+            val notificationBuilder =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
                     .setContentText("${deviceName}: ${username}@${hostname}")
                     .setContentIntent(pendingIntent)
-                    .setFullScreenIntent(pendingIntent, true)
                     .addAction(
                         dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground,
                         "Approve",
@@ -240,16 +239,23 @@ class AuthRequestManager private constructor() {
                     .setAutoCancel(false)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setTimeoutAfter(remainingTimeout)
-                    .build()
+
+            // E2E-only: launch BiometricPromptActivity full-screen from the
+            // notification (e.g. over the lock screen). Production builds hold no
+            // USE_FULL_SCREEN_INTENT permission and rely on the heads-up
+            // notification instead, so this must stay behind the e2e build flag.
+            if (dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
+                notificationBuilder.setFullScreenIntent(pendingIntent, true)
+            }
+
+            val notification = notificationBuilder.build()
 
             // Deterministic prompt launch for automated E2E runs only.
             //
             // A background service cannot normally start an activity: Android 10+
-            // blocks background activity starts, and USE_FULL_SCREEN_INTENT is
-            // limited to call/alarm apps on Android 14+. In production this call is
-            // therefore silently rejected and the user acts on the notification (and
-            // its full-screen intent) instead. The E2E harness needs a UI-independent
-            // path to the prompt, so it stays behind the e2e build flag.
+            // blocks background activity starts. The E2E harness needs a
+            // UI-independent path to the prompt, so this stays behind the e2e
+            // build flag; production relies on the notification.
             if (dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
                 try {
                     context.startActivity(biometricIntent)
