@@ -13,8 +13,17 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
 
+/// Production builds always talk to the systemd-activated socket. Only dev
+/// builds (feature `dev-socket-override`, pulled in by `fallback-socket`) may
+/// redirect the CLI to another socket via TAPAUTHD_SOCK.
+#[cfg(feature = "dev-socket-override")]
 fn socket_path() -> String {
     env::var("TAPAUTHD_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
+}
+
+#[cfg(not(feature = "dev-socket-override"))]
+fn socket_path() -> String {
+    DEFAULT_SOCKET.to_string()
 }
 
 async fn daemon_socket() -> Result<UnixStream, Box<dyn std::error::Error>> {

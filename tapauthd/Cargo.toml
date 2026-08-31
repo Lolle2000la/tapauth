@@ -54,10 +54,16 @@ dev-udp-loopback = ["shared/dev-udp-loopback"]
 # dev-polkit-bypass: let same-UID and root admin callers through without a
 # PolKit check, so test harnesses do not need an authentication agent.
 dev-polkit-bypass = []
+# dev-socket-override: honour TAPAUTHD_SOCK in the tapauth-ipc-cli admin tool
+# (redirects it to a sandbox socket). Mirrors the same-named feature on
+# client-pam/client-config-gui. For testing/dev only; production builds must
+# NOT enable it.
+dev-socket-override = []
 # fallback-socket: bind the IPC socket manually instead of relying on systemd
 # socket activation (FD#3). Everything a local dev sandbox needs.
 fallback-socket = [
     "dev-state-override",
     "dev-udp-loopback",
     "dev-polkit-bypass",
+    "dev-socket-override",
 ]

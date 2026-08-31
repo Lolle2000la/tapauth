@@ -29,12 +29,12 @@ if ! command -v "$STRINGS_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Variable names that must never appear in a shipped binary.
-# TAPAUTHD_SOCK is deliberately excluded for tapauthd itself: main.rs reads it
-# unconditionally at shutdown to unlink the socket it created (pre-existing
-# behaviour, only reachable when the socket was not systemd-activated).
+# Variable names that must never appear in a shipped binary. All of these are
+# read only behind dev Cargo features (dev-state-override, dev-udp-loopback,
+# dev-socket-override, fallback-socket), so a clean scan proves no dev knob was
+# compiled into the artifact.
 DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET")
-DEV_VARS_DAEMON=("TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET")
+DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET")
 
 echo "==> Building production artifacts (per crate, default features)"
 # Mirrors install.sh: each crate is built on its own so no dev feature can be
@@ -73,6 +73,7 @@ check_artifact() {
 
 echo "==> Checking shipped artifacts"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauthd" "${DEV_VARS_DAEMON[@]}"
+check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-config" "${DEV_VARS_CLIENT[@]}"
 

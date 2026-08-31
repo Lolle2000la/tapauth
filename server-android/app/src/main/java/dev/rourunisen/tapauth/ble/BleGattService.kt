@@ -45,6 +45,13 @@ class BleGattService : Service() {
 
         const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
 
+        /**
+         * Grace period after a GATT disconnect before pending requests for that device are
+         * cancelled. Short enough to bound an orphaned prompt's lifetime, long enough to ride out
+         * transient link drops and duplicate connection callbacks.
+         */
+        const val BLE_DISCONNECT_CANCEL_GRACE_MS = 5_000L
+
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
@@ -160,12 +167,29 @@ class BleGattService : Service() {
                         connectingOrConnectedDevices.remove(deviceAddress)
                         confirmationValues.remove(deviceAddress)
 
-                        // Note: We intentionally do NOT cancel pending authentication requests on
-                        // disconnect. Authentication prompts are user-driven and governed by
-                        // daemon/PAM
-                        // timeouts; premature cancellation would break user approvals during
-                        // transient
-                        // GATT reconnections or duplicate connection drops.
+                        // Drop any challenge-tracked connections that pointed at this (now dead)
+                        // GATT handle so a stale response can never be written through it.
+                        activeConnectionsByChallenge.values.removeAll { it == gatt }
+
+                        // Authentication prompts are user-driven and must survive transient GATT
+                        // reconnections, so requests are NOT cancelled immediately here. But a
+                        // link that stays down must not leave an orphaned prompt (and its BLE
+                        // connection intent) alive until the daemon timeout: after a short grace
+                        // period, if the device has not reconnected, cancel its pending requests.
+                        serviceScope.launch {
+                            delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
+                            if (!connectingOrConnectedDevices.contains(deviceAddress)) {
+                                if (
+                                    dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
+                                        .cancelRequestsByBleDisconnection(deviceAddress)
+                                ) {
+                                    Log.d(
+                                        TAG,
+                                        "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
+                                    )
+                                }
+                            }
+                        }
 
                         gatt.close()
                     }
@@ -990,6 +1014,7 @@ class BleGattService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
+                bleDeviceAddress = gatt.device.address,
             ) { approved, signedChallenge, explicitDenial ->
                 // Create and send encrypted grant/denial
                 if (approved && signedChallenge != null) {

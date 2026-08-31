@@ -30,6 +30,11 @@ class AuthRequestManager private constructor() {
     // Index challenges (Base64) to request IDs for fast cancel-by-challenge
     private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
 
+    // Track BLE device addresses to request IDs so pending prompts can be
+    // cleaned up when the GATT link to a device is gone (with a grace period,
+    // see BleGattService). Only used for BLE-transport requests.
+    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
+
     // Track recently cancelled challenges to handle out-of-order cancel vs request arrival
     private val cancelledChallenges = ConcurrentHashMap<String, Long>()
     private val CANCEL_TTL_MS = 10_000L // Keep cancellation intent for 10 seconds
@@ -61,6 +66,7 @@ class AuthRequestManager private constructor() {
         val callback:
             (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
         val appContext: android.content.Context,
+        val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
 
     /** Submit an authentication request for user approval Returns a request ID */
@@ -73,6 +79,7 @@ class AuthRequestManager private constructor() {
         challenge: ByteArray,
         timestamp: Long,
         transportType: TransportType,
+        bleDeviceAddress: String? = null, // Optional: BLE MAC address for disconnect cleanup
         callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
@@ -105,7 +112,7 @@ class AuthRequestManager private constructor() {
 
         // Store the pending request
         pendingRequests[requestId] =
-            PendingAuthRequest(authRequest, callback, context.applicationContext)
+            PendingAuthRequest(authRequest, callback, context.applicationContext, bleDeviceAddress)
 
         // Index by challenge for fast cancellation
         runCatching {
@@ -115,6 +122,12 @@ class AuthRequestManager private constructor() {
             .onFailure { e ->
                 Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
             }
+
+        // If this is a BLE request, track it by device address so a lingering
+        // GATT disconnect can clean up the prompt (with a grace period)
+        if (bleDeviceAddress != null) {
+            bleDeviceRequests.getOrPut(bleDeviceAddress) { mutableSetOf() }.add(requestId)
+        }
 
         // Broadcast to MainActivity
         val intent =
@@ -320,6 +333,14 @@ class AuthRequestManager private constructor() {
                 }
             }
 
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
+                }
+            }
+
             // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
             scope.launch { pending.callback(approved, signedChallenge, explicitDenial) }
             // Cancel the persistent notification
@@ -348,6 +369,14 @@ class AuthRequestManager private constructor() {
                 challengeIndex[key]?.remove(requestId)
                 if (challengeIndex[key]?.isEmpty() == true) {
                     challengeIndex.remove(key)
+                }
+            }
+
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
                 }
             }
 
@@ -410,6 +439,14 @@ class AuthRequestManager private constructor() {
             if (pending != null) {
                 Log.d(TAG, "Cancelled auth request $requestId due to AuthenticationCancel")
 
+                // Remove from BLE tracking if applicable
+                pending.bleDeviceAddress?.let { address ->
+                    bleDeviceRequests[address]?.remove(requestId)
+                    if (bleDeviceRequests[address]?.isEmpty() == true) {
+                        bleDeviceRequests.remove(address)
+                    }
+                }
+
                 // Invoke callback with cancelled status (not explicit denial)
                 scope.launch { pending.callback(false, null, false) }
 
@@ -433,6 +470,59 @@ class AuthRequestManager private constructor() {
         markCancelledChallenge(challenge)
 
         return cancelledAny
+    }
+
+    /**
+     * Cancel all pending requests associated with a BLE device whose GATT connection is gone.
+     *
+     * Called by BleGattService after a short reconnect grace period following a disconnect, so
+     * transient link drops (which the device survives by reconnecting) never cancel a prompt the
+     * user may be about to answer, while a link that stays down cannot leave an orphaned prompt
+     * alive until the daemon timeout.
+     *
+     * @param bleDeviceAddress The BLE MAC address of the disconnected device
+     * @return true if any requests were cancelled
+     */
+    fun cancelRequestsByBleDisconnection(bleDeviceAddress: String): Boolean {
+        val requestIds = bleDeviceRequests.remove(bleDeviceAddress) ?: return false
+
+        if (requestIds.isEmpty()) return false
+
+        Log.d(
+            TAG,
+            "BLE device $bleDeviceAddress stayed disconnected, cancelling ${requestIds.size} pending request(s)",
+        )
+
+        requestIds.forEach { requestId ->
+            val pending = pendingRequests.remove(requestId)
+            if (pending != null) {
+                // Invoke callback with cancelled status (not explicit denial)
+                scope.launch { pending.callback(false, null, false) }
+
+                // Dismiss the notification
+                try {
+                    val notificationId = notificationIdFor(pending.authRequest.challenge)
+                    Log.d(
+                        TAG,
+                        "Dismissing notification for BLE-disconnected request $requestId (id=$notificationId)",
+                    )
+                    NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
+                }
+
+                // Remove from challenge index
+                runCatching {
+                    val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
+                    challengeIndex[key]?.remove(requestId)
+                    if (challengeIndex[key]?.isEmpty() == true) {
+                        challengeIndex.remove(key)
+                    }
+                }
+            }
+        }
+
+        return true
     }
 
     companion object {
