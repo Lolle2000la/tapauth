@@ -3,24 +3,24 @@
 
 Two subcommands:
 
-  extract-grants <pcap> [--port N]
-      Parse a tcpdump-captured pcap file and print hex-encoded UDP payloads of
-      EncryptedPacket datagrams that were sent TO the daemon's port (i.e.
-      server->client messages such as AuthenticationGrant). One hex string per
-      line; the first line is the first captured grant.
+  sniff [--port N] [--duration SECS]
+      Passively capture hex-encoded UDP payloads of EncryptedPacket datagrams
+      that were sent TO the daemon's port (i.e. server->client messages such as
+      AuthenticationGrant). One hex string per line; the first line is the first
+      captured grant. Requires root (CAP_NET_RAW).
 
   send <hex_payload> [--corrupt] [--host H] [--port N]
       Re-inject a captured datagram. With --corrupt, the last byte (inside the
       AES-GCM tag region) is flipped so that AEAD verification must fail while
-      the protobuf framing and temporal identifier stay intact.
+      the protobuf framing and temporal identifier stay intact. Sending itself
+      works unprivileged.
 
-Requires only the Python standard library. Root is needed by the caller to run
-tcpdump; sending itself works unprivileged.
+Requires only the Python standard library.
 
 NOTE: The daemon drops datagrams whose source address is one of the host's own
-addresses unless it runs with TAPAUTH_DEV_MODE set (self-send filter). The E2E
-always injects with TAPAUTH_DEV_MODE=1 on the daemon, which is why loopback
-injection is accepted.
+addresses unless it runs with TAPAUTH_DEV_MODE set (self-send filter, requires
+the dev-udp-loopback feature). The E2E always injects with TAPAUTH_DEV_MODE=1 on
+the daemon, which is why loopback injection is accepted.
 """
 
 from __future__ import annotations
@@ -31,18 +31,8 @@ import struct
 import sys
 import time
 
-# pcap linktype values we know how to parse
-LT_EN10MB = 1  # Ethernet, 14-byte header
-LT_LINUX_SLL = 113  # Linux cooked capture, 16-byte header
-LT_LINUX_SLL2 = 276  # Linux cooked capture v2, 20-byte header
-
-LINKTYPE_HEADER_LEN = {LT_EN10MB: 14, LT_LINUX_SLL: 16, LT_LINUX_SLL2: 20}
-
-PCAP_MAGIC_BE_USEC = b"\xa1\xb2\xc3\xd4"
-PCAP_MAGIC_LE_USEC = b"\xd4\xc3\xb2\xa1"
-PCAP_MAGIC_BE_NSEC = b"\xa1\xb2<\x8d"
-PCAP_MAGIC_LE_NSEC = b"\x8d<\xb2\xa1"
-
+# AF_PACKET frames on Linux carry a synthesized 14-byte Ethernet header, which
+# is what `sniff` parses below.
 ETH_P_IPV6 = 0x86DD
 ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
@@ -88,30 +78,20 @@ def parse_ipv6(data: bytes) -> tuple[str, str, int, int, bytes] | None:
     return src, dst, sport, dport, payload
 
 
-def extract_l3(linktype: int, frame: bytes) -> bytes | None:
-    """Strip the link-layer (and any VLAN tags) to yield an IP packet."""
-    if linktype == LT_EN10MB:
-        if len(frame) < 14:
+def strip_link_layer(frame: bytes) -> bytes | None:
+    """Strip the (synthesized) Ethernet header and any VLAN tags from a frame."""
+    if len(frame) < 14:
+        return None
+    ethertype = struct.unpack("!H", frame[12:14])[0]
+    offset = 14
+    while ethertype == ETH_P_VLAN:  # 802.1Q tag(s)
+        if len(frame) < offset + 4:
             return None
-        ethertype = struct.unpack("!H", frame[12:14])[0]
-        offset = 14
-        while ethertype == ETH_P_VLAN:  # 802.1Q tag(s)
-            if len(frame) < offset + 4:
-                return None
-            ethertype = struct.unpack("!H", frame[offset + 2 : offset + 4])[0]
-            offset += 4
-        return frame[offset:]
-    if linktype == LT_LINUX_SLL:
-        if len(frame) < 16:
-            return None
-        protocol = struct.unpack("!H", frame[14:16])[0]
-        return frame[16:] if protocol in (ETH_P_IP, ETH_P_IPV6) else None
-    if linktype == LT_LINUX_SLL2:
-        if len(frame) < 20:
-            return None
-        protocol = struct.unpack("!H", frame[0:2])[0]
-        return frame[20:] if protocol in (ETH_P_IP, ETH_P_IPV6) else None
-    return None
+        ethertype = struct.unpack("!H", frame[offset + 2 : offset + 4])[0]
+        offset += 4
+    if ethertype not in (ETH_P_IP, ETH_P_IPV6):
+        return None
+    return frame[offset:]
 
 
 def looks_like_encrypted_packet(payload: bytes) -> bool:
@@ -160,7 +140,7 @@ def sniff(port: int, duration: float) -> int:
                 frame = s.recv(65535)
                 # On AF_PACKET, loopback frames carry a synthesized 14-byte
                 # Ethernet header, so link-layer parsing matches EN10MB.
-                l3 = extract_l3(LT_EN10MB, frame)
+                l3 = strip_link_layer(frame)
                 if l3 is None:
                     continue
                 parsed = parse_ipv4(l3) or parse_ipv6(l3)
@@ -182,45 +162,6 @@ def is_broadcast_dst(dst: str) -> bool:
     return dst in ("255.255.255.255", "ff02::1") or dst.endswith(".255")
 
 
-def extract_grants(pcap_path: str, port: int) -> list[str]:
-    with open(pcap_path, "rb") as fh:
-        magic = fh.read(4)
-        if magic == PCAP_MAGIC_BE_USEC or magic == PCAP_MAGIC_BE_NSEC:
-            endian = ">"
-        elif magic == PCAP_MAGIC_LE_USEC or magic == PCAP_MAGIC_LE_NSEC:
-            endian = "<"
-        else:
-            raise SystemExit(
-                f"ERROR: {pcap_path} is not a pcap file (magic={magic.hex()})"
-            )
-        # remaining global header: vmaj(H) vmin(H) thiszone(i) sigfigs(I) snaplen(I) network(I)
-        fields = struct.unpack(endian + "HHiIII", fh.read(20))
-        linktype = fields[5] & 0xFFFF  # high bits may carry linktype class info
-
-        grants: list[str] = []
-        while True:
-            pkthdr = fh.read(16)
-            if len(pkthdr) < 16:
-                break
-            (_ts_sec, _ts_frac, incl_len, _orig_len) = struct.unpack(endian + "IIII", pkthdr)
-            frame = fh.read(incl_len)
-            if len(frame) < incl_len:
-                break
-            l3 = extract_l3(linktype, frame)
-            if l3 is None:
-                continue
-            parsed = parse_ipv4(l3) or parse_ipv6(l3)
-            if parsed is None:
-                continue
-            _src, dst, _sport, dport, payload = parsed
-            if dport != port or is_broadcast_dst(dst):
-                continue  # daemon->server broadcasts (requests/confirmations)
-            if not looks_like_encrypted_packet(payload):
-                continue
-            grants.append(payload.hex())
-        return grants
-
-
 def send_packet(hex_payload: str, host: str, port: int, corrupt: bool) -> None:
     data = bytes.fromhex(hex_payload)
     if corrupt:
@@ -236,10 +177,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_extract = sub.add_parser("extract-grants", help="print captured server->client payloads as hex")
-    p_extract.add_argument("pcap")
-    p_extract.add_argument("--port", type=int, default=36692)
-
     p_send = sub.add_parser("send", help="re-inject a captured payload")
     p_send.add_argument("hex_payload")
     p_send.add_argument("--corrupt", action="store_true", help="flip a tag bit (must fail AEAD)")
@@ -251,14 +188,6 @@ def main() -> int:
     p_sniff.add_argument("--duration", type=float, default=30.0)
 
     args = parser.parse_args()
-    if args.command == "extract-grants":
-        grants = extract_grants(args.pcap, args.port)
-        if not grants:
-            print("ERROR: no EncryptedPacket datagrams captured", file=sys.stderr)
-            return 1
-        for grant in grants:
-            print(grant)
-        return 0
     if args.command == "sniff":
         return sniff(args.port, args.duration)
     if args.command == "send":

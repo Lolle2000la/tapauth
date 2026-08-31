@@ -30,7 +30,7 @@ case "$ACTION" in
         adb shell cmd fingerprint enroll 0 2>/dev/null &
         ENROLL_PID=$!
         sleep 0.5
-        for i in {1..10}; do
+        for _ in {1..10}; do
             adb emu finger touch 1 2>/dev/null || true
             sleep 0.2
         done
@@ -38,17 +38,16 @@ case "$ACTION" in
         echo "✅ Test biometric profile enrolled (Finger 1 / Virtual Biometrics HAL)."
         ;;
 
-    grant)
-        echo "    Triggering biometric grant (finger touch 1)..."
-        adb emu finger touch 1 2>/dev/null || true
-        ;;
-
     deny)
-        echo "    Triggering biometric denial (finger touch 2 / cancel / dev-deny broadcast)..."
+        # Arg 2: the package under test. The dev-deny receiver only exists in the
+        # e2e build variant (BuildConfig.E2E_TESTING + exported receiver), so the
+        # caller tells us which package to target instead of guessing.
+        PKG="${2:-dev.rourunisen.tapauth.e2e}"
+        echo "    Triggering biometric denial for $PKG (finger 2 / cancel / dev-deny broadcast)..."
         # Finger 2 is not enrolled, causing biometric failure
         adb emu finger touch 2 2>/dev/null || true
-        # Send explicit denial broadcast to dev receiver with package targeting
-        adb shell am broadcast -p dev.rourunisen.tapauth.e2e -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || adb shell am broadcast -p dev.rourunisen.tapauth.debug -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || adb shell am broadcast -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
+        # Explicit denial broadcast (no-op unless the e2e variant is installed)
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
         # Also simulate negative / cancel button if prompt is active
         adb shell input keyevent KEYCODE_BACK 2>/dev/null || true
         ;;
@@ -58,13 +57,31 @@ case "$ACTION" in
         LOGCAT_LOG="/tmp/bio-auto-grant.log"
 
         cat << 'EOF' > /tmp/bio_auto_grant.py
-import subprocess, time, sys
+import subprocess, signal, sys
 
 print("Biometric auto-grant daemon started...")
 sys.stdout.flush()
 
 proc = subprocess.Popen(['adb', 'logcat', '-v', 'brief', '*:V'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+
+def shutdown(*_):
+    # The `adb logcat` child is in its own process, so killing this script alone
+    # would leave it running (and holding the adb connection) on the runner.
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+# Deliberately broad keyword set: a stray `finger touch 1` while no prompt is
+# showing is a no-op, whereas a missed prompt hangs the authentication phase
+# until the daemon timeout.
 try:
     for line in iter(proc.stdout.readline, ''):
         if any(k in line for k in ['Showing biometric prompt', 'BiometricPrompt', 'BiometricPromptActivity', 'FingerprintService', 'fingerprint', 'Biometric availability']):
@@ -91,7 +108,7 @@ EOF
         ;;
 
     *)
-        echo "Usage: $0 {setup|grant|deny|start-auto-grant|stop-auto-grant}"
+        echo "Usage: $0 {setup|deny [package]|start-auto-grant|stop-auto-grant}"
         exit 1
         ;;
 esac

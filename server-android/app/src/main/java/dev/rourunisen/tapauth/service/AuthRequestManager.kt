@@ -25,8 +25,6 @@ class AuthRequestManager private constructor() {
     private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    // Track BLE device addresses to request IDs for disconnection handling
-    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
     // Index challenges (Base64) to request IDs for fast cancel-by-challenge
     private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
     // Debug registry removed: no longer tracking posted notification IDs
@@ -62,7 +60,6 @@ class AuthRequestManager private constructor() {
         val callback:
             (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
         val appContext: android.content.Context,
-        val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
 
     /** Submit an authentication request for user approval Returns a request ID */
@@ -75,7 +72,6 @@ class AuthRequestManager private constructor() {
         challenge: ByteArray,
         timestamp: Long,
         transportType: TransportType,
-        bleDeviceAddress: String? = null, // Optional: BLE MAC address for tracking disconnections
         callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
@@ -108,7 +104,7 @@ class AuthRequestManager private constructor() {
 
         // Store the pending request
         pendingRequests[requestId] =
-            PendingAuthRequest(authRequest, callback, context.applicationContext, bleDeviceAddress)
+            PendingAuthRequest(authRequest, callback, context.applicationContext)
 
         // Index by challenge for fast cancellation
         runCatching {
@@ -118,11 +114,6 @@ class AuthRequestManager private constructor() {
             .onFailure { e ->
                 Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
             }
-
-        // If this is a BLE request, track it by device address
-        if (bleDeviceAddress != null) {
-            bleDeviceRequests.getOrPut(bleDeviceAddress) { mutableSetOf() }.add(requestId)
-        }
 
         // Broadcast to MainActivity
         val intent =
@@ -237,14 +228,24 @@ class AuthRequestManager private constructor() {
                     .setTimeoutAfter(remainingTimeout)
                     .build()
 
-            try {
-                context.startActivity(biometricIntent)
-                Log.d(TAG, "Directly launched BiometricPromptActivity for request $requestId")
-            } catch (e: Exception) {
-                Log.d(
-                    TAG,
-                    "Direct activity launch not permitted from current context: ${e.message}",
-                )
+            // Deterministic prompt launch for automated E2E runs only.
+            //
+            // A background service cannot normally start an activity: Android 10+
+            // blocks background activity starts, and USE_FULL_SCREEN_INTENT is
+            // limited to call/alarm apps on Android 14+. In production this call is
+            // therefore silently rejected and the user acts on the notification (and
+            // its full-screen intent) instead. The E2E harness needs a UI-independent
+            // path to the prompt, so it stays behind the e2e build flag.
+            if (dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
+                try {
+                    context.startActivity(biometricIntent)
+                    Log.d(TAG, "E2E build: launched BiometricPromptActivity for request $requestId")
+                } catch (e: Exception) {
+                    Log.d(
+                        TAG,
+                        "Direct activity launch not permitted from current context: ${e.message}",
+                    )
+                }
             }
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
@@ -309,14 +310,6 @@ class AuthRequestManager private constructor() {
                 "Auth request $requestId ${if (approved) "approved" else if (explicitDenial) "explicitly denied" else "timed out/cancelled"}",
             )
 
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
-
             // Remove from challenge index
             runCatching {
                 val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
@@ -347,14 +340,6 @@ class AuthRequestManager private constructor() {
         val pending = pendingRequests.remove(requestId)
         if (pending != null) {
             Log.d(TAG, "Cancelled auth request $requestId (timeout)")
-
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
 
             // Remove from challenge index
             runCatching {
@@ -455,54 +440,6 @@ class AuthRequestManager private constructor() {
         markCancelledChallenge(challenge)
 
         return cancelledAny
-    }
-
-    /**
-     * Cancel all pending requests associated with a BLE device that disconnected
-     *
-     * @param bleDeviceAddress The BLE MAC address of the disconnected device
-     * @return true if any requests were cancelled
-     */
-    fun cancelRequestsByBleDisconnection(bleDeviceAddress: String): Boolean {
-        val requestIds = bleDeviceRequests.remove(bleDeviceAddress) ?: return false
-
-        if (requestIds.isEmpty()) return false
-
-        Log.d(
-            TAG,
-            "BLE device $bleDeviceAddress disconnected, cancelling ${requestIds.size} pending requests",
-        )
-
-        requestIds.forEach { requestId ->
-            val pending = pendingRequests.remove(requestId)
-            if (pending != null) {
-                // Invoke callback with cancelled status (not explicit denial)
-                scope.launch { pending.callback(false, null, false) }
-
-                // Dismiss the notification
-                try {
-                    val notificationId = notificationIdFor(pending.authRequest.challenge)
-                    Log.d(
-                        TAG,
-                        "Dismissing notification for BLE-disconnected request $requestId (id=$notificationId)",
-                    )
-                    NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
-                }
-
-                // Remove from challenge index
-                runCatching {
-                    val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
-                    challengeIndex[key]?.remove(requestId)
-                    if (challengeIndex[key]?.isEmpty() == true) {
-                        challengeIndex.remove(key)
-                    }
-                }
-            }
-        }
-
-        return true
     }
 
     companion object {

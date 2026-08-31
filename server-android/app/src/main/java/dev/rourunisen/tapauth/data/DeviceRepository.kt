@@ -18,23 +18,22 @@ class DeviceRepository(context: Context) {
 
     companion object {
         private const val KEY_DEVICES = "paired_devices"
-        private val changeListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
 
-        fun addOnDevicesChangedListener(listener: () -> Unit) {
-            changeListeners.add(listener)
-        }
-
-        fun removeOnDevicesChangedListener(listener: () -> Unit) {
-            changeListeners.remove(listener)
-        }
+        /**
+         * Single-slot device-change hook, used by [dev.rourunisen.tapauth.service.TemporalIdCache]
+         * to refresh its precomputed IDs immediately after pairing/un-pairing.
+         *
+         * There is only ever one cache in the process, so registering deliberately replaces any
+         * previous listener instead of accumulating them.
+         */
+        @Volatile private var changeListener: (() -> Unit)? = null
 
         fun setOnDevicesChangedListener(listener: (() -> Unit)?) {
-            changeListeners.clear()
-            listener?.let { changeListeners.add(it) }
+            changeListener = listener
         }
 
-        private fun notifyListeners() {
-            changeListeners.forEach { it.invoke() }
+        private fun notifyListener() {
+            changeListener?.invoke()
         }
     }
 
@@ -48,7 +47,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListeners()
+            notifyListener()
         }
 
     fun getAllPairedDevicesSync(): List<PairedDevice> {
@@ -81,7 +80,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListeners()
+            notifyListener()
         }
 
     /**
@@ -116,7 +115,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListeners()
+            notifyListener()
 
             return@withContext entirelyRemoved
         }

@@ -17,8 +17,9 @@ import kotlinx.coroutines.launch
  * - Check incoming packets against cache before attempting decryption
  * - Silently drop packets with invalid temporal IDs
  *
- * Uses on-demand (lazy evaluation) to compute temporal IDs at the exact moment a packet arrives,
- * avoiding stale caches caused by Doze mode freezing background coroutine loops.
+ * The precomputed ID set is refreshed when the 60s window rolls over (checked lazily on the first
+ * packet of a new window, so a Doze-frozen coroutine loop can never leave it stale) and immediately
+ * whenever the paired-device list changes.
  */
 class TemporalIdCache(
     private val deviceRepository: DeviceRepository,

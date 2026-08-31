@@ -1,42 +1,54 @@
 #!/bin/bash
 # Sets up Google Bumble Virtual HCI bridge connecting Android Emulator Netsim to Linux host /dev/vhci
+#
+# Virtual BLE is a hard requirement of the E2E suite: when no virtual HCI adapter
+# can be created this script exits non-zero, and test-e2e.sh (running under
+# `set -e`) aborts before any phase executes. There is intentionally no
+# "skip BLE" path.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 echo "==> Configuring Virtual Bluetooth Bridge (Bumble <-> Netsim)..."
 
-# Ensure vhci module is loaded and /dev/vhci node exists with write permissions
-if [ ! -w /dev/vhci ] || ! python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
+# CI runners are unprivileged-but-sudoable; a root shell needs no prefix.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+fi
+
+# Ensure the vhci module is loaded and /dev/vhci is writable by us.
+if [ ! -w /dev/vhci ]; then
     if [ -f "$SCRIPT_DIR/build-kernel-vhci.sh" ]; then
         bash "$SCRIPT_DIR/build-kernel-vhci.sh"
     fi
 fi
 
-# Check if /dev/vhci is actually accessible
-VHCI_SUPPORTED=false
-if [ -w /dev/vhci ] && python3 -c "import os; fd = os.open('/dev/vhci', os.O_RDWR); os.close(fd)" 2>/dev/null; then
-    VHCI_SUPPORTED=true
-fi
-
-if [ "$VHCI_SUPPORTED" != "true" ]; then
-    echo "❌ ERROR: Virtual HCI (/dev/vhci) is not writable by current user."
+if [ ! -w /dev/vhci ]; then
+    echo "❌ ERROR: Virtual HCI (/dev/vhci) is not writable by the current user."
+    echo "   Load hci_vhci (or run scripts/ci/build-kernel-vhci.sh) and grant access first."
     exit 1
 fi
 
-# Ensure BlueZ packages are installed and bluetoothd is running
-sudo apt-get update -qq
-sudo apt-get install -y -qq bluez bluez-tools
-
-if ! pgrep -x bluetoothd > /dev/null; then
-    sudo systemctl start bluetooth 2>/dev/null || { sudo bluetoothd -n -d >/tmp/bluetoothd.log 2>&1 & sleep 2; }
+# BlueZ userspace (hciconfig/btmgmt) — installed here only when missing, so a
+# local first run works without re-running apt on every CI invocation.
+if ! command -v hciconfig >/dev/null 2>&1 || ! command -v btmgmt >/dev/null 2>&1; then
+    echo "    Installing BlueZ tools (bluez, bluez-tools)..."
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq bluez bluez-tools
 fi
 
-# Verify bumble is available
+if ! pgrep -x bluetoothd > /dev/null; then
+    $SUDO systemctl start bluetooth 2>/dev/null \
+        || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+fi
+
+# Bumble provides the netsim <-> vhci bridge; --break-system-packages only exists
+# on pip >= 23.0, hence the plain retry.
 if ! python3 -c "import bumble" 2>/dev/null; then
-    echo "    Installing Bumble Python package..."
-    pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf || pip install "bumble[android-netsim]" grpcio protobuf
+    echo "    Installing Bumble (android-netsim extra)..."
+    $SUDO python3 -m pip install --break-system-packages "bumble[android-netsim]" grpcio protobuf \
+        || $SUDO python3 -m pip install "bumble[android-netsim]" grpcio protobuf
 fi
 
 # Capture existing hci devices to detect the newly created one
@@ -46,25 +58,12 @@ EXISTING_HCI=$(hciconfig 2>/dev/null | grep -o '^hci[0-9]*' || true)
 echo "    Starting bumble-hci-bridge (android-netsim <-> vhci)..."
 BUMBLE_LOG="/tmp/bumble-bridge.log"
 
-USER_SITE=$(python3 -c 'import site; print(":".join(site.getsitepackages() + [site.getusersitepackages()]))' 2>/dev/null || true)
-
-if [ -w /dev/vhci ]; then
-    if command -v bumble-hci-bridge &> /dev/null; then
-        bumble-hci-bridge "android-netsim" "vhci:" > "$BUMBLE_LOG" 2>&1 &
-        BUMBLE_PID=$!
-    else
-        python3 -m bumble.apps.hci_bridge "android-netsim" "vhci:" > "$BUMBLE_LOG" 2>&1 &
-        BUMBLE_PID=$!
-    fi
+if command -v bumble-hci-bridge >/dev/null 2>&1; then
+    bumble-hci-bridge android-netsim "vhci:" > "$BUMBLE_LOG" 2>&1 &
 else
-    if command -v bumble-hci-bridge &> /dev/null; then
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "bumble-hci-bridge 'android-netsim' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
-        BUMBLE_PID=$!
-    else
-        sudo env PATH="$PATH" PYTHONPATH="$PYTHONPATH:$USER_SITE" sh -c "python3 -m bumble.apps.hci_bridge 'android-netsim' 'vhci:' > '$BUMBLE_LOG' 2>&1" &
-        BUMBLE_PID=$!
-    fi
+    python3 -m bumble.apps.hci_bridge android-netsim "vhci:" > "$BUMBLE_LOG" 2>&1 &
 fi
+BUMBLE_PID=$!
 
 echo "$BUMBLE_PID" > /tmp/bumble-bridge.pid
 echo "    bumble-hci-bridge running with PID $BUMBLE_PID (logs: $BUMBLE_LOG)"
@@ -74,7 +73,7 @@ sleep 5
 
 # Wait for new virtual HCI adapter to appear (up to 10s)
 NEW_HCI=""
-for i in {1..50}; do
+for _ in {1..50}; do
     CURRENT_HCI=$(hciconfig 2>/dev/null | grep -o '^hci[0-9]*' || true)
     for dev in $CURRENT_HCI; do
         if ! echo "$EXISTING_HCI" | grep -qw "$dev"; then
@@ -90,28 +89,8 @@ for i in {1..50}; do
     sleep 0.2
 done
 
-if [ -n "$NEW_HCI" ]; then
-    echo "✅ Virtual Bluetooth adapter detected: $NEW_HCI"
-    INDEX=$(echo "$NEW_HCI" | sed 's/hci//')
-    
-    # Power on adapter with retries
-    for attempt in {1..10}; do
-        sudo btmgmt --index "$INDEX" power on 2>/dev/null || sudo btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
-        sudo hciconfig "$NEW_HCI" up 2>/dev/null || true
-        if sudo btmgmt info 2>/dev/null | grep -q "current settings:.*powered"; then
-            echo "✅ $NEW_HCI powered on successfully."
-            break
-        fi
-        sleep 1
-    done
-
-    echo "--- Adapter details ---"
-    sudo btmgmt info 2>/dev/null || true
-    bluetoothctl show 2>/dev/null || true
-    echo "true" > /tmp/ble-available.txt
-else
+if [ -z "$NEW_HCI" ]; then
     echo "❌ ERROR: No virtual Bluetooth adapter (HCI) detected after bridge launch."
-    echo "false" > /tmp/ble-available.txt
     if [ -f "$BUMBLE_LOG" ]; then
         echo "=== BUMBLE BRIDGE LOG ==="
         cat "$BUMBLE_LOG"
@@ -119,5 +98,23 @@ else
     fi
     exit 1
 fi
+
+echo "✅ Virtual Bluetooth adapter detected: $NEW_HCI"
+INDEX=$(echo "$NEW_HCI" | sed 's/hci//')
+
+# Power on adapter with retries
+for _ in {1..10}; do
+    $SUDO btmgmt --index "$INDEX" power on 2>/dev/null || $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+    $SUDO hciconfig "$NEW_HCI" up 2>/dev/null || true
+    if $SUDO btmgmt info 2>/dev/null | grep -q "current settings:.*powered"; then
+        echo "✅ $NEW_HCI powered on successfully."
+        break
+    fi
+    sleep 1
+done
+
+echo "--- Adapter details ---"
+$SUDO btmgmt info 2>/dev/null || true
+bluetoothctl show 2>/dev/null || true
 
 echo "✅ Virtual BLE bridge setup completed."

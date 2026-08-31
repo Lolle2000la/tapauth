@@ -5,26 +5,30 @@ import android.util.Log
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import dev.rourunisen.tapauth.ble.BleGattService
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.network.PairingClient
 import dev.rourunisen.tapauth.network.PairingInitResult
 import dev.rourunisen.tapauth.network.PairingResult
-import dev.rourunisen.tapauth.service.AuthenticationService
 import kotlinx.coroutines.runBlocking
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * End-to-end instrumentation test for device pairing.
+ * End-to-end instrumentation test for device pairing, driven by scripts/test-e2e.sh over `adb shell
+ * am instrument`:
  *
- * Can be executed via adb: adb shell am instrument -w \ -e class
- * dev.rourunisen.tapauth.e2e.PairingE2eTest \ -e pairing_host 10.0.2.2 \ -e pairing_port 36693 \ -e
- * expected_sas 123456 \
- * dev.rourunisen.tapauth.debug.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
+ * adb shell am instrument -w \ -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \ -e pairing_host
+ * 10.0.2.2 \ -e pairing_port <port> \ [-e reject_sas true] \
+ * dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
+ *
+ * With `reject_sas true` this runs the negative case (Phase 1a): the handshake completes far enough
+ * to derive the SAS, then the client rejects it, and the test asserts that pairing fails and
+ * nothing is stored.
+ *
+ * The derived SAS is logged and written to filesDir so the host side can compare it against the
+ * daemon's own value (bilateral anti-MITM verification).
  */
 @RunWith(AndroidJUnit4::class)
 class PairingE2eTest {
@@ -46,12 +50,10 @@ class PairingE2eTest {
 
         val host = args.getString("pairing_host") ?: "10.0.2.2"
         val port = args.getString("pairing_port")?.toIntOrNull() ?: 36693
-        val expectedSas = args.getString("expected_sas")
-        val startServices = args.getString("start_services")?.toBoolean() ?: (!rejectSas)
 
         Log.i(
             TAG,
-            "Starting E2E Pairing Test: host=$host, port=$port, expectedSas=$expectedSas, rejectSas=$rejectSas",
+            "Starting E2E Pairing Test: host=$host, port=$port, rejectSas=$rejectSas",
         )
 
         val client = PairingClient(context)
@@ -74,10 +76,8 @@ class PairingE2eTest {
             Log.w(TAG, "Failed to write SAS to filesDir: ${e.message}")
         }
 
-        // Step 2: If expected SAS provided, verify match
-        if (!expectedSas.isNullOrEmpty()) {
-            assertEquals("SAS mismatch between desktop and Android", expectedSas, awaiting.sas)
-        }
+        // The host compares this against the daemon's own SAS (bilateral check); the
+        // guest does not know the expected value here.
 
         if (rejectSas) {
             // Negative test: User rejects SAS verification or SAS mismatch detected
@@ -103,7 +103,7 @@ class PairingE2eTest {
             return
         }
 
-        // Step 3: Complete pairing (CSK exchange & storage)
+        // Step 2: Complete pairing (CSK exchange & storage)
         val completeResult =
             client.completePairing(
                 socket = awaiting.socket,
@@ -128,12 +128,5 @@ class PairingE2eTest {
         // Verify stored in DeviceRepository
         val storedDevice = deviceRepo.getPairedDevice(pairedDevice.deviceId)
         assertNotNull("Paired device not found in repository", storedDevice)
-
-        // Step 4: Start background services for subsequent auth testing if requested
-        if (startServices) {
-            Log.i(TAG, "Starting AuthenticationService and BleGattService...")
-            AuthenticationService.start(context)
-            BleGattService.start(context)
-        }
     }
 }

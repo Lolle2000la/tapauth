@@ -317,11 +317,6 @@ impl ClientConfigManager {
         }
     }
 
-    /// Create a configuration manager with a specific directory
-    pub fn with_dir(config_dir: PathBuf) -> Self {
-        Self { config_dir }
-    }
-
     /// Initialize configuration directory
     pub fn init(&self) -> Result<(), ConfigError> {
         ensure_secure_directory(&self.config_dir)?;

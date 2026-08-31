@@ -716,13 +716,8 @@ impl AuthSession {
                         .handle_cancellation(ble_abort, udp_abort, ble_transport, udp_transport, cancel_packet)
                         .await;
                 }
-                else => break,
             }
         }
-
-        // Both transports failed with non-terminal errors and no cancel
-        // arrived.
-        Err(AuthHandlerError::Denied)
     }
 
     #[cfg(feature = "ble")]

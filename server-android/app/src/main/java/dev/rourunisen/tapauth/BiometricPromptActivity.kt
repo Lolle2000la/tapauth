@@ -65,19 +65,6 @@ class BiometricPromptActivity : FragmentActivity() {
             return
         }
 
-        val action = intent.getStringExtra("notification_action")
-        if (action == "deny") {
-            Log.i(TAG, "Denied via notification action for request: ${authRequest.requestId}")
-            handleAuthResponse(
-                authRequest.requestId,
-                approved = false,
-                signedChallenge = null,
-                explicitDenial = true,
-            )
-            finish()
-            return
-        }
-
         currentAuthRequest = authRequest
         setupBiometricPrompt()
 
