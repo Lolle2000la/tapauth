@@ -54,25 +54,39 @@ cd server-android && ./gradlew spotlessCheck
 # Unit tests (JVM):
 cd server-android && ./gradlew test
 
-# Instrumentation tests (requires emulator + native libs built):
-cd server-android && ./gradlew connectedDebugAndroidTest
+# Instrumentation tests (requires emulator + native libs built; the e2e build
+# variant is used for instrumented tests, see testBuildType in build.gradle.kts):
+cd server-android && ./gradlew connectedE2eAndroidTest
 ```
 
 ## Feature Flags (critical)
 
 | Crate | Default | Features |
 |-------|---------|----------|
-| `shared` | `[]` | `jni`, `tpm`, `firewall` |
-| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket` |
+| `shared` | `[]` | `jni`, `tpm`, `firewall`, `dev-state-override`, `dev-udp-loopback` |
+| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override` |
 | `client-pam` | `[]` | `tpm`, `dev-socket-override` |
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
+
+Each dev knob is **separately** feature-gated so a test build can enable exactly one
+of them. The UDP shim, its receive-filter bypass and the PolKit bypass additionally
+require `TAPAUTH_DEV_MODE=1` at runtime, so a shipped binary cannot be toggled by the
+environment alone:
+
+| Dev feature | Env var it honours | What it does |
+| :--- | :--- | :--- |
+| `dev-state-override` (`shared`, `tapauthd`) | `TAPAUTH_STATE_DIR` | Relocates the state dir (and `config.toml` inside it) |
+| `dev-udp-loopback` (`shared`, `tapauthd`) | `TAPAUTH_DEV_UDP_TARGET` | Unicasts packets to a local peer and accepts locally-sourced replies (emulator) |
+| `dev-polkit-bypass` (`tapauthd`) | `TAPAUTH_DEV_MODE` | Skips the PolKit check for same-UID/root callers so headless harnesses need no agent |
+| `dev-socket-override` (`client-pam`, `client-config-gui`, `tapauthd`) | `TAPAUTHD_SOCK` | Redirects the IPC client to another socket. On `tapauthd` the feature only affects the `tapauth-ipc-cli` admin tool; the daemon itself always uses the systemd-activated socket in production |
 
 **Gotchas:**
 - `--all-features` **may not work locally** — it pulls in `jni` which requires `libjvm`/JDK headers. If you have a JDK installed, it should compile; otherwise use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
-- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Without this, the daemon errors out with "Systemd socket activation required."
+- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Pulls in all four daemon dev knobs above (`dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override`) — i.e. it is a full local sandbox build.
+- The **E2E suite's systemd mode** deliberately enables only `dev-udp-loopback,dev-polkit-bypass` (NOT `dev-state-override`), so state/config/socket paths stay production while the emulator transport shim works.
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
-- **`dev-socket-override`** on `client-pam` and `client-config-gui`: enables `TAPAUTHD_SOCK` env var to override the default IPC socket path.  This is for development/testing only — production builds must NOT enable this feature, as it would allow environment-controlled socket redirection.
+- **Production builds must NOT enable any `dev-*` feature** (nor `fallback-socket`/`dev-socket-override`): they would allow environment-controlled socket/state redirection. `scripts/ci/check-production-build.sh` (run in CI) enforces this by building the shipped artifacts per crate and failing if a dev env-var name survives into them. Beware that Cargo unifies features **per package across a workspace build**: `cargo build --workspace --features tapauthd/fallback-socket` compiles `shared/dev-state-override` into the GUI and PAM module too, even though neither asks for it — build shipped artifacts per crate (as `install.sh` does).
 
 ## Development Quick Start
 ```bash

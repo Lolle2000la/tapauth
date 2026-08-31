@@ -35,6 +35,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(feature = "fallback-socket")]
 use std::path::Path;
 
+#[cfg(feature = "fallback-socket")]
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
 #[derive(thiserror::Error, Debug)]
@@ -148,6 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    // The flag is only consulted by the fallback-socket shutdown path.
+    #[cfg(not(feature = "fallback-socket"))]
+    let _ = using_systemd_socket;
 
     // Drop privileges to tapauthd:tapauthd
     // Note: When running under systemd with User=tapauthd, this is redundant but harmless
@@ -212,7 +216,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {}
     }
 
-    // Cleanup socket on exit only if we created it ourselves
+    // Cleanup socket on exit only if we created it ourselves. Without the
+    // fallback-socket feature this branch is unreachable: a production build
+    // refuses to start without systemd socket activation, so there is never a
+    // self-created socket (nor a TAPAUTHD_SOCK read) to clean up.
+    #[cfg(feature = "fallback-socket")]
     if !using_systemd_socket {
         // Try to read the path from env; safe to fail silently
         if let Ok(sock_path) = std::env::var("TAPAUTHD_SOCK") {

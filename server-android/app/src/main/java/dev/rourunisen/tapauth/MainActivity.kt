@@ -193,44 +193,7 @@ class MainActivity : FragmentActivity() {
                         Log.d(TAG, "Biometric authentication succeeded")
                         // Handle current auth request approval
                         currentAuthRequest?.let { authRequest ->
-                            // Sign the challenge with server keypair
-                            try {
-                                val keypairRepo =
-                                    dev.rourunisen.tapauth.data.KeypairRepository(this@MainActivity)
-                                val privateKey = keypairRepo.getPrivateKey()
-                                Log.d(
-                                    TAG,
-                                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                val signedChallenge =
-                                    dev.rourunisen.tapauth.crypto.signData(
-                                        privateKey,
-                                        authRequest.challenge,
-                                    )
-
-                                Log.d(
-                                    TAG,
-                                    "Successfully signed challenge (${signedChallenge.size} bytes)",
-                                )
-                                Log.d(
-                                    TAG,
-                                    "Signed challenge (trunc): ${signedChallenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = true,
-                                    signedChallenge = signedChallenge,
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to sign challenge", e)
-                                // Signature failure is not explicit denial - just error
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = false,
-                                    signedChallenge = null,
-                                    explicitDenial = false,
-                                )
-                            }
+                            AuthRequestManager.approveRequest(this@MainActivity, authRequest)
                             currentAuthRequest = null
                         }
                     }
@@ -283,19 +246,24 @@ class MainActivity : FragmentActivity() {
     private fun handleAuthRequest(authRequest: AuthRequest) {
         Log.d(TAG, "Received auth request for ${authRequest.username}@${authRequest.hostname}")
 
-        // Check if biometric authentication is available
+        // Check if biometric authentication is available (Class 3 BIOMETRIC_STRONG required)
         val biometricManager = BiometricManager.from(this)
-        when (biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
-            BiometricManager.BIOMETRIC_SUCCESS -> {
-                // Show biometric prompt
-                currentAuthRequest = authRequest
-                showBiometricPrompt(authRequest)
-            }
-            else -> {
-                // Biometric not available, deny request
-                Log.e(TAG, "Biometric authentication not available")
-                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
-            }
+        val canAuthStrong =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+
+        if (canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS) {
+            // Show biometric prompt
+            currentAuthRequest = authRequest
+            showBiometricPrompt(authRequest)
+        } else if (BuildConfig.E2E_TESTING) {
+            AuthRequestManager.autoApproveInE2e(this, authRequest, canAuthStrong)
+        } else {
+            // Biometric not available, deny request
+            Log.e(
+                TAG,
+                "Biometric authentication not available (strong=$canAuthStrong)",
+            )
+            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
         }
     }
 

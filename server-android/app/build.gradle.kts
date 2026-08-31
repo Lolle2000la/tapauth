@@ -80,6 +80,17 @@ android {
         manifestPlaceholders["appName"] = "TapAuth"
     }
 
+    // Intentional: unit tests (./gradlew test) and instrumented tests
+    // (connectedE2eAndroidTest) both run against the e2e variant. This is fine
+    // today because no unit-testable logic reads BuildConfig.E2E_TESTING — the
+    // unit tests are pure logic (rate limiter, replay cache, retransmission).
+    // Two caveats to keep in mind:
+    //   1. If you add a test that branches on E2E_TESTING, it would silently
+    //      test e2e behavior, not production behavior — revisit this setting.
+    //   2. Unit tests also run with unitTests.isReturnDefaultValues = true
+    //      (below), a slightly more permissive environment than production.
+    testBuildType = "e2e"
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -92,6 +103,7 @@ android {
             if (ciReleaseSigning != null) {
                 signingConfig = ciReleaseSigning
             }
+            buildConfigField("Boolean", "E2E_TESTING", "false")
         }
         debug {
             // Use different application ID suffix for debug builds
@@ -100,6 +112,16 @@ android {
             versionNameSuffix = "-debug"
 
             manifestPlaceholders["appName"] = "TapAuth (Debug)"
+            buildConfigField("Boolean", "E2E_TESTING", "false")
+        }
+        create("e2e") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+            applicationIdSuffix = ".e2e"
+            versionNameSuffix = "-e2e"
+
+            manifestPlaceholders["appName"] = "TapAuth (E2E)"
+            buildConfigField("Boolean", "E2E_TESTING", "true")
         }
     }
     compileOptions {
@@ -110,6 +132,9 @@ android {
         compose = true
         resValues = true
         buildConfig = true
+    }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 }
 

@@ -12,39 +12,64 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-fn make_stdout_layer() -> impl Layer<tracing_subscriber::Registry> {
-    let filter = std::env::var("TAPAUTH_LOG_LEVEL")
+pub fn init_logging() {
+    let stdout_filter = std::env::var("TAPAUTH_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .and_then(|level| EnvFilter::try_new(&level).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
-    tracing_subscriber::fmt::layer()
+
+    // TAPAUTH_DEV_MODE is only meaningful in dev-feature builds (it gates the UDP
+    // shim and the PolKit bypass at runtime). Dev runs redirect the daemon's
+    // output to a log file, so they want the stdout layer instead of journald.
+    // Production binaries have no dev features compiled in and always log to
+    // journald, no matter what the environment says.
+    #[cfg(any(
+        feature = "dev-state-override",
+        feature = "dev-udp-loopback",
+        feature = "dev-polkit-bypass"
+    ))]
+    let dev_mode = std::env::var("TAPAUTH_DEV_MODE").is_ok();
+    #[cfg(not(any(
+        feature = "dev-state-override",
+        feature = "dev-udp-loopback",
+        feature = "dev-polkit-bypass"
+    )))]
+    let dev_mode = false;
+
+    if !dev_mode {
+        if let Ok(journald_layer) = tracing_journald::layer() {
+            let journald_level =
+                std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+            let filter =
+                EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
+            if std::env::var("JOURNAL_STREAM").is_ok() {
+                // Under systemd: journald only, since systemd already forwards
+                // stdout to the journal (a stdout layer would duplicate entries).
+                tracing_subscriber::registry()
+                    .with(journald_layer.with_filter(filter))
+                    .init();
+            } else {
+                // Outside systemd: mirror to stdout for terminal visibility.
+                tracing_subscriber::registry()
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_target(false)
+                            .with_writer(std::io::stdout)
+                            .with_filter(stdout_filter),
+                    )
+                    .with(journald_layer.with_filter(filter))
+                    .init();
+            }
+            return;
+        }
+    }
+
+    // Stdout only: journald is unavailable, or this is a dev run
+    // (TAPAUTH_DEV_MODE) whose output is redirected to a log file.
+    tracing_subscriber::fmt()
+        .with_env_filter(stdout_filter)
         .with_target(false)
         .with_writer(std::io::stdout)
-        .with_filter(filter)
-}
-
-pub fn init_logging() {
-    let journald_level =
-        std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-
-    if let Ok(journald_layer) = tracing_journald::layer() {
-        if std::env::var("JOURNAL_STREAM").is_ok() {
-            let filter =
-                EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(journald_layer.with_filter(filter))
-                .init();
-        } else {
-            let filter =
-                EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(make_stdout_layer())
-                .with(journald_layer.with_filter(filter))
-                .init();
-        }
-    } else {
-        tracing_subscriber::registry()
-            .with(make_stdout_layer())
-            .init();
-    }
+        .init();
 }

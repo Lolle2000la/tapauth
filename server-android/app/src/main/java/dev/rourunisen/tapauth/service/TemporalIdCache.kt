@@ -5,7 +5,6 @@ import dev.rourunisen.tapauth.crypto.generateTemporalId
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /**
@@ -17,8 +16,9 @@ import kotlinx.coroutines.launch
  * - Check incoming packets against cache before attempting decryption
  * - Silently drop packets with invalid temporal IDs
  *
- * Uses on-demand (lazy evaluation) to compute temporal IDs at the exact moment a packet arrives,
- * avoiding stale caches caused by Doze mode freezing background coroutine loops.
+ * The precomputed ID set is refreshed when the 60s window rolls over (checked lazily on the first
+ * packet of a new window, so a Doze-frozen coroutine loop can never leave it stale) and immediately
+ * whenever the paired-device list changes.
  */
 class TemporalIdCache(
     private val deviceRepository: DeviceRepository,
@@ -31,30 +31,41 @@ class TemporalIdCache(
     @Volatile private var cachedDevices: List<CachedDevice> = emptyList()
     @Volatile private var lastComputedWindow: Long = -1
 
-    private var deviceRefreshJob: Job? = null
+    /**
+     * Whether the paired-device list has been successfully read at least once.
+     *
+     * Distinguishes "not loaded yet" (retry the disk read when a packet arrives) from "loaded and
+     * genuinely empty" (trust the [DeviceRepository] change listener for additions and never touch
+     * disk on the packet path — otherwise every packet against a device with zero paired devices
+     * would trigger a SharedPreferences read + JSON parse).
+     */
+    @Volatile private var devicesLoaded = false
 
     private data class CachedDevice(val deviceId: String, val csk: ByteArray)
 
     fun start() {
         stop()
-        deviceRefreshJob = scope.launch { refreshDeviceList() }
+        DeviceRepository.setOnDevicesChangedListener {
+            scope.launch { refreshDeviceList() }
+        }
+        scope.launch { refreshDeviceList() }
         Log.d(TAG, "Started temporal ID cache")
     }
 
     fun stop() {
-        deviceRefreshJob?.cancel()
-        deviceRefreshJob = null
+        DeviceRepository.setOnDevicesChangedListener(null)
         validIds.clear()
         cachedDevices = emptyList()
         lastComputedWindow = -1
+        devicesLoaded = false
         Log.d(TAG, "Stopped temporal ID cache")
     }
 
     /**
      * Check if the given temporal identifier is valid.
      *
-     * Uses on-demand computation: if the cached map doesn't contain the ID (e.g. after Doze),
-     * recomputes temporal IDs for the current time window before returning.
+     * Uses in-memory O(1) cache lookup across precomputed current and previous time windows for all
+     * paired devices, providing instantaneous verification without disk I/O or JNI overhead.
      *
      * @param temporalId The 16-byte temporal identifier from the packet
      * @return Pair of (isValid, deviceId) - deviceId is null if invalid
@@ -66,7 +77,6 @@ class TemporalIdCache(
         }
 
         val idHex = temporalId.toHex()
-
         ensureCacheIsCurrent()
 
         val deviceId = validIds[idHex]
@@ -81,9 +91,9 @@ class TemporalIdCache(
         val now = System.currentTimeMillis()
         val currentWindow = now / TIME_WINDOW_MS
 
-        if (currentWindow != lastComputedWindow) {
+        if (currentWindow != lastComputedWindow || !devicesLoaded) {
             synchronized(this) {
-                if (currentWindow != lastComputedWindow) {
+                if (currentWindow != lastComputedWindow || !devicesLoaded) {
                     recomputeCache(currentWindow)
                 }
             }
@@ -91,34 +101,25 @@ class TemporalIdCache(
     }
 
     private fun recomputeCache(currentWindow: Long) {
-        val devices = cachedDevices
-        if (devices.isEmpty()) {
-            lastComputedWindow = currentWindow
-            return
+        var devices = cachedDevices
+        if (!devicesLoaded) {
+            // Lazy-path reload: the first packet can arrive before start()'s initial
+            // refreshDeviceList() completes, so load the paired devices here as well. Only a
+            // successful load (or a refreshDeviceList() call) sets devicesLoaded; a load failure
+            // returns early without advancing lastComputedWindow so the next packet retries.
+            devices =
+                deviceRepository.getAllPairedDevicesSync().map {
+                    CachedDevice(it.deviceId, it.csk)
+                }
+            cachedDevices = devices
+            devicesLoaded = true
         }
 
-        val previousWindow = currentWindow - 1
-        val newIds = ConcurrentHashMap<String, String>()
-
-        for (device in devices) {
-            try {
-                val currentIdHex =
-                    generateTemporalIdentifier(device.csk, currentWindow * TIME_WINDOW_MS)
-                newIds[currentIdHex] = device.deviceId
-
-                val previousIdHex =
-                    generateTemporalIdentifier(device.csk, previousWindow * TIME_WINDOW_MS)
-                newIds[previousIdHex] = device.deviceId
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
-            }
-        }
-
-        validIds = newIds
+        validIds = computeValidIds(devices, currentWindow)
         lastComputedWindow = currentWindow
         Log.d(
             TAG,
-            "Recomputed cache on-demand: ${newIds.size} valid IDs for ${devices.size} devices",
+            "Recomputed cache on-demand: ${validIds.size} valid IDs for ${devices.size} devices",
         )
     }
 
@@ -128,13 +129,40 @@ class TemporalIdCache(
             val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
             synchronized(this) {
                 cachedDevices = mapped
-                lastComputedWindow = -1
-                ensureCacheIsCurrent()
+                devicesLoaded = true
+                val currentWindow = System.currentTimeMillis() / TIME_WINDOW_MS
+                validIds = computeValidIds(mapped, currentWindow)
+                lastComputedWindow = currentWindow
             }
-            Log.d(TAG, "Refreshed device list: ${cachedDevices.size} paired devices")
+            Log.d(TAG, "Refreshed device list: ${mapped.size} paired devices")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to refresh device list", e)
         }
+    }
+
+    /**
+     * Compute the valid temporal ID set for [devices] across the current and previous 60s windows.
+     */
+    private fun computeValidIds(
+        devices: List<CachedDevice>,
+        currentWindow: Long,
+    ): ConcurrentHashMap<String, String> {
+        val previousWindow = currentWindow - 1
+        val newIds = ConcurrentHashMap<String, String>()
+
+        for (device in devices) {
+            try {
+                newIds[generateTemporalIdentifier(device.csk, currentWindow * TIME_WINDOW_MS)] =
+                    device.deviceId
+
+                newIds[generateTemporalIdentifier(device.csk, previousWindow * TIME_WINDOW_MS)] =
+                    device.deviceId
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
+            }
+        }
+
+        return newIds
     }
 
     private fun generateTemporalIdentifier(csk: ByteArray, timestampMs: Long): String {

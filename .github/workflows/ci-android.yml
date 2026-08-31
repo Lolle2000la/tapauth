@@ -6,16 +6,30 @@ on:
     paths:
       - 'server-android/**'
       - 'shared/**'
+      - 'tapauthd/**'
+      - 'client-pam/**'
+      - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
+      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
+      - 'systemd/**'
+      - 'packaging/**'
+      - 'create-dev-users.sh'
       - '.github/workflows/ci-android.yml'
   pull_request:
     branches: [main]
     paths:
       - 'server-android/**'
       - 'shared/**'
+      - 'tapauthd/**'
+      - 'client-pam/**'
+      - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
+      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
+      - 'systemd/**'
+      - 'packaging/**'
+      - 'create-dev-users.sh'
       - '.github/workflows/ci-android.yml'
 
 env:
@@ -30,6 +44,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Setup Virtual Bluetooth Kernel Module (hci_vhci fail-fast)
+        run: ./scripts/ci/build-kernel-vhci.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -76,6 +93,44 @@ jobs:
       - name: Build native libraries (fail-fast)
         run: cd server-android && ./gradlew cargoBuild
 
+      - name: Run Android JVM unit tests
+        # Rate limiter, replay cache and retransmission semantics are pure JVM
+        # logic; these run without an emulator and must not sit unexecuted.
+        run: cd server-android && ./gradlew test --stacktrace
+
+      - name: Build Android Debug APK, E2E APK, and Test APK
+        run: cd server-android && ./gradlew assembleDebug assembleE2e assembleE2eAndroidTest --stacktrace
+
+      - name: Install Host E2E Dependencies & Bumble
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bluez bluez-tools dbus \
+            libpam0g-dev pamtester \
+            libdbus-1-dev pkg-config \
+            policykit-1
+          # The runner image ships typing-extensions as a Debian-owned package with
+          # no RECORD file, so a system-wide install of bumble aborts on it. A
+          # user-site install avoids that; the plain form is kept as the last resort
+          # because it is what actually succeeded historically (pip auto-selects a
+          # user install when system site-packages is not writable).
+          python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
+            || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
+
+      - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
+        run: |
+          # Build used by the E2E: systemd socket activation (fallback-socket OFF)
+          # and NO dev-state-override, so every state/config/socket path is the real
+          # production one. Only two dev knobs are compiled in, both still requiring
+          # TAPAUTH_DEV_MODE at runtime:
+          #   dev-udp-loopback   - the emulator UDP delivery shim (a hosted runner
+          #                        has no LAN broadcast path into the emulator)
+          #   dev-polkit-bypass  - lets the root test harness administer the daemon
+          #                        without an authentication agent; PolKit is still
+          #                        enforced for non-root callers (asserted by Phase 7)
+          cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
+          cargo build -p client-pam
+
       - name: Free disk space for emulator
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -113,7 +168,7 @@ jobs:
           disable-animations: false
           script: echo "Generated AVD snapshot for caching."
 
-      - name: Run JNI instrumentation tests
+      - name: Run JNI & Full Real-Android E2E Tests (Single Emulator Session)
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36
@@ -121,7 +176,10 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: cd server-android && ./gradlew connectedDebugAndroidTest --stacktrace
+          script: |
+            # Run JNI crypto instrumentation tests (on device/emulator). Note: Full E2E pairing & auth flow is executed below via test-e2e.sh.
+            (cd server-android && ./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
+            sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
 
       - name: Upload test results
         uses: actions/upload-artifact@v7
@@ -131,22 +189,33 @@ jobs:
           path: server-android/app/build/reports/androidTests/
           retention-days: 7
 
-      - name: Build Android APK (Debug)
-        run: cd server-android && ./gradlew assembleDebug --stacktrace
-
       - name: Check Kotlin formatting with Spotless
         run: cd server-android && ./gradlew spotlessCheck
 
-      - name: Upload APK artifact
+      - name: Upload debug APK artifact (safe for manual testing)
         uses: actions/upload-artifact@v7
         with:
           name: tapauth-debug-apk
           path: server-android/app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
+      # The E2E build variant auto-approves authentication requests when no
+      # biometrics are enrolled and exports a test-only denial receiver. It is
+      # uploaded under an explicit name and short retention so it can never be
+      # mistaken for a distributable app build.
+      - name: Upload E2E variant APK artifact (UNSAFE — auto-approves, do not install)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tapauth-e2e-apk-UNSAFE-auto-approves
+          path: server-android/app/build/outputs/apk/e2e/*.apk
+          retention-days: 7
+
       - name: Upload native libraries artifact
         uses: actions/upload-artifact@v7
         with:
           name: native-libraries
-          path: server-android/app/src/main/jniLibs/
+          path: server-android/app/build/rustJniLibs/android/
+          # `ignore` here would let the plugin's output directory move silently and
+          # drop the artifact; a missing directory should fail the job instead.
+          if-no-files-found: error
           retention-days: 30

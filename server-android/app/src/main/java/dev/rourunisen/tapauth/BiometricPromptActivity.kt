@@ -65,19 +65,25 @@ class BiometricPromptActivity : FragmentActivity() {
         currentAuthRequest = authRequest
         setupBiometricPrompt()
 
-        // Check if biometric authentication is available
+        // Check if biometric authentication is available (Class 3 BIOMETRIC_STRONG required)
         val biometricManager = BiometricManager.from(this)
-        when (biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
-            BiometricManager.BIOMETRIC_SUCCESS -> {
-                // Show biometric prompt immediately
-                showBiometricPrompt(authRequest)
-            }
-            else -> {
-                // Biometric not available, deny request and finish
-                Log.e(TAG, "Biometric authentication not available")
-                handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
-                finish()
-            }
+        val canAuthStrong =
+            biometricManager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        Log.d(TAG, "Biometric availability: strong=$canAuthStrong")
+
+        if (canAuthStrong == BiometricManager.BIOMETRIC_SUCCESS) {
+            // Show biometric prompt immediately
+            showBiometricPrompt(authRequest)
+        } else if (BuildConfig.E2E_TESTING) {
+            AuthRequestManager.autoApproveInE2e(this, authRequest, canAuthStrong) { finish() }
+        } else {
+            // Biometric not available in production, deny request and finish
+            Log.e(
+                TAG,
+                "Biometric authentication not available (strong=$canAuthStrong)",
+            )
+            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+            finish()
         }
     }
 
@@ -128,41 +134,10 @@ class BiometricPromptActivity : FragmentActivity() {
                         Log.d(TAG, "Biometric authentication succeeded")
 
                         currentAuthRequest?.let { authRequest ->
-                            // Sign the challenge with server keypair
-                            try {
-                                val keypairRepo =
-                                    dev.rourunisen.tapauth.data.KeypairRepository(
-                                        this@BiometricPromptActivity
-                                    )
-                                val privateKey = keypairRepo.getPrivateKey()
-                                Log.d(
-                                    TAG,
-                                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
-                                )
-                                val signedChallenge =
-                                    dev.rourunisen.tapauth.crypto.signData(
-                                        privateKey,
-                                        authRequest.challenge,
-                                    )
-
-                                Log.d(
-                                    TAG,
-                                    "Successfully signed challenge (${signedChallenge.size} bytes)",
-                                )
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = true,
-                                    signedChallenge = signedChallenge,
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to sign challenge", e)
-                                handleAuthResponse(
-                                    authRequest.requestId,
-                                    approved = false,
-                                    signedChallenge = null,
-                                    explicitDenial = false,
-                                )
-                            }
+                            AuthRequestManager.approveRequest(
+                                this@BiometricPromptActivity,
+                                authRequest,
+                            )
                         }
 
                         // Always finish the activity when authentication ends

@@ -95,21 +95,6 @@ class ReplayMitigationCache {
         challengeCache.clear()
         Log.d(TAG, "Cache cleared")
     }
-
-    /** Get current cache statistics for debugging. */
-    fun getStats(): Map<String, Any> {
-        return mapOf(
-            "cache_size" to challengeCache.size,
-            "oldest_entry_age_seconds" to getOldestEntryAge(),
-        )
-    }
-
-    private fun getOldestEntryAge(): Long {
-        val nowSeconds = System.currentTimeMillis() / 1000
-        return challengeCache.values.minOrNull()?.let { oldestExpiry ->
-            nowSeconds - (oldestExpiry - CACHE_EXPIRY_SECONDS)
-        } ?: 0
-    }
 }
 
 /** Extension function to convert ByteArray to hex string */

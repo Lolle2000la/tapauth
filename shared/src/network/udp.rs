@@ -397,6 +397,9 @@ pub async fn receive_udp_packet(
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
     let mut buf = [0u8; 65536];
 
+    // Our own bound source port, used to detect exact self-echoes (below).
+    let local_port = socket.local_addr().ok().map(|a| a.port());
+
     loop {
         let (len, addr) = socket.recv_from(&mut buf).await?;
 
@@ -416,7 +419,29 @@ pub async fn receive_udp_packet(
             }),
         };
 
-        if is_local_ip(&src_ip) {
+        // A broadcast/multicast sent by this very socket can be looped back by
+        // the kernel with our own address AND our own source port. Such an
+        // exact self-echo is never a legitimate peer packet; processing it
+        // would make the retransmission loop spin at full speed (each echo
+        // looks like a fast "no valid response yet" outcome). This check is
+        // independent of the dev-mode local-address filter below, which must
+        // stay permissive so loopback test harnesses (Android emulator over
+        // SLIRP) keep working.
+        if local_port == Some(addr.port()) && is_local_ip(&src_ip) {
+            tracing::debug!("Ignored self-echoed UDP packet from {}", addr);
+            // drop and continue waiting for next packet
+            continue;
+        }
+
+        #[cfg(any(feature = "dev-udp-loopback", test))]
+        let skip_local_filter = {
+            static DEV_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *DEV_MODE.get_or_init(|| std::env::var("TAPAUTH_DEV_MODE").is_ok())
+        };
+        #[cfg(not(any(feature = "dev-udp-loopback", test)))]
+        let skip_local_filter = false;
+
+        if !skip_local_filter && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-sent UDP packet from {}", addr);
             // drop and continue waiting for next packet
             continue;

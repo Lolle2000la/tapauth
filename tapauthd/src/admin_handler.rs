@@ -154,6 +154,13 @@ pub async fn handle_admin_request(
     // PolKit check.  The tapauthd user must be registered as an action owner
     // via org.freedesktop.policykit.owner in the policy file.
     if let Err(e) = check_authorization(&identity).await {
+        tracing::warn!(
+            "Unauthorized admin request from uid={} (pid={}, user={}): {}",
+            identity.uid,
+            identity.pid,
+            identity.username,
+            e
+        );
         return err_resp(ipc::AdminStatus::AdminUnauthorized, e.to_string());
     }
 
@@ -671,7 +678,7 @@ async fn handle_save_config(
     if let Some(enable_network) = req.enable_network {
         toml_config.enable_network = enable_network;
     }
-    if let Err(e) = toml_config.save_to_path(shared::config::DEFAULT_CONFIG_PATH) {
+    if let Err(e) = toml_config.save() {
         return err_resp(
             ipc::AdminStatus::AdminError,
             format!("Failed to save TOML config: {}", e),

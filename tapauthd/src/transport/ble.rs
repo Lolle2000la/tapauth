@@ -163,6 +163,7 @@ impl BleTransport {
     }
 
     /// Static shutdown implementation operating on cloned handles
+    #[cfg_attr(test, allow(dead_code))] // test targets don't resolve trait dispatch call paths
     async fn do_shutdown(
         adapter: bluer::Adapter,
         adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,

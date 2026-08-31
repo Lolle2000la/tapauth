@@ -7,6 +7,8 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.KeypairRepository
@@ -25,11 +27,13 @@ class AuthRequestManager private constructor() {
     private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    // Track BLE device addresses to request IDs for disconnection handling
-    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
     // Index challenges (Base64) to request IDs for fast cancel-by-challenge
     private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
-    // Debug registry removed: no longer tracking posted notification IDs
+
+    // Track BLE device addresses to request IDs so pending prompts can be
+    // cleaned up when the GATT link to a device is gone (with a grace period,
+    // see BleGattService). Only used for BLE-transport requests.
+    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
 
     // Track recently cancelled challenges to handle out-of-order cancel vs request arrival
     private val cancelledChallenges = ConcurrentHashMap<String, Long>()
@@ -75,7 +79,7 @@ class AuthRequestManager private constructor() {
         challenge: ByteArray,
         timestamp: Long,
         transportType: TransportType,
-        bleDeviceAddress: String? = null, // Optional: BLE MAC address for tracking disconnections
+        bleDeviceAddress: String? = null, // Optional: BLE MAC address for disconnect cleanup
         callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
@@ -119,7 +123,8 @@ class AuthRequestManager private constructor() {
                 Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
             }
 
-        // If this is a BLE request, track it by device address
+        // If this is a BLE request, track it by device address so a lingering
+        // GATT disconnect can clean up the prompt (with a grace period)
         if (bleDeviceAddress != null) {
             bleDeviceRequests.getOrPut(bleDeviceAddress) { mutableSetOf() }.add(requestId)
         }
@@ -156,12 +161,11 @@ class AuthRequestManager private constructor() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
 
-            // Action: Approve -> show biometric prompt directly (same as tapping notification body)
+            // Action: Approve -> opens BiometricPromptActivity to prompt for biometric verification
             val approveIntent =
                 Intent(context, dev.rourunisen.tapauth.BiometricPromptActivity::class.java).apply {
                     action = ACTION_AUTH_REQUEST
                     putExtra(EXTRA_AUTH_REQUEST, authRequest)
-                    putExtra("notification_action", "approve")
                     flags =
                         Intent.FLAG_ACTIVITY_NEW_TASK or
                             Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
@@ -215,7 +219,7 @@ class AuthRequestManager private constructor() {
             val timeElapsed = currentTime - timestamp
             val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
 
-            val notification =
+            val notificationBuilder =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
@@ -235,7 +239,34 @@ class AuthRequestManager private constructor() {
                     .setAutoCancel(false)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setTimeoutAfter(remainingTimeout)
-                    .build()
+
+            // E2E-only: launch BiometricPromptActivity full-screen from the
+            // notification (e.g. over the lock screen). Production builds hold no
+            // USE_FULL_SCREEN_INTENT permission and rely on the heads-up
+            // notification instead, so this must stay behind the e2e build flag.
+            if (dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
+                notificationBuilder.setFullScreenIntent(pendingIntent, true)
+            }
+
+            val notification = notificationBuilder.build()
+
+            // Deterministic prompt launch for automated E2E runs only.
+            //
+            // A background service cannot normally start an activity: Android 10+
+            // blocks background activity starts. The E2E harness needs a
+            // UI-independent path to the prompt, so this stays behind the e2e
+            // build flag; production relies on the notification.
+            if (dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
+                try {
+                    context.startActivity(biometricIntent)
+                    Log.d(TAG, "E2E build: launched BiometricPromptActivity for request $requestId")
+                } catch (e: Exception) {
+                    Log.d(
+                        TAG,
+                        "Direct activity launch not permitted from current context: ${e.message}",
+                    )
+                }
+            }
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
             Log.d(
@@ -299,20 +330,20 @@ class AuthRequestManager private constructor() {
                 "Auth request $requestId ${if (approved) "approved" else if (explicitDenial) "explicitly denied" else "timed out/cancelled"}",
             )
 
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
-
             // Remove from challenge index
             runCatching {
                 val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
                 challengeIndex[key]?.remove(requestId)
                 if (challengeIndex[key]?.isEmpty() == true) {
                     challengeIndex.remove(key)
+                }
+            }
+
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
                 }
             }
 
@@ -338,20 +369,20 @@ class AuthRequestManager private constructor() {
         if (pending != null) {
             Log.d(TAG, "Cancelled auth request $requestId (timeout)")
 
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
-
             // Remove from challenge index
             runCatching {
                 val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
                 challengeIndex[key]?.remove(requestId)
                 if (challengeIndex[key]?.isEmpty() == true) {
                     challengeIndex.remove(key)
+                }
+            }
+
+            // Remove from BLE tracking if applicable
+            pending.bleDeviceAddress?.let { address ->
+                bleDeviceRequests[address]?.remove(requestId)
+                if (bleDeviceRequests[address]?.isEmpty() == true) {
+                    bleDeviceRequests.remove(address)
                 }
             }
 
@@ -370,13 +401,11 @@ class AuthRequestManager private constructor() {
         }
     }
 
-    /** Get a pending request by ID */
-    fun getPendingRequest(requestId: String): AuthRequest? {
-        return pendingRequests[requestId]?.authRequest
-    }
+    /** Check if a pending request exists by ID */
+    fun hasPendingRequest(requestId: String): Boolean = pendingRequests.containsKey(requestId)
 
-    /** Get count of pending requests */
-    fun getPendingCount(): Int = pendingRequests.size
+    /** Get all active request IDs */
+    fun getActiveRequestIds(): Set<String> = pendingRequests.keys.toSet()
 
     /**
      * Cancel all pending requests that match the given challenge This is used when an
@@ -416,6 +445,14 @@ class AuthRequestManager private constructor() {
             if (pending != null) {
                 Log.d(TAG, "Cancelled auth request $requestId due to AuthenticationCancel")
 
+                // Remove from BLE tracking if applicable
+                pending.bleDeviceAddress?.let { address ->
+                    bleDeviceRequests[address]?.remove(requestId)
+                    if (bleDeviceRequests[address]?.isEmpty() == true) {
+                        bleDeviceRequests.remove(address)
+                    }
+                }
+
                 // Invoke callback with cancelled status (not explicit denial)
                 scope.launch { pending.callback(false, null, false) }
 
@@ -442,7 +479,12 @@ class AuthRequestManager private constructor() {
     }
 
     /**
-     * Cancel all pending requests associated with a BLE device that disconnected
+     * Cancel all pending requests associated with a BLE device whose GATT connection is gone.
+     *
+     * Called by BleGattService after a short reconnect grace period following a disconnect, so
+     * transient link drops (which the device survives by reconnecting) never cancel a prompt the
+     * user may be about to answer, while a link that stays down cannot leave an orphaned prompt
+     * alive until the daemon timeout.
      *
      * @param bleDeviceAddress The BLE MAC address of the disconnected device
      * @return true if any requests were cancelled
@@ -454,7 +496,7 @@ class AuthRequestManager private constructor() {
 
         Log.d(
             TAG,
-            "BLE device $bleDeviceAddress disconnected, cancelling ${requestIds.size} pending requests",
+            "BLE device $bleDeviceAddress stayed disconnected, cancelling ${requestIds.size} pending request(s)",
         )
 
         requestIds.forEach { requestId ->
@@ -496,11 +538,7 @@ class AuthRequestManager private constructor() {
         // individually dismissed.
 
         const val ACTION_AUTH_REQUEST = "dev.rourunisen.tapauth.AUTH_REQUEST"
-        const val ACTION_AUTH_RESPONSE = "dev.rourunisen.tapauth.AUTH_RESPONSE"
         const val EXTRA_AUTH_REQUEST = "auth_request"
-        const val EXTRA_REQUEST_ID = "request_id"
-        const val EXTRA_APPROVED = "approved"
-        const val EXTRA_SIGNED_CHALLENGE = "signed_challenge"
 
         @Volatile private var instance: AuthRequestManager? = null
 
@@ -533,9 +571,75 @@ class AuthRequestManager private constructor() {
                 (challenge.contentHashCode() and 0x7FFFFFFF)
             }
         }
-    }
 
-    // Debug helper methods removed
+        /** Delay in ms before debug auto-approval fires when no biometrics are enrolled. */
+        const val DEBUG_AUTO_APPROVE_DELAY_MS = 1000L
+
+        /**
+         * E2E-build-only auto-approval used when no biometrics are enrolled.
+         *
+         * Called from the `BuildConfig.E2E_TESTING` branch of the biometric availability checks in
+         * [dev.rourunisen.tapauth.MainActivity] and
+         * [dev.rourunisen.tapauth.BiometricPromptActivity] (which pass their own
+         * `onGracePeriodElapsed`). Waits [DEBUG_AUTO_APPROVE_DELAY_MS] so the E2E harness can
+         * inject an explicit denial broadcast first, then approves if the request is still pending.
+         */
+        fun autoApproveInE2e(
+            activity: FragmentActivity,
+            authRequest: AuthRequest,
+            canAuthStrong: Int,
+            onGracePeriodElapsed: () -> Unit = {},
+        ) {
+            Log.i(
+                TAG,
+                "Biometrics not enrolled in E2E test mode (strong=$canAuthStrong); auto-approving after grace period if not denied",
+            )
+            activity.lifecycleScope.launch {
+                delay(DEBUG_AUTO_APPROVE_DELAY_MS)
+                if (getInstance().hasPendingRequest(authRequest.requestId)) {
+                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
+                    approveRequest(activity, authRequest)
+                }
+                onGracePeriodElapsed()
+            }
+        }
+
+        /**
+         * Signs the auth challenge using the device's private key and submits an approved response
+         * through AuthRequestManager.
+         */
+        fun approveRequest(context: Context, authRequest: AuthRequest) {
+            try {
+                val keypairRepo = KeypairRepository(context)
+                val privateKey = keypairRepo.getPrivateKey()
+                Log.d(
+                    TAG,
+                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                )
+                val signedChallenge =
+                    dev.rourunisen.tapauth.crypto.signData(
+                        privateKey,
+                        authRequest.challenge,
+                    )
+                Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
+                getInstance()
+                    .handleResponse(
+                        authRequest.requestId,
+                        approved = true,
+                        signedChallenge = signedChallenge,
+                    )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to sign challenge", e)
+                getInstance()
+                    .handleResponse(
+                        authRequest.requestId,
+                        approved = false,
+                        signedChallenge = null,
+                        explicitDenial = false,
+                    )
+            }
+        }
+    }
 }
 
 private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {

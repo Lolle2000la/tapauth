@@ -38,5 +38,32 @@ default = ["ble", "firewall"]
 ble = ["bluer"]
 tpm = ["shared/tpm"]
 firewall = ["shared/firewall"]
+#
+# Development / test-only knobs, all compiled out of production builds. The UDP
+# shim, its receive-filter bypass and the PolKit bypass additionally require
+# TAPAUTH_DEV_MODE at runtime, so a shipped binary can never be toggled by the
+# environment alone; dev-state-override is keyed off TAPAUTH_STATE_DIR itself.
+#
+# dev-state-override: honour TAPAUTH_STATE_DIR (relocates the state dir and the
+# config.toml inside it).
+dev-state-override = ["shared/dev-state-override"]
+# dev-udp-loopback: unicast every outgoing packet to TAPAUTH_DEV_UDP_TARGET and
+# accept peer packets arriving from local addresses. Needed to talk to a peer
+# that is emulated on the same host (e.g. the Android emulator over SLIRP).
+dev-udp-loopback = ["shared/dev-udp-loopback"]
+# dev-polkit-bypass: let same-UID and root admin callers through without a
+# PolKit check, so test harnesses do not need an authentication agent.
+dev-polkit-bypass = []
+# dev-socket-override: honour TAPAUTHD_SOCK in the tapauth-ipc-cli admin tool
+# (redirects it to a sandbox socket). Mirrors the same-named feature on
+# client-pam/client-config-gui. For testing/dev only; production builds must
+# NOT enable it.
+dev-socket-override = []
+# fallback-socket: bind the IPC socket manually instead of relying on systemd
+# socket activation (FD#3). Everything a local dev sandbox needs.
 fallback-socket = [
-] # Enable manual socket binding for development/testing (production uses systemd socket activation)
+    "dev-state-override",
+    "dev-udp-loopback",
+    "dev-polkit-bypass",
+    "dev-socket-override",
+]

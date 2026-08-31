@@ -28,9 +28,7 @@ pub enum PeerIdentityError {
 }
 
 pub struct PeerIdentity {
-    #[allow(dead_code)]
     pub pid: i32,
-    #[allow(dead_code)]
     pub uid: u32,
     pub username: String,
     pub start_time: u64,
@@ -105,6 +103,20 @@ fn read_process_start_time(pid: i32) -> Result<u64, PeerIdentityError> {
 ///
 /// Falls back to root-only when PolKit is unavailable.
 pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIdentityError> {
+    // Development and isolated test-automation environments (feature `dev-polkit-bypass`):
+    // allow same-UID callers (the user running the test harness / daemon) or root to
+    // administer the daemon over the socket without requiring an interactive PolKit
+    // authentication agent on headless runners. Requires TAPAUTH_DEV_MODE at runtime and
+    // is compiled out of production builds. Unprivileged callers with a different UID are
+    // always evaluated (and denied) by PolKit / the root-only fallback.
+    #[cfg(any(feature = "dev-polkit-bypass", test))]
+    if std::env::var("TAPAUTH_DEV_MODE").is_ok() {
+        let my_uid = nix::unistd::geteuid().as_raw();
+        if identity.uid == my_uid || identity.uid == 0 {
+            return Ok(());
+        }
+    }
+
     match check_polkit(identity).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(PeerIdentityError::AuthorizationDenied),
@@ -116,6 +128,7 @@ pub async fn check_authorization(identity: &PeerIdentity) -> Result<(), PeerIden
                     s_lower.contains("not found")
                         || s_lower.contains("no such")
                         || s_lower.contains("serviceunknown")
+                        || s_lower.contains("not registered")
                 }
                 _ => false,
             };

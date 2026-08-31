@@ -45,6 +45,13 @@ class BleGattService : Service() {
 
         const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
 
+        /**
+         * Grace period after a GATT disconnect before pending requests for that device are
+         * cancelled. Short enough to bound an orphaned prompt's lifetime, long enough to ride out
+         * transient link drops and duplicate connection callbacks.
+         */
+        const val BLE_DISCONNECT_CANCEL_GRACE_MS = 5_000L
+
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
         val SERVICE_UUID: UUID = UUID.fromString("b4ad84c0-2adb-4876-8315-b39d983b2bde")
@@ -97,6 +104,11 @@ class BleGattService : Service() {
     // Track active GATT connections by challenge for cancellation
     private val activeConnectionsByChallenge =
         java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
+
+    // Track in-flight or active GATT connections by device address to prevent duplicate concurrent
+    // connections
+    private val connectingOrConnectedDevices =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     // Store confirmation characteristic values from onCharacteristicRead callback (API 33+)
     private val confirmationValues = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
@@ -152,16 +164,31 @@ class BleGattService : Service() {
                         val deviceAddress = gatt.device.address
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
+                        connectingOrConnectedDevices.remove(deviceAddress)
                         confirmationValues.remove(deviceAddress)
 
-                        // Cancel any pending authentication requests from this device
-                        val authRequestManager =
-                            dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
-                        if (authRequestManager.cancelRequestsByBleDisconnection(deviceAddress)) {
-                            Log.d(
-                                TAG,
-                                "Cancelled pending requests for disconnected device $deviceAddress",
-                            )
+                        // Drop any challenge-tracked connections that pointed at this (now dead)
+                        // GATT handle so a stale response can never be written through it.
+                        activeConnectionsByChallenge.values.removeAll { it == gatt }
+
+                        // Authentication prompts are user-driven and must survive transient GATT
+                        // reconnections, so requests are NOT cancelled immediately here. But a
+                        // link that stays down must not leave an orphaned prompt (and its BLE
+                        // connection intent) alive until the daemon timeout: after a short grace
+                        // period, if the device has not reconnected, cancel its pending requests.
+                        serviceScope.launch {
+                            delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
+                            if (!connectingOrConnectedDevices.contains(deviceAddress)) {
+                                if (
+                                    dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
+                                        .cancelRequestsByBleDisconnection(deviceAddress)
+                                ) {
+                                    Log.d(
+                                        TAG,
+                                        "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
+                                    )
+                                }
+                            }
                         }
 
                         gatt.close()
@@ -253,16 +280,6 @@ class BleGattService : Service() {
                     Log.d(TAG, "Successfully wrote response to client")
                 } else {
                     Log.e(TAG, "Failed to write response to client, status: $status")
-                }
-
-                // Disconnect after writing response
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
                 }
             }
         }
@@ -575,11 +592,53 @@ class BleGattService : Service() {
             return
         }
 
+        if (!connectingOrConnectedDevices.add(device.address)) {
+            Log.d(
+                TAG,
+                "Already connecting or connected to ${device.address}, ignoring duplicate scan result",
+            )
+            return
+        }
+
         Log.i(TAG, "Connecting to client GATT server: ${device.address}")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(this, false, gattCallback)
+        try {
+            @Suppress("DEPRECATION")
+            val gatt =
+                when {
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                        device.connectGatt(
+                            this,
+                            false,
+                            gattCallback,
+                            BluetoothDevice.TRANSPORT_LE,
+                            BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK,
+                            null,
+                        )
+                    }
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.O -> {
+                        @Suppress("DEPRECATION")
+                        device.connectGatt(
+                            this,
+                            false,
+                            gattCallback,
+                            BluetoothDevice.TRANSPORT_LE,
+                            BluetoothDevice.PHY_LE_1M_MASK or BluetoothDevice.PHY_LE_2M_MASK,
+                        )
+                    }
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
+                        @Suppress("DEPRECATION")
+                        device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                    }
+                    else -> {
+                        @Suppress("DEPRECATION") device.connectGatt(this, false, gattCallback)
+                    }
+                }
+            if (gatt == null) {
+                connectingOrConnectedDevices.remove(device.address)
+            }
+        } catch (e: Exception) {
+            connectingOrConnectedDevices.remove(device.address)
+            Log.e(TAG, "Failed to initiate connectGatt to ${device.address}: ${e.message}", e)
         }
     }
 
@@ -946,7 +1005,6 @@ class BleGattService : Service() {
 
             // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
-            val bleDeviceAddress = gatt.device.address // Get BLE MAC address for tracking
             authRequestManager.submitRequest(
                 context = this,
                 deviceId = matchedDevice.deviceId,
@@ -956,7 +1014,7 @@ class BleGattService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
-                bleDeviceAddress = bleDeviceAddress, // Track by BLE address
+                bleDeviceAddress = gatt.device.address,
             ) { approved, signedChallenge, explicitDenial ->
                 // Create and send encrypted grant/denial
                 if (approved && signedChallenge != null) {
@@ -1291,6 +1349,7 @@ class BleGattService : Service() {
             }
         }
         activeConnectionsByChallenge.clear()
+        connectingOrConnectedDevices.clear()
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)

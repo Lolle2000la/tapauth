@@ -16,6 +16,27 @@ class DeviceRepository(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("tapauth_devices", Context.MODE_PRIVATE)
 
+    companion object {
+        private const val KEY_DEVICES = "paired_devices"
+
+        /**
+         * Single-slot device-change hook, used by [dev.rourunisen.tapauth.service.TemporalIdCache]
+         * to refresh its precomputed IDs immediately after pairing/un-pairing.
+         *
+         * There is only ever one cache in the process, so registering deliberately replaces any
+         * previous listener instead of accumulating them.
+         */
+        @Volatile private var changeListener: (() -> Unit)? = null
+
+        fun setOnDevicesChangedListener(listener: (() -> Unit)?) {
+            changeListener = listener
+        }
+
+        private fun notifyListener() {
+            changeListener?.invoke()
+        }
+    }
+
     suspend fun savePairedDevice(device: PairedDevice) =
         withContext(Dispatchers.IO) {
             val devices = getAllPairedDevices().toMutableList()
@@ -25,22 +46,27 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            notifyListener()
         }
+
+    fun getAllPairedDevicesSync(): List<PairedDevice> {
+        val devicesJson = prefs.getString(KEY_DEVICES, null) ?: return emptyList()
+
+        val jsonArray = JSONArray(devicesJson)
+        val devices = mutableListOf<PairedDevice>()
+
+        for (i in 0 until jsonArray.length()) {
+            val json = jsonArray.getJSONObject(i)
+            devices.add(jsonToDevice(json))
+        }
+
+        return devices
+    }
 
     suspend fun getAllPairedDevices(): List<PairedDevice> =
         withContext(Dispatchers.IO) {
-            val devicesJson = prefs.getString(KEY_DEVICES, null) ?: return@withContext emptyList()
-
-            val jsonArray = JSONArray(devicesJson)
-            val devices = mutableListOf<PairedDevice>()
-
-            for (i in 0 until jsonArray.length()) {
-                val json = jsonArray.getJSONObject(i)
-                devices.add(jsonToDevice(json))
-            }
-
-            devices
+            getAllPairedDevicesSync()
         }
 
     suspend fun getPairedDevice(deviceId: String): PairedDevice? =
@@ -53,7 +79,8 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            notifyListener()
         }
 
     /**
@@ -74,23 +101,23 @@ class DeviceRepository(context: Context) {
             val device = devices[deviceIndex]
             val updatedUsers = device.allowedUsers.filter { it != username }
 
-            if (updatedUsers.isEmpty()) {
+            val entirelyRemoved = updatedUsers.isEmpty()
+            if (entirelyRemoved) {
                 // No users left, remove entire device
                 devices.removeAt(deviceIndex)
-                true
             } else {
                 // Update device with new user list
                 devices[deviceIndex] = device.copy(allowedUsers = updatedUsers)
-                false
             }
 
             // Save updated list
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).apply()
+            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            notifyListener()
 
-            return@withContext updatedUsers.isEmpty()
+            return@withContext entirelyRemoved
         }
 
     private fun deviceToJson(device: PairedDevice): JSONObject {
@@ -123,9 +150,5 @@ class DeviceRepository(context: Context) {
             pairedAt = json.getLong("pairedAt"),
             allowedUsers = allowedUsers,
         )
-    }
-
-    companion object {
-        private const val KEY_DEVICES = "paired_devices"
     }
 }

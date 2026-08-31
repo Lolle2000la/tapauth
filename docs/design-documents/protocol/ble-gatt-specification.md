@@ -54,6 +54,14 @@ The BLE transport implements the same retransmission and confirmation protocol a
 
 This design ensures reliable delivery of authentication results over BLE while maintaining consistency with the UDP transport behavior specified in `authentication-flow.md`.
 
+### Connection Lifecycle
+
+The GATT connection between the Server (phone, central) and the Client (desktop, peripheral) is managed as follows:
+
+* **Held open during the exchange**: The connection is **not** torn down after each characteristic write. It must stay alive until the response has been delivered *and* the GrantConfirmation has been read, since retransmission and confirmation polling both use the same link. Disconnecting earlier would race with the confirmation round-trip.
+* **Torn down after completion**: Once retransmission stops (confirmation received or the 10s retransmission window expires), or the transaction fails/times out, the Server disconnects the GATT link. Error and rejection paths disconnect immediately and silently.
+* **Disconnect cleanup with grace period**: If the link drops while a prompt is still pending (user has not answered), the pending request is **not** cancelled immediately — transient link drops and duplicate connection callbacks must not dismiss a prompt the user is about to answer. Instead, the Server cancels pending requests for that device only if it has **not reconnected within a short grace period** (currently 5 seconds). Daemon/PAM timeouts remain the upper bound for any pending request.
+
 ## BLE Security Best Practices
 
 To protect the confidentiality and integrity of the communication at the transport layer, the following BLE security practice is **strongly recommended** if your implementation has low-level control over BLE security parameters.
