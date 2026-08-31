@@ -31,10 +31,12 @@ fi
 
 # Variable names that must never appear in a shipped binary. All of these are
 # read only behind dev Cargo features (dev-state-override, dev-udp-loopback,
-# dev-socket-override, fallback-socket), so a clean scan proves no dev knob was
-# compiled into the artifact.
-DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET")
-DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET")
+# dev-socket-override, dev-polkit-bypass, fallback-socket), so a clean scan
+# proves no dev knob was compiled into the artifact. TAPAUTH_DEV_MODE matters
+# in particular because it is the ONLY runtime string of dev-polkit-bypass:
+# without it, an accidental dev-polkit-bypass build would pass the scan.
+DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
+DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
 
 echo "==> Building production artifacts (per crate, default features)"
 # Mirrors install.sh: each crate is built on its own so no dev feature can be

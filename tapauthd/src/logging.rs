@@ -37,19 +37,36 @@ pub fn init_logging() {
     )))]
     let dev_mode = false;
 
-    if std::env::var("JOURNAL_STREAM").is_ok() && !dev_mode {
-        let journald_level =
-            std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    if !dev_mode {
         if let Ok(journald_layer) = tracing_journald::layer() {
+            let journald_level =
+                std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
             let filter =
                 EnvFilter::try_new(&journald_level).unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(journald_layer.with_filter(filter))
-                .init();
+            if std::env::var("JOURNAL_STREAM").is_ok() {
+                // Under systemd: journald only, since systemd already forwards
+                // stdout to the journal (a stdout layer would duplicate entries).
+                tracing_subscriber::registry()
+                    .with(journald_layer.with_filter(filter))
+                    .init();
+            } else {
+                // Outside systemd: mirror to stdout for terminal visibility.
+                tracing_subscriber::registry()
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_target(false)
+                            .with_writer(std::io::stdout)
+                            .with_filter(stdout_filter),
+                    )
+                    .with(journald_layer.with_filter(filter))
+                    .init();
+            }
             return;
         }
     }
 
+    // Stdout only: journald is unavailable, or this is a dev run
+    // (TAPAUTH_DEV_MODE) whose output is redirected to a log file.
     tracing_subscriber::fmt()
         .with_env_filter(stdout_filter)
         .with_target(false)
