@@ -11,6 +11,9 @@ Packages are built and tracked using Fedora COPR.
 ```bash
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
+
+# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
+sudo dnf install tapauth-fprintd
 ```
 * **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. The package ships ready-made authselect vendor profiles that you can enable with a single command:
   ```bash
@@ -30,6 +33,9 @@ Packages are published via a Launchpad Personal Package Archive (PPA).
 sudo add-apt-repository ppa:lolle2000la/tapauth
 sudo apt-get update
 sudo apt-get install tapauth
+
+# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
+sudo apt-get install tapauth-fprintd
 ```
 * **PAM Configuration:** Installation automatically registers a module profile hook. To toggle or configure the module non-interactively, run:
 ```bash
@@ -42,11 +48,52 @@ The source package metadata configuration is available via the Arch User Reposit
 paru -S tapauth
 # or alternatively
 yay -S tapauth
+
+# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
+paru -S tapauth-fprintd
+# or yay -S tapauth-fprintd
 ```
 * **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
 ```text
 auth      sufficient      pam_tapauth.so
 ```
+
+## Desktop Lock Screen Integration (GNOME & KDE Plasma)
+
+Modern Linux desktop lock screens (KDE Plasma's `kscreenlocker` and GNOME's `gdm`/`gnome-shell`) support simultaneous password and biometric authentication through virtual fingerprint emulation.
+
+### Optional Package: `tapauth-fprintd`
+TapAuth includes an embedded virtual `fprintd` D-Bus bridge (`net.reactivated.Fprint`) in the daemon. Installing the optional `tapauth-fprintd` package enables automatic desktop lock screen recognition:
+- **How it works:** When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
+- **Physical Fingerprint Hardware Notice:** If your machine already has a physical hardware fingerprint scanner and you actively use upstream `fprintd`, do **not** install `tapauth-fprintd` (they conflict on the D-Bus service name). TapAuth can still be used for `sudo`, PAM, and login via `pam_tapauth.so`.
+- **Configuration Toggle:** You can disable or enable the virtual bridge anytime in `/etc/tapauth/config.toml` (`enable_fprintd_bridge = true|false`) or dynamically in the `tapauth-config` GUI under **Settings → Connectivity**.
+
+### Dual-Stack PAM Setup (Manual Configuration)
+If configuring PAM manually (or on distributions like Arch):
+- **KDE Plasma (`/etc/pam.d/kde-fingerprint`):**
+  ```text
+  #%PAM-1.0
+  auth        [success=done default=bad]    pam_tapauth.so
+  auth        include      system-local-login
+  account     include      system-local-login
+  password    include      system-local-login
+  session     include      system-local-login
+  ```
+- **GNOME / GDM (`/etc/pam.d/gdm-fingerprint`):**
+  ```text
+  #%PAM-1.0
+  auth        [success=done default=bad]    pam_tapauth.so
+  auth        include      system-local-login
+  account     include      system-local-login
+  password    include      system-local-login
+  session     include      system-local-login
+  ```
+  And enable fingerprint authentication in GDM dconf (`/etc/dconf/db/gdm.d/01-tapauth`):
+  ```ini
+  [org/gnome/login-screen]
+  enable-fingerprint-authentication=true
+  ```
+  Then run `sudo dconf update`.
 
 ### 4. Android (via F-Droid)
 A custom, unified F-Droid repository delivers the TapAuth Android companion app and update channels without requiring any third-party app store account.
