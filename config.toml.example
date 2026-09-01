@@ -43,10 +43,10 @@ enable_ble = true
 
 # Virtual fprintd D-Bus Bridge
 # Exposes the net.reactivated.Fprint D-Bus service, allowing desktop
-# environments (like GNOME Shell lockscreen) to query and trigger TapAuth
+# environments (like GNOME Shell and KDE Plasma lockscreens) to query and trigger TapAuth
 # biometrics in parallel with password entry.
-# Default: true
-enable_fprintd_bridge = true
+# Default: false (enabled when using the tapauth-fprintd package or explicitly configured)
+enable_fprintd_bridge = false
 
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.

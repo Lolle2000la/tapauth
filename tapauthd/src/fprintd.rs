@@ -529,19 +529,24 @@ async fn run_verify(
         tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    let auth_fut = session.handle_authenticate(
+        None,
+        Some("fprintd-verify".to_string()),
+        Some("fprintd-verify".to_string()),
+        cancel_registry.clone(),
+    );
+    tokio::pin!(auth_fut);
+
     let mut cancel_rx = cancel_rx;
     let result = tokio::select! {
-        res = session.handle_authenticate(
-            None,
-            Some("fprintd-verify".to_string()),
-            Some("fprintd-verify".to_string()),
-            cancel_registry.clone()
-        ) => Some(res),
+        res = &mut auth_fut => Some(res),
         _ = &mut cancel_rx => {
             let mut reg = cancel_registry.lock().await;
             if let Some(tx) = reg.remove("fprintd-verify") {
                 let _ = tx.send(());
             }
+            drop(reg);
+            let _ = auth_fut.await;
             None
         }
     };

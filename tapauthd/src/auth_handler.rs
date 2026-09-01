@@ -225,6 +225,31 @@ impl DaemonState {
 
 type CancelRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
 
+/// Drop guard to ensure cancel-registry entries are never leaked on normal completion,
+/// errors, or drop.
+struct CancelGuard {
+    registry: Option<CancelRegistry>,
+    request_id: Option<String>,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let (Some(reg), Some(id)) = (self.registry.take(), self.request_id.take()) {
+            match reg.clone().try_lock_owned() {
+                Ok(mut lock) => {
+                    lock.remove(&id);
+                }
+                Err(_) => {
+                    tokio::spawn(async move {
+                        let mut lock = reg.lock().await;
+                        lock.remove(&id);
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Query systemd-logind over system D-Bus to check if the target user has an active
 /// graphical session that is currently locked (`LockedHint == true`).
 async fn is_user_session_locked(username: &str) -> bool {
@@ -236,10 +261,12 @@ async fn is_user_session_locked(username: &str) -> bool {
         }
     };
 
-    let target_uid = match nix::unistd::User::from_name(username) {
-        Ok(Some(u)) => u.uid.as_raw(),
-        _ => return false,
-    };
+    let user_name = username.to_string();
+    let target_uid =
+        match tokio::task::spawn_blocking(move || nix::unistd::User::from_name(&user_name)).await {
+            Ok(Ok(Some(u))) => u.uid.as_raw(),
+            _ => return false,
+        };
 
     // Query org.freedesktop.login1.Manager at /org/freedesktop/login1
     let reply = match connection
@@ -552,6 +579,10 @@ impl AuthSession {
         // Setup cancellation mechanism
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.register_cancel_handler(cancel_tx).await;
+        let _cancel_guard = CancelGuard {
+            registry: self.cancel_registry.clone(),
+            request_id: self.request_id.clone(),
+        };
 
         // Pre-compute cancel packet
         let cancel_packet = self.create_cancel_packet()?;
@@ -1200,4 +1231,32 @@ impl AuthSession {
 enum ResponseError {
     /// Invalid message that should be ignored (wait for another response)
     InvalidMessage,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cancel_guard_cleanup_on_drop() {
+        let registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        let req_id = "test-request-123".to_string();
+
+        registry.lock().await.insert(req_id.clone(), tx);
+        assert!(registry.lock().await.contains_key(&req_id));
+
+        {
+            let _guard = CancelGuard {
+                registry: Some(registry.clone()),
+                request_id: Some(req_id.clone()),
+            };
+            assert!(registry.lock().await.contains_key(&req_id));
+        }
+
+        // After guard is dropped, the entry must be removed from the registry
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!registry.lock().await.contains_key(&req_id));
+    }
 }

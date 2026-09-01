@@ -854,15 +854,25 @@ pub enum PamContext {
 /// Classify the PAM service context.
 ///
 /// Priority order:
-/// 1. Secondary biometric stacks (`kde-fingerprint`, `gdm-fingerprint`, etc.) ALWAYS take precedence.
-/// 2. Primary display manager logins (e.g. `sddm`, `gdm`, `gdm-password`, `plasmalogin`).
-/// 3. Polkit agent (`polkit-1`).
-/// 4. Interactive terminal (`/dev/tty` available).
+/// 1. Polkit agent (`polkit-1`).
+/// 2. Interactive terminal (`/dev/tty` available): always interactive terminal mode.
+/// 3. Secondary biometric stacks (`kde-fingerprint`, `gdm-fingerprint`, etc.) in TTY-less environments.
+/// 4. Primary display manager logins (e.g. `sddm`, `gdm`, `gdm-password`, `plasmalogin`).
 /// 5. Standalone GUI sequential fallback.
 pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
     let service_lower = service.to_ascii_lowercase();
 
-    // 1. Dual-Stack Secondary Biometric Services
+    // 1. Polkit Agent
+    if service_lower == "polkit-1" {
+        return PamContext::PolkitThreaded;
+    }
+
+    // 2. Interactive Terminal
+    if has_terminal {
+        return PamContext::Terminal;
+    }
+
+    // 3. Dual-Stack Secondary Biometric Services (TTY-less lockscreen workers)
     const DUAL_STACK_SECONDARY: &[&str] = &[
         "kde-fingerprint",
         "kde-smartcard",
@@ -870,14 +880,12 @@ pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
         "kde-u2f",
         "gdm-fingerprint",
         "gdm-smartcard",
-        "fingerprint-auth",
-        "smartcard-auth",
     ];
     if DUAL_STACK_SECONDARY.iter().any(|s| service_lower == *s) {
         return PamContext::DualStackSecondary;
     }
 
-    // 2. Primary Display Manager Logins (Exact matches & primary prefixes)
+    // 4. Primary Display Manager Logins (Exact matches & primary prefixes)
     // Note: gdm-password is intentionally included here so the password worker is 100% responsive
     const DM_SERVICES: &[&str] = &[
         "sddm",
@@ -904,16 +912,6 @@ pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
         return PamContext::DisplayManagerBypass;
     }
 
-    // 3. Polkit Agent
-    if service_lower == "polkit-1" {
-        return PamContext::PolkitThreaded;
-    }
-
-    // 4. Interactive Terminal
-    if has_terminal {
-        return PamContext::Terminal;
-    }
-
     // 5. Standalone / Single-Stack GUI
     PamContext::GuiSequential
 }
@@ -927,11 +925,7 @@ fn unavail_or_ignore(context: PamContext) -> c_int {
     }
 }
 
-/// Spawn a thread to monitor `/dev/tty` for skip signals.
-///
-/// Reads from the controlling terminal and signals via `skip_tx` when any key
-/// is pressed. Uses `/dev/tty` instead of stdin to work correctly in PAM contexts
-/// where stdin may not be connected to the terminal.
+/// Map daemon IPC response outcome to the appropriate PAM return code based on context.
 fn map_pam_outcome(
     resp: &shared::ipc::pb::PamAuthenticateResponse,
     username: &str,
@@ -939,69 +933,51 @@ fn map_pam_outcome(
     msgs: &pam_messages::PamMessages,
     context: PamContext,
 ) -> c_int {
-    match context {
-        PamContext::DualStackSecondary => match resp.outcome() {
-            shared::ipc::pb::PamOutcome::Success => {
-                tracing::info!("Authentication successful for user: {}", username);
-                pam_conv.try_info(msgs.auth_successful());
-                pam_sys::PAM_SUCCESS
-            }
-            shared::ipc::pb::PamOutcome::Denied => {
-                tracing::info!("Authentication explicitly denied for user: {}", username);
-                pam_conv.try_info(msgs.auth_denied());
-                pam_sys::PAM_PERM_DENIED
-            }
-            shared::ipc::pb::PamOutcome::Timeout => {
-                tracing::info!("Authentication timed out for user: {}", username);
+    match resp.outcome() {
+        shared::ipc::pb::PamOutcome::Success => {
+            tracing::info!("Authentication successful for user: {}", username);
+            pam_conv.try_info(msgs.auth_successful());
+            pam_sys::PAM_SUCCESS
+        }
+        shared::ipc::pb::PamOutcome::Denied => {
+            tracing::info!("Authentication explicitly denied for user: {}", username);
+            pam_conv.try_info(msgs.auth_denied());
+            pam_sys::PAM_PERM_DENIED
+        }
+        shared::ipc::pb::PamOutcome::Timeout => {
+            tracing::info!("Authentication timed out for user: {}", username);
+            if context == PamContext::DualStackSecondary {
                 pam_conv.try_info(msgs.timed_out());
                 pam_sys::PAM_AUTH_ERR
+            } else {
+                pam_sys::PAM_IGNORE
             }
-            shared::ipc::pb::PamOutcome::Ignore => {
-                tracing::info!(
-                    "Daemon indicated IGNORE for user: {} (dual-stack secondary -> PAM_AUTHINFO_UNAVAIL)",
-                    username
-                );
+        }
+        shared::ipc::pb::PamOutcome::Ignore => {
+            tracing::info!(
+                "Daemon indicated IGNORE for user: {} (context: {:?})",
+                username,
+                context
+            );
+            if context == PamContext::DualStackSecondary {
                 pam_sys::PAM_AUTHINFO_UNAVAIL
+            } else {
+                pam_sys::PAM_IGNORE
             }
-            shared::ipc::pb::PamOutcome::Error => {
-                tracing::error!(
-                    "Daemon reported error for user {}: {}",
-                    username,
-                    resp.detail
-                );
-                pam_conv.try_error(&msgs.error(&resp.detail));
+        }
+        shared::ipc::pb::PamOutcome::Error => {
+            tracing::error!(
+                "Daemon reported error for user {}: {}",
+                username,
+                resp.detail
+            );
+            pam_conv.try_error(&msgs.error(&resp.detail));
+            if context == PamContext::DualStackSecondary {
                 pam_sys::PAM_AUTH_ERR
-            }
-        },
-        _ => match resp.outcome() {
-            shared::ipc::pb::PamOutcome::Success => {
-                tracing::info!("Authentication successful for user: {}", username);
-                pam_conv.try_info(msgs.auth_successful());
-                pam_sys::PAM_SUCCESS
-            }
-            shared::ipc::pb::PamOutcome::Denied => {
-                tracing::info!("Authentication explicitly denied for user: {}", username);
-                pam_conv.try_info(msgs.auth_denied());
-                pam_sys::PAM_PERM_DENIED
-            }
-            shared::ipc::pb::PamOutcome::Timeout => {
-                tracing::info!("Authentication timed out for user: {}", username);
+            } else {
                 pam_sys::PAM_IGNORE
             }
-            shared::ipc::pb::PamOutcome::Ignore => {
-                tracing::info!("Daemon indicated IGNORE for user: {}", username);
-                pam_sys::PAM_IGNORE
-            }
-            shared::ipc::pb::PamOutcome::Error => {
-                tracing::error!(
-                    "Daemon reported error for user {}: {}",
-                    username,
-                    resp.detail
-                );
-                pam_conv.try_error(&msgs.error(&resp.detail));
-                pam_sys::PAM_IGNORE
-            }
-        },
+        }
     }
 }
 
@@ -1019,13 +995,9 @@ mod tests {
 
     #[test]
     fn test_classify_pam_context() {
-        // DualStackSecondary priority
+        // Dual-stack secondary
         assert_eq!(
             classify_pam_context("kde-fingerprint", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("kde-fingerprint", true),
             PamContext::DualStackSecondary
         );
         assert_eq!(
@@ -1034,10 +1006,6 @@ mod tests {
         );
         assert_eq!(
             classify_pam_context("kde-smartcard", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("fingerprint-auth", false),
             PamContext::DualStackSecondary
         );
 

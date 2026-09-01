@@ -166,7 +166,7 @@ impl Default for TapAuthConfig {
             udp_port: DEFAULT_UDP_PORT,
             enable_network: DEFAULT_TRANSPORT_ENABLED,
             enable_ble: DEFAULT_TRANSPORT_ENABLED,
-            enable_fprintd_bridge: true,
+            enable_fprintd_bridge: false,
             #[cfg(feature = "tpm")]
             use_tpm: false,
             #[cfg(feature = "tpm")]

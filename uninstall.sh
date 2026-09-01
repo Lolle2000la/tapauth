@@ -168,6 +168,9 @@ remove_systemd_units_and_daemon() {
         show_file_removal "$DAEMON_PATH" "TapAuth daemon binary"
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
+        show_file_removal "/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf" "Virtual fprintd D-Bus policy"
+        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation service"
+        show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override"
         
         local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
         if [[ -f "$polkit_dropin" ]]; then

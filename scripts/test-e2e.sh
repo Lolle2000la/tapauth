@@ -929,15 +929,22 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     DUAL_STACK_SERVICE="kde-fingerprint"
     DUAL_STACK_PAM_PATH="/etc/pam.d/${DUAL_STACK_SERVICE}"
     
+    # Backup pre-existing PAM file if present
+    ORIG_PAM_BACKUP=""
+    if [ -f "$DUAL_STACK_PAM_PATH" ]; then
+        ORIG_PAM_BACKUP=$(cat "$DUAL_STACK_PAM_PATH")
+    fi
+
+    # Distro-aware include
+    INCLUDES="account include common-account\npassword include common-password\nsession include common-session"
+    if [ -f /etc/pam.d/system-local-login ]; then
+        INCLUDES="account include system-local-login\npassword include system-local-login\nsession include system-local-login"
+    elif [ -f /etc/pam.d/system-auth ]; then
+        INCLUDES="account include system-auth\npassword include system-auth\nsession include system-auth"
+    fi
+    
     echo "==> Configuring temporary decisive PAM service for ${DUAL_STACK_SERVICE}..."
-    cat << EOF > "$DUAL_STACK_PAM_PATH"
-#%PAM-1.0
-auth        [success=done default=bad]    $PAM_LIB
-auth        include      system-local-login
-account     include      system-local-login
-password    include      system-local-login
-session     include      system-local-login
-EOF
+    printf "#%%PAM-1.0\nauth        [success=done default=bad]    %s\n%b\n" "$PAM_LIB" "$INCLUDES" > "$DUAL_STACK_PAM_PATH"
 
     echo "==> Testing successful dual-stack authentication via pamtester..."
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
@@ -947,11 +954,20 @@ EOF
         echo "✅ Dual-stack secondary service returned PAM_SUCCESS on phone approval."
     else
         echo "❌ ERROR: expected PAM_SUCCESS on dual-stack authentication."
-        rm -f "$DUAL_STACK_PAM_PATH"
+        if [ -n "$ORIG_PAM_BACKUP" ]; then
+            printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
+        else
+            rm -f "$DUAL_STACK_PAM_PATH"
+        fi
         exit 1
     fi
 
-    rm -f "$DUAL_STACK_PAM_PATH"
+    # Restore original PAM file or clean up
+    if [ -n "$ORIG_PAM_BACKUP" ]; then
+        printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
+    else
+        rm -f "$DUAL_STACK_PAM_PATH"
+    fi
 else
     echo "ℹ️  SKIPPED (pamtester not available, PAM library missing, or /etc/pam.d not writable)."
 fi

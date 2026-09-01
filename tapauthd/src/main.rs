@@ -380,11 +380,22 @@ async fn handle_conn(
                                 if let Some(tx) = reg.remove(&req_id) {
                                     let _ = tx.send(());
                                 }
+                                drop(reg);
+                                let _ = auth_fut.await;
                                 (None, true)
                             }
                             Ok(_) => {
-                                let resp = auth_fut.await;
-                                (Some(resp), false)
+                                tracing::warn!(
+                                    "Unexpected data received from client during authentication '{}' — cancelling request",
+                                    req_id
+                                );
+                                let mut reg = cancel_reg.lock().await;
+                                if let Some(tx) = reg.remove(&req_id) {
+                                    let _ = tx.send(());
+                                }
+                                drop(reg);
+                                let _ = auth_fut.await;
+                                (None, true)
                             }
                         }
                     }
