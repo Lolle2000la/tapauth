@@ -41,6 +41,17 @@ Suggests:       iptables
 A modern, privacy-preserving local-first authentication system using Rust PAM modules,
 systemd system daemons, and low-level communication links.
 
+%package fprintd
+Summary:        Virtual fprintd D-Bus bridge for TapAuth lock screen integration
+Requires:       %{name} = %{version}-%{release}
+Requires:       dbus
+Conflicts:      fprintd
+Provides:       fprintd
+
+%description fprintd
+Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
+authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
+
 %prep
 %setup -q -n %{name}-%{version}
 
@@ -126,6 +137,12 @@ install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datad
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 
+# Virtual fprintd D-Bus Bridge files (subpackage)
+mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
+mkdir -p %{buildroot}%{_sysconfdir}/dbus-1/system.d
+install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
+install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
@@ -169,3 +186,7 @@ fi
 %{_datadir}/authselect/vendor/tapauth
 %{_datadir}/authselect/vendor/tapauth-sssd
 %endif
+
+%files fprintd
+%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
+%config(noreplace) %{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf

@@ -97,7 +97,7 @@ jobs:
           Package: tapauth
           Architecture: any
           Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
-          Recommends: firewalld
+          Recommends: firewalld, tapauth-fprintd
           Suggests: iptables
           Description: Local smartphone-based authentication framework
            A modern, privacy-preserving local-first authentication system
@@ -105,6 +105,16 @@ jobs:
            communication links. Provides phone-based biometric
            verification for Linux desktop login, sudo, and polkit
            authentication via UDP and BLE transport layers.
+
+          Package: tapauth-fprintd
+          Architecture: all
+          Depends: \${misc:Depends}, tapauth (>= \${source:Version}), dbus
+          Conflicts: fprintd
+          Provides: fprintd
+          Replaces: fprintd
+          Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
+           Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
+           authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
           EOF
 
           cat > debian/rules <<EOF
@@ -151,6 +161,11 @@ jobs:
           	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
           	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
           	
+          	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system-services
+          	mkdir -p debian/tapauth-fprintd/etc/dbus-1/system.d
+          	cp packaging/net.reactivated.Fprint.service debian/tapauth-fprintd/usr/share/dbus-1/system-services/
+          	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth-fprintd/etc/dbus-1/system.d/
+
           	if [ "\$(DISTRO_SERIES)" = "jammy" ]; then \
           		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
           		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \

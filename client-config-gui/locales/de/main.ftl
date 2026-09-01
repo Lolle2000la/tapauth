@@ -59,6 +59,7 @@ settings-udp-port-placeholder = UDP-Port eingeben (Standard: 36692)
 settings-connectivity-section = Konnektivität
 settings-enable-network = Lokales Netzwerk (UDP)
 settings-enable-ble = Bluetooth (BLE)
+settings-enable-fprintd-bridge = Virtuelle fprintd-Bridge (Desktop-Sperrbildschirm)
 settings-connectivity-note = Gilt ab dem nächsten Authentifizierungsversuch. Sind beide deaktiviert, wird immer das Passwort zur Authentifizierung verwendet.
 settings-security-section = Sicherheit
 settings-language-section = Sprache

@@ -99,12 +99,14 @@ message SaveConfigRequest {
   uint32 udp_port = 2;
   optional bool enable_ble = 3;
   optional bool enable_network = 4;
+  optional bool enable_fprintd_bridge = 5;
 }
 message GetConfigResponse {
   string hostname = 1;
   uint32 udp_port = 2;
   bool enable_ble = 3;
   bool enable_network = 4;
+  bool enable_fprintd_bridge = 5;
 }
 
 message AdminResponse {

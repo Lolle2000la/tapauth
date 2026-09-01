@@ -75,6 +75,7 @@ fn get_config_success(
     udp_port: u32,
     enable_ble: bool,
     enable_network: bool,
+    enable_fprintd_bridge: bool,
 ) -> ipc::AdminResponse {
     ipc::AdminResponse {
         status: ipc::AdminStatus::AdminSuccess as i32,
@@ -85,6 +86,7 @@ fn get_config_success(
                 udp_port,
                 enable_ble,
                 enable_network,
+                enable_fprintd_bridge,
             },
         )),
     }
@@ -678,6 +680,9 @@ async fn handle_save_config(
     if let Some(enable_network) = req.enable_network {
         toml_config.enable_network = enable_network;
     }
+    if let Some(enable_fprintd_bridge) = req.enable_fprintd_bridge {
+        toml_config.enable_fprintd_bridge = enable_fprintd_bridge;
+    }
     if let Err(e) = toml_config.save() {
         return err_resp(
             ipc::AdminStatus::AdminError,
@@ -697,9 +702,10 @@ async fn handle_save_config(
         port
     );
     tracing::info!(
-        "Transports: BLE={}, LocalNetwork={} — takes effect on next authentication attempt",
+        "Transports: BLE={}, LocalNetwork={}, FprintdBridge={}",
         toml_config.enable_ble,
-        toml_config.enable_network
+        toml_config.enable_network,
+        toml_config.enable_fprintd_bridge
     );
 
     empty_success()
@@ -734,6 +740,7 @@ async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
         toml_config.udp_port as u32,
         toml_config.enable_ble,
         toml_config.enable_network,
+        toml_config.enable_fprintd_bridge,
     )
 }
 

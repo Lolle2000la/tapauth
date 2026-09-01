@@ -59,6 +59,7 @@ settings-udp-port-placeholder = UDPポートを入力（デフォルト: 36692�
 settings-connectivity-section = 接続
 settings-enable-network = ローカルネットワーク（UDP）
 settings-enable-ble = Bluetooth（BLE）
+settings-enable-fprintd-bridge = 仮想fprintdブリッジ（デスクトップ画面ロック）
 settings-connectivity-note = 変更は次回の認証から適用されます。両方を無効にすると、常にパスワード認証にフォールバックします。
 settings-security-section = セキュリティ
 settings-language-section = 言語

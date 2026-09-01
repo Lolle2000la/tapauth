@@ -60,35 +60,38 @@ jobs:
 
           # Added aarch64 to arch layout matrix, removed self-conflicting references
           cat > PKGBUILD <<EOF
-          pkgname=tapauth
+          pkgbase=tapauth
+          pkgname=('tapauth' 'tapauth-fprintd')
           pkgver=${{ steps.version_vars.outputs.VERSION }}
           pkgrel=1
           pkgdesc="Local smartphone-based authentication framework engine"
           arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
           license=('AGPL-3.0')
-          depends=('dbus' 'pam')
           makedepends=('cargo' 'rust' 'protobuf' 'clang')
-          backup=('etc/tapauth/config.toml')
-          install=tapauth.install
-          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
+          source=("\$pkgbase-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
           prepare() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             export CARGO_HOME="\${srcdir}/cargo-home"
             cargo fetch --locked --target "\$CARCH-unknown-linux-gnu"
           }
 
           build() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             export CARGO_HOME="\${srcdir}/cargo-home"
             export CARGO_PROFILE_RELEASE_STRIP=true
             cargo build --frozen --workspace --release
           }
 
-          package() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+          package_tapauth() {
+            pkgdesc="Local smartphone-based authentication framework engine"
+            depends=('dbus' 'pam')
+            backup=('etc/tapauth/config.toml')
+            install=tapauth.install
+
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             install -dm0755 "\$pkgdir/etc/tapauth"
             install -Dm0755 target/release/tapauthd "\$pkgdir/usr/bin/tapauthd"
             install -Dm0755 target/release/tapauth-config "\$pkgdir/usr/bin/tapauth-config"
@@ -103,6 +106,17 @@ jobs:
             install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
             install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+
+          package_tapauth-fprintd() {
+            pkgdesc="Virtual fprintd D-Bus bridge for TapAuth lock screen integration"
+            depends=("tapauth=\$pkgver" 'dbus')
+            conflicts=('fprintd')
+            provides=('fprintd')
+
+            cd "\$srcdir/\$pkgbase-\$pkgver"
+            install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "\$pkgdir/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+            install -Dm0644 packaging/net.reactivated.Fprint.service "\$pkgdir/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
           }
           EOF
 
@@ -136,17 +150,26 @@ jobs:
           	arch = x86_64
           	arch = aarch64
           	license = AGPL-3.0
-          	install = tapauth.install
           	makedepends = cargo
           	makedepends = rust
           	makedepends = protobuf
           	makedepends = clang
-          	depends = dbus
-          	depends = pam
           	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
           	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
 
           pkgname = tapauth
+          	pkgdesc = Local smartphone-based authentication framework engine
+          	install = tapauth.install
+          	backup = etc/tapauth/config.toml
+          	depends = dbus
+          	depends = pam
+
+          pkgname = tapauth-fprintd
+          	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration
+          	depends = tapauth
+          	depends = dbus
+          	conflicts = fprintd
+          	provides = fprintd
           EOF
 
           git add PKGBUILD .SRCINFO tapauth.install
