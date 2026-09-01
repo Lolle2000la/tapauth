@@ -98,6 +98,7 @@ async fn send_pam_auth(
                 tty_present: false,
                 timeout_seconds: timeout_secs,
                 request_id,
+                service_name: "tapauth-ipc-cli".to_string(),
             },
         )),
     };

@@ -891,6 +891,89 @@ else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
 fi
 
+# Step 6f: Phase 2f - Hard cancellation on IPC client disconnect
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2f: Hard Cancellation on IPC Disconnect                ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+"$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+sleep 1
+
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+DISCONNECT_REQ_ID="e2e-disconnect-$$"
+echo "==> Spawning pam-auth in background then abruptly killing client process (simulating lockscreen password entry)..."
+"$CLI_BIN" pam-auth "$TEST_USER" 60 "$DISCONNECT_REQ_ID" > /dev/null 2>&1 &
+CLI_KILL_PID=$!
+sleep 0.5
+
+echo "==> Killing IPC client process (PID $CLI_KILL_PID)..."
+kill -9 "$CLI_KILL_PID" || true
+wait "$CLI_KILL_PID" 2>/dev/null || true
+sleep 1.5
+
+assert_log_since "$LOG_BASE" "IPC client disconnected while authentication" \
+    "Daemon detected socket EOF/disconnect and cancelled in-flight auth"
+
+# Restore auto-grant
+"$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+sleep 1
+
+# Step 6g: Phase 2g - Dual-Stack Secondary PAM stack
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2g: Dual-Stack Secondary PAM Return Code & Behavior    ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+if [ "$PAM_TEST_OK" = "1" ]; then
+    DUAL_STACK_SERVICE="kde-fingerprint"
+    DUAL_STACK_PAM_PATH="/etc/pam.d/${DUAL_STACK_SERVICE}"
+    
+    echo "==> Configuring temporary decisive PAM service for ${DUAL_STACK_SERVICE}..."
+    cat << EOF > "$DUAL_STACK_PAM_PATH"
+#%PAM-1.0
+auth        [success=done default=bad]    $PAM_SO_PATH
+auth        include      system-local-login
+account     include      system-local-login
+password    include      system-local-login
+session     include      system-local-login
+EOF
+
+    echo "==> Testing successful dual-stack authentication via pamtester..."
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+    sleep 1
+
+    if "${PAM_ENV[@]}" pamtester -v "$DUAL_STACK_SERVICE" "$TEST_USER" authenticate; then
+        echo "✅ Dual-stack secondary service returned PAM_SUCCESS on phone approval."
+    else
+        echo "❌ ERROR: expected PAM_SUCCESS on dual-stack authentication."
+        rm -f "$DUAL_STACK_PAM_PATH"
+        exit 1
+    fi
+
+    rm -f "$DUAL_STACK_PAM_PATH"
+else
+    echo "ℹ️  SKIPPED (pamtester not available or not root)."
+fi
+
+# Step 6h: Phase 2h - Virtual fprintd D-Bus verification
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2h: Virtual fprintd D-Bus Interface Verification       ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+if command -v dbus-send >/dev/null 2>&1; then
+    echo "==> Querying net.reactivated.Fprint.Manager.GetDefaultDevice..."
+    if dbus-send --system --print-reply --dest=net.reactivated.Fprint /net/reactivated/Fprint/Manager net.reactivated.Fprint.Manager.GetDefaultDevice > "${TEST_DIR}/fprint_dev.log" 2>&1; then
+        echo "✅ Virtual fprintd responded to GetDefaultDevice on system bus"
+    else
+        echo "ℹ️  Virtual fprintd D-Bus call returned error (system bus permission or not running in test sandbox):"
+        cat "${TEST_DIR}/fprint_dev.log"
+    fi
+else
+    echo "ℹ️  SKIPPED (dbus-send not found)."
+fi
+
 # Step 7: Phase 3 - Bluetooth Low Energy (BLE) Authentication
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"

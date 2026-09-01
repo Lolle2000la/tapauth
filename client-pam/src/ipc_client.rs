@@ -118,12 +118,14 @@ impl IpcClient {
         tty_present: bool,
         timeout_seconds: u32,
         request_id: &str,
+        service_name: &str,
     ) -> Result<ipc::PamAuthenticateResponse, IpcError> {
         let req = ipc::PamAuthenticateRequest {
             username: username.to_string(),
             tty_present,
             timeout_seconds,
             request_id: request_id.to_string(),
+            service_name: service_name.to_string(),
         };
         let envelope = ipc::IpcEnvelope {
             msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
@@ -143,17 +145,21 @@ impl IpcClient {
         tty_present: bool,
         timeout_seconds: u32,
         request_id: &str,
+        service_name: &str,
     ) -> Result<(), IpcError> {
         let req = ipc::PamAuthenticateRequest {
             username: username.to_string(),
             tty_present,
             timeout_seconds,
             request_id: request_id.to_string(),
+            service_name: service_name.to_string(),
         };
         let envelope = ipc::IpcEnvelope {
             msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
         };
-        tracing::trace!("Sending PamAuthenticateRequest [request_id={request_id}]");
+        tracing::trace!(
+            "Sending PamAuthenticateRequest [request_id={request_id}, service={service_name}]"
+        );
         self.send_message(&envelope)
     }
 

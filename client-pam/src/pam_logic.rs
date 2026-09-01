@@ -21,7 +21,7 @@
 use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::pam_messages;
-use crate::pam_sys::{self, PAM_IGNORE};
+use crate::pam_sys;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::Read;
@@ -379,15 +379,31 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
-    if let Some(pam_status) = guard_display_manager_bypass(pamh) {
-        return pam_status;
+    let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
+    let is_polkit = service == "polkit-1";
+    let tty_file = if !is_polkit {
+        std::fs::File::open("/dev/tty").ok()
+    } else {
+        None
+    };
+    let has_terminal = tty_file.is_some();
+    let pam_context = classify_pam_context(&service, has_terminal);
+
+    if pam_context == PamContext::DisplayManagerBypass {
+        tracing::info!(
+            "TapAuth: Service '{}' is a primary display manager. \
+             Skipping to avoid breaking keyring auto-unlock.",
+            service
+        );
+        return pam_sys::PAM_IGNORE;
     }
 
     // Load configuration for timeouts
     let config = crate::config::PamConfig::load();
     tracing::debug!(
-        "PAM operation timeout: {}s",
-        config.pam_operation_timeout_secs
+        "PAM operation timeout: {}s (context: {:?})",
+        config.pam_operation_timeout_secs,
+        pam_context
     );
 
     let username = unsafe {
@@ -410,7 +426,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             Ok(conv) => conv,
             Err(e) => {
                 tracing::error!("Failed to get PAM conversation function: {}", e);
-                return pam_sys::PAM_IGNORE;
+                return unavail_or_ignore(pam_context);
             }
         }
     };
@@ -419,24 +435,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     let msgs = pam_messages::load_for_user(&username);
 
-    // Block terminal polling if running under the Polkit Graphical Helper.
-    // This prevents the PAM module from stealing stdin strings from checking
-    // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
-    // to deadlock during graphical challenge-response dialogs.
-    let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
-    let is_polkit = service == "polkit-1";
     // Only hosts whose conversation is a plain blocking fd fed by a separate
     // process (polkit-agent-helper-1) can safely run the conversation from a
     // background thread while this thread waits for the daemon.  Event-loop
     // based hosts (e.g. kscreenlocker_worker) deadlock instead — see
     // `run_sequential_event_loop`.
-    let supports_threaded_conversation = is_polkit;
-    let tty_file = if !is_polkit {
-        std::fs::File::open("/dev/tty").ok()
-    } else {
-        None
-    };
-    let has_terminal = tty_file.is_some();
+    let supports_threaded_conversation = pam_context == PamContext::PolkitThreaded;
 
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
@@ -448,19 +452,24 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut rid_bytes = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut rid_bytes) {
         tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
-        return PAM_IGNORE;
+        return unavail_or_ignore(pam_context);
     }
     let request_id = hex::encode(rid_bytes);
+
     // Use the configured PAM operation timeout for both the local poll deadline
-    // and the daemon's authentication timeout, so they stay in sync.  GUI
-    // contexts without a usable conversation get the shorter GUI deadline so
-    // password fallback remains close at hand.
-    let effective_timeout_secs = if !has_terminal && !supports_threaded_conversation {
-        config
+    // and the daemon's authentication timeout, so they stay in sync.
+    // In DualStackSecondary mode, we use full operation timeout since the primary
+    // worker's password box is completely free and interactive.
+    // GUI contexts without a usable conversation (GuiSequential) get the shorter
+    // GUI deadline so password fallback remains close at hand.
+    let effective_timeout_secs = match pam_context {
+        PamContext::DualStackSecondary | PamContext::PolkitThreaded | PamContext::Terminal => {
+            config.pam_operation_timeout_secs
+        }
+        PamContext::GuiSequential => config
             .pam_gui_timeout_secs
-            .min(config.pam_operation_timeout_secs)
-    } else {
-        config.pam_operation_timeout_secs
+            .min(config.pam_operation_timeout_secs),
+        PamContext::DisplayManagerBypass => 0,
     };
     let timeout_secs = {
         let secs = effective_timeout_secs;
@@ -470,17 +479,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             secs as u32
         }
     };
-    let context = if has_terminal {
-        "terminal"
-    } else if supports_threaded_conversation {
-        "gui-threaded (polkit)"
-    } else {
-        "gui-sequential"
-    };
     tracing::debug!(
-        "Authentication deadline: {}s (context: {})",
+        "Authentication deadline: {}s (context: {:?})",
         timeout_secs,
-        context
+        pam_context
     );
 
     // Establish nonblocking IPC connection and send authenticate request
@@ -489,34 +491,38 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
             pam_conv.try_error(msgs.cannot_connect());
-            return pam_sys::PAM_IGNORE;
+            return unavail_or_ignore(pam_context);
         }
     };
-    if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
+    if let Err(e) =
+        ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id, &service)
     {
         tracing::error!("Failed to send authenticate request: {}", e);
         pam_conv.try_error(msgs.communication_error());
-        return pam_sys::PAM_IGNORE;
+        return unavail_or_ignore(pam_context);
     }
 
-    // GUI contexts without a usable conversation (e.g. the KDE lock screen's
-    // kscreenlocker_worker): wait for the daemon on this thread and never
-    // touch the conversation.  Password fallback happens after this returns,
-    // when the next PAM module runs its own conversation.
+    // GUI contexts without a usable conversation (e.g. DualStackSecondary or GuiSequential):
+    // wait for the daemon on this thread and never touch the conversation.
+    // Password fallback happens after this returns, when the next PAM module runs its own conversation.
     if !has_terminal && !supports_threaded_conversation {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
         let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline);
 
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
-                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs),
-                None => pam_sys::PAM_IGNORE,
+                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs, pam_context),
+                None => unavail_or_ignore(pam_context),
             },
             ExitReason::Timeout => {
                 // The daemon runs on the same deadline and broadcasts its own
                 // AuthenticationCancel, so no client-side cancel is needed.
                 pam_conv.try_info(msgs.timed_out());
-                pam_sys::PAM_IGNORE
+                if pam_context == PamContext::DualStackSecondary {
+                    pam_sys::PAM_AUTH_ERR
+                } else {
+                    pam_sys::PAM_IGNORE
+                }
             }
             _ => {
                 // IPC error: the request may still be in flight daemon-side.
@@ -526,7 +532,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     let _ = c.send_cancel("gui-ipc-error", &request_id);
                 }
                 pam_conv.try_error(msgs.communication_error());
-                pam_sys::PAM_IGNORE
+                unavail_or_ignore(pam_context)
             }
         };
     }
@@ -668,7 +674,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
 
         if let Some(resp) = auth_response {
-            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
+            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs, pam_context);
         }
 
         if exit_reason == ExitReason::Timeout {
@@ -734,7 +740,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
-                                return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                return map_pam_outcome(
+                                    &resp,
+                                    &username,
+                                    &pam_conv,
+                                    &msgs,
+                                    pam_context,
+                                )
                             }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
@@ -814,28 +826,63 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     pam_sys::PAM_IGNORE
 }
 
-/// Yield `PAM_IGNORE` if the calling service is a primary display manager.
-///
-/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
-/// LightDM, LXDM), a successful phone confirmation authenticates the user but
-/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
-/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
-/// depend on that token to unlock the local secure keyring/wallet at login-time.
-///
-/// Bypassing DM services preserves the normal password collection flow so the
-/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
-/// secondary prompt. The module still runs for secondary services such as
-/// `sudo`, `polkit-1`, and desktop screensavers.
-///
-/// Returns `Some(PAM_IGNORE)` for display manager services, `None` otherwise.
-fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
-    let service = unsafe { pam_sys::get_service_name(pamh) }?;
-    tracing::debug!("Calling PAM service name: {}", service);
+/// Execution mode determined from the calling PAM service name and environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PamContext {
+    /// Primary graphical display manager logins (SDDM, GDM login, LightDM, etc.).
+    /// Bypassed immediately to preserve cleartext password collection and keyring auto-unlock.
+    DisplayManagerBypass,
 
+    /// Secondary biometric PAM workers running in parallel with password prompts
+    /// (e.g., KDE's `kde-fingerprint` or GNOME's `gdm-fingerprint`).
+    /// Uses full operation timeout and decisive return codes (`PAM_AUTHINFO_UNAVAIL`, `PAM_AUTH_ERR`).
+    DualStackSecondary,
+
+    /// Polkit authentication agent helper (`polkit-1`).
+    /// Uses a threaded self-pipe to collect passwords in parallel with TapAuth.
+    PolkitThreaded,
+
+    /// Interactive terminal sessions with an open `/dev/tty` (e.g. `sudo`, `su`, console `login`).
+    /// Allows skipping TapAuth wait on Enter key.
+    Terminal,
+
+    /// Standalone single-worker GUI lock screens (e.g. `swaylock`, `hyprlock`, single-stack `kde`).
+    /// Uses shorter `pam_gui_timeout_secs` sequential wait before falling through to password.
+    GuiSequential,
+}
+
+/// Classify the PAM service context.
+///
+/// Priority order:
+/// 1. Secondary biometric stacks (`kde-fingerprint`, `gdm-fingerprint`, etc.) ALWAYS take precedence.
+/// 2. Primary display manager logins (e.g. `sddm`, `gdm`, `gdm-password`, `plasmalogin`).
+/// 3. Polkit agent (`polkit-1`).
+/// 4. Interactive terminal (`/dev/tty` available).
+/// 5. Standalone GUI sequential fallback.
+pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
     let service_lower = service.to_ascii_lowercase();
-    let dm_prefixes = [
+
+    // 1. Dual-Stack Secondary Biometric Services
+    const DUAL_STACK_SECONDARY: &[&str] = &[
+        "kde-fingerprint",
+        "kde-smartcard",
+        "kde-face",
+        "kde-u2f",
+        "gdm-fingerprint",
+        "gdm-smartcard",
+        "fingerprint-auth",
+        "smartcard-auth",
+    ];
+    if DUAL_STACK_SECONDARY.iter().any(|s| service_lower == *s) {
+        return PamContext::DualStackSecondary;
+    }
+
+    // 2. Primary Display Manager Logins (Exact matches & primary prefixes)
+    // Note: gdm-password is intentionally included here so the password worker is 100% responsive
+    const DM_SERVICES: &[&str] = &[
         "sddm",
         "gdm",
+        "gdm-password",
         "gdm3",
         "lightdm",
         "lxdm",
@@ -848,20 +895,36 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
         "entrance",
         "plasmalogin",
     ];
-    if dm_prefixes.iter().any(|p| {
+    let is_dm = DM_SERVICES.iter().any(|p| {
         service_lower == *p
             || (service_lower.starts_with(p)
                 && service_lower.as_bytes().get(p.len()) == Some(&b'-'))
-    }) {
-        tracing::info!(
-            "TapAuth: Service '{}' is a primary display manager. \
-             Skipping to avoid breaking keyring auto-unlock.",
-            service
-        );
-        return Some(pam_sys::PAM_IGNORE);
+    });
+    if is_dm {
+        return PamContext::DisplayManagerBypass;
     }
 
-    None
+    // 3. Polkit Agent
+    if service_lower == "polkit-1" {
+        return PamContext::PolkitThreaded;
+    }
+
+    // 4. Interactive Terminal
+    if has_terminal {
+        return PamContext::Terminal;
+    }
+
+    // 5. Standalone / Single-Stack GUI
+    PamContext::GuiSequential
+}
+
+/// Helper returning `PAM_AUTHINFO_UNAVAIL` in dual-stack secondary mode, or `PAM_IGNORE` otherwise.
+fn unavail_or_ignore(context: PamContext) -> c_int {
+    if context == PamContext::DualStackSecondary {
+        pam_sys::PAM_AUTHINFO_UNAVAIL
+    } else {
+        pam_sys::PAM_IGNORE
+    }
 }
 
 /// Spawn a thread to monitor `/dev/tty` for skip signals.
@@ -874,47 +937,168 @@ fn map_pam_outcome(
     username: &str,
     pam_conv: &pam_sys::PamConversation,
     msgs: &pam_messages::PamMessages,
+    context: PamContext,
 ) -> c_int {
-    match resp.outcome() {
-        shared::ipc::pb::PamOutcome::Success => {
-            tracing::info!("Authentication successful for user: {}", username);
-            pam_conv.try_info(msgs.auth_successful());
-            pam_sys::PAM_SUCCESS
-        }
-        shared::ipc::pb::PamOutcome::Denied => {
-            tracing::info!("Authentication explicitly denied for user: {}", username);
-            pam_conv.try_info(msgs.auth_denied());
-            pam_sys::PAM_PERM_DENIED
-        }
-        shared::ipc::pb::PamOutcome::Timeout => {
-            tracing::info!("Authentication timed out for user: {}", username);
-            pam_sys::PAM_IGNORE
-        }
-        shared::ipc::pb::PamOutcome::Ignore => {
-            tracing::info!("Daemon indicated IGNORE for user: {}", username);
-            pam_sys::PAM_IGNORE
-        }
-        shared::ipc::pb::PamOutcome::Error => {
-            tracing::error!(
-                "Daemon reported error for user {}: {}",
-                username,
-                resp.detail
-            );
-            pam_conv.try_error(&msgs.error(&resp.detail));
-            pam_sys::PAM_IGNORE
-        }
+    match context {
+        PamContext::DualStackSecondary => match resp.outcome() {
+            shared::ipc::pb::PamOutcome::Success => {
+                tracing::info!("Authentication successful for user: {}", username);
+                pam_conv.try_info(msgs.auth_successful());
+                pam_sys::PAM_SUCCESS
+            }
+            shared::ipc::pb::PamOutcome::Denied => {
+                tracing::info!("Authentication explicitly denied for user: {}", username);
+                pam_conv.try_info(msgs.auth_denied());
+                pam_sys::PAM_PERM_DENIED
+            }
+            shared::ipc::pb::PamOutcome::Timeout => {
+                tracing::info!("Authentication timed out for user: {}", username);
+                pam_conv.try_info(msgs.timed_out());
+                pam_sys::PAM_AUTH_ERR
+            }
+            shared::ipc::pb::PamOutcome::Ignore => {
+                tracing::info!(
+                    "Daemon indicated IGNORE for user: {} (dual-stack secondary -> PAM_AUTHINFO_UNAVAIL)",
+                    username
+                );
+                pam_sys::PAM_AUTHINFO_UNAVAIL
+            }
+            shared::ipc::pb::PamOutcome::Error => {
+                tracing::error!(
+                    "Daemon reported error for user {}: {}",
+                    username,
+                    resp.detail
+                );
+                pam_conv.try_error(&msgs.error(&resp.detail));
+                pam_sys::PAM_AUTH_ERR
+            }
+        },
+        _ => match resp.outcome() {
+            shared::ipc::pb::PamOutcome::Success => {
+                tracing::info!("Authentication successful for user: {}", username);
+                pam_conv.try_info(msgs.auth_successful());
+                pam_sys::PAM_SUCCESS
+            }
+            shared::ipc::pb::PamOutcome::Denied => {
+                tracing::info!("Authentication explicitly denied for user: {}", username);
+                pam_conv.try_info(msgs.auth_denied());
+                pam_sys::PAM_PERM_DENIED
+            }
+            shared::ipc::pb::PamOutcome::Timeout => {
+                tracing::info!("Authentication timed out for user: {}", username);
+                pam_sys::PAM_IGNORE
+            }
+            shared::ipc::pb::PamOutcome::Ignore => {
+                tracing::info!("Daemon indicated IGNORE for user: {}", username);
+                pam_sys::PAM_IGNORE
+            }
+            shared::ipc::pb::PamOutcome::Error => {
+                tracing::error!(
+                    "Daemon reported error for user {}: {}",
+                    username,
+                    resp.detail
+                );
+                pam_conv.try_error(&msgs.error(&resp.detail));
+                pam_sys::PAM_IGNORE
+            }
+        },
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::*;
     use crate::logging;
 
     #[test]
     fn test_logging_init() {
         logging::init_logging();
         logging::init_logging();
+    }
+
+    #[test]
+    fn test_classify_pam_context() {
+        // DualStackSecondary priority
+        assert_eq!(
+            classify_pam_context("kde-fingerprint", false),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("kde-fingerprint", true),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("gdm-fingerprint", false),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("kde-smartcard", false),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("fingerprint-auth", false),
+            PamContext::DualStackSecondary
+        );
+
+        // Display Manager Bypass
+        assert_eq!(
+            classify_pam_context("sddm", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("sddm-autologin", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("gdm", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("gdm-password", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("gdm3", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("lightdm", false),
+            PamContext::DisplayManagerBypass
+        );
+        assert_eq!(
+            classify_pam_context("plasmalogin", false),
+            PamContext::DisplayManagerBypass
+        );
+
+        // Polkit
+        assert_eq!(
+            classify_pam_context("polkit-1", false),
+            PamContext::PolkitThreaded
+        );
+        assert_eq!(
+            classify_pam_context("polkit-1", true),
+            PamContext::PolkitThreaded
+        );
+
+        // Terminal
+        assert_eq!(classify_pam_context("sudo", true), PamContext::Terminal);
+        assert_eq!(classify_pam_context("login", true), PamContext::Terminal);
+        assert_eq!(classify_pam_context("su", true), PamContext::Terminal);
+
+        // Sequential GUI (single-stack lockscreens)
+        assert_eq!(
+            classify_pam_context("kde", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("swaylock", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("hyprlock", false),
+            PamContext::GuiSequential
+        );
     }
 }
 

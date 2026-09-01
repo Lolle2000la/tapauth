@@ -7,6 +7,7 @@
 
 mod admin_handler;
 mod auth_handler;
+mod fprintd;
 mod logging;
 mod peer_identity;
 mod transport;
@@ -14,6 +15,7 @@ mod transport;
 use admin_handler::PairingState;
 use auth_handler::{AuthSession, DaemonState};
 use bytes::{BufMut, BytesMut};
+use fprintd::AuthState;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{setgid, setuid, Gid, Uid, User};
@@ -60,7 +62,7 @@ struct RecentAuthRequest {
 
 /// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
-    daemon: RwLock<Arc<DaemonState>>,
+    daemon: Arc<RwLock<Arc<DaemonState>>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
     pending_pairing: Arc<Mutex<Option<PairingState>>>,
@@ -165,8 +167,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Dropped privileges to tapauthd user");
     }
 
+    // Create shared daemon handle used by both the IPC dispatcher and fprintd.
+    // Wrapped in RwLock so admin reloads are immediately visible to all consumers.
+    let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
+
+    // Start the virtual fprintd D-Bus service if enabled (non-fatal: daemon functions without it)
+    let _fprintd_conn = if toml_config.enable_fprintd_bridge {
+        let auth_state = AuthState {
+            daemon: shared_daemon.clone(),
+        };
+        match fprintd::start_fprintd_service(auth_state).await {
+            Ok(conn) => {
+                tracing::info!("Virtual fprintd D-Bus service registered successfully");
+                Some(conn)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to register virtual fprintd D-Bus service: {}. \
+                     Desktop lockscreen integration via fingerprint will not be available. \
+                     This is often due to missing D-Bus system bus permissions \
+                     (/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf).",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("Virtual fprintd D-Bus bridge disabled by configuration");
+        None
+    };
+
     let server_state = Arc::new(ServerState {
-        daemon: RwLock::new(daemon_state.clone()),
+        daemon: shared_daemon,
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         recent_requests: Arc::new(Mutex::new(HashMap::new())),
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -328,8 +360,47 @@ async fn handle_conn(
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
-                let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
-                return write_response(&mut stream, &envelope_pam_response(response), "PAM").await;
+                let req_id = auth_req.request_id.clone();
+                let cancel_reg = server_state.cancel_registry.clone();
+
+                let auth_fut = handle_pam_authenticate(auth_req, &daemon, &server_state);
+                tokio::pin!(auth_fut);
+
+                let mut eof_buf = [0u8; 1];
+                let (response, client_disconnected) = tokio::select! {
+                    resp = &mut auth_fut => (Some(resp), false),
+                    read_res = stream.read(&mut eof_buf) => {
+                        match read_res {
+                            Ok(0) | Err(_) => {
+                                tracing::info!(
+                                    "IPC client disconnected while authentication '{}' was in-flight — cancelling request",
+                                    req_id
+                                );
+                                let mut reg = cancel_reg.lock().await;
+                                if let Some(tx) = reg.remove(&req_id) {
+                                    let _ = tx.send(());
+                                }
+                                (None, true)
+                            }
+                            Ok(_) => {
+                                let resp = auth_fut.await;
+                                (Some(resp), false)
+                            }
+                        }
+                    }
+                };
+
+                if let Some(response) = response {
+                    if !client_disconnected {
+                        return write_response(
+                            &mut stream,
+                            &envelope_pam_response(response),
+                            "PAM",
+                        )
+                        .await;
+                    }
+                }
+                return Ok(());
             }
             Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
                 let response = handle_pam_cancel(cancel_req, &server_state).await;
@@ -409,6 +480,7 @@ async fn handle_pam_authenticate(
             .handle_authenticate(
                 timeout,
                 Some(req.request_id.clone()),
+                Some(req.service_name.clone()),
                 server_state.cancel_registry.clone(),
             )
             .await

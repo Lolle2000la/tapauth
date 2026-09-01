@@ -217,6 +217,29 @@ remove_systemd_units_and_daemon() {
         rm -f "$rules_file"
     fi
 
+    # Remove virtual fprintd files
+    local fprint_conf="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+    if [[ -f "$fprint_conf" ]]; then
+        print_info "Removing virtual fprintd D-Bus configuration"
+        rm -f "$fprint_conf"
+    fi
+
+    local fprint_srv="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+    if [[ -f "$fprint_srv" ]]; then
+        print_info "Removing virtual fprintd D-Bus service activation file"
+        rm -f "$fprint_srv"
+    fi
+
+    # Remove GDM dconf override
+    local gdm_dconf="/etc/dconf/db/gdm.d/01-tapauth"
+    if [[ -f "$gdm_dconf" ]]; then
+        print_info "Removing GDM dconf override"
+        rm -f "$gdm_dconf"
+        if command -v dconf &> /dev/null; then
+            dconf update || true
+        fi
+    fi
+
     print_success "Daemon and systemd units removed (if present)"
 }
 
@@ -430,6 +453,11 @@ remove_pam_config() {
     if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
         print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
+    fi
+
+    if [[ -f /etc/pam.d/gdm-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
+        print_info "Removing TapAuth from GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
+        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-fingerprint
     fi
     
     # Remove from SDDM

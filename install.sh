@@ -50,6 +50,11 @@ SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
 POLKIT_DROPIN_SOURCE="systemd/polkit-agent-helper@.service.d/tapauth.conf"
 POLKIT_DROPIN_DEST_DIR="/etc/systemd/system/polkit-agent-helper@.service.d"
+FPRINT_DBUS_CONF_SOURCE="packaging/net.reactivated.Fprint.tapauth.conf"
+FPRINT_DBUS_CONF_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+FPRINT_SERVICE_SOURCE="packaging/net.reactivated.Fprint.service"
+FPRINT_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+GDM_DCONF_DEST="/etc/dconf/db/gdm.d/01-tapauth"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -867,6 +872,23 @@ install_daemon() {
             restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules || true
         fi
     fi
+
+    # Install virtual fprintd D-Bus policy and service activation files
+    if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d /etc/dbus-1/system.d ]]; then
+        print_info "Installing virtual fprintd D-Bus configuration"
+        install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
+        if command -v restorecon &> /dev/null; then
+            restorecon "$FPRINT_DBUS_CONF_DEST" || true
+        fi
+    fi
+
+    if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+        print_info "Installing virtual fprintd D-Bus system service activation file"
+        install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
+        if command -v restorecon &> /dev/null; then
+            restorecon "$FPRINT_SERVICE_DEST" || true
+        fi
+    fi
 }
 
 # Build components
@@ -1261,31 +1283,42 @@ configure_pam() {
     
     # Configure GDM (GNOME Display Manager)
     if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
-        print_info "Configuring PAM for GDM (GNOME - first login)..."
+        print_info "Configuring PAM for GDM (GNOME dual-stack & lock screen)..."
+        local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
         
-        # GDM typically uses gdm-password for authentication
-        local gdm_configured=false
-        if [[ -f /etc/pam.d/gdm-password ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm-password; then
-                sed -i "1i $pam_line" /etc/pam.d/gdm-password
-                print_success "Configured PAM for GDM (gdm-password)"
-                gdm_configured=true
+        # Configure /etc/pam.d/gdm-fingerprint (dual-stack secondary service)
+        if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm-fingerprint; then
+                sed -i "1i $pam_decisive_line" /etc/pam.d/gdm-fingerprint
+                print_success "Configured PAM for GDM fingerprint (gdm-fingerprint)"
             else
-                print_warning "PAM GDM already configured (gdm-password)"
-                gdm_configured=true
+                print_warning "PAM GDM fingerprint already configured (gdm-fingerprint)"
             fi
+        else
+            print_info "Creating /etc/pam.d/gdm-fingerprint for dual-stack GNOME lock screen..."
+            cat << EOF > /etc/pam.d/gdm-fingerprint
+#%PAM-1.0
+$pam_decisive_line
+auth        include      system-local-login
+account     include      system-local-login
+password    include      system-local-login
+session     include      system-local-login
+EOF
+            chmod 644 /etc/pam.d/gdm-fingerprint
+            print_success "Created /etc/pam.d/gdm-fingerprint"
         fi
-        
-        # Some systems might use just 'gdm'
-        if [[ -f /etc/pam.d/gdm ]] && [[ "$gdm_configured" == false ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm; then
-                sed -i "1i $pam_line" /etc/pam.d/gdm
-                print_success "Configured PAM for GDM"
-            else
-                print_warning "PAM GDM already configured"
+
+        # Enable fingerprint authentication in GDM dconf settings
+        if [[ -d /etc/dconf/db/gdm.d ]]; then
+            print_info "Configuring GDM dconf to enable fingerprint auth..."
+            cat << 'EOF' > "$GDM_DCONF_DEST"
+[org/gnome/login-screen]
+enable-fingerprint-authentication=true
+EOF
+            if command -v dconf &> /dev/null; then
+                dconf update || true
             fi
-        elif [[ "$gdm_configured" == false ]]; then
-            print_warning "GDM PAM configuration not found (checked /etc/pam.d/gdm-password and /etc/pam.d/gdm)"
+            print_success "Configured GDM dconf override ($GDM_DCONF_DEST)"
         fi
     fi
     
@@ -1323,60 +1356,31 @@ configure_pam() {
         fi
     fi
     
-    # Configure KDE (multiple PAM files)
+    # Configure KDE (dual-stack lock screen)
     if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
-        print_info "Configuring PAM for KDE (lock screen)..."
+        print_info "Configuring PAM for KDE (dual-stack lock screen)..."
+        local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
         
-        local kde_configured=false
-        
-        # Configure /etc/pam.d/kde
-        if [[ -f /etc/pam.d/kde ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde; then
-                sed -i "1i $pam_line" /etc/pam.d/kde
-                print_success "Configured PAM for KDE (kde)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE already configured (kde)"
-                kde_configured=true
-            fi
-        fi
-        
-        # Configure /etc/pam.d/kscreenlocker
-        if [[ -f /etc/pam.d/kscreenlocker ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker; then
-                sed -i "1i $pam_line" /etc/pam.d/kscreenlocker
-                print_success "Configured PAM for KDE screen locker (kscreenlocker)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE screen locker already configured (kscreenlocker)"
-                kde_configured=true
-            fi
-        fi
-        
-        # Configure /etc/pam.d/kde-fingerprint (if it exists)
+        # Configure /etc/pam.d/kde-fingerprint (dual-stack secondary service)
         if [[ -f /etc/pam.d/kde-fingerprint ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
-                sed -i "1i $pam_line" /etc/pam.d/kde-fingerprint
+                sed -i "1i $pam_decisive_line" /etc/pam.d/kde-fingerprint
                 print_success "Configured PAM for KDE fingerprint (kde-fingerprint)"
-                kde_configured=true
             else
                 print_warning "PAM KDE fingerprint already configured (kde-fingerprint)"
             fi
-        fi
-        
-        # Configure /etc/pam.d/kde-smartcard (if it exists)
-        if [[ -f /etc/pam.d/kde-smartcard ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard; then
-                sed -i "1i $pam_line" /etc/pam.d/kde-smartcard
-                print_success "Configured PAM for KDE smartcard (kde-smartcard)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE smartcard already configured (kde-smartcard)"
-            fi
-        fi
-        
-        if [[ "$kde_configured" == false ]]; then
-            print_warning "No KDE PAM configuration files found (checked /etc/pam.d/kde, kscreenlocker, kde-fingerprint, kde-smartcard)"
+        else
+            print_info "Creating /etc/pam.d/kde-fingerprint for dual-stack lock screen..."
+            cat << EOF > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+$pam_decisive_line
+auth        include      system-local-login
+account     include      system-local-login
+password    include      system-local-login
+session     include      system-local-login
+EOF
+            chmod 644 /etc/pam.d/kde-fingerprint
+            print_success "Created /etc/pam.d/kde-fingerprint"
         fi
     fi
     

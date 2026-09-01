@@ -41,6 +41,13 @@ enable_network = true
 # Default: true
 enable_ble = true
 
+# Virtual fprintd D-Bus Bridge
+# Exposes the net.reactivated.Fprint D-Bus service, allowing desktop
+# environments (like GNOME Shell lockscreen) to query and trigger TapAuth
+# biometrics in parallel with password entry.
+# Default: true
+enable_fprintd_bridge = true
+
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.
 # When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).
