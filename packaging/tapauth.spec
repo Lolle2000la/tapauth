@@ -216,8 +216,8 @@ fi
 
 %files
 %license LICENSE
-%dir %attr(0700, tapauthd, tapauthd) %{_sysconfdir}/tapauth
-%config(noreplace) %attr(0600, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
+%dir %attr(0755, tapauthd, tapauthd) %{_sysconfdir}/tapauth
+%config(noreplace) %attr(0644, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_libdir}/security/pam_tapauth.so

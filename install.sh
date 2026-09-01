@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # TapAuth Interactive Installation Script
 # This script builds and installs all TapAuth components with optimizations
@@ -33,6 +33,7 @@ USE_BLE=true
 ENABLE_FPRINTD_BRIDGE=false
 BUILD_ONLY=false
 DRY_RUN=false
+FORCE=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
@@ -855,6 +856,7 @@ install_systemd_units() {
     
     systemctl daemon-reload
     systemctl enable --now tapauthd.socket
+    systemctl try-restart tapauthd.service 2>/dev/null || true
     print_success "Systemd units installed and socket activated"
 }
 
@@ -946,6 +948,12 @@ EOF
         else
             local dbus_dir
             dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
+            local DBUS_POLICY_DIR="$dbus_dir"
+            if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
+                print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
+                print_warning "Lock screen integration will not work until the policy file is manually installed."
+                # Still continue — do NOT abort the installation
+            fi
             if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
                 print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
                 install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
@@ -1143,6 +1151,37 @@ install_pam() {
 }
 
 # Configure PAM
+backup_pam_file() {
+        local target_file="$1"
+        if [[ -f "$target_file" && ! -f "${target_file}.tapauth-bak" ]]; then
+            cp -p "$target_file" "${target_file}.tapauth-bak" 2>/dev/null || true
+        fi
+    }
+
+insert_pam_decisive() {
+        local target_file="$1"
+        local pam_decisive="auth    [success=done default=bad]    $PAM_SO_PATH"
+        if grep -q "pam_tapauth.so" "$target_file" 2>/dev/null; then
+            return 0
+        fi
+    backup_pam_file "$target_file"
+        if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
+            if [[ "$has_hardware_fprintd" == true ]]; then
+                print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
+                return 0
+            else
+                sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
+            fi
+        else
+            local last_env_line
+            last_env_line=$(grep -n -E "pam_env\.so|pam_nologin\.so" "$target_file" 2>/dev/null | tail -n1 | cut -d: -f1 || true)
+            if [[ -n "$last_env_line" ]]; then
+                sed -i "${last_env_line}a $pam_decisive" "$target_file"
+            else
+                sed -i "1i $pam_decisive" "$target_file"
+            fi
+        fi
+    }
 configure_pam() {
         if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SU" == false && "$CONFIGURE_PAM_SU_L" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
             "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
@@ -1395,37 +1434,6 @@ configure_pam() {
         fi
     }
 
-    backup_pam_file() {
-        local target_file="$1"
-        if [[ -f "$target_file" && ! -f "${target_file}.tapauth-bak" ]]; then
-            cp -p "$target_file" "${target_file}.tapauth-bak" 2>/dev/null || true
-        fi
-    }
-
-    insert_pam_decisive() {
-        local target_file="$1"
-        local pam_decisive="auth    [success=done default=bad]    $PAM_SO_PATH"
-        if grep -q "pam_tapauth.so" "$target_file" 2>/dev/null; then
-            return 0
-        fi
-        backup_pam_file "$target_file"
-        if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
-            if [[ "$has_hardware_fprintd" == true ]]; then
-                print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
-                return 0
-            else
-                sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
-            fi
-        else
-            local last_env_line
-            last_env_line=$(grep -n -E "pam_env\.so|pam_nologin\.so" "$target_file" 2>/dev/null | tail -n1 | cut -d: -f1 || true)
-            if [[ -n "$last_env_line" ]]; then
-                sed -i "${last_env_line}a $pam_decisive" "$target_file"
-            else
-                sed -i "1i $pam_decisive" "$target_file"
-            fi
-        fi
-    }
 
     # Configure GDM (GNOME Display Manager)
     if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
@@ -1471,40 +1479,12 @@ EOF
         fi
     fi
     
-    # Configure SDDM (Simple Desktop Display Manager)
     if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
-        print_info "Configuring PAM for SDDM (KDE/LXQt - first login)..."
-        
-        # SDDM uses /etc/pam.d/sddm for user authentication
-        # Note: sddm-greeter is for the greeter UI process itself, not user auth
-        if [[ -f /etc/pam.d/sddm ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
-                backup_pam_file "/etc/pam.d/sddm"
-                sed -i "1i $pam_line" /etc/pam.d/sddm
-                print_success "Configured PAM for SDDM"
-            else
-                print_warning "PAM SDDM already configured"
-            fi
-        else
-            print_warning "SDDM PAM configuration not found at /etc/pam.d/sddm"
-        fi
+        print_info "Skipping SDDM PAM configuration: TapAuth bypasses display manager login to preserve keyring auto-unlock. No PAM entry is needed."
     fi
     
-    # Configure LightDM
     if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
-        print_info "Configuring PAM for LightDM (first login)..."
-        
-        if [[ -f /etc/pam.d/lightdm ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/lightdm; then
-                backup_pam_file "/etc/pam.d/lightdm"
-                sed -i "1i $pam_line" /etc/pam.d/lightdm
-                print_success "Configured PAM for LightDM"
-            else
-                print_warning "PAM LightDM already configured"
-            fi
-        else
-            print_warning "LightDM PAM configuration not found at /etc/pam.d/lightdm"
-        fi
+        print_info "Skipping LightDM PAM configuration: TapAuth bypasses display manager login to preserve keyring auto-unlock. No PAM entry is needed."
     fi
     
     # Configure KDE (dual-stack lock screen & legacy fallback)

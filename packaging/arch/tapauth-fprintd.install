@@ -1,3 +1,8 @@
+pre_install() {
+  echo ":: WARNING: tapauth-fprintd conflicts with hardware fprintd."
+  echo ":: If you rely on a hardware fingerprint reader, do not install this package."
+}
+
 post_install() {
   if [ ! -f /etc/tapauth/config.toml ]; then
     mkdir -p /etc/tapauth
@@ -5,15 +10,15 @@ post_install() {
 # TapAuth Configuration
 enable_fprintd_bridge = true
 CFGEOF
-    chmod 600 /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   elif grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
     sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
-    chmod 600 /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   else
     echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
-    chmod 600 /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
@@ -39,7 +44,7 @@ pre_remove() {
 post_remove() {
   if [ -f /etc/tapauth/config.toml ]; then
     sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
-    chmod 600 /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then

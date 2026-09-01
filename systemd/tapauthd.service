@@ -3,7 +3,7 @@
 Description=TapAuth authentication daemon
 Requires=tapauthd.socket
 After=dbus.service bluetooth.target network.target
-Wants=bluetooth.target
+Wants=dbus.service bluetooth.target
 
 [Service]
 Type=simple

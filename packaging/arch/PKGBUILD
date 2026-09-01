@@ -6,9 +6,10 @@ pkgrel=1
 arch=('x86_64' 'aarch64')
 url="https://github.com/lolle2000la/tapauth"
 license=('AGPL-3.0-only')
-makedepends=('cargo' 'rust' 'protobuf' 'clang' 'pam')
+makedepends=('cargo' 'protobuf' 'clang' 'pam')
 source=("$pkgbase-$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
+backup=('etc/tapauth/config.toml')
 
 prepare() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
@@ -33,12 +34,12 @@ package_tapauth() {
     'bluez: for Bluetooth Low Energy (BLE) transport'
     'tapauth-fprintd: for virtual fprintd desktop lock screen integration'
   )
-  provides=('tapauth')
   conflicts=('tapauth-git')
   install=tapauth.install
 
   cd "${srcdir}/${pkgbase}-${pkgver}"
-  install -dm0700 "${pkgdir}/etc/tapauth"
+  install -dm0755 "${pkgdir}/etc/tapauth"
+  install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
   install -Dm0755 target/release/libclient_pam.so "${pkgdir}/usr/lib/security/pam_tapauth.so"

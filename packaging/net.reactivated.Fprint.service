@@ -1,5 +1,5 @@
 [D-BUS Service]
 Name=net.reactivated.Fprint
 Exec=/usr/bin/tapauthd
-User=root
+User=tapauthd
 SystemdService=tapauthd.service

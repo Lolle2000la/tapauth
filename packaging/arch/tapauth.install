@@ -7,7 +7,7 @@ post_install() {
 # TapAuth Configuration
 enable_fprintd_bridge = false
 CFGEOF
-    chmod 600 /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
   systemctl daemon-reload

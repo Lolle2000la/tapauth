@@ -1,5 +1,6 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+FORCE=false
 
 # TapAuth Interactive Uninstallation Script
 # This script removes all TapAuth components and optionally their configurations
@@ -522,15 +523,41 @@ remove_pam_config() {
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
     fi
     
-    # Restore PAM backups if present
+    # Restore PAM backups if present — warn the user since restoring may revert security updates
+    local bak_files=()
     for bak in /etc/pam.d/*.tapauth-bak; do
-        if [[ -f "$bak" ]]; then
-            local orig="${bak%.tapauth-bak}"
-            print_info "Restoring original PAM configuration for $orig"
-            cp -p "$bak" "$orig"
-            rm -f "$bak"
-        fi
+        [[ -f "$bak" ]] && bak_files+=("$bak")
     done
+    
+    if [[ ${#bak_files[@]} -gt 0 ]]; then
+        print_warning "Found PAM backup files from original TapAuth installation:"
+        for bak in "${bak_files[@]}"; do
+            echo "  - $bak"
+        done
+        print_warning "Restoring these may revert security updates made after TapAuth was installed."
+        
+        local restore="false"
+        if [[ "$FORCE" == true ]]; then
+            restore="false"  # Even --force does not auto-restore PAM backups
+            print_info "Skipping PAM backup restoration (use --restore-pam-backups to force)."
+        else
+            read -rp "Restore original PAM files from backups? [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] && restore="true"
+        fi
+        
+        if [[ "$restore" == true ]]; then
+            for bak in "${bak_files[@]}"; do
+                local orig="${bak%.tapauth-bak}"
+                print_info "Restoring original PAM configuration for $orig"
+                cp -p "$bak" "$orig"
+                rm -f "$bak"
+            done
+        else
+            for bak in "${bak_files[@]}"; do
+                print_info "Leaving backup file: $bak (delete manually if not needed)"
+            done
+        fi
+    fi
     
     print_success "PAM configurations cleaned up"
 }
