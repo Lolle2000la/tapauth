@@ -363,6 +363,10 @@ impl AuthSession {
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
         self.cancel_registry = Some(cancel_registry);
+        let _cancel_guard = CancelGuard {
+            registry: self.cancel_registry.clone(),
+            request_id: self.request_id.clone(),
+        };
 
         // If the request originates from GDM's biometric stack (gdm-fingerprint or gdm-smartcard),
         // check whether the user already has an active session with LockedHint == true.
@@ -579,10 +583,6 @@ impl AuthSession {
         // Setup cancellation mechanism
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.register_cancel_handler(cancel_tx).await;
-        let _cancel_guard = CancelGuard {
-            registry: self.cancel_registry.clone(),
-            request_id: self.request_id.clone(),
-        };
 
         // Pre-compute cancel packet
         let cancel_packet = self.create_cancel_packet()?;
