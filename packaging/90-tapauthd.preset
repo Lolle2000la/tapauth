@@ -1,0 +1,2 @@
+# Default systemd preset for TapAuth
+enable tapauthd.socket

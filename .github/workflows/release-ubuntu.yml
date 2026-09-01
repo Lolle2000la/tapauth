@@ -181,11 +181,8 @@ jobs:
           	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
           	mkdir -p /etc/tapauth
           	if [ ! -f /etc/tapauth/config.toml ]; then
-          		cat << 'CFGEOF' > /etc/tapauth/config.toml
-# TapAuth Configuration
-enable_fprintd_bridge = false
-CFGEOF
-          		chmod 644 /etc/tapauth/config.toml
+          		printf "# TapAuth Configuration\nenable_fprintd_bridge = false\n" > /etc/tapauth/config.toml
+          		chmod 600 /etc/tapauth/config.toml
           		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
           	if command -v pam-auth-update >/dev/null 2>&1; then
@@ -205,7 +202,8 @@ CFGEOF
           	fi
           fi
           if [ "\$1" = "purge" ]; then
-          	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf || true
+          	rm -rf /etc/tapauth /var/lib/tapauth /run/tapauthd || true
+          	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf 2>/dev/null || true
           fi
           #DEBHELPER#
           exit 0
@@ -218,16 +216,13 @@ CFGEOF
           	if [ -z "\$2" ]; then
           		mkdir -p /etc/tapauth
           		if [ ! -f /etc/tapauth/config.toml ]; then
-          			cat << 'CFGEOF' > /etc/tapauth/config.toml
-# TapAuth Configuration
-enable_fprintd_bridge = true
-CFGEOF
+          			printf "# TapAuth Configuration\nenable_fprintd_bridge = true\n" > /etc/tapauth/config.toml
           		elif grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
           			sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
           		else
           			echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
           		fi
-          		chmod 644 /etc/tapauth/config.toml
+          		chmod 600 /etc/tapauth/config.toml
           		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
           	if command -v deb-systemd-invoke >/dev/null 2>&1; then
@@ -248,6 +243,7 @@ CFGEOF
           if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
           	if [ -f /etc/tapauth/config.toml ]; then
           		sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+          		chmod 600 /etc/tapauth/config.toml
           		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
           	if command -v deb-systemd-invoke >/dev/null 2>&1; then

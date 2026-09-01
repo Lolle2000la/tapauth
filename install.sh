@@ -85,7 +85,7 @@ check_hardware_fprintd() {
         fi
     fi
     has_hardware_fprintd=false
-    return 1
+    return 0
 }
 
 # Print functions
@@ -1260,6 +1260,7 @@ configure_pam() {
         
         if [[ -f /etc/pam.d/system-auth ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
+                backup_pam_file "/etc/pam.d/system-auth"
                 # Insert at the beginning of the auth section
                 sed -i "1i $pam_line" /etc/pam.d/system-auth
                 print_success "Configured PAM for system-auth"
@@ -1277,6 +1278,7 @@ configure_pam() {
         print_info "Configuring PAM for login (console login)..."
         if [[ -f /etc/pam.d/login ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
+                backup_pam_file "/etc/pam.d/login"
                 # Insert after pam_nologin.so if present, otherwise at the beginning
                 if grep -q "pam_nologin.so" /etc/pam.d/login; then
                     sed -i "/pam_nologin.so/a $pam_line" /etc/pam.d/login
@@ -1298,6 +1300,7 @@ configure_pam() {
         print_info "Configuring PAM for su (user switching)..."
         if [[ -f "$su_file" ]]; then
             if ! grep -q "pam_tapauth.so" "$su_file" 2>/dev/null; then
+                backup_pam_file "$su_file"
                 if grep -q "pam_env.so" "$su_file"; then
                     sed -i "/pam_env.so/a $pam_line" "$su_file"
                 else
@@ -1318,6 +1321,7 @@ configure_pam() {
         print_info "Configuring PAM for su-l (root shells via 'su -')..."
         if [[ -f "$su_l_file" ]]; then
             if ! grep -q "pam_tapauth.so" "$su_l_file" 2>/dev/null; then
+                backup_pam_file "$su_l_file"
                 if grep -q "pam_env.so" "$su_l_file"; then
                     sed -i "/pam_env.so/a $pam_line" "$su_l_file"
                 else
@@ -1336,6 +1340,7 @@ configure_pam() {
     if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
         print_info "Configuring PAM for sudo..."
         if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
+            backup_pam_file "/etc/pam.d/sudo"
             # Insert at beginning of auth section
             sed -i "1i $pam_line" /etc/pam.d/sudo
             print_success "Configured PAM for sudo"
@@ -1358,6 +1363,7 @@ configure_pam() {
         
         if [[ -n "$polkit_pam_file" ]]; then
             if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
+                backup_pam_file "$polkit_pam_file"
                 sed -i "1i $pam_line" "$polkit_pam_file"
                 print_success "Configured PAM for polkit at $polkit_pam_file"
             else
@@ -1389,12 +1395,20 @@ configure_pam() {
         fi
     }
 
+    backup_pam_file() {
+        local target_file="$1"
+        if [[ -f "$target_file" && ! -f "${target_file}.tapauth-bak" ]]; then
+            cp -p "$target_file" "${target_file}.tapauth-bak" 2>/dev/null || true
+        fi
+    }
+
     insert_pam_decisive() {
         local target_file="$1"
         local pam_decisive="auth    [success=done default=bad]    $PAM_SO_PATH"
         if grep -q "pam_tapauth.so" "$target_file" 2>/dev/null; then
             return 0
         fi
+        backup_pam_file "$target_file"
         if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
             if [[ "$has_hardware_fprintd" == true ]]; then
                 print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
@@ -1465,6 +1479,7 @@ EOF
         # Note: sddm-greeter is for the greeter UI process itself, not user auth
         if [[ -f /etc/pam.d/sddm ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
+                backup_pam_file "/etc/pam.d/sddm"
                 sed -i "1i $pam_line" /etc/pam.d/sddm
                 print_success "Configured PAM for SDDM"
             else
@@ -1481,6 +1496,7 @@ EOF
         
         if [[ -f /etc/pam.d/lightdm ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/lightdm; then
+                backup_pam_file "/etc/pam.d/lightdm"
                 sed -i "1i $pam_line" /etc/pam.d/lightdm
                 print_success "Configured PAM for LightDM"
             else
@@ -1518,6 +1534,7 @@ EOF
         for legacy_kde_pam in /etc/pam.d/kscreenlocker /etc/pam.d/kde; do
             if [[ -f "$legacy_kde_pam" ]]; then
                 if ! grep -q "pam_tapauth.so" "$legacy_kde_pam"; then
+                    backup_pam_file "$legacy_kde_pam"
                     sed -i "1i $pam_line" "$legacy_kde_pam"
                     print_success "Configured PAM for legacy KDE lock screen ($legacy_kde_pam)"
                 fi

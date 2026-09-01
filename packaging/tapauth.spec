@@ -7,9 +7,9 @@ Version:        %{?pkgversion}%{!?pkgversion:0.1.0}
 Release:        1%{?dist}
 Summary:        Local smartphone-based authentication framework
 
-License:        AGPL-3.0
+License:        AGPL-3.0-only
 URL:            https://github.com/lolle2000la/tapauth
-Source0:        %{name}-%{version}.tar.gz
+Source0:        https://github.com/lolle2000la/tapauth/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
@@ -27,6 +27,7 @@ BuildRequires:  protobuf-compiler
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pam-devel
+BuildRequires:  systemd-rpm-macros
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -46,8 +47,7 @@ Summary:        Virtual fprintd D-Bus bridge for TapAuth lock screen integration
 Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
-Provides:       fprintd
-Obsoletes:      fprintd <= 1.94.5
+Provides:       fprintd = 1.94.5
 Recommends:     fprintd-pam
 
 %description fprintd
@@ -58,12 +58,16 @@ authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
 %setup -q -n %{name}-%{version}
 
 %build
-cargo build --workspace --release
+cargo build --workspace --release --locked
+
+%check
+cargo test --workspace
 
 %install
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_libdir}/security
 mkdir -p %{buildroot}%{_unitdir}
+mkdir -p %{buildroot}%{_presetdir}
 mkdir -p %{buildroot}%{_sysusersdir}
 mkdir -p %{buildroot}%{_tmpfilesdir}
 mkdir -p %{buildroot}%{_datadir}/doc/tapauth
@@ -77,6 +81,13 @@ mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
 install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
 install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
+
+# Default Configuration
+cat << 'EOF' > %{buildroot}%{_sysconfdir}/tapauth/config.toml
+# TapAuth System Configuration
+enable_fprintd_bridge = false
+EOF
+chmod 0600 %{buildroot}%{_sysconfdir}/tapauth/config.toml
 
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation
@@ -123,9 +134,10 @@ grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/
 printf "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
 %endif
 
-# System Services
+# System Services and Presets
 install -m 0644 systemd/tapauthd.service %{buildroot}%{_unitdir}/tapauthd.service
 install -m 0644 systemd/tapauthd.socket %{buildroot}%{_unitdir}/tapauthd.socket
+install -m 0644 packaging/90-tapauthd.preset %{buildroot}%{_presetdir}/90-tapauthd.preset
 
 mkdir -p %{buildroot}%{_unitdir}/polkit-agent-helper@.service.d
 install -m 0644 systemd/polkit-agent-helper@.service.d/tapauth.conf %{buildroot}%{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
@@ -148,15 +160,9 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sys
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
-if [ ! -f %{_sysconfdir}/tapauth/config.toml ]; then
-    mkdir -p %{_sysconfdir}/tapauth
-    cat << 'EOF' > %{_sysconfdir}/tapauth/config.toml
-# TapAuth Configuration
-enable_fprintd_bridge = false
-EOF
-    chmod 644 %{_sysconfdir}/tapauth/config.toml
-    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-fi
+chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
+chmod 0700 %{_sysconfdir}/tapauth 2>/dev/null || true
+chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 %systemd_post tapauthd.service tapauthd.socket
 
 %preun
@@ -178,19 +184,15 @@ fi
 
 %post fprintd
 if [ "$1" -eq 1 ]; then
-    mkdir -p %{_sysconfdir}/tapauth
-    if [ ! -f %{_sysconfdir}/tapauth/config.toml ]; then
-        cat << 'EOF' > %{_sysconfdir}/tapauth/config.toml
-# TapAuth Configuration
-enable_fprintd_bridge = true
-EOF
-    elif grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
-        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
-    else
-        echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
+    if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+        if grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
+            sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
+        else
+            echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
+        fi
+        chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
     fi
-    chmod 644 %{_sysconfdir}/tapauth/config.toml
-    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 fi
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
@@ -204,6 +206,7 @@ if [ $1 -eq 0 ]; then
     if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
         sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
         chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
     fi
     if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
         systemctl reload dbus 2>/dev/null || true
@@ -213,12 +216,14 @@ fi
 
 %files
 %license LICENSE
-%dir %{_sysconfdir}/tapauth
+%dir %attr(0700, tapauthd, tapauthd) %{_sysconfdir}/tapauth
+%config(noreplace) %attr(0600, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_libdir}/security/pam_tapauth.so
 %{_unitdir}/tapauthd.service
 %{_unitdir}/tapauthd.socket
+%{_presetdir}/90-tapauthd.preset
 %dir %{_unitdir}/polkit-agent-helper@.service.d
 %{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
 %{_sysusersdir}/tapauth.conf

@@ -16,7 +16,7 @@ CFGEOF
   echo ":: To allow your user to configure TapAuth via GUI, add yourself to the tapauthd-clients group:"
   echo "::   sudo usermod -aG tapauthd-clients \$USER"
   echo ":: To complete activation, add 'auth sufficient pam_tapauth.so' to /etc/pam.d/system-auth"
-  echo ":: For KDE/GNOME lock screen integration, install 'tapauth-fprintd-git'."
+  echo ":: For KDE/GNOME lock screen integration, install 'tapauth-fprintd'."
 }
 
 post_upgrade() {

@@ -184,10 +184,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(conn)
         }
         Err(e) => {
-            tracing::debug!(
-                "Virtual fprintd D-Bus service not registered: {} (normal if real fprintd is running or D-Bus system policy not installed)",
-                e
-            );
+            if shared::config::TapAuthConfig::load().enable_fprintd_bridge {
+                tracing::warn!(
+                    "Virtual fprintd D-Bus service failed to register: {} (check that real fprintd is stopped and D-Bus policy is installed)",
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "Virtual fprintd D-Bus service not registered: {} (normal if real fprintd is running or D-Bus system policy not installed)",
+                    e
+                );
+            }
             None
         }
     };

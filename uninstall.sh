@@ -221,10 +221,12 @@ remove_systemd_units_and_daemon() {
     fi
 
     # Remove virtual fprintd files
+    local removed_fprint_dbus=false
     for conf_dir in /etc/dbus-1/system.d /usr/share/dbus-1/system.d; do
         if [[ -f "$conf_dir/net.reactivated.Fprint.tapauth.conf" ]]; then
             print_info "Removing virtual fprintd D-Bus configuration ($conf_dir/net.reactivated.Fprint.tapauth.conf)"
             rm -f "$conf_dir/net.reactivated.Fprint.tapauth.conf"
+            removed_fprint_dbus=true
         fi
     done
 
@@ -233,7 +235,18 @@ remove_systemd_units_and_daemon() {
         if grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
             print_info "Removing virtual fprintd D-Bus service activation file"
             rm -f "$fprint_srv"
+            removed_fprint_dbus=true
         fi
+    fi
+
+    if [[ "$removed_fprint_dbus" == true ]]; then
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -f /etc/tapauth/config.toml ]]; then
+        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
     fi
 
     # Remove GDM dconf override
@@ -508,6 +521,16 @@ remove_pam_config() {
         print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
     fi
+    
+    # Restore PAM backups if present
+    for bak in /etc/pam.d/*.tapauth-bak; do
+        if [[ -f "$bak" ]]; then
+            local orig="${bak%.tapauth-bak}"
+            print_info "Restoring original PAM configuration for $orig"
+            cp -p "$bak" "$orig"
+            rm -f "$bak"
+        fi
+    done
     
     print_success "PAM configurations cleaned up"
 }
