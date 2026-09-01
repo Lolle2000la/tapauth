@@ -60,42 +60,43 @@ jobs:
 
           # Added aarch64 to arch layout matrix, removed self-conflicting references
           cat > PKGBUILD <<EOF
-          pkgname=tapauth
+          pkgbase=tapauth
+          pkgname=('tapauth' 'tapauth-fprintd')
           pkgver=${{ steps.version_vars.outputs.VERSION }}
           pkgrel=1
-          pkgdesc="Local smartphone-based authentication framework engine"
           arch=('x86_64' 'aarch64')
           url="https://github.com/lolle2000la/tapauth"
           license=('AGPL-3.0')
-          depends=('dbus' 'pam')
-          conflicts=('fprintd')
-          provides=('fprintd')
-          optdepends=(
-            'polkit: for polkit agent authentication helper'
-            'firewalld: for automated firewall port management'
-            'iptables: for iptables firewall integration'
-            'bluez: for Bluetooth Low Energy (BLE) transport'
-          )
           makedepends=('cargo' 'rust' 'protobuf' 'clang')
-          install=tapauth.install
-          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
+          source=("\$pkgbase-\$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')
 
           prepare() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             export CARGO_HOME="\${srcdir}/cargo-home"
             cargo fetch --locked --target "\$CARCH-unknown-linux-gnu"
           }
 
           build() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             export CARGO_HOME="\${srcdir}/cargo-home"
             export CARGO_PROFILE_RELEASE_STRIP=true
             cargo build --frozen --workspace --release
           }
 
-          package() {
-            cd "\$srcdir/\$pkgname-\$pkgver"
+          package_tapauth() {
+            pkgdesc="Local smartphone-based authentication framework engine"
+            depends=('dbus' 'pam')
+            optdepends=(
+              'polkit: for polkit agent authentication helper'
+              'firewalld: for automated firewall port management'
+              'iptables: for iptables firewall integration'
+              'bluez: for Bluetooth Low Energy (BLE) transport'
+              'tapauth-fprintd: for virtual fprintd desktop lock screen integration'
+            )
+            install=tapauth.install
+
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             install -dm0755 "\$pkgdir/etc/tapauth"
             install -Dm0755 target/release/tapauthd "\$pkgdir/usr/bin/tapauthd"
             install -Dm0755 target/release/tapauth-config "\$pkgdir/usr/bin/tapauth-config"
@@ -109,6 +110,17 @@ jobs:
             install -Dm0644 client-config-gui/assets/tapauth-config.svg "\$pkgdir/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
             install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "\$pkgdir/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
             install -Dm0644 packaging/50-tapauthd.rules "\$pkgdir/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+            install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+
+          package_tapauth-fprintd() {
+            pkgdesc="Virtual fprintd D-Bus bridge for TapAuth lock screen integration"
+            depends=("tapauth" 'dbus')
+            provides=('fprintd')
+            conflicts=('fprintd')
+            install=tapauth-fprintd.install
+
+            cd "\$srcdir/\$pkgbase-\$pkgver"
             install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "\$pkgdir/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
             install -Dm0644 packaging/net.reactivated.Fprint.service "\$pkgdir/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
             install -Dm0644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
@@ -132,7 +144,7 @@ CFGEOF
             systemctl enable --now tapauthd.socket
             echo ":: TapAuth installed successfully."
             echo ":: To complete activation, add 'auth sufficient pam_tapauth.so' to /etc/pam.d/system-auth"
-            echo ":: For KDE/GNOME lock screen integration, see /usr/share/doc/tapauth/ or online documentation."
+            echo ":: For KDE/GNOME lock screen integration, install 'tapauth-fprintd'."
           }
 
           post_upgrade() {
@@ -153,13 +165,54 @@ CFGEOF
           }
           EOF
 
+          cat > tapauth-fprintd.install <<EOF
+          post_install() {
+            if [ ! -f /etc/tapauth/config.toml ]; then
+              mkdir -p /etc/tapauth
+              cat << 'CFGEOF' > /etc/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = true
+CFGEOF
+              chmod 644 /etc/tapauth/config.toml
+              chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+            elif grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+              sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+              chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+            else
+              echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+              chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+            fi
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+              systemctl reload dbus 2>/dev/null || true
+            fi
+            systemctl try-restart tapauthd.service 2>/dev/null || true
+          }
+
+          post_upgrade() {
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+              systemctl reload dbus 2>/dev/null || true
+            fi
+            systemctl try-restart tapauthd.service 2>/dev/null || true
+          }
+
+          post_remove() {
+            if [ -f /etc/tapauth/config.toml ]; then
+              sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+              chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+            fi
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+              systemctl reload dbus 2>/dev/null || true
+            fi
+            systemctl try-restart tapauthd.service 2>/dev/null || true
+          }
+          EOF
+
           cat > .SRCINFO <<EOF
           pkgbase = tapauth
           	pkgdesc = Local smartphone-based authentication framework engine
           	pkgver = ${{ steps.version_vars.outputs.VERSION }}
           	pkgrel = 1
           	url = https://github.com/lolle2000la/tapauth
-          	install = tapauth.install
           	arch = x86_64
           	arch = aarch64
           	license = AGPL-3.0
@@ -167,20 +220,29 @@ CFGEOF
           	makedepends = rust
           	makedepends = protobuf
           	makedepends = clang
+          	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
+          	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
+
+          pkgname = tapauth
+          	pkgdesc = Local smartphone-based authentication framework engine
+          	install = tapauth.install
           	depends = dbus
           	depends = pam
           	optdepends = polkit: for polkit agent authentication helper
           	optdepends = firewalld: for automated firewall port management
           	optdepends = iptables: for iptables firewall integration
           	optdepends = bluez: for Bluetooth Low Energy (BLE) transport
+          	optdepends = tapauth-fprintd: for virtual fprintd desktop lock screen integration
+
+          pkgname = tapauth-fprintd
+          	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration
+          	install = tapauth-fprintd.install
+          	depends = tapauth
+          	depends = dbus
           	provides = fprintd
           	conflicts = fprintd
-          	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
-          	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
-
-          pkgname = tapauth
           EOF
 
-          git add PKGBUILD .SRCINFO tapauth.install
+          git add PKGBUILD .SRCINFO tapauth.install tapauth-fprintd.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master

@@ -43,11 +43,15 @@ sudo pam-auth-update
 ```
 
 ### 3. Arch Linux / CachyOS
-The package is available via the Arch User Repository (AUR).
+The packages are available via the Arch User Repository (AUR).
 ```bash
 paru -S tapauth
 # or alternatively
 yay -S tapauth
+
+# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
+paru -S tapauth-fprintd
+# (or for development/git versions: paru -S tapauth-fprintd-git)
 ```
 * **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
 ```text
