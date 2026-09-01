@@ -5,6 +5,10 @@ name: "Release: Arch AUR (Git)"
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: aur-git-push
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -36,11 +40,13 @@ jobs:
           cp packaging/arch-git/PKGBUILD aur-repo/PKGBUILD
           cp packaging/arch-git/tapauth-git.install aur-repo/tapauth-git.install
           cp packaging/arch-git/tapauth-fprintd-git.install aur-repo/tapauth-fprintd-git.install
-          cp packaging/arch-git/.SRCINFO aur-repo/.SRCINFO
+
+          # Regenerate .SRCINFO via makepkg (must run as non-root)
+          docker run --rm -v "$(pwd)/aur-repo:/pkg" archlinux:base-devel \
+            bash -c "useradd -m builder && chown -R builder:builder /pkg && su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'"
 
           cd aur-repo
 
-          # Check if git diff exists in aur-repo
           if git diff --quiet PKGBUILD .SRCINFO tapauth-git.install tapauth-fprintd-git.install; then
             echo "No changes in tapauth-git packaging files. Skipping commit."
             exit 0

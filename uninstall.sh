@@ -122,8 +122,8 @@ Usage: $0 [OPTIONS]
 OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
-    -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --remove-user-data      Remove user configuration data (keys, pairings)
+    -y, --yes               Answer yes to all prompts (non-interactive; does NOT remove user data)
+    --purge, --remove-user-data Remove user data including pairing keys (use with caution)
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
     --dry-run               Show what would be done without doing it
 
@@ -277,10 +277,10 @@ parse_args() {
                 ;;
             -y|--yes)
                 INTERACTIVE=false
-                REMOVE_USER_DATA=true
+                # Note: --yes does NOT imply user data deletion; use --purge for that
                 shift
                 ;;
-            --remove-user-data)
+            --purge|--remove-user-data)
                 REMOVE_USER_DATA=true
                 shift
                 ;;

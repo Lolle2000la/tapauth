@@ -281,6 +281,7 @@ parse_args() {
                 CONFIGURE_PAM_SU_L=true
                 CONFIGURE_PAM_SYSTEM_AUTH=true
                 CONFIGURE_PAM_GDM=true
+                CONFIGURE_PAM_KDE=true
                 CONFIGURE_PAM_SDDM=false
                 CONFIGURE_PAM_LIGHTDM=true
                 USE_BLE=true

@@ -91,14 +91,13 @@ jobs:
           Section: admin
           Priority: optional
           Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev
+          Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
           Standards-Version: 4.7.0
 
           Package: tapauth
           Architecture: any
-          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd
-          Recommends: firewalld
-          Suggests: iptables, tapauth-fprintd
+          Depends: \${shlibs:Depends}, \${misc:Depends}, polkitd, libdbus-1-3, bluez
+          Suggests: firewalld, iptables, tapauth-fprintd
           Description: Local smartphone-based authentication framework
            A modern, privacy-preserving local-first authentication system
            using Rust PAM modules, systemd system daemons, and low-level
@@ -110,6 +109,7 @@ jobs:
           Architecture: all
           Depends: \${misc:Depends}, tapauth (>= \${source:Version}), dbus
           Conflicts: fprintd
+          Provides: fprintd
           Replaces: fprintd
           Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
            Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
@@ -188,6 +188,11 @@ jobs:
           	if command -v pam-auth-update >/dev/null 2>&1; then
           		pam-auth-update --package
           	fi
+          	# Inform the user about the tapauthd-clients group
+          	echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
+          	echo "         add your user to the tapauthd-clients group:"
+          	echo "         sudo usermod -aG tapauthd-clients \$USER"
+          	echo "         Then log out and log back in for the change to take effect."
           fi
           #DEBHELPER#
           exit 0

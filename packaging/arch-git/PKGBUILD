@@ -46,6 +46,7 @@ package_tapauth-git() {
     'bluez: for Bluetooth Low Energy (BLE) transport'
     'tapauth-fprintd-git: for virtual fprintd desktop lock screen integration'
   )
+  provides=("tapauth=${pkgver}")
   conflicts=('tapauth')
   install=tapauth-git.install
 

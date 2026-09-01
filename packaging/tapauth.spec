@@ -48,7 +48,6 @@ Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
 Provides:       fprintd = 1.94.5
-Recommends:     fprintd-pam
 
 %description fprintd
 Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
@@ -183,6 +182,10 @@ fi
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %post fprintd
+
+echo "TapAuth virtual fprintd bridge enabled."
+echo "For lock screen integration, ensure /etc/pam.d/kde-fingerprint or"
+echo "gdm-fingerprint contains: auth [success=done default=bad] /usr/lib/security/pam_tapauth.so"
 if [ "$1" -eq 1 ]; then
     if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
         if grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
