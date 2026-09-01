@@ -1,0 +1,50 @@
+name: "Release: Arch AUR (Git)"
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-arch-aur-git:
+    name: Arch User Repository (AUR) Git Sync
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v7
+
+      - name: Synchronize and Push Metadata Changes to AUR (tapauth-git)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_aur
+          chmod 600 ~/.ssh/id_aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_aur
+
+          git config --global user.name "AUR Deployment Pipeline"
+          git config --global user.email "lolle2000.la+tapauth@gmail.com"
+
+          git clone aur@aur.archlinux.org:tapauth-git.git aur-repo
+          
+          # Synchronize from repository packaging/arch-git/
+          cp packaging/arch-git/PKGBUILD aur-repo/PKGBUILD
+          cp packaging/arch-git/tapauth-git.install aur-repo/tapauth-git.install
+          cp packaging/arch-git/.SRCINFO aur-repo/.SRCINFO
+
+          cd aur-repo
+
+          # Check if git diff exists in aur-repo
+          if git diff --quiet PKGBUILD .SRCINFO tapauth-git.install; then
+            echo "No changes in tapauth-git packaging files. Skipping commit."
+            exit 0
+          fi
+
+          git add PKGBUILD .SRCINFO tapauth-git.install
+          git commit -m "Automated sync from main (${GITHUB_SHA::8})"
+          git push origin master

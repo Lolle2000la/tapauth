@@ -1,0 +1,35 @@
+post_install() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  if [ ! -f /etc/tapauth/config.toml ]; then
+    mkdir -p /etc/tapauth
+    cat << 'CFGEOF' > /etc/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = false
+CFGEOF
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  systemctl enable --now tapauthd.socket
+  echo ":: TapAuth development version installed successfully."
+  echo ":: To complete activation, add 'auth sufficient pam_tapauth.so' to /etc/pam.d/system-auth"
+  echo ":: For KDE/GNOME lock screen integration, see /usr/share/doc/tapauth/ or online documentation."
+}
+
+post_upgrade() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  systemctl daemon-reload
+  systemctl reenable tapauthd.socket
+  systemctl restart tapauthd.socket
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
+  if grep -rq "pam_tapauth.so" /etc/pam.d/ 2>/dev/null; then
+    echo ":: WARNING: Found references to pam_tapauth.so in /etc/pam.d/."
+    echo ":: Please remove them to avoid authentication lockouts!"
+  fi
+}
