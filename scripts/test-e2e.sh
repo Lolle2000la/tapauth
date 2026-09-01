@@ -935,6 +935,15 @@ if [ "$PAM_TESTABLE" = "true" ]; then
         ORIG_PAM_BACKUP=$(cat "$DUAL_STACK_PAM_PATH")
     fi
 
+    restore_dual_stack_pam() {
+        if [ -n "$ORIG_PAM_BACKUP" ]; then
+            printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
+        else
+            rm -f "$DUAL_STACK_PAM_PATH"
+        fi
+    }
+    trap restore_dual_stack_pam EXIT INT TERM
+
     # Distro-aware include
     INCLUDES="account include common-account\npassword include common-password\nsession include common-session"
     if [ -f /etc/pam.d/system-local-login ]; then
@@ -954,20 +963,13 @@ if [ "$PAM_TESTABLE" = "true" ]; then
         echo "✅ Dual-stack secondary service returned PAM_SUCCESS on phone approval."
     else
         echo "❌ ERROR: expected PAM_SUCCESS on dual-stack authentication."
-        if [ -n "$ORIG_PAM_BACKUP" ]; then
-            printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
-        else
-            rm -f "$DUAL_STACK_PAM_PATH"
-        fi
+        restore_dual_stack_pam
         exit 1
     fi
 
-    # Restore original PAM file or clean up
-    if [ -n "$ORIG_PAM_BACKUP" ]; then
-        printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
-    else
-        rm -f "$DUAL_STACK_PAM_PATH"
-    fi
+    restore_dual_stack_pam
+    # Reset exit trap back to general cleanup if cleanup() is defined
+    trap cleanup EXIT INT TERM
 else
     echo "ℹ️  SKIPPED (pamtester not available, PAM library missing, or /etc/pam.d not writable)."
 fi
@@ -979,9 +981,21 @@ echo "║  PHASE 2h: Virtual fprintd D-Bus Interface Verification       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 if command -v dbus-send >/dev/null 2>&1; then
+    echo "==> Enabling virtual fprintd bridge via admin IPC..."
+    "$CLI_BIN" set-transports --fprintd-bridge true || true
+
     echo "==> Querying net.reactivated.Fprint.Manager.GetDefaultDevice..."
     if dbus-send --system --print-reply --dest=net.reactivated.Fprint /net/reactivated/Fprint/Manager net.reactivated.Fprint.Manager.GetDefaultDevice > "${TEST_DIR}/fprint_dev.log" 2>&1; then
         echo "✅ Virtual fprintd responded to GetDefaultDevice on system bus"
+        DEV_PATH=$(grep -o 'object path "[^"]*"' "${TEST_DIR}/fprint_dev.log" | cut -d'"' -f2 || true)
+        if [ -n "$DEV_PATH" ]; then
+            echo "==> Querying ListEnrolledFingers on device $DEV_PATH..."
+            if dbus-send --system --print-reply --dest=net.reactivated.Fprint "$DEV_PATH" net.reactivated.Fprint.Device.ListEnrolledFingers string:"$TEST_USER" > "${TEST_DIR}/fprint_fingers.log" 2>&1; then
+                if grep -q 'string "any"' "${TEST_DIR}/fprint_fingers.log"; then
+                    echo "✅ Virtual fprintd ListEnrolledFingers returned ['any'] for user '$TEST_USER'"
+                fi
+            fi
+        fi
     else
         echo "ℹ️  Virtual fprintd D-Bus call returned error (system bus permission or not running in test sandbox):"
         cat "${TEST_DIR}/fprint_dev.log"

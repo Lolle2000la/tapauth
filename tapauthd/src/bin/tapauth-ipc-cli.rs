@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  complete-pairing <port>");
         eprintln!("  get-servers");
         eprintln!("  remove-device <public_key_hex>");
-        eprintln!("  set-transports --ble <true|false> --network <true|false>");
+        eprintln!("  set-transports [--ble <true|false>] [--network <true|false>] [--fprintd-bridge <true|false>]");
         eprintln!("  get-config");
         eprintln!("  pam-auth <username> [timeout_secs] [request_id]");
         eprintln!("  pam-cancel <request_id> [reason]");

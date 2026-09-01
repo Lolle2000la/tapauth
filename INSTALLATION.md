@@ -43,20 +43,17 @@ sudo pam-auth-update
 ```
 
 ### 3. Arch Linux / CachyOS
-The source package metadata configuration is available via the Arch User Repository (AUR).
+The package is available via the Arch User Repository (AUR).
 ```bash
 paru -S tapauth
 # or alternatively
 yay -S tapauth
-
-# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
-paru -S tapauth-fprintd
-# or yay -S tapauth-fprintd
 ```
 * **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
 ```text
 auth      sufficient      pam_tapauth.so
 ```
+To enable desktop lock screen integration on Arch, see the [Desktop Lock Screen Integration](#desktop-lock-screen-integration-gnome--kde-plasma) section below.
 
 ## Desktop Lock Screen Integration (GNOME & KDE Plasma)
 

@@ -135,11 +135,12 @@ pub struct TapAuthConfig {
     /// authentication.
     pub enable_ble: bool,
 
-    /// Whether the virtual fprintd D-Bus bridge is enabled (default: true).
+    /// Whether the virtual fprintd D-Bus bridge is enabled (default: false).
     ///
     /// When enabled, the daemon exposes the `net.reactivated.Fprint` D-Bus
     /// interface, allowing desktop environments like GNOME Shell to query
-    /// and trigger TapAuth biometrics seamlessly.
+    /// and trigger TapAuth biometrics seamlessly. Requires a daemon restart
+    /// to acquire or release the D-Bus bus name.
     pub enable_fprintd_bridge: bool,
 
     /// Whether to use TPM for key storage

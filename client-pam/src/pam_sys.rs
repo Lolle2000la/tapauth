@@ -14,6 +14,7 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[allow(unused_imports)]
 pub use ffi::{
     pam_get_authtok, PAM_AUTHINFO_UNAVAIL, PAM_AUTHTOK, PAM_AUTH_ERR, PAM_BUF_ERR, PAM_CONV_ERR,
     PAM_ERROR_MSG, PAM_IGNORE, PAM_PERM_DENIED, PAM_SERVICE, PAM_SUCCESS, PAM_SYSTEM_ERR,
@@ -262,14 +263,29 @@ impl<'a> PamConversation<'a> {
         })
     }
 
+    /// Create a mock conversation that discards messages (for testing).
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self {
+            pamh: std::ptr::null_mut(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Send an informational message to the user.
     pub fn info(&self, message: &str) -> Result<(), c_int> {
+        if self.pamh.is_null() {
+            return Ok(());
+        }
         unsafe { send_message(self.pamh, PAM_TEXT_INFO, message) }
     }
 
     /// Send an error message to the user.
     #[allow(dead_code)]
     pub fn error(&self, message: &str) -> Result<(), c_int> {
+        if self.pamh.is_null() {
+            return Ok(());
+        }
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
     }
 

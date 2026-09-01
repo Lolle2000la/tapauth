@@ -30,6 +30,7 @@ CONFIGURE_PAM_LIGHTDM=false
 CONFIGURE_PAM_KDE=false
 USE_TPM=false
 USE_BLE=true
+ENABLE_FPRINTD_BRIDGE=false
 BUILD_ONLY=false
 DRY_RUN=false
 
@@ -52,6 +53,9 @@ POLKIT_DROPIN_SOURCE="systemd/polkit-agent-helper@.service.d/tapauth.conf"
 POLKIT_DROPIN_DEST_DIR="/etc/systemd/system/polkit-agent-helper@.service.d"
 FPRINT_DBUS_CONF_SOURCE="packaging/net.reactivated.Fprint.tapauth.conf"
 FPRINT_DBUS_CONF_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+if [[ -d /usr/share/dbus-1/system.d ]]; then
+    FPRINT_DBUS_CONF_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+fi
 FPRINT_SERVICE_SOURCE="packaging/net.reactivated.Fprint.service"
 FPRINT_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
 GDM_DCONF_DEST="/etc/dconf/db/gdm.d/01-tapauth"
@@ -201,6 +205,7 @@ OPTIONS:
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
     --no-ble                Build without Bluetooth support (UDP only)
     --use-tpm               Enable TPM support for key storage
+    --enable-fprintd        Enable virtual fprintd bridge (emulates fingerprint sensor for GNOME/KDE lock screen)
     --configure-login       Configure PAM for login authentication
     --configure-su          Configure PAM for su (root shells via su)
     --configure-sudo        Configure PAM for sudo authentication
@@ -266,6 +271,10 @@ parse_args() {
                 ;;
             --no-ble)
                 USE_BLE=false
+                shift
+                ;;
+            --enable-fprintd|--enable-fprintd-bridge)
+                ENABLE_FPRINTD_BRIDGE=true
                 shift
                 ;;
             --configure-login)
@@ -347,6 +356,9 @@ prompt_features() {
         print_info "TPM tools not detected. TPM support disabled."
         USE_TPM=false
     fi
+
+    read -p "Enable virtual fprintd bridge (emulates fingerprint sensor on lock screen)? [y/N]: " response
+    [[ "$response" =~ ^[Yy]$ ]] && ENABLE_FPRINTD_BRIDGE=true || ENABLE_FPRINTD_BRIDGE=false
 }
 
 prompt_pam_configuration() {
@@ -885,30 +897,43 @@ install_daemon() {
         has_hardware_fprintd=true
     fi
 
-    if [[ "$has_hardware_fprintd" == true ]]; then
-        print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
-    else
-        if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d /etc/dbus-1/system.d ]]; then
-            print_info "Installing virtual fprintd D-Bus configuration"
-            install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
-            if command -v restorecon &> /dev/null; then
-                restorecon "$FPRINT_DBUS_CONF_DEST" || true
+    if [[ "$ENABLE_FPRINTD_BRIDGE" == true ]]; then
+        if [[ "$has_hardware_fprintd" == true ]]; then
+            print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
+        else
+            local dbus_dir
+            dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
+            if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
+                print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
+                install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
+                if command -v restorecon &> /dev/null; then
+                    restorecon "$FPRINT_DBUS_CONF_DEST" || true
+                fi
             fi
-        fi
 
-        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
-            print_info "Installing virtual fprintd D-Bus system service activation file"
-            install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
-            if command -v restorecon &> /dev/null; then
-                restorecon "$FPRINT_SERVICE_DEST" || true
+            if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+                print_info "Installing virtual fprintd D-Bus system service activation file"
+                install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
+                if command -v restorecon &> /dev/null; then
+                    restorecon "$FPRINT_SERVICE_DEST" || true
+                fi
             fi
-        fi
 
-        # Reload system D-Bus configuration to apply the new policy immediately
-        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
-            systemctl reload dbus 2>/dev/null || true
-        elif command -v busctl &>/dev/null; then
-            busctl reload-config 2>/dev/null || true
+            # Enable fprintd bridge in /etc/tapauth/config.toml
+            if [[ -f /etc/tapauth/config.toml ]]; then
+                if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+                    sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+                else
+                    echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+                fi
+            fi
+
+            # Reload system D-Bus configuration to apply the new policy immediately
+            if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+                systemctl reload dbus 2>/dev/null || true
+            elif command -v dbus-send &>/dev/null; then
+                dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+            fi
         fi
     fi
 }
@@ -1326,7 +1351,12 @@ configure_pam() {
             return 0
         fi
         if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
-            sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
+            if [[ "$has_hardware_fprintd" == true ]]; then
+                print_warning "Physical fprintd detected on system; preserving pam_fprintd.so in $target_file"
+                sed -i "/pam_fprintd\.so/i $pam_decisive" "$target_file"
+            else
+                sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
+            fi
         else
             local last_env_line
             last_env_line=$(grep -n -E "pam_env\.so|pam_nologin\.so" "$target_file" 2>/dev/null | tail -n1 | cut -d: -f1 || true)
@@ -1353,6 +1383,7 @@ configure_pam() {
             includes=$(get_pam_distro_includes)
             cat << EOF > /etc/pam.d/gdm-fingerprint
 #%PAM-1.0
+# Managed by TapAuth
 $pam_decisive_line
 $includes
 EOF
@@ -1363,6 +1394,13 @@ EOF
         # Enable fingerprint authentication in GDM dconf settings
         if [[ -d /etc/dconf/db/gdm.d ]]; then
             print_info "Configuring GDM dconf to enable fingerprint auth..."
+            if [[ -d /etc/dconf/profile && ! -f /etc/dconf/profile/gdm ]]; then
+                cat << 'EOF' > /etc/dconf/profile/gdm
+user-db:user
+system-db:gdm
+file-db:/usr/share/gdm/greeter-dconf-defaults
+EOF
+            fi
             cat << 'EOF' > "$GDM_DCONF_DEST"
 [org/gnome/login-screen]
 enable-fingerprint-authentication=true
@@ -1423,6 +1461,7 @@ EOF
             includes=$(get_pam_distro_includes)
             cat << EOF > /etc/pam.d/kde-fingerprint
 #%PAM-1.0
+# Managed by TapAuth
 $pam_decisive_line
 $includes
 EOF

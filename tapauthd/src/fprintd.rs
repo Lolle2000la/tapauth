@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::sync::RwLock;
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
@@ -71,6 +72,7 @@ struct DeviceState {
     verifying: bool,
     cancel_token: Option<tokio::sync::oneshot::Sender<()>>,
     session_id: u64,
+    last_verify_time: Option<Instant>,
 }
 
 pub struct VirtualFprintDevice {
@@ -90,6 +92,7 @@ impl VirtualFprintDevice {
                 verifying: false,
                 cancel_token: None,
                 session_id: 0,
+                last_verify_time: None,
             })),
         }
     }
@@ -272,6 +275,42 @@ impl VirtualFprintDevice {
         }
         s.claimed_user = Some(target_username);
         s.claimed_owner = Some(sender.to_string());
+
+        // Watch for caller disconnect / crash to auto-release the claim immediately
+        let conn_clone = connection.clone();
+        let state_clone = self.state.clone();
+        let owner_sender = sender.to_string();
+        tokio::spawn(async move {
+            if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(&conn_clone).await {
+                if let Ok(mut stream) = dbus_proxy.receive_name_owner_changed().await {
+                    use zbus::export::ordered_stream::OrderedStreamExt;
+                    while let Some(signal) = stream.next().await {
+                        if let Ok(args) = signal.args() {
+                            if args.name.as_str() == owner_sender.as_str()
+                                && args.new_owner.is_none()
+                            {
+                                tracing::info!(
+                                    "fprintd: D-Bus client '{}' disconnected — releasing claim",
+                                    owner_sender
+                                );
+                                if let Ok(mut s) = state_clone.lock() {
+                                    if s.claimed_owner.as_deref() == Some(&owner_sender) {
+                                        s.claimed_user = None;
+                                        s.claimed_owner = None;
+                                        s.verifying = false;
+                                        if let Some(tx) = s.cancel_token.take() {
+                                            let _ = tx.send(());
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -399,6 +438,15 @@ impl VirtualFprintDevice {
                     "Verification already in progress".to_string(),
                 ));
             }
+            let now = std::time::Instant::now();
+            if let Some(last) = s.last_verify_time {
+                if now.duration_since(last) < std::time::Duration::from_millis(1000) {
+                    return Err(FprintError::AlreadyInUse(
+                        "Rate limit exceeded for verify requests".to_string(),
+                    ));
+                }
+            }
+            s.last_verify_time = Some(now);
             s.session_id = s.session_id.wrapping_add(1);
             s.verifying = true;
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -465,33 +513,38 @@ impl VirtualFprintDevice {
             }
         };
 
-        let mut s = self.state.lock().map_err(|e| {
-            FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
-        })?;
-        let owner = s.claimed_owner.as_ref();
-        match owner {
-            Some(existing) => {
-                if existing != &sender {
+        let cancel_token = {
+            let mut s = self.state.lock().map_err(|e| {
+                FprintError::Internal(format!("Failed to acquire device state lock: {}", e))
+            })?;
+            let owner = s.claimed_owner.as_ref();
+            match owner {
+                Some(existing) => {
+                    if existing != &sender {
+                        return Err(FprintError::ClaimDevice(
+                            "Caller is not the owner of the claim".to_string(),
+                        ));
+                    }
+                }
+                None => {
                     return Err(FprintError::ClaimDevice(
-                        "Caller is not the owner of the claim".to_string(),
+                        "Device is not claimed".to_string(),
                     ));
                 }
             }
-            None => {
+            if !s.verifying {
                 return Err(FprintError::ClaimDevice(
-                    "Device must be claimed before stopping verification".to_string(),
+                    "No verification in progress to stop".to_string(),
                 ));
             }
+            s.cancel_token.take()
+        };
+
+        if let Some(token) = cancel_token {
+            let _ = token.send(());
         }
-        if !s.verifying {
-            return Err(FprintError::NoActionInProgress(
-                "No verification in progress".to_string(),
-            ));
-        }
-        s.verifying = false;
-        if let Some(tx) = s.cancel_token.take() {
-            let _ = tx.send(());
-        }
+
+        emit_status(&self.connection, "verify-unknown-error", true).await;
         Ok(())
     }
 
@@ -525,15 +578,24 @@ async fn run_verify(
         }
     };
 
+    let mut rnd_bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut rnd_bytes);
+    let req_id = format!("fprintd-{}", hex::encode(rnd_bytes));
+    let (internal_cancel_tx, internal_cancel_rx) = tokio::sync::oneshot::channel();
     let cancel_registry: Arc<
         tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    {
+        let mut reg = cancel_registry.lock().await;
+        reg.insert(req_id.clone(), internal_cancel_tx);
+    }
 
     let auth_fut = session.handle_authenticate(
         None,
-        Some("fprintd-verify".to_string()),
+        Some(req_id.clone()),
         Some("fprintd-verify".to_string()),
         cancel_registry.clone(),
+        internal_cancel_rx,
     );
     tokio::pin!(auth_fut);
 
@@ -542,7 +604,7 @@ async fn run_verify(
         res = &mut auth_fut => Some(res),
         _ = &mut cancel_rx => {
             let mut reg = cancel_registry.lock().await;
-            if let Some(tx) = reg.remove("fprintd-verify") {
+            if let Some(tx) = reg.remove(&req_id) {
                 let _ = tx.send(());
             }
             drop(reg);
@@ -695,6 +757,7 @@ mod tests {
             verifying: false,
             cancel_token: None,
             session_id: 0,
+            last_verify_time: None,
         };
         assert!(!state.verifying);
         assert!(state.claimed_user.is_none());

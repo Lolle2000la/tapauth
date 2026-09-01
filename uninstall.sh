@@ -221,11 +221,12 @@ remove_systemd_units_and_daemon() {
     fi
 
     # Remove virtual fprintd files
-    local fprint_conf="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
-    if [[ -f "$fprint_conf" ]]; then
-        print_info "Removing virtual fprintd D-Bus configuration"
-        rm -f "$fprint_conf"
-    fi
+    for conf_dir in /etc/dbus-1/system.d /usr/share/dbus-1/system.d; do
+        if [[ -f "$conf_dir/net.reactivated.Fprint.tapauth.conf" ]]; then
+            print_info "Removing virtual fprintd D-Bus configuration ($conf_dir/net.reactivated.Fprint.tapauth.conf)"
+            rm -f "$conf_dir/net.reactivated.Fprint.tapauth.conf"
+        fi
+    done
 
     local fprint_srv="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
     if [[ -f "$fprint_srv" ]]; then
@@ -458,9 +459,14 @@ remove_pam_config() {
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
     fi
 
-    if [[ -f /etc/pam.d/gdm-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
-        print_info "Removing TapAuth from GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-fingerprint
+    if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
+        if grep -q "Managed by TapAuth" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
+            print_info "Removing synthetic GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
+            rm -f /etc/pam.d/gdm-fingerprint
+        elif grep -q "pam_tapauth.so" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
+            print_info "Removing TapAuth from GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-fingerprint
+        fi
     fi
     
     # Remove from SDDM
@@ -486,9 +492,14 @@ remove_pam_config() {
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
     fi
     
-    if [[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
-        print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
+    if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+        if grep -q "Managed by TapAuth" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+            print_info "Removing synthetic KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+            rm -f /etc/pam.d/kde-fingerprint
+        elif grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+            print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
+        fi
     fi
     
     if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then

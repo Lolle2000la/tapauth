@@ -202,7 +202,43 @@ jobs:
           #DEBHELPER#
           exit 0
           EOF
-          chmod +x debian/postinst debian/postrm
+
+          cat > debian/tapauth-fprintd.postinst <<EOF
+          #!/bin/sh
+          set -e
+          if [ "\$1" = "configure" ]; then
+          	if [ -f /etc/tapauth/config.toml ]; then
+          		if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+          			sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+          		else
+          			echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+          		fi
+          	fi
+          	if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+          		systemctl reload dbus 2>/dev/null || true
+          	fi
+          	systemctl try-restart tapauthd.service 2>/dev/null || true
+          fi
+          #DEBHELPER#
+          exit 0
+          EOF
+
+          cat > debian/tapauth-fprintd.postrm <<EOF
+          #!/bin/sh
+          set -e
+          if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
+          	if [ -f /etc/tapauth/config.toml ]; then
+          		sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+          	fi
+          	if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+          		systemctl reload dbus 2>/dev/null || true
+          	fi
+          	systemctl try-restart tapauthd.service 2>/dev/null || true
+          fi
+          #DEBHELPER#
+          exit 0
+          EOF
+          chmod +x debian/postinst debian/postrm debian/tapauth-fprintd.postinst debian/tapauth-fprintd.postrm
 
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))

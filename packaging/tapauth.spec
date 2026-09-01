@@ -165,6 +165,32 @@ fi
 %postun
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
+%post fprintd
+if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+    if grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
+        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
+    else
+        echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
+    fi
+fi
+if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+elif command -v dbus-send &>/dev/null; then
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+fi
+systemctl try-restart tapauthd.service 2>/dev/null || true
+
+%postun fprintd
+if [ $1 -eq 0 ]; then
+    if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+    fi
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+        systemctl reload dbus 2>/dev/null || true
+    fi
+    systemctl try-restart tapauthd.service 2>/dev/null || true
+fi
+
 %files
 %license LICENSE
 %dir %{_sysconfdir}/tapauth

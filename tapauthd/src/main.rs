@@ -361,9 +361,14 @@ async fn handle_conn(
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
                 let req_id = auth_req.request_id.clone();
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut reg = server_state.cancel_registry.lock().await;
+                    reg.insert(req_id.clone(), cancel_tx);
+                }
                 let cancel_reg = server_state.cancel_registry.clone();
 
-                let auth_fut = handle_pam_authenticate(auth_req, &daemon, &server_state);
+                let auth_fut = handle_pam_authenticate(auth_req, &daemon, &server_state, cancel_rx);
                 tokio::pin!(auth_fut);
 
                 let mut eof_buf = [0u8; 1];
@@ -453,6 +458,7 @@ async fn handle_pam_authenticate(
     req: ipc::PamAuthenticateRequest,
     daemon: &Arc<DaemonState>,
     server_state: &Arc<ServerState>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> ipc::PamAuthenticateResponse {
     const DEDUP_WINDOW: Duration = Duration::from_secs(1);
     let now = Instant::now();
@@ -493,6 +499,7 @@ async fn handle_pam_authenticate(
                 Some(req.request_id.clone()),
                 Some(req.service_name.clone()),
                 server_state.cancel_registry.clone(),
+                cancel_rx,
             )
             .await
         {
