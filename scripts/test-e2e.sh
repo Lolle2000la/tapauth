@@ -925,14 +925,14 @@ echo "╔═══════════════════════�
 echo "║  PHASE 2g: Dual-Stack Secondary PAM Return Code & Behavior    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-if [ "$PAM_TEST_OK" = "1" ]; then
+if [ "$PAM_TESTABLE" = "true" ]; then
     DUAL_STACK_SERVICE="kde-fingerprint"
     DUAL_STACK_PAM_PATH="/etc/pam.d/${DUAL_STACK_SERVICE}"
     
     echo "==> Configuring temporary decisive PAM service for ${DUAL_STACK_SERVICE}..."
     cat << EOF > "$DUAL_STACK_PAM_PATH"
 #%PAM-1.0
-auth        [success=done default=bad]    $PAM_SO_PATH
+auth        [success=done default=bad]    $PAM_LIB
 auth        include      system-local-login
 account     include      system-local-login
 password    include      system-local-login
@@ -943,7 +943,7 @@ EOF
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
 
-    if "${PAM_ENV[@]}" pamtester -v "$DUAL_STACK_SERVICE" "$TEST_USER" authenticate; then
+    if "${PAM_ENV[@]}" pamtester -v "$DUAL_STACK_SERVICE" "$TEST_USER" authenticate < <(sleep 30); then
         echo "✅ Dual-stack secondary service returned PAM_SUCCESS on phone approval."
     else
         echo "❌ ERROR: expected PAM_SUCCESS on dual-stack authentication."
@@ -953,7 +953,7 @@ EOF
 
     rm -f "$DUAL_STACK_PAM_PATH"
 else
-    echo "ℹ️  SKIPPED (pamtester not available or not root)."
+    echo "ℹ️  SKIPPED (pamtester not available, PAM library missing, or /etc/pam.d not writable)."
 fi
 
 # Step 6h: Phase 2h - Virtual fprintd D-Bus verification

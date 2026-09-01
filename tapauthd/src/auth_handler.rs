@@ -351,9 +351,8 @@ impl AuthSession {
                 );
                 return Ok(ipc::PamAuthenticateResponse {
                     outcome: ipc::PamOutcome::Ignore as i32,
-                    detail:
-                        "GDM initial login screen — password required for keyring auto-unlock"
-                            .to_string(),
+                    detail: "GDM initial login screen — password required for keyring auto-unlock"
+                        .to_string(),
                     challenge: self.challenge.to_vec(),
                 });
             }

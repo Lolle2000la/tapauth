@@ -676,7 +676,10 @@ mod tests {
 
         let all_devs = manager.get_devices().await;
         assert_eq!(all_devs.len(), 1);
-        assert_eq!(all_devs.first().map(|d| d.as_str()), Some(FPRINT_DEVICE_PATH));
+        assert_eq!(
+            all_devs.first().map(|d| d.as_str()),
+            Some(FPRINT_DEVICE_PATH)
+        );
     }
 
     #[test]
