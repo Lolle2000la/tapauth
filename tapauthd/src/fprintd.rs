@@ -166,6 +166,13 @@ impl VirtualFprintDevice {
             username
         };
 
+        let toml_config = shared::config::TapAuthConfig::load();
+        if !toml_config.enable_fprintd_bridge {
+            return Err(FprintError::NoEnrolledPrints(
+                "Virtual fprintd bridge is disabled in configuration".to_string(),
+            ));
+        }
+
         let state = self.auth_state.read().await;
         let has_authorized = state
             .paired_servers
@@ -187,6 +194,12 @@ impl VirtualFprintDevice {
         #[zbus(header)] header: zbus::message::Header<'_>,
         username: String,
     ) -> Result<(), FprintError> {
+        let toml_config = shared::config::TapAuthConfig::load();
+        if !toml_config.enable_fprintd_bridge {
+            return Err(FprintError::NoEnrolledPrints(
+                "Virtual fprintd bridge is disabled in configuration".to_string(),
+            ));
+        }
         let sender = match header.sender() {
             Some(s) => s.clone(),
             None => {
@@ -533,18 +546,16 @@ impl VirtualFprintDevice {
                 }
             }
             if !s.verifying {
-                return Err(FprintError::ClaimDevice(
-                    "No verification in progress to stop".to_string(),
-                ));
+                return Ok(());
             }
             s.cancel_token.take()
         };
 
         if let Some(token) = cancel_token {
             let _ = token.send(());
+            emit_status(&self.connection, "verify-unknown-error", true).await;
         }
 
-        emit_status(&self.connection, "verify-unknown-error", true).await;
         Ok(())
     }
 
@@ -762,5 +773,19 @@ mod tests {
         assert!(!state.verifying);
         assert!(state.claimed_user.is_none());
         assert!(state.claimed_owner.is_none());
+    }
+
+    #[test]
+    fn test_fprint_error_display() {
+        let err = FprintError::NoEnrolledPrints("bridge disabled".to_string());
+        assert_eq!(
+            err.to_string(),
+            "net.reactivated.Fprint.Error.NoEnrolledPrints: bridge disabled"
+        );
+        let claim_err = FprintError::ClaimDevice("already claimed".to_string());
+        assert_eq!(
+            claim_err.to_string(),
+            "net.reactivated.Fprint.Error.ClaimDevice: already claimed"
+        );
     }
 }

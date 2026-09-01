@@ -230,8 +230,10 @@ remove_systemd_units_and_daemon() {
 
     local fprint_srv="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
     if [[ -f "$fprint_srv" ]]; then
-        print_info "Removing virtual fprintd D-Bus service activation file"
-        rm -f "$fprint_srv"
+        if grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
+            print_info "Removing virtual fprintd D-Bus service activation file"
+            rm -f "$fprint_srv"
+        fi
     fi
 
     # Remove GDM dconf override

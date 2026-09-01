@@ -72,6 +72,22 @@ has_polkit_agent_helper() {
        -f "/etc/systemd/system/polkit-agent-helper@.service" ]]
 }
 
+has_hardware_fprintd=false
+check_hardware_fprintd() {
+    if command -v fprintd &>/dev/null || [[ -f /usr/libexec/fprintd || -f /usr/lib/fprintd/fprintd || -f /usr/lib/fprintd || -f /usr/sbin/fprintd ]]; then
+        has_hardware_fprintd=true
+        return 0
+    fi
+    if [[ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ]]; then
+        if ! grep -q "tapauthd" /usr/share/dbus-1/system-services/net.reactivated.Fprint.service 2>/dev/null; then
+            has_hardware_fprintd=true
+            return 0
+        fi
+    fi
+    has_hardware_fprintd=false
+    return 1
+}
+
 # Print functions
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -891,11 +907,38 @@ install_daemon() {
         fi
     fi
 
-    # Install virtual fprintd D-Bus policy and service activation files (guarded against real hardware fprintd)
-    local has_hardware_fprintd=false
-    if command -v fprintd &>/dev/null || [[ -f /usr/libexec/fprintd || -f /usr/lib/fprintd/fprintd || -f /usr/sbin/fprintd ]]; then
-        has_hardware_fprintd=true
+    # Seed default /etc/tapauth/config.toml if missing
+    mkdir -p /etc/tapauth
+    if [[ ! -f /etc/tapauth/config.toml ]]; then
+        print_info "Creating default /etc/tapauth/config.toml"
+        cat << 'EOF' > /etc/tapauth/config.toml
+# TapAuth System Configuration
+# See https://github.com/Lolle2000la/tapauth for documentation.
+
+# Authentication timeout in seconds (default: 120)
+# pam_operation_timeout_secs = 120
+
+# GUI authentication timeout in seconds (default: 30)
+# pam_gui_timeout_secs = 30
+
+# UDP port for local network transport (default: 36692)
+# udp_port = 36692
+
+# Enable Local Network transport (default: true)
+# enable_network = true
+
+# Enable Bluetooth Low Energy transport (default: true)
+# enable_ble = true
+
+# Enable virtual fprintd D-Bus bridge for desktop lock screens (default: false)
+enable_fprintd_bridge = false
+EOF
+        chmod 644 /etc/tapauth/config.toml
+        chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
     fi
+
+    # Install virtual fprintd D-Bus policy and service activation files (guarded against real hardware fprintd)
+    check_hardware_fprintd
 
     if [[ "$ENABLE_FPRINTD_BRIDGE" == true ]]; then
         if [[ "$has_hardware_fprintd" == true ]]; then
@@ -920,19 +963,21 @@ install_daemon() {
             fi
 
             # Enable fprintd bridge in /etc/tapauth/config.toml
-            if [[ -f /etc/tapauth/config.toml ]]; then
-                if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
-                    sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
-                else
-                    echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
-                fi
+            if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+                sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+            else
+                echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
             fi
+            chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 
             # Reload system D-Bus configuration to apply the new policy immediately
             if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
                 systemctl reload dbus 2>/dev/null || true
             elif command -v dbus-send &>/dev/null; then
                 dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+            fi
+            if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
+                systemctl try-restart tapauthd.service 2>/dev/null || true
             fi
         fi
     fi
@@ -1352,8 +1397,8 @@ configure_pam() {
         fi
         if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
             if [[ "$has_hardware_fprintd" == true ]]; then
-                print_warning "Physical fprintd detected on system; preserving pam_fprintd.so in $target_file"
-                sed -i "/pam_fprintd\.so/i $pam_decisive" "$target_file"
+                print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
+                return 0
             else
                 sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
             fi

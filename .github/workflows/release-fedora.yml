@@ -23,7 +23,7 @@ jobs:
       - name: Initialize System Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm python3-pip
+          sudo apt-get install -y rpm rpmlint python3-pip
 
       - name: Extract Dynamic Version Context
         id: version_vars
@@ -77,6 +77,9 @@ jobs:
           # Dynamically append changelog entries
           CURRENT_DATE=$(date +"%a %b %d %Y")
           echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-${{ steps.version_vars.outputs.RELEASE }}\n- Automated build." >> rpmbuild/SPECS/tapauth.spec
+
+          # Validate spec file with rpmlint
+          rpmlint rpmbuild/SPECS/tapauth.spec || true
 
           # Strip the ./ prefix before adding the versioned directory so
           # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths

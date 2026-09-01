@@ -190,6 +190,12 @@ cleanup() {
     if [ "$INSTALLED_POLKIT" = true ]; then
         sudo rm -f "$POLKIT_POLICY_DEST" 2>/dev/null || true
     fi
+    if [ "$INSTALLED_FPRINT_POLICY" = true ]; then
+        sudo rm -f "$FPRINT_POLICY_DEST" 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        fi
+    fi
     # systemd mode installed a real daemon on this host; put the machine back the
     # way we found it. Without this, `sudo ./scripts/test-e2e.sh` would leave a
     # debug binary plus an E2E drop-in (TAPAUTH_DEV_MODE=1 + UDP shim) enabled on
@@ -346,6 +352,16 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     if [ ! -f "$POLKIT_POLICY_DEST" ]; then
         install -Dm0644 "${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy" "$POLKIT_POLICY_DEST"
         INSTALLED_POLKIT=true
+    fi
+
+    # Install virtual fprintd D-Bus policy if not present
+    FPRINT_POLICY_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+    if [ ! -f "$FPRINT_POLICY_DEST" ]; then
+        install -Dm0644 "${PROJECT_ROOT}/packaging/net.reactivated.Fprint.tapauth.conf" "$FPRINT_POLICY_DEST"
+        INSTALLED_FPRINT_POLICY=true
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        fi
     fi
 
     # 3. Runtime/state/config directories exactly as packaging does
@@ -982,7 +998,7 @@ echo "╚═══════════════════════�
 
 if command -v dbus-send >/dev/null 2>&1; then
     echo "==> Enabling virtual fprintd bridge via admin IPC..."
-    "$CLI_BIN" set-transports --fprintd-bridge true || true
+    "$CLI_BIN" set-transports --fprintd-bridge true
 
     echo "==> Querying net.reactivated.Fprint.Manager.GetDefaultDevice..."
     if dbus-send --system --print-reply --dest=net.reactivated.Fprint /net/reactivated/Fprint/Manager net.reactivated.Fprint.Manager.GetDefaultDevice > "${TEST_DIR}/fprint_dev.log" 2>&1; then
@@ -991,14 +1007,32 @@ if command -v dbus-send >/dev/null 2>&1; then
         if [ -n "$DEV_PATH" ]; then
             echo "==> Querying ListEnrolledFingers on device $DEV_PATH..."
             if dbus-send --system --print-reply --dest=net.reactivated.Fprint "$DEV_PATH" net.reactivated.Fprint.Device.ListEnrolledFingers string:"$TEST_USER" > "${TEST_DIR}/fprint_fingers.log" 2>&1; then
-                if grep -q 'string "any"' "${TEST_DIR}/fprint_fingers.log"; then
-                    echo "✅ Virtual fprintd ListEnrolledFingers returned ['any'] for user '$TEST_USER'"
+                if grep -q 'string "right-index-finger"' "${TEST_DIR}/fprint_fingers.log"; then
+                    echo "✅ Virtual fprintd ListEnrolledFingers returned ['right-index-finger'] for user '$TEST_USER'"
+                else
+                    echo "❌ ERROR: ListEnrolledFingers did not return ['right-index-finger']:"
+                    cat "${TEST_DIR}/fprint_fingers.log"
+                    exit 1
                 fi
+            else
+                echo "❌ ERROR: Virtual fprintd ListEnrolledFingers call failed:"
+                cat "${TEST_DIR}/fprint_fingers.log"
+                exit 1
             fi
+        else
+            echo "❌ ERROR: Could not parse device path from GetDefaultDevice output:"
+            cat "${TEST_DIR}/fprint_dev.log"
+            exit 1
         fi
     else
-        echo "ℹ️  Virtual fprintd D-Bus call returned error (system bus permission or not running in test sandbox):"
-        cat "${TEST_DIR}/fprint_dev.log"
+        if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
+            echo "❌ ERROR: Virtual fprintd GetDefaultDevice call failed on system bus in systemd mode:"
+            cat "${TEST_DIR}/fprint_dev.log"
+            exit 1
+        else
+            echo "ℹ️  Virtual fprintd D-Bus call returned error (system bus permission or not running in test sandbox):"
+            cat "${TEST_DIR}/fprint_dev.log"
+        fi
     fi
 else
     echo "ℹ️  SKIPPED (dbus-send not found)."

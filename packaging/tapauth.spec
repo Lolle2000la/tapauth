@@ -47,6 +47,8 @@ Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
 Provides:       fprintd
+Obsoletes:      fprintd <= 1.94.5
+Recommends:     fprintd-pam
 
 %description fprintd
 Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
@@ -146,6 +148,15 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sys
 %post
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
+if [ ! -f %{_sysconfdir}/tapauth/config.toml ]; then
+    mkdir -p %{_sysconfdir}/tapauth
+    cat << 'EOF' > %{_sysconfdir}/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = false
+EOF
+    chmod 644 %{_sysconfdir}/tapauth/config.toml
+    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+fi
 %systemd_post tapauthd.service tapauthd.socket
 
 %preun
@@ -166,12 +177,20 @@ fi
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %post fprintd
-if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-    if grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
+if [ "$1" -eq 1 ]; then
+    mkdir -p %{_sysconfdir}/tapauth
+    if [ ! -f %{_sysconfdir}/tapauth/config.toml ]; then
+        cat << 'EOF' > %{_sysconfdir}/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = true
+EOF
+    elif grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
         sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
     else
         echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
     fi
+    chmod 644 %{_sysconfdir}/tapauth/config.toml
+    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 fi
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
@@ -184,6 +203,7 @@ systemctl try-restart tapauthd.service 2>/dev/null || true
 if [ $1 -eq 0 ]; then
     if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
         sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
     fi
     if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
         systemctl reload dbus 2>/dev/null || true
@@ -214,5 +234,6 @@ fi
 %endif
 
 %files fprintd
+%license LICENSE
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 %config(noreplace) %{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf

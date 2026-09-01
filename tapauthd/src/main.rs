@@ -171,30 +171,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrapped in RwLock so admin reloads are immediately visible to all consumers.
     let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
 
-    // Start the virtual fprintd D-Bus service if enabled (non-fatal: daemon functions without it)
-    let _fprintd_conn = if toml_config.enable_fprintd_bridge {
-        let auth_state = AuthState {
-            daemon: shared_daemon.clone(),
-        };
-        match fprintd::start_fprintd_service(auth_state).await {
-            Ok(conn) => {
-                tracing::info!("Virtual fprintd D-Bus service registered successfully");
-                Some(conn)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to register virtual fprintd D-Bus service: {}. \
-                     Desktop lockscreen integration via fingerprint will not be available. \
-                     This is often due to missing D-Bus system bus permissions \
-                     (/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf).",
-                    e
-                );
-                None
-            }
+    // Start the virtual fprintd D-Bus service (non-fatal: daemon functions without it).
+    // Always claiming the bus name when the D-Bus activation service is present ensures
+    // that desktop lock screens query without 25s activation timeouts; if disabled in config,
+    // queries return NoEnrolledPrints immediately.
+    let auth_state = AuthState {
+        daemon: shared_daemon.clone(),
+    };
+    let _fprintd_conn = match fprintd::start_fprintd_service(auth_state).await {
+        Ok(conn) => {
+            tracing::info!("Virtual fprintd D-Bus service registered successfully");
+            Some(conn)
         }
-    } else {
-        tracing::info!("Virtual fprintd D-Bus bridge disabled by configuration");
-        None
+        Err(e) => {
+            tracing::debug!(
+                "Virtual fprintd D-Bus service not registered: {} (normal if real fprintd is running or D-Bus system policy not installed)",
+                e
+            );
+            None
+        }
     };
 
     let server_state = Arc::new(ServerState {
@@ -481,6 +476,9 @@ async fn handle_pam_authenticate(
             req.username,
             elapsed_ms
         );
+        let mut reg = server_state.cancel_registry.lock().await;
+        reg.remove(&req.request_id);
+        drop(reg);
         return ipc::PamAuthenticateResponse {
             outcome: ipc::PamOutcome::Ignore as i32,
             detail: "Duplicate request - another authentication is in progress".to_string(),
@@ -514,10 +512,13 @@ async fn handle_pam_authenticate(
             }
         },
         Err(e) => {
-            tracing::error!("Failed to create auth session: {}", e);
+            let mut reg = server_state.cancel_registry.lock().await;
+            reg.remove(&req.request_id);
+            drop(reg);
+            tracing::error!("Failed to create authentication session: {}", e);
             ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Error as i32,
-                detail: format!("Internal error: {}", e),
+                detail: format!("Failed to create auth session: {}", e),
                 challenge: Vec::new(),
             }
         }

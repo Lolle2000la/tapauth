@@ -110,7 +110,6 @@ jobs:
           Architecture: all
           Depends: \${misc:Depends}, tapauth (>= \${source:Version}), dbus
           Conflicts: fprintd
-          Provides: fprintd
           Replaces: fprintd
           Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
            Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
@@ -162,9 +161,9 @@ jobs:
           	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
           	
           	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system-services
-          	mkdir -p debian/tapauth-fprintd/etc/dbus-1/system.d
+          	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system.d
           	cp packaging/net.reactivated.Fprint.service debian/tapauth-fprintd/usr/share/dbus-1/system-services/
-          	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth-fprintd/etc/dbus-1/system.d/
+          	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth-fprintd/usr/share/dbus-1/system.d/
 
           	if [ "\$(DISTRO_SERIES)" = "jammy" ]; then \
           		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
@@ -180,6 +179,15 @@ jobs:
           if [ "\$1" = "configure" ]; then
           	systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
           	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+          	mkdir -p /etc/tapauth
+          	if [ ! -f /etc/tapauth/config.toml ]; then
+          		cat << 'CFGEOF' > /etc/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = false
+CFGEOF
+          		chmod 644 /etc/tapauth/config.toml
+          		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+          	fi
           	if command -v pam-auth-update >/dev/null 2>&1; then
           		pam-auth-update --package
           	fi
@@ -207,17 +215,28 @@ jobs:
           #!/bin/sh
           set -e
           if [ "\$1" = "configure" ]; then
-          	if [ -f /etc/tapauth/config.toml ]; then
-          		if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+          	if [ -z "\$2" ]; then
+          		mkdir -p /etc/tapauth
+          		if [ ! -f /etc/tapauth/config.toml ]; then
+          			cat << 'CFGEOF' > /etc/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = true
+CFGEOF
+          		elif grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
           			sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
           		else
           			echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
           		fi
+          		chmod 644 /etc/tapauth/config.toml
+          		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
-          	if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+          	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+          		deb-systemd-invoke reload dbus || true
+          		deb-systemd-invoke try-restart tapauthd.service || true
+          	elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
           		systemctl reload dbus 2>/dev/null || true
+          		systemctl try-restart tapauthd.service 2>/dev/null || true
           	fi
-          	systemctl try-restart tapauthd.service 2>/dev/null || true
           fi
           #DEBHELPER#
           exit 0
@@ -229,11 +248,15 @@ jobs:
           if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
           	if [ -f /etc/tapauth/config.toml ]; then
           		sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+          		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
-          	if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+          	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+          		deb-systemd-invoke reload dbus || true
+          		deb-systemd-invoke try-restart tapauthd.service || true
+          	elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
           		systemctl reload dbus 2>/dev/null || true
+          		systemctl try-restart tapauthd.service 2>/dev/null || true
           	fi
-          	systemctl try-restart tapauthd.service 2>/dev/null || true
           fi
           #DEBHELPER#
           exit 0
