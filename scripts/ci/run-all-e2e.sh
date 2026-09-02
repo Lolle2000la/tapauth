@@ -19,7 +19,12 @@ echo " [0/3] Running JNI Crypto Instrumentation Tests"
 echo "=================================================="
 adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
 adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
-adb shell am instrument -w -r -e class dev.rourunisen.tapauth.crypto.TapAuthCryptoTest dev.rourunisen.tapauth.e2e.test/androidx.test.runner.AndroidJUnitRunner > /tmp/jni-test.log 2>&1
+RUNNER=$(adb shell pm list instrumentation | grep dev.rourunisen.tapauth | head -n1 | cut -d: -f2 | cut -d' ' -f1)
+if [ -z "$RUNNER" ]; then
+    RUNNER="dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner"
+fi
+echo "==> Using test runner: $RUNNER"
+adb shell am instrument -w -r -e class dev.rourunisen.tapauth.crypto.TapAuthCryptoTest "$RUNNER" > /tmp/jni-test.log 2>&1 || true
 cat /tmp/jni-test.log
 if grep -q "FAILURES!!!" /tmp/jni-test.log || ! grep -q "OK (" /tmp/jni-test.log; then
     echo "❌ JNI Crypto Tests Failed!"

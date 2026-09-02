@@ -140,6 +140,8 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "deb-pkg-v1"
 
       - name: Install Debian Packaging Prerequisites
         run: |
@@ -188,6 +190,7 @@ jobs:
             -v ~/.cache/target-fedora:/cache/target \
             fedora:latest \
             bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+          sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
 
       - name: Upload Fedora RPM Packages
         uses: actions/upload-artifact@v7
@@ -226,6 +229,7 @@ jobs:
             -v ~/.cache/target-arch:/cache/target \
             archlinux:base-devel \
             bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+          sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
 
       - name: Upload Arch Linux Packages
         uses: actions/upload-artifact@v7
