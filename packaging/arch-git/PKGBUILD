@@ -1,7 +1,7 @@
 # Maintainer: Lolle2000la
 pkgbase=tapauth-git
 pkgname=('tapauth-git' 'tapauth-fprintd-git')
-pkgver=0.4.0.r0.gc0223fc
+pkgver=0.10.0.r14.g1e0eb73
 pkgrel=1
 arch=('x86_64' 'aarch64')
 url="https://github.com/lolle2000la/tapauth"

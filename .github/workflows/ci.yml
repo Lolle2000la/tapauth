@@ -1,4 +1,4 @@
-name: CI - Rust
+name: CI - Rust & Packages
 
 on:
   push:
@@ -8,8 +8,13 @@ on:
       - 'tapauthd/**'
       - 'client-pam/**'
       - 'client-config-gui/**'
+      - 'server-android/**'
       - 'proto/**'
-      - 'scripts/ci/check-production-build.sh'
+      - 'packaging/**'
+      - 'systemd/**'
+      - 'scripts/**'
+      - 'install.sh'
+      - 'uninstall.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -20,8 +25,13 @@ on:
       - 'tapauthd/**'
       - 'client-pam/**'
       - 'client-config-gui/**'
+      - 'server-android/**'
       - 'proto/**'
-      - 'scripts/ci/check-production-build.sh'
+      - 'packaging/**'
+      - 'systemd/**'
+      - 'scripts/**'
+      - 'install.sh'
+      - 'uninstall.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -31,8 +41,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  build-and-test:
-    name: Build and Test All Modules
+  lint-and-format:
+    name: Code Quality & Format Checks
     runs-on: ubuntu-latest
 
     steps:
@@ -43,6 +53,58 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 17 for Spotless Check
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libpam0g-dev \
+            protobuf-compiler \
+            libgtk-4-dev \
+            build-essential
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: "Run clippy (dev sandbox, fallback-socket)"
+        run: cargo clippy -p tapauthd --features fallback-socket --all-targets -- -D warnings
+
+      - name: "Run clippy (E2E build, UDP loopback + PolKit bypass)"
+        run: cargo clippy -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --all-targets -- -D warnings
+
+      - name: "Run clippy (state-dir override only)"
+        run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
+
+      - name: Verify production binaries contain no dev/test overrides
+        run: ./scripts/ci/check-production-build.sh
+
+      - name: Check Kotlin formatting with Spotless
+        run: cd server-android && ./gradlew spotlessCheck
+
+  build-and-test:
+    name: Build and Test Workspace Modules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -82,9 +144,6 @@ jobs:
       - name: Build all workspace members
         run: cargo build --workspace --verbose
 
-      - name: Verify production binaries contain no dev/test overrides
-        run: ./scripts/ci/check-production-build.sh
-
       - name: Run tests for shared library
         run: cargo test --manifest-path shared/Cargo.toml --verbose
 
@@ -100,17 +159,27 @@ jobs:
       - name: Run all workspace tests
         run: cargo test --workspace --verbose
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+  distro-package-smoke-tests:
+    name: Package Smoke Test (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: "Fedora RPM"
+            image: "fedora:latest"
+            script: "/workspace/scripts/ci/test-fedora-rpm.sh"
+          - distro: "Arch Linux"
+            image: "archlinux:base-devel"
+            script: "/workspace/scripts/ci/test-arch-pkg.sh"
+          - distro: "Ubuntu Deb"
+            image: "ubuntu:noble"
+            script: "/workspace/scripts/ci/test-ubuntu-deb.sh"
 
-      - name: Run clippy (default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
 
-      - name: "Run clippy (dev sandbox, fallback-socket)"
-        run: cargo clippy -p tapauthd --features fallback-socket --all-targets -- -D warnings
-
-      - name: "Run clippy (E2E build, UDP loopback + PolKit bypass)"
-        run: cargo clippy -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --all-targets -- -D warnings
-
-      - name: "Run clippy (state-dir override only)"
-        run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
+      - name: Run ${{ matrix.distro }} Packaging Smoke Tests in Container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace:ro" ${{ matrix.image }} ${{ matrix.script }}

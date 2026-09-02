@@ -222,8 +222,8 @@ jobs:
           		mkdir -p /etc/tapauth
           		if [ ! -f /etc/tapauth/config.toml ]; then
           			printf "# TapAuth Configuration\nenable_fprintd_bridge = true\n" > /etc/tapauth/config.toml
-          		elif grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
-          			sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+          		elif grep -Eq '^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge' /etc/tapauth/config.toml; then
+          			sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
           		else
           			echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
           		fi
@@ -247,7 +247,7 @@ jobs:
           set -e
           if [ "\$1" = "remove" ] || [ "\$1" = "purge" ]; then
           	if [ -f /etc/tapauth/config.toml ]; then
-          		sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+          		sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
           		chmod 644 /etc/tapauth/config.toml
           		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
           	fi
@@ -315,13 +315,19 @@ jobs:
             if [ "${FIRST_UPLOAD_DONE}" = "1" ]; then
               sleep 90
             fi
+            UPLOAD_SUCCESS=0
             for ATTEMPT in 1 2 3; do
               if dput ppa:lolle2000la/tapauth ../tapauth_${DEB_VER}-1~ppa1~${SERIES}1_source.changes; then
                 echo "dput succeeded on attempt ${ATTEMPT}"
+                UPLOAD_SUCCESS=1
                 break
               fi
               echo "dput failed on attempt ${ATTEMPT} (exit $?), retrying..."
               sleep $((2 ** (3 + ATTEMPT)))
             done
+            if [ "${UPLOAD_SUCCESS}" -ne 1 ]; then
+              echo "::error:: dput failed for ${SERIES} after 3 attempts"
+              exit 1
+            fi
             FIRST_UPLOAD_DONE=1
           done

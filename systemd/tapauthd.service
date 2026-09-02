@@ -14,6 +14,7 @@ Sockets=tapauthd.socket
 ExecStart=/usr/bin/tapauthd
 Restart=on-failure
 StateDirectory=tapauth
+StateDirectoryMode=0700
 LogsDirectory=tapauth
 
 # Hardening (adjust as needed if daemon requires more access)

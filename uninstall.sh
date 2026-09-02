@@ -22,6 +22,7 @@ REMOVE_DAEMON=true
 # Only user data removal is configurable
 REMOVE_USER_DATA=false
 PRESERVE_SYSTEM_ACCOUNTS=false
+RESTORE_PAM_BACKUPS=false
 DRY_RUN=false
 
 # Installation paths (some will be detected at runtime)
@@ -124,6 +125,7 @@ OPTIONS:
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (non-interactive; does NOT remove user data)
     --purge, --remove-user-data Remove user data including pairing keys (use with caution)
+    --restore-pam-backups   Restore original PAM configurations from .tapauth-bak files
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
     --dry-run               Show what would be done without doing it
 
@@ -282,6 +284,10 @@ parse_args() {
                 ;;
             --purge|--remove-user-data)
                 REMOVE_USER_DATA=true
+                shift
+                ;;
+            --restore-pam-backups)
+                RESTORE_PAM_BACKUPS=true
                 shift
                 ;;
             --preserve-system-accounts)
@@ -537,9 +543,11 @@ remove_pam_config() {
         print_warning "Restoring these may revert security updates made after TapAuth was installed."
         
         local restore="false"
-        if [[ "$FORCE" == true ]]; then
-            restore="false"  # Even --force does not auto-restore PAM backups
-            print_info "Skipping PAM backup restoration (use --restore-pam-backups to force)."
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            restore="true"
+        elif [[ "$INTERACTIVE" == false ]]; then
+            restore="false"
+            print_info "Non-interactive mode: skipping PAM backup restoration (use --restore-pam-backups to restore)."
         else
             read -rp "Restore original PAM files from backups? [y/N] " confirm
             [[ "$confirm" =~ ^[Yy]$ ]] && restore="true"

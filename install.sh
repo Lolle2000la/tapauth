@@ -430,6 +430,10 @@ prompt_pam_configuration() {
         echo "individual services (login, sudo, polkit) separately."
         echo ""
         print_warning "Note: Lock screens often need separate configuration (see below)"
+        if [[ "$has_kde" == true || "$has_gdm" == true ]]; then
+            print_info "Keyring notice: Entering your password at initial login unlocks your desktop"
+            print_info "keyring (gnome-keyring / kwallet). TapAuth unlocks your screen after lock."
+        fi
         echo ""
         read -p "Configure TapAuth for system-auth? [Y/n]: " response
         if [[ ! "$response" =~ ^[Nn]$ ]]; then
@@ -1445,7 +1449,7 @@ configure_pam() {
         if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
             insert_pam_decisive "/etc/pam.d/gdm-fingerprint"
             print_success "Configured PAM for GDM fingerprint (gdm-fingerprint)"
-        else
+        elif [[ -f /etc/pam.d/gdm-password || -f /etc/pam.d/gdm || -d /etc/gdm || -d /etc/gdm3 ]]; then
             print_info "Creating /etc/pam.d/gdm-fingerprint for dual-stack GNOME lock screen..."
             local includes
             includes=$(get_pam_distro_includes)
@@ -1497,7 +1501,7 @@ EOF
         if [[ -f /etc/pam.d/kde-fingerprint ]]; then
             insert_pam_decisive "/etc/pam.d/kde-fingerprint"
             print_success "Configured PAM for KDE fingerprint (kde-fingerprint)"
-        else
+        elif [[ -f /etc/pam.d/kscreenlocker || -f /etc/pam.d/kde || -f /etc/pam.d/plasma || -d /usr/share/plasma || -d /usr/share/kde4 ]]; then
             print_info "Creating /etc/pam.d/kde-fingerprint for dual-stack lock screen..."
             local includes
             includes=$(get_pam_distro_includes)

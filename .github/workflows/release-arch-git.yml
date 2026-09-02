@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout Source Context
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Synchronize and Push Metadata Changes to AUR (tapauth-git)
         run: |
@@ -40,6 +42,16 @@ jobs:
           cp packaging/arch-git/PKGBUILD aur-repo/PKGBUILD
           cp packaging/arch-git/tapauth-git.install aur-repo/tapauth-git.install
           cp packaging/arch-git/tapauth-fprintd-git.install aur-repo/tapauth-fprintd-git.install
+
+          # Dynamically compute git pkgver matching PKGBUILD pkgver()
+          GIT_DESC=$(git describe --long --tags 2>/dev/null || echo "")
+          if [ -n "$GIT_DESC" ]; then
+            NEW_PKGVER=$(echo "$GIT_DESC" | sed -E 's/^v//;s/-([0-9]+)-g([0-9a-f]+)$/.r\1.g\2/;s/-/_/g')
+          else
+            BASE_TAG=$(git tag --sort=-version:refname 2>/dev/null | grep -E '^v[0-9]' | head -1 | sed 's/^v//' || echo "0.1.0")
+            NEW_PKGVER="${BASE_TAG:-0.1.0}.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+          fi
+          sed -i "s/^pkgver=.*/pkgver=${NEW_PKGVER}/" aur-repo/PKGBUILD
 
           # Regenerate .SRCINFO via makepkg (must run as non-root)
           docker run --rm -v "$(pwd)/aur-repo:/pkg" archlinux:base-devel \

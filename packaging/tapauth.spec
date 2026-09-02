@@ -188,13 +188,13 @@ echo "For lock screen integration, ensure /etc/pam.d/kde-fingerprint or"
 echo "gdm-fingerprint contains: auth [success=done default=bad] /usr/lib/security/pam_tapauth.so"
 if [ "$1" -eq 1 ]; then
     if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-        if grep -q "enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
-            sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
+        if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
+            sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
         else
             echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
         fi
         chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-        chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
     fi
 fi
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
@@ -207,9 +207,9 @@ systemctl try-restart tapauthd.service 2>/dev/null || true
 %postun fprintd
 if [ $1 -eq 0 ]; then
     if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
         chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-        chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+        chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
     fi
     if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
         systemctl reload dbus 2>/dev/null || true
