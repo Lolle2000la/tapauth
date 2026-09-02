@@ -23,11 +23,11 @@ build() {
   export CARGO_PROFILE_RELEASE_STRIP=true
   if [ -d /cache/target ]; then
     mkdir -p target
-    cp -al /cache/target/* target/ 2>/dev/null || cp -r /cache/target/* target/ 2>/dev/null || true
+    cp -al /cache/target/. target/ 2>/dev/null || cp -r /cache/target/. target/ 2>/dev/null || true
   fi
   cargo build --frozen --workspace --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
   if [ -d /cache/target ]; then
-    cp -al target/* /cache/target/ 2>/dev/null || cp -r target/* /cache/target/ 2>/dev/null || true
+    cp -al target/. /cache/target/ 2>/dev/null || cp -r target/. /cache/target/ 2>/dev/null || true
   fi
 }
 
