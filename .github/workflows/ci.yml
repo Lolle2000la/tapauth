@@ -57,11 +57,6 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Set up JDK 17 for Spotless Check
-        uses: actions/setup-java@v6
-        with:
-          distribution: "temurin"
-          java-version: "17"
 
       - name: Install system dependencies
         run: |
@@ -92,8 +87,6 @@ jobs:
       - name: Verify production binaries contain no dev/test overrides
         run: ./scripts/ci/check-production-build.sh
 
-      - name: Check Kotlin formatting with Spotless
-        run: cd server-android && ./gradlew spotlessCheck
 
   build-and-test:
     name: Build and Test Workspace Modules

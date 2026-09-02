@@ -117,19 +117,24 @@ jobs:
           python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
             || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
 
-      - name: Build Host Linux Binaries (tapauthd, client-pam, tapauth-ipc-cli)
+      - name: Install Debian Packaging Prerequisites
         run: |
-          # Build used by the E2E: systemd socket activation (fallback-socket OFF)
-          # and NO dev-state-override, so every state/config/socket path is the real
-          # production one. Only two dev knobs are compiled in, both still requiring
-          # TAPAUTH_DEV_MODE at runtime:
-          #   dev-udp-loopback   - the emulator UDP delivery shim (a hosted runner
-          #                        has no LAN broadcast path into the emulator)
-          #   dev-polkit-bypass  - lets the root test harness administer the daemon
-          #                        without an authentication agent; PolKit is still
-          #                        enforced for non-root callers (asserted by Phase 7)
-          cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
-          cargo build -p client-pam
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config dpkg-dev polkitd dbus
+
+      - name: Build and Install TapAuth Debian Packages on Host
+        run: |
+          # Build real Debian packages (.deb) with emulator test features (dev-udp-loopback, dev-polkit-bypass)
+          ./scripts/ci/build-debian-packages.sh --features "tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass"
+          # Install generated packages on the runner via apt
+          sudo apt-get install -y /tmp/deb-build/tapauth_*.deb /tmp/deb-build/tapauth-fprintd_*.deb
+          # Verify package-installed files, user/group creation, and systemd units
+          dpkg -l tapauth tapauth-fprintd
+          id tapauthd
+          getent group tapauthd-clients
+          systemctl is-enabled tapauthd.socket
+          ls -la /lib/x86_64-linux-gnu/security/pam_tapauth.so /usr/bin/tapauthd /usr/bin/tapauth-ipc-cli
 
       - name: Free disk space for emulator
         run: |
@@ -179,7 +184,13 @@ jobs:
           script: |
             # Run JNI crypto instrumentation tests (on device/emulator). Note: Full E2E pairing & auth flow is executed below via test-e2e.sh.
             (cd server-android && ./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
-            sudo -E env "PATH=$PATH" ./scripts/test-e2e.sh
+            sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
+
+      - name: Verify Package Removal and Purge
+        if: always()
+        run: |
+          sudo apt-get purge -y tapauth-fprintd tapauth || true
+          test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
 
       - name: Upload test results
         uses: actions/upload-artifact@v7

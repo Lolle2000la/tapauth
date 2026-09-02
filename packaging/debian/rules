@@ -1,0 +1,44 @@
+#!/usr/bin/make -f
+
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+CARGO_FEATURES ?=
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --workspace --release --locked $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES))
+
+override_dh_auto_install:
+	mkdir -p debian/tapauth/usr/bin
+	mkdir -p debian/tapauth/lib/$(DEB_HOST_MULTIARCH)/security
+	mkdir -p debian/tapauth/lib/systemd/system
+	mkdir -p debian/tapauth/usr/lib/sysusers.d
+	mkdir -p debian/tapauth/usr/lib/tmpfiles.d
+	mkdir -p debian/tapauth/usr/share/pam-configs
+	mkdir -p debian/tapauth/usr/share/applications
+	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
+	mkdir -p debian/tapauth/usr/share/polkit-1/actions
+	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
+	mkdir -p debian/tapauth/etc/tapauth
+	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
+	cp target/release/tapauthd debian/tapauth/usr/bin/
+	cp target/release/tapauth-config debian/tapauth/usr/bin/
+	cp target/release/tapauth-ipc-cli debian/tapauth/usr/bin/
+	cp target/release/libclient_pam.so debian/tapauth/lib/$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
+	cp systemd/tapauthd.service debian/tapauth/lib/systemd/system/
+	cp systemd/tapauthd.socket debian/tapauth/lib/systemd/system/
+	cp packaging/sysusers.conf debian/tapauth/usr/lib/sysusers.d/tapauth.conf
+	cp packaging/tmpfiles.conf debian/tapauth/usr/lib/tmpfiles.d/tapauth.conf
+	cp packaging/debian.pam-config debian/tapauth/usr/share/pam-configs/tapauth
+	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
+	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
+	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
+	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+	
+	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system-services
+	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system.d
+	cp packaging/net.reactivated.Fprint.service debian/tapauth-fprintd/usr/share/dbus-1/system-services/
+	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth-fprintd/usr/share/dbus-1/system.d/

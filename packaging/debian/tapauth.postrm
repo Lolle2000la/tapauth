@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+	if command -v pam-auth-update >/dev/null 2>&1; then
+		pam-auth-update --package
+	fi
+fi
+if [ "$1" = "purge" ]; then
+	rm -rf /etc/tapauth /var/lib/tapauth /run/tapauthd || true
+	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf 2>/dev/null || true
+fi
+#DEBHELPER#
+exit 0

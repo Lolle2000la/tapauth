@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+	if [ -z "$2" ]; then
+		mkdir -p /etc/tapauth
+		if [ ! -f /etc/tapauth/config.toml ]; then
+			printf "# TapAuth Configuration\nenable_fprintd_bridge = true\n" > /etc/tapauth/config.toml
+		elif grep -Eq '^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge' /etc/tapauth/config.toml; then
+			sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+		else
+			echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+		fi
+		chmod 644 /etc/tapauth/config.toml
+		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+	fi
+	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+		deb-systemd-invoke reload dbus || true
+		deb-systemd-invoke try-restart tapauthd.service || true
+	elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+		systemctl reload dbus 2>/dev/null || true
+		systemctl try-restart tapauthd.service 2>/dev/null || true
+	fi
+fi
+#DEBHELPER#
+exit 0

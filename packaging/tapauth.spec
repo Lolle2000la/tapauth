@@ -32,18 +32,17 @@ Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 Requires:       pam
-Requires:       dbus-libs
-Requires:       systemd-libs
 Requires:       polkit
 Recommends:     firewalld
 Suggests:       iptables
 
 %description
-A modern, privacy-preserving local-first authentication system using Rust PAM modules,
-systemd system daemons, and low-level communication links.
+A modern, privacy-preserving local-first authentication system using Rust
+PAM modules, systemd system daemons, and low-level communication links.
 
 %package fprintd
 Summary:        Virtual fprintd D-Bus bridge for TapAuth lock screen integration
+BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
@@ -79,6 +78,7 @@ mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 # Binaries & Shared Objects
 install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
 install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
+install -m 0755 target/release/tapauth-ipc-cli %{buildroot}%{_bindir}/tapauth-ipc-cli
 install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 # Default Configuration
@@ -86,7 +86,7 @@ cat << 'EOF' > %{buildroot}%{_sysconfdir}/tapauth/config.toml
 # TapAuth System Configuration
 enable_fprintd_bridge = false
 EOF
-chmod 0600 %{buildroot}%{_sysconfdir}/tapauth/config.toml
+chmod 0644 %{buildroot}%{_sysconfdir}/tapauth/config.toml
 
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation
@@ -160,8 +160,8 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sys
 %sysusers_create_compat %{_sysusersdir}/tapauth.conf
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
 chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
-chmod 0700 %{_sysconfdir}/tapauth 2>/dev/null || true
-chmod 0600 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
+chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 %systemd_post tapauthd.service tapauthd.socket
 
 %preun
@@ -223,6 +223,7 @@ fi
 %config(noreplace) %attr(0644, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
+%{_bindir}/tapauth-ipc-cli
 %{_libdir}/security/pam_tapauth.so
 %{_unitdir}/tapauthd.service
 %{_unitdir}/tapauthd.socket
@@ -245,3 +246,7 @@ fi
 %license LICENSE
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 %config(noreplace) %{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+%changelog
+* Wed Sep 02 2026 Luca Auer <lolle2000.la+tapauth@gmail.com> - 0.1.0-1
+- Release 0.1.0

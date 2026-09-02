@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+	systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+	mkdir -p /etc/tapauth
+	if [ ! -f /etc/tapauth/config.toml ]; then
+		printf "# TapAuth Configuration\nenable_fprintd_bridge = false\n" > /etc/tapauth/config.toml
+		chmod 644 /etc/tapauth/config.toml
+		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+	fi
+	if command -v pam-auth-update >/dev/null 2>&1; then
+		pam-auth-update --package
+	fi
+	echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
+	echo "         add your user to the tapauthd-clients group:"
+	echo "         sudo usermod -aG tapauthd-clients \$USER"
+	echo "         Then log out and log back in for the change to take effect."
+fi
+#DEBHELPER#
+exit 0

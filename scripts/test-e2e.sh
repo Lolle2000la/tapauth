@@ -216,7 +216,7 @@ cleanup() {
         if [ "$E2E_OWNED_STATE" = true ]; then
             find /var/lib/tapauth -mindepth 1 -delete 2>/dev/null || true
         fi
-        if [ "$UNITS_PREEXISTED" = true ] || [ "$BINARY_PREEXISTED" = true ]; then
+        if [ "$USE_INSTALLED_PACKAGE" != "1" ] && { [ "$UNITS_PREEXISTED" = true ] || [ "$BINARY_PREEXISTED" = true ]; }; then
             echo "⚠️  WARNING: this run replaced pre-existing TapAuth units/binaries with"
             echo "   the E2E debug build and left them in place. Reinstall (e.g."
             echo "   ./install.sh or your distro package) before using TapAuth again."
@@ -276,110 +276,176 @@ wait_pid_with_timeout() {
 POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
 INSTALLED_POLKIT=false
 
-# Step 1: Build necessary Linux binaries
-echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
-# Pin the cargo target directory so the artifact paths below are deterministic
-# regardless of any user-level CARGO_TARGET_DIR override (~/.cargo/config.toml).
-export CARGO_TARGET_DIR="${PROJECT_ROOT}/target"
-if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
-    # Production-style build: systemd socket activation (fallback-socket OFF) and
-    # no dev-state-override, so state/config/socket paths are production. Only the
-    # emulator UDP shim and the headless PolKit bypass are compiled in, both still
-    # requiring TAPAUTH_DEV_MODE at runtime.
-    cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
-    cargo build -p client-pam
-else
-    cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
-    cargo build -p client-pam --features dev-socket-override
-fi
+USE_INSTALLED_PACKAGE="${TAPAUTH_E2E_USE_INSTALLED_PACKAGE:-0}"
 
-TAPAUTHD_BIN="${PROJECT_ROOT}/target/debug/tapauthd"
-CLI_BIN="${PROJECT_ROOT}/target/debug/tapauth-ipc-cli"
-PAM_LIB="${PROJECT_ROOT}/target/debug/libclient_pam.so"
+# Step 1: Build necessary Linux binaries or resolve installed packages
+if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
+    echo "==> Step 1: Using pre-installed distro packages for E2E tests..."
+    TAPAUTHD_BIN="/usr/bin/tapauthd"
+    CLI_BIN="$(command -v tapauth-ipc-cli || true)"
+    if [ -z "$CLI_BIN" ] && [ -x /usr/bin/tapauth-ipc-cli ]; then
+        CLI_BIN="/usr/bin/tapauth-ipc-cli"
+    elif [ -z "$CLI_BIN" ] && [ -x /usr/local/bin/tapauth-ipc-cli ]; then
+        CLI_BIN="/usr/local/bin/tapauth-ipc-cli"
+    fi
+
+    PAM_LIB=""
+    for candidate in \
+        "/lib/x86_64-linux-gnu/security/pam_tapauth.so" \
+        "/usr/lib/security/pam_tapauth.so" \
+        "/lib/security/pam_tapauth.so" \
+        "/usr/lib64/security/pam_tapauth.so"; do
+        if [ -f "$candidate" ]; then
+            PAM_LIB="$candidate"
+            break
+        fi
+    done
+    if [ -z "$PAM_LIB" ]; then
+        PAM_LIB="pam_tapauth.so"
+    fi
+
+    if [ ! -x "$TAPAUTHD_BIN" ]; then
+        echo "❌ ERROR: tapauthd binary not found at $TAPAUTHD_BIN"
+        exit 1
+    fi
+    if [ ! -x "$CLI_BIN" ]; then
+        echo "❌ ERROR: tapauth-ipc-cli binary not found"
+        exit 1
+    fi
+    echo "    Found installed tapauthd:       $TAPAUTHD_BIN"
+    echo "    Found installed tapauth-ipc-cli: $CLI_BIN"
+    echo "    Found installed pam_tapauth.so:  $PAM_LIB"
+else
+    echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
+    # Pin the cargo target directory so the artifact paths below are deterministic
+    # regardless of any user-level CARGO_TARGET_DIR override (~/.cargo/config.toml).
+    export CARGO_TARGET_DIR="${PROJECT_ROOT}/target"
+    if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
+        # Production-style build: systemd socket activation (fallback-socket OFF) and
+        # no dev-state-override, so state/config/socket paths are production. Only the
+        # emulator UDP shim and the headless PolKit bypass are compiled in, both still
+        # requiring TAPAUTH_DEV_MODE at runtime.
+        cargo build -p tapauthd --no-default-features --features ble,dev-udp-loopback,dev-polkit-bypass --bin tapauthd --bin tapauth-ipc-cli
+        cargo build -p client-pam
+    else
+        cargo build -p tapauthd --features fallback-socket,ble --bin tapauthd --bin tapauth-ipc-cli
+        cargo build -p client-pam --features dev-socket-override
+    fi
+
+    TAPAUTHD_BIN="${PROJECT_ROOT}/target/debug/tapauthd"
+    CLI_BIN="${PROJECT_ROOT}/target/debug/tapauth-ipc-cli"
+    PAM_LIB="${PROJECT_ROOT}/target/debug/libclient_pam.so"
+fi
 
 # ── systemd-mode environment setup ────────────────────────────────────────────
 if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     echo ""
-    echo "==> Step 1b: Installing production systemd environment (units, users, config)..."
+    echo "==> Step 1b: Setting up production systemd environment (units, users, config)..."
 
-    # This mode installs over a REAL system installation (/usr/bin/tapauthd, the
-    # systemd units, /etc/tapauth, /var/lib/tapauth). On CI the runner is
-    # disposable; on a developer workstation that is someone's live pairing state,
-    # so refuse unless the caller opts in explicitly.
-    PREEXISTING=""
-    if [ -x /usr/bin/tapauthd ]; then
-        PREEXISTING="/usr/bin/tapauthd"
-    fi
-    if [ -n "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
-        PREEXISTING="${PREEXISTING:+$PREEXISTING, }/var/lib/tapauth (non-empty)"
-    fi
-    if [ -n "$PREEXISTING" ] && [ "${TAPAUTH_E2E_ALLOW_DESTRUCTIVE:-0}" != "1" ]; then
-        echo "❌ ERROR: systemd mode would overwrite an existing TapAuth installation: $PREEXISTING"
-        echo "   Run as root inside a disposable VM/container, or set"
-        echo "   TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 to accept that pairing state and"
-        echo "   binaries under /var/lib/tapauth, /etc/tapauth and /usr/bin are replaced."
-        exit 1
-    fi
-    # We only remove state/config files that we know were absent before this run.
-    E2E_OWNED_STATE=false
-    if [ ! -d /var/lib/tapauth ] || [ -z "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
-        E2E_OWNED_STATE=true
-    fi
-    CREATED_CONFIG=false
-    # Same for the units and binaries: with TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 on a
-    # host that already has TapAuth installed, overwrite them for the duration of
-    # the run but never delete the pre-existing files afterwards.
-    UNITS_PREEXISTED=false
-    if [ -e /etc/systemd/system/tapauthd.service ] || [ -e /etc/systemd/system/tapauthd.socket ]; then
+    if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
+        echo "    Verifying pre-installed package systemd environment..."
         UNITS_PREEXISTED=true
-    fi
-    BINARY_PREEXISTED=false
-    if [ -e /usr/bin/tapauthd ] || [ -e /usr/local/bin/tapauth-ipc-cli ]; then
         BINARY_PREEXISTED=true
-    fi
+        E2E_OWNED_STATE=false
+        CREATED_CONFIG=false
 
-    # 1. System users/groups exactly as install.sh creates them
-    "$PROJECT_ROOT/create-dev-users.sh"
+        id tapauthd >/dev/null 2>&1 || "$PROJECT_ROOT/create-dev-users.sh"
+        systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf" 2>/dev/null || true
 
-    # 2. Install binaries + units + PolKit policy as the packages would
-    install -Dm0755 "$TAPAUTHD_BIN" /usr/bin/tapauthd
-    install -Dm0755 "$CLI_BIN" /usr/local/bin/tapauth-ipc-cli
-    install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.service" /etc/systemd/system/tapauthd.service
-    install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.socket" /etc/systemd/system/tapauthd.socket
-    # Only register the policy if it is not already installed: cleanup() deletes
-    # what it registered, and removing a pre-existing production policy would
-    # break the host's real installation.
-    if [ ! -f "$POLKIT_POLICY_DEST" ]; then
-        install -Dm0644 "${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy" "$POLKIT_POLICY_DEST"
-        INSTALLED_POLKIT=true
-    fi
-
-    # Install virtual fprintd D-Bus policy if not present
-    FPRINT_POLICY_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
-    if [ ! -f "$FPRINT_POLICY_DEST" ]; then
-        install -Dm0644 "${PROJECT_ROOT}/packaging/net.reactivated.Fprint.tapauth.conf" "$FPRINT_POLICY_DEST"
-        INSTALLED_FPRINT_POLICY=true
-        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
-            systemctl reload dbus 2>/dev/null || true
+        mkdir -p /etc/tapauth
+        chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+        chmod 755 /etc/tapauth 2>/dev/null || true
+        if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
+            CREATED_CONFIG=true
+            cat > "$CONFIG_ASSERT_FILE" <<EOF
+# TapAuth Configuration (created by the E2E suite)
+pam_operation_timeout_secs = 120
+udp_port = ${UDP_PORT}
+use_tpm = false
+enable_fprintd_bridge = true
+EOF
+            chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+            chmod 644 "$CONFIG_ASSERT_FILE" 2>/dev/null || true
         fi
-    fi
+    else
+        # This mode installs over a REAL system installation (/usr/bin/tapauthd, the
+        # systemd units, /etc/tapauth, /var/lib/tapauth). On CI the runner is
+        # disposable; on a developer workstation that is someone's live pairing state,
+        # so refuse unless the caller opts in explicitly.
+        PREEXISTING=""
+        if [ -x /usr/bin/tapauthd ]; then
+            PREEXISTING="/usr/bin/tapauthd"
+        fi
+        if [ -n "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
+            PREEXISTING="${PREEXISTING:+$PREEXISTING, }/var/lib/tapauth (non-empty)"
+        fi
+        if [ -n "$PREEXISTING" ] && [ "${TAPAUTH_E2E_ALLOW_DESTRUCTIVE:-0}" != "1" ]; then
+            echo "❌ ERROR: systemd mode would overwrite an existing TapAuth installation: $PREEXISTING"
+            echo "   Run as root inside a disposable VM/container, or set"
+            echo "   TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 to accept that pairing state and"
+            echo "   binaries under /var/lib/tapauth, /etc/tapauth and /usr/bin are replaced."
+            exit 1
+        fi
+        # We only remove state/config files that we know were absent before this run.
+        E2E_OWNED_STATE=false
+        if [ ! -d /var/lib/tapauth ] || [ -z "$(find /var/lib/tapauth -maxdepth 1 -type f 2>/dev/null | head -1)" ]; then
+            E2E_OWNED_STATE=true
+        fi
+        CREATED_CONFIG=false
+        # Same for the units and binaries: with TAPAUTH_E2E_ALLOW_DESTRUCTIVE=1 on a
+        # host that already has TapAuth installed, overwrite them for the duration of
+        # the run but never delete the pre-existing files afterwards.
+        UNITS_PREEXISTED=false
+        if [ -e /etc/systemd/system/tapauthd.service ] || [ -e /etc/systemd/system/tapauthd.socket ]; then
+            UNITS_PREEXISTED=true
+        fi
+        BINARY_PREEXISTED=false
+        if [ -e /usr/bin/tapauthd ] || [ -e /usr/local/bin/tapauth-ipc-cli ]; then
+            BINARY_PREEXISTED=true
+        fi
 
-    # 3. Runtime/state/config directories exactly as packaging does
-    systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
-    # /etc/tapauth is created+owned by install.sh in production (daemon = single writer)
-    mkdir -p /etc/tapauth
-    chown tapauthd:tapauthd /etc/tapauth
-    chmod 700 /etc/tapauth
-    if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
-        CREATED_CONFIG=true
-        cat > "$CONFIG_ASSERT_FILE" <<EOF
+        # 1. System users/groups exactly as install.sh creates them
+        "$PROJECT_ROOT/create-dev-users.sh"
+
+        # 2. Install binaries + units + PolKit policy as the packages would
+        install -Dm0755 "$TAPAUTHD_BIN" /usr/bin/tapauthd
+        install -Dm0755 "$CLI_BIN" /usr/local/bin/tapauth-ipc-cli
+        install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.service" /etc/systemd/system/tapauthd.service
+        install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.socket" /etc/systemd/system/tapauthd.socket
+        # Only register the policy if it is not already installed: cleanup() deletes
+        # what it registered, and removing a pre-existing production policy would
+        # break the host's real installation.
+        if [ ! -f "$POLKIT_POLICY_DEST" ]; then
+            install -Dm0644 "${PROJECT_ROOT}/tapauthd/dev.rourunisen.tapauth.config.admin.policy" "$POLKIT_POLICY_DEST"
+            INSTALLED_POLKIT=true
+        fi
+
+        # Install virtual fprintd D-Bus policy if not present
+        FPRINT_POLICY_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+        if [ ! -f "$FPRINT_POLICY_DEST" ]; then
+            install -Dm0644 "${PROJECT_ROOT}/packaging/net.reactivated.Fprint.tapauth.conf" "$FPRINT_POLICY_DEST"
+            INSTALLED_FPRINT_POLICY=true
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+                systemctl reload dbus 2>/dev/null || true
+            fi
+        fi
+
+        # 3. Runtime/state/config directories exactly as packaging does
+        systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
+        mkdir -p /etc/tapauth
+        chown tapauthd:tapauthd /etc/tapauth
+        chmod 755 /etc/tapauth
+        if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
+            CREATED_CONFIG=true
+            cat > "$CONFIG_ASSERT_FILE" <<EOF
 # TapAuth Configuration (created by the E2E suite, mirrors install.sh)
 pam_operation_timeout_secs = 120
 udp_port = ${UDP_PORT}
 use_tpm = false
 EOF
-        chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE"
-        chmod 644 "$CONFIG_ASSERT_FILE"
+            chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE"
+            chmod 644 "$CONFIG_ASSERT_FILE"
+        fi
     fi
 
     # 4. E2E-only unit override. These are the ONLY non-production knobs: the

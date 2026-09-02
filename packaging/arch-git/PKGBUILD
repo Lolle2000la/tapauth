@@ -55,6 +55,7 @@ package_tapauth-git() {
   install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
+  install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"
   install -Dm0755 target/release/libclient_pam.so "${pkgdir}/usr/lib/security/pam_tapauth.so"
 
   install -Dm0644 systemd/tapauthd.service "${pkgdir}/usr/lib/systemd/system/tapauthd.service"
