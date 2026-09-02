@@ -43,7 +43,7 @@ sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
-docker run --rm --privileged --net=host \
+docker run --rm --privileged --net=host --pid=host \
   -v /dev:/dev \
   -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
@@ -54,7 +54,7 @@ docker run --rm --privileged --net=host \
 echo "=================================================="
 echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
-docker run --rm --privileged --net=host \
+docker run --rm --privileged --net=host --pid=host \
   -v /dev:/dev \
   -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
