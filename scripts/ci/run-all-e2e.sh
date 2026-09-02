@@ -6,11 +6,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_DIR"
 
-# 1. Run JNI crypto instrumentation tests (on device/emulator)
+export E2E_KEEP_BLE_BRIDGE=1
+trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi' EXIT
+
+# Ensure host virtual BLE bridge is up
+echo "==> Starting Virtual BLE Bridge on host..."
+"$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
+
+# 1. Run JNI crypto instrumentation tests directly on emulator via ADB
 echo "=================================================="
 echo " [0/3] Running JNI Crypto Instrumentation Tests"
 echo "=================================================="
-(cd server-android && ./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
+adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
+adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
+adb shell am instrument -w -r -e class dev.rourunisen.tapauth.crypto.TapAuthCryptoTest dev.rourunisen.tapauth.e2e.test/androidx.test.runner.AndroidJUnitRunner > /tmp/jni-test.log 2>&1
+cat /tmp/jni-test.log
+if grep -q "FAILURES!!!" /tmp/jni-test.log || ! grep -q "OK (" /tmp/jni-test.log; then
+    echo "❌ JNI Crypto Tests Failed!"
+    exit 1
+fi
+echo "✅ JNI Crypto Instrumentation Tests Passed!"
 
 # 2. Run E2E against installed Ubuntu (.deb) package on host
 echo "=================================================="
@@ -25,6 +40,7 @@ echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
 docker run --rm --privileged --net=host \
   -v /dev:/dev \
+  -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
   -v "$WORKSPACE_DIR":/workspace \
   fedora:latest /workspace/scripts/ci/run-container-e2e.sh fedora /workspace/pkg-fedora
@@ -35,6 +51,7 @@ echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
 docker run --rm --privileged --net=host \
   -v /dev:/dev \
+  -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
   -v "$WORKSPACE_DIR":/workspace \
   archlinux:base-devel /workspace/scripts/ci/run-container-e2e.sh arch /workspace/pkg-arch

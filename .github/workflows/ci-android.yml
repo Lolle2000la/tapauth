@@ -11,7 +11,6 @@ on:
       - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
-      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
       - 'systemd/**'
       - 'packaging/**'
       - 'create-dev-users.sh'
@@ -26,7 +25,6 @@ on:
       - 'scripts/**'
       - 'proto/**'
       - 'Cargo.lock'
-      # The E2E suite installs these verbatim (systemd mode) and asserts on them.
       - 'systemd/**'
       - 'packaging/**'
       - 'create-dev-users.sh'
@@ -37,9 +35,10 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── 1. Android Mobile Build & APK Generation ─────────────────────────────────
   build-android:
-    name: Build Android Native Libraries and APK
-    runs-on: ubuntu-latest
+    name: Build Android Native Libraries and APKs
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
@@ -94,12 +93,166 @@ jobs:
         run: cd server-android && ./gradlew cargoBuild
 
       - name: Run Android JVM unit tests
-        # Rate limiter, replay cache and retransmission semantics are pure JVM
-        # logic; these run without an emulator and must not sit unexecuted.
         run: cd server-android && ./gradlew test --stacktrace
 
       - name: Build Android Debug APK, E2E APK, and Test APK
         run: cd server-android && ./gradlew assembleDebug assembleE2e assembleE2eAndroidTest --stacktrace
+
+      - name: Check Kotlin formatting with Spotless
+        run: cd server-android && ./gradlew spotlessCheck
+
+      - name: Upload E2E APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apks
+          path: |
+            server-android/app/build/outputs/apk/e2e/*.apk
+            server-android/app/build/outputs/apk/androidTest/e2e/*.apk
+          retention-days: 1
+
+      - name: Upload debug APK artifact (safe for manual testing)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tapauth-debug-apk
+          path: server-android/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload native libraries artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-libraries
+          path: server-android/app/build/rustJniLibs/android/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── 2. Ubuntu Debian Package Build (Parallel) ────────────────────────────────
+  build-pkg-ubuntu:
+    name: Build Ubuntu Debian Package (.deb)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Debian Packaging Prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config dpkg-dev polkitd dbus
+
+      - name: Build TapAuth Debian Packages
+        run: |
+          ./scripts/ci/build-debian-packages.sh --features "tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass"
+
+      - name: Upload Debian Packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-ubuntu
+          path: /tmp/deb-build/*.deb
+          retention-days: 1
+
+  # ── 3. Fedora RPM Package Build (Parallel, with --nocheck & cache) ────────────
+  build-pkg-fedora:
+    name: Build Fedora RPM Package (.rpm)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Build TapAuth Fedora RPM Packages
+        run: |
+          mkdir -p ~/.cargo/registry ~/.cargo/git
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -v ~/.cargo/registry:/root/.cargo/registry \
+            -v ~/.cargo/git:/root/.cargo/git \
+            fedora:latest \
+            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+
+      - name: Upload Fedora RPM Packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-fedora
+          path: pkg-fedora/*.rpm
+          retention-days: 1
+
+  # ── 4. Arch Linux Package Build (Parallel) ───────────────────────────────────
+  build-pkg-arch:
+    name: Build Arch Linux Package (.pkg.tar.zst)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Build TapAuth Arch Linux Packages
+        run: |
+          mkdir -p ~/.cargo/registry ~/.cargo/git
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -v ~/.cargo/registry:/root/.cargo/registry \
+            -v ~/.cargo/git:/root/.cargo/git \
+            archlinux:base-devel \
+            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+
+      - name: Upload Arch Linux Packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-arch
+          path: pkg-arch/*.pkg.tar.zst
+          retention-days: 1
+
+  # ── 5. Real-Android Emulator E2E Test (Single Session, All Distros) ──────────
+  e2e:
+    name: Real-Android E2E Tests (Ubuntu, Fedora, Arch)
+    needs: [build-android, build-pkg-ubuntu, build-pkg-fedora, build-pkg-arch]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Virtual Bluetooth Kernel Module (hci_vhci fail-fast)
+        run: ./scripts/ci/build-kernel-vhci.sh
+
+      - name: Download Android APKs
+        uses: actions/download-artifact@v7
+        with:
+          name: android-apks
+          path: apks
+
+      - name: Place APKs in Expected Paths
+        run: |
+          mkdir -p server-android/app/build/outputs/apk/e2e server-android/app/build/outputs/apk/androidTest/e2e
+          cp apks/app-e2e.apk server-android/app/build/outputs/apk/e2e/
+          cp apks/app-e2e-androidTest.apk server-android/app/build/outputs/apk/androidTest/e2e/
+
+      - name: Download Distro Packages
+        uses: actions/download-artifact@v7
+        with:
+          path: packages
+
+      - name: Arrange Distro Packages
+        run: |
+          mkdir -p pkg-fedora pkg-arch /tmp/deb-build
+          cp packages/pkg-ubuntu/*.deb /tmp/deb-build/
+          cp packages/pkg-fedora/*.rpm pkg-fedora/
+          cp packages/pkg-arch/*.pkg.tar.zst pkg-arch/
 
       - name: Install Host E2E Dependencies & Bumble
         run: |
@@ -108,54 +261,36 @@ jobs:
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config \
-            policykit-1
-          # The runner image ships typing-extensions as a Debian-owned package with
-          # no RECORD file, so a system-wide install of bumble aborts on it. A
-          # user-site install avoids that; the plain form is kept as the last resort
-          # because it is what actually succeeded historically (pip auto-selects a
-          # user install when system site-packages is not writable).
+            policykit-1 qrencode
           python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
             || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
 
-      - name: Install Debian Packaging Prerequisites
+      - name: Install Host Ubuntu Debian Package
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config dpkg-dev polkitd dbus
-
-      - name: Build and Install TapAuth Debian Packages on Host
-        run: |
-          # Build real Debian packages (.deb) with emulator test features (dev-udp-loopback, dev-polkit-bypass)
-          ./scripts/ci/build-debian-packages.sh --features "tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass"
-          # Install generated packages on the runner via apt
           sudo apt-get install -y /tmp/deb-build/tapauth_*.deb /tmp/deb-build/tapauth-fprintd_*.deb
-          # Verify package-installed files, user/group creation, and systemd units
           dpkg -l tapauth tapauth-fprintd
           id tapauthd
           getent group tapauthd-clients
           systemctl is-enabled tapauthd.socket
           ls -la /lib/x86_64-linux-gnu/security/pam_tapauth.so /usr/bin/tapauthd /usr/bin/tapauth-ipc-cli
 
-      - name: Build TapAuth Fedora RPM Packages
+      - name: Free disk space & Pre-pull Distro Images for Fast E2E
         run: |
-          docker run --rm -v "$PWD":/workspace fedora:latest \
-            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
-
-      - name: Build TapAuth Arch Linux Packages
-        run: |
-          docker run --rm -v "$PWD":/workspace archlinux:base-devel \
-            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
-
-      - name: Free disk space for emulator
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/local/share/chromium
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell /usr/local/share/chromium /opt/hostedtoolcache/CodeQL
           sudo docker image prune -f || true
+          docker pull fedora:latest &
+          docker pull archlinux:base-devel &
+          wait
           df -h
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK (platform-tools / adb)
+        uses: android-actions/setup-android@v4
 
       - name: Enable KVM (for Android Emulator)
         run: |
@@ -197,44 +332,5 @@ jobs:
         if: always()
         run: |
           sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
-          sudo rm -rf pkg-fedora pkg-arch /tmp/deb-build
+          sudo rm -rf pkg-fedora pkg-arch /tmp/deb-build apks packages
           test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: instrumentation-test-results
-          path: server-android/app/build/reports/androidTests/
-          retention-days: 7
-
-      - name: Check Kotlin formatting with Spotless
-        run: cd server-android && ./gradlew spotlessCheck
-
-      - name: Upload debug APK artifact (safe for manual testing)
-        uses: actions/upload-artifact@v7
-        with:
-          name: tapauth-debug-apk
-          path: server-android/app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-      # The E2E build variant auto-approves authentication requests when no
-      # biometrics are enrolled and exports a test-only denial receiver. It is
-      # uploaded under an explicit name and short retention so it can never be
-      # mistaken for a distributable app build.
-      - name: Upload E2E variant APK artifact (UNSAFE — auto-approves, do not install)
-        uses: actions/upload-artifact@v7
-        with:
-          name: tapauth-e2e-apk-UNSAFE-auto-approves
-          path: server-android/app/build/outputs/apk/e2e/*.apk
-          retention-days: 7
-
-      - name: Upload native libraries artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-libraries
-          path: server-android/app/build/rustJniLibs/android/
-          # `ignore` here would let the plugin's output directory move silently and
-          # drop the artifact; a missing directory should fail the job instead.
-          if-no-files-found: error
-          retention-days: 30

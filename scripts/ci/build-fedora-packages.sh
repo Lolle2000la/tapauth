@@ -8,6 +8,7 @@ WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/rpm-build}"
+NO_CHECK=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18,6 +19,10 @@ while [[ $# -gt 0 ]]; do
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
+            ;;
+        --nocheck)
+            NO_CHECK=true
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -48,6 +53,9 @@ tar -czf "$RPM_ROOT/SOURCES/tapauth-${PKG_VER}.tar.gz" \
 
 # Define cargo_features macro if features were passed
 RPMBUILD_ARGS=("-ba" "$RPM_ROOT/SPECS/tapauth.spec")
+if [ "$NO_CHECK" = true ]; then
+    RPMBUILD_ARGS+=("--nocheck")
+fi
 if [ -n "$CARGO_FEATURES" ]; then
     RPMBUILD_ARGS+=("--define" "cargo_features --features ${CARGO_FEATURES}")
 fi

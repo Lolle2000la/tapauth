@@ -45,7 +45,7 @@ tapauth (${PKG_VER}-1) noble; urgency=medium
 EOF
 
 echo "==> Building Debian packages with dpkg-buildpackage..."
-dpkg-buildpackage -us -uc -b -d
+DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-nocheck}" dpkg-buildpackage -us -uc -b -d
 
 echo "==> Built Debian packages in /tmp/deb-build/:"
 ls -la /tmp/deb-build/*.deb

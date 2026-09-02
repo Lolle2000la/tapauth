@@ -190,9 +190,11 @@ cleanup() {
         wait "$CAPTURE_PID" 2>/dev/null || true
     fi
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant 2>/dev/null || true
-    if [ -f /tmp/bumble-bridge.pid ]; then
-        kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
-        rm -f /tmp/bumble-bridge.pid
+    if [ "${E2E_KEEP_BLE_BRIDGE:-0}" != "1" ]; then
+        if [ -f /tmp/bumble-bridge.pid ]; then
+            kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
+            rm -f /tmp/bumble-bridge.pid
+        fi
     fi
     if [ "$INSTALLED_POLKIT" = true ]; then
         sudo rm -f "$POLKIT_POLICY_DEST" 2>/dev/null || true
