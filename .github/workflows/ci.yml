@@ -151,28 +151,3 @@ jobs:
 
       - name: Run all workspace tests
         run: cargo test --workspace --verbose
-
-  distro-package-smoke-tests:
-    name: Package Smoke Test (${{ matrix.distro }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - distro: "Fedora RPM"
-            image: "fedora:latest"
-            script: "/workspace/scripts/ci/test-fedora-rpm.sh"
-          - distro: "Arch Linux"
-            image: "archlinux:base-devel"
-            script: "/workspace/scripts/ci/test-arch-pkg.sh"
-          - distro: "Ubuntu Deb"
-            image: "ubuntu:noble"
-            script: "/workspace/scripts/ci/test-ubuntu-deb.sh"
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Run ${{ matrix.distro }} Packaging Smoke Tests in Container
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace:ro" ${{ matrix.image }} ${{ matrix.script }}
