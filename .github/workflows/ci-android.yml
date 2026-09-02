@@ -136,6 +136,16 @@ jobs:
           systemctl is-enabled tapauthd.socket
           ls -la /lib/x86_64-linux-gnu/security/pam_tapauth.so /usr/bin/tapauthd /usr/bin/tapauth-ipc-cli
 
+      - name: Build TapAuth Fedora RPM Packages
+        run: |
+          docker run --rm -v "$PWD":/workspace fedora:latest \
+            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+
+      - name: Build TapAuth Arch Linux Packages
+        run: |
+          docker run --rm -v "$PWD":/workspace archlinux:base-devel \
+            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+
       - name: Free disk space for emulator
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -144,7 +154,7 @@ jobs:
           sudo rm -rf /usr/local/share/powershell
           sudo rm -rf /usr/local/share/chromium
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af || true
+          sudo docker image prune -f || true
           df -h
 
       - name: Enable KVM (for Android Emulator)
@@ -182,14 +192,41 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
-            # Run JNI crypto instrumentation tests (on device/emulator). Note: Full E2E pairing & auth flow is executed below via test-e2e.sh.
+            # 1. Run JNI crypto instrumentation tests (on device/emulator)
             (cd server-android && ./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest --stacktrace)
+
+            # 2. Run E2E against installed Ubuntu (.deb) package on host
+            echo "=================================================="
+            echo " [1/3] Running E2E against installed Ubuntu (.deb) package"
+            echo "=================================================="
             sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
+            sudo apt-get purge -y tapauth-fprintd tapauth
+
+            # 3. Run E2E against installed Fedora (.rpm) package in container
+            echo "=================================================="
+            echo " [2/3] Running E2E against installed Fedora (.rpm) package"
+            echo "=================================================="
+            docker run --rm --privileged --net=host \
+              -v /dev:/dev \
+              -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
+              -v "$PWD":/workspace \
+              fedora:latest /workspace/scripts/ci/run-container-e2e.sh fedora /workspace/pkg-fedora
+
+            # 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in container
+            echo "=================================================="
+            echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
+            echo "=================================================="
+            docker run --rm --privileged --net=host \
+              -v /dev:/dev \
+              -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
+              -v "$PWD":/workspace \
+              archlinux:base-devel /workspace/scripts/ci/run-container-e2e.sh arch /workspace/pkg-arch
 
       - name: Verify Package Removal and Purge
         if: always()
         run: |
-          sudo apt-get purge -y tapauth-fprintd tapauth || true
+          sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
+          rm -rf pkg-fedora pkg-arch /tmp/deb-build
           test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
 
       - name: Upload test results
