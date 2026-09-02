@@ -56,7 +56,14 @@ authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
 %setup -q -n %{name}-%{version}
 
 %build
+if [ -d /cache/target ]; then
+    mkdir -p target
+    cp -al /cache/target/* target/ 2>/dev/null || cp -r /cache/target/* target/ 2>/dev/null || true
+fi
 cargo build --workspace --release --locked %{?cargo_features}
+if [ -d /cache/target ]; then
+    cp -al target/* /cache/target/ 2>/dev/null || cp -r target/* /cache/target/ 2>/dev/null || true
+fi
 
 %check
 cargo test --workspace %{?cargo_features}
