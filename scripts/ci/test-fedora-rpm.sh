@@ -59,7 +59,7 @@ rpm -V tapauth
 
 echo "Testing authselect vendor profile activation and rollback..."
 if command -v authselect >/dev/null 2>&1; then
-    authselect select vendor/tapauth --force
+    authselect select tapauth --force
     authselect check
     authselect select local --force
 fi

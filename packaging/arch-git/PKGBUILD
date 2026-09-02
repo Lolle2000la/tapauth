@@ -33,7 +33,7 @@ build() {
   cd "${srcdir}/tapauth"
   export CARGO_HOME="${srcdir}/cargo-home"
   export CARGO_PROFILE_RELEASE_STRIP=true
-  cargo build --frozen --workspace --release --locked
+  cargo build --frozen --workspace --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 }
 
 package_tapauth-git() {

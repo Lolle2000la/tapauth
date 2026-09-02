@@ -56,10 +56,10 @@ authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
 %setup -q -n %{name}-%{version}
 
 %build
-cargo build --workspace --release --locked
+cargo build --workspace --release --locked %{?cargo_features}
 
 %check
-cargo test --workspace
+cargo test --workspace %{?cargo_features}
 
 %install
 mkdir -p %{buildroot}%{_bindir}
@@ -97,7 +97,7 @@ for f in %{_datadir}/authselect/default/local/*; do
     case "$filename" in
         system-auth|password-auth|README) continue ;;
     esac
-    ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
+    ln -sf "%{_datadir}/authselect/default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
@@ -118,7 +118,7 @@ for f in %{_datadir}/authselect/default/sssd/*; do
     case "$filename" in
         system-auth|password-auth|README) continue ;;
     esac
-    ln -sf "../../default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
+    ln -sf "%{_datadir}/authselect/default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth

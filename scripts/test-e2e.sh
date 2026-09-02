@@ -278,6 +278,11 @@ INSTALLED_POLKIT=false
 
 USE_INSTALLED_PACKAGE="${TAPAUTH_E2E_USE_INSTALLED_PACKAGE:-0}"
 
+# Ensure Android app is in a clean state (wiping any previous pairing keys)
+if command -v adb >/dev/null 2>&1; then
+    adb shell pm clear dev.rourunisen.tapauth.e2e >/dev/null 2>&1 || true
+fi
+
 # Step 1: Build necessary Linux binaries or resolve installed packages
 if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
     echo "==> Step 1: Using pre-installed distro packages for E2E tests..."
@@ -366,6 +371,10 @@ enable_fprintd_bridge = true
 EOF
             chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE" 2>/dev/null || true
             chmod 644 "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+        else
+            if ! grep -q "^[[:space:]]*enable_fprintd_bridge[[:space:]]*=[[:space:]]*true" "$CONFIG_ASSERT_FILE"; then
+                sed -i 's/^[#[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+            fi
         fi
     else
         # This mode installs over a REAL system installation (/usr/bin/tapauthd, the
@@ -477,7 +486,7 @@ EOF
     echo "✅ tapauthd.socket enabled (socket-activated service)."
 
     # 6. Real socket activation: this CLI call starts the daemon via FD#3
-    if ! /usr/local/bin/tapauth-ipc-cli get-config > "${TEST_DIR}/activation.log" 2>&1; then
+    if ! "$CLI_BIN" get-config > "${TEST_DIR}/activation.log" 2>&1; then
         echo "❌ ERROR: socket-activated daemon did not answer. Log:"
         cat "${TEST_DIR}/activation.log"
         systemctl status tapauthd.service --no-pager || true
@@ -1307,7 +1316,7 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     echo "==> Admin request as unprivileged user (must be denied by the daemon)..."
     set +e
-    runuser -u "$ADMIN_DENY_USER" -- /usr/local/bin/tapauth-ipc-cli get-servers > "${TEST_DIR}/deny-admin.log" 2>&1
+    runuser -u "$ADMIN_DENY_USER" -- "$CLI_BIN" get-servers > "${TEST_DIR}/deny-admin.log" 2>&1
     DENY_EXIT=$?
     set -e
     cat "${TEST_DIR}/deny-admin.log"
@@ -1324,7 +1333,7 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
 
     echo "==> Socket access gate: user outside 'tapauthd-clients' must not connect..."
     set +e
-    runuser -u nobody -- /usr/local/bin/tapauth-ipc-cli get-servers > "${TEST_DIR}/deny-socket.log" 2>&1
+    runuser -u nobody -- "$CLI_BIN" get-servers > "${TEST_DIR}/deny-socket.log" 2>&1
     SOCKET_DENY_EXIT=$?
     set -e
     cat "${TEST_DIR}/deny-socket.log"
