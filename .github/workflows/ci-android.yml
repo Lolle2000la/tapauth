@@ -33,6 +33,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # ── 1. Android Mobile Build & APK Generation ─────────────────────────────────
@@ -134,6 +135,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Install Debian Packaging Prerequisites
         run: |
           sudo apt-get update
@@ -160,22 +167,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Cache Cargo Registry
+      - name: Cache Cargo Registry & Target
         uses: actions/cache@v6
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/cargo-target-fedora
+          key: ${{ runner.os }}-cargo-fedora-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fedora-
 
       - name: Build TapAuth Fedora RPM Packages
         run: |
-          mkdir -p ~/.cargo/registry ~/.cargo/git
+          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/cargo-target-fedora
           docker run --rm \
             -v "$PWD":/workspace \
             -v ~/.cargo/registry:/root/.cargo/registry \
             -v ~/.cargo/git:/root/.cargo/git \
+            -v ~/.cache/cargo-target-fedora:/root/target-cache \
             fedora:latest \
-            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && CARGO_TARGET_DIR=/root/target-cache ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
 
       - name: Upload Fedora RPM Packages
         uses: actions/upload-artifact@v7
@@ -193,22 +205,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Cache Cargo Registry
+      - name: Cache Cargo Registry & Target
         uses: actions/cache@v6
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/cargo-target-arch
+          key: ${{ runner.os }}-cargo-arch-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arch-
 
       - name: Build TapAuth Arch Linux Packages
         run: |
-          mkdir -p ~/.cargo/registry ~/.cargo/git
+          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/cargo-target-arch
           docker run --rm \
             -v "$PWD":/workspace \
             -v ~/.cargo/registry:/root/.cargo/registry \
             -v ~/.cargo/git:/root/.cargo/git \
+            -v ~/.cache/cargo-target-arch:/tmp/cargo-target-arch \
             archlinux:base-devel \
-            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && CARGO_TARGET_DIR=/tmp/cargo-target-arch ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
 
       - name: Upload Arch Linux Packages
         uses: actions/upload-artifact@v7
@@ -239,8 +256,9 @@ jobs:
       - name: Place APKs in Expected Paths
         run: |
           mkdir -p server-android/app/build/outputs/apk/e2e server-android/app/build/outputs/apk/androidTest/e2e
-          cp apks/app-e2e.apk server-android/app/build/outputs/apk/e2e/
-          cp apks/app-e2e-androidTest.apk server-android/app/build/outputs/apk/androidTest/e2e/
+          find apks -type f -name "*e2e*.apk" -not -name "*androidTest*" -exec cp {} server-android/app/build/outputs/apk/e2e/app-e2e.apk \;
+          find apks -type f -name "*androidTest*.apk" -exec cp {} server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk \;
+          ls -la server-android/app/build/outputs/apk/e2e/ server-android/app/build/outputs/apk/androidTest/e2e/
 
       - name: Download Distro Packages
         uses: actions/download-artifact@v7
@@ -250,9 +268,10 @@ jobs:
       - name: Arrange Distro Packages
         run: |
           mkdir -p pkg-fedora pkg-arch /tmp/deb-build
-          cp packages/pkg-ubuntu/*.deb /tmp/deb-build/
-          cp packages/pkg-fedora/*.rpm pkg-fedora/
-          cp packages/pkg-arch/*.pkg.tar.zst pkg-arch/
+          find packages -type f -name "*.deb" -exec cp {} /tmp/deb-build/ \;
+          find packages -type f -name "*.rpm" -exec cp {} pkg-fedora/ \;
+          find packages -type f -name "*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
+          ls -la /tmp/deb-build/ pkg-fedora/ pkg-arch/
 
       - name: Install Host E2E Dependencies & Bumble
         run: |

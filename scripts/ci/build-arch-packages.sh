@@ -56,10 +56,14 @@ sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
 if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    mkdir -p "$CARGO_TARGET_DIR"
+    chown -R builder:builder "$CARGO_TARGET_DIR"
+fi
 chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"
 
 echo "==> Building Arch packages with makepkg..."
-su builder -c "CARGO_FEATURES='${CARGO_FEATURES}' makepkg -s --noconfirm --nodeps"
+su builder -c "CARGO_FEATURES='${CARGO_FEATURES}' CARGO_TARGET_DIR='${CARGO_TARGET_DIR:-}' makepkg -s --noconfirm --nodeps"
 
 echo "==> Copying built Arch packages to $OUTPUT_DIR..."
 cp "$BUILD_DIR"/*.pkg.tar.zst "$OUTPUT_DIR/"

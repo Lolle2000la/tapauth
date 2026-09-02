@@ -31,6 +31,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    mkdir -p "$CARGO_TARGET_DIR"
+    export CARGO_TARGET_DIR
+fi
+
 if ! command -v rpmbuild >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     echo "==> Installing build dependencies for Fedora..."
     dnf install -y rpm-build cargo rust protobuf-compiler clang pam-devel systemd-devel dbus-devel
