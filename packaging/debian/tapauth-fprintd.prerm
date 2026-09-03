@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "purge" ]; then
 	# Restore PAM stacks
 	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
 		if [ -f "${pam_file}.tapauth-bak" ]; then

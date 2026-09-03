@@ -9,34 +9,17 @@ license=('AGPL-3.0-only')
 makedepends=('cargo' 'protobuf' 'clang' 'pam')
 source=("$pkgbase-$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
-backup=('etc/tapauth/config.toml')
-
 prepare() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
-  if [ -d /cache/cargo ]; then
-    export CARGO_HOME="/cache/cargo"
-  else
-    export CARGO_HOME="${srcdir}/cargo-home"
-  fi
+  export CARGO_HOME="${srcdir}/cargo-home"
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
-  if [ -d /cache/cargo ]; then
-    export CARGO_HOME="/cache/cargo"
-  else
-    export CARGO_HOME="${srcdir}/cargo-home"
-  fi
+  export CARGO_HOME="${srcdir}/cargo-home"
   export CARGO_PROFILE_RELEASE_STRIP=true
-  if [ -d /cache/target ]; then
-    mkdir -p target
-    cp -al /cache/target/. target/ 2>/dev/null || cp -r /cache/target/. target/ 2>/dev/null || true
-  fi
-  cargo build --frozen --workspace --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
-  if [ -d /cache/target ]; then
-    cp -al target/. /cache/target/ 2>/dev/null || cp -r target/. /cache/target/ 2>/dev/null || true
-  fi
+  cargo build --frozen --workspace --release --locked
 }
 
 package_tapauth() {
@@ -55,7 +38,6 @@ package_tapauth() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
   install -dm0755 "${pkgdir}/etc/tapauth"
   install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
-  install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
   install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"

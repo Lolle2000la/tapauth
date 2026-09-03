@@ -19,9 +19,11 @@ if [ "$1" = "configure" ]; then
 	mkdir -p /etc/tapauth
 	if [ ! -f /etc/tapauth/config.toml ]; then
 		printf "# TapAuth Configuration\nenable_fprintd_bridge = false\n" > /etc/tapauth/config.toml
-		chmod 644 /etc/tapauth/config.toml
-		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 	fi
+	chmod 0755 /etc/tapauth 2>/dev/null || true
+	chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+	chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+	chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 	if command -v pam-auth-update >/dev/null 2>&1; then
 		pam-auth-update --package
 	fi

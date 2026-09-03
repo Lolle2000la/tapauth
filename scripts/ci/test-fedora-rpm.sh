@@ -4,7 +4,7 @@ set -euo pipefail
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 cd "$WORKSPACE_DIR"
 
-PKG_VER=$(grep '^version = ' "${WORKSPACE_DIR}/Cargo.toml" | head -1 | cut -d '"' -f2 || echo "0.1.0")
+PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
 echo "==> Testing Fedora RPM packaging for TapAuth version: ${PKG_VER}..."
 
 echo "==> 1. Installing Fedora build dependencies and rpmlint..."
@@ -57,11 +57,10 @@ test "$MODE" = "644"
 echo "Verifying rpm integrity (rpm -V tapauth)..."
 rpm -V tapauth
 
-echo "Testing authselect vendor profile activation and rollback..."
+echo "Testing authselect vendor profile activation..."
 if command -v authselect >/dev/null 2>&1; then
     authselect select tapauth --force
     authselect check
-    authselect select local --force
 fi
 
 echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
@@ -99,8 +98,15 @@ test "$MODE" = "644"
 echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 11. Testing complete removal of base package..."
+echo "==> 11. Testing complete removal of base package and authselect rollback..."
 rpm -e tapauth
+
+if command -v authselect >/dev/null 2>&1; then
+    echo "Verifying that authselect profile was automatically rolled back to local..."
+    current_prof=$(authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
+    test "$current_prof" = "local"
+    authselect check
+fi
 
 echo "=================================================="
 echo "🎉 ALL FEDORA RPM BUILD, LINT AND INSTALL TESTS PASSED!"

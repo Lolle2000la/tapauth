@@ -534,6 +534,13 @@ prompt_pam_configuration() {
 
 # Detect PAM module directory
 detect_pam_directory() {
+    # Honor environment variable override if provided and valid
+    if [[ -n "${PAM_MODULE_DIR:-}" && -d "$PAM_MODULE_DIR" ]]; then
+        PAM_SO_PATH="$PAM_MODULE_DIR/$PAM_SO_NAME"
+        print_success "Using overridden PAM directory: $PAM_MODULE_DIR"
+        return
+    fi
+
     print_info "Detecting PAM module directory..."
     
     # Possible PAM module directories for different distributions
@@ -947,34 +954,33 @@ EOF
     # Install virtual fprintd D-Bus policy and service activation files (guarded against real hardware fprintd)
     check_hardware_fprintd
 
-    if [[ "$ENABLE_FPRINTD_BRIDGE" == true ]]; then
-        if [[ "$has_hardware_fprintd" == true ]]; then
-            print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
-        else
-            local dbus_dir
-            dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
-            local DBUS_POLICY_DIR="$dbus_dir"
-            if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
-                print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
-                print_warning "Lock screen integration will not work until the policy file is manually installed."
-                # Still continue — do NOT abort the installation
+    if [[ "$has_hardware_fprintd" == true ]]; then
+        print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
+    else
+        local dbus_dir
+        dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
+        local DBUS_POLICY_DIR="$dbus_dir"
+        if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
+            print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
+            print_warning "Lock screen integration will not work until the policy file is manually installed."
+        fi
+        if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
+            print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
+            install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
+            if command -v restorecon &> /dev/null; then
+                restorecon "$FPRINT_DBUS_CONF_DEST" || true
             fi
-            if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
-                print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
-                install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
-                if command -v restorecon &> /dev/null; then
-                    restorecon "$FPRINT_DBUS_CONF_DEST" || true
-                fi
-            fi
+        fi
 
-            if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
-                print_info "Installing virtual fprintd D-Bus system service activation file"
-                install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
-                if command -v restorecon &> /dev/null; then
-                    restorecon "$FPRINT_SERVICE_DEST" || true
-                fi
+        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+            print_info "Installing virtual fprintd D-Bus system service activation file"
+            install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
+            if command -v restorecon &> /dev/null; then
+                restorecon "$FPRINT_SERVICE_DEST" || true
             fi
+        fi
 
+        if [[ "$ENABLE_FPRINTD_BRIDGE" == true ]]; then
             # Enable fprintd bridge in /etc/tapauth/config.toml
             if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
                 sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
@@ -982,16 +988,16 @@ EOF
                 echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
             fi
             chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+        fi
 
-            # Reload system D-Bus configuration to apply the new policy immediately
-            if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
-                systemctl reload dbus 2>/dev/null || true
-            elif command -v dbus-send &>/dev/null; then
-                dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
-            fi
-            if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
-                systemctl try-restart tapauthd.service 2>/dev/null || true
-            fi
+        # Reload system D-Bus configuration to apply the new policy immediately
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        elif command -v dbus-send &>/dev/null; then
+            dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+        fi
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
+            systemctl try-restart tapauthd.service 2>/dev/null || true
         fi
     fi
 }
@@ -1383,13 +1389,17 @@ configure_pam() {
     # Configure sudo
     if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
         print_info "Configuring PAM for sudo..."
-        if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-            backup_pam_file "/etc/pam.d/sudo"
-            # Insert at beginning of auth section
-            sed -i "1i $pam_line" /etc/pam.d/sudo
-            print_success "Configured PAM for sudo"
+        if [[ -f /etc/pam.d/sudo ]]; then
+            if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
+                backup_pam_file "/etc/pam.d/sudo"
+                # Insert at beginning of auth section
+                sed -i "1i $pam_line" /etc/pam.d/sudo
+                print_success "Configured PAM for sudo"
+            else
+                print_warning "PAM sudo already configured"
+            fi
         else
-            print_warning "PAM sudo already configured"
+            print_warning "sudo PAM configuration not found at /etc/pam.d/sudo"
         fi
     fi
     

@@ -9,7 +9,6 @@ license=('AGPL-3.0-only')
 makedepends=('cargo' 'protobuf' 'clang' 'git' 'pam')
 source=("tapauth::git+https://github.com/lolle2000la/tapauth.git#branch=main")
 sha256sums=('SKIP')
-backup=('etc/tapauth/config.toml')
 
 pkgver() {
   cd "${srcdir}/tapauth"
@@ -33,7 +32,7 @@ build() {
   cd "${srcdir}/tapauth"
   export CARGO_HOME="${srcdir}/cargo-home"
   export CARGO_PROFILE_RELEASE_STRIP=true
-  cargo build --frozen --workspace --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+  cargo build --frozen --workspace --release --locked
 }
 
 package_tapauth-git() {
@@ -53,7 +52,6 @@ package_tapauth-git() {
   cd "${srcdir}/tapauth"
   install -dm0755 "${pkgdir}/etc/tapauth"
   install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
-  install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
   install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"

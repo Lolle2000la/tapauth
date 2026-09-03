@@ -54,18 +54,23 @@ sed -i "s|^source=.*|source=(\"tapauth-\${pkgver}.tar.gz\")|" PKGBUILD
 # Replace sha256sums with SKIP for local source tarball
 sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
 
+if [ -n "$CARGO_FEATURES" ]; then
+    sed -i "s|cargo build --frozen --workspace --release --locked|cargo build --frozen --workspace --release --locked --features \"$CARGO_FEATURES\"|" PKGBUILD
+fi
+
 # Ensure builder user exists
 if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
 if [ -d /cache ]; then
-    mkdir -p /cache/cargo /cache/target
+    mkdir -p /cache/cargo
     chown -R builder:builder /cache
+    sed -i 's|export CARGO_HOME=.*|export CARGO_HOME="/cache/cargo"|' PKGBUILD
 fi
 chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"
 
 echo "==> Building Arch packages with makepkg..."
-su builder -c "CARGO_FEATURES='${CARGO_FEATURES}' makepkg -s --noconfirm --nodeps"
+su builder -c "makepkg -s --noconfirm --nodeps"
 
 echo "==> Copying built Arch packages to $OUTPUT_DIR..."
 cp "$BUILD_DIR"/*.pkg.tar.zst "$OUTPUT_DIR/"

@@ -105,20 +105,23 @@ for f in %{_datadir}/authselect/default/local/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
     case "$filename" in
-        system-auth|password-auth|README) continue ;;
+        system-auth|password-auth|fingerprint-auth|README) continue ;;
     esac
     ln -sf "%{_datadir}/authselect/default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+install -m 0644 %{_datadir}/authselect/default/local/fingerprint-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth
 if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth; then
     sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 else
     sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 fi
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+sed -i 's/pam_fprintd\.so/pam_tapauth.so/g' %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth || exit 1
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth || exit 1
 printf "TapAuth Local Authentication\n\nThis profile extends the default local profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
 
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
@@ -126,20 +129,23 @@ for f in %{_datadir}/authselect/default/sssd/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
     case "$filename" in
-        system-auth|password-auth|README) continue ;;
+        system-auth|password-auth|fingerprint-auth|README) continue ;;
     esac
     ln -sf "%{_datadir}/authselect/default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
 done
 install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+install -m 0644 %{_datadir}/authselect/default/sssd/fingerprint-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth
 if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth; then
     sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 else
     sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
 fi
 sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
+sed -i 's/pam_fprintd\.so/pam_tapauth.so/g' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth || exit 1
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth || exit 1
+grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth || exit 1
 printf "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
 %endif
 
@@ -180,16 +186,16 @@ echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
 echo "         add your user to the tapauthd-clients group:"
 echo "         sudo usermod -aG tapauthd-clients \$USER"
 echo "TapAuth: To enable system-wide authentication with authselect:"
-echo "         sudo authselect select vendor/tapauth with-silent-lastlog with-mkhomedir --force"
+echo "         sudo authselect select tapauth with-silent-lastlog with-mkhomedir --force"
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
 %if 0%{?fedora} || 0%{?rhel}
 if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
     current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "vendor/tapauth" ] || [ "$current_profile" = "vendor/tapauth-sssd" ]; then
+    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
         target_profile="local"
-        [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
+        [ "$current_profile" = "tapauth-sssd" ] && target_profile="sssd"
         features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
         authselect select "$target_profile" $features --force || true
     fi
@@ -210,15 +216,24 @@ if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
     chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 fi
 
-# Wire up PAM stacks for lock screen fingerprint integration
+# Wire up PAM stacks for desktop lock screen integration (non-authselect files)
 pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
-for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
     [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
     if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
         [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
         sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
     fi
 done
+
+# If authselect is active with a TapAuth profile, refresh authselect files
+if command -v authselect &>/dev/null; then
+    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
+    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
+        authselect apply-changes || true
+    fi
+fi
 
 # Create gdm-fingerprint if GDM exists but service file does not
 if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm ]; }; then
@@ -274,8 +289,9 @@ systemctl try-restart tapauthd.service 2>/dev/null || true
 
 %preun fprintd
 if [ $1 -eq 0 ]; then
-    # Restore PAM stacks
-    for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+    # Restore PAM stacks (non-authselect files)
+    for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
+        [ -L "$pam_file" ] && continue
         if [ -f "${pam_file}.tapauth-bak" ]; then
             cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null || true
             rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true

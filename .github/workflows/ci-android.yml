@@ -235,6 +235,13 @@ jobs:
             bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
           sudo chown -R $(id -u):$(id -g) ~/.cache
 
+      - name: Verify Arch Package Quality & Invariants
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD":/workspace \
+            archlinux:base-devel \
+            bash -c "cd /workspace && ./scripts/ci/test-arch-pkg.sh --skip-build /workspace/pkg-arch"
+
       - name: Upload Arch Linux Packages
         uses: actions/upload-artifact@v7
         with:

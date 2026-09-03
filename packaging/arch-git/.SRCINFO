@@ -1,5 +1,5 @@
 pkgbase = tapauth-git
-	pkgver = 0.4.0.r0.gc0223fc
+	pkgver = 0.10.0.r14.g1e0eb73
 	pkgrel = 1
 	url = https://github.com/lolle2000la/tapauth
 	arch = x86_64
@@ -23,13 +23,13 @@ pkgname = tapauth-git
 	optdepends = iptables: for iptables firewall integration
 	optdepends = bluez: for Bluetooth Low Energy (BLE) transport
 	optdepends = tapauth-fprintd-git: for virtual fprintd desktop lock screen integration
-	provides = tapauth
+	provides = tapauth=0.10.0.r14.g1e0eb73
 	conflicts = tapauth
 
 pkgname = tapauth-fprintd-git
 	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration (conflicts with hardware fprintd)
 	install = tapauth-fprintd-git.install
-	depends = tapauth-git=0.4.0.r0.gc0223fc
+	depends = tapauth-git=0.10.0.r14.g1e0eb73
 	depends = dbus
 	provides = fprintd
 	provides = tapauth-fprintd

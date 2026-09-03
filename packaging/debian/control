@@ -2,7 +2,7 @@ Source: tapauth
 Section: admin
 Priority: optional
 Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91 | cargo, rustc (>= 1.85) | rustc-1.91 | rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91, rustc (>= 1.85) | rustc-1.91, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
 Standards-Version: 4.7.0
 
 Package: tapauth

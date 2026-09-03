@@ -15,19 +15,25 @@ sudo dnf install tapauth
 # Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
 sudo dnf install tapauth-fprintd
 ```
+* **Group Membership:** To configure TapAuth via the `tapauth-config` GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
+  ```bash
+  sudo usermod -aG tapauthd-clients $USER
+  ```
+  *(Log out and back in for group membership to take effect).*
+
 * **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. The package ships ready-made authselect vendor profiles that you can enable with a single command:
   ```bash
   # For standard workstations (local accounts, Fedora 40+):
-  sudo authselect select vendor/tapauth
+  sudo authselect select tapauth with-silent-lastlog with-mkhomedir --force
 
   # For environments using SSSD (FreeIPA, Active Directory, LDAP):
-  sudo authselect select vendor/tapauth-sssd
+  sudo authselect select tapauth-sssd with-silent-lastlog with-mkhomedir --force
   ```
-  > **Warning:** Switching profiles will reset any currently enabled authselect features (e.g., fingerprint reader, smartcard, or MFA). To preserve them, check your active features first with `authselect current` and append them to the command (for example: `sudo authselect select vendor/tapauth with-fingerprint`).
+  > **Warning:** Switching profiles will reset any currently enabled authselect features (e.g., fingerprint reader, smartcard, or MFA). To preserve them, check your active features first with `authselect current` and append them to the command (for example: `sudo authselect select tapauth with-fingerprint`).
 
   You can verify the available profiles with `authselect list` after installation. To revert to the default Fedora profile, run `sudo authselect select local` (or `sssd` if that was your previous profile).
 
-### 2. Ubuntu
+### 2. Ubuntu / Debian
 Packages are published via a Launchpad Personal Package Archive (PPA).
 ```bash
 sudo add-apt-repository ppa:lolle2000la/tapauth
@@ -37,10 +43,17 @@ sudo apt-get install tapauth
 # Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
 sudo apt-get install tapauth-fprintd
 ```
-* **PAM Configuration:** Installation automatically registers a module profile hook. To toggle or configure the module non-interactively, run:
-```bash
-sudo pam-auth-update
-```
+* **Group Membership:** To configure TapAuth via the GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
+  ```bash
+  sudo usermod -aG tapauthd-clients $USER
+  ```
+  *(Log out and back in for group membership to take effect).*
+
+* **PAM Configuration:** Installation automatically registers a module profile hook via `pam-auth-update`. To toggle or configure the module non-interactively, run:
+  ```bash
+  sudo pam-auth-update
+  ```
+  > **Note on GDM upgrades:** When `tapauth-fprintd` is installed, it configures `/etc/pam.d/gdm-fingerprint`. When upgrading the `gdm3` package in the future, `dpkg` may notify you that the conffile was modified. Choose **keep your currently-installed version** to maintain TapAuth desktop lock screen unlock.
 
 ### 3. Arch Linux / CachyOS
 The packages are available via the Arch User Repository (AUR).
@@ -53,10 +66,16 @@ yay -S tapauth
 paru -S tapauth-fprintd
 # (or for development/git versions: paru -S tapauth-fprintd-git)
 ```
+* **Group Membership:** Add your user to the `tapauthd-clients` group:
+  ```bash
+  sudo usermod -aG tapauthd-clients $USER
+  ```
+  *(Log out and back in for group membership to take effect).*
+
 * **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
-```text
-auth      sufficient      pam_tapauth.so
-```
+  ```text
+  auth      sufficient      pam_tapauth.so
+  ```
 To enable desktop lock screen integration on Arch, see the [Desktop Lock Screen Integration](#desktop-lock-screen-integration-gnome--kde-plasma) section below.
 
 ## Desktop Lock Screen Integration (GNOME & KDE Plasma)
@@ -547,20 +566,19 @@ The install script adds TapAuth as a `sufficient` module, which means:
 
 ### What Gets Removed
 
-- **Default**: All binaries and system files
-- **Optional**: PAM configuration entries
-- **Optional**: User data (keys and pairings)
+- **Default**: All binaries (`tapauthd`, `tapauth-config`, `tapauth-ipc-cli`, `pam_tapauth.so`), systemd units/sockets, D-Bus activation/policy files, and all PAM configuration entries (all `pam_tapauth.so` references are automatically stripped to prevent system lockouts).
+- **Optional (`--purge` / `--remove-user-data`)**: User pairing keys and device pairings in `/var/lib/tapauth/`.
 
 ### What Gets Preserved
 
 By default, the uninstall script preserves:
-- User encryption keys in `/var/lib/tapauth/`
-- User-specific configuration in `~/.config/tapauth/`
-- PAM configuration (unless explicitly requested to remove)
+- User encryption keys and paired devices in `/var/lib/tapauth/` (retained for reinstallation unless `--purge` is passed)
+- Pre-installation PAM backup files (`.tapauth-bak`) unless `--restore-pam-backups` is passed
+- System accounts (`tapauthd`, `tapauthd-clients`) when `--preserve-system-accounts` is passed
 
-To completely remove everything:
+To completely purge everything including pairing keys:
 ```bash
-sudo ./uninstall.sh --yes --remove-user-data
+sudo ./uninstall.sh --yes --purge
 ```
 
 ## Support

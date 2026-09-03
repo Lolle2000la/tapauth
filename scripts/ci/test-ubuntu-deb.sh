@@ -98,13 +98,20 @@ echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 5. Testing removal of subpackage (tapauth-fprintd)..."
+echo "==> 5. Testing removal and purge of subpackage (tapauth-fprintd)..."
 apt-get remove -y tapauth-fprintd
 test -f /etc/tapauth/config.toml
 grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
 
 echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+
+echo "Re-installing tapauth-fprintd to test apt purge..."
+apt-get install -y /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+apt-get purge -y tapauth-fprintd
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 
 echo "==> 6. Testing purge of base package (tapauth)..."
 apt-get purge -y tapauth

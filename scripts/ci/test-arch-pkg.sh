@@ -4,48 +4,74 @@ set -euo pipefail
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 cd "$WORKSPACE_DIR"
 
-PKG_VER=$(grep '^version = ' "${WORKSPACE_DIR}/Cargo.toml" | head -1 | cut -d '"' -f2 || echo "0.1.0")
+SKIP_BUILD=false
+PKG_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-build)
+            SKIP_BUILD=true
+            if [[ $# -ge 2 && "$2" != --* ]]; then
+                PKG_DIR="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
 echo "==> Testing Arch Linux packaging for TapAuth version: ${PKG_VER}..."
 
-echo "==> 1. Updating pacman databases and installing build dependencies..."
-pacman -Syu --noconfirm --needed sudo rust protobuf clang pam dbus systemd git tar binutils findutils sed grep
+BUILD_DIR="/home/builder/pkg"
 
-echo "==> 2. Setting up unprivileged builder user..."
-if ! id -u builder >/dev/null 2>&1; then
-    useradd -m -s /bin/bash builder
-    echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+if [ "$SKIP_BUILD" = false ]; then
+    echo "==> 1. Updating pacman databases and installing build dependencies..."
+    pacman -Syu --noconfirm --needed sudo rust protobuf clang pam dbus systemd git tar binutils findutils sed grep
+
+    echo "==> 2. Setting up unprivileged builder user..."
+    if ! id -u builder >/dev/null 2>&1; then
+        useradd -m -s /bin/bash builder
+        echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+    fi
+
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+
+    echo "==> 3. Packaging local source tarball for offline/local makepkg..."
+    mkdir -p "/tmp/src/tapauth-${PKG_VER}"
+    tar -C "${WORKSPACE_DIR}" --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle -cf - . | tar -C "/tmp/src/tapauth-${PKG_VER}" -xf -
+    tar -C /tmp/src -czf "${BUILD_DIR}/tapauth-${PKG_VER}.tar.gz" "tapauth-${PKG_VER}"
+
+    cp "${WORKSPACE_DIR}/packaging/arch/PKGBUILD" "${BUILD_DIR}/PKGBUILD"
+    cp "${WORKSPACE_DIR}/packaging/arch/tapauth.install" "${BUILD_DIR}/tapauth.install"
+    cp "${WORKSPACE_DIR}/packaging/arch/tapauth-fprintd.install" "${BUILD_DIR}/tapauth-fprintd.install"
+    cp "${WORKSPACE_DIR}/packaging/arch/"*.hook "${BUILD_DIR}/" 2>/dev/null || true
+    cp "${WORKSPACE_DIR}/config.toml.example" "${BUILD_DIR}/config.toml.example"
+
+    # Adjust PKGBUILD for local tarball build
+    sed -i "s/^pkgver=.*/pkgver=${PKG_VER}/" "${BUILD_DIR}/PKGBUILD"
+    sed -i "s|^source=.*|source=(\"tapauth-\${pkgver}.tar.gz\")|" "${BUILD_DIR}/PKGBUILD"
+    sed -i "s|^sha256sums=.*|sha256sums=('SKIP')|" "${BUILD_DIR}/PKGBUILD"
+
+    chown -R builder:builder "$BUILD_DIR" "/home/builder"
+
+    echo "==> 4. Building Arch packages with makepkg..."
+    su builder -c "cd '$BUILD_DIR' && makepkg --noconfirm"
+
+    echo "==> 5. Generated Arch packages:"
+    ls -la "${BUILD_DIR}"/*.pkg.tar.zst
+    PKG_DIR="${BUILD_DIR}"
+else
+    PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-arch}"
 fi
 
-BUILD_DIR="/home/builder/pkg"
-rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR"
-
-echo "==> 3. Packaging local source tarball for offline/local makepkg..."
-mkdir -p "/tmp/src/tapauth-${PKG_VER}"
-tar -C "${WORKSPACE_DIR}" --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle -cf - . | tar -C "/tmp/src/tapauth-${PKG_VER}" -xf -
-tar -C /tmp/src -czf "${BUILD_DIR}/tapauth-${PKG_VER}.tar.gz" "tapauth-${PKG_VER}"
-
-cp "${WORKSPACE_DIR}/packaging/arch/PKGBUILD" "${BUILD_DIR}/PKGBUILD"
-cp "${WORKSPACE_DIR}/packaging/arch/tapauth.install" "${BUILD_DIR}/tapauth.install"
-cp "${WORKSPACE_DIR}/packaging/arch/tapauth-fprintd.install" "${BUILD_DIR}/tapauth-fprintd.install"
-cp "${WORKSPACE_DIR}/packaging/arch/"*.hook "${BUILD_DIR}/" 2>/dev/null || true
-cp "${WORKSPACE_DIR}/config.toml.example" "${BUILD_DIR}/config.toml.example"
-
-# Adjust PKGBUILD for local tarball build
-sed -i "s/^pkgver=.*/pkgver=${PKG_VER}/" "${BUILD_DIR}/PKGBUILD"
-sed -i "s|^source=.*|source=(\"tapauth-\${pkgver}.tar.gz\")|" "${BUILD_DIR}/PKGBUILD"
-sed -i "s|^sha256sums=.*|sha256sums=('SKIP')|" "${BUILD_DIR}/PKGBUILD"
-
-chown -R builder:builder "$BUILD_DIR" "/home/builder"
-
-echo "==> 4. Building Arch packages with makepkg..."
-su builder -c "cd '$BUILD_DIR' && makepkg --noconfirm"
-
-echo "==> 5. Generated Arch packages:"
-ls -la "${BUILD_DIR}"/*.pkg.tar.zst
-
 echo "==> 6. Testing installation of base package (tapauth)..."
-pacman -U --noconfirm "${BUILD_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
 
 echo "Checking directory and config file ownership and permissions..."
 test -d /etc/tapauth
@@ -76,7 +102,7 @@ account include       system-login
 PAMEof
 
 echo "==> 8. Testing installation of subpackage (tapauth-fprintd)..."
-pacman -U --noconfirm "${BUILD_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
 
 echo "Checking config file and bridge enablement after subpackage install..."
 grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
