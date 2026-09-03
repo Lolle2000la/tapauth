@@ -1135,11 +1135,13 @@ echo "╚═══════════════════════�
 
 sleep 2
 
-# Check if system D-Bus is accessible (e.g., host environment with BlueZ).
+# Check if system D-Bus and BlueZ are accessible (e.g., host environment with BlueZ).
 # In container environments, host D-Bus rejects cross-container Unix socket connections
 # (REJECTED EXTERNAL), making BlueZ inaccessible; BLE is strictly verified on the host.
 BLE_AVAILABLE=true
-if ! dbus-send --system --dest=org.freedesktop.DBus / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+    BLE_AVAILABLE=false
+elif ! dbus-send --system --dest=org.bluez / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
     BLE_AVAILABLE=false
 fi
 
