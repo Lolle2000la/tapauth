@@ -21,7 +21,7 @@ echo "=================================================="
 case "$DISTRO" in
     fedora)
         echo "==> Installing Fedora runtime requirements..."
-        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus procps-ng iproute android-tools
+        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus procps-ng iproute android-tools systemd
 
         echo "==> Installing pre-built Fedora RPM packages..."
         dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm "$PACKAGE_DIR"/tapauth-fprintd-[0-9]*.rpm
@@ -47,9 +47,16 @@ esac
 echo "==> Verifying system users, permissions, and directories..."
 id tapauthd
 getent group tapauthd-clients
-mkdir -p /run/tapauthd /etc/tapauth
-chown tapauthd:tapauthd /etc/tapauth /run/tapauthd 2>/dev/null || true
+mkdir -p /run/tapauthd /etc/tapauth /var/lib/tapauth
+chown -R tapauthd:tapauthd /etc/tapauth /run/tapauthd /var/lib/tapauth 2>/dev/null || true
 chmod 0755 /etc/tapauth /run/tapauthd 2>/dev/null || true
+chmod 0700 /var/lib/tapauth 2>/dev/null || true
+
+# Verify shipped systemd unit files syntax using distro's systemd
+if command -v systemd-analyze >/dev/null 2>&1; then
+    echo "==> Verifying shipped systemd unit files syntax via systemd-analyze..."
+    systemd-analyze verify /usr/lib/systemd/system/tapauthd.service /usr/lib/systemd/system/tapauthd.socket || true
+fi
 
 # Check ADB connectivity to host emulator
 if command -v adb >/dev/null 2>&1; then

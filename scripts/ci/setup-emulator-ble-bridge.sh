@@ -18,8 +18,8 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # If Bumble is already running (e.g. started on host), don't restart or reinstall
-if [ -f /tmp/bumble-bridge.pid ] && kill -0 "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null; then
-    echo "    bumble-hci-bridge is already running (PID $(cat /tmp/bumble-bridge.pid))."
+if [ -f /tmp/bumble-bridge.pid ]; then
+    echo "    bumble-hci-bridge is already running (PID $(cat /tmp/bumble-bridge.pid 2>/dev/null || echo unknown))."
     exit 0
 fi
 

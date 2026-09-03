@@ -94,6 +94,7 @@ PAM_MIXED_CONFIG_PATH="/etc/pam.d/${PAM_MIXED_SERVICE_NAME}"
 PAM_FALLBACK_USER="tapauth-e2e-pam"
 PAM_FALLBACK_PASS="TapAuth-E2E-Fallback-$(date +%s)!"
 ADMIN_DENY_USER="tapauth-e2e-deny"
+USE_INSTALLED_PACKAGE="${TAPAUTH_E2E_USE_INSTALLED_PACKAGE:-0}"
 
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     # Dev-mode sandbox: feature-gated daemon + env redirection.
@@ -109,6 +110,7 @@ if [ "$E2E_DAEMON_MODE" = "dev" ]; then
         mkdir -p "$TAPAUTH_STATE_DIR"
         chmod 700 "$TAPAUTH_STATE_DIR"
         CONFIG_ASSERT_FILE="${TAPAUTH_STATE_DIR}/config.toml"
+        chown -R tapauthd:tapauthd "$TEST_DIR" 2>/dev/null || true
     fi
 else
     CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
@@ -284,8 +286,6 @@ wait_pid_with_timeout() {
 # defaults keep cleanup() safe if the suite aborts before that block runs.
 POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
 INSTALLED_POLKIT=false
-
-USE_INSTALLED_PACKAGE="${TAPAUTH_E2E_USE_INSTALLED_PACKAGE:-0}"
 
 # Ensure Android app is in a clean state (wiping any previous pairing keys)
 if command -v adb >/dev/null 2>&1; then
