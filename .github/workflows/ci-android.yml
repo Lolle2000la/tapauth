@@ -197,6 +197,13 @@ jobs:
             bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
           sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
 
+      - name: Verify Fedora RPM Package Quality & Invariants
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD":/workspace \
+            fedora:latest \
+            bash -c "cd /workspace && ./scripts/ci/test-fedora-rpm.sh --skip-build /workspace/pkg-fedora"
+
       - name: Upload Fedora RPM Packages
         uses: actions/upload-artifact@v7
         with:

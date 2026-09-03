@@ -180,7 +180,11 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_dat
 chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-%systemd_post tapauthd.service tapauthd.socket
+%systemd_post tapauthd.socket
+if [ $1 -eq 1 ]; then
+    # Start the socket immediately on initial install so auth requests don't hit a dead socket
+    systemctl start tapauthd.socket 2>/dev/null || true
+fi
 
 echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
 echo "         add your user to the tapauthd-clients group:"

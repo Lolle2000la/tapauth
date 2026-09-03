@@ -18,6 +18,7 @@ pkgname = tapauth-git
 	install = tapauth-git.install
 	depends = dbus
 	depends = pam
+	depends = wayland
 	optdepends = polkit: for polkit agent authentication helper
 	optdepends = firewalld: for automated firewall port management
 	optdepends = iptables: for iptables firewall integration

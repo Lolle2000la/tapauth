@@ -31,7 +31,7 @@ BUILD_DIR="/home/builder/pkg"
 
 if [ "$SKIP_BUILD" = false ]; then
     echo "==> 1. Updating pacman databases and installing build dependencies..."
-    pacman -Syu --noconfirm --needed sudo rust protobuf clang pam dbus systemd git tar binutils findutils sed grep
+    pacman -Syu --noconfirm --needed sudo cargo rust protobuf clang pam dbus systemd git tar binutils findutils sed grep wayland
 
     echo "==> 2. Setting up unprivileged builder user..."
     if ! id -u builder >/dev/null 2>&1; then
@@ -61,7 +61,7 @@ if [ "$SKIP_BUILD" = false ]; then
     chown -R builder:builder "$BUILD_DIR" "/home/builder"
 
     echo "==> 4. Building Arch packages with makepkg..."
-    su builder -c "cd '$BUILD_DIR' && makepkg --noconfirm"
+    su builder -c "cd '$BUILD_DIR' && makepkg -s --noconfirm"
 
     echo "==> 5. Generated Arch packages:"
     ls -la "${BUILD_DIR}"/*.pkg.tar.zst

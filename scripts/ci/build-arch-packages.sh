@@ -63,9 +63,11 @@ if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
 if [ -d /cache ]; then
-    mkdir -p /cache/cargo
+    mkdir -p /cache/cargo /cache/target
     chown -R builder:builder /cache
     sed -i 's|export CARGO_HOME=.*|export CARGO_HOME="/cache/cargo"|' PKGBUILD
+    sed -i '/export CARGO_PROFILE_RELEASE_STRIP=/a \  export CARGO_TARGET_DIR="/cache/target"' PKGBUILD
+    sed -i 's|target/release/|/cache/target/release/|g' PKGBUILD
 fi
 chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"
 

@@ -889,6 +889,32 @@ main() {
     fi
     
     check_root
+
+    # Check if installed via system package manager
+    local pkg_manager=""
+    if command -v dpkg >/dev/null 2>&1 && dpkg -l tapauth 2>/dev/null | grep -q '^ii'; then
+        pkg_manager="apt-get remove tapauth"
+    elif command -v rpm >/dev/null 2>&1 && rpm -q tapauth >/dev/null 2>&1; then
+        pkg_manager="dnf remove tapauth"
+    elif command -v pacman >/dev/null 2>&1 && pacman -Q tapauth >/dev/null 2>&1; then
+        pkg_manager="pacman -R tapauth"
+    fi
+
+    if [[ -n "$pkg_manager" ]]; then
+        print_warning "TapAuth appears to have been installed via your system package manager."
+        print_warning "Running this standalone script will delete package-managed binaries without updating"
+        print_warning "the package database, which may cause errors during package updates or removal."
+        print_info "Recommended command: sudo $pkg_manager"
+        if [[ "$FORCE" == true || "$NON_INTERACTIVE" == true ]]; then
+            print_info "Continuing due to non-interactive/force mode."
+        else
+            read -p "Proceed with manual uninstallation anyway? [y/N]: " pkg_uninst_confirm
+            if [[ ! "$pkg_uninst_confirm" =~ ^[Yy]$ ]]; then
+                print_info "Uninstallation cancelled. Please use your package manager (sudo $pkg_manager)."
+                exit 0
+            fi
+        fi
+    fi
     
     # Remove in reverse order of installation
     remove_systemd_units_and_daemon

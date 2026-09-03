@@ -41,6 +41,8 @@ override_dh_auto_install:
 	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
 	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
 	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
+	mkdir -p debian/tapauth/lib/systemd/system-preset
+	cp packaging/90-tapauthd.preset debian/tapauth/lib/systemd/system-preset/90-tapauthd.preset
 	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
 
 	if [ "$$(dpkg-parsechangelog -S Distribution 2>/dev/null)" = "jammy" ] && [ -f packaging/tapauthd.pkla ]; then \

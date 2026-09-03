@@ -37,7 +37,7 @@ build() {
 
 package_tapauth-git() {
   pkgdesc="Local smartphone-based authentication framework engine (Development/Git version)"
-  depends=('dbus' 'pam')
+  depends=('dbus' 'pam' 'wayland')
   optdepends=(
     'polkit: for polkit agent authentication helper'
     'firewalld: for automated firewall port management'
@@ -59,6 +59,7 @@ package_tapauth-git() {
 
   install -Dm0644 systemd/tapauthd.service "${pkgdir}/usr/lib/systemd/system/tapauthd.service"
   install -Dm0644 systemd/tapauthd.socket "${pkgdir}/usr/lib/systemd/system/tapauthd.socket"
+  install -Dm0644 packaging/90-tapauthd.preset "${pkgdir}/usr/lib/systemd/system-preset/90-tapauthd.preset"
   install -Dm0644 systemd/polkit-agent-helper@.service.d/tapauth.conf "${pkgdir}/usr/lib/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
 
   install -Dm0644 packaging/sysusers.conf "${pkgdir}/usr/lib/sysusers.d/tapauth.conf"
