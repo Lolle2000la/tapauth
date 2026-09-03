@@ -100,7 +100,7 @@ if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     # Dev-mode sandbox: feature-gated daemon + env redirection.
     if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
         export TAPAUTHD_SOCK="/run/tapauthd/tapauthd.sock"
-        export TAPAUTH_STATE_DIR="/var/lib/tapauth"
+        unset TAPAUTH_STATE_DIR
         export TAPAUTH_DEV_MODE=1
         CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
     else
@@ -549,7 +549,7 @@ echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 # Step 4: Launch tapauthd daemon
 echo "==> Step 4: Launching tapauthd daemon..."
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
-    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
+    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" ${TAPAUTH_STATE_DIR:+TAPAUTH_STATE_DIR="$TAPAUTH_STATE_DIR"} "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
 
     echo -n "    Waiting for daemon socket"
