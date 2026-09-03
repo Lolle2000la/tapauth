@@ -837,7 +837,7 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     # PAM_PERM_DENIED even though the module succeeded.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
-    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
+    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
     "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 30)
@@ -1300,13 +1300,14 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
         useradd -m "$PAM_FALLBACK_USER"
     fi
+    chmod 0600 /etc/shadow 2>/dev/null || true
+    passwd -u "$PAM_FALLBACK_USER" 2>/dev/null || true
     echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
+    echo "$PAM_FALLBACK_PASS" | passwd --stdin "$PAM_FALLBACK_USER" 2>/dev/null || true
 
-    if [ ! -f "$PAM_MIXED_CONFIG_PATH" ]; then
-        # Same stack shape as Phase 2e (trailing pam_permit so the
-        # [success=1] jump can never overshoot the stack).
-        printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
-    fi
+    # Same stack shape as Phase 2e (trailing pam_permit so the
+    # [success=1] jump can never overshoot the stack).
+    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
     echo "$PAM_FALLBACK_PASS" | "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$PAM_FALLBACK_USER" authenticate
