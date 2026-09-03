@@ -158,22 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drop privileges to tapauthd:tapauthd
     // Note: When running under systemd with User=tapauthd, this is redundant but harmless
     // as long as we don't fail if already dropped.
-    // In dev mode (dev-polkit-bypass + TAPAUTH_DEV_MODE=1), keep root credentials so that
-    // container testing can access host D-Bus (BlueZ) and network interfaces without permission drops.
-    #[cfg(feature = "dev-polkit-bypass")]
-    let skip_drop = std::env::var("TAPAUTH_DEV_MODE").as_deref() == Ok("1");
-    #[cfg(not(feature = "dev-polkit-bypass"))]
-    let skip_drop = false;
-
-    if !skip_drop {
-        if let Err(e) = drop_privileges_to_tapauthd() {
-            tracing::warn!(
-                "Failed to drop privileges (might already be running as user): {}",
-                e
-            );
-        } else {
-            tracing::info!("Dropped privileges to tapauthd user");
-        }
+    if let Err(e) = drop_privileges_to_tapauthd() {
+        tracing::warn!(
+            "Failed to drop privileges (might already be running as user): {}",
+            e
+        );
+    } else {
+        tracing::info!("Dropped privileges to tapauthd user");
     }
 
     // Create shared daemon handle used by both the IPC dispatcher and fprintd.
