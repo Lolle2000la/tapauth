@@ -17,9 +17,15 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
-# If Bumble is already running (e.g. started on host), don't restart or reinstall
+# If Bumble is already running (e.g. started on host), don't restart Bumble,
+# but verify that bluetoothd is active and the virtual adapter is powered on.
 if [ -f /tmp/bumble-bridge.pid ]; then
     echo "    bumble-hci-bridge is already running (PID $(cat /tmp/bumble-bridge.pid 2>/dev/null || echo unknown))."
+    if ! pgrep -x bluetoothd > /dev/null; then
+        $SUDO systemctl start bluetooth 2>/dev/null \
+            || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+    fi
+    $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
     exit 0
 fi
 

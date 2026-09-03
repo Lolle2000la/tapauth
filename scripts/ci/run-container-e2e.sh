@@ -21,7 +21,7 @@ echo "=================================================="
 case "$DISTRO" in
     fedora)
         echo "==> Installing Fedora runtime requirements..."
-        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus procps-ng iproute android-tools systemd
+        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus dbus-tools procps-ng iproute android-tools systemd bluez bluez-deprecated
 
         echo "==> Installing pre-built Fedora RPM packages..."
         dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm "$PACKAGE_DIR"/tapauth-fprintd-[0-9]*.rpm
@@ -29,7 +29,7 @@ case "$DISTRO" in
 
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
-        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools
+        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils
 
         echo "==> Building standalone pamtester..."
         gcc -o /usr/bin/pamtester "$WORKSPACE_DIR/scripts/ci/pamtester.c" -lpam -lpam_misc

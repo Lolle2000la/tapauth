@@ -43,6 +43,7 @@ sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
+"$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 docker run --rm --privileged --net=host --pid=host \
   -v /dev:/dev \
   -v /tmp:/tmp \
@@ -54,6 +55,7 @@ docker run --rm --privileged --net=host --pid=host \
 echo "=================================================="
 echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
+"$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 docker run --rm --privileged --net=host --pid=host \
   -v /dev:/dev \
   -v /tmp:/tmp \

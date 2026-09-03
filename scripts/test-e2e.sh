@@ -169,6 +169,11 @@ cleanup() {
         cat /tmp/bumble-bridge.log
         echo "======================="
     fi
+    if [ "$EXIT_CODE" -ne 0 ] && [ -f /tmp/bluetoothd.log ]; then
+        echo "=== BLUETOOTH DAEMON LOG DUMP ==="
+        cat /tmp/bluetoothd.log
+        echo "=================================="
+    fi
     if [ "$EXIT_CODE" -ne 0 ]; then
         echo "=== ANDROID LOGCAT DUMP ==="
         adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* 2>/dev/null || true
