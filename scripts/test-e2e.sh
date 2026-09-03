@@ -72,7 +72,7 @@ echo "✅ Android emulator detected."
 # ── Daemon mode detection ─────────────────────────────────────────────────────
 E2E_DAEMON_MODE="${TAPAUTH_E2E_DAEMON_MODE:-auto}"
 if [ "$E2E_DAEMON_MODE" = "auto" ]; then
-    if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm=)" = "systemd" ]; then
+    if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm=)" = "systemd" ] && [ -d /run/systemd/system ]; then
         E2E_DAEMON_MODE="systemd"
     else
         E2E_DAEMON_MODE="dev"

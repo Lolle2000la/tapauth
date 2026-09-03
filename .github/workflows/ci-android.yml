@@ -176,8 +176,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/target-fedora
-          key: ${{ runner.os }}-cargo-target-fedora-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-target-fedora-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-target-fedora-v2-
             ${{ runner.os }}-cargo-target-fedora-
 
       - name: Build TapAuth Fedora RPM Packages
@@ -212,24 +213,23 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cache/cargo-arch
             ~/.cache/target-arch
-          key: ${{ runner.os }}-cargo-target-arch-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-target-arch-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-target-arch-v2-
             ${{ runner.os }}-cargo-target-arch-
 
       - name: Build TapAuth Arch Linux Packages
         run: |
-          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/target-arch
+          mkdir -p ~/.cache/cargo-arch ~/.cache/target-arch
           docker run --rm \
             -v "$PWD":/workspace \
-            -v ~/.cargo/registry:/root/.cargo/registry \
-            -v ~/.cargo/git:/root/.cargo/git \
+            -v ~/.cache/cargo-arch:/cache/cargo \
             -v ~/.cache/target-arch:/cache/target \
             archlinux:base-devel \
             bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
-          sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
+          sudo chown -R $(id -u):$(id -g) ~/.cache
 
       - name: Upload Arch Linux Packages
         uses: actions/upload-artifact@v7

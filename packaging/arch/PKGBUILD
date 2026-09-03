@@ -13,13 +13,21 @@ backup=('etc/tapauth/config.toml')
 
 prepare() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
-  export CARGO_HOME="${srcdir}/cargo-home"
+  if [ -d /cache/cargo ]; then
+    export CARGO_HOME="/cache/cargo"
+  else
+    export CARGO_HOME="${srcdir}/cargo-home"
+  fi
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
   cd "${srcdir}/${pkgbase}-${pkgver}"
-  export CARGO_HOME="${srcdir}/cargo-home"
+  if [ -d /cache/cargo ]; then
+    export CARGO_HOME="/cache/cargo"
+  else
+    export CARGO_HOME="${srcdir}/cargo-home"
+  fi
   export CARGO_PROFILE_RELEASE_STRIP=true
   if [ -d /cache/target ]; then
     mkdir -p target

@@ -62,6 +62,7 @@ echo "==> Running TapAuth E2E suite against installed $DISTRO package..."
 cd "$WORKSPACE_DIR"
 export TAPAUTH_DEV_MODE=1
 export TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1
+export TAPAUTH_E2E_DAEMON_MODE=dev
 ./scripts/test-e2e.sh
 
 echo "==> Verifying clean package uninstallation on $DISTRO..."

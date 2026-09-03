@@ -56,6 +56,10 @@ sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
 if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
+if [ -d /cache ]; then
+    mkdir -p /cache/cargo /cache/target
+    chown -R builder:builder /cache
+fi
 chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"
 
 echo "==> Building Arch packages with makepkg..."
