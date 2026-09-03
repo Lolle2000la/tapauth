@@ -75,7 +75,7 @@ export TAPAUTH_E2E_DAEMON_MODE=dev
 echo "==> Verifying clean package uninstallation on $DISTRO..."
 case "$DISTRO" in
     fedora)
-        dnf remove -y tapauth-fprintd tapauth
+        rpm -e tapauth-fprintd tapauth
         ;;
     arch)
         pacman -R --noconfirm tapauth-fprintd tapauth
