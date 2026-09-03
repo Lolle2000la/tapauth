@@ -131,7 +131,7 @@ echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "==> 10. Testing simultaneous removal of both packages..."
-pacman -U --noconfirm "${BUILD_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 pacman -R --noconfirm tapauth-fprintd tapauth
 echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped after simultaneous removal..."
