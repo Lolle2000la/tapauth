@@ -42,13 +42,15 @@ tar -czf "$BUILD_DIR/tapauth-${PKG_VER}.tar.gz" \
     --transform "s,^./,tapauth-${PKG_VER}/," \
     -C "${WORKSPACE_DIR}" .
 
-# Copy PKGBUILD and install files
+# Copy PKGBUILD, install files, and hooks
 cp "${WORKSPACE_DIR}/packaging/arch/PKGBUILD" "$BUILD_DIR/"
 cp "${WORKSPACE_DIR}/packaging/arch/"*.install "$BUILD_DIR/" 2>/dev/null || true
+cp "${WORKSPACE_DIR}/packaging/arch/"*.hook "$BUILD_DIR/" 2>/dev/null || true
 cp "${WORKSPACE_DIR}/config.toml.example" "$BUILD_DIR/" 2>/dev/null || true
 
 cd "$BUILD_DIR"
 sed -i "s/^pkgver=.*/pkgver=${PKG_VER}/" PKGBUILD
+sed -i "s|^source=.*|source=(\"tapauth-\${pkgver}.tar.gz\")|" PKGBUILD
 # Replace sha256sums with SKIP for local source tarball
 sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
 

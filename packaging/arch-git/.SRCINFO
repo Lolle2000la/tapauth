@@ -6,7 +6,6 @@ pkgbase = tapauth-git
 	arch = aarch64
 	license = AGPL-3.0-only
 	makedepends = cargo
-	makedepends = rust
 	makedepends = protobuf
 	makedepends = clang
 	makedepends = git
@@ -28,7 +27,7 @@ pkgname = tapauth-git
 	conflicts = tapauth
 
 pkgname = tapauth-fprintd-git
-	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration (Development/Git version)
+	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration (conflicts with hardware fprintd)
 	install = tapauth-fprintd-git.install
 	depends = tapauth-git=0.4.0.r0.gc0223fc
 	depends = dbus

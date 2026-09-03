@@ -28,6 +28,7 @@ tar -C /tmp/src -czf "${BUILD_DIR}/tapauth-${PKG_VER}.tar.gz" "tapauth-${PKG_VER
 cp "${WORKSPACE_DIR}/packaging/arch/PKGBUILD" "${BUILD_DIR}/PKGBUILD"
 cp "${WORKSPACE_DIR}/packaging/arch/tapauth.install" "${BUILD_DIR}/tapauth.install"
 cp "${WORKSPACE_DIR}/packaging/arch/tapauth-fprintd.install" "${BUILD_DIR}/tapauth-fprintd.install"
+cp "${WORKSPACE_DIR}/packaging/arch/"*.hook "${BUILD_DIR}/" 2>/dev/null || true
 cp "${WORKSPACE_DIR}/config.toml.example" "${BUILD_DIR}/config.toml.example"
 
 # Adjust PKGBUILD for local tarball build
@@ -86,6 +87,7 @@ test "$MODE" = "644"
 
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+test -f /usr/share/libalpm/hooks/tapauth-fprintd-pam.hook
 
 echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
@@ -102,14 +104,13 @@ test "$MODE" = "644"
 echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 10. Adding simulated pam_tapauth.so line to system-auth to test pre_remove cleanup..."
-echo "auth sufficient pam_tapauth.so" >> /etc/pam.d/system-auth
-
-echo "==> 11. Testing complete removal of base package (tapauth)..."
-pacman -R --noconfirm tapauth
-
-echo "Verifying pam_tapauth.so was stripped from system-auth on uninstall..."
-! grep "pam_tapauth.so" /etc/pam.d/system-auth
+echo "==> 10. Testing simultaneous removal of both packages..."
+pacman -U --noconfirm "${BUILD_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+pacman -R --noconfirm tapauth-fprintd tapauth
+echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped after simultaneous removal..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 
 echo "=================================================="
 echo "🎉 ALL ARCH LINUX BUILD AND INSTALL TESTS PASSED!"

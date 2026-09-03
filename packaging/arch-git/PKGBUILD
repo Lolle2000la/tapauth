@@ -53,6 +53,7 @@ package_tapauth-git() {
   cd "${srcdir}/tapauth"
   install -dm0755 "${pkgdir}/etc/tapauth"
   install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
+  install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
   install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"
@@ -74,7 +75,7 @@ package_tapauth-git() {
 }
 
 package_tapauth-fprintd-git() {
-  pkgdesc="Virtual fprintd D-Bus bridge for TapAuth lock screen integration (Development/Git version)"
+  pkgdesc="Virtual fprintd D-Bus bridge for TapAuth lock screen integration (conflicts with hardware fprintd)"
   depends=("tapauth-git=${pkgver}" 'dbus')
   provides=('fprintd' 'tapauth-fprintd')
   conflicts=('fprintd' 'tapauth-fprintd')
@@ -83,5 +84,6 @@ package_tapauth-fprintd-git() {
   cd "${srcdir}/tapauth"
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
   install -Dm0644 packaging/net.reactivated.Fprint.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+  install -Dm0644 packaging/arch/tapauth-fprintd-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-fprintd-pam.hook"
   install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

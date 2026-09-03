@@ -18,6 +18,13 @@ echo " Starting TapAuth E2E Test on Distro: $DISTRO"
 echo " Package directory: $PACKAGE_DIR"
 echo "=================================================="
 
+# Set up a dummy kde-fingerprint to verify PAM stack repair by tapauth-fprintd
+mkdir -p /etc/pam.d
+cat << 'EOF' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+auth    sufficient    pam_fprintd.so
+EOF
+
 case "$DISTRO" in
     fedora)
         echo "==> Installing Fedora runtime requirements..."
@@ -43,6 +50,10 @@ case "$DISTRO" in
         exit 1
         ;;
 esac
+
+echo "==> Verifying PAM fingerprint stack was patched by tapauth-fprintd on $DISTRO..."
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "==> Verifying system users, permissions, and directories..."
 id tapauthd
@@ -81,6 +92,10 @@ case "$DISTRO" in
         pacman -R --noconfirm tapauth-fprintd tapauth
         ;;
 esac
+
+echo "==> Verifying PAM fingerprint stack was cleanly restored after simultaneous removal on $DISTRO..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ON DISTRO: $DISTRO"

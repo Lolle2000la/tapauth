@@ -64,6 +64,14 @@ if command -v authselect >/dev/null 2>&1; then
     authselect select local --force
 fi
 
+echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
+mkdir -p /etc/pam.d
+cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+auth    sufficient    pam_fprintd.so
+account include       system-auth
+PAMEof
+
 echo "==> 9. Testing installation of subpackage (tapauth-fprintd)..."
 dnf install -y /root/rpmbuild/RPMS/*/tapauth-fprintd-${PKG_VER}-*.rpm
 
@@ -74,15 +82,22 @@ MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 test "$OWNER" = "tapauthd:tapauthd"
 test "$MODE" = "644"
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-test -f /etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "==> 10. Testing removal of subpackage (tapauth-fprintd)..."
-dnf remove -y tapauth-fprintd
+rpm -e tapauth-fprintd
 grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 test "$OWNER" = "tapauthd:tapauthd"
 test "$MODE" = "644"
+
+echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "==> 11. Testing complete removal of base package..."
 rpm -e tapauth

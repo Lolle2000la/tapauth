@@ -66,7 +66,13 @@ Modern Linux desktop lock screens (KDE Plasma's `kscreenlocker` and GNOME's `gdm
 ### Optional Package: `tapauth-fprintd`
 TapAuth includes an embedded virtual `fprintd` D-Bus bridge (`net.reactivated.Fprint`) in the daemon. Installing the optional `tapauth-fprintd` package enables automatic desktop lock screen recognition:
 - **How it works:** When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
-- **Physical Fingerprint Hardware Notice:** If your machine already has a physical hardware fingerprint scanner and you actively use upstream `fprintd`, do **not** install `tapauth-fprintd` (they conflict on the D-Bus service name). TapAuth can still be used for `sudo`, PAM, and login via `pam_tapauth.so`.
+
+> [!WARNING]
+> **Installing `tapauth-fprintd` replaces and conflicts with hardware `fprintd`!**
+> Do not install `tapauth-fprintd` if your system has a built-in physical fingerprint reader that you rely on.
+> Because both services claim the `net.reactivated.Fprint` D-Bus bus name, installing `tapauth-fprintd` will replace `fprintd` and reroute fingerprint biometric requests from desktop lock screens to your paired phone instead of your laptop's physical fingerprint scanner.
+> Standard PAM authentication (`sudo`, terminal logins, polkit) via `pam_tapauth.so` works completely independently without `tapauth-fprintd`.
+
 - **Configuration Toggle:** You can disable or enable the virtual bridge anytime in `/etc/tapauth/config.toml` (`enable_fprintd_bridge = true|false`) or dynamically in the `tapauth-config` GUI under **Settings → Connectivity**.
 
 ### Dual-Stack PAM Setup (Manual Configuration)
@@ -265,16 +271,13 @@ Installation paths are automatically detected based on your distribution:
 Usage: ./uninstall.sh [OPTIONS]
 
 OPTIONS:
-    -h, --help              Show help message
-    -n, --non-interactive   Run in non-interactive mode
-    -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --no-pam                Don't remove PAM module
-    --no-gui                Don't remove configuration GUI
-    --remove-pam-login      Remove PAM login configuration
-    --remove-pam-sudo       Remove PAM sudo configuration
-    --remove-pam-polkit     Remove PAM polkit configuration
-    --remove-user-data      Remove user configuration data (keys, pairings)
-    --dry-run               Show what would be done without doing it
+    -h, --help                  Show help message
+    -n, --non-interactive       Run in non-interactive mode
+    -y, --yes                   Answer yes to all prompts (non-interactive; does NOT remove user data)
+    --purge, --remove-user-data Remove user configuration data (keys, pairings; use with caution)
+    --restore-pam-backups       Restore original PAM configurations from .tapauth-bak files
+    --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
+    --dry-run                   Show what would be done without doing it
 ```
 
 ### Examples
@@ -284,19 +287,19 @@ OPTIONS:
 sudo ./uninstall.sh
 ```
 
-#### Complete Removal (Including User Data)
+#### Complete Removal (Purge User Data and Pairings)
 ```bash
-sudo ./uninstall.sh --yes --remove-user-data
+sudo ./uninstall.sh --yes --purge
 ```
 
-#### Remove Only PAM Module
+#### Uninstall While Preserving Pairing Keys & System Accounts (e.g. for Upgrades or Switching to Packages)
 ```bash
-sudo ./uninstall.sh --no-gui
+sudo ./uninstall.sh --yes --preserve-system-accounts
 ```
 
 #### Preview Uninstallation (Dry Run)
 ```bash
-./uninstall.sh --dry-run --yes
+./uninstall.sh --dry-run
 ```
 
 This will show detailed information about what would be removed, including:
@@ -307,11 +310,31 @@ This will show detailed information about what would be removed, including:
 
 **No root access required for dry-run mode.**
 
-#### Remove Components but Keep User Data
-```bash
-sudo ./uninstall.sh --yes
-# (Don't use --remove-user-data flag)
-```
+### Migrating Between Installation Methods
+
+If you previously installed TapAuth using `install.sh` and wish to switch to native distribution packages (`.deb`, `.rpm`, or Arch PKGBUILD), or vice versa:
+
+#### Switching from `install.sh` to Distribution Packages
+1. **Uninstall source files while preserving keys and system accounts**:
+   ```bash
+   sudo ./uninstall.sh --yes --preserve-system-accounts
+   ```
+   This safely cleans up the source binaries and PAM files without wiping `/var/lib/tapauth/` or removing user group memberships.
+2. **Install your distribution's package**:
+   - **Ubuntu / Debian**: `sudo apt install tapauth` (and optionally `tapauth-fprintd`)
+   - **Fedora**: `sudo dnf install tapauth` (and optionally `tapauth-fprintd`)
+   - **Arch Linux**: `yay -S tapauth` (and optionally `tapauth-fprintd`)
+   The newly installed package automatically detects existing pairings in `/var/lib/tapauth/` and configuration in `/etc/tapauth/config.toml`.
+
+#### Switching from Distribution Packages to `install.sh`
+1. **Uninstall the package**:
+   - **Ubuntu / Debian**: `sudo apt remove tapauth tapauth-fprintd` (or `sudo apt purge` to delete configuration)
+   - **Fedora**: `sudo rpm -e tapauth-fprintd tapauth`
+   - **Arch Linux**: `sudo pacman -R tapauth-fprintd tapauth`
+2. **Build and install with `install.sh`**:
+   ```bash
+   ./install.sh
+   ```
 
 ## How PAM Integration Works
 

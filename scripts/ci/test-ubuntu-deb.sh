@@ -20,20 +20,37 @@ echo "=================================================="
 echo "Testing Ubuntu/Debian packaging for TapAuth ${PKG_VER}"
 echo "=================================================="
 
-echo "==> 1. Installing Debian build tools and dependencies..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends     build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config git tar dpkg-dev polkitd dbus curl ca-certificates
+SKIP_BUILD=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-build)
+            SKIP_BUILD=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
 
-# Ensure Rust toolchain >= 1.85 is available for lockfile v4
-if ! command -v cargo >/dev/null 2>&1 || [ "$(rustc --version 2>/dev/null | cut -d ' ' -f2 | cut -d. -f2 || echo 0)" -lt 85 ]; then
-    echo "Installing modern Rust toolchain via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-    export PATH="$HOME/.cargo/bin:$PATH"
+if [ "$SKIP_BUILD" = false ]; then
+    echo "==> 1. Installing Debian build tools and dependencies..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config git tar dpkg-dev polkitd dbus curl ca-certificates
+
+    # Ensure Rust toolchain >= 1.85 is available for lockfile v4
+    if ! command -v cargo >/dev/null 2>&1 || [ "$(rustc --version 2>/dev/null | cut -d ' ' -f2 | cut -d. -f2 || echo 0)" -lt 85 ]; then
+        echo "Installing modern Rust toolchain via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+
+    echo "==> 2. Building Debian packages using build-debian-packages.sh..."
+    "${WORKSPACE_DIR}/scripts/ci/build-debian-packages.sh"
 fi
-
-echo "==> 2. Building Debian packages using build-debian-packages.sh..."
-"${WORKSPACE_DIR}/scripts/ci/build-debian-packages.sh"
 
 echo "==> 3. Testing installation of base package (tapauth)..."
 apt-get install -y /tmp/deb-build/tapauth_${PKG_VER}*.deb
@@ -57,6 +74,14 @@ test "$MODE" = "644"
 test -f /lib/systemd/system/tapauthd.service || test -f /usr/lib/systemd/system/tapauthd.service
 test -f /lib/systemd/system/tapauthd.socket || test -f /usr/lib/systemd/system/tapauthd.socket
 
+echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
+mkdir -p /etc/pam.d
+cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+auth    sufficient    pam_fprintd.so
+@include common-auth
+PAMEof
+
 echo "==> 4. Testing installation of subpackage (tapauth-fprintd)..."
 apt-get install -y /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
 
@@ -69,10 +94,17 @@ test "$MODE" = "644"
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
+echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+
 echo "==> 5. Testing removal of subpackage (tapauth-fprintd)..."
 apt-get remove -y tapauth-fprintd
 test -f /etc/tapauth/config.toml
 grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
+
+echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "==> 6. Testing purge of base package (tapauth)..."
 apt-get purge -y tapauth

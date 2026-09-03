@@ -52,6 +52,9 @@ Provides:       fprintd = 1.94.5
 Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
 authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
 
+WARNING: Installing this package replaces and conflicts with hardware fprintd.
+Do not install if you rely on a physical fingerprint reader.
+
 %prep
 %setup -q -n %{name}-%{version}
 
@@ -159,17 +162,25 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 
 # Virtual fprintd D-Bus Bridge files (subpackage)
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
-mkdir -p %{buildroot}%{_sysconfdir}/dbus-1/system.d
+mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
 install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
-install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+%pre
+%sysusers_create_compat %{_sysusersdir}/tapauth.conf
 
 %post
-%sysusers_create_compat %{_sysusersdir}/tapauth.conf
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
 chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 %systemd_post tapauthd.service tapauthd.socket
+
+echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
+echo "         add your user to the tapauthd-clients group:"
+echo "         sudo usermod -aG tapauthd-clients \$USER"
+echo "TapAuth: To enable system-wide authentication with authselect:"
+echo "         sudo authselect select vendor/tapauth with-silent-lastlog with-mkhomedir --force"
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
@@ -189,27 +200,100 @@ fi
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %post fprintd
+if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+    if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
+        sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
+    else
+        echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
+    fi
+    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+    chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+fi
 
-echo "TapAuth virtual fprintd bridge enabled."
-echo "For lock screen integration, ensure /etc/pam.d/kde-fingerprint or"
-echo "gdm-fingerprint contains: auth [success=done default=bad] /usr/lib/security/pam_tapauth.so"
-if [ "$1" -eq 1 ]; then
-    if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-        if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
-            sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
-        else
-            echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
-        fi
-        chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-        chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+# Wire up PAM stacks for lock screen fingerprint integration
+pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
+for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+    [ -f "$pam_file" ] || continue
+    if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+    fi
+done
+
+# Create gdm-fingerprint if GDM exists but service file does not
+if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm ]; }; then
+    cat << 'EOF' > /etc/pam.d/gdm-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+auth    [success=done default=bad]    pam_tapauth.so
+auth    include                       system-auth
+account include                       system-auth
+session include                       system-auth
+EOF
+    chmod 0644 /etc/pam.d/gdm-fingerprint
+fi
+
+# Create kde-fingerprint if KDE lock screen exists but service file does not
+if [ ! -f /etc/pam.d/kde-fingerprint ] && { [ -f /etc/pam.d/kscreenlocker ] || [ -f /etc/pam.d/kde ] || [ -d /usr/share/plasma ]; }; then
+    cat << 'EOF' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+auth    [success=done default=bad]    pam_tapauth.so
+auth    include                       system-auth
+account include                       system-auth
+session include                       system-auth
+EOF
+    chmod 0644 /etc/pam.d/kde-fingerprint
+fi
+
+# Enable fingerprint authentication in GDM dconf settings
+if [ -d /etc/dconf/db/gdm.d ]; then
+    mkdir -p /etc/dconf/profile
+    if [ ! -f /etc/dconf/profile/gdm ]; then
+        cat << 'EOF' > /etc/dconf/profile/gdm
+user-db:user
+system-db:gdm
+file-db:/usr/share/gdm/greeter-dconf-defaults
+EOF
+    fi
+    cat << 'EOF' > /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+[org/gnome/login-screen]
+enable-fingerprint-authentication=true
+EOF
+    if command -v dconf &>/dev/null; then
+        dconf update 2>/dev/null || true
     fi
 fi
+
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
 elif command -v dbus-send &>/dev/null; then
     dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
 fi
 systemctl try-restart tapauthd.service 2>/dev/null || true
+
+%preun fprintd
+if [ $1 -eq 0 ]; then
+    # Restore PAM stacks
+    for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+        if [ -f "${pam_file}.tapauth-bak" ]; then
+            cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null || true
+            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+        elif [ -f "$pam_file" ]; then
+            if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+                rm -f "$pam_file" 2>/dev/null || true
+            elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+                sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null || true
+            fi
+        fi
+    done
+    if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
+        rm -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+        if command -v dconf &>/dev/null; then
+            dconf update 2>/dev/null || true
+        fi
+    fi
+fi
 
 %postun fprintd
 if [ $1 -eq 0 ]; then
@@ -252,7 +336,7 @@ fi
 %files fprintd
 %license LICENSE
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
-%config(noreplace) %{_sysconfdir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %changelog
 * Wed Sep 02 2026 Luca Auer <lolle2000.la+tapauth@gmail.com> - 0.1.0-1

@@ -36,11 +36,22 @@ pre_remove() {
   for pam_file in /etc/pam.d/*; do
     [ -f "$pam_file" ] || continue
     if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-      if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
-        echo ":: Removed pam_tapauth.so from $pam_file"
-      else
-        failed_files+=("$pam_file")
-      fi
+      case "$(basename "$pam_file")" in
+        kde-fingerprint|gdm-fingerprint|fingerprint-auth)
+          if sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null; then
+            echo ":: Restored pam_fprintd.so in $pam_file"
+          else
+            failed_files+=("$pam_file")
+          fi
+          ;;
+        *)
+          if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+            echo ":: Removed pam_tapauth.so from $pam_file"
+          else
+            failed_files+=("$pam_file")
+          fi
+          ;;
+      esac
     fi
   done
   if [ ${#failed_files[@]} -gt 0 ]; then

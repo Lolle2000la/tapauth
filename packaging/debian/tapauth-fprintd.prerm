@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+	# Restore PAM stacks
+	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+		if [ -f "${pam_file}.tapauth-bak" ]; then
+			cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null || true
+			rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+		elif [ -f "$pam_file" ]; then
+			if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+				rm -f "$pam_file" 2>/dev/null || true
+			elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+				sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null || true
+			fi
+		fi
+	done
+
+	# Remove GDM dconf override
+	if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
+		rm -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+		if command -v dconf >/dev/null 2>&1; then
+			dconf update 2>/dev/null || true
+		fi
+	fi
+fi
+
+#DEBHELPER#
+exit 0

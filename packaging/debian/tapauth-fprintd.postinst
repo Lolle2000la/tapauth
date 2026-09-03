@@ -13,6 +13,62 @@ if [ "$1" = "configure" ]; then
 		chmod 644 /etc/tapauth/config.toml
 		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 	fi
+
+	# Wire up PAM stacks for lock screen fingerprint integration
+	pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
+	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+		[ -f "$pam_file" ] || continue
+		if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+			[ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+			sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+		fi
+	done
+
+	# Create gdm-fingerprint if GDM exists but service file does not
+	if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm3 ] || [ -d /etc/gdm ]; }; then
+		cat << 'EOF' > /etc/pam.d/gdm-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+auth    [success=done default=bad]    pam_tapauth.so
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+EOF
+		chmod 644 /etc/pam.d/gdm-fingerprint
+	fi
+
+	# Create kde-fingerprint if KDE lock screen exists but service file does not
+	if [ ! -f /etc/pam.d/kde-fingerprint ] && { [ -f /etc/pam.d/kscreenlocker ] || [ -f /etc/pam.d/kde ] || [ -d /usr/share/plasma ]; }; then
+		cat << 'EOF' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+auth    [success=done default=bad]    pam_tapauth.so
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+EOF
+		chmod 644 /etc/pam.d/kde-fingerprint
+	fi
+
+	# Enable fingerprint authentication in GDM dconf settings
+	if [ -d /etc/dconf/db/gdm.d ]; then
+		mkdir -p /etc/dconf/profile
+		if [ ! -f /etc/dconf/profile/gdm ]; then
+			cat << 'EOF' > /etc/dconf/profile/gdm
+user-db:user
+system-db:gdm
+file-db:/usr/share/gdm/greeter-dconf-defaults
+EOF
+		fi
+		cat << 'EOF' > /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+[org/gnome/login-screen]
+enable-fingerprint-authentication=true
+EOF
+		if command -v dconf >/dev/null 2>&1; then
+			dconf update 2>/dev/null || true
+		fi
+	fi
+
 	if command -v deb-systemd-invoke >/dev/null 2>&1; then
 		deb-systemd-invoke reload dbus || true
 		deb-systemd-invoke try-restart tapauthd.service || true

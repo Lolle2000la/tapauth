@@ -2,13 +2,14 @@ Source: tapauth
 Section: admin
 Priority: optional
 Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
-Build-Depends: debhelper-compat (= 13), cargo, rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91 | cargo, rustc (>= 1.85) | rustc-1.91 | rustc, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
 Standards-Version: 4.7.0
 
 Package: tapauth
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd, libdbus-1-3, bluez
-Suggests: firewalld, iptables, tapauth-fprintd
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd, libdbus-1-3
+Recommends: bluez, iptables
+Suggests: firewalld, tapauth-fprintd
 Description: Local smartphone-based authentication framework
  A modern, privacy-preserving local-first authentication system.
 
@@ -19,4 +20,8 @@ Conflicts: fprintd
 Provides: fprintd
 Replaces: fprintd
 Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
- Virtual net.reactivated.Fprint D-Bus service.
+ Virtual net.reactivated.Fprint D-Bus service allowing desktop lock screens
+ (GDM, KDE Screenlocker) to unlock via TapAuth smartphone biometric verification.
+ .
+ WARNING: Installing this package replaces and conflicts with hardware fprintd.
+ Do not install if you rely on a physical fingerprint reader.

@@ -4,11 +4,16 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 CARGO_FEATURES ?=
 
+CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
+
 %:
 	dh $@
 
+override_dh_clean:
+	dh_clean -Xvendor/
+
 override_dh_auto_build:
-	cargo build --workspace --release --locked $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES))
+	$(CARGO) build --workspace --release $(if $(wildcard vendor),--offline --frozen,--locked) $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES))
 
 override_dh_auto_install:
 	mkdir -p debian/tapauth/usr/bin
@@ -37,6 +42,11 @@ override_dh_auto_install:
 	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
 	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
 	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+
+	if [ "$$(dpkg-parsechangelog -S Distribution 2>/dev/null)" = "jammy" ] && [ -f packaging/tapauthd.pkla ]; then \
+		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
+		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \
+	fi
 	
 	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system-services
 	mkdir -p debian/tapauth-fprintd/usr/share/dbus-1/system.d

@@ -53,18 +53,6 @@ post_upgrade() {
 }
 
 pre_remove() {
-  if grep -rq "pam_fprintd.so" /etc/pam.d/ 2>/dev/null; then
-    echo ":: WARNING: Found references to pam_fprintd.so in /etc/pam.d/."
-    echo ":: Please remove or adjust them to avoid authentication issues!"
-  fi
-}
-
-post_remove() {
-  if [ -f /etc/tapauth/config.toml ]; then
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
-    chmod 644 /etc/tapauth/config.toml
-    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
-  fi
   # Restore pam_fprintd.so in fingerprint PAM stacks if pam_tapauth.so was substituted
   for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
     [ -f "$pam_file" ] || continue
@@ -73,6 +61,14 @@ post_remove() {
         echo ":: Restored pam_fprintd.so in $pam_file"
     fi
   done
+}
+
+post_remove() {
+  if [ -f /etc/tapauth/config.toml ]; then
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
   fi
