@@ -1213,8 +1213,15 @@ DENIAL_OUT_LOG="${TEST_DIR}/denial-cli.log"
 "$CLI_BIN" pam-auth "$TEST_USER" 10 > "$DENIAL_OUT_LOG" 2>&1 &
 DENIAL_CLI_PID=$!
 
-sleep 0.5
-"$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny "$APP_PKG"
+# Trigger denial repeatedly while the request is in flight to ensure it catches
+# the active request without racing UDP transit or background scheduling delays.
+for _ in {1..15}; do
+    if ! kill -0 "$DENIAL_CLI_PID" 2>/dev/null; then
+        break
+    fi
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny "$APP_PKG"
+    sleep 0.3
+done
 
 set +e
 wait "$DENIAL_CLI_PID"

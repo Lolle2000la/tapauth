@@ -39,6 +39,14 @@ echo "=================================================="
 sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
 sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
 
+# Pass emulator auth token to containers so adb emu can authenticate to the console
+AUTH_TOKEN_MOUNT=()
+if [ -f "$HOME/.emulator_auth_token" ]; then
+  AUTH_TOKEN_MOUNT=(-v "$HOME/.emulator_auth_token:/root/.emulator_auth_token:ro")
+elif [ -f "/root/.emulator_auth_token" ]; then
+  AUTH_TOKEN_MOUNT=(-v "/root/.emulator_auth_token:/root/.emulator_auth_token:ro")
+fi
+
 # 3. Run E2E against installed Fedora (.rpm) package in container
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
@@ -49,6 +57,7 @@ docker run --rm --privileged --net=host --pid=host \
   -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
   -v "$WORKSPACE_DIR":/workspace \
+  ${AUTH_TOKEN_MOUNT[@]+"${AUTH_TOKEN_MOUNT[@]}"} \
   fedora:latest /workspace/scripts/ci/run-container-e2e.sh fedora /workspace/pkg-fedora
 
 # 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in container
@@ -61,6 +70,7 @@ docker run --rm --privileged --net=host --pid=host \
   -v /tmp:/tmp \
   -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
   -v "$WORKSPACE_DIR":/workspace \
+  ${AUTH_TOKEN_MOUNT[@]+"${AUTH_TOKEN_MOUNT[@]}"} \
   archlinux:base-devel /workspace/scripts/ci/run-container-e2e.sh arch /workspace/pkg-arch
 
 echo "=================================================="
