@@ -1275,11 +1275,17 @@ configure_pam() {
         
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
             local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
-            if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
+            local gdm_fp_target="/etc/pam.d/gdm-fingerprint"
+            if [[ -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm3 ]]; then
+                gdm_fp_target="/etc/pam.d/gdm3-fingerprint"
+            fi
+            if [[ -f "$gdm_fp_target" ]]; then
+                show_pam_diff "$gdm_fp_target" "$pam_decisive_line" "pam_env.so"
+            elif [[ -f /etc/pam.d/gdm-fingerprint ]]; then
                 show_pam_diff "/etc/pam.d/gdm-fingerprint" "$pam_decisive_line" "pam_env.so"
             else
                 echo ""
-                echo -e "${YELLOW}[CREATE]${NC} /etc/pam.d/gdm-fingerprint"
+                echo -e "${YELLOW}[CREATE]${NC} $gdm_fp_target"
                 echo "  → Dual-stack secondary service with decisive flag"
             fi
             if [[ -d /etc/dconf/db/gdm.d ]]; then
@@ -1480,22 +1486,34 @@ configure_pam() {
         print_info "Configuring PAM for GDM (GNOME dual-stack & lock screen)..."
         local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
         
-        # Configure /etc/pam.d/gdm-fingerprint (dual-stack secondary service)
-        if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
-            insert_pam_decisive "/etc/pam.d/gdm-fingerprint"
-            print_success "Configured PAM for GDM fingerprint (gdm-fingerprint)"
-        elif [[ -f /etc/pam.d/gdm-password || -f /etc/pam.d/gdm || -d /etc/gdm || -d /etc/gdm3 ]]; then
-            print_info "Creating /etc/pam.d/gdm-fingerprint for dual-stack GNOME lock screen..."
-            local includes
-            includes=$(get_pam_distro_includes)
-            cat << EOF > /etc/pam.d/gdm-fingerprint
+        # Configure /etc/pam.d/gdm-fingerprint or /etc/pam.d/gdm3-fingerprint (dual-stack secondary service)
+        local configured_gdm=false
+        for fp_file in /etc/pam.d/gdm3-fingerprint /etc/pam.d/gdm-fingerprint; do
+            if [[ -f "$fp_file" ]]; then
+                insert_pam_decisive "$fp_file"
+                print_success "Configured PAM for GDM fingerprint ($fp_file)"
+                configured_gdm=true
+            fi
+        done
+
+        if [[ "$configured_gdm" == false ]]; then
+            local target_fp="/etc/pam.d/gdm-fingerprint"
+            if [[ -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm3 ]]; then
+                target_fp="/etc/pam.d/gdm3-fingerprint"
+            fi
+            if [[ -f /etc/pam.d/gdm-password || -f /etc/pam.d/gdm || -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm || -d /etc/gdm3 ]]; then
+                print_info "Creating $target_fp for dual-stack GNOME lock screen..."
+                local includes
+                includes=$(get_pam_distro_includes)
+                cat << EOF > "$target_fp"
 #%PAM-1.0
 # Managed by TapAuth
 $pam_decisive_line
 $includes
 EOF
-            chmod 644 /etc/pam.d/gdm-fingerprint
-            print_success "Created /etc/pam.d/gdm-fingerprint"
+                chmod 644 "$target_fp"
+                print_success "Created $target_fp"
+            fi
         fi
 
         # Enable fingerprint authentication in GDM dconf settings

@@ -379,6 +379,17 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
+    // De-duplicate invocations within the same PAM transaction:
+    // If an earlier module in the same PAM stack (e.g. gdm-fingerprint or kde-fingerprint)
+    // already invoked pam_tapauth, subsequent invocations via common-auth or system-auth
+    // must not trigger a second phone tap prompt or secondary timeout.
+    if unsafe { pam_sys::has_already_attempted(pamh) } {
+        tracing::info!(
+            "TapAuth: Already attempted within this PAM transaction; returning PAM_IGNORE to allow password fallback"
+        );
+        return pam_sys::PAM_IGNORE;
+    }
+
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
     let is_polkit = service == "polkit-1";
     let tty_file = if !is_polkit {
@@ -396,6 +407,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             service
         );
         return pam_sys::PAM_IGNORE;
+    }
+
+    // Mark that an authentication attempt is beginning for this PAM transaction
+    unsafe {
+        pam_sys::mark_attempted(pamh);
     }
 
     // Load configuration for timeouts
@@ -870,6 +886,8 @@ pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
         "kde-u2f",
         "gdm-fingerprint",
         "gdm-smartcard",
+        "gdm3-fingerprint",
+        "gdm3-smartcard",
         "sddm-fingerprint",
     ];
     if DUAL_STACK_SECONDARY.iter().any(|s| service_lower == *s) {
@@ -998,6 +1016,14 @@ mod tests {
         );
         assert_eq!(
             classify_pam_context("gdm-fingerprint", false),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("gdm3-fingerprint", false),
+            PamContext::DualStackSecondary
+        );
+        assert_eq!(
+            classify_pam_context("gdm3-smartcard", false),
             PamContext::DualStackSecondary
         );
         assert_eq!(
@@ -1433,5 +1459,14 @@ mod gui_loop_tests {
             map_pam_outcome(&error_resp, "testuser", &conv, &msgs, context),
             pam_sys::PAM_AUTHINFO_UNAVAIL
         );
+    }
+
+    #[test]
+    fn test_attempt_tracking_null_handle() {
+        unsafe {
+            assert!(!pam_sys::has_already_attempted(std::ptr::null_mut()));
+            pam_sys::mark_attempted(std::ptr::null_mut());
+            assert!(!pam_sys::has_already_attempted(std::ptr::null_mut()));
+        }
     }
 }

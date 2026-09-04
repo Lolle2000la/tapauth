@@ -38,12 +38,18 @@ pre_remove() {
   local failed_files=()
   for pam_file in /etc/pam.d/*; do
     [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
     if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
       case "$(basename "$pam_file")" in
         kde-fingerprint|gdm-fingerprint|fingerprint-auth)
           if [ -f "${pam_file}.tapauth-bak" ]; then
-            cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
-          elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
+            if [ ! "$pam_file" -nt "${pam_file}.tapauth-bak" ]; then
+              cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
+            else
+              sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || failed_files+=("$pam_file")
+              rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            fi
+          elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; then
             if sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null; then
               echo ":: Restored pam_fprintd.so in $pam_file"
             else

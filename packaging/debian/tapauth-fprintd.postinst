@@ -16,16 +16,30 @@ if [ "$1" = "configure" ]; then
 
 	# Wire up PAM stacks for lock screen fingerprint integration
 	pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
-	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
 		[ -f "$pam_file" ] || continue
+		[ -L "$pam_file" ] && continue
 		if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
 			[ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
 			sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
 		fi
 	done
 
-	# Create gdm-fingerprint if GDM exists but service file does not
-	if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm3 ] || [ -d /etc/gdm ]; }; then
+	# Create gdm3-fingerprint if Debian/Ubuntu GDM3 exists but service file does not
+	if [ ! -f /etc/pam.d/gdm3-fingerprint ] && { [ -f /etc/pam.d/gdm3-password ] || [ -d /etc/gdm3 ]; }; then
+		cat << 'EOF' > /etc/pam.d/gdm3-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+auth    [success=done default=bad]    pam_tapauth.so
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+EOF
+		chmod 644 /etc/pam.d/gdm3-fingerprint
+	fi
+
+	# Create gdm-fingerprint if upstream GDM exists but service file does not
+	if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm ]; }; then
 		cat << 'EOF' > /etc/pam.d/gdm-fingerprint
 #%PAM-1.0
 # Managed by TapAuth

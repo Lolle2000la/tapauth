@@ -391,12 +391,15 @@ impl AuthSession {
             request_id: self.request_id.clone(),
         };
 
-        // If the request originates from GDM's biometric stack (gdm-fingerprint or gdm-smartcard),
+        // If the request originates from GDM's biometric stack (gdm-fingerprint, gdm3-fingerprint, etc.),
         // check whether the user already has an active session with LockedHint == true.
         // If not (initial login screen), return Ignore immediately so the greeter falls through to
         // password collection, populating PAM_AUTHTOK and unlocking GNOME Keyring.
         if let Some(ref service) = service_name {
-            if (service == "gdm-fingerprint" || service == "gdm-smartcard")
+            if (service == "gdm-fingerprint"
+                || service == "gdm-smartcard"
+                || service == "gdm3-fingerprint"
+                || service == "gdm3-smartcard")
                 && !is_user_session_locked(&self.username).await
             {
                 tracing::info!(

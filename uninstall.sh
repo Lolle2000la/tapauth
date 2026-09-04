@@ -481,15 +481,17 @@ remove_pam_config() {
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
     fi
 
-    if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
-        if grep -q "Managed by TapAuth" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
-            print_info "Removing synthetic GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
-            rm -f /etc/pam.d/gdm-fingerprint
-        elif grep -q "pam_tapauth.so" /etc/pam.d/gdm-fingerprint 2>/dev/null; then
-            print_info "Removing TapAuth from GDM fingerprint PAM configuration (/etc/pam.d/gdm-fingerprint)"
-            sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-fingerprint
+    for gdm_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint; do
+        if [[ -f "$gdm_file" ]]; then
+            if grep -q "Managed by TapAuth" "$gdm_file" 2>/dev/null; then
+                print_info "Removing synthetic GDM fingerprint PAM configuration ($gdm_file)"
+                rm -f "$gdm_file"
+            elif grep -q "pam_tapauth.so" "$gdm_file" 2>/dev/null; then
+                print_info "Removing TapAuth from GDM fingerprint PAM configuration ($gdm_file)"
+                sed -i '/pam_tapauth\.so/d' "$gdm_file"
+            fi
         fi
-    fi
+    done
     
     # Remove from SDDM
     if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then

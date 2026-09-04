@@ -28,6 +28,7 @@ BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pam-devel
 BuildRequires:  systemd-rpm-macros
+%{?sysusers_requires_compat}
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -173,7 +174,13 @@ install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %pre
-%sysusers_create_compat %{_sysusersdir}/tapauth.conf
+%{?sysusers_create_compat:%sysusers_create_compat packaging/sysusers.conf}
+if ! getent passwd tapauthd >/dev/null 2>&1; then
+    getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd 2>/dev/null || :
+    getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients 2>/dev/null || :
+    useradd -r -g tapauthd -G tapauthd-clients -d /var/lib/tapauth -s /sbin/nologin \
+        -c "TapAuth Daemon" tapauthd 2>/dev/null || :
+fi
 
 %post
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
@@ -190,7 +197,9 @@ echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
 echo "         add your user to the tapauthd-clients group:"
 echo "         sudo usermod -aG tapauthd-clients \$USER"
 echo "TapAuth: To enable system-wide authentication with authselect:"
-echo "         sudo authselect select tapauth with-silent-lastlog with-mkhomedir --force"
+echo "         sudo authselect select tapauth with-silent-lastlog with-mkhomedir --backup=pre-tapauth --force"
+echo "TapAuth: On SELinux enforcing systems, if greeter access to the socket is denied,"
+echo "         inspect audit logs: ausearch -m avc -ts recent | audit2allow -M tapauth_selinux"
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
@@ -201,7 +210,10 @@ if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
         target_profile="local"
         [ "$current_profile" = "tapauth-sssd" ] && target_profile="sssd"
         features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
-        authselect select "$target_profile" $features --force || true
+        if ! authselect select "$target_profile" $features --backup=tapauth-uninstall --force 2>/dev/null; then
+            echo "WARNING: Failed to automatically revert authselect profile to $target_profile." >&2
+            echo "         Please run 'sudo authselect select $target_profile' manually to avoid PAM issues." >&2
+        fi
     fi
 fi
 %endif
@@ -297,13 +309,19 @@ if [ $1 -eq 0 ]; then
     for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
         [ -L "$pam_file" ] && continue
         if [ -f "${pam_file}.tapauth-bak" ]; then
-            cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null || true
-            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            if [ ! "$pam_file" -nt "${pam_file}.tapauth-bak" ]; then
+                if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
+                    rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+                fi
+            else
+                sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+                rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            fi
         elif [ -f "$pam_file" ]; then
             if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
                 rm -f "$pam_file" 2>/dev/null || true
             elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-                sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null || true
+                sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
             fi
         fi
     done

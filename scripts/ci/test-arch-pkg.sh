@@ -132,11 +132,19 @@ test "$MODE" = "644"
 echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 10. Testing simultaneous removal of both packages..."
+echo "==> 10. Testing simultaneous removal of both packages (order: tapauth-fprintd tapauth)..."
 pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 pacman -R --noconfirm tapauth-fprintd tapauth
 echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped after simultaneous removal..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+
+echo "==> 11. Testing simultaneous removal in reverse order (order: tapauth tapauth-fprintd)..."
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+pacman -R --noconfirm tapauth tapauth-fprintd
+echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped in reverse removal order..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 

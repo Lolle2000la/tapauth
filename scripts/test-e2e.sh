@@ -334,6 +334,13 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
     echo "    Found installed tapauthd:       $TAPAUTHD_BIN"
     echo "    Found installed tapauth-ipc-cli: $CLI_BIN"
     echo "    Found installed pam_tapauth.so:  $PAM_LIB"
+
+    # Capability probe: detect whether the installed daemon contains dev-mode shims
+    if strings "$TAPAUTHD_BIN" | grep -q 'TAPAUTH_DEV_UDP_TARGET' 2>/dev/null; then
+        echo "    Daemon Capabilities:            dev shims enabled (UDP loopback, PolKit bypass)"
+    else
+        echo "    Daemon Capabilities:            production release build (no dev shims, systemd activation required)"
+    fi
 else
     echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."
     # Pin the cargo target directory so the artifact paths below are deterministic
@@ -1107,6 +1114,20 @@ if command -v dbus-send >/dev/null 2>&1; then
                 echo "❌ ERROR: Virtual fprintd ListEnrolledFingers call failed:"
                 cat "${TEST_DIR}/fprint_fingers.log"
                 exit 1
+            fi
+
+            if [ -f "$SCRIPT_DIR/ci/test-fprint-verify.py" ] && python3 -c "from gi.repository import Gio" >/dev/null 2>&1; then
+                echo "==> Testing Claim -> VerifyStart -> VerifyStatus('verify-match') -> Release lifecycle..."
+                "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+                sleep 0.5
+                if python3 "$SCRIPT_DIR/ci/test-fprint-verify.py" "$DEV_PATH" "$TEST_USER" 15 > "${TEST_DIR}/fprint_verify.log" 2>&1; then
+                    cat "${TEST_DIR}/fprint_verify.log"
+                    echo "✅ Virtual fprintd full Claim -> VerifyStart -> VerifyStatus('verify-match') cycle verified!"
+                else
+                    echo "❌ ERROR: Virtual fprintd Claim -> VerifyStart cycle failed:"
+                    cat "${TEST_DIR}/fprint_verify.log"
+                    exit 1
+                fi
             fi
         else
             echo "❌ ERROR: Could not parse device path from GetDefaultDevice output:"
