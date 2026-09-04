@@ -59,13 +59,12 @@ pre_remove() {
   for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
+    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+      continue
+    fi
     if [ -f "${pam_file}.tapauth-bak" ]; then
-      if [ ! "$pam_file" -nt "${pam_file}.tapauth-bak" ]; then
-        cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
-      else
-        sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null
-        rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-      fi
+      cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
     elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
       sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null && \
         echo ":: Restored pam_fprintd.so in $pam_file"

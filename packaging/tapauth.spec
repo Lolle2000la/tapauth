@@ -308,21 +308,20 @@ if [ $1 -eq 0 ]; then
     # Restore PAM stacks (non-authselect files)
     for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
         [ -L "$pam_file" ] && continue
-        if [ -f "${pam_file}.tapauth-bak" ]; then
-            if [ ! "$pam_file" -nt "${pam_file}.tapauth-bak" ]; then
-                if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
-                    rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-                fi
-            else
-                sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+        [ -f "$pam_file" ] || continue
+        if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+            # Active PAM stack was modified to remove TapAuth; drop stale backup without clobbering
+            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            continue
+        fi
+        if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+            rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        elif [ -f "${pam_file}.tapauth-bak" ]; then
+            if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
                 rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
             fi
-        elif [ -f "$pam_file" ]; then
-            if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
-                rm -f "$pam_file" 2>/dev/null || true
-            elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-                sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
-            fi
+        else
+            sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
         fi
     done
     if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
