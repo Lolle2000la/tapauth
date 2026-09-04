@@ -88,9 +88,13 @@ jobs:
           sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${{ steps.version_vars.outputs.VERSION }}/g" rpmbuild/SPECS/tapauth.spec
           sed -i "s/Release:        1%{?dist}/Release:        ${{ steps.version_vars.outputs.RELEASE }}%{?dist}/g" rpmbuild/SPECS/tapauth.spec
 
-          # Dynamically append changelog entries
+          # Dynamically prepend changelog entry under existing %changelog
           CURRENT_DATE=$(date +"%a %b %d %Y")
-          echo -e "\n%changelog\n* $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-${{ steps.version_vars.outputs.RELEASE }}\n- Automated build." >> rpmbuild/SPECS/tapauth.spec
+          sed -i "/^%changelog/a * $CURRENT_DATE Luca Auer <lolle2000.la+tapauth@gmail.com> - ${{ steps.version_vars.outputs.VERSION }}-${{ steps.version_vars.outputs.RELEASE }}\n- Automated build." rpmbuild/SPECS/tapauth.spec
+
+          # Copy supplementary source files
+          cp packaging/sysusers.conf rpmbuild/SOURCES/tapauth-sysusers.conf
+          cp packaging/tmpfiles.conf rpmbuild/SOURCES/tapauth-tmpfiles.conf
 
           # Validate spec file with rpmlint
           rpmlint rpmbuild/SPECS/tapauth.spec || true

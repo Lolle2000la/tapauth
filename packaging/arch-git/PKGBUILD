@@ -37,7 +37,7 @@ build() {
 
 package_tapauth-git() {
   pkgdesc="Local smartphone-based authentication framework engine (Development/Git version)"
-  depends=('dbus' 'pam' 'wayland')
+  depends=('dbus' 'pam' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon')
   optdepends=(
     'polkit: for polkit agent authentication helper'
     'firewalld: for automated firewall port management'

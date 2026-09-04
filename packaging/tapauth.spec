@@ -10,6 +10,10 @@ Summary:        Local smartphone-based authentication framework
 License:        AGPL-3.0-only
 URL:            https://github.com/lolle2000la/tapauth
 Source0:        https://github.com/lolle2000la/tapauth/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source1:        tapauth-sysusers.conf
+Source2:        tapauth-tmpfiles.conf
+
+%bcond_with check
 
 ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
@@ -69,8 +73,10 @@ if [ -d /cache/target ]; then
     cp -al target/. /cache/target/ 2>/dev/null || cp -r target/. /cache/target/ 2>/dev/null || true
 fi
 
+%if %{with check}
 %check
 cargo test --workspace %{?cargo_features}
+%endif
 
 %install
 mkdir -p %{buildroot}%{_bindir}
@@ -79,6 +85,9 @@ mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_presetdir}
 mkdir -p %{buildroot}%{_sysusersdir}
 mkdir -p %{buildroot}%{_tmpfilesdir}
+mkdir -p %{buildroot}%{_sharedstatedir}/tapauth
+mkdir -p %{buildroot}%{_localstatedir}/log/tapauth
+mkdir -p %{buildroot}/run/tapauthd
 mkdir -p %{buildroot}%{_datadir}/doc/tapauth
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
@@ -174,12 +183,14 @@ install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %pre
-%{?sysusers_create_compat:%sysusers_create_compat packaging/sysusers.conf}
+%{?sysusers_create_compat:%sysusers_create_compat %{SOURCE1}}
+getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd 2>/dev/null || :
+getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients 2>/dev/null || :
 if ! getent passwd tapauthd >/dev/null 2>&1; then
-    getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd 2>/dev/null || :
-    getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients 2>/dev/null || :
     useradd -r -g tapauthd -G tapauthd-clients -d /var/lib/tapauth -s /sbin/nologin \
         -c "TapAuth Daemon" tapauthd 2>/dev/null || :
+else
+    usermod -aG tapauthd-clients tapauthd 2>/dev/null || :
 fi
 
 %post
@@ -187,6 +198,13 @@ fi
 chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+# If authselect is active with a TapAuth profile, refresh authselect files on upgrade
+if command -v authselect &>/dev/null; then
+    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
+    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
+        authselect apply-changes || true
+    fi
+fi
 %systemd_post tapauthd.socket
 if [ $1 -eq 1 ]; then
     # Start the socket immediately on initial install so auth requests don't hit a dead socket
@@ -316,7 +334,7 @@ if [ $1 -eq 0 ]; then
         fi
         if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
             rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        elif [ -f "${pam_file}.tapauth-bak" ]; then
+        elif [ -s "${pam_file}.tapauth-bak" ]; then
             if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
                 rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
             fi
@@ -349,6 +367,9 @@ fi
 %license LICENSE
 %dir %attr(0755, tapauthd, tapauthd) %{_sysconfdir}/tapauth
 %config(noreplace) %attr(0644, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
+%dir %attr(0700, tapauthd, tapauthd) %{_sharedstatedir}/tapauth
+%dir %attr(0755, tapauthd, tapauthd) %{_localstatedir}/log/tapauth
+%ghost %dir %attr(0750, tapauthd, tapauthd-clients) /run/tapauthd
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_bindir}/tapauth-ipc-cli

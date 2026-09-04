@@ -42,7 +42,7 @@ pre_remove() {
     if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
       case "$(basename "$pam_file")" in
         kde-fingerprint|gdm-fingerprint|fingerprint-auth)
-          if [ -f "${pam_file}.tapauth-bak" ]; then
+          if [ -s "${pam_file}.tapauth-bak" ]; then
             cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
           elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; then
             if sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null; then

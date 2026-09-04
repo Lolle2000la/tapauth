@@ -48,6 +48,13 @@ CFGEOF
 }
 
 post_upgrade() {
+  local pam_decisive="auth    [success=done default=bad]    /usr/lib/security/pam_tapauth.so"
+  for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
+    [ -f "$pam_file" ] || continue
+    if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+    fi
+  done
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
   fi
@@ -63,7 +70,7 @@ pre_remove() {
       rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
       continue
     fi
-    if [ -f "${pam_file}.tapauth-bak" ]; then
+    if [ -s "${pam_file}.tapauth-bak" ]; then
       cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
     elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
       sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null && \

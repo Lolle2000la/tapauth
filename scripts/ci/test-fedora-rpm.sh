@@ -46,6 +46,8 @@ if [ "$SKIP_BUILD" = false ]; then
     mkdir -p "/tmp/src/tapauth-${PKG_VER}"
     tar -C "${WORKSPACE_DIR}" --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle -cf - . | tar -C "/tmp/src/tapauth-${PKG_VER}" -xf -
     tar -C /tmp/src -czf "/root/rpmbuild/SOURCES/tapauth-${PKG_VER}.tar.gz" "tapauth-${PKG_VER}"
+    cp "${WORKSPACE_DIR}/packaging/sysusers.conf" "/root/rpmbuild/SOURCES/tapauth-sysusers.conf"
+    cp "${WORKSPACE_DIR}/packaging/tmpfiles.conf" "/root/rpmbuild/SOURCES/tapauth-tmpfiles.conf"
 
     echo "==> 5. Building SRPM and Binary RPMs with rpmbuild..."
     rpmbuild -ba /root/rpmbuild/SPECS/tapauth.spec --define "_topdir /root/rpmbuild"

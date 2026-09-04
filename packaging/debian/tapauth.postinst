@@ -27,7 +27,7 @@ if [ "$1" = "configure" ]; then
 		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 	fi
 	if command -v pam-auth-update >/dev/null 2>&1; then
-		pam-auth-update --package
+		pam-auth-update --package || true
 	fi
 	echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
 	echo "         add your user to the tapauthd-clients group:"

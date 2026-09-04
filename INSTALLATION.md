@@ -66,6 +66,11 @@ yay -S tapauth
 paru -S tapauth-fprintd
 # (or for development/git versions: paru -S tapauth-fprintd-git)
 ```
+* **Service Activation:** Arch Linux does not enable or start services automatically upon installation. Enable and start the TapAuth daemon socket:
+  ```bash
+  sudo systemctl enable --now tapauthd.socket
+  ```
+
 * **Group Membership:** Add your user to the `tapauthd-clients` group:
   ```bash
   sudo usermod -aG tapauthd-clients $USER
