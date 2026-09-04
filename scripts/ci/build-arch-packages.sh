@@ -27,8 +27,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "==> Installing build dependencies (cargo, protobuf, clang, pam)..."
-    pacman -Sy --noconfirm cargo protobuf clang pam
+    echo "==> Installing build dependencies (cargo, protobuf, clang, pam, sccache)..."
+    pacman -Sy --noconfirm --needed cargo protobuf clang pam sccache
 fi
 
 BUILD_DIR="/tmp/arch-build-src"
@@ -63,10 +63,10 @@ if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
 if [ -d /cache ]; then
-    mkdir -p /cache/cargo /cache/target
+    mkdir -p /cache/cargo /cache/sccache /cache/target
     chown -R builder:builder /cache
     sed -i 's|export CARGO_HOME=.*|export CARGO_HOME="/cache/cargo"|' PKGBUILD
-    sed -i '/export CARGO_PROFILE_RELEASE_STRIP=/a \  export CARGO_TARGET_DIR="/cache/target"' PKGBUILD
+    sed -i '/export CARGO_PROFILE_RELEASE_STRIP=/a \  export RUSTC_WRAPPER=sccache\n  export SCCACHE_DIR="/cache/sccache"\n  export CARGO_TARGET_DIR="/cache/target"' PKGBUILD
     sed -i 's|target/release/|/cache/target/release/|g' PKGBUILD
 fi
 chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"

@@ -33,7 +33,7 @@ done
 
 if ! command -v rpmbuild >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     echo "==> Installing build dependencies for Fedora..."
-    dnf install -y rpm-build cargo rust protobuf-compiler clang pam-devel systemd-devel dbus-devel
+    dnf install -y --setopt=keepcache=1 rpm-build cargo rust protobuf-compiler clang pam-devel systemd-devel dbus-devel sccache
 fi
 
 echo "==> Preparing RPM build directory structure..."
@@ -50,6 +50,8 @@ tar -czf "$RPM_ROOT/SOURCES/tapauth-${PKG_VER}.tar.gz" \
     --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle \
     --transform "s,^./,tapauth-${PKG_VER}/," \
     -C "${WORKSPACE_DIR}" .
+cp "${WORKSPACE_DIR}/packaging/sysusers.conf" "$RPM_ROOT/SOURCES/tapauth-sysusers.conf"
+cp "${WORKSPACE_DIR}/packaging/tmpfiles.conf" "$RPM_ROOT/SOURCES/tapauth-tmpfiles.conf"
 
 # Define cargo_features macro if features were passed
 RPMBUILD_ARGS=("-ba" "$RPM_ROOT/SPECS/tapauth.spec")

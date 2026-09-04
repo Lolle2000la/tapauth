@@ -173,26 +173,30 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Cache Cargo Registry & Target
+      - name: Cache Cargo, sccache, and DNF
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cache/target-fedora
-          key: ${{ runner.os }}-cargo-target-fedora-v2-${{ hashFiles('Cargo.lock') }}
+            ~/.cache/sccache
+            ~/.cache/dnf
+          key: ${{ runner.os }}-fedora-sccache-v1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-target-fedora-v2-
-            ${{ runner.os }}-cargo-target-fedora-
+            ${{ runner.os }}-fedora-sccache-v1-
+            ${{ runner.os }}-fedora-sccache-
 
       - name: Build TapAuth Fedora RPM Packages
         run: |
-          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/target-fedora
+          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/sccache ~/.cache/dnf
           docker run --rm \
             -v "$PWD":/workspace \
             -v ~/.cargo/registry:/root/.cargo/registry \
             -v ~/.cargo/git:/root/.cargo/git \
-            -v ~/.cache/target-fedora:/cache/target \
+            -v ~/.cache/sccache:/root/.cache/sccache \
+            -v ~/.cache/dnf:/var/cache/dnf \
+            -e RUSTC_WRAPPER=sccache \
+            -e SCCACHE_DIR=/root/.cache/sccache \
             fedora:latest \
             bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
           sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
@@ -220,24 +224,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Cache Cargo Registry & Target
+      - name: Cache Cargo, sccache, and Pacman
         uses: actions/cache@v6
         with:
           path: |
             ~/.cache/cargo-arch
-            ~/.cache/target-arch
-          key: ${{ runner.os }}-cargo-target-arch-v2-${{ hashFiles('Cargo.lock') }}
+            ~/.cache/sccache
+            ~/.cache/pacman/pkg
+          key: ${{ runner.os }}-arch-sccache-v1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-target-arch-v2-
-            ${{ runner.os }}-cargo-target-arch-
+            ${{ runner.os }}-arch-sccache-v1-
+            ${{ runner.os }}-arch-sccache-
 
       - name: Build TapAuth Arch Linux Packages
         run: |
-          mkdir -p ~/.cache/cargo-arch ~/.cache/target-arch
+          mkdir -p ~/.cache/cargo-arch ~/.cache/sccache ~/.cache/pacman/pkg
           docker run --rm \
             -v "$PWD":/workspace \
             -v ~/.cache/cargo-arch:/cache/cargo \
-            -v ~/.cache/target-arch:/cache/target \
+            -v ~/.cache/sccache:/cache/sccache \
+            -v ~/.cache/pacman/pkg:/var/cache/pacman/pkg \
+            -e RUSTC_WRAPPER=sccache \
+            -e SCCACHE_DIR=/cache/sccache \
             archlinux:base-devel \
             bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
           sudo chown -R $(id -u):$(id -g) ~/.cache
