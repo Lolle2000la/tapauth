@@ -67,6 +67,8 @@ if [ "$SKIP_BUILD" = false ]; then
     ls -la "${BUILD_DIR}"/*.pkg.tar.zst
     PKG_DIR="${BUILD_DIR}"
 else
+    echo "==> Updating pacman databases..."
+    pacman -Sy --noconfirm
     PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-arch}"
 fi
 
