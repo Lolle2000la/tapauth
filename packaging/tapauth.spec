@@ -52,6 +52,7 @@ Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
 Provides:       fprintd = 1.94.5
+%{?systemd_requires}
 
 %description fprintd
 Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
@@ -64,11 +65,11 @@ Do not install if you rely on a physical fingerprint reader.
 %setup -q -n %{name}-%{version}
 
 %build
-export CARGO_HOME="${CARGO_HOME:-/root/.cargo}"
+export CARGO_HOME="${CARGO_HOME:-%{_builddir}/cargo-home}"
 export CARGO_PROFILE_RELEASE_STRIP=true
 if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
-    export SCCACHE_DIR="${SCCACHE_DIR:-/root/.cache/sccache}"
+    export SCCACHE_DIR="${SCCACHE_DIR:-%{_builddir}/sccache}"
 fi
 cargo build --workspace --release --locked %{?cargo_features}
 if command -v sccache >/dev/null 2>&1; then
@@ -218,8 +219,12 @@ echo "         add your user to the tapauthd-clients group:"
 echo "         sudo usermod -aG tapauthd-clients \$USER"
 echo "TapAuth: To enable system-wide authentication with authselect:"
 echo "         sudo authselect select tapauth with-silent-lastlog with-mkhomedir --backup=pre-tapauth --force"
-echo "TapAuth: On SELinux enforcing systems, if greeter access to the socket is denied,"
-echo "         inspect audit logs: ausearch -m avc -ts recent | audit2allow -M tapauth_selinux"
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    echo "TapAuth: SELinux is Enforcing. If GDM/KDM lock screen authentication fails due to AVC denial,"
+    echo "         allow GDM to connect to the daemon socket via:"
+    echo "         sudo ausearch -m avc -ts recent | audit2allow -M tapauth_gdm && sudo semodule -i tapauth_gdm.pp"
+fi
+restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>/dev/null || true
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
@@ -242,7 +247,7 @@ fi
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
 
 %post fprintd
-if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+if [ $1 -eq 1 ] && [ -f %{_sysconfdir}/tapauth/config.toml ]; then
     if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
         sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
     else

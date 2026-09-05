@@ -7,7 +7,7 @@ Standards-Version: 4.7.0
 
 Package: tapauth
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd, libdbus-1-3
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd | policykit-1, adduser, libdbus-1-3
 Recommends: bluez, iptables
 Suggests: firewalld, tapauth-fprintd
 Description: Local smartphone-based authentication framework

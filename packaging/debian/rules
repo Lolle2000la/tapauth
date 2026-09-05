@@ -27,6 +27,7 @@ override_dh_auto_install:
 	mkdir -p debian/tapauth/usr/share/polkit-1/actions
 	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
 	mkdir -p debian/tapauth/etc/tapauth
+	cp config.toml.example debian/tapauth/etc/tapauth/config.toml.example
 	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
 	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
 	cp target/release/tapauthd debian/tapauth/usr/bin/

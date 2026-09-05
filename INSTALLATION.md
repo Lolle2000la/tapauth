@@ -188,10 +188,11 @@ This installs everything with default settings (including PAM configuration for 
 
 - **Privilege Separation**: Builds run as the original user (via `$SUDO_USER`) even when script is run with `sudo`, preventing root-owned files in cargo cache
 - **Optimized Build**: Builds all components in release mode with `-C target-cpu=native -C opt-level=3`
-- **Component Selection**: Choose which components to install (PAM module, Config GUI)
+- **Component Installation**: Builds and installs all TapAuth components (PAM module, daemon, Config GUI)
 - **Bluetooth Support (daemon)**: Optional - build the daemon with or without Bluetooth (BLE) support
-- **PAM Configuration**: Optionally configure PAM for login, sudo, and polkit
+- **PAM Configuration**: Optionally configure PAM for login, sudo, polkit, su, GDM, SDDM, LightDM, and KDE
 - **TPM Support**: Optional TPM integration for secure key storage
+- **Virtual fprintd Bridge**: Optional lock screen biometric integration emulating fprintd
 - **Interactive Mode**: User-friendly prompts for all options
 - **Non-Interactive Mode**: Full automation via command-line flags
 - **Dry Run**: Preview what will be installed without making changes
@@ -205,13 +206,19 @@ OPTIONS:
     -h, --help              Show help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --no-pam                Don't install PAM module
     --no-ble                Build daemon without Bluetooth support (UDP only)
-    --no-gui                Don't install configuration GUI
-    --configure-login       Configure PAM for login authentication
-    --configure-sudo        Configure PAM for sudo authentication
-    --configure-polkit      Configure PAM for polkit authentication
     --use-tpm               Enable TPM support for key storage
+    --enable-fprintd        Enable virtual fprintd bridge (for desktop lock screen unlock)
+    --configure-login       Configure PAM for login authentication
+    --configure-su          Configure PAM for su (root shells via su)
+    --configure-sudo        Configure PAM for sudo authentication
+    --configure-su-l        Configure PAM for su-l (root shells via su -)
+    --configure-polkit      Configure PAM for polkit authentication
+    --configure-system-auth Configure PAM for system-auth (used by SDDM, lock screens, etc.)
+    --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
+    --configure-sddm        Configure PAM for SDDM
+    --configure-lightdm     Configure PAM for LightDM
+    --configure-kde         Configure PAM for KDE (kscreenlocker)
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
 ```

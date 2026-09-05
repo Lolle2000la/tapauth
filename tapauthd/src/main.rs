@@ -172,31 +172,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
 
     // Start the virtual fprintd D-Bus service (non-fatal: daemon functions without it).
-    // Always claiming the bus name when the D-Bus activation service is present ensures
-    // that desktop lock screens query without 25s activation timeouts; if disabled in config,
-    // queries return NoEnrolledPrints immediately.
-    let auth_state = AuthState {
-        daemon: shared_daemon.clone(),
-    };
-    let _fprintd_conn = match fprintd::start_fprintd_service(auth_state).await {
-        Ok(conn) => {
-            tracing::info!("Virtual fprintd D-Bus service registered successfully");
-            Some(conn)
-        }
-        Err(e) => {
-            if shared::config::TapAuthConfig::load().enable_fprintd_bridge {
+    // Only claim the bus name when enable_fprintd_bridge is enabled in configuration
+    // to avoid stealing net.reactivated.Fprint from real hardware fprintd when only
+    // the base tapauth package is installed.
+    let _fprintd_conn = if toml_config.enable_fprintd_bridge {
+        let auth_state = AuthState {
+            daemon: shared_daemon.clone(),
+        };
+        match fprintd::start_fprintd_service(auth_state).await {
+            Ok(conn) => {
+                tracing::info!("Virtual fprintd D-Bus service registered successfully");
+                Some(conn)
+            }
+            Err(e) => {
                 tracing::warn!(
                     "Virtual fprintd D-Bus service failed to register: {} (check that real fprintd is stopped and D-Bus policy is installed)",
                     e
                 );
-            } else {
-                tracing::debug!(
-                    "Virtual fprintd D-Bus service not registered: {} (normal if real fprintd is running or D-Bus system policy not installed)",
-                    e
-                );
+                None
             }
-            None
         }
+    } else {
+        tracing::debug!(
+            "Virtual fprintd D-Bus bridge is disabled in configuration (enable_fprintd_bridge = false)"
+        );
+        None
     };
 
     let server_state = Arc::new(ServerState {

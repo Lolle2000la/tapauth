@@ -12,20 +12,7 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "purge" ]; then
 			continue
 		fi
 		if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
-			case "$(basename "$pam_file")" in
-				gdm*fingerprint)
-					cat << 'EOF' > "$pam_file"
-#%PAM-1.0
-auth    include                       common-auth
-account include                       common-account
-session include                       common-session
-EOF
-					rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-					;;
-				*)
-					rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-					;;
-			esac
+			rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
 		elif [ -s "${pam_file}.tapauth-bak" ]; then
 			if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
 				rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true

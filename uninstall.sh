@@ -173,7 +173,8 @@ remove_systemd_units_and_daemon() {
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         show_file_removal "/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf" "Virtual fprintd D-Bus policy"
         show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation service"
-        show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override"
+        show_file_removal "/etc/dconf/db/gdm.d/10-tapauth-fingerprint" "GDM dconf override"
+        show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override (legacy)"
         
         local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
         if [[ -f "$polkit_dropin" ]]; then
@@ -253,13 +254,16 @@ remove_systemd_units_and_daemon() {
     fi
 
     # Remove GDM dconf override
-    local gdm_dconf="/etc/dconf/db/gdm.d/01-tapauth"
-    if [[ -f "$gdm_dconf" ]]; then
-        print_info "Removing GDM dconf override"
-        rm -f "$gdm_dconf"
-        if command -v dconf &> /dev/null; then
-            dconf update || true
+    local updated_dconf=false
+    for gdm_dconf in /etc/dconf/db/gdm.d/10-tapauth-fingerprint /etc/dconf/db/gdm.d/01-tapauth; do
+        if [[ -f "$gdm_dconf" ]]; then
+            print_info "Removing GDM dconf override ($gdm_dconf)"
+            rm -f "$gdm_dconf"
+            updated_dconf=true
         fi
+    done
+    if [[ "$updated_dconf" == true ]] && command -v dconf &> /dev/null; then
+        dconf update || true
     fi
 
     print_success "Daemon and systemd units removed (if present)"
@@ -894,12 +898,12 @@ main() {
 
     # Check if installed via system package manager
     local pkg_manager=""
-    if command -v dpkg >/dev/null 2>&1 && dpkg -l tapauth 2>/dev/null | grep -q '^ii'; then
-        pkg_manager="apt-get remove tapauth"
-    elif command -v rpm >/dev/null 2>&1 && rpm -q tapauth >/dev/null 2>&1; then
-        pkg_manager="dnf remove tapauth"
-    elif command -v pacman >/dev/null 2>&1 && pacman -Q tapauth >/dev/null 2>&1; then
-        pkg_manager="pacman -R tapauth"
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; }; then
+        pkg_manager="apt-get remove tapauth tapauth-fprintd"
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd >/dev/null 2>&1; }; then
+        pkg_manager="dnf remove tapauth tapauth-fprintd"
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
+        pkg_manager="pacman -R tapauth tapauth-fprintd"
     fi
 
     if [[ -n "$pkg_manager" ]]; then
@@ -907,7 +911,7 @@ main() {
         print_warning "Running this standalone script will delete package-managed binaries without updating"
         print_warning "the package database, which may cause errors during package updates or removal."
         print_info "Recommended command: sudo $pkg_manager"
-        if [[ "$FORCE" == true || "$NON_INTERACTIVE" == true ]]; then
+        if [[ "$FORCE" == true || "$INTERACTIVE" == false ]]; then
             print_info "Continuing due to non-interactive/force mode."
         else
             read -p "Proceed with manual uninstallation anyway? [y/N]: " pkg_uninst_confirm

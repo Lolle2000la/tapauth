@@ -72,9 +72,11 @@ pre_remove() {
     fi
     if [ -s "${pam_file}.tapauth-bak" ]; then
       cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
-    elif grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+    elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
       sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null && \
         echo ":: Restored pam_fprintd.so in $pam_file"
+    else
+      sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
     fi
   done
 }

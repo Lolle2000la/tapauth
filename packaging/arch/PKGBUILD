@@ -32,12 +32,18 @@ package_tapauth() {
     'bluez: for Bluetooth Low Energy (BLE) transport'
     'tapauth-fprintd: for virtual fprintd desktop lock screen integration'
   )
+  backup=('etc/tapauth/config.toml')
   conflicts=('tapauth-git')
   install=tapauth.install
 
   cd "${srcdir}/${pkgbase}-${pkgver}"
   install -dm0755 "${pkgdir}/etc/tapauth"
   install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
+  cat << 'EOF' > "${pkgdir}/etc/tapauth/config.toml"
+# TapAuth Configuration
+enable_fprintd_bridge = false
+EOF
+  chmod 0644 "${pkgdir}/etc/tapauth/config.toml"
   install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
   install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
   install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"

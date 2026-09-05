@@ -59,7 +59,7 @@ if [[ -d /usr/share/dbus-1/system.d ]]; then
 fi
 FPRINT_SERVICE_SOURCE="packaging/net.reactivated.Fprint.service"
 FPRINT_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
-GDM_DCONF_DEST="/etc/dconf/db/gdm.d/01-tapauth"
+GDM_DCONF_DEST="/etc/dconf/db/gdm.d/10-tapauth-fingerprint"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -595,11 +595,11 @@ check_existing_installation() {
 
     # Check if installed via system package manager
     local pkg_manager=""
-    if command -v dpkg >/dev/null 2>&1 && dpkg -l tapauth 2>/dev/null | grep -q '^ii'; then
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; }; then
         pkg_manager="dpkg / apt"
-    elif command -v rpm >/dev/null 2>&1 && rpm -q tapauth >/dev/null 2>&1; then
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd >/dev/null 2>&1; }; then
         pkg_manager="rpm / dnf"
-    elif command -v pacman >/dev/null 2>&1 && pacman -Q tapauth >/dev/null 2>&1; then
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
         pkg_manager="pacman"
     fi
 
@@ -607,7 +607,7 @@ check_existing_installation() {
         print_warning "TapAuth is already installed on this system via distribution package ($pkg_manager)."
         print_warning "Running install.sh will overwrite package-managed binaries and create standalone units"
         print_warning "in /etc/systemd/system/ that permanently shadow distro-provided units in /usr/lib/systemd/system/."
-        if [[ "$FORCE" == true || "$NON_INTERACTIVE" == true ]]; then
+        if [[ "$FORCE" == true || "$INTERACTIVE" == false ]]; then
             print_info "Continuing due to non-interactive/force mode."
         else
             read -p "Proceed with manual script installation over the distribution package? [y/N]: " pkg_confirm
@@ -1519,6 +1519,7 @@ EOF
         # Enable fingerprint authentication in GDM dconf settings
         if [[ -d /etc/dconf/db/gdm.d ]]; then
             print_info "Configuring GDM dconf to enable fingerprint auth..."
+            rm -f /etc/dconf/db/gdm.d/01-tapauth 2>/dev/null || true
             if [[ -d /etc/dconf/profile && ! -f /etc/dconf/profile/gdm ]]; then
                 cat << 'EOF' > /etc/dconf/profile/gdm
 user-db:user
