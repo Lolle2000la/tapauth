@@ -103,7 +103,7 @@ echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 4b. Testing package upgrade and reconfiguration ($2 state)..."
+echo "==> 4b. Testing package upgrade and reconfiguration..."
 dpkg -i /tmp/deb-build/tapauth_${PKG_VER}*.deb
 dpkg -i /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
 
