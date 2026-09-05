@@ -1,0 +1,76 @@
+post_install() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  elif [ -f /etc/tapauth/config.toml.example ]; then
+    cp -p /etc/tapauth/config.toml.example /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  echo ":: TapAuth installed successfully."
+  echo ":: To start TapAuth, enable and start the socket:"
+  echo "::   systemctl enable --now tapauthd.socket"
+  echo ":: To allow your user to configure TapAuth via GUI, add yourself to the tapauthd-clients group:"
+  echo "::   sudo usermod -aG tapauthd-clients \$USER"
+  echo ":: To complete activation, add 'auth sufficient pam_tapauth.so' to /etc/pam.d/system-auth"
+  echo ":: For KDE/GNOME lock screen integration, install 'tapauth-fprintd'."
+}
+
+post_upgrade() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
+  # Remove pam_tapauth.so lines to prevent lockout after uninstall
+  local failed_files=()
+  for pam_file in /etc/pam.d/*; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      case "$(basename "$pam_file")" in
+        kde-fingerprint|gdm-fingerprint|fingerprint-auth)
+          if [ -s "${pam_file}.tapauth-bak" ]; then
+            cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
+          elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
+            if sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null; then
+              echo ":: Restored pam_fprintd.so in $pam_file"
+            else
+              failed_files+=("$pam_file")
+            fi
+          else
+            if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+              echo ":: Removed pam_tapauth.so from $pam_file"
+            else
+              failed_files+=("$pam_file")
+            fi
+          fi
+          ;;
+        *)
+          if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+            echo ":: Removed pam_tapauth.so from $pam_file"
+          else
+            failed_files+=("$pam_file")
+          fi
+          ;;
+      esac
+    fi
+  done
+  if [ ${#failed_files[@]} -gt 0 ]; then
+    echo ":: WARNING: Could not automatically remove pam_tapauth.so from:"
+    for f in "${failed_files[@]}"; do echo "::   $f"; done
+    echo ":: Please remove these references manually to avoid authentication lockouts!"
+  fi
+}

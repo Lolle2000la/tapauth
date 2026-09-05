@@ -135,6 +135,14 @@ pub struct TapAuthConfig {
     /// authentication.
     pub enable_ble: bool,
 
+    /// Whether the virtual fprintd D-Bus bridge is enabled (default: false).
+    ///
+    /// When enabled, the daemon exposes the `net.reactivated.Fprint` D-Bus
+    /// interface, allowing desktop environments like GNOME Shell to query
+    /// and trigger TapAuth biometrics seamlessly. Requires a daemon restart
+    /// to acquire or release the D-Bus bus name.
+    pub enable_fprintd_bridge: bool,
+
     /// Whether to use TPM for key storage
     /// Requires TPM 2.0 hardware and tpm2-tools installed
     #[cfg(feature = "tpm")]
@@ -159,6 +167,7 @@ impl Default for TapAuthConfig {
             udp_port: DEFAULT_UDP_PORT,
             enable_network: DEFAULT_TRANSPORT_ENABLED,
             enable_ble: DEFAULT_TRANSPORT_ENABLED,
+            enable_fprintd_bridge: false,
             #[cfg(feature = "tpm")]
             use_tpm: false,
             #[cfg(feature = "tpm")]
@@ -368,6 +377,7 @@ mod tests {
             udp_port: 54321,
             enable_network: false,
             enable_ble: true,
+            enable_fprintd_bridge: false,
             #[cfg(feature = "tpm")]
             use_tpm: true,
             #[cfg(feature = "tpm")]
@@ -385,6 +395,7 @@ mod tests {
         assert_eq!(parsed.udp_port, config.udp_port);
         assert_eq!(parsed.enable_network, config.enable_network);
         assert_eq!(parsed.enable_ble, config.enable_ble);
+        assert_eq!(parsed.enable_fprintd_bridge, config.enable_fprintd_bridge);
         #[cfg(feature = "tpm")]
         {
             assert_eq!(parsed.use_tpm, config.use_tpm);

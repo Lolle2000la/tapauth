@@ -43,6 +43,7 @@ pub struct SettingsScreen {
     udp_port_input: String,
     ble_enabled: bool,
     network_enabled: bool,
+    fprintd_bridge_enabled: bool,
 }
 
 impl SettingsScreen {
@@ -56,6 +57,7 @@ impl SettingsScreen {
             udp_port_input: String::new(),
             ble_enabled: true,
             network_enabled: true,
+            fprintd_bridge_enabled: true,
         }
     }
 
@@ -98,6 +100,10 @@ impl SettingsScreen {
                 self.network_enabled = enabled;
                 Task::none()
             }
+            ScreenMessage::FprintdBridgeEnabledChanged(enabled) => {
+                self.fprintd_bridge_enabled = enabled;
+                Task::none()
+            }
             ScreenMessage::SaveConfig => {
                 self.error = None;
                 self.success = None;
@@ -111,8 +117,15 @@ impl SettingsScreen {
                 };
                 let ble_enabled = self.ble_enabled;
                 let network_enabled = self.network_enabled;
+                let fprintd_bridge_enabled = self.fprintd_bridge_enabled;
                 Task::perform(
-                    crate::ipc::save_config(hostname, udp_port, ble_enabled, network_enabled),
+                    crate::ipc::save_config(
+                        hostname,
+                        udp_port,
+                        ble_enabled,
+                        network_enabled,
+                        fprintd_bridge_enabled,
+                    ),
                     |result| match result {
                         Ok(_) => ScreenMessage::ConfigSaved,
                         Err(e) => ScreenMessage::ConfigSaveFailed(e),
@@ -134,6 +147,7 @@ impl SettingsScreen {
                 self.udp_port_input = config.udp_port.to_string();
                 self.ble_enabled = config.enable_ble;
                 self.network_enabled = config.enable_network;
+                self.fprintd_bridge_enabled = config.enable_fprintd_bridge;
                 Task::none()
             }
             _ => Task::none(),
@@ -194,6 +208,13 @@ impl SettingsScreen {
             .text_size(16)
             .width(Length::Fixed(400.0));
 
+        let fprintd_checkbox = checkbox(self.fprintd_bridge_enabled)
+            .label(self.l10n.tr("settings-enable-fprintd-bridge"))
+            .on_toggle(ScreenMessage::FprintdBridgeEnabledChanged)
+            .size(20)
+            .text_size(16)
+            .width(Length::Fixed(400.0));
+
         let connectivity_note = text(self.l10n.tr("settings-connectivity-note")).size(12);
 
         let save_button = button(text(self.l10n.tr("btn-save-config")).size(16))
@@ -250,6 +271,7 @@ impl SettingsScreen {
             Space::new().height(Length::Fixed(10.0)),
             network_checkbox,
             ble_checkbox,
+            fprintd_checkbox,
             Space::new().height(Length::Fixed(5.0)),
             connectivity_note,
             Space::new().height(Length::Fixed(20.0)),

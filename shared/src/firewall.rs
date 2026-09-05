@@ -232,6 +232,10 @@ pub fn close_port(port: u16, protocol: Protocol) -> Result<(), FirewallError> {
 }
 
 fn is_firewalld_running() -> bool {
+    // Only invoke systemctl if systemd is running (avoids hanging in container environments)
+    if !std::path::Path::new("/run/systemd/system").exists() {
+        return false;
+    }
     // Capture output: systemd forwards any inherited stdout to the journal,
     // which would pollute `journalctl -u tapauthd` with systemctl's status
     // lines.

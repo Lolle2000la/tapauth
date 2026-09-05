@@ -14,10 +14,11 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[allow(unused_imports)]
 pub use ffi::{
-    pam_get_authtok, PAM_AUTHTOK, PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_IGNORE,
-    PAM_PERM_DENIED, PAM_SERVICE, PAM_SUCCESS, PAM_SYSTEM_ERR, PAM_TEXT_INFO, PAM_USER,
-    PAM_USER_UNKNOWN,
+    pam_get_authtok, PAM_AUTHINFO_UNAVAIL, PAM_AUTHTOK, PAM_AUTH_ERR, PAM_BUF_ERR, PAM_CONV_ERR,
+    PAM_ERROR_MSG, PAM_IGNORE, PAM_PERM_DENIED, PAM_SERVICE, PAM_SUCCESS, PAM_SYSTEM_ERR,
+    PAM_TEXT_INFO, PAM_USER, PAM_USER_UNKNOWN,
 };
 
 pub type PamHandle = ffi::pam_handle_t;
@@ -262,14 +263,29 @@ impl<'a> PamConversation<'a> {
         })
     }
 
+    /// Create a mock conversation that discards messages (for testing).
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self {
+            pamh: std::ptr::null_mut(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Send an informational message to the user.
     pub fn info(&self, message: &str) -> Result<(), c_int> {
+        if self.pamh.is_null() {
+            return Ok(());
+        }
         unsafe { send_message(self.pamh, PAM_TEXT_INFO, message) }
     }
 
     /// Send an error message to the user.
     #[allow(dead_code)]
     pub fn error(&self, message: &str) -> Result<(), c_int> {
+        if self.pamh.is_null() {
+            return Ok(());
+        }
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
     }
 
@@ -305,4 +321,55 @@ impl<'a> PamConversation<'a> {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
         }
     }
+}
+
+/// Module data key used to track whether `pam_tapauth` has already executed within
+/// the active PAM transaction handle (`pamh`).
+const ATTEMPTED_DATA_KEY: &[u8] = b"pam_tapauth_attempted\0";
+
+/// Cleanup callback for `pam_set_data` to deallocate the marker on PAM transaction end.
+unsafe extern "C" fn cleanup_attempted(
+    _pamh: *mut ffi::pam_handle_t,
+    data: *mut c_void,
+    _error_status: c_int,
+) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut u8));
+    }
+}
+
+/// Check if `pam_tapauth` has already been invoked within this PAM transaction.
+///
+/// # Safety
+/// Caller must ensure `pamh` is a valid PAM handle or null pointer.
+pub unsafe fn has_already_attempted(pamh: *mut PamHandle) -> bool {
+    if pamh.is_null() {
+        return false;
+    }
+    let key = match CStr::from_bytes_with_nul(ATTEMPTED_DATA_KEY) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let mut data: *const c_void = std::ptr::null();
+    let ret = ffi::pam_get_data(pamh, key.as_ptr(), &mut data);
+    ret == PAM_SUCCESS && !data.is_null()
+}
+
+/// Mark that `pam_tapauth` has been invoked within this PAM transaction.
+///
+/// # Safety
+/// Caller must ensure `pamh` is a valid PAM handle or null pointer.
+pub unsafe fn mark_attempted(pamh: *mut PamHandle) {
+    if pamh.is_null() {
+        return;
+    }
+    let data = Box::into_raw(Box::new(1u8)) as *mut c_void;
+    let key = match CStr::from_bytes_with_nul(ATTEMPTED_DATA_KEY) {
+        Ok(k) => k,
+        Err(_) => {
+            drop(Box::from_raw(data as *mut u8));
+            return;
+        }
+    };
+    let _ = ffi::pam_set_data(pamh, key.as_ptr(), data, Some(cleanup_attempted));
 }

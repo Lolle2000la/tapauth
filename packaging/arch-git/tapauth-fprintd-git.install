@@ -1,0 +1,96 @@
+pre_install() {
+  echo ":: WARNING: tapauth-fprintd conflicts with hardware fprintd."
+  echo ":: If you rely on a hardware fingerprint reader, do not install this package."
+}
+
+post_install() {
+  if [ ! -f /etc/tapauth/config.toml ]; then
+    mkdir -p /etc/tapauth
+    cat << 'CFGEOF' > /etc/tapauth/config.toml
+# TapAuth Configuration
+enable_fprintd_bridge = true
+CFGEOF
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  elif grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" /etc/tapauth/config.toml; then
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  else
+    echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+  fi
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+  # Detect pam_fprintd.so references and offer to replace them with the decisive TapAuth line
+  local pam_decisive="auth    [success=done default=bad]    /usr/lib/security/pam_tapauth.so"
+  local repaired=0
+  for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+      sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null && {
+        echo ":: Replaced pam_fprintd.so with pam_tapauth.so in $pam_file"
+        repaired=$((repaired + 1))
+      } || echo ":: WARNING: Could not update $pam_file — please replace pam_fprintd.so lines manually"
+    fi
+  done
+  if [ "$repaired" -gt 0 ]; then
+    echo ":: Lock screen fingerprint stack updated to use TapAuth. You may need to log out and back in."
+  else
+    echo ":: To enable lock screen unlock, ensure /etc/pam.d/kde-fingerprint or gdm-fingerprint"
+    echo ":: contains: auth    [success=done default=bad]    /usr/lib/security/pam_tapauth.so"
+  fi
+}
+
+post_upgrade() {
+  local pam_decisive="auth    [success=done default=bad]    /usr/lib/security/pam_tapauth.so"
+  for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+      sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+    fi
+  done
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+  fi
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+}
+
+pre_remove() {
+  # Restore PAM stacks
+  for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/fingerprint-auth; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+      continue
+    fi
+    if [ -s "${pam_file}.tapauth-bak" ]; then
+      cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
+    elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
+      sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null && \
+        echo ":: Restored pam_fprintd.so in $pam_file"
+    else
+      sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+    fi
+  done
+}
+
+post_remove() {
+  if [ -f /etc/tapauth/config.toml ]; then
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+  fi
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+}

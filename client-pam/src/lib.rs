@@ -41,7 +41,7 @@ pub use ipc_client::*;
 
 use std::os::raw::c_int;
 use std::panic::catch_unwind;
-// Internal panic guard: returns PAM_IGNORE if the inner closure panics.
+// Internal panic guard: returns PAM_AUTHINFO_UNAVAIL if the inner closure panics.
 fn guard<F>(f: F) -> c_int
 where
     F: FnOnce() -> c_int + std::panic::UnwindSafe,
@@ -51,10 +51,10 @@ where
         Err(_) => {
             let _ = catch_unwind(|| {
                 tracing::error!(
-                    "TapAuth PAM: panic caught in guarded section; returning PAM_IGNORE"
+                    "TapAuth PAM: panic caught in guarded section; returning PAM_AUTHINFO_UNAVAIL"
                 );
             });
-            pam_sys::PAM_IGNORE
+            pam_sys::PAM_AUTHINFO_UNAVAIL
         }
     }
 }
@@ -134,8 +134,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn guard_returns_ignore_on_panic() {
+    fn guard_returns_authinfo_unavail_on_panic() {
         let code = guard(|| panic!("boom"));
-        assert_eq!(code, crate::pam_sys::PAM_IGNORE);
+        assert_eq!(code, crate::pam_sys::PAM_AUTHINFO_UNAVAIL);
     }
 }

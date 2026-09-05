@@ -1,0 +1,35 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "purge" ]; then
+	# Restore PAM stacks
+	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+		[ -L "$pam_file" ] && continue
+		[ -f "$pam_file" ] || continue
+		if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+			# Active PAM stack was modified to remove TapAuth; drop stale backup without clobbering
+			rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+			continue
+		fi
+		if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+			rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+		elif [ -s "${pam_file}.tapauth-bak" ]; then
+			if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
+				rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+			fi
+		else
+			sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+		fi
+	done
+
+	# Remove GDM dconf override
+	if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
+		rm -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+		if command -v dconf >/dev/null 2>&1; then
+			dconf update 2>/dev/null || true
+		fi
+	fi
+fi
+
+#DEBHELPER#
+exit 0

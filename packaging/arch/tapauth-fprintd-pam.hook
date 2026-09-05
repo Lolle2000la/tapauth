@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = etc/pam.d/gdm-fingerprint
+Target = etc/pam.d/kde-fingerprint
+Target = etc/pam.d/fingerprint-auth
+
+[Action]
+Description = Updating lock-screen PAM stacks for TapAuth virtual fprintd...
+When = PostTransaction
+Exec = /usr/bin/sh -c 'test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service || exit 0; for f in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do [ -f "$f" ] && [ ! -L "$f" ] && grep -Eq "^[[:space:]]*auth[[:space:]].*pam_fprintd\.so" "$f" && ! grep -q "pam_tapauth\.so" "$f" && { [ -f "$f.tapauth-bak" ] || cp -p "$f" "$f.tapauth-bak" 2>/dev/null || true; sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|auth    [success=done default=bad]    /usr/lib/security/pam_tapauth.so|" "$f" 2>/dev/null || true; }; done'

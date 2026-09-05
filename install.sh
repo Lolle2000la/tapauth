@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # TapAuth Interactive Installation Script
 # This script builds and installs all TapAuth components with optimizations
@@ -30,8 +30,10 @@ CONFIGURE_PAM_LIGHTDM=false
 CONFIGURE_PAM_KDE=false
 USE_TPM=false
 USE_BLE=true
+ENABLE_FPRINTD_BRIDGE=false
 BUILD_ONLY=false
 DRY_RUN=false
+FORCE=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
@@ -50,6 +52,14 @@ SOCKET_UNIT_DEST="/etc/systemd/system/tapauthd.socket"
 SERVICE_UNIT_DEST="/etc/systemd/system/tapauthd.service"
 POLKIT_DROPIN_SOURCE="systemd/polkit-agent-helper@.service.d/tapauth.conf"
 POLKIT_DROPIN_DEST_DIR="/etc/systemd/system/polkit-agent-helper@.service.d"
+FPRINT_DBUS_CONF_SOURCE="packaging/net.reactivated.Fprint.tapauth.conf"
+FPRINT_DBUS_CONF_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+if [[ -d /usr/share/dbus-1/system.d ]]; then
+    FPRINT_DBUS_CONF_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+fi
+FPRINT_SERVICE_SOURCE="packaging/net.reactivated.Fprint.service"
+FPRINT_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+GDM_DCONF_DEST="/etc/dconf/db/gdm.d/10-tapauth-fingerprint"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -61,6 +71,22 @@ has_polkit_agent_helper() {
     [[ -f "/usr/lib/systemd/system/polkit-agent-helper@.service" || \
        -f "/lib/systemd/system/polkit-agent-helper@.service" || \
        -f "/etc/systemd/system/polkit-agent-helper@.service" ]]
+}
+
+has_hardware_fprintd=false
+check_hardware_fprintd() {
+    if command -v fprintd &>/dev/null || [[ -f /usr/libexec/fprintd || -f /usr/lib/fprintd/fprintd || -f /usr/lib/fprintd || -f /usr/sbin/fprintd ]]; then
+        has_hardware_fprintd=true
+        return 0
+    fi
+    if [[ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ]]; then
+        if ! grep -q "tapauthd" /usr/share/dbus-1/system-services/net.reactivated.Fprint.service 2>/dev/null; then
+            has_hardware_fprintd=true
+            return 0
+        fi
+    fi
+    has_hardware_fprintd=false
+    return 0
 }
 
 # Print functions
@@ -194,8 +220,10 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
+    -f, --force             Force installation over existing packages/files without prompting
     --no-ble                Build without Bluetooth support (UDP only)
     --use-tpm               Enable TPM support for key storage
+    --enable-fprintd        Enable virtual fprintd bridge (emulates fingerprint sensor for GNOME/KDE lock screen)
     --configure-login       Configure PAM for login authentication
     --configure-su          Configure PAM for su (root shells via su)
     --configure-sudo        Configure PAM for sudo authentication
@@ -245,6 +273,10 @@ parse_args() {
                 INTERACTIVE=false
                 shift
                 ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
             -y|--yes)
                 INTERACTIVE=false
                 CONFIGURE_PAM_LOGIN=true
@@ -254,6 +286,7 @@ parse_args() {
                 CONFIGURE_PAM_SU_L=true
                 CONFIGURE_PAM_SYSTEM_AUTH=true
                 CONFIGURE_PAM_GDM=true
+                CONFIGURE_PAM_KDE=true
                 CONFIGURE_PAM_SDDM=false
                 CONFIGURE_PAM_LIGHTDM=true
                 USE_BLE=true
@@ -261,6 +294,10 @@ parse_args() {
                 ;;
             --no-ble)
                 USE_BLE=false
+                shift
+                ;;
+            --enable-fprintd|--enable-fprintd-bridge)
+                ENABLE_FPRINTD_BRIDGE=true
                 shift
                 ;;
             --configure-login)
@@ -342,6 +379,9 @@ prompt_features() {
         print_info "TPM tools not detected. TPM support disabled."
         USE_TPM=false
     fi
+
+    read -p "Enable virtual fprintd bridge (emulates fingerprint sensor on lock screen)? [y/N]: " response
+    [[ "$response" =~ ^[Yy]$ ]] && ENABLE_FPRINTD_BRIDGE=true || ENABLE_FPRINTD_BRIDGE=false
 }
 
 prompt_pam_configuration() {
@@ -395,6 +435,10 @@ prompt_pam_configuration() {
         echo "individual services (login, sudo, polkit) separately."
         echo ""
         print_warning "Note: Lock screens often need separate configuration (see below)"
+        if [[ "$has_kde" == true || "$has_gdm" == true ]]; then
+            print_info "Keyring notice: Entering your password at initial login unlocks your desktop"
+            print_info "keyring (gnome-keyring / kwallet). TapAuth unlocks your screen after lock."
+        fi
         echo ""
         read -p "Configure TapAuth for system-auth? [Y/n]: " response
         if [[ ! "$response" =~ ^[Nn]$ ]]; then
@@ -495,6 +539,13 @@ prompt_pam_configuration() {
 
 # Detect PAM module directory
 detect_pam_directory() {
+    # Honor environment variable override if provided and valid
+    if [[ -n "${PAM_MODULE_DIR:-}" && -d "$PAM_MODULE_DIR" ]]; then
+        PAM_SO_PATH="$PAM_MODULE_DIR/$PAM_SO_NAME"
+        print_success "Using overridden PAM directory: $PAM_MODULE_DIR"
+        return
+    fi
+
     print_info "Detecting PAM module directory..."
     
     # Possible PAM module directories for different distributions
@@ -545,6 +596,35 @@ detect_distribution() {
 check_existing_installation() {
     if [[ "$BUILD_ONLY" == true || "$DRY_RUN" == true ]]; then
         return
+    fi
+
+    # Check if installed via system package manager
+    local pkg_manager=""
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; }; then
+        pkg_manager="dpkg / apt"
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd >/dev/null 2>&1; }; then
+        pkg_manager="rpm / dnf"
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
+        pkg_manager="pacman"
+    fi
+
+    if [[ -n "$pkg_manager" ]]; then
+        print_warning "TapAuth is already installed on this system via distribution package ($pkg_manager)."
+        print_warning "Running install.sh will overwrite package-managed binaries and create standalone units"
+        print_warning "in /etc/systemd/system/ that permanently shadow distro-provided units in /usr/lib/systemd/system/."
+        if [[ "$FORCE" == true ]]; then
+            print_info "Continuing due to --force flag."
+        elif [[ "$INTERACTIVE" == false ]]; then
+            print_error "Cannot install over a distribution package ($pkg_manager) in non-interactive mode without --force."
+            print_info "Use your distribution package manager to manage TapAuth, or re-run with --force."
+            exit 1
+        else
+            read -p "Proceed with manual script installation over the distribution package? [y/N]: " pkg_confirm
+            if [[ ! "$pkg_confirm" =~ ^[Yy]$ ]]; then
+                print_info "Installation cancelled. Please manage TapAuth using your system package manager ($pkg_manager)."
+                exit 0
+            fi
+        fi
     fi
     
     if [[ ! -f "$UNINSTALL_SCRIPT_DEST" ]]; then
@@ -822,6 +902,7 @@ install_systemd_units() {
     
     systemctl daemon-reload
     systemctl enable --now tapauthd.socket
+    systemctl try-restart tapauthd.service 2>/dev/null || true
     print_success "Systemd units installed and socket activated"
 }
 
@@ -841,6 +922,12 @@ install_daemon() {
             if command -v restorecon &> /dev/null; then
                 show_command "restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules" "Restore SELinux context"
             fi
+        fi
+        if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d /etc/dbus-1/system.d ]]; then
+            show_command "install -m 0644 $FPRINT_DBUS_CONF_SOURCE $FPRINT_DBUS_CONF_DEST" "Install virtual fprintd D-Bus configuration"
+        fi
+        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+            show_command "install -m 0644 $FPRINT_SERVICE_SOURCE $FPRINT_SERVICE_DEST" "Install virtual fprintd D-Bus activation service"
         fi
         return
     fi
@@ -865,6 +952,86 @@ install_daemon() {
         install -m 0644 packaging/50-tapauthd.rules /usr/share/polkit-1/rules.d/50-tapauthd.rules
         if command -v restorecon &> /dev/null; then
             restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules || true
+        fi
+    fi
+
+    # Seed default /etc/tapauth/config.toml if missing
+    mkdir -p /etc/tapauth
+    if [[ ! -f /etc/tapauth/config.toml ]]; then
+        print_info "Creating default /etc/tapauth/config.toml"
+        cat << 'EOF' > /etc/tapauth/config.toml
+# TapAuth System Configuration
+# See https://github.com/Lolle2000la/tapauth for documentation.
+
+# Authentication timeout in seconds (default: 120)
+# pam_operation_timeout_secs = 120
+
+# GUI authentication timeout in seconds (default: 30)
+# pam_gui_timeout_secs = 30
+
+# UDP port for local network transport (default: 36692)
+# udp_port = 36692
+
+# Enable Local Network transport (default: true)
+# enable_network = true
+
+# Enable Bluetooth Low Energy transport (default: true)
+# enable_ble = true
+
+# Enable virtual fprintd D-Bus bridge for desktop lock screens (default: false)
+enable_fprintd_bridge = false
+EOF
+        chmod 644 /etc/tapauth/config.toml
+        chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    fi
+
+    # Install virtual fprintd D-Bus policy and service activation files (guarded against real hardware fprintd)
+    check_hardware_fprintd
+
+    if [[ "$has_hardware_fprintd" == true ]]; then
+        print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
+    else
+        local dbus_dir
+        dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
+        local DBUS_POLICY_DIR="$dbus_dir"
+        if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
+            print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
+            print_warning "Lock screen integration will not work until the policy file is manually installed."
+        fi
+        if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
+            print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
+            install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
+            if command -v restorecon &> /dev/null; then
+                restorecon "$FPRINT_DBUS_CONF_DEST" || true
+            fi
+        fi
+
+        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+            print_info "Installing virtual fprintd D-Bus system service activation file"
+            install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
+            if command -v restorecon &> /dev/null; then
+                restorecon "$FPRINT_SERVICE_DEST" || true
+            fi
+        fi
+
+        if [[ "$ENABLE_FPRINTD_BRIDGE" == true ]]; then
+            # Enable fprintd bridge in /etc/tapauth/config.toml
+            if grep -q "enable_fprintd_bridge" /etc/tapauth/config.toml; then
+                sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = true/' /etc/tapauth/config.toml
+            else
+                echo "enable_fprintd_bridge = true" >> /etc/tapauth/config.toml
+            fi
+            chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+        fi
+
+        # Reload system D-Bus configuration to apply the new policy immediately
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        elif command -v dbus-send &>/dev/null; then
+            dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+        fi
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
+            systemctl try-restart tapauthd.service 2>/dev/null || true
         fi
     fi
 }
@@ -1029,6 +1196,37 @@ install_pam() {
 }
 
 # Configure PAM
+backup_pam_file() {
+        local target_file="$1"
+        if [[ -f "$target_file" && ! -f "${target_file}.tapauth-bak" ]]; then
+            cp -p "$target_file" "${target_file}.tapauth-bak" 2>/dev/null || true
+        fi
+    }
+
+insert_pam_decisive() {
+        local target_file="$1"
+        local pam_decisive="auth    [success=done default=bad]    $PAM_SO_PATH"
+        if grep -q "pam_tapauth.so" "$target_file" 2>/dev/null; then
+            return 0
+        fi
+    backup_pam_file "$target_file"
+        if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$target_file" 2>/dev/null; then
+            if [[ "$has_hardware_fprintd" == true ]]; then
+                print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
+                return 0
+            else
+                sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
+            fi
+        else
+            local last_env_line
+            last_env_line=$(grep -n -E "pam_env\.so|pam_nologin\.so" "$target_file" 2>/dev/null | tail -n1 | cut -d: -f1 || true)
+            if [[ -n "$last_env_line" ]]; then
+                sed -i "${last_env_line}a $pam_decisive" "$target_file"
+            else
+                sed -i "1i $pam_decisive" "$target_file"
+            fi
+        fi
+    }
 configure_pam() {
         if [[ "$CONFIGURE_PAM_LOGIN" == false && "$CONFIGURE_PAM_SU" == false && "$CONFIGURE_PAM_SU_L" == false && "$CONFIGURE_PAM_SUDO" == false && "$CONFIGURE_PAM_POLKIT" == false && \
             "$CONFIGURE_PAM_SYSTEM_AUTH" == false && "$CONFIGURE_PAM_GDM" == false && "$CONFIGURE_PAM_SDDM" == false && \
@@ -1085,15 +1283,24 @@ configure_pam() {
         fi
         
         if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
-            # GDM typically uses gdm-password
-            if [[ -f /etc/pam.d/gdm-password ]]; then
-                show_pam_diff "/etc/pam.d/gdm-password" "$pam_line" ""
-            elif [[ -f /etc/pam.d/gdm ]]; then
-                show_pam_diff "/etc/pam.d/gdm" "$pam_line" ""
+            local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
+            local gdm_fp_target="/etc/pam.d/gdm-fingerprint"
+            if [[ -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm3 ]]; then
+                gdm_fp_target="/etc/pam.d/gdm3-fingerprint"
+            fi
+            if [[ -f "$gdm_fp_target" ]]; then
+                show_pam_diff "$gdm_fp_target" "$pam_decisive_line" "pam_env.so"
+            elif [[ -f /etc/pam.d/gdm-fingerprint ]]; then
+                show_pam_diff "/etc/pam.d/gdm-fingerprint" "$pam_decisive_line" "pam_env.so"
             else
                 echo ""
-                echo -e "${YELLOW}[SKIP]${NC} GDM PAM configuration"
-                echo "  → Not found at /etc/pam.d/gdm-password or /etc/pam.d/gdm"
+                echo -e "${YELLOW}[CREATE]${NC} $gdm_fp_target"
+                echo "  → Dual-stack secondary service with decisive flag"
+            fi
+            if [[ -d /etc/dconf/db/gdm.d ]]; then
+                echo ""
+                echo -e "${YELLOW}[DCONF]${NC} $GDM_DCONF_DEST"
+                echo "  → Enable fingerprint authentication"
             fi
         fi
         
@@ -1119,28 +1326,19 @@ configure_pam() {
         fi
         
         if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
-            # KDE uses multiple PAM files
-            local kde_found=false
+            local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
+            if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+                show_pam_diff "/etc/pam.d/kde-fingerprint" "$pam_decisive_line" "pam_env.so"
+            else
+                echo ""
+                echo -e "${YELLOW}[CREATE]${NC} /etc/pam.d/kde-fingerprint"
+                echo "  → Dual-stack secondary service with decisive flag"
+            fi
             if [[ -f /etc/pam.d/kde ]]; then
                 show_pam_diff "/etc/pam.d/kde" "$pam_line" ""
-                kde_found=true
             fi
             if [[ -f /etc/pam.d/kscreenlocker ]]; then
                 show_pam_diff "/etc/pam.d/kscreenlocker" "$pam_line" ""
-                kde_found=true
-            fi
-            if [[ -f /etc/pam.d/kde-fingerprint ]]; then
-                show_pam_diff "/etc/pam.d/kde-fingerprint" "$pam_line" ""
-                kde_found=true
-            fi
-            if [[ -f /etc/pam.d/kde-smartcard ]]; then
-                show_pam_diff "/etc/pam.d/kde-smartcard" "$pam_line" ""
-                kde_found=true
-            fi
-            if [[ "$kde_found" == false ]]; then
-                echo ""
-                echo -e "${YELLOW}[SKIP]${NC} KDE PAM configuration"
-                echo "  → No KDE PAM files found (/etc/pam.d/kde, kscreenlocker, etc.)"
             fi
         fi
         return
@@ -1152,6 +1350,7 @@ configure_pam() {
         
         if [[ -f /etc/pam.d/system-auth ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
+                backup_pam_file "/etc/pam.d/system-auth"
                 # Insert at the beginning of the auth section
                 sed -i "1i $pam_line" /etc/pam.d/system-auth
                 print_success "Configured PAM for system-auth"
@@ -1164,15 +1363,15 @@ configure_pam() {
         fi
     fi
     
-    # Only configure individual services if system-auth was NOT configured
-    if [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == false ]]; then
-        # Configure login
-        if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
-            print_info "Configuring PAM for login (console/TTY)..."
+    # Configure login (console login)
+    if [[ "$CONFIGURE_PAM_LOGIN" == true ]]; then
+        print_info "Configuring PAM for login (console login)..."
+        if [[ -f /etc/pam.d/login ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-                # Insert after pam_env.so or at beginning of auth section
-                if grep -q "pam_env.so" /etc/pam.d/login; then
-                    sed -i "/pam_env.so/a $pam_line" /etc/pam.d/login
+                backup_pam_file "/etc/pam.d/login"
+                # Insert after pam_nologin.so if present, otherwise at the beginning
+                if grep -q "pam_nologin.so" /etc/pam.d/login; then
+                    sed -i "/pam_nologin.so/a $pam_line" /etc/pam.d/login
                 else
                     sed -i "1i $pam_line" /etc/pam.d/login
                 fi
@@ -1180,204 +1379,215 @@ configure_pam() {
             else
                 print_warning "PAM login already configured"
             fi
+        else
+            print_warning "login PAM configuration not found at /etc/pam.d/login"
         fi
+    fi
 
-        # Configure su (used by `su`)
-        if [[ "$CONFIGURE_PAM_SU" == true ]]; then
-            local su_file="/etc/pam.d/su"
-            print_info "Configuring PAM for su (root shells via 'su')..."
-            if [[ -f "$su_file" ]]; then
-                if ! grep -q "pam_tapauth.so" "$su_file" 2>/dev/null; then
-                    if grep -q "pam_env.so" "$su_file"; then
-                        sed -i "/pam_env.so/a $pam_line" "$su_file"
-                    else
-                        sed -i "1i $pam_line" "$su_file"
-                    fi
-                    print_success "Configured PAM for su"
+    # Configure su (switching users)
+    if [[ "$CONFIGURE_PAM_SU" == true ]]; then
+        local su_file="/etc/pam.d/su"
+        print_info "Configuring PAM for su (user switching)..."
+        if [[ -f "$su_file" ]]; then
+            if ! grep -q "pam_tapauth.so" "$su_file" 2>/dev/null; then
+                backup_pam_file "$su_file"
+                if grep -q "pam_env.so" "$su_file"; then
+                    sed -i "/pam_env.so/a $pam_line" "$su_file"
                 else
-                    print_warning "PAM su already configured"
+                    sed -i "1i $pam_line" "$su_file"
                 fi
+                print_success "Configured PAM for su"
             else
-                print_warning "su PAM configuration not found at $su_file"
+                print_warning "PAM su already configured"
             fi
+        else
+            print_warning "su PAM configuration not found at $su_file"
         fi
+    fi
 
-        # Configure su-l (used by `su -`)
-        if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
-            local su_l_file="/etc/pam.d/su-l"
-            print_info "Configuring PAM for su-l (root shells via 'su -')..."
-            if [[ -f "$su_l_file" ]]; then
-                if ! grep -q "pam_tapauth.so" "$su_l_file" 2>/dev/null; then
-                    if grep -q "pam_env.so" "$su_l_file"; then
-                        sed -i "/pam_env.so/a $pam_line" "$su_l_file"
-                    else
-                        sed -i "1i $pam_line" "$su_l_file"
-                    fi
-                    print_success "Configured PAM for su-l"
+    # Configure su-l (used by `su -`)
+    if [[ "$CONFIGURE_PAM_SU_L" == true ]]; then
+        local su_l_file="/etc/pam.d/su-l"
+        print_info "Configuring PAM for su-l (root shells via 'su -')..."
+        if [[ -f "$su_l_file" ]]; then
+            if ! grep -q "pam_tapauth.so" "$su_l_file" 2>/dev/null; then
+                backup_pam_file "$su_l_file"
+                if grep -q "pam_env.so" "$su_l_file"; then
+                    sed -i "/pam_env.so/a $pam_line" "$su_l_file"
                 else
-                    print_warning "PAM su-l already configured"
+                    sed -i "1i $pam_line" "$su_l_file"
                 fi
+                print_success "Configured PAM for su-l"
             else
-                print_warning "su-l PAM configuration not found at $su_l_file"
+                print_warning "PAM su-l already configured"
             fi
+        else
+            print_warning "su-l PAM configuration not found at $su_l_file"
         fi
-        
-        # Configure sudo
-        if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
-            print_info "Configuring PAM for sudo..."
+    fi
+    
+    # Configure sudo
+    if [[ "$CONFIGURE_PAM_SUDO" == true ]]; then
+        print_info "Configuring PAM for sudo..."
+        if [[ -f /etc/pam.d/sudo ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
+                backup_pam_file "/etc/pam.d/sudo"
                 # Insert at beginning of auth section
                 sed -i "1i $pam_line" /etc/pam.d/sudo
                 print_success "Configured PAM for sudo"
             else
                 print_warning "PAM sudo already configured"
             fi
-        fi
-        
-        # Configure polkit
-        if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
-            print_info "Configuring PAM for polkit (GUI privilege elevation)..."
-            
-            # Check both /etc/pam.d and /usr/lib/pam.d (Fedora uses the latter)
-            local polkit_pam_file=""
-            if [[ -f /etc/pam.d/polkit-1 ]]; then
-                polkit_pam_file="/etc/pam.d/polkit-1"
-            elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-                polkit_pam_file="/usr/lib/pam.d/polkit-1"
-            fi
-            
-            if [[ -n "$polkit_pam_file" ]]; then
-                if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
-                    sed -i "1i $pam_line" "$polkit_pam_file"
-                    print_success "Configured PAM for polkit at $polkit_pam_file"
-                else
-                    print_warning "PAM polkit already configured at $polkit_pam_file"
-                fi
-            else
-                print_warning "polkit PAM configuration not found (checked /etc/pam.d/polkit-1 and /usr/lib/pam.d/polkit-1)"
-            fi
+        else
+            print_warning "sudo PAM configuration not found at /etc/pam.d/sudo"
         fi
     fi
     
+    # Configure polkit
+    if [[ "$CONFIGURE_PAM_POLKIT" == true ]]; then
+        print_info "Configuring PAM for polkit (GUI privilege elevation)..."
+        
+        # Check both /etc/pam.d and /usr/lib/pam.d (Fedora uses the latter)
+        local polkit_pam_file=""
+        if [[ -f /etc/pam.d/polkit-1 ]]; then
+            polkit_pam_file="/etc/pam.d/polkit-1"
+        elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
+            polkit_pam_file="/usr/lib/pam.d/polkit-1"
+        fi
+        
+        if [[ -n "$polkit_pam_file" ]]; then
+            if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
+                backup_pam_file "$polkit_pam_file"
+                sed -i "1i $pam_line" "$polkit_pam_file"
+                print_success "Configured PAM for polkit at $polkit_pam_file"
+            else
+                print_warning "PAM polkit already configured at $polkit_pam_file"
+            fi
+        else
+            print_warning "polkit PAM configuration not found (checked /etc/pam.d/polkit-1 and /usr/lib/pam.d/polkit-1)"
+        fi
+    fi
+    
+    # Helper to resolve distro account/password/session includes
+    get_pam_distro_includes() {
+        if [[ -f /etc/pam.d/system-local-login ]]; then
+            echo "account     include      system-local-login"
+            echo "password    include      system-local-login"
+            echo "session     include      system-local-login"
+        elif [[ -f /etc/pam.d/common-account ]]; then
+            echo "account     include      common-account"
+            echo "password    include      common-password"
+            echo "session     include      common-session"
+        elif [[ -f /etc/pam.d/system-auth ]]; then
+            echo "account     include      system-auth"
+            echo "password    include      system-auth"
+            echo "session     include      system-auth"
+        else
+            echo "account     required     pam_unix.so"
+            echo "password    required     pam_unix.so"
+            echo "session     required     pam_unix.so"
+        fi
+    }
+
+
     # Configure GDM (GNOME Display Manager)
     if [[ "$CONFIGURE_PAM_GDM" == true ]]; then
-        print_info "Configuring PAM for GDM (GNOME - first login)..."
+        print_info "Configuring PAM for GDM (GNOME dual-stack & lock screen)..."
+        local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
         
-        # GDM typically uses gdm-password for authentication
-        local gdm_configured=false
-        if [[ -f /etc/pam.d/gdm-password ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm-password; then
-                sed -i "1i $pam_line" /etc/pam.d/gdm-password
-                print_success "Configured PAM for GDM (gdm-password)"
-                gdm_configured=true
-            else
-                print_warning "PAM GDM already configured (gdm-password)"
-                gdm_configured=true
+        # Configure /etc/pam.d/gdm-fingerprint or /etc/pam.d/gdm3-fingerprint (dual-stack secondary service)
+        local configured_gdm=false
+        for fp_file in /etc/pam.d/gdm3-fingerprint /etc/pam.d/gdm-fingerprint; do
+            if [[ -f "$fp_file" ]]; then
+                insert_pam_decisive "$fp_file"
+                print_success "Configured PAM for GDM fingerprint ($fp_file)"
+                configured_gdm=true
+            fi
+        done
+
+        if [[ "$configured_gdm" == false ]]; then
+            local target_fp="/etc/pam.d/gdm-fingerprint"
+            if [[ -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm3 ]]; then
+                target_fp="/etc/pam.d/gdm3-fingerprint"
+            fi
+            if [[ -f /etc/pam.d/gdm-password || -f /etc/pam.d/gdm || -f /etc/pam.d/gdm3-password || -f /etc/pam.d/gdm3 || -d /etc/gdm || -d /etc/gdm3 ]]; then
+                print_info "Creating $target_fp for dual-stack GNOME lock screen..."
+                local includes
+                includes=$(get_pam_distro_includes)
+                cat << EOF > "$target_fp"
+#%PAM-1.0
+# Managed by TapAuth
+$pam_decisive_line
+$includes
+EOF
+                chmod 644 "$target_fp"
+                print_success "Created $target_fp"
             fi
         fi
-        
-        # Some systems might use just 'gdm'
-        if [[ -f /etc/pam.d/gdm ]] && [[ "$gdm_configured" == false ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/gdm; then
-                sed -i "1i $pam_line" /etc/pam.d/gdm
-                print_success "Configured PAM for GDM"
-            else
-                print_warning "PAM GDM already configured"
+
+        # Enable fingerprint authentication in GDM dconf settings
+        if [[ -d /etc/dconf/db/gdm.d ]]; then
+            print_info "Configuring GDM dconf to enable fingerprint auth..."
+            rm -f /etc/dconf/db/gdm.d/01-tapauth 2>/dev/null || true
+            if [[ -d /etc/dconf/profile && ! -f /etc/dconf/profile/gdm ]]; then
+                cat << 'EOF' > /etc/dconf/profile/gdm
+user-db:user
+system-db:gdm
+file-db:/usr/share/gdm/greeter-dconf-defaults
+EOF
             fi
-        elif [[ "$gdm_configured" == false ]]; then
-            print_warning "GDM PAM configuration not found (checked /etc/pam.d/gdm-password and /etc/pam.d/gdm)"
+            cat << 'EOF' > "$GDM_DCONF_DEST"
+[org/gnome/login-screen]
+enable-fingerprint-authentication=true
+EOF
+            if command -v dconf &> /dev/null; then
+                dconf update || true
+            fi
+            print_success "Configured GDM dconf override ($GDM_DCONF_DEST)"
         fi
     fi
     
-    # Configure SDDM (Simple Desktop Display Manager)
     if [[ "$CONFIGURE_PAM_SDDM" == true ]]; then
-        print_info "Configuring PAM for SDDM (KDE/LXQt - first login)..."
-        
-        # SDDM uses /etc/pam.d/sddm for user authentication
-        # Note: sddm-greeter is for the greeter UI process itself, not user auth
-        if [[ -f /etc/pam.d/sddm ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/sddm; then
-                sed -i "1i $pam_line" /etc/pam.d/sddm
-                print_success "Configured PAM for SDDM"
-            else
-                print_warning "PAM SDDM already configured"
-            fi
-        else
-            print_warning "SDDM PAM configuration not found at /etc/pam.d/sddm"
-        fi
+        print_info "Skipping SDDM PAM configuration: TapAuth bypasses display manager login to preserve keyring auto-unlock. No PAM entry is needed."
     fi
     
-    # Configure LightDM
     if [[ "$CONFIGURE_PAM_LIGHTDM" == true ]]; then
-        print_info "Configuring PAM for LightDM (first login)..."
-        
-        if [[ -f /etc/pam.d/lightdm ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/lightdm; then
-                sed -i "1i $pam_line" /etc/pam.d/lightdm
-                print_success "Configured PAM for LightDM"
-            else
-                print_warning "PAM LightDM already configured"
-            fi
-        else
-            print_warning "LightDM PAM configuration not found at /etc/pam.d/lightdm"
-        fi
+        print_info "Skipping LightDM PAM configuration: TapAuth bypasses display manager login to preserve keyring auto-unlock. No PAM entry is needed."
     fi
     
-    # Configure KDE (multiple PAM files)
+    # Configure KDE (dual-stack lock screen & legacy fallback)
     if [[ "$CONFIGURE_PAM_KDE" == true ]]; then
         print_info "Configuring PAM for KDE (lock screen)..."
+        local pam_decisive_line="auth    [success=done default=bad]    $PAM_SO_PATH"
         
-        local kde_configured=false
-        
-        # Configure /etc/pam.d/kde
-        if [[ -f /etc/pam.d/kde ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde; then
-                sed -i "1i $pam_line" /etc/pam.d/kde
-                print_success "Configured PAM for KDE (kde)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE already configured (kde)"
-                kde_configured=true
-            fi
-        fi
-        
-        # Configure /etc/pam.d/kscreenlocker
-        if [[ -f /etc/pam.d/kscreenlocker ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker; then
-                sed -i "1i $pam_line" /etc/pam.d/kscreenlocker
-                print_success "Configured PAM for KDE screen locker (kscreenlocker)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE screen locker already configured (kscreenlocker)"
-                kde_configured=true
-            fi
-        fi
-        
-        # Configure /etc/pam.d/kde-fingerprint (if it exists)
+        # Configure /etc/pam.d/kde-fingerprint (dual-stack secondary service)
         if [[ -f /etc/pam.d/kde-fingerprint ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
-                sed -i "1i $pam_line" /etc/pam.d/kde-fingerprint
-                print_success "Configured PAM for KDE fingerprint (kde-fingerprint)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE fingerprint already configured (kde-fingerprint)"
+            insert_pam_decisive "/etc/pam.d/kde-fingerprint"
+            print_success "Configured PAM for KDE fingerprint (kde-fingerprint)"
+        elif [[ -f /etc/pam.d/kscreenlocker || -f /etc/pam.d/kde || -f /etc/pam.d/plasma || -d /usr/share/plasma || -d /usr/share/kde4 ]]; then
+            print_info "Creating /etc/pam.d/kde-fingerprint for dual-stack lock screen..."
+            local includes
+            includes=$(get_pam_distro_includes)
+            cat << EOF > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+# Managed by TapAuth
+$pam_decisive_line
+$includes
+EOF
+            chmod 644 /etc/pam.d/kde-fingerprint
+            print_success "Created /etc/pam.d/kde-fingerprint"
+        fi
+
+        # Pre-dual-stack Plasma fallback (single-stack kde / kscreenlocker)
+        for legacy_kde_pam in /etc/pam.d/kscreenlocker /etc/pam.d/kde; do
+            if [[ -f "$legacy_kde_pam" ]]; then
+                if ! grep -q "pam_tapauth.so" "$legacy_kde_pam"; then
+                    backup_pam_file "$legacy_kde_pam"
+                    sed -i "1i $pam_line" "$legacy_kde_pam"
+                    print_success "Configured PAM for legacy KDE lock screen ($legacy_kde_pam)"
+                fi
             fi
-        fi
-        
-        # Configure /etc/pam.d/kde-smartcard (if it exists)
-        if [[ -f /etc/pam.d/kde-smartcard ]]; then
-            if ! grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard; then
-                sed -i "1i $pam_line" /etc/pam.d/kde-smartcard
-                print_success "Configured PAM for KDE smartcard (kde-smartcard)"
-                kde_configured=true
-            else
-                print_warning "PAM KDE smartcard already configured (kde-smartcard)"
-            fi
-        fi
-        
-        if [[ "$kde_configured" == false ]]; then
-            print_warning "No KDE PAM configuration files found (checked /etc/pam.d/kde, kscreenlocker, kde-fingerprint, kde-smartcard)"
-        fi
+        done
     fi
     
     # Inform about when changes take effect
@@ -1627,6 +1837,7 @@ main() {
     print_header "TapAuth Installation"
     
     parse_args "$@"
+    check_prerequisites
     
     if [[ "$INTERACTIVE" == true ]]; then
         prompt_features
@@ -1640,7 +1851,6 @@ main() {
         fi
     fi
     
-    check_prerequisites
     check_existing_installation
     build_components
     
@@ -1687,9 +1897,10 @@ main() {
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
         [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
         [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (skipped)"
-        [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
-        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)" || echo "  ✗ SDDM (skipped)"
-        [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (skipped)"
+        [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-fingerprint & dconf)" || echo "  ✗ GDM (skipped)"
+        [[ "$CONFIGURE_PAM_KDE" == true ]] && echo "  ✓ KDE (/etc/pam.d/kde-fingerprint)" || echo "  ✗ KDE (skipped)"
+        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  - SDDM (bypassed to preserve keyring unlock)" || echo "  ✗ SDDM (skipped)"
+        [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  - LightDM (bypassed to preserve keyring unlock)" || echo "  ✗ LightDM (skipped)"
         
         echo ""
         echo "Configuration:"

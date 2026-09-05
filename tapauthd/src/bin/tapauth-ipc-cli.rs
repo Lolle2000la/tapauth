@@ -98,6 +98,7 @@ async fn send_pam_auth(
                 tty_present: false,
                 timeout_seconds: timeout_secs,
                 request_id,
+                service_name: "tapauth-ipc-cli".to_string(),
             },
         )),
     };
@@ -148,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  complete-pairing <port>");
         eprintln!("  get-servers");
         eprintln!("  remove-device <public_key_hex>");
-        eprintln!("  set-transports --ble <true|false> --network <true|false>");
+        eprintln!("  set-transports [--ble <true|false>] [--network <true|false>] [--fprintd-bridge <true|false>]");
         eprintln!("  get-config");
         eprintln!("  pam-auth <username> [timeout_secs] [request_id]");
         eprintln!("  pam-cancel <request_id> [reason]");
@@ -255,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "set-transports" => {
             let mut ble = None;
             let mut network = None;
+            let mut fprintd_bridge = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -272,6 +274,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             std::process::exit(1);
                         }
                         network = Some(args[i + 1].parse::<bool>()?);
+                        i += 2;
+                    }
+                    "--fprintd-bridge" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing value for --fprintd-bridge");
+                            std::process::exit(1);
+                        }
+                        fprintd_bridge = Some(args[i + 1].parse::<bool>()?);
                         i += 2;
                     }
                     _ => i += 1,
@@ -309,6 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         udp_port,
                         enable_ble: ble,
                         enable_network: network,
+                        enable_fprintd_bridge: fprintd_bridge,
                     },
                 )),
             };
@@ -335,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("UDP_PORT={}", c.udp_port);
                 println!("ENABLE_BLE={}", c.enable_ble);
                 println!("ENABLE_NETWORK={}", c.enable_network);
+                println!("ENABLE_FPRINTD_BRIDGE={}", c.enable_fprintd_bridge);
             }
         }
         "pam-auth" => {

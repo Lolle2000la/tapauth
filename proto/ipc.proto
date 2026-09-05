@@ -31,6 +31,7 @@ message PamAuthenticateRequest {
   bool tty_present = 2;      // Whether PAM session has an interactive TTY
   uint32 timeout_seconds = 3; // Optional override; 0 => daemon default
   string request_id = 4;     // Client-generated unique id for cancel correlation
+  string service_name = 5;   // Calling PAM service name (e.g. "gdm-fingerprint", "kde-fingerprint", "sudo")
 }
 
 // Request to cancel a running authentication flow
@@ -98,12 +99,14 @@ message SaveConfigRequest {
   uint32 udp_port = 2;
   optional bool enable_ble = 3;
   optional bool enable_network = 4;
+  optional bool enable_fprintd_bridge = 5;
 }
 message GetConfigResponse {
   string hostname = 1;
   uint32 udp_port = 2;
   bool enable_ble = 3;
   bool enable_network = 4;
+  bool enable_fprintd_bridge = 5;
 }
 
 message AdminResponse {

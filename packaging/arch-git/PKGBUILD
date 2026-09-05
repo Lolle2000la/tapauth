@@ -1,0 +1,92 @@
+# Maintainer: Lolle2000la
+pkgbase=tapauth-git
+pkgname=('tapauth-git' 'tapauth-fprintd-git')
+pkgver=0.10.0.r14.g1e0eb73
+pkgrel=1
+arch=('x86_64' 'aarch64')
+url="https://github.com/lolle2000la/tapauth"
+license=('AGPL-3.0-only')
+makedepends=('cargo' 'protobuf' 'clang' 'git' 'pam')
+source=("tapauth::git+https://github.com/lolle2000la/tapauth.git#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/tapauth"
+  local desc
+  if desc=$(git describe --long --tags 2>/dev/null); then
+    echo "$desc" | sed -E 's/^v//;s/-([0-9]+)-g([0-9a-f]+)$/.r\1.g\2/;s/-/_/g'
+  else
+    local base
+    base=$(git tag --sort=-version:refname 2>/dev/null | grep -E '^v[0-9]' | head -1 | sed 's/^v//')
+    printf "%s.r%s.%s" "${base:-0.0.0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  fi
+}
+
+prepare() {
+  cd "${srcdir}/tapauth"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "${srcdir}/tapauth"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_PROFILE_RELEASE_STRIP=true
+  cargo build --frozen --workspace --release --locked
+}
+
+package_tapauth-git() {
+  pkgdesc="Local smartphone-based authentication framework engine (Development/Git version)"
+  depends=('dbus' 'pam' 'polkit' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon')
+  optdepends=(
+    'firewalld: for automated firewall port management'
+    'iptables: for iptables firewall integration'
+    'bluez: for Bluetooth Low Energy (BLE) transport'
+    'tapauth-fprintd-git: for virtual fprintd desktop lock screen integration'
+  )
+  provides=("tapauth=${pkgver}")
+  backup=('etc/tapauth/config.toml')
+  conflicts=('tapauth')
+  install=tapauth-git.install
+
+  cd "${srcdir}/tapauth"
+  install -dm0755 "${pkgdir}/etc/tapauth"
+  install -Dm0644 config.toml.example "${pkgdir}/etc/tapauth/config.toml.example"
+  cat << 'EOF' > "${pkgdir}/etc/tapauth/config.toml"
+# TapAuth Configuration
+enable_fprintd_bridge = false
+EOF
+  chmod 0644 "${pkgdir}/etc/tapauth/config.toml"
+  install -Dm0755 target/release/tapauthd "${pkgdir}/usr/bin/tapauthd"
+  install -Dm0755 target/release/tapauth-config "${pkgdir}/usr/bin/tapauth-config"
+  install -Dm0755 target/release/tapauth-ipc-cli "${pkgdir}/usr/bin/tapauth-ipc-cli"
+  install -Dm0755 target/release/libclient_pam.so "${pkgdir}/usr/lib/security/pam_tapauth.so"
+
+  install -Dm0644 systemd/tapauthd.service "${pkgdir}/usr/lib/systemd/system/tapauthd.service"
+  install -Dm0644 systemd/tapauthd.socket "${pkgdir}/usr/lib/systemd/system/tapauthd.socket"
+  install -Dm0644 systemd/polkit-agent-helper@.service.d/tapauth.conf "${pkgdir}/usr/lib/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
+
+  install -Dm0644 packaging/sysusers.conf "${pkgdir}/usr/lib/sysusers.d/tapauth.conf"
+  install -Dm0644 packaging/tmpfiles.conf "${pkgdir}/usr/lib/tmpfiles.d/tapauth.conf"
+
+  install -Dm0644 client-config-gui/tapauth-config.desktop "${pkgdir}/usr/share/applications/tapauth-config.desktop"
+  install -Dm0644 client-config-gui/assets/tapauth-config.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
+  install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "${pkgdir}/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
+  install -Dm0644 packaging/50-tapauthd.rules "${pkgdir}/usr/share/polkit-1/rules.d/50-tapauthd.rules"
+
+  install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
+
+package_tapauth-fprintd-git() {
+  pkgdesc="Virtual fprintd D-Bus bridge for TapAuth lock screen integration (conflicts with hardware fprintd)"
+  depends=("tapauth-git=${pkgver}" 'dbus')
+  provides=('fprintd' 'tapauth-fprintd')
+  conflicts=('fprintd' 'tapauth-fprintd')
+  install=tapauth-fprintd-git.install
+
+  cd "${srcdir}/tapauth"
+  install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+  install -Dm0644 packaging/net.reactivated.Fprint.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+  install -Dm0644 packaging/arch/tapauth-fprintd-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-fprintd-pam.hook"
+  install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -225,6 +225,124 @@ impl DaemonState {
 
 type CancelRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
 
+/// Drop guard to ensure cancel-registry entries are never leaked on normal completion,
+/// errors, or drop.
+struct CancelGuard {
+    registry: Option<CancelRegistry>,
+    request_id: Option<String>,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let (Some(reg), Some(id)) = (self.registry.take(), self.request_id.take()) {
+            match reg.clone().try_lock_owned() {
+                Ok(mut lock) => {
+                    lock.remove(&id);
+                }
+                Err(_) => {
+                    tokio::spawn(async move {
+                        let mut lock = reg.lock().await;
+                        lock.remove(&id);
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Query systemd-logind over system D-Bus to check if the target user has an active
+/// graphical session that is currently locked (`LockedHint == true`).
+async fn is_user_session_locked(username: &str) -> bool {
+    let probe = async {
+        let connection = match zbus::Connection::system().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to connect to system D-Bus for logind query: {}", e);
+                return false;
+            }
+        };
+
+        let user_name = username.to_string();
+        let name_for_task = user_name.clone();
+        let target_uid =
+            match tokio::task::spawn_blocking(move || nix::unistd::User::from_name(&name_for_task))
+                .await
+            {
+                Ok(Ok(Some(u))) => u.uid.as_raw(),
+                _ => {
+                    tracing::warn!(
+                        "Failed to resolve UID for user '{}' during logind probe",
+                        user_name
+                    );
+                    return false;
+                }
+            };
+
+        // Query org.freedesktop.login1.Manager at /org/freedesktop/login1
+        let reply = match connection
+            .call_method(
+                Some("org.freedesktop.login1"),
+                "/org/freedesktop/login1",
+                Some("org.freedesktop.login1.Manager"),
+                "ListSessions",
+                &(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("logind ListSessions call failed: {}", e);
+                return false;
+            }
+        };
+
+        let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
+            match reply.body().deserialize() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to deserialize ListSessions reply: {}", e);
+                    return false;
+                }
+            };
+
+        for (_, uid, _, _, session_path) in sessions {
+            if uid == target_uid {
+                if let Ok(reply) = connection
+                    .call_method(
+                        Some("org.freedesktop.login1"),
+                        session_path.as_str(),
+                        Some("org.freedesktop.DBus.Properties"),
+                        "Get",
+                        &("org.freedesktop.login1.Session", "LockedHint"),
+                    )
+                    .await
+                {
+                    if let Ok(val) = reply.body().deserialize::<zbus::zvariant::OwnedValue>() {
+                        if let Ok(locked) = bool::try_from(val) {
+                            if locked {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), probe).await {
+        Ok(res) => res,
+        Err(_) => {
+            tracing::warn!(
+                "logind session lock check timed out for user '{}'",
+                username
+            );
+            false
+        }
+    }
+}
+
 /// Per-request authentication session
 pub struct AuthSession {
     state: Arc<DaemonState>,
@@ -261,11 +379,41 @@ impl AuthSession {
         mut self,
         timeout_seconds: Option<u32>,
         request_id: Option<String>,
+        service_name: Option<String>,
         cancel_registry: CancelRegistry,
+        cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
         // Record cancel context for targeted cancellation
         self.request_id = request_id;
         self.cancel_registry = Some(cancel_registry);
+        let _cancel_guard = CancelGuard {
+            registry: self.cancel_registry.clone(),
+            request_id: self.request_id.clone(),
+        };
+
+        // If the request originates from GDM's biometric stack (gdm-fingerprint, gdm3-fingerprint, etc.),
+        // check whether the user already has an active session with LockedHint == true.
+        // If not (initial login screen), return Ignore immediately so the greeter falls through to
+        // password collection, populating PAM_AUTHTOK and unlocking GNOME Keyring.
+        if let Some(ref service) = service_name {
+            if (service == "gdm-fingerprint"
+                || service == "gdm-smartcard"
+                || service == "gdm3-fingerprint"
+                || service == "gdm3-smartcard")
+                && !is_user_session_locked(&self.username).await
+            {
+                tracing::info!(
+                    "GDM initial login screen detected for user '{}' — skipping biometric auth to preserve keyring auto-unlock",
+                    self.username
+                );
+                return Ok(ipc::PamAuthenticateResponse {
+                    outcome: ipc::PamOutcome::Ignore as i32,
+                    detail: "GDM initial login screen — password required for keyring auto-unlock"
+                        .to_string(),
+                    challenge: self.challenge.to_vec(),
+                });
+            }
+        }
 
         // Read transport toggles fresh from the TOML config so that changes
         // made via the GUI/admin IPC take effect without a daemon restart.
@@ -363,7 +511,7 @@ impl AuthSession {
             None
         };
 
-        // Create the authentication request
+        // Generate challenge and create authentication request
         let request = create_auth_request_with_challenge(
             &self.username,
             &self.state.hostname,
@@ -388,8 +536,11 @@ impl AuthSession {
         // Run authentication with timeout
         let timeout_duration = Duration::from_secs(timeout_seconds.unwrap_or(30) as u64);
 
-        let auth_result =
-            tokio::time::timeout(timeout_duration, self.try_parallel_authentication(&packet)).await;
+        let auth_result = tokio::time::timeout(
+            timeout_duration,
+            self.try_parallel_authentication(&packet, cancel_rx),
+        )
+        .await;
 
         match auth_result {
             Ok(Ok(())) => Ok(ipc::PamAuthenticateResponse {
@@ -443,7 +594,23 @@ impl AuthSession {
     async fn try_parallel_authentication(
         &mut self,
         packet: &EncryptedPacket,
+        mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<(), AuthHandlerError> {
+        if cancel_rx.try_recv().is_ok() {
+            tracing::info!(
+                "Authentication for '{}' cancelled prior to transport setup",
+                self.username
+            );
+            let cancel_packet = self.create_cancel_packet()?;
+            if self.transports.network {
+                let toml_config = shared::config::TapAuthConfig::load();
+                let transport =
+                    UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
+                let _ = transport.send_cancel(&cancel_packet).await;
+            }
+            return Err(AuthHandlerError::Denied);
+        }
+
         let temporal_id = generate_current_temporal_identifier_ble(
             self.state
                 .csk
@@ -457,10 +624,6 @@ impl AuthSession {
         // Initialize transports
         let (udp_transport, ble_transport) =
             self.initialize_transports(temporal_id, timeout).await?;
-
-        // Setup cancellation mechanism
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.register_cancel_handler(cancel_tx).await;
 
         // Pre-compute cancel packet
         let cancel_packet = self.create_cancel_packet()?;
@@ -535,13 +698,6 @@ impl AuthSession {
         };
 
         Ok((Arc::new(udp_transport), ble_transport))
-    }
-
-    #[cfg(feature = "ble")]
-    async fn register_cancel_handler(&mut self, cancel_tx: oneshot::Sender<()>) {
-        if let (Some(reg), Some(id)) = (self.cancel_registry.as_ref(), self.request_id.as_ref()) {
-            reg.lock().await.insert(id.clone(), cancel_tx);
-        }
     }
 
     fn create_cancel_packet(&self) -> Result<EncryptedPacket, AuthHandlerError> {
@@ -803,6 +959,7 @@ impl AuthSession {
     async fn try_parallel_authentication(
         &mut self,
         packet: &EncryptedPacket,
+        mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<(), AuthHandlerError> {
         let toml_config = shared::config::TapAuthConfig::load();
         let transport =
@@ -820,15 +977,30 @@ impl AuthSession {
             .csk
             .as_ref()
             .unwrap_or_else(|| unreachable!("csk checked in health check"));
-        Self::authenticate_with_transport(
-            transport_arc,
+
+        let auth_fut = Self::authenticate_with_transport(
+            transport_arc.clone(),
             packet,
             csk,
             keypair,
             &self.challenge,
             servers,
-        )
-        .await
+        );
+        tokio::pin!(auth_fut);
+
+        tokio::select! {
+            res = &mut auth_fut => res,
+            _ = &mut cancel_rx => {
+                tracing::info!(
+                    "Authentication cancelled by client disconnect for user: {}",
+                    self.username
+                );
+                let cancel_packet = self.create_cancel_packet()?;
+                let _ = transport_arc.send_cancel(&cancel_packet).await;
+                let _ = transport_arc.finalize().await;
+                Err(AuthHandlerError::Denied)
+            }
+        }
     }
 
     /// Authenticate using any Transport
@@ -1109,4 +1281,32 @@ impl AuthSession {
 enum ResponseError {
     /// Invalid message that should be ignored (wait for another response)
     InvalidMessage,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cancel_guard_cleanup_on_drop() {
+        let registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        let req_id = "test-request-123".to_string();
+
+        registry.lock().await.insert(req_id.clone(), tx);
+        assert!(registry.lock().await.contains_key(&req_id));
+
+        {
+            let _guard = CancelGuard {
+                registry: Some(registry.clone()),
+                request_id: Some(req_id.clone()),
+            };
+            assert!(registry.lock().await.contains_key(&req_id));
+        }
+
+        // After guard is dropped, the entry must be removed from the registry
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!registry.lock().await.contains_key(&req_id));
+    }
 }

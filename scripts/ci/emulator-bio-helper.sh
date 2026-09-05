@@ -31,7 +31,7 @@ case "$ACTION" in
         ENROLL_PID=$!
         sleep 0.5
         for _ in {1..10}; do
-            adb emu finger touch 1 2>/dev/null || true
+            adb emu finger touch 1 >/dev/null 2>&1 || true
             sleep 0.2
         done
         wait $ENROLL_PID 2>/dev/null || true
@@ -45,11 +45,11 @@ case "$ACTION" in
         PKG="${2:-dev.rourunisen.tapauth.e2e}"
         echo "    Triggering biometric denial for $PKG (finger 2 / cancel / dev-deny broadcast)..."
         # Finger 2 is not enrolled, causing biometric failure
-        adb emu finger touch 2 2>/dev/null || true
+        adb emu finger touch 2 >/dev/null 2>&1 || true
         # Explicit denial broadcast (no-op unless the e2e variant is installed)
-        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_DENY 2>/dev/null || true
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_DENY >/dev/null 2>&1 || true
         # Also simulate negative / cancel button if prompt is active
-        adb shell input keyevent KEYCODE_BACK 2>/dev/null || true
+        adb shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
         ;;
 
     start-auto-grant)
