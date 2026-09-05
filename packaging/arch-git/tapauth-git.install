@@ -2,15 +2,11 @@ post_install() {
   systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
   systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
   chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
-  if [ ! -f /etc/tapauth/config.toml ]; then
-    if [ -f /etc/tapauth/config.toml.example ]; then
-      cp -p /etc/tapauth/config.toml.example /etc/tapauth/config.toml
-    else
-      cat << 'CFGEOF' > /etc/tapauth/config.toml
-# TapAuth Configuration
-enable_fprintd_bridge = false
-CFGEOF
-    fi
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  elif [ -f /etc/tapauth/config.toml.example ]; then
+    cp -p /etc/tapauth/config.toml.example /etc/tapauth/config.toml
     chmod 644 /etc/tapauth/config.toml
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
@@ -28,6 +24,10 @@ post_upgrade() {
   systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
   systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
   chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  fi
   systemctl daemon-reload
   systemctl try-restart tapauthd.service 2>/dev/null || true
 }

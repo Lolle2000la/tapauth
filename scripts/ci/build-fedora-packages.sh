@@ -62,8 +62,13 @@ if [ -n "$CARGO_FEATURES" ]; then
     RPMBUILD_ARGS+=("--define" "cargo_features --features ${CARGO_FEATURES}")
 fi
 
-export CARGO_HOME="${CARGO_HOME:-/root/.cargo}"
-export SCCACHE_DIR="${SCCACHE_DIR:-/root/.cache/sccache}"
+if [ -d /root/.cargo ]; then
+    RPMBUILD_ARGS+=("--define" "_cargo_home /root/.cargo")
+fi
+if [ -d /root/.cache/sccache ]; then
+    RPMBUILD_ARGS+=("--define" "_sccache_dir /root/.cache/sccache")
+fi
+
 echo "==> Running rpmbuild..."
 rpmbuild "${RPMBUILD_ARGS[@]}"
 

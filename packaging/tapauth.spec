@@ -65,11 +65,11 @@ Do not install if you rely on a physical fingerprint reader.
 %setup -q -n %{name}-%{version}
 
 %build
-export CARGO_HOME="${CARGO_HOME:-%{_builddir}/cargo-home}"
+export CARGO_HOME="%{?_cargo_home}%{!?_cargo_home:${CARGO_HOME:-%{_builddir}/cargo-home}}"
 export CARGO_PROFILE_RELEASE_STRIP=true
 if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
-    export SCCACHE_DIR="${SCCACHE_DIR:-%{_builddir}/sccache}"
+    export SCCACHE_DIR="%{?_sccache_dir}%{!?_sccache_dir:${SCCACHE_DIR:-%{_builddir}/sccache}}"
 fi
 cargo build --workspace --release --locked %{?cargo_features}
 if command -v sccache >/dev/null 2>&1; then
