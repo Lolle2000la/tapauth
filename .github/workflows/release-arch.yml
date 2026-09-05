@@ -77,11 +77,12 @@ jobs:
             bash -c "useradd -m builder && chown -R builder:builder /pkg && su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'"
           cd aur-repo
 
-          if git diff --quiet PKGBUILD .SRCINFO tapauth.install tapauth-fprintd.install config.toml.example; then
+          git add -A
+
+          if git diff --cached --quiet; then
             echo "No changes in packaging files. Skipping commit."
             exit 0
           fi
 
-          git add PKGBUILD .SRCINFO tapauth.install tapauth-fprintd.install config.toml.example
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master

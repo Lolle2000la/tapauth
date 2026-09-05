@@ -24,6 +24,7 @@ REMOVE_USER_DATA=false
 PRESERVE_SYSTEM_ACCOUNTS=false
 RESTORE_PAM_BACKUPS=false
 DRY_RUN=false
+FORCE=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
@@ -124,6 +125,7 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (non-interactive; does NOT remove user data)
+    -f, --force             Force uninstallation over package-managed files without prompting
     --purge, --remove-user-data Remove user data including pairing keys (use with caution)
     --restore-pam-backups   Restore original PAM configurations from .tapauth-bak files
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
@@ -279,6 +281,10 @@ parse_args() {
                 ;;
             -n|--non-interactive)
                 INTERACTIVE=false
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
                 shift
                 ;;
             -y|--yes)
@@ -696,7 +702,8 @@ remove_user_data() {
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove user data"
         echo ""
-        show_file_removal "$CONFIG_DIR" "System configuration directory (contains keys and config)"
+        show_file_removal "$CONFIG_DIR" "System state directory (contains keys and paired devices)"
+        show_file_removal "/etc/tapauth" "System configuration directory (/etc/tapauth)"
         
         # Check for user-specific configs
         for home_dir in /home/*; do
@@ -712,7 +719,12 @@ remove_user_data() {
         rm -rf "$CONFIG_DIR"
         print_success "User data removed"
     else
-        print_info "No user data found"
+        print_info "No user data found in $CONFIG_DIR"
+    fi
+
+    if [[ -d "/etc/tapauth" ]]; then
+        print_info "Removing system configuration directory /etc/tapauth"
+        rm -rf "/etc/tapauth"
     fi
     
     # Remove log directory
@@ -910,9 +922,12 @@ main() {
         print_warning "TapAuth appears to have been installed via your system package manager."
         print_warning "Running this standalone script will delete package-managed binaries without updating"
         print_warning "the package database, which may cause errors during package updates or removal."
-        print_info "Recommended command: sudo $pkg_manager"
-        if [[ "$FORCE" == true || "$INTERACTIVE" == false ]]; then
-            print_info "Continuing due to non-interactive/force mode."
+        if [[ "$FORCE" == true ]]; then
+            print_info "Continuing due to --force flag."
+        elif [[ "$INTERACTIVE" == false ]]; then
+            print_error "Cannot uninstall package-managed TapAuth ($pkg_manager) in non-interactive mode without --force."
+            print_info "Use your distribution package manager to uninstall TapAuth, or pass --force."
+            exit 1
         else
             read -p "Proceed with manual uninstallation anyway? [y/N]: " pkg_uninst_confirm
             if [[ ! "$pkg_uninst_confirm" =~ ^[Yy]$ ]]; then

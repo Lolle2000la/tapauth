@@ -1,0 +1,6 @@
+; TapAuth SELinux Policy Module (CIL)
+; Enables desktop display managers and lock screens (xdm_t)
+; to communicate with tapauthd over the daemon's Unix domain socket.
+
+(allow xdm_t init_t (unix_stream_socket (connectto)))
+(allow xdm_t unconfined_service_t (unix_stream_socket (connectto)))

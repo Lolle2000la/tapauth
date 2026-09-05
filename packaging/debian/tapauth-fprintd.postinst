@@ -19,9 +19,9 @@ if [ "$1" = "configure" ]; then
 	for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
 		[ -f "$pam_file" ] || continue
 		[ -L "$pam_file" ] && continue
-		if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+		if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
 			[ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-			sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+			sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
 		fi
 	done
 

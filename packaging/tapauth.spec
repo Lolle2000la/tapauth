@@ -51,7 +51,7 @@ BuildArch:      noarch
 Requires:       %{name} = %{version}-%{release}
 Requires:       dbus
 Conflicts:      fprintd
-Provides:       fprintd = 1.94.5
+Provides:       fprintd
 %{?systemd_requires}
 
 %description fprintd
@@ -111,7 +111,7 @@ enable_fprintd_bridge = false
 EOF
 chmod 0644 %{buildroot}%{_sysconfdir}/tapauth/config.toml
 
-%if 0%{?fedora} || 0%{?rhel}
+%if 0%{?fedora}
 # Authselect Vendor Profile Generation
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/local/*; do
@@ -179,6 +179,10 @@ install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datad
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 
+# SELinux Policy Module
+mkdir -p %{buildroot}%{_datadir}/selinux/packages
+install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/packages/tapauth.cil
+
 # Virtual fprintd D-Bus Bridge files (subpackage)
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
@@ -187,13 +191,13 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_dat
 
 %pre
 %{?sysusers_create_compat:%sysusers_create_compat %{SOURCE1}}
-getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd 2>/dev/null || :
-getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients 2>/dev/null || :
+getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd
+getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients
 if ! getent passwd tapauthd >/dev/null 2>&1; then
     useradd -r -g tapauthd -G tapauthd-clients -d /var/lib/tapauth -s /sbin/nologin \
-        -c "TapAuth Daemon" tapauthd 2>/dev/null || :
+        -c "TapAuth Daemon" tapauthd
 else
-    usermod -aG tapauthd-clients tapauthd 2>/dev/null || :
+    usermod -aG tapauthd-clients tapauthd 2>/dev/null || true
 fi
 
 %post
@@ -224,6 +228,9 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enf
     echo "         allow GDM to connect to the daemon socket via:"
     echo "         sudo ausearch -m avc -ts recent | audit2allow -M tapauth_gdm && sudo semodule -i tapauth_gdm.pp"
 fi
+if command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinuxenabled ] && /usr/sbin/selinuxenabled 2>/dev/null; then
+    semodule -i %{_datadir}/selinux/packages/tapauth.cil 2>/dev/null || true
+fi
 restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>/dev/null || true
 
 %preun
@@ -245,6 +252,9 @@ fi
 
 %postun
 %systemd_postun_with_restart tapauthd.service tapauthd.socket
+if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinuxenabled ] && /usr/sbin/selinuxenabled 2>/dev/null; then
+    semodule -r tapauth 2>/dev/null || true
+fi
 
 %post fprintd
 if [ $1 -eq 1 ] && [ -f %{_sysconfdir}/tapauth/config.toml ]; then
@@ -262,9 +272,9 @@ pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
 for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
-    if grep -q "pam_fprintd\.so" "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
         [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+        sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
     fi
 done
 
@@ -327,6 +337,18 @@ elif command -v dbus-send &>/dev/null; then
     dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
 fi
 systemctl try-restart tapauthd.service 2>/dev/null || true
+
+%triggerin fprintd -- gdm, plasma-workspace
+# Re-patch PAM stacks if desktop manager updates overwrite /etc/pam.d/
+pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
+for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
+    fi
+done
 
 %preun fprintd
 if [ $1 -eq 0 ]; then
@@ -393,6 +415,7 @@ fi
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
+%{_datadir}/selinux/packages/tapauth.cil
 %if 0%{?fedora} || 0%{?rhel}
 %{_datadir}/authselect/vendor/tapauth
 %{_datadir}/authselect/vendor/tapauth-sssd

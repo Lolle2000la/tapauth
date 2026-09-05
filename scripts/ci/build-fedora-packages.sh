@@ -9,6 +9,7 @@ PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/rpm-build}"
 NO_CHECK=false
+ALLOW_TEST_FEATURES=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -24,12 +25,29 @@ while [[ $# -gt 0 ]]; do
             NO_CHECK=true
             shift
             ;;
+        --allow-test-features)
+            ALLOW_TEST_FEATURES=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
             ;;
     esac
 done
+
+# Guard: reject dev/test features in production package builds unless explicitly allowed
+DEV_FEATURE_PATTERNS=("dev-" "fallback-socket")
+if [ "$ALLOW_TEST_FEATURES" = false ] && [ -n "$CARGO_FEATURES" ]; then
+    for pattern in "${DEV_FEATURE_PATTERNS[@]}"; do
+        if echo "$CARGO_FEATURES" | grep -q "$pattern"; then
+            echo "❌ ERROR: Cannot build production Fedora package with test feature: '$CARGO_FEATURES'"
+            echo "   Production packages must never contain dev overrides."
+            echo "   Pass --allow-test-features if this is an explicit test build."
+            exit 1
+        fi
+    done
+fi
 
 if ! command -v rpmbuild >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     echo "==> Installing build dependencies for Fedora..."

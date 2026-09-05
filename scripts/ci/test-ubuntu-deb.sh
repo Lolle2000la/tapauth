@@ -74,6 +74,11 @@ test "$MODE" = "644"
 test -f /lib/systemd/system/tapauthd.service || test -f /usr/lib/systemd/system/tapauthd.service
 test -f /lib/systemd/system/tapauthd.socket || test -f /usr/lib/systemd/system/tapauthd.socket
 
+echo "Verifying pam-auth-update wired pam_tapauth.so into /etc/pam.d/common-auth..."
+if [ -f /etc/pam.d/common-auth ]; then
+    grep "pam_tapauth.so" /etc/pam.d/common-auth
+fi
+
 echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
 mkdir -p /etc/pam.d
 cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
@@ -98,6 +103,21 @@ echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
+echo "==> 4b. Testing package upgrade and reconfiguration ($2 state)..."
+dpkg -i /tmp/deb-build/tapauth_${PKG_VER}*.deb
+dpkg -i /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
+
+echo "Verifying configuration, PAM wiring, and permissions survived upgrade..."
+grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
+OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
+MODE=$(stat -c "%a" /etc/tapauth/config.toml)
+test "$OWNER" = "tapauthd:tapauthd"
+test "$MODE" = "644"
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+if [ -f /etc/pam.d/common-auth ]; then
+    grep "pam_tapauth.so" /etc/pam.d/common-auth
+fi
+
 echo "==> 5. Testing removal and purge of subpackage (tapauth-fprintd)..."
 apt-get remove -y tapauth-fprintd
 test -f /etc/tapauth/config.toml
@@ -116,6 +136,10 @@ test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 echo "==> 6. Testing purge of base package (tapauth)..."
 apt-get purge -y tapauth
 test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
+if [ -f /etc/pam.d/common-auth ]; then
+    echo "Verifying pam_tapauth.so unwired from common-auth upon purge..."
+    ! grep "pam_tapauth.so" /etc/pam.d/common-auth
+fi
 
 echo "=================================================="
 echo "🎉 ALL UBUNTU/DEBIAN BUILD AND INSTALL TESTS PASSED!"

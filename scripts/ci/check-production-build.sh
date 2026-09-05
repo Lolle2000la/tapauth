@@ -38,12 +38,16 @@ fi
 DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
 DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
 
-echo "==> Building production artifacts (per crate, default features)"
+echo "==> Building production artifacts (per crate, default features, debug & release)"
 # Mirrors install.sh: each crate is built on its own so no dev feature can be
 # pulled in through workspace feature unification.
 cargo build --quiet -p tapauthd
 cargo build --quiet -p client-pam
 cargo build --quiet -p client-config-gui
+
+cargo build --quiet --release -p tapauthd
+cargo build --quiet --release -p client-pam
+cargo build --quiet --release -p client-config-gui
 
 fail=0
 
@@ -73,11 +77,17 @@ check_artifact() {
     fi
 }
 
-echo "==> Checking shipped artifacts"
+echo "==> Checking debug artifacts"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauthd" "${DEV_VARS_DAEMON[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-config" "${DEV_VARS_CLIENT[@]}"
+
+echo "==> Checking release artifacts (shipping binaries)"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauthd" "${DEV_VARS_DAEMON[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauth-config" "${DEV_VARS_CLIENT[@]}"
 
 # Positive control: prove the scan above is capable of detecting a dev build.
 # Without this, a missing/garbled strings binary would report "clean" for every

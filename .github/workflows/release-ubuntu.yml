@@ -96,8 +96,24 @@ jobs:
           ln -s "${PARENT_DIR}" "tapauth-${DEB_VER}"
           cd "tapauth-${DEB_VER}"
 
+          # Ensure ~/.dput.cf explicitly uses anonymous FTP to ppa.launchpad.net (no SSH key needed; GPG-verified)
+          cat << 'EOF' | sed 's/^[[:space:]]*//' > ~/.dput.cf
+          [ppa]
+          fqdn = ppa.launchpad.net
+          method = ftp
+          incoming = ~%(ppa)s/ubuntu
+          login = anonymous
+          allow_unsigned_uploads = 0
+          EOF
+
           ACTIVE_SERIES=""
+          DEVEL_SERIES=$(ubuntu-distro-info --devel 2>/dev/null || echo "")
           for SERIES in $(ubuntu-distro-info --supported 2>/dev/null); do
+            # Skip unreleased in-development series to prevent upload failures
+            if [ -n "$DEVEL_SERIES" ] && [ "$SERIES" = "$DEVEL_SERIES" ]; then
+              echo "Skipping unreleased development series: ${SERIES}"
+              continue
+            fi
             if REL_VER=$(ubuntu-distro-info -r --series="${SERIES}" 2>/dev/null) && [ -n "$REL_VER" ]; then
               CLEAN_VER="${REL_VER%% *}"
               if dpkg --compare-versions "${CLEAN_VER}" ge "22.04" 2>/dev/null; then

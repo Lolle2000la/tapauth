@@ -115,6 +115,22 @@ echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
+echo "==> 9b. Testing package upgrade (rpm -Uvh --replacepkgs)..."
+rpm -Uvh --replacepkgs "${PKG_DIR}"/tapauth-${PKG_VER}-*.rpm
+rpm -Uvh --replacepkgs "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.rpm
+
+echo "Verifying %config(noreplace) preserved config.toml and authselect state..."
+test -f /etc/tapauth/config.toml
+grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
+OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
+MODE=$(stat -c "%a" /etc/tapauth/config.toml)
+test "$OWNER" = "tapauthd:tapauthd"
+test "$MODE" = "644"
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+if command -v authselect >/dev/null 2>&1; then
+    authselect check
+fi
+
 echo "==> 10. Testing removal of subpackage (tapauth-fprintd)..."
 rpm -e tapauth-fprintd
 grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml

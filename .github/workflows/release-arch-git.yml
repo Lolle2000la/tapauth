@@ -59,11 +59,12 @@ jobs:
 
           cd aur-repo
 
-          if git diff --quiet PKGBUILD .SRCINFO tapauth-git.install tapauth-fprintd-git.install; then
+          git add -A
+
+          if git diff --cached --quiet; then
             echo "No changes in tapauth-git packaging files. Skipping commit."
             exit 0
           fi
 
-          git add PKGBUILD .SRCINFO tapauth-git.install tapauth-fprintd-git.install
           git commit -m "Automated sync from main (${GITHUB_SHA::8})"
           git push origin master

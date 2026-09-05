@@ -13,6 +13,9 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
 		systemctl reload dbus 2>/dev/null || true
 		systemctl try-restart tapauthd.service 2>/dev/null || true
 	fi
+	if ! dpkg -l fprintd 2>/dev/null | grep -q '^ii'; then
+		echo "TapAuth: If you have a physical fingerprint sensor, reinstall hardware fprintd via: sudo apt install fprintd libpam-fprintd"
+	fi
 fi
 #DEBHELPER#
 exit 0

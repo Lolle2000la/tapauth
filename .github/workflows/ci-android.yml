@@ -149,19 +149,34 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config dpkg-dev polkitd dbus
 
-      - name: Build TapAuth Debian Packages
+      - name: Build TapAuth Debian Packages (Production)
         run: |
-          ./scripts/ci/build-debian-packages.sh --features "tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass"
+          ./scripts/ci/build-debian-packages.sh
 
       - name: Verify Debian Package Quality & Invariants
         run: |
           sudo ./scripts/ci/test-ubuntu-deb.sh --skip-build
 
-      - name: Upload Debian Packages
+      - name: Scan Shipped Debian Binaries for Dev Overrides
+        run: |
+          ./scripts/ci/scan-package-artifacts.sh deb /tmp/deb-build
+
+      - name: Upload Production Debian Packages
         uses: actions/upload-artifact@v7
         with:
           name: pkg-ubuntu
           path: /tmp/deb-build/*.deb
+          retention-days: 1
+
+      - name: Build TapAuth Debian Packages (Test/E2E)
+        run: |
+          ./scripts/ci/build-debian-packages.sh --allow-test-features --features "tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass" --output-dir /tmp/deb-test-build
+
+      - name: Upload Test Debian Packages (E2E)
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-ubuntu-test
+          path: /tmp/deb-test-build/*.deb
           retention-days: 1
 
   # ── 3. Fedora RPM Package Build (Parallel, with --nocheck & cache) ────────────
@@ -186,7 +201,7 @@ jobs:
             ${{ runner.os }}-fedora-sccache-v1-
             ${{ runner.os }}-fedora-sccache-
 
-      - name: Build TapAuth Fedora RPM Packages
+      - name: Build TapAuth Fedora RPM Packages (Production)
         run: |
           mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/sccache ~/.cache/dnf
           docker run --rm \
@@ -198,7 +213,7 @@ jobs:
             -e RUSTC_WRAPPER=sccache \
             -e SCCACHE_DIR=/root/.cache/sccache \
             fedora:latest \
-            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora"
           sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
 
       - name: Verify Fedora RPM Package Quality & Invariants
@@ -208,11 +223,40 @@ jobs:
             fedora:latest \
             bash -c "cd /workspace && ./scripts/ci/test-fedora-rpm.sh --skip-build /workspace/pkg-fedora"
 
-      - name: Upload Fedora RPM Packages
+      - name: Scan Shipped Fedora RPM Binaries for Dev Overrides
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            fedora:latest \
+            bash -c "dnf install -y binutils cpio rpm-build >/dev/null 2>&1 && cd /workspace && ./scripts/ci/scan-package-artifacts.sh rpm /workspace/pkg-fedora"
+
+      - name: Upload Production Fedora RPM Packages
         uses: actions/upload-artifact@v7
         with:
           name: pkg-fedora
           path: pkg-fedora/*.rpm
+          retention-days: 1
+
+      - name: Build TapAuth Fedora RPM Packages (Test/E2E)
+        run: |
+          mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/sccache ~/.cache/dnf
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -v ~/.cargo/registry:/root/.cargo/registry \
+            -v ~/.cargo/git:/root/.cargo/git \
+            -v ~/.cache/sccache:/root/.cache/sccache \
+            -v ~/.cache/dnf:/var/cache/dnf \
+            -e RUSTC_WRAPPER=sccache \
+            -e SCCACHE_DIR=/root/.cache/sccache \
+            fedora:latest \
+            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+          sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
+
+      - name: Upload Test Fedora RPM Packages (E2E)
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-fedora-test
+          path: pkg-fedora-test/*.rpm
           retention-days: 1
 
   # ── 4. Arch Linux Package Build (Parallel) ───────────────────────────────────
@@ -236,7 +280,7 @@ jobs:
             ${{ runner.os }}-arch-sccache-v1-
             ${{ runner.os }}-arch-sccache-
 
-      - name: Build TapAuth Arch Linux Packages
+      - name: Build TapAuth Arch Linux Packages (Production)
         run: |
           mkdir -p ~/.cache/cargo-arch ~/.cache/sccache ~/.cache/pacman/pkg
           docker run --rm \
@@ -247,7 +291,7 @@ jobs:
             -e RUSTC_WRAPPER=sccache \
             -e SCCACHE_DIR=/cache/sccache \
             archlinux:base-devel \
-            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch"
           sudo chown -R $(id -u):$(id -g) ~/.cache
 
       - name: Verify Arch Package Quality & Invariants
@@ -257,11 +301,39 @@ jobs:
             archlinux:base-devel \
             bash -c "cd /workspace && ./scripts/ci/test-arch-pkg.sh --skip-build /workspace/pkg-arch"
 
-      - name: Upload Arch Linux Packages
+      - name: Scan Shipped Arch Binaries for Dev Overrides
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            archlinux:base-devel \
+            bash -c "cd /workspace && ./scripts/ci/scan-package-artifacts.sh arch /workspace/pkg-arch"
+
+      - name: Upload Production Arch Linux Packages
         uses: actions/upload-artifact@v7
         with:
           name: pkg-arch
           path: pkg-arch/*.pkg.tar.zst
+          retention-days: 1
+
+      - name: Build TapAuth Arch Linux Packages (Test/E2E)
+        run: |
+          mkdir -p ~/.cache/cargo-arch ~/.cache/sccache ~/.cache/pacman/pkg
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -v ~/.cache/cargo-arch:/cache/cargo \
+            -v ~/.cache/sccache:/cache/sccache \
+            -v ~/.cache/pacman/pkg:/var/cache/pacman/pkg \
+            -e RUSTC_WRAPPER=sccache \
+            -e SCCACHE_DIR=/cache/sccache \
+            archlinux:base-devel \
+            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+          sudo chown -R $(id -u):$(id -g) ~/.cache
+
+      - name: Upload Test Arch Linux Packages (E2E)
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-arch-test
+          path: pkg-arch-test/*.pkg.tar.zst
           retention-days: 1
 
   # ── 5. Real-Android Emulator E2E Test (Single Session, All Distros) ──────────
@@ -298,9 +370,23 @@ jobs:
       - name: Arrange Distro Packages
         run: |
           mkdir -p pkg-fedora pkg-arch /tmp/deb-build
-          find packages -type f -name "*.deb" -exec cp {} /tmp/deb-build/ \;
-          find packages -type f -name "*.rpm" -exec cp {} pkg-fedora/ \;
-          find packages -type f -name "*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
+          if find packages -type f -name "*.deb" | grep -q "pkg-ubuntu-test"; then
+            find packages -type f -path "*pkg-ubuntu-test*/*.deb" -exec cp {} /tmp/deb-build/ \;
+          else
+            find packages -type f -name "*.deb" -exec cp {} /tmp/deb-build/ \;
+          fi
+
+          if find packages -type f -name "*.rpm" | grep -q "pkg-fedora-test"; then
+            find packages -type f -path "*pkg-fedora-test*/*.rpm" -exec cp {} pkg-fedora/ \;
+          else
+            find packages -type f -name "*.rpm" -exec cp {} pkg-fedora/ \;
+          fi
+
+          if find packages -type f -name "*.pkg.tar.zst" | grep -q "pkg-arch-test"; then
+            find packages -type f -path "*pkg-arch-test*/*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
+          else
+            find packages -type f -name "*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
+          fi
           ls -la /tmp/deb-build/ pkg-fedora/ pkg-arch/
 
       - name: Install Host E2E Dependencies & Bumble
@@ -381,5 +467,5 @@ jobs:
         if: always()
         run: |
           sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
-          sudo rm -rf pkg-fedora pkg-arch /tmp/deb-build apks packages
+          sudo rm -rf pkg-fedora pkg-fedora-test pkg-arch pkg-arch-test /tmp/deb-build /tmp/deb-test-build apks packages
           test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]

@@ -121,6 +121,19 @@ echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
 grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
+echo "==> 8b. Testing package upgrade (exercises post_upgrade)..."
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
+pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
+
+echo "Verifying permissions, config, and PAM wiring survived upgrade..."
+test -f /etc/tapauth/config.toml
+grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
+OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
+MODE=$(stat -c "%a" /etc/tapauth/config.toml)
+test "$OWNER" = "tapauthd:tapauthd"
+test "$MODE" = "644"
+grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+
 echo "==> 9. Testing removal of subpackage (tapauth-fprintd)..."
 pacman -R --noconfirm tapauth-fprintd
 grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml

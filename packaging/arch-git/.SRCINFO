@@ -18,14 +18,15 @@ pkgname = tapauth-git
 	install = tapauth-git.install
 	depends = dbus
 	depends = pam
+	depends = polkit
 	depends = wayland
-	optdepends = polkit: for polkit agent authentication helper
 	optdepends = firewalld: for automated firewall port management
 	optdepends = iptables: for iptables firewall integration
 	optdepends = bluez: for Bluetooth Low Energy (BLE) transport
 	optdepends = tapauth-fprintd-git: for virtual fprintd desktop lock screen integration
 	provides = tapauth=0.10.0.r14.g1e0eb73
 	conflicts = tapauth
+	backup = etc/tapauth/config.toml
 
 pkgname = tapauth-fprintd-git
 	pkgdesc = Virtual fprintd D-Bus bridge for TapAuth lock screen integration (conflicts with hardware fprintd)

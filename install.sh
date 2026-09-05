@@ -220,6 +220,7 @@ OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
+    -f, --force             Force installation over existing packages/files without prompting
     --no-ble                Build without Bluetooth support (UDP only)
     --use-tpm               Enable TPM support for key storage
     --enable-fprintd        Enable virtual fprintd bridge (emulates fingerprint sensor for GNOME/KDE lock screen)
@@ -270,6 +271,10 @@ parse_args() {
                 ;;
             -n|--non-interactive)
                 INTERACTIVE=false
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
                 shift
                 ;;
             -y|--yes)
@@ -607,8 +612,12 @@ check_existing_installation() {
         print_warning "TapAuth is already installed on this system via distribution package ($pkg_manager)."
         print_warning "Running install.sh will overwrite package-managed binaries and create standalone units"
         print_warning "in /etc/systemd/system/ that permanently shadow distro-provided units in /usr/lib/systemd/system/."
-        if [[ "$FORCE" == true || "$INTERACTIVE" == false ]]; then
-            print_info "Continuing due to non-interactive/force mode."
+        if [[ "$FORCE" == true ]]; then
+            print_info "Continuing due to --force flag."
+        elif [[ "$INTERACTIVE" == false ]]; then
+            print_error "Cannot install over a distribution package ($pkg_manager) in non-interactive mode without --force."
+            print_info "Use your distribution package manager to manage TapAuth, or re-run with --force."
+            exit 1
         else
             read -p "Proceed with manual script installation over the distribution package? [y/N]: " pkg_confirm
             if [[ ! "$pkg_confirm" =~ ^[Yy]$ ]]; then
@@ -1201,12 +1210,12 @@ insert_pam_decisive() {
             return 0
         fi
     backup_pam_file "$target_file"
-        if grep -q "pam_fprintd.so" "$target_file" 2>/dev/null; then
+        if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$target_file" 2>/dev/null; then
             if [[ "$has_hardware_fprintd" == true ]]; then
                 print_info "Physical fprintd detected on system; preserving unmodified $target_file to avoid stack poisoning."
                 return 0
             else
-                sed -i "s|.*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
+                sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$target_file"
             fi
         else
             local last_env_line
@@ -1828,6 +1837,7 @@ main() {
     print_header "TapAuth Installation"
     
     parse_args "$@"
+    check_prerequisites
     
     if [[ "$INTERACTIVE" == true ]]; then
         prompt_features
@@ -1841,7 +1851,6 @@ main() {
         fi
     fi
     
-    check_prerequisites
     check_existing_installation
     build_components
     
@@ -1888,9 +1897,10 @@ main() {
         [[ "$CONFIGURE_PAM_SUDO" == true ]] && echo "  ✓ Sudo (/etc/pam.d/sudo)" || echo "  ✗ Sudo (skipped)"
         [[ "$CONFIGURE_PAM_POLKIT" == true ]] && echo "  ✓ Polkit (/etc/pam.d/polkit-1)" || echo "  ✗ Polkit (skipped)"
         [[ "$CONFIGURE_PAM_SYSTEM_AUTH" == true ]] && echo "  ✓ System-auth (/etc/pam.d/system-auth)" || echo "  ✗ System-auth (skipped)"
-        [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-password)" || echo "  ✗ GDM (skipped)"
-        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  ✓ SDDM (/etc/pam.d/sddm-greeter)" || echo "  ✗ SDDM (skipped)"
-        [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  ✓ LightDM (/etc/pam.d/lightdm)" || echo "  ✗ LightDM (skipped)"
+        [[ "$CONFIGURE_PAM_GDM" == true ]] && echo "  ✓ GDM (/etc/pam.d/gdm-fingerprint & dconf)" || echo "  ✗ GDM (skipped)"
+        [[ "$CONFIGURE_PAM_KDE" == true ]] && echo "  ✓ KDE (/etc/pam.d/kde-fingerprint)" || echo "  ✗ KDE (skipped)"
+        [[ "$CONFIGURE_PAM_SDDM" == true ]] && echo "  - SDDM (bypassed to preserve keyring unlock)" || echo "  ✗ SDDM (skipped)"
+        [[ "$CONFIGURE_PAM_LIGHTDM" == true ]] && echo "  - LightDM (bypassed to preserve keyring unlock)" || echo "  ✗ LightDM (skipped)"
         
         echo ""
         echo "Configuration:"

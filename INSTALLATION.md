@@ -33,6 +33,11 @@ sudo dnf install tapauth-fprintd
 
   You can verify the available profiles with `authselect list` after installation. To revert to the default Fedora profile, run `sudo authselect select local` (or `sssd` if that was your previous profile).
 
+* **SELinux Integration:** On Fedora systems with SELinux in Enforcing mode, the package automatically installs the `tapauth.cil` policy module so desktop display managers (GDM, KDE Plasma) can communicate with the daemon socket. If you encounter any AVC denials after a major system update, reload the policy with:
+  ```bash
+  sudo semodule -i /usr/share/selinux/packages/tapauth.cil
+  ```
+
 ### 2. Ubuntu / Debian
 Packages are published via a Launchpad Personal Package Archive (PPA).
 ```bash
@@ -119,7 +124,7 @@ If configuring PAM manually (or on distributions like Arch):
   password    include      system-local-login
   session     include      system-local-login
   ```
-  And enable fingerprint authentication in GDM dconf (`/etc/dconf/db/gdm.d/01-tapauth`):
+  And enable fingerprint authentication in GDM dconf (`/etc/dconf/db/gdm.d/10-tapauth-fingerprint`):
   ```ini
   [org/gnome/login-screen]
   enable-fingerprint-authentication=true
