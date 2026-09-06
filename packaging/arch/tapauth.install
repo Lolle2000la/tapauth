@@ -11,9 +11,14 @@ post_install() {
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
   systemctl daemon-reload
+  # Apply the shipped preset so the daemon is enabled after install, matching
+  # the Debian/RPM packages (preset enables tapauthd.socket, disables service)
+  systemctl preset tapauthd.socket tapauthd.service >/dev/null 2>&1 || true
+  # Start the socket immediately so IPC works before the first reboot
+  # (matches the Debian/RPM scriptlets; preset only enables, does not start)
+  systemctl start tapauthd.socket >/dev/null 2>&1 || true
   echo ":: TapAuth installed successfully."
-  echo ":: To start TapAuth, enable and start the socket:"
-  echo "::   systemctl enable --now tapauthd.socket"
+  echo ":: The tapauthd.socket has been enabled via the systemd preset."
   echo ":: To allow your user to configure TapAuth via GUI, add yourself to the tapauthd-clients group:"
   echo "::   sudo usermod -aG tapauthd-clients \$USER"
   echo ":: To complete activation, add 'auth sufficient pam_tapauth.so' to /etc/pam.d/system-auth"
@@ -39,12 +44,18 @@ pre_remove() {
   for pam_file in /etc/pam.d/*; do
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
+    # Never edit our own backup files
+    [[ "$pam_file" == *.tapauth-bak ]] && continue
     if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
       case "$(basename "$pam_file")" in
         kde-fingerprint|gdm-fingerprint|fingerprint-auth)
           if [ -s "${pam_file}.tapauth-bak" ]; then
             cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
-          elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
+          elif [ -f /usr/lib/security/pam_fprintd.so ]; then
+            # Only restore pam_fprintd.so when the real module exists on
+            # disk: pacman -Q fprintd also matches "provides" (e.g. the
+            # virtual tapauth-fprintd), which would write PAM lines
+            # referencing a module that does not exist.
             if sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null; then
               echo ":: Restored pam_fprintd.so in $pam_file"
             else
@@ -73,4 +84,15 @@ pre_remove() {
     for f in "${failed_files[@]}"; do echo "::   $f"; done
     echo ":: Please remove these references manually to avoid authentication lockouts!"
   fi
+  # Clean up orphaned .tapauth-bak backups of PAM stacks that no longer
+  # reference pam_tapauth.so (e.g. upstream replaced the file again, or the
+  # backup was already restored). Files whose restore failed keep their
+  # backup, since they still reference pam_tapauth.so.
+  for backup in /etc/pam.d/*.tapauth-bak; do
+    [ -f "$backup" ] || continue
+    pam_file="${backup%.tapauth-bak}"
+    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      rm -f "$backup" 2>/dev/null || true
+    fi
+  done
 }

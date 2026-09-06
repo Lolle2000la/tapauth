@@ -38,8 +38,10 @@ Requires(preun): systemd
 Requires(postun): systemd
 Requires:       pam
 Requires:       polkit
-Recommends:     firewalld
-Suggests:       iptables
+# firewalld/iptables are optional integrations. They must be Suggests, not
+# Recommends: dnf removes Recommends when the package is removed, which
+# would uninstall the system firewall (and can fail the whole transaction).
+Suggests:       firewalld iptables
 
 %description
 A modern, privacy-preserving local-first authentication system using Rust
@@ -60,6 +62,10 @@ authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
 
 WARNING: Installing this package replaces and conflicts with hardware fprintd.
 Do not install if you rely on a physical fingerprint reader.
+
+NOTE: Installing or upgrading this subpackage sets enable_fprintd_bridge = true
+in /etc/tapauth/config.toml (removing the subpackage sets it back to false).
+To turn the bridge off without removing the package, edit the config manually.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -89,8 +95,6 @@ mkdir -p %{buildroot}%{_presetdir}
 mkdir -p %{buildroot}%{_sysusersdir}
 mkdir -p %{buildroot}%{_tmpfilesdir}
 mkdir -p %{buildroot}%{_sharedstatedir}/tapauth
-mkdir -p %{buildroot}%{_localstatedir}/log/tapauth
-mkdir -p %{buildroot}/run/tapauthd
 mkdir -p %{buildroot}%{_datadir}/doc/tapauth
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
@@ -190,7 +194,7 @@ install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %pre
-%{?sysusers_create_compat:%sysusers_create_compat %{SOURCE1}}
+%sysusers_create_compat %{SOURCE1}
 getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd
 getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients
 if ! getent passwd tapauthd >/dev/null 2>&1; then
@@ -202,9 +206,10 @@ fi
 
 %post
 %tmpfiles_create %{_tmpfilesdir}/tapauth.conf
-chown -R tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
+chown tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
+chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 # If authselect is active with a TapAuth profile, refresh authselect files on upgrade
 if command -v authselect &>/dev/null; then
     current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
@@ -257,7 +262,11 @@ if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinux
 fi
 
 %post fprintd
-if [ $1 -eq 1 ] && [ -f %{_sysconfdir}/tapauth/config.toml ]; then
+# Configure on EVERY %post (initial install AND remove-then-reinstall, where
+# $1 is 0): the subpackage being installed means the bridge must be enabled.
+# Otherwise a reinstall after removal leaves enable_fprintd_bridge = false
+# and lock screens silently lose the virtual fprintd service.
+if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
     if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
         sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
     else
@@ -273,7 +282,10 @@ for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
     if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-        [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        # Always refresh the backup: the current file is the upstream version
+        # (it still references pam_fprintd), so a stale backup would restore
+        # outdated content and silently drop upstream changes later.
+        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
         sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
     fi
 done
@@ -289,7 +301,7 @@ fi
 # Create gdm-fingerprint if GDM exists but service file does not
 if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm ]; }; then
     cat << 'EOF' > /etc/pam.d/gdm-fingerprint
-#%PAM-1.0
+#%%PAM-1.0
 # Managed by TapAuth
 auth    [success=done default=bad]    pam_tapauth.so
 auth    include                       system-auth
@@ -302,7 +314,7 @@ fi
 # Create kde-fingerprint if KDE lock screen exists but service file does not
 if [ ! -f /etc/pam.d/kde-fingerprint ] && { [ -f /etc/pam.d/kscreenlocker ] || [ -f /etc/pam.d/kde ] || [ -d /usr/share/plasma ]; }; then
     cat << 'EOF' > /etc/pam.d/kde-fingerprint
-#%PAM-1.0
+#%%PAM-1.0
 # Managed by TapAuth
 auth    [success=done default=bad]    pam_tapauth.so
 auth    include                       system-auth
@@ -345,7 +357,8 @@ for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
     if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-        [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        # Always refresh the backup (see %post fprintd for rationale)
+        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
         sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
     fi
 done
@@ -397,8 +410,8 @@ fi
 %dir %attr(0755, tapauthd, tapauthd) %{_sysconfdir}/tapauth
 %config(noreplace) %attr(0644, tapauthd, tapauthd) %{_sysconfdir}/tapauth/config.toml
 %dir %attr(0700, tapauthd, tapauthd) %{_sharedstatedir}/tapauth
-%dir %attr(0755, tapauthd, tapauthd) %{_localstatedir}/log/tapauth
-%ghost %dir %attr(0750, tapauthd, tapauthd-clients) /run/tapauthd
+# /run/tapauthd and /var/log/tapauth are created at runtime by the systemd
+# units (RuntimeDirectory= / LogsDirectory=), not packaged.
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
 %{_bindir}/tapauth-ipc-cli

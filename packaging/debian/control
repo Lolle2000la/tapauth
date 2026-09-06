@@ -2,6 +2,11 @@ Source: tapauth
 Section: admin
 Priority: optional
 Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
+# NOTE: the Rust toolchain must be >= 1.85 (Cargo lockfile v4). Debian
+# stable archives (e.g. noble) ship older cargo/rustc; builds rely on
+# rustup (PATH via debian/rules) or a rust PPA (cargo-1.91/rustc-1.91
+# alternates below). Plain `apt-get build-dep` on stock noble is NOT
+# sufficient — see scripts/ci/build-debian-packages.sh.
 Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91, rustc (>= 1.85) | rustc-1.91, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
 Standards-Version: 4.7.0
 
@@ -21,7 +26,12 @@ Provides: fprintd
 Replaces: fprintd
 Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
  Virtual net.reactivated.Fprint D-Bus service allowing desktop lock screens
- (GDM, KDE Screenlocker) to unlock via TapAuth smartphone biometric verification.
+ (GDM, KDE Screenlocker) to unlock via TapAuth smartphone biometric
+ verification.
+ .
+ NOTE: Installing or upgrading this package sets enable_fprintd_bridge = true
+ in /etc/tapauth/config.toml (removing the package sets it back to false).
+ To turn the bridge off without removing the package, edit the config manually.
  .
  WARNING: Installing this package replaces and conflicts with hardware fprintd.
  Do not install if you rely on a physical fingerprint reader.

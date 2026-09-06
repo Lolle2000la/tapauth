@@ -32,7 +32,10 @@ CFGEOF
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
     if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-      [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+      # Always refresh the backup: the current file is the upstream version
+      # (it still references pam_fprintd), so a stale backup would restore
+      # outdated content and silently drop upstream changes later.
+      cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
       sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null && {
         echo ":: Replaced pam_fprintd.so with pam_tapauth.so in $pam_file"
         repaired=$((repaired + 1))
@@ -53,7 +56,8 @@ post_upgrade() {
     [ -f "$pam_file" ] || continue
     [ -L "$pam_file" ] && continue
     if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-      [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+      # Always refresh the backup (see post_install for rationale)
+      cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
       sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
     fi
   done
@@ -74,7 +78,9 @@ pre_remove() {
     fi
     if [ -s "${pam_file}.tapauth-bak" ]; then
       cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file"
-    elif [ -f /usr/lib/security/pam_fprintd.so ] || pacman -Q fprintd >/dev/null 2>&1; then
+    elif [ -f /usr/lib/security/pam_fprintd.so ]; then
+      # Only restore pam_fprintd.so when the real module exists on disk;
+      # pacman -Q fprintd also matches "provides" (e.g. virtual tapauth-fprintd-git)
       sed -i "s|.*pam_tapauth\.so.*|auth    sufficient    pam_fprintd.so|" "$pam_file" 2>/dev/null && \
         echo ":: Restored pam_fprintd.so in $pam_file"
     else

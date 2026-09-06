@@ -1,0 +1,51 @@
+# rpmlintrc for the TapAuth packages (rpmlint 1.x/2.x compatible format).
+#
+# Every filter below is an intentional design decision or a known
+# false positive — do NOT add filters for issues that can be fixed
+# at the source instead.
+#
+# Usage: rpmlint -r packaging/tapauth.rpmlintrc <rpm files...>
+# (rpmlint warns about "unused-rpmlintrc-filter" for entries that did not
+# match in a given run — that is expected and self-documenting.)
+
+# pam_tapauth.so is a first-party PAM module; rpmlint only whitelists known
+# distro modules. Needs an exemption in a Fedora package review (or an
+# upstream rpmlint whitelist addition).
+addFilter("pam-unauthorized-module")
+
+# The authselect vendor profiles are populated at build time with symlinks
+# into /usr/share/authselect/default/...; they resolve once authselect (a
+# hard Requires) is installed, so "dangling" at package-inspection time is
+# expected.
+addFilter("dangling-symlink")
+
+# Intentionally unversioned: this package provides a virtual fprintd D-Bus
+# service, not a specific fprintd release; a versioned Provides would falsely
+# claim compatibility with a real fprintd version.
+addFilter("unversioned-explicit-provides")
+
+# PAM-stack manipulation inherently uses chown/cp/rm in scriptlets. All
+# commands are guarded and idempotent (see scriptlet comments).
+addFilter("dangerous-command-in-%post")
+addFilter("dangerous-command-in-%preun")
+addFilter("dangerous-command-in-%postun")
+addFilter("dangerous-command-in-%trigger")
+
+# The tapauthd system user/group is created with a low dynamic uid/gid on
+# purpose (sysusers); rpmlint flags any non-reserved account.
+addFilter("non-standard-uid")
+addFilter("non-standard-gid")
+
+# Binaries are built with CARGO_PROFILE_RELEASE_STRIP=true (verified: no
+# .symtab); rpmlint misdetects Rust binaries as unstripped.
+addFilter("unstripped-binary-or-object")
+
+# Project name; not an English word.
+addFilter("spelling-error")
+
+# Man pages are deliberately deferred for now — remove this filter once
+# docs/man pages are added.
+addFilter("no-manual-page-for-binary")
+
+# Initial uploads by definition close no bugs.
+addFilter("initial-upload-closes-no-bugs")

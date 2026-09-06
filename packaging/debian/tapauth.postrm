@@ -9,6 +9,25 @@ if [ "$1" = "purge" ]; then
 	rm -rf /etc/tapauth /var/lib/tapauth /var/log/tapauth /run/tapauthd || true
 	rm -f /var/lib/polkit-1/localauthority/10-vendor.d/tapauthd.pkla 2>/dev/null || true
 	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf 2>/dev/null || true
+	# Stop the units before removing the user: dh_installsystemd's generated
+	# prerm only stops units on "remove", not on a direct "purge", so the
+	# daemon can still be running as tapauthd here and userdel would fail
+	# ("user is currently used by process"). Use systemctl directly:
+	# deb-systemd-invoke is subject to policy-rc.d, which may deny the stop.
+	if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+		systemctl stop tapauthd.service tapauthd.socket >/dev/null 2>&1 || true
+	fi
+	# Debian policy: system users/groups created for a package should be
+	# removed on purge (they are re-created by sysusers on reinstall).
+	# delgroup ships with adduser (a Depends); guard defensively anyway.
+	if command -v deluser >/dev/null 2>&1; then
+		deluser --system tapauthd 2>/dev/null || \
+			echo "tapauth: WARNING: could not remove system user 'tapauthd' on purge (still in use?)." >&2
+	fi
+	if command -v delgroup >/dev/null 2>&1; then
+		delgroup --system tapauthd-clients 2>/dev/null || true
+		delgroup --system tapauthd 2>/dev/null || true
+	fi
 fi
 #DEBHELPER#
 exit 0

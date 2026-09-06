@@ -6,15 +6,15 @@ if [ "$1" = "configure" ]; then
 	else
 		getent group tapauthd >/dev/null 2>&1 || addgroup --system tapauthd || true
 		getent group tapauthd-clients >/dev/null 2>&1 || addgroup --system tapauthd-clients || true
-		getent passwd tapauthd >/dev/null 2>&1 || adduser --system --ingroup tapauthd --no-create-home --shell /usr/sbin/nologin tapauthd || true
+		getent passwd tapauthd >/dev/null 2>&1 || adduser --system --home /nonexistent --ingroup tapauthd --no-create-home --shell /usr/sbin/nologin tapauthd || true
 	fi
 	if command -v systemd-tmpfiles >/dev/null 2>&1; then
 		systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf || true
 	else
-		mkdir -p /run/tapauthd /var/lib/tapauth /var/log/tapauth /etc/tapauth
-		chown -R tapauthd:tapauthd /var/lib/tapauth /var/log/tapauth /etc/tapauth 2>/dev/null || true
-		chown root:tapauthd-clients /run/tapauthd 2>/dev/null || true
-		chmod 0750 /run/tapauthd 2>/dev/null || true
+		# /run/tapauthd is created by tapauthd.socket (RuntimeDirectory=) and
+		# /var/log/tapauth by tapauthd.service (LogsDirectory=) at runtime.
+		mkdir -p /var/lib/tapauth /etc/tapauth
+		chown tapauthd:tapauthd /var/lib/tapauth /etc/tapauth 2>/dev/null || true
 	fi
 	mkdir -p /etc/tapauth
 	if [ -z "$2" ] || [ ! -f /etc/tapauth/config.toml ]; then

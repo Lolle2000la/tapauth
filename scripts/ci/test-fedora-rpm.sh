@@ -30,7 +30,7 @@ echo "==> Testing Fedora RPM packaging for TapAuth version: ${PKG_VER}..."
 if [ "$SKIP_BUILD" = false ]; then
     echo "==> 1. Installing Fedora build dependencies and rpmlint..."
     dnf install -y --setopt=install_weak_deps=False \
-        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel dbus-devel systemd-rpm-macros authselect sed tar git findutils
+        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel dbus-devel systemd-rpm-macros authselect sed tar git findutils selinux-policy-devel secilc
 
     echo "==> 2. Setting up RPM build directory..."
     mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -41,6 +41,11 @@ if [ "$SKIP_BUILD" = false ]; then
 
     echo "==> 3. Running rpmlint on spec file..."
     rpmlint /root/rpmbuild/SPECS/tapauth.spec
+
+    echo "==> 3b. Compile-checking the SELinux policy module (container-safe)..."
+    secilc -o /tmp/tapauth-check.pp "${WORKSPACE_DIR}/packaging/selinux/tapauth.cil" \
+        && echo "SELinux policy compiles cleanly" \
+        || echo "WARNING: SELinux policy failed to compile"
 
     echo "==> 4. Packaging source tarball..."
     mkdir -p "/tmp/src/tapauth-${PKG_VER}"
