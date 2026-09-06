@@ -73,6 +73,7 @@ To turn the bridge off without removing the package, edit the config manually.
 %build
 export CARGO_HOME="%{?_cargo_home}%{!?_cargo_home:${CARGO_HOME:-%{_builddir}/cargo-home}}"
 export CARGO_PROFILE_RELEASE_STRIP=true
+export CARGO_TARGET_DIR="%{?_cargo_target_dir}%{!?_cargo_target_dir:${CARGO_TARGET_DIR:-target}}"
 if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
     export SCCACHE_DIR="%{?_sccache_dir}%{!?_sccache_dir:${SCCACHE_DIR:-%{_builddir}/sccache}}"
@@ -103,10 +104,11 @@ mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
-install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
-install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
-install -m 0755 target/release/tapauth-ipc-cli %{buildroot}%{_bindir}/tapauth-ipc-cli
-install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
+# (%install runs in the source dir; CARGO_TARGET_DIR mirrors %build)
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauthd" %{buildroot}%{_bindir}/tapauthd
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-ipc-cli" %{buildroot}%{_bindir}/tapauth-ipc-cli
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 # Default Configuration
 cat << 'EOF' > %{buildroot}%{_sysconfdir}/tapauth/config.toml

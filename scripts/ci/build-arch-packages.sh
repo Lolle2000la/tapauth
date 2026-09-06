@@ -95,3 +95,9 @@ su builder -c "makepkg -s --noconfirm --nodeps"
 echo "==> Copying built Arch packages to $OUTPUT_DIR..."
 cp "$BUILD_DIR"/*.pkg.tar.zst "$OUTPUT_DIR/"
 ls -la "$OUTPUT_DIR"/*.pkg.tar.zst
+
+# Visibility for CI: report sccache hit rate (server may still be running)
+if [ -d /cache/sccache ] && command -v sccache >/dev/null 2>&1; then
+    echo "==> sccache statistics:"
+    su builder -c "SCCACHE_DIR=/cache/sccache sccache --show-stats" 2>/dev/null | sed -n '1,10p' || true
+fi
