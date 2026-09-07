@@ -556,7 +556,11 @@ adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_SCAN 2>/dev/null || t
 echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 "$SCRIPT_DIR/ci/setup-emulator-ble-bridge.sh"
 "$SCRIPT_DIR/ci/setup-emulator-udp-bridge.sh"
-"$SCRIPT_DIR/ci/emulator-bio-helper.sh" setup
+# Setup biometrics: the helper performs real enrollment where the image
+# supports it (`cmd fingerprint enroll`) and otherwise falls back — loudly — to
+# the e2e build's auto-approve behavior (no biometrics enrolled, grant ~1s after
+# the prompt). Passing the package lets it verify that fallback prerequisite.
+"$SCRIPT_DIR/ci/emulator-bio-helper.sh" setup "$APP_PKG"
 
 # Step 4: Launch tapauthd daemon
 echo "==> Step 4: Launching tapauthd daemon..."
@@ -891,8 +895,10 @@ if [ "$CAPTURE_OK" = "1" ]; then
     # Clear the 2s auth-flight completion cooldown left by Phase 2e (same user).
     sleep 3
 
-    # Timing note: with no biometrics enrolled, the E2E app build auto-approves a
-    # request after AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS (1s) plus prompt
+    # Timing note: on images where real enrollment is unavailable (API 36+;
+    # emulator-bio-helper.sh setup falls back to leaving no biometrics
+    # enrolled), the E2E app build auto-approves a request after
+    # AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS (1s) plus prompt
     # overhead. Injections and the cancel below deliberately land inside that
     # window while the session is still pending.
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
@@ -1126,8 +1132,9 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # through to pam_unix, whose conversation consumes the piped password.
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
-    # Keep the phone silent: the e2e app build auto-approves a pending request
-    # ~1s after the prompt whenever biometric enrollment is unavailable, so a
+    # Keep the phone silent: with no biometrics enrolled (the helper's
+    # auto-approve fallback on images without `cmd fingerprint enroll`), the
+    # e2e app build auto-approves a pending request ~1s after the prompt, so a
     # broadcast can never stay pending while the app is alive. Force-stop the
     # app (same as Phase 5b) so request #1's broadcast stays unanswered and its
     # auth flight remains in flight. The sleep also clears the 2s auth-flight

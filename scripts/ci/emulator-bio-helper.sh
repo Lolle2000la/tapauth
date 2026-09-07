@@ -16,7 +16,11 @@ ACTION="${1:-setup}"
 
 case "$ACTION" in
     setup)
-        echo "==> Enrolling test biometric credentials in Android Emulator..."
+        # Optional arg 2: package under test. When real fingerprint enrollment is
+        # unavailable, the fallback (the e2e app build's auto-approve) only works
+        # if that package is installed, so the caller passes it for verification.
+        PKG="${2:-}"
+        echo "==> Setting up biometric handling in Android Emulator..."
         # Set lock screen PIN
         adb shell locksettings set-pin 1234 2>/dev/null || true
         # Configure Android Virtual Biometrics HAL (Android 14/15/16)
@@ -24,18 +28,44 @@ case "$ACTION" in
         adb shell setprop persist.vendor.fingerprint.virtual.type rear 2>/dev/null || true
         adb shell setprop persist.vendor.fingerprint.virtual.enrollments 1 2>/dev/null || true
         adb shell setprop vendor.fingerprint.virtual.enrollments 1 2>/dev/null || true
-        adb shell cmd fingerprint reset 2>/dev/null || true
-        adb shell cmd fingerprint sync 2>/dev/null || true
-        # Enroll fingerprint 1 (for both virtual HAL and traditional emulator HAL)
-        adb shell cmd fingerprint enroll 0 2>/dev/null &
-        ENROLL_PID=$!
-        sleep 0.5
-        for _ in {1..10}; do
-            adb emu finger touch 1 >/dev/null 2>&1 || true
-            sleep 0.2
-        done
-        wait $ENROLL_PID 2>/dev/null || true
-        echo "✅ Test biometric profile enrolled (Finger 1 / Virtual Biometrics HAL)."
+
+        # Detect whether this image still implements `cmd fingerprint enroll`.
+        # Newer images (API 36+) removed the subcommand; it then prints
+        # "Unrecognized command", which the previous `2>/dev/null || true`
+        # guards swallowed, silently no-op'ing enrollment while this script
+        # still reported success. Probe the shell command's own help text.
+        if adb shell cmd fingerprint help 2>&1 | grep -qw enroll; then
+            echo "    'cmd fingerprint enroll' is supported; performing real enrollment."
+            adb shell cmd fingerprint reset >/dev/null 2>&1 || true
+            adb shell cmd fingerprint sync >/dev/null 2>&1 || true
+            # Enroll fingerprint 1 (for both virtual HAL and traditional emulator HAL)
+            adb shell cmd fingerprint enroll 0 >/dev/null 2>&1 &
+            ENROLL_PID=$!
+            sleep 0.5
+            for _ in {1..10}; do
+                adb emu finger touch 1 >/dev/null 2>&1 || true
+                sleep 0.2
+            done
+            wait $ENROLL_PID 2>/dev/null || true
+            # Verify the enrollment actually landed (entry format: "1: name (id=1)").
+            if adb shell cmd fingerprint list 2>/dev/null | grep -qE '\(id=[0-9]+\)|^[[:space:]]*[0-9]+:'; then
+                echo "✅ Test biometric profile enrolled (Finger 1 / Virtual Biometrics HAL)."
+            else
+                echo "⚠️  WARNING: could not confirm fingerprint enrollment via 'cmd fingerprint list'."
+                echo "    If nothing is enrolled, the e2e build's auto-approve fallback still covers the suite."
+            fi
+        else
+            echo "⚠️  'cmd fingerprint enroll' is NOT supported on this image (removed in newer Android APIs)."
+            echo "    Falling back to the e2e app build's auto-approve behavior: with no biometrics enrolled,"
+            echo "    pending requests are granted ~1s after the prompt (AuthRequestManager.autoApproveInE2e)."
+            # The fallback only works with the e2e build installed. Fail loudly
+            # here instead of letting every auth phase hang until its timeout.
+            if [ -n "$PKG" ] && [ -z "$(adb shell pm path "$PKG" 2>/dev/null)" ]; then
+                echo "❌ ERROR: e2e package '$PKG' is not installed; the auto-approve fallback cannot work."
+                exit 1
+            fi
+            echo "✅ Auto-approve fallback active (no biometrics enrolled on this image)."
+        fi
         ;;
 
     deny)
@@ -108,7 +138,7 @@ EOF
         ;;
 
     *)
-        echo "Usage: $0 {setup|deny [package]|start-auto-grant|stop-auto-grant}"
+        echo "Usage: $0 {setup [package]|deny [package]|start-auto-grant|stop-auto-grant}"
         exit 1
         ;;
 esac
