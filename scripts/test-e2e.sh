@@ -802,7 +802,11 @@ echo "╔═══════════════════════�
 echo "║  PHASE 2b: Real PAM Module Authentication (pamtester)         ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-sleep 2
+sleep 3
+# NOTE: the auth-flight registry's 2s completion cooldown (single-broadcast
+# dedup) means a new same-user request arriving within 2s of a finished auth is
+# answered with Ignore. All sleeps below that separate sequential same-user
+# auth phases exist to clear that cooldown.
 
 PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
@@ -844,6 +848,8 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     # PAM_PERM_DENIED even though the module succeeded.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
+    # Clear the 2s auth-flight completion cooldown left by Phase 2b (same user).
+    sleep 3
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
@@ -882,7 +888,8 @@ echo "╚═══════════════════════�
 
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-    sleep 1
+    # Clear the 2s auth-flight completion cooldown left by Phase 2e (same user).
+    sleep 3
 
     # Timing note: with no biometrics enrolled, the E2E app build auto-approves a
     # request after AuthRequestManager.DEBUG_AUTO_APPROVE_DELAY_MS (1s) plus prompt
@@ -947,7 +954,8 @@ echo "╚═══════════════════════�
 
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-    sleep 1
+    # Clear the 2s auth-flight completion cooldown left by Phase 2c (same user).
+    sleep 3
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     TAMPER_REQUEST_ID="e2e-tamper-$$"
@@ -1010,7 +1018,8 @@ echo "║  PHASE 2f: Hard Cancellation on IPC Disconnect                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-sleep 1
+# Clear the 2s auth-flight completion cooldown left by Phase 2d (same user).
+sleep 3
 
 LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 DISCONNECT_REQ_ID="e2e-disconnect-$$"
@@ -1225,7 +1234,8 @@ if command -v dbus-send >/dev/null 2>&1; then
             if [ -f "$SCRIPT_DIR/ci/test-fprint-verify.py" ] && python3 -c "from gi.repository import Gio" >/dev/null 2>&1; then
                 echo "==> Testing Claim -> VerifyStart -> VerifyStatus('verify-match') -> Release lifecycle..."
                 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
-                sleep 0.5
+                # Clear the 2s auth-flight completion cooldown left by Phase 2g (same user).
+                sleep 2.5
                 if python3 "$SCRIPT_DIR/ci/test-fprint-verify.py" "$DEV_PATH" "$TEST_USER" 15 > "${TEST_DIR}/fprint_verify.log" 2>&1; then
                     cat "${TEST_DIR}/fprint_verify.log"
                     echo "✅ Virtual fprintd full Claim -> VerifyStart -> VerifyStatus('verify-match') cycle verified!"
@@ -1260,7 +1270,8 @@ echo "╔═══════════════════════�
 echo "║  PHASE 3: Bluetooth Low Energy (BLE) Authentication           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-sleep 2
+# Clear the 2s auth-flight completion cooldown left by the previous same-user auth.
+sleep 3
 
 # Check if system D-Bus and BlueZ are accessible (e.g., host environment with BlueZ).
 # In container environments, host D-Bus rejects cross-container Unix socket connections
@@ -1303,7 +1314,8 @@ echo "╔═══════════════════════�
 echo "║  PHASE 4: Parallel Discovery Race (UDP + BLE Simultaneous)    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-sleep 2
+# Clear the 2s auth-flight completion cooldown left by Phase 3 (same user).
+sleep 3
 
 if [ "$BLE_AVAILABLE" = false ]; then
     echo "ℹ️  SKIPPED: System D-Bus / BlueZ not accessible in this environment (verified on host)."
@@ -1330,7 +1342,8 @@ echo "╚═══════════════════════�
 
 # Stop auto-grant watcher
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-sleep 2
+# Clear the 2s auth-flight completion cooldown left by Phase 4 (same user).
+sleep 3
 
 echo "==> Setting transport config: UDP enabled, BLE disabled..."
 "$CLI_BIN" set-transports --ble false --network true
@@ -1375,7 +1388,8 @@ echo "╔═══════════════════════�
 echo "║  PHASE 5b: Authentication Timeout Verification                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-sleep 1
+# Clear the 2s auth-flight completion cooldown left by Phase 5 (same user).
+sleep 2
 # Stop the Android app so that no server responds to the broadcast, verifying daemon timeout handling
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
 sleep 1
@@ -1411,7 +1425,8 @@ else
     exit 1
 fi
 
-sleep 2
+# Clear the 2s auth-flight completion cooldown left by Phase 5b (same user).
+sleep 3
 echo "==> Verifying authentication returns PAM_IGNORE when no devices are configured..."
 UNPAIRED_AUTH_LOG="${TEST_DIR}/unpaired-cli.log"
 "$CLI_BIN" pam-auth "$TEST_USER" 5 > "$UNPAIRED_AUTH_LOG" 2>&1 || true
