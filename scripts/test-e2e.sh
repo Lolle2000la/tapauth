@@ -1086,6 +1086,112 @@ else
     echo "ℹ️  SKIPPED (pamtester not available, PAM library missing, or /etc/pam.d not writable)."
 fi
 
+# Step 6i: Phase 2i - Concurrent same-user auth dedup (single-broadcast rule)
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2i: Concurrent Same-User Dedup (Ignore Fall-Through)   ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+# The daemon must answer a second authentication for a user whose broadcast is
+# already in flight with outcome=Ignore IMMEDIATELY (never a mirrored outcome),
+# so the requesting PAM stack falls through to its next auth method instead of
+# hanging until the operation timeout or buzzing the phone a second time.
+DEDUP_OK=0
+if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
+    # The dedup check is per username and the fall-through below needs a locally
+    # known password, so both requests target the dedicated fallback account
+    # (Phase 6b reuses the same user later and re-sets the same password).
+    if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
+        useradd -m "$PAM_FALLBACK_USER"
+    fi
+    echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
+
+    # Same mixed-stack shape as Phase 2e/6b: TapAuth's PAM_IGNORE must fall
+    # through to pam_unix, whose conversation consumes the piped password.
+    printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
+
+    # Keep the phone silent: with auto-grant stopped (biometrics ARE enrolled)
+    # the biometric prompt stays pending, so request #1 remains in flight until
+    # it is explicitly granted below.
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    sleep 1
+
+    LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+
+    echo "==> Starting concurrent auth #1 for '$PAM_FALLBACK_USER' (must stay in flight)..."
+    DUP1_LOG="${TEST_DIR}/dedup-auth1.log"
+    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$PAM_FALLBACK_USER" authenticate < <(sleep 60) > "$DUP1_LOG" 2>&1 &
+    DUP1_PID=$!
+    # Let the daemon register the auth flight and the phone show the prompt.
+    sleep 2
+
+    echo "==> Running concurrent auth #2 with the CORRECT password (must fall through fast)..."
+    DUP2_LOG="${TEST_DIR}/dedup-auth2.log"
+    DUP2_START=$SECONDS
+    set +e
+    echo "$PAM_FALLBACK_PASS" | "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$PAM_FALLBACK_USER" authenticate > "$DUP2_LOG" 2>&1 &
+    DUP2_PID=$!
+    wait_pid_with_timeout "$DUP2_PID" 20
+    DUP2_EXIT=$?
+    set -e
+    DUP2_ELAPSED=$(( SECONDS - DUP2_START ))
+    cat "$DUP2_LOG"
+
+    # Before the single-broadcast dedup, request #2 either triggered a second
+    # phone broadcast or hung for the full operation timeout. The tight bound
+    # proves no 30s/120s GuiSequential-style wait occurred.
+    if [ "$DUP2_EXIT" -eq 0 ] && [ "$DUP2_ELAPSED" -lt 20 ]; then
+        echo "✅ Duplicate request #2 fell through to pam_unix and completed in ${DUP2_ELAPSED}s (< 20s)."
+    else
+        echo "❌ ERROR: concurrent duplicate did not fall through fast (rc=$DUP2_EXIT, elapsed=${DUP2_ELAPSED}s)."
+        kill -9 "$DUP1_PID" 2>/dev/null || true
+        exit 1
+    fi
+
+    # The duplicate only counts as such if #1's broadcast was still in flight.
+    if kill -0 "$DUP1_PID" 2>/dev/null; then
+        echo "✅ Auth #1 was still in flight when the duplicate completed."
+    else
+        echo "❌ ERROR: auth #1 finished before the duplicate arrived — test inconclusive."
+        exit 1
+    fi
+
+    # Give the journal follower time to deliver the daemon's audit lines.
+    sleep 1
+    assert_log_since "$LOG_BASE" "Duplicate authentication request" \
+        "Daemon answered the concurrent same-user request with Ignore (dedup active)"
+
+    # Resolve #1 by granting it on the phone (the prompt is still pending);
+    # repeated touches are safe: while no prompt shows they are no-ops.
+    echo "==> Resolving in-flight auth #1 via fingerprint grant..."
+    for _ in {1..10}; do
+        if ! kill -0 "$DUP1_PID" 2>/dev/null; then
+            break
+        fi
+        adb emu finger touch 1 >/dev/null 2>&1 || true
+        sleep 0.5
+    done
+    set +e
+    wait_pid_with_timeout "$DUP1_PID" 30
+    DUP1_EXIT=$?
+    set -e
+    cat "$DUP1_LOG"
+
+    if [ "$DUP1_EXIT" -eq 0 ]; then
+        echo "✅ In-flight auth #1 granted; the outcome was NOT mirrored to the duplicate."
+        DEDUP_OK=1
+    else
+        echo "❌ ERROR: in-flight auth #1 was not granted (rc=$DUP1_EXIT)."
+        exit 1
+    fi
+
+    # Restore auto-grant for the following positive phases
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+    sleep 1
+else
+    echo "ℹ️  SKIPPED (pamtester/PAM library missing, /etc/pam.d not writable, or not running as root)."
+fi
+
 # Step 6h: Phase 2h - Virtual fprintd D-Bus verification
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -1423,6 +1529,11 @@ fi
 else
 echo "║  Phase 2b: Real PAM Module (pamtester):          SKIPPED      ║"
 echo "║  Phase 2e: Mixed-stack PAM (grant path):         SKIPPED      ║"
+fi
+if [ "${DEDUP_OK:-0}" = "1" ]; then
+echo "║  Phase 2i: Concurrent Same-User Dedup:           PASSED       ║"
+else
+echo "║  Phase 2i: Concurrent Same-User Dedup:           SKIPPED      ║"
 fi
 if [ "$CAPTURE_OK" = "1" ]; then
 echo "║  Phase 2c: Adversarial Replay + PamCancel:       PASSED       ║"
