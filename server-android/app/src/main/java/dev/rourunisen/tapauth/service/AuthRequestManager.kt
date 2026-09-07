@@ -640,7 +640,10 @@ class AuthRequestManager private constructor() {
                             "Auto-approve suppressed; awaiting explicit grant for request ${authRequest.requestId}",
                         )
                     } else {
-                        Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
+                        Log.i(
+                            TAG,
+                            "Auto-approving request ${authRequest.requestId} in E2E test mode",
+                        )
                         approveRequest(activity, authRequest)
                     }
                 }

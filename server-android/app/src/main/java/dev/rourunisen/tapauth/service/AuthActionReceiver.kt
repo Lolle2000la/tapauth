@@ -26,8 +26,8 @@ class AuthActionReceiver : BroadcastReceiver() {
 
         /**
          * E2E-only actions to toggle the auto-approve fallback (see
-         * [AuthRequestManager.autoApproveInE2e]): suppression lets a request stay pending while
-         * the app is alive; restoration returns to deterministic default behavior.
+         * [AuthRequestManager.autoApproveInE2e]): suppression lets a request stay pending while the
+         * app is alive; restoration returns to deterministic default behavior.
          */
         const val ACTION_DEV_SUPPRESS_AUTO_APPROVE =
             "dev.rourunisen.tapauth.ACTION_DEV_SUPPRESS_AUTO_APPROVE"
