@@ -1106,14 +1106,21 @@ echo "╚═══════════════════════�
 # so the requesting PAM stack falls through to its next auth method instead of
 # hanging until the operation timeout or buzzing the phone a second time.
 DEDUP_OK=0
-if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
-    # The dedup check is per username and the fall-through below needs a locally
-    # known password, so both requests target the dedicated fallback account
-    # (Phase 6b reuses the same user later and re-sets the same password).
-    if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
-        useradd -m "$PAM_FALLBACK_USER"
-    fi
-    echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
+# Capture the original shadow hash up front; without it we cannot safely
+# restore TEST_USER's password, so the phase must be skipped instead.
+ROOT_SHADOW_HASH=$(getent shadow "$TEST_USER" 2>/dev/null | cut -d: -f2)
+if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HASH" ]; then
+    # The daemon only broadcasts for users listed in the pairing's
+    # allowed_users (= TEST_USER at pairing time), so both requests must
+    # authenticate as TEST_USER. The pam_unix fall-through needs a locally
+    # known password, so temporarily set TEST_USER's password and restore the
+    # original shadow hash on every exit path (same pattern as Phase 2g's
+    # restore_dual_stack_pam).
+    restore_test_user_password() {
+        usermod -p "$ROOT_SHADOW_HASH" "$TEST_USER" 2>/dev/null || true
+    }
+    trap 'restore_test_user_password; cleanup' EXIT INT TERM
+    echo "${TEST_USER}:${PAM_FALLBACK_PASS}" | chpasswd
 
     # Same mixed-stack shape as Phase 2e/6b: TapAuth's PAM_IGNORE must fall
     # through to pam_unix, whose conversation consumes the piped password.
@@ -1121,15 +1128,17 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
 
     # Keep the phone silent: with auto-grant stopped (biometrics ARE enrolled)
     # the biometric prompt stays pending, so request #1 remains in flight until
-    # it is explicitly granted below.
+    # it is explicitly granted below. The sleep also clears the 2s auth-flight
+    # completion cooldown left by Phase 2g (same user) — otherwise request #1
+    # itself would be answered with Ignore.
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-    sleep 1
+    sleep 3
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 
-    echo "==> Starting concurrent auth #1 for '$PAM_FALLBACK_USER' (must stay in flight)..."
+    echo "==> Starting concurrent auth #1 for '$TEST_USER' (must stay in flight)..."
     DUP1_LOG="${TEST_DIR}/dedup-auth1.log"
-    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$PAM_FALLBACK_USER" authenticate < <(sleep 60) > "$DUP1_LOG" 2>&1 &
+    "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 60) > "$DUP1_LOG" 2>&1 &
     DUP1_PID=$!
     # Let the daemon register the auth flight and the phone show the prompt.
     sleep 2
@@ -1138,7 +1147,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     DUP2_LOG="${TEST_DIR}/dedup-auth2.log"
     DUP2_START=$SECONDS
     set +e
-    echo "$PAM_FALLBACK_PASS" | "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$PAM_FALLBACK_USER" authenticate > "$DUP2_LOG" 2>&1 &
+    echo "$PAM_FALLBACK_PASS" | "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate > "$DUP2_LOG" 2>&1 &
     DUP2_PID=$!
     wait_pid_with_timeout "$DUP2_PID" 20
     DUP2_EXIT=$?
@@ -1154,6 +1163,8 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     else
         echo "❌ ERROR: concurrent duplicate did not fall through fast (rc=$DUP2_EXIT, elapsed=${DUP2_ELAPSED}s)."
         kill -9 "$DUP1_PID" 2>/dev/null || true
+        restore_test_user_password
+        trap cleanup EXIT INT TERM
         exit 1
     fi
 
@@ -1162,11 +1173,13 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
         echo "✅ Auth #1 was still in flight when the duplicate completed."
     else
         echo "❌ ERROR: auth #1 finished before the duplicate arrived — test inconclusive."
+        restore_test_user_password
+        trap cleanup EXIT INT TERM
         exit 1
     fi
 
     # Give the journal follower time to deliver the daemon's audit lines.
-    sleep 1
+    sleep 3
     assert_log_since "$LOG_BASE" "Duplicate authentication request" \
         "Daemon answered the concurrent same-user request with Ignore (dedup active)"
 
@@ -1186,6 +1199,9 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     set -e
     cat "$DUP1_LOG"
 
+    restore_test_user_password
+    trap cleanup EXIT INT TERM
+
     if [ "$DUP1_EXIT" -eq 0 ]; then
         echo "✅ In-flight auth #1 granted; the outcome was NOT mirrored to the duplicate."
         DEDUP_OK=1
@@ -1198,7 +1214,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
 else
-    echo "ℹ️  SKIPPED (pamtester/PAM library missing, /etc/pam.d not writable, or not running as root)."
+    echo "ℹ️  SKIPPED (pamtester/PAM library missing, /etc/pam.d not writable, not running as root, or TEST_USER's shadow hash unreadable)."
 fi
 
 # Step 6h: Phase 2h - Virtual fprintd D-Bus verification
