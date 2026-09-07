@@ -1151,10 +1151,12 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
 
     # Keep the phone silent: stop the host-side auto-grant daemon (which taps
     # finger 1 on enrolled images) and broadcast the e2e build's auto-approve
-    # suppression, so request #1 stays pending while the app is ALIVE. No
-    # force-stop is needed: the explicit grant below resolves #1 through the
-    # real grant path (the client-disconnect cancel path itself stays covered
-    # by Phase 2f). The sleep also keeps this phase's auths outside the 1s
+    # suppression, so request #1 stays pending while the app is ALIVE during
+    # this phase. The explicit grant below resolves #1 through the real grant
+    # path instead of a client-SIGKILL cancel (that disconnect-cancel path
+    # itself stays covered by Phase 2f); the app is force-stopped and relaunched
+    # again after the grant to reset its BLE scan registration for Phases 3/4.
+    # The sleep also keeps this phase's auths outside the 1s
     # PAM-PAM dedup window left by Phase 2g (same user) — otherwise request #1
     # itself would be answered with Ignore.
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
@@ -1256,9 +1258,21 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
 
     DEDUP_OK=1
 
-    # Restore deterministic auto-approve behavior and the auto-grant daemon for
-    # the following positive phases.
+    # Restore deterministic auto-approve behavior for the following phases
+    # while the (still running) app can receive the broadcast.
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" restore-auto-approve "$APP_PKG"
+
+    # Restart the Android app so the following phases have a fresh responder:
+    # the BLE phases (3/4) depend on the app's hardware-offloaded PendingIntent
+    # BLE scan, which is registered once at service start — a long-lived app
+    # process after the dedup/grant churn above can leave that registration
+    # silently dead (the daemon advertises, the emulator never delivers a scan
+    # result). Force-stop + relaunch re-registers it (same reset the pre-existing
+    # suite relied on between Phase 2i and Phase 3).
+    adb shell am force-stop "$APP_PKG" 2>/dev/null || true
+    adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity" >/dev/null 2>&1 || true
+    sleep 1
+
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
 else
