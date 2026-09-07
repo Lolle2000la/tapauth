@@ -1126,11 +1126,14 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # through to pam_unix, whose conversation consumes the piped password.
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
-    # Keep the phone silent: with auto-grant stopped (biometrics ARE enrolled)
-    # the biometric prompt stays pending, so request #1 remains in flight until
-    # it is explicitly granted below. The sleep also clears the 2s auth-flight
+    # Keep the phone silent: the e2e app build auto-approves a pending request
+    # ~1s after the prompt whenever biometric enrollment is unavailable, so a
+    # broadcast can never stay pending while the app is alive. Force-stop the
+    # app (same as Phase 5b) so request #1's broadcast stays unanswered and its
+    # auth flight remains in flight. The sleep also clears the 2s auth-flight
     # completion cooldown left by Phase 2g (same user) — otherwise request #1
     # itself would be answered with Ignore.
+    adb shell am force-stop "$APP_PKG" 2>/dev/null || true
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     sleep 3
 
@@ -1140,8 +1143,14 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     DUP1_LOG="${TEST_DIR}/dedup-auth1.log"
     "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 60) > "$DUP1_LOG" 2>&1 &
     DUP1_PID=$!
-    # Let the daemon register the auth flight and the phone show the prompt.
+    # Let the daemon register the auth flight.
     sleep 2
+    if ! kill -0 "$DUP1_PID" 2>/dev/null; then
+        echo "❌ ERROR: auth #1 did not stay in flight — test inconclusive."
+        restore_test_user_password
+        trap cleanup EXIT INT TERM
+        exit 1
+    fi
 
     echo "==> Running concurrent auth #2 with the CORRECT password (must fall through fast)..."
     DUP2_LOG="${TEST_DIR}/dedup-auth2.log"
@@ -1183,32 +1192,28 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     assert_log_since "$LOG_BASE" "Duplicate authentication request" \
         "Daemon answered the concurrent same-user request with Ignore (dedup active)"
 
-    # Resolve #1 by granting it on the phone (the prompt is still pending);
-    # repeated touches are safe: while no prompt shows they are no-ops.
-    echo "==> Resolving in-flight auth #1 via fingerprint grant..."
-    for _ in {1..10}; do
-        if ! kill -0 "$DUP1_PID" 2>/dev/null; then
-            break
-        fi
-        adb emu finger touch 1 >/dev/null 2>&1 || true
-        sleep 0.5
-    done
+    # Resolve #1 by cancelling it: SIGKILL the pamtester client; the daemon
+    # detects the IPC disconnect and hard-cancels the in-flight auth (same
+    # path Phase 2f asserts). With the app force-stopped no grant can arrive,
+    # so cancellation is the only deterministic resolution.
+    LOG_BASE2=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+    echo "==> Cancelling in-flight auth #1 via client disconnect..."
     set +e
-    wait_pid_with_timeout "$DUP1_PID" 30
-    DUP1_EXIT=$?
+    kill -9 "$DUP1_PID" 2>/dev/null || true
+    wait "$DUP1_PID" 2>/dev/null || true
     set -e
     cat "$DUP1_LOG"
+    sleep 2
+    assert_log_since "$LOG_BASE2" "IPC client disconnected while authentication" \
+        "Daemon cancelled in-flight auth #1 after the client disconnect"
 
+    # Restart the Android app so the following phases have a responder again.
+    adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity" >/dev/null 2>&1 || true
+    sleep 1
     restore_test_user_password
     trap cleanup EXIT INT TERM
 
-    if [ "$DUP1_EXIT" -eq 0 ]; then
-        echo "✅ In-flight auth #1 granted; the outcome was NOT mirrored to the duplicate."
-        DEDUP_OK=1
-    else
-        echo "❌ ERROR: in-flight auth #1 was not granted (rc=$DUP1_EXIT)."
-        exit 1
-    fi
+    DEDUP_OK=1
 
     # Restore auto-grant for the following positive phases
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
