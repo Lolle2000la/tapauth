@@ -1149,16 +1149,16 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # through to pam_unix, whose conversation consumes the piped password.
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
-    # Keep the phone silent: with no biometrics enrolled (the helper's
-    # auto-approve fallback on images without `cmd fingerprint enroll`), the
-    # e2e app build auto-approves a pending request ~1s after the prompt, so a
-    # broadcast can never stay pending while the app is alive. Force-stop the
-    # app (same as Phase 5b) so request #1's broadcast stays unanswered and its
-    # auth flight remains in flight. The sleep also keeps this phase's auths
-    # outside the 1s PAM-PAM dedup window left by Phase 2g (same user) —
-    # otherwise request #1 itself would be answered with Ignore.
-    adb shell am force-stop "$APP_PKG" 2>/dev/null || true
+    # Keep the phone silent: stop the host-side auto-grant daemon (which taps
+    # finger 1 on enrolled images) and broadcast the e2e build's auto-approve
+    # suppression, so request #1 stays pending while the app is ALIVE. No
+    # force-stop is needed: the explicit grant below resolves #1 through the
+    # real grant path (the client-disconnect cancel path itself stays covered
+    # by Phase 2f). The sleep also keeps this phase's auths outside the 1s
+    # PAM-PAM dedup window left by Phase 2g (same user) — otherwise request #1
+    # itself would be answered with Ignore.
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" suppress-auto-approve "$APP_PKG"
     sleep 3
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
@@ -1228,30 +1228,37 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     assert_log_since "$LOG_BASE" "Duplicate authentication request" \
         "Daemon answered the concurrent same-user request with Ignore (dedup active)"
 
-    # Resolve #1 by cancelling it: SIGKILL the pamtester client; the daemon
-    # detects the IPC disconnect and hard-cancels the in-flight auth (same
-    # path Phase 2f asserts). With the app force-stopped no grant can arrive,
-    # so cancellation is the only deterministic resolution.
-    LOG_BASE2=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
-    echo "==> Cancelling in-flight auth #1 via client disconnect..."
+    # Resolve #1 deterministically via the e2e-only explicit grant broadcast:
+    # the app signs the still-pending challenge and submits it, so pamtester #1
+    # must exit 0. This proves the duplicate's Ignore outcome was never
+    # mirrored to #1 and exercises the real grant path end-to-end — without
+    # depending on the 1s auto-approve timing or a client-SIGKILL cancel (the
+    # disconnect-cancel path is asserted separately by Phase 2f).
+    echo "==> Resolving in-flight auth #1 via explicit grant broadcast..."
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" grant "$APP_PKG"
     set +e
-    kill -9 "$DUP1_PID" 2>/dev/null || true
-    wait "$DUP1_PID" 2>/dev/null || true
+    wait_pid_with_timeout "$DUP1_PID" 30
+    DUP1_EXIT=$?
     set -e
     cat "$DUP1_LOG"
-    sleep 2
-    assert_log_since "$LOG_BASE2" "IPC client disconnected while authentication" \
-        "Daemon cancelled in-flight auth #1 after the client disconnect"
+    if [ "$DUP1_EXIT" -eq 0 ]; then
+        echo "✅ Explicit grant resolved auth #1 successfully (dedup did not mirror #2's Ignore outcome)."
+    else
+        echo "❌ ERROR: explicit grant did not resolve auth #1 (rc=$DUP1_EXIT)."
+        kill -9 "$DUP1_PID" 2>/dev/null || true
+        restore_test_user_password
+        trap cleanup EXIT INT TERM
+        exit 1
+    fi
 
-    # Restart the Android app so the following phases have a responder again.
-    adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity" >/dev/null 2>&1 || true
-    sleep 1
     restore_test_user_password
     trap cleanup EXIT INT TERM
 
     DEDUP_OK=1
 
-    # Restore auto-grant for the following positive phases
+    # Restore deterministic auto-approve behavior and the auto-grant daemon for
+    # the following positive phases.
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" restore-auto-approve "$APP_PKG"
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
 else

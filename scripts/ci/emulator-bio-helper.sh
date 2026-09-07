@@ -82,6 +82,35 @@ case "$ACTION" in
         adb shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
         ;;
 
+    grant)
+        # Arg 2: the package under test (see deny). The dev-grant receiver only
+        # exists in the e2e build variant (BuildConfig.E2E_TESTING + exported
+        # receiver); it signs the pending challenge with the device private key,
+        # mirroring a real biometric approval.
+        PKG="${2:-dev.rourunisen.tapauth.e2e}"
+        echo "    Triggering biometric grant for $PKG (finger 1 / dev-grant broadcast)..."
+        # Real fingerprint touch works on enrolled images; the e2e-only explicit
+        # grant broadcast covers images where nothing is enrolled.
+        adb emu finger touch 1 >/dev/null 2>&1 || true
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_GRANT >/dev/null 2>&1 || true
+        ;;
+
+    suppress-auto-approve)
+        # E2E-only: keep pending requests pending despite the e2e build's
+        # auto-approve fallback, so the harness can resolve them explicitly
+        # (no-op unless the e2e variant is installed).
+        PKG="${2:-dev.rourunisen.tapauth.e2e}"
+        echo "    Suppressing e2e auto-approve for $PKG..."
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_SUPPRESS_AUTO_APPROVE >/dev/null 2>&1 || true
+        ;;
+
+    restore-auto-approve)
+        # E2E-only: undo suppress-auto-approve.
+        PKG="${2:-dev.rourunisen.tapauth.e2e}"
+        echo "    Restoring e2e auto-approve for $PKG..."
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_RESTORE_AUTO_APPROVE >/dev/null 2>&1 || true
+        ;;
+
     start-auto-grant)
         echo "==> Starting background biometric auto-grant listener..."
         LOGCAT_LOG="/tmp/bio-auto-grant.log"
@@ -138,7 +167,7 @@ EOF
         ;;
 
     *)
-        echo "Usage: $0 {setup [package]|deny [package]|start-auto-grant|stop-auto-grant}"
+        echo "Usage: $0 {setup [package]|deny [package]|grant [package]|suppress-auto-approve [package]|restore-auto-approve [package]|start-auto-grant|stop-auto-grant}"
         exit 1
         ;;
 esac
