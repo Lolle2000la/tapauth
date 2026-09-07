@@ -54,19 +54,44 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, RwLock};
 
+/// Which channel owns an authentication broadcast for a username.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlightChannel {
+    Pam,
+    Fprintd,
+}
+
 /// Tracks the state of an authentication broadcast for one username.
 ///
-/// Guarantees at most one concurrent authentication broadcast per user:
-/// any request arriving while another auth for the same user is in flight —
-/// or within `COMPLETION_COOLDOWN` after one completed — is answered with
-/// `Ignore` immediately, so the requesting channel (PAM stack or fprintd
-/// verify) falls through to its next auth method instead of triggering a
-/// second phone prompt. Outcomes are never mirrored to concurrent requests:
-/// a grant only ever authenticates the request that owns the broadcast.
-#[derive(Clone)]
+/// Guarantees at most one concurrent authentication broadcast per user, with
+/// fprintd-priority semantics:
+///
+/// - A PAM request arriving while a fprintd flight is in flight — or within
+///   `PAM_DEDUP_WINDOW` of a PAM flight's start — is answered with `Ignore`
+///   immediately, so the requesting PAM stack falls through to its next auth
+///   method instead of triggering a second phone prompt.
+/// - A fprintd verify *preempts* an in-flight PAM broadcast via handover: the
+///   PAM waiter gets `Ignore` while the verify adopts the running session's
+///   outcome (no re-broadcast, no second phone buzz, and the broadcast
+///   survives the PAM client disconnecting).
+///
+/// Outcomes are never mirrored to concurrent requesters: a grant only ever
+/// authenticates the request that owns the broadcast.
 pub(crate) struct AuthFlight {
+    pub(crate) channel: FlightChannel,
     started: Instant,
-    finished: Option<Instant>,
+    /// Cancel-registry key of the owning broadcast. Used by the fprintd
+    /// bridge in handover mode to forward a D-Bus VerifyStop as an internal
+    /// cancel of the handed-over broadcast.
+    pub(crate) request_id: String,
+    /// Preemption signal, installed at flight start: `preempt_tx` is fired by
+    /// `auth_flight_preempt_pam`, `preempt_rx` is taken by the PAM handler
+    /// via `auth_flight_preempted`.
+    preempt_tx: Option<oneshot::Sender<()>>,
+    preempt_rx: Option<oneshot::Receiver<()>>,
+    /// After preemption the detached PAM continuation publishes the underlying
+    /// session's outcome here; the fprintd verify awaits it.
+    outcome_tx: Option<oneshot::Sender<ipc::PamAuthenticateResponse>>,
 }
 
 /// Longest time an in-flight entry may survive without a completion marker
@@ -74,45 +99,136 @@ pub(crate) struct AuthFlight {
 /// to 120 and is clamped well below this).
 const MAX_FLIGHT_SECS: u64 = 300;
 
-/// How long after a completed authentication further same-user requests are
-/// still treated as duplicates (covers late-arriving duplicate channels and
-/// prevents a second phone buzz right after an unlock).
-const COMPLETION_COOLDOWN: Duration = Duration::from_secs(2);
+/// PAM-PAM dedup window: a second PAM request for the same user within 1s of
+/// the first request's start is treated as a duplicate. There is deliberately
+/// no completion cooldown — back-to-back same-user PAM auths more than 1s
+/// apart each broadcast normally.
+const PAM_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 pub(crate) type AuthFlightRegistry = Arc<Mutex<HashMap<String, AuthFlight>>>;
 
-/// Returns true if `username` already has an in-flight or recently completed
-/// authentication (i.e. the caller must not start another broadcast). Also
-/// purges expired entries.
+/// Drops flight entries whose broadcast started too long ago without ever
+/// being finished (safety purge for crashed sessions).
+fn purge_stale_flights(flights: &mut HashMap<String, AuthFlight>, now: Instant) {
+    flights.retain(|_, flight| {
+        now.duration_since(flight.started) < Duration::from_secs(MAX_FLIGHT_SECS)
+    });
+}
+
+/// Returns true if a PAM request for `username` must be answered with Ignore:
+/// a fprintd flight is in flight (any age), or a PAM flight started within
+/// `PAM_DEDUP_WINDOW`. Also purges expired entries.
 pub(crate) async fn auth_flight_is_duplicate(
     registry: &AuthFlightRegistry,
     username: &str,
 ) -> bool {
     let now = Instant::now();
     let mut flights = registry.lock().await;
-    flights.retain(|_, flight| match flight.finished {
-        Some(finished) => now.duration_since(finished) < COMPLETION_COOLDOWN,
-        None => now.duration_since(flight.started) < Duration::from_secs(MAX_FLIGHT_SECS),
-    });
-    flights.contains_key(username)
+    purge_stale_flights(&mut flights, now);
+    match flights.get(username) {
+        // The fprintd verify owns the outstanding broadcast regardless of age.
+        Some(flight) if flight.channel == FlightChannel::Fprintd => true,
+        Some(flight) => now.duration_since(flight.started) < PAM_DEDUP_WINDOW,
+        None => false,
+    }
+}
+
+/// Returns true while a fprintd-owned flight is active for `username` (a
+/// second fprintd verify must not broadcast; the IPC dispatcher also uses
+/// this to keep a preempted broadcast alive across PAM client disconnects).
+pub(crate) async fn auth_flight_fprintd_active(
+    registry: &AuthFlightRegistry,
+    username: &str,
+) -> bool {
+    let now = Instant::now();
+    let mut flights = registry.lock().await;
+    purge_stale_flights(&mut flights, now);
+    matches!(
+        flights.get(username),
+        Some(flight) if flight.channel == FlightChannel::Fprintd
+    )
 }
 
 /// Registers the start of an authentication broadcast for `username`.
-pub(crate) async fn auth_flight_start(registry: &AuthFlightRegistry, username: &str) {
+pub(crate) async fn auth_flight_start(
+    registry: &AuthFlightRegistry,
+    username: &str,
+    channel: FlightChannel,
+    request_id: &str,
+) {
+    let (preempt_tx, preempt_rx) = oneshot::channel();
     registry.lock().await.insert(
         username.to_string(),
         AuthFlight {
+            channel,
             started: Instant::now(),
-            finished: None,
+            request_id: request_id.to_string(),
+            preempt_tx: Some(preempt_tx),
+            preempt_rx: Some(preempt_rx),
+            outcome_tx: None,
         },
     );
 }
 
 /// Marks the authentication for `username` as completed (success, denial,
-/// error or cancellation alike).
+/// error or cancellation alike) by removing the flight entry — there is no
+/// completion cooldown.
 pub(crate) async fn auth_flight_finish(registry: &AuthFlightRegistry, username: &str) {
-    if let Some(flight) = registry.lock().await.get_mut(username) {
-        flight.finished = Some(Instant::now());
+    registry.lock().await.remove(username);
+}
+
+/// Hands the preemption receiver to the PAM handler so it can observe (and
+/// yield to) a fprintd takeover mid-flight.
+pub(crate) async fn auth_flight_preempted(
+    registry: &AuthFlightRegistry,
+    username: &str,
+) -> Option<oneshot::Receiver<()>> {
+    let mut flights = registry.lock().await;
+    flights
+        .get_mut(username)
+        .and_then(|flight| flight.preempt_rx.take())
+}
+
+/// fprintd-priority preemption (handover): flips an in-flight PAM flight to
+/// fprintd ownership, signals the PAM waiter and installs the outcome channel
+/// the detached PAM continuation will publish into. Returns the owning
+/// broadcast's cancel-registry key and the outcome receiver; `None` when
+/// there is no PAM flight to preempt.
+pub(crate) async fn auth_flight_preempt_pam(
+    registry: &AuthFlightRegistry,
+    username: &str,
+) -> Option<(String, oneshot::Receiver<ipc::PamAuthenticateResponse>)> {
+    let mut flights = registry.lock().await;
+    let flight = flights.get_mut(username)?;
+    if flight.channel != FlightChannel::Pam {
+        return None;
+    }
+    flight.channel = FlightChannel::Fprintd;
+    // Refresh the age: the handed-over broadcast now serves the fprintd verify.
+    flight.started = Instant::now();
+    if let Some(tx) = flight.preempt_tx.take() {
+        let _ = tx.send(());
+    }
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    flight.outcome_tx = Some(outcome_tx);
+    Some((flight.request_id.clone(), outcome_rx))
+}
+
+/// Publishes the underlying session's outcome of a preempted flight to the
+/// fprintd verify (drop-safe: the receiver may already be gone).
+pub(crate) async fn auth_flight_publish_outcome(
+    registry: &AuthFlightRegistry,
+    username: &str,
+    response: ipc::PamAuthenticateResponse,
+) {
+    let tx = {
+        let mut flights = registry.lock().await;
+        flights
+            .get_mut(username)
+            .and_then(|flight| flight.outcome_tx.take())
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(response);
     }
 }
 
@@ -228,9 +344,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
 
     // Shared auth-flight registry (at most one concurrent authentication
-    // broadcast per username), used by both the PAM IPC channel and the
-    // virtual fprintd bridge.
+    // broadcast per username, fprintd-priority semantics), used by both the
+    // PAM IPC channel and the virtual fprintd bridge.
     let auth_flights: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Shared IPC cancel registry (targeted PamCancel / disconnect handling),
+    // also shared with the fprintd bridge so a D-Bus VerifyStop can cancel a
+    // broadcast it took over from PAM.
+    let cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Start the virtual fprintd D-Bus service (non-fatal: daemon functions without it).
     // Only claim the bus name when enable_fprintd_bridge is enabled in configuration
@@ -240,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let auth_state = AuthState {
             daemon: shared_daemon.clone(),
             auth_flights: auth_flights.clone(),
+            cancel_registry: cancel_registry.clone(),
         };
         match fprintd::start_fprintd_service(auth_state).await {
             Ok(conn) => {
@@ -263,7 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_state = Arc::new(ServerState {
         daemon: shared_daemon,
-        cancel_registry: Arc::new(Mutex::new(HashMap::new())),
+        cancel_registry,
         recent_requests: auth_flights,
         pending_pairing: Arc::new(Mutex::new(None)),
     });
@@ -425,6 +548,7 @@ async fn handle_conn(
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
                 let req_id = auth_req.request_id.clone();
+                let username = auth_req.username.clone();
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
                 {
                     let mut reg = server_state.cancel_registry.lock().await;
@@ -442,15 +566,32 @@ async fn handle_conn(
                         match read_res {
                             Ok(0) | Err(_) => {
                                 tracing::info!(
-                                    "IPC client disconnected while authentication '{}' was in-flight — cancelling request",
+                                    "IPC client disconnected while authentication '{}' was in-flight",
                                     req_id
                                 );
-                                let mut reg = cancel_reg.lock().await;
-                                if let Some(tx) = reg.remove(&req_id) {
-                                    let _ = tx.send(());
+                                // fprintd-priority: once a fprintd verify has
+                                // preempted this flight, the broadcast belongs to
+                                // the verify and must survive the PAM client's
+                                // disconnect — do not cancel it.
+                                if auth_flight_fprintd_active(
+                                    &server_state.recent_requests,
+                                    &username,
+                                )
+                                .await
+                                {
+                                    tracing::info!(
+                                        "Authentication '{}' was preempted by fprintd — broadcast survives the client disconnect",
+                                        req_id
+                                    );
+                                    let _ = auth_fut.await;
+                                } else {
+                                    let mut reg = cancel_reg.lock().await;
+                                    if let Some(tx) = reg.remove(&req_id) {
+                                        let _ = tx.send(());
+                                    }
+                                    drop(reg);
+                                    let _ = auth_fut.await;
                                 }
-                                drop(reg);
-                                let _ = auth_fut.await;
                                 (None, true)
                             }
                             Ok(_) => {
@@ -526,7 +667,7 @@ async fn handle_pam_authenticate(
 ) -> ipc::PamAuthenticateResponse {
     if auth_flight_is_duplicate(&server_state.recent_requests, &req.username).await {
         tracing::warn!(
-            "Duplicate authentication request for user '{}' - another auth is in flight or just completed; ignoring",
+            "Duplicate authentication request for user '{}' - another auth is in flight; ignoring",
             req.username
         );
         let mut reg = server_state.cancel_registry.lock().await;
@@ -538,44 +679,100 @@ async fn handle_pam_authenticate(
             challenge: Vec::new(),
         };
     }
-    auth_flight_start(&server_state.recent_requests, &req.username).await;
+    auth_flight_start(
+        &server_state.recent_requests,
+        &req.username,
+        FlightChannel::Pam,
+        &req.request_id,
+    )
+    .await;
 
     let timeout = Some(req.timeout_seconds);
-    let response = match AuthSession::new(daemon.clone(), req.username.clone()) {
-        Ok(sess) => match sess
-            .handle_authenticate(
-                timeout,
-                Some(req.request_id.clone()),
-                Some(req.service_name.clone()),
-                server_state.cancel_registry.clone(),
-                cancel_rx,
-            )
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Authentication handler error: {}", e);
-                ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Error as i32,
-                    detail: format!("Internal error: {}", e),
-                    challenge: Vec::new(),
-                }
-            }
-        },
+    let mut auth_fut = match AuthSession::new(daemon.clone(), req.username.clone()) {
+        Ok(sess) => Box::pin(sess.handle_authenticate(
+            timeout,
+            Some(req.request_id.clone()),
+            Some(req.service_name.clone()),
+            server_state.cancel_registry.clone(),
+            cancel_rx,
+        )),
         Err(e) => {
             let mut reg = server_state.cancel_registry.lock().await;
             reg.remove(&req.request_id);
             drop(reg);
+            auth_flight_finish(&server_state.recent_requests, &req.username).await;
             tracing::error!("Failed to create authentication session: {}", e);
-            ipc::PamAuthenticateResponse {
+            return ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Error as i32,
                 detail: format!("Failed to create auth session: {}", e),
                 challenge: Vec::new(),
-            }
+            };
         }
     };
-    auth_flight_finish(&server_state.recent_requests, &req.username).await;
-    response
+
+    match auth_flight_preempted(&server_state.recent_requests, &req.username).await {
+        Some(mut preempt_rx) => {
+            tokio::select! {
+                result = &mut auth_fut => {
+                    auth_flight_finish(&server_state.recent_requests, &req.username).await;
+                    flatten_auth_result(result)
+                }
+                _ = &mut preempt_rx => {
+                    // fprintd-priority handover: the verify adopts the running
+                    // broadcast. Answer our client immediately (its stack falls
+                    // through to the next auth method) and keep driving the
+                    // session detached for fprintd's benefit — even if this
+                    // client disconnects now.
+                    tracing::info!(
+                        "PAM authentication for user '{}' preempted by fprintd verify - handing over the in-flight broadcast",
+                        req.username
+                    );
+                    let server_state = server_state.clone();
+                    let username = req.username.clone();
+                    tokio::spawn(async move {
+                        let result = auth_fut.await;
+                        auth_flight_publish_outcome(
+                            &server_state.recent_requests,
+                            &username,
+                            flatten_auth_result(result),
+                        )
+                        .await;
+                        auth_flight_finish(&server_state.recent_requests, &username).await;
+                    });
+                    ipc::PamAuthenticateResponse {
+                        outcome: ipc::PamOutcome::Ignore as i32,
+                        detail: "Duplicate request - fprintd biometric in flight".to_string(),
+                        challenge: Vec::new(),
+                    }
+                }
+            }
+        }
+        None => {
+            // No preemption channel available (flight already finished) —
+            // complete without preemption support.
+            let result = auth_fut.await;
+            auth_flight_finish(&server_state.recent_requests, &req.username).await;
+            flatten_auth_result(result)
+        }
+    }
+}
+
+/// Maps an `AuthSession` result to the IPC response (handler errors become
+/// outcome=Error responses, as before).
+fn flatten_auth_result(
+    result: Result<ipc::PamAuthenticateResponse, auth_handler::AuthHandlerError>,
+) -> ipc::PamAuthenticateResponse {
+    match result {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("Authentication handler error: {}", e);
+            ipc::PamAuthenticateResponse {
+                outcome: ipc::PamOutcome::Error as i32,
+                detail: format!("Internal error: {}", e),
+                challenge: Vec::new(),
+            }
+        }
+    }
 }
 
 async fn handle_pam_cancel(
@@ -674,53 +871,155 @@ async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
 #[cfg(test)]
 mod auth_flight_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[tokio::test]
-    async fn duplicate_while_in_flight() {
-        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
-        auth_flight_start(&registry, "user").await;
-        assert!(auth_flight_is_duplicate(&registry, "user").await);
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn req_id(tag: &str) -> String {
+        format!("{}-{}", tag, REQ_SEQ.fetch_add(1, Ordering::Relaxed))
     }
 
-    #[tokio::test]
-    async fn duplicate_within_completion_cooldown() {
-        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
-        auth_flight_start(&registry, "user").await;
-        auth_flight_finish(&registry, "user").await;
-        assert!(auth_flight_is_duplicate(&registry, "user").await);
-    }
-
-    #[tokio::test]
-    async fn allowed_after_cooldown() {
-        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
-        auth_flight_start(&registry, "user").await;
-        auth_flight_finish(&registry, "user").await;
-        {
-            let mut flights = registry.lock().await;
-            if let Some(flight) = flights.get_mut("user") {
-                flight.finished = Some(Instant::now() - Duration::from_secs(3));
-            }
+    /// Backdates the flight for `username` by `age` (test helper; the registry
+    /// records `Instant::now()` at start).
+    async fn backdate_flight(registry: &AuthFlightRegistry, username: &str, age: Duration) {
+        if let Some(flight) = registry.lock().await.get_mut(username) {
+            flight.started = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         }
+    }
+
+    fn ignore_response() -> ipc::PamAuthenticateResponse {
+        ipc::PamAuthenticateResponse {
+            outcome: ipc::PamOutcome::Ignore as i32,
+            detail: "test".to_string(),
+            challenge: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pam_pam_duplicate_within_window() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user", FlightChannel::Pam, &req_id("pam")).await;
+        backdate_flight(&registry, "user", Duration::from_millis(500)).await;
+        assert!(auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn pam_pam_allowed_after_window() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user", FlightChannel::Pam, &req_id("pam")).await;
+        backdate_flight(&registry, "user", Duration::from_secs(2)).await;
+        // Past the 1s window: PAM may broadcast again (no completion cooldown).
         assert!(!auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn pam_defers_to_fprintd_regardless_of_age() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(
+            &registry,
+            "user",
+            FlightChannel::Fprintd,
+            &req_id("fprintd"),
+        )
+        .await;
+        backdate_flight(&registry, "user", Duration::from_secs(60)).await;
+        // A fprintd-owned broadcast is always a duplicate for PAM.
+        assert!(auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn fprintd_preempts_pam_flight() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user", FlightChannel::Pam, &req_id("pam")).await;
+        let preempt_rx = auth_flight_preempted(&registry, "user").await;
+        assert!(
+            preempt_rx.is_some(),
+            "PAM handler must get a preemption receiver"
+        );
+
+        let preempted = auth_flight_preempt_pam(&registry, "user").await;
+        assert!(
+            preempted.is_some(),
+            "preemption of a PAM flight must succeed"
+        );
+
+        let channel = registry.lock().await.get("user").map(|f| f.channel);
+        assert_eq!(channel, Some(FlightChannel::Fprintd));
+        let outcome_installed = registry
+            .lock()
+            .await
+            .get("user")
+            .map(|f| f.outcome_tx.is_some());
+        assert_eq!(outcome_installed, Some(true));
+
+        if let Some(rx) = preempt_rx {
+            assert!(rx.await.is_ok(), "preempted receiver must fire");
+        }
     }
 
     #[tokio::test]
     async fn stale_in_flight_purged() {
         let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
-        auth_flight_start(&registry, "user").await;
-        {
-            let mut flights = registry.lock().await;
-            if let Some(flight) = flights.get_mut("user") {
-                flight.started = Instant::now() - Duration::from_secs(400);
-            }
-        }
+        auth_flight_start(&registry, "user", FlightChannel::Pam, &req_id("pam")).await;
+        backdate_flight(&registry, "user", Duration::from_secs(400)).await;
         assert!(!auth_flight_is_duplicate(&registry, "user").await);
     }
 
     #[tokio::test]
     async fn different_users_independent() {
         let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
-        auth_flight_start(&registry, "u1").await;
+        auth_flight_start(&registry, "u1", FlightChannel::Pam, &req_id("pam")).await;
         assert!(!auth_flight_is_duplicate(&registry, "u2").await);
+    }
+
+    /// Focused async test of the preempt flow: a fake PAM handler registers a
+    /// flight, waits for preemption, then publishes the session outcome and
+    /// finishes — mirroring the detached continuation in
+    /// `handle_pam_authenticate`. The preempting side must receive the outcome.
+    #[tokio::test]
+    async fn preempted_pam_handler_returns_and_publishes_outcome() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user", FlightChannel::Pam, &req_id("pam")).await;
+        let mut preempt_rx = auth_flight_preempted(&registry, "user").await;
+
+        let (done_tx, done_rx) = oneshot::channel::<bool>();
+        let task_registry = registry.clone();
+        let handler = tokio::spawn(async move {
+            // Fake session: a broadcast that never completes on its own.
+            let preempted = match preempt_rx.as_mut() {
+                Some(rx) => tokio::select! {
+                    _ = std::future::pending::<()>() => false,
+                    _ = rx => true,
+                },
+                None => false,
+            };
+            if preempted {
+                auth_flight_publish_outcome(&task_registry, "user", ignore_response()).await;
+                auth_flight_finish(&task_registry, "user").await;
+            }
+            let _ = done_tx.send(preempted);
+        });
+
+        let preempted = auth_flight_preempt_pam(&registry, "user").await;
+        assert!(
+            preempted.is_some(),
+            "preemption of a PAM flight must succeed"
+        );
+
+        // The fake handler must observe the preemption and wind down.
+        let handler_preempted = done_rx.await.unwrap_or(false);
+        assert!(handler_preempted, "fake PAM handler must report preemption");
+
+        if let Some(outcome_rx) = preempted.map(|(_, rx)| rx) {
+            let outcome = outcome_rx.await;
+            assert!(outcome.is_ok(), "published outcome must reach the receiver");
+            if let Ok(response) = outcome {
+                assert_eq!(response.outcome, ipc::PamOutcome::Ignore as i32);
+            }
+        }
+
+        // The fake handler finished the flight (entry removed).
+        assert!(registry.lock().await.get("user").is_none());
+        let _ = handler.await;
     }
 }

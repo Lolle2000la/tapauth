@@ -6,7 +6,10 @@ use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::auth_handler::DaemonState;
-use crate::{auth_flight_finish, auth_flight_is_duplicate, auth_flight_start, AuthFlightRegistry};
+use crate::{
+    auth_flight_finish, auth_flight_fprintd_active, auth_flight_preempt_pam, auth_flight_start,
+    AuthFlightRegistry, FlightChannel,
+};
 
 const FPRINT_BUS_NAME: &str = "net.reactivated.Fprint";
 const FPRINT_MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
@@ -35,6 +38,10 @@ pub struct AuthState {
     /// concurrent authentication broadcast per username across the PAM IPC
     /// channel and this fprintd bridge.
     pub auth_flights: AuthFlightRegistry,
+    /// Shared IPC cancel registry (also held by `ServerState`): used in
+    /// handover mode to forward a D-Bus VerifyStop as an internal cancel of
+    /// the broadcast this bridge took over from PAM.
+    pub cancel_registry: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl AuthState {
@@ -584,18 +591,51 @@ async fn run_verify(
     username: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Single-broadcast rule: if another auth for this user is in flight or just
-    // completed, the PAM channel owns the outstanding request — don't broadcast
-    // again, just report "no match" so fprintd falls through to its next method.
-    if auth_flight_is_duplicate(&auth_state.auth_flights, &username).await {
+    // fprintd-priority dedup: a second fprintd verify while one is already in
+    // flight (unexpected — the device claim is exclusive) must not broadcast.
+    // Report "no match" so the caller falls through to its next method.
+    if auth_flight_fprintd_active(&auth_state.auth_flights, &username).await {
         tracing::info!(
-            "fprintd: another auth for user '{}' is in flight or just completed; skipping broadcast",
+            "fprintd: another fprintd verify for user '{}' is in flight; skipping broadcast",
             username
         );
         emit_status(&connection, "verify-no-match", true).await;
         return Ok(());
     }
-    auth_flight_start(&auth_state.auth_flights, &username).await;
+
+    // fprintd is the priority channel: preempt an in-flight PAM broadcast via
+    // handover instead of re-broadcasting (no second phone buzz). The PAM
+    // waiter gets Ignore immediately while this verify adopts the running
+    // session's outcome.
+    if let Some((owner_request_id, outcome_rx)) =
+        auth_flight_preempt_pam(&auth_state.auth_flights, &username).await
+    {
+        tracing::info!(
+            "fprintd: preempting in-flight PAM broadcast for user '{}' (request '{}'); awaiting its outcome",
+            username,
+            owner_request_id
+        );
+        return run_verify_handover(
+            auth_state,
+            connection,
+            username,
+            owner_request_id,
+            outcome_rx,
+            cancel_rx,
+        )
+        .await;
+    }
+
+    let mut rnd_bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut rnd_bytes);
+    let req_id = format!("fprintd-{}", hex::encode(rnd_bytes));
+    auth_flight_start(
+        &auth_state.auth_flights,
+        &username,
+        FlightChannel::Fprintd,
+        &req_id,
+    )
+    .await;
 
     let state = auth_state.read().await;
     let session = match crate::auth_handler::AuthSession::new(state, username.clone()) {
@@ -608,9 +648,6 @@ async fn run_verify(
         }
     };
 
-    let mut rnd_bytes = [0u8; 8];
-    let _ = getrandom::fill(&mut rnd_bytes);
-    let req_id = format!("fprintd-{}", hex::encode(rnd_bytes));
     let (internal_cancel_tx, internal_cancel_rx) = tokio::sync::oneshot::channel();
     let cancel_registry: Arc<
         tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
@@ -651,22 +688,68 @@ async fn run_verify(
         return Ok(());
     };
 
-    let (status, done) = match result {
-        Ok(response) => {
-            let outcome = shared::ipc::pb::PamOutcome::try_from(response.outcome);
-            match outcome {
-                Ok(shared::ipc::pb::PamOutcome::Success) => ("verify-match", true),
-                Ok(shared::ipc::pb::PamOutcome::Denied) => ("verify-no-match", true),
-                _ => ("verify-unknown-error", true),
-            }
-        }
+    let status = match result {
+        Ok(response) => auth_response_to_status(&response),
         Err(ref e) => {
             tracing::warn!("fprintd: auth error: {}", e);
-            ("verify-unknown-error", true)
+            "verify-unknown-error"
         }
     };
 
-    emit_status(&connection, status, done).await;
+    emit_status(&connection, status, true).await;
+    Ok(())
+}
+
+/// Maps an authentication outcome to the virtual fprintd device's
+/// verify-status string (done is always true once a broadcast completed).
+fn auth_response_to_status(response: &shared::ipc::pb::PamAuthenticateResponse) -> &'static str {
+    match shared::ipc::pb::PamOutcome::try_from(response.outcome) {
+        Ok(shared::ipc::pb::PamOutcome::Success) => "verify-match",
+        Ok(shared::ipc::pb::PamOutcome::Denied) => "verify-no-match",
+        _ => "verify-unknown-error",
+    }
+}
+
+/// Handover mode of a preempted broadcast: the PAM handler keeps driving the
+/// session (detached, surviving its client's disconnect) and publishes the
+/// outcome; this verify awaits that outcome — no new `AuthSession` — and maps
+/// it to the verify status. A D-Bus VerifyStop is forwarded as an internal
+/// cancel of the handed-over broadcast via the shared cancel registry.
+async fn run_verify_handover(
+    auth_state: AuthState,
+    connection: zbus::Connection,
+    username: String,
+    owner_request_id: String,
+    mut outcome_rx: tokio::sync::oneshot::Receiver<shared::ipc::pb::PamAuthenticateResponse>,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::select! {
+        outcome = &mut outcome_rx => {
+            auth_flight_finish(&auth_state.auth_flights, &username).await;
+            let status = match outcome {
+                Ok(response) => auth_response_to_status(&response),
+                // The broadcast ended without publishing an outcome (e.g. the
+                // PAM session failed to start): report no match.
+                Err(_) => "verify-no-match",
+            };
+            emit_status(&connection, status, true).await;
+        }
+        _ = &mut cancel_rx => {
+            // Forward the stop as an internal cancel of the handed-over
+            // broadcast (same mechanism as the PAM cancel path).
+            {
+                let mut reg = auth_state.cancel_registry.lock().await;
+                if let Some(tx) = reg.remove(&owner_request_id) {
+                    let _ = tx.send(());
+                }
+            }
+            // Let the detached PAM continuation wind the session down; its
+            // outcome is deliberately not mirrored here (existing cancel
+            // semantics: no verify-status emission on stop).
+            let _ = outcome_rx.await;
+            auth_flight_finish(&auth_state.auth_flights, &username).await;
+        }
+    }
     Ok(())
 }
 

@@ -807,10 +807,10 @@ echo "║  PHASE 2b: Real PAM Module Authentication (pamtester)         ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 sleep 3
-# NOTE: the auth-flight registry's 2s completion cooldown (single-broadcast
-# dedup) means a new same-user request arriving within 2s of a finished auth is
-# answered with Ignore. All sleeps below that separate sequential same-user
-# auth phases exist to clear that cooldown.
+# NOTE: same-user PAM auths that start within 1s of each other are
+# deduplicated (the second is answered with Ignore, single-broadcast rule).
+# All sleeps below that separate sequential same-user auth phases exist to
+# keep them safely outside that dedup window.
 
 PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
@@ -852,7 +852,7 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     # PAM_PERM_DENIED even though the module succeeded.
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
-    # Clear the 2s auth-flight completion cooldown left by Phase 2b (same user).
+    # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2b).
     sleep 3
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
@@ -884,6 +884,23 @@ assert_log_since() {
     fi
 }
 
+# Helper: block until a pattern appears in the daemon log after `base`, or
+# fail after `max_ticks` tenths of a second. Used to synchronise with the
+# daemon deterministically instead of sleeping a fixed guess.
+wait_for_log_line() {
+    local base=$1 pattern=$2 max_ticks=$3 label=$4
+    local tick=0
+    while [ "$tick" -lt "$max_ticks" ]; do
+        if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
+            return 0
+        fi
+        sleep 0.1
+        tick=$((tick + 1))
+    done
+    echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log within $((max_ticks / 10))s."
+    exit 1
+}
+
 # Step 6c: Phase 2c - Adversarial UDP: Replay of a captured grant + PamCancel
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -892,7 +909,7 @@ echo "╚═══════════════════════�
 
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-    # Clear the 2s auth-flight completion cooldown left by Phase 2e (same user).
+    # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2e).
     sleep 3
 
     # Timing note: on images where real enrollment is unavailable (API 36+;
@@ -960,7 +977,7 @@ echo "╚═══════════════════════�
 
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-    # Clear the 2s auth-flight completion cooldown left by Phase 2c (same user).
+    # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2c).
     sleep 3
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
@@ -1024,7 +1041,7 @@ echo "║  PHASE 2f: Hard Cancellation on IPC Disconnect                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-# Clear the 2s auth-flight completion cooldown left by Phase 2d (same user).
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2d).
 sleep 3
 
 LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
@@ -1137,9 +1154,9 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # e2e app build auto-approves a pending request ~1s after the prompt, so a
     # broadcast can never stay pending while the app is alive. Force-stop the
     # app (same as Phase 5b) so request #1's broadcast stays unanswered and its
-    # auth flight remains in flight. The sleep also clears the 2s auth-flight
-    # completion cooldown left by Phase 2g (same user) — otherwise request #1
-    # itself would be answered with Ignore.
+    # auth flight remains in flight. The sleep also keeps this phase's auths
+    # outside the 1s PAM-PAM dedup window left by Phase 2g (same user) —
+    # otherwise request #1 itself would be answered with Ignore.
     adb shell am force-stop "$APP_PKG" 2>/dev/null || true
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     sleep 3
@@ -1150,8 +1167,14 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     DUP1_LOG="${TEST_DIR}/dedup-auth1.log"
     "${PAM_ENV[@]}" pamtester "$PAM_MIXED_SERVICE_NAME" "$TEST_USER" authenticate < <(sleep 60) > "$DUP1_LOG" 2>&1 &
     DUP1_PID=$!
-    # Let the daemon register the auth flight.
-    sleep 2
+    # Wait until the daemon has registered auth #1's flight and is actually
+    # broadcasting for it. Request #2 must arrive within the 1s PAM-PAM dedup
+    # window of #1's start, so #2 is launched immediately after the broadcast
+    # is confirmed — waiting on the audit line keeps the race tight and
+    # deterministic (a fixed sleep could drift past the 1s window on a slow
+    # runner).
+    wait_for_log_line "$LOG_BASE" "server(s) authorized for user $TEST_USER" 100 \
+        "auth #1 broadcast start"
     if ! kill -0 "$DUP1_PID" 2>/dev/null; then
         echo "❌ ERROR: auth #1 did not stay in flight — test inconclusive."
         restore_test_user_password
@@ -1268,7 +1291,7 @@ if command -v dbus-send >/dev/null 2>&1; then
             if [ -f "$SCRIPT_DIR/ci/test-fprint-verify.py" ] && python3 -c "from gi.repository import Gio" >/dev/null 2>&1; then
                 echo "==> Testing Claim -> VerifyStart -> VerifyStatus('verify-match') -> Release lifecycle..."
                 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
-                # Clear the 2s auth-flight completion cooldown left by Phase 2g (same user).
+                # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2g).
                 sleep 2.5
                 if python3 "$SCRIPT_DIR/ci/test-fprint-verify.py" "$DEV_PATH" "$TEST_USER" 15 > "${TEST_DIR}/fprint_verify.log" 2>&1; then
                     cat "${TEST_DIR}/fprint_verify.log"
@@ -1304,7 +1327,7 @@ echo "╔═══════════════════════�
 echo "║  PHASE 3: Bluetooth Low Energy (BLE) Authentication           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-# Clear the 2s auth-flight completion cooldown left by the previous same-user auth.
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth above).
 sleep 3
 
 # Check if system D-Bus and BlueZ are accessible (e.g., host environment with BlueZ).
@@ -1348,7 +1371,7 @@ echo "╔═══════════════════════�
 echo "║  PHASE 4: Parallel Discovery Race (UDP + BLE Simultaneous)    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-# Clear the 2s auth-flight completion cooldown left by Phase 3 (same user).
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 3).
 sleep 3
 
 if [ "$BLE_AVAILABLE" = false ]; then
@@ -1376,7 +1399,7 @@ echo "╚═══════════════════════�
 
 # Stop auto-grant watcher
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
-# Clear the 2s auth-flight completion cooldown left by Phase 4 (same user).
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 4).
 sleep 3
 
 echo "==> Setting transport config: UDP enabled, BLE disabled..."
@@ -1422,7 +1445,7 @@ echo "╔═══════════════════════�
 echo "║  PHASE 5b: Authentication Timeout Verification                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-# Clear the 2s auth-flight completion cooldown left by Phase 5 (same user).
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 5).
 sleep 2
 # Stop the Android app so that no server responds to the broadcast, verifying daemon timeout handling
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
@@ -1459,7 +1482,7 @@ else
     exit 1
 fi
 
-# Clear the 2s auth-flight completion cooldown left by Phase 5b (same user).
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 5b).
 sleep 3
 echo "==> Verifying authentication returns PAM_IGNORE when no devices are configured..."
 UNPAIRED_AUTH_LOG="${TEST_DIR}/unpaired-cli.log"
