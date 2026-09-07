@@ -6,6 +6,7 @@ use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::auth_handler::DaemonState;
+use crate::{auth_flight_finish, auth_flight_is_duplicate, auth_flight_start, AuthFlightRegistry};
 
 const FPRINT_BUS_NAME: &str = "net.reactivated.Fprint";
 const FPRINT_MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
@@ -30,6 +31,10 @@ enum FprintError {
 #[derive(Clone)]
 pub struct AuthState {
     pub daemon: Arc<RwLock<Arc<DaemonState>>>,
+    /// Shared auth-flight registry (also held by `ServerState`): at most one
+    /// concurrent authentication broadcast per username across the PAM IPC
+    /// channel and this fprintd bridge.
+    pub auth_flights: AuthFlightRegistry,
 }
 
 impl AuthState {
@@ -579,10 +584,24 @@ async fn run_verify(
     username: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Single-broadcast rule: if another auth for this user is in flight or just
+    // completed, the PAM channel owns the outstanding request — don't broadcast
+    // again, just report "no match" so fprintd falls through to its next method.
+    if auth_flight_is_duplicate(&auth_state.auth_flights, &username).await {
+        tracing::info!(
+            "fprintd: another auth for user '{}' is in flight or just completed; skipping broadcast",
+            username
+        );
+        emit_status(&connection, "verify-no-match", true).await;
+        return Ok(());
+    }
+    auth_flight_start(&auth_state.auth_flights, &username).await;
+
     let state = auth_state.read().await;
-    let session = match crate::auth_handler::AuthSession::new(state, username) {
+    let session = match crate::auth_handler::AuthSession::new(state, username.clone()) {
         Ok(s) => s,
         Err(e) => {
+            auth_flight_finish(&auth_state.auth_flights, &username).await;
             tracing::error!("fprintd: failed to create auth session: {}", e);
             emit_status(&connection, "verify-unknown-error", true).await;
             return Ok(());
@@ -623,6 +642,10 @@ async fn run_verify(
             None
         }
     };
+
+    // The flight ends here whether the auth completed naturally or was
+    // cancelled via the D-Bus VerifyStop path.
+    auth_flight_finish(&auth_state.auth_flights, &username).await;
 
     let Some(result) = result else {
         return Ok(());

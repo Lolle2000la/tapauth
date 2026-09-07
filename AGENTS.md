@@ -170,6 +170,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### Replay & DoS Protections
 - **Two replay checks**: nonce cache (primary, 120s TTL) + timestamp window (secondary, 60s).
+- **Single-broadcast dedup**: concurrent same-user auth requests (PAM IPC or fprintd bridge) are answered with Ignore instead of broadcasting again; never mirrored.
 - **Pre-authentication DoS**: temporal IDs are pre-computed per 60s window into a hash set for O(1) checks before crypto.
 - **Post-authentication rate limiting**: escalating backoff (1s → 2s → 4s → max 5s) per Client public key.
 

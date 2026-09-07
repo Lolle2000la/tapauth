@@ -54,17 +54,73 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-/// Tracks recent authentication requests to prevent duplicates
+/// Tracks the state of an authentication broadcast for one username.
+///
+/// Guarantees at most one concurrent authentication broadcast per user:
+/// any request arriving while another auth for the same user is in flight —
+/// or within `COMPLETION_COOLDOWN` after one completed — is answered with
+/// `Ignore` immediately, so the requesting channel (PAM stack or fprintd
+/// verify) falls through to its next auth method instead of triggering a
+/// second phone prompt. Outcomes are never mirrored to concurrent requests:
+/// a grant only ever authenticates the request that owns the broadcast.
 #[derive(Clone)]
-struct RecentAuthRequest {
-    timestamp: Instant,
+pub(crate) struct AuthFlight {
+    started: Instant,
+    finished: Option<Instant>,
+}
+
+/// Longest time an in-flight entry may survive without a completion marker
+/// (safety purge for crashed sessions; pam_operation_timeout_secs defaults
+/// to 120 and is clamped well below this).
+const MAX_FLIGHT_SECS: u64 = 300;
+
+/// How long after a completed authentication further same-user requests are
+/// still treated as duplicates (covers late-arriving duplicate channels and
+/// prevents a second phone buzz right after an unlock).
+const COMPLETION_COOLDOWN: Duration = Duration::from_secs(2);
+
+pub(crate) type AuthFlightRegistry = Arc<Mutex<HashMap<String, AuthFlight>>>;
+
+/// Returns true if `username` already has an in-flight or recently completed
+/// authentication (i.e. the caller must not start another broadcast). Also
+/// purges expired entries.
+pub(crate) async fn auth_flight_is_duplicate(
+    registry: &AuthFlightRegistry,
+    username: &str,
+) -> bool {
+    let now = Instant::now();
+    let mut flights = registry.lock().await;
+    flights.retain(|_, flight| match flight.finished {
+        Some(finished) => now.duration_since(finished) < COMPLETION_COOLDOWN,
+        None => now.duration_since(flight.started) < Duration::from_secs(MAX_FLIGHT_SECS),
+    });
+    flights.contains_key(username)
+}
+
+/// Registers the start of an authentication broadcast for `username`.
+pub(crate) async fn auth_flight_start(registry: &AuthFlightRegistry, username: &str) {
+    registry.lock().await.insert(
+        username.to_string(),
+        AuthFlight {
+            started: Instant::now(),
+            finished: None,
+        },
+    );
+}
+
+/// Marks the authentication for `username` as completed (success, denial,
+/// error or cancellation alike).
+pub(crate) async fn auth_flight_finish(registry: &AuthFlightRegistry, username: &str) {
+    if let Some(flight) = registry.lock().await.get_mut(username) {
+        flight.finished = Some(Instant::now());
+    }
 }
 
 /// Server shared state (daemon runtime + cancel registry + deduplication + pairing)
 struct ServerState {
     daemon: Arc<RwLock<Arc<DaemonState>>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    recent_requests: Arc<Mutex<HashMap<String, RecentAuthRequest>>>,
+    recent_requests: AuthFlightRegistry,
     pending_pairing: Arc<Mutex<Option<PairingState>>>,
 }
 
@@ -171,6 +227,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrapped in RwLock so admin reloads are immediately visible to all consumers.
     let shared_daemon = Arc::new(RwLock::new(daemon_state.clone()));
 
+    // Shared auth-flight registry (at most one concurrent authentication
+    // broadcast per username), used by both the PAM IPC channel and the
+    // virtual fprintd bridge.
+    let auth_flights: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+
     // Start the virtual fprintd D-Bus service (non-fatal: daemon functions without it).
     // Only claim the bus name when enable_fprintd_bridge is enabled in configuration
     // to avoid stealing net.reactivated.Fprint from real hardware fprintd when only
@@ -178,6 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _fprintd_conn = if toml_config.enable_fprintd_bridge {
         let auth_state = AuthState {
             daemon: shared_daemon.clone(),
+            auth_flights: auth_flights.clone(),
         };
         match fprintd::start_fprintd_service(auth_state).await {
             Ok(conn) => {
@@ -202,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_state = Arc::new(ServerState {
         daemon: shared_daemon,
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
-        recent_requests: Arc::new(Mutex::new(HashMap::new())),
+        recent_requests: auth_flights,
         pending_pairing: Arc::new(Mutex::new(None)),
     });
 
@@ -462,26 +524,10 @@ async fn handle_pam_authenticate(
     server_state: &Arc<ServerState>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> ipc::PamAuthenticateResponse {
-    const DEDUP_WINDOW: Duration = Duration::from_secs(1);
-    let now = Instant::now();
-    let mut recent_requests = server_state.recent_requests.lock().await;
-
-    recent_requests.retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(2));
-
-    let is_duplicate = recent_requests
-        .get(&req.username)
-        .map(|r| now.duration_since(r.timestamp) < DEDUP_WINDOW)
-        .unwrap_or(false);
-
-    if is_duplicate {
-        let elapsed_ms = recent_requests
-            .get(&req.username)
-            .map(|r| now.duration_since(r.timestamp).as_millis())
-            .unwrap_or(0);
+    if auth_flight_is_duplicate(&server_state.recent_requests, &req.username).await {
         tracing::warn!(
-            "Duplicate authentication request for user '{}' within {}ms - ignoring",
-            req.username,
-            elapsed_ms
+            "Duplicate authentication request for user '{}' - another auth is in flight or just completed; ignoring",
+            req.username
         );
         let mut reg = server_state.cancel_registry.lock().await;
         reg.remove(&req.request_id);
@@ -492,12 +538,10 @@ async fn handle_pam_authenticate(
             challenge: Vec::new(),
         };
     }
-
-    recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
-    drop(recent_requests);
+    auth_flight_start(&server_state.recent_requests, &req.username).await;
 
     let timeout = Some(req.timeout_seconds);
-    match AuthSession::new(daemon.clone(), req.username.clone()) {
+    let response = match AuthSession::new(daemon.clone(), req.username.clone()) {
         Ok(sess) => match sess
             .handle_authenticate(
                 timeout,
@@ -529,7 +573,9 @@ async fn handle_pam_authenticate(
                 challenge: Vec::new(),
             }
         }
-    }
+    };
+    auth_flight_finish(&server_state.recent_requests, &req.username).await;
+    response
 }
 
 async fn handle_pam_cancel(
@@ -621,4 +667,60 @@ async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
+}
+
+// ── Auth-flight registry tests ──
+
+#[cfg(test)]
+mod auth_flight_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn duplicate_while_in_flight() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user").await;
+        assert!(auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn duplicate_within_completion_cooldown() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user").await;
+        auth_flight_finish(&registry, "user").await;
+        assert!(auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn allowed_after_cooldown() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user").await;
+        auth_flight_finish(&registry, "user").await;
+        {
+            let mut flights = registry.lock().await;
+            if let Some(flight) = flights.get_mut("user") {
+                flight.finished = Some(Instant::now() - Duration::from_secs(3));
+            }
+        }
+        assert!(!auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_purged() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "user").await;
+        {
+            let mut flights = registry.lock().await;
+            if let Some(flight) = flights.get_mut("user") {
+                flight.started = Instant::now() - Duration::from_secs(400);
+            }
+        }
+        assert!(!auth_flight_is_duplicate(&registry, "user").await);
+    }
+
+    #[tokio::test]
+    async fn different_users_independent() {
+        let registry: AuthFlightRegistry = Arc::new(Mutex::new(HashMap::new()));
+        auth_flight_start(&registry, "u1").await;
+        assert!(!auth_flight_is_duplicate(&registry, "u2").await);
+    }
 }
