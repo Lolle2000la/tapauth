@@ -634,7 +634,7 @@ class AuthRequestManager private constructor() {
             activity.lifecycleScope.launch {
                 delay(DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (getInstance().hasPendingRequest(authRequest.requestId)) {
-                    if (autoApproveSuppressed) {
+                    if (getInstance().autoApproveSuppressed) {
                         Log.i(
                             TAG,
                             "Auto-approve suppressed; awaiting explicit grant for request ${authRequest.requestId}",
