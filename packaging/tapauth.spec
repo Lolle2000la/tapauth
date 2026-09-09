@@ -52,12 +52,16 @@ Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
 automatically through the built-in virtual fprintd D-Bus service
 (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
 which resolves to tapauthd. The package deliberately does NOT conflict
-with the real fprintd package — the real daemon simply stays dormant
-while tapauthd claims the bus name. No local fingerprint reader is
-required.
+with the real fprintd package and ships no D-Bus activation file for
+the bus name, so nothing can collide with fprintd's own activation
+file: tapauthd is a systemd-managed daemon that owns the bus name while
+it runs, and real fprintd stays dormant. No local fingerprint reader
+is required.
 
-To keep using a real local fingerprint reader instead, set
-enable_fprintd_bridge = false in /etc/tapauth/config.toml.
+To keep using a real local fingerprint reader instead, install fprintd
+and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
+(applies at the next daemon restart): tapauthd then never claims the
+bus name and real fprintd handles all fingerprint requests again.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -96,7 +100,7 @@ mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
-# (%install runs in the source dir; CARGO_TARGET_DIR mirrors %build)
+# (the install section runs in the source dir; the cargo target dir mirrors the build one)
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauthd" %{buildroot}%{_bindir}/tapauthd
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-ipc-cli" %{buildroot}%{_bindir}/tapauth-ipc-cli
@@ -123,6 +127,7 @@ install -m 0644 systemd/polkit-agent-helper@.service.d/tapauth.conf %{buildroot}
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
 install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth/pam-config.example
+install -m 0644 config.toml.example %{buildroot}%{_datadir}/doc/tapauth/config.toml.example
 install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}/applications/tapauth-config.desktop
 install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 install -m 0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy %{buildroot}%{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
@@ -132,14 +137,19 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 mkdir -p %{buildroot}%{_datadir}/selinux/packages
 install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/packages/tapauth.cil
 
-# Virtual fprintd D-Bus bridge files (the bridge is enabled by default, so
-# lock screens and greeters work out of the box). The activation file name
-# differs from fprintd's own, so the real fprintd package can stay
-# installed side by side (its daemon stays dormant while tapauthd owns the
-# net.reactivated.Fprint bus name).
-mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
+# Virtual fprintd D-Bus bridge policy (the bridge is enabled by default, so
+# lock screens and greeters work out of the box). We deliberately ship NO
+# D-Bus activation service file for net.reactivated.Fprint: fprintd's own
+# package owns /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+# and a second activation file with the same Name= cannot win anyway —
+# dbus-daemon keeps the first-sorted file (fprintd's sorts first) and
+# dbus-broker (Fedora's default broker) ignores files not named after the
+# bus name. Instead, tapauthd is a systemd-managed daemon that owns the bus
+# name while it runs; the shipped policy file below is what authorizes
+# tapauthd to do so. With real fprintd installed the two coexist without
+# file conflicts, and real fprintd remains fully functional whenever the
+# bridge is disabled (enable_fprintd_bridge = false) or tapauthd is stopped.
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
-install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %pre
@@ -147,7 +157,7 @@ install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_dat
 getent group tapauthd >/dev/null 2>&1 || groupadd -r tapauthd
 getent group tapauthd-clients >/dev/null 2>&1 || groupadd -r tapauthd-clients
 if ! getent passwd tapauthd >/dev/null 2>&1; then
-    useradd -r -g tapauthd -G tapauthd-clients -d /var/lib/tapauth -s /sbin/nologin \
+    useradd -r -g tapauthd -G tapauthd-clients -d /var/lib/tapauth -s /usr/sbin/nologin \
         -c "TapAuth Daemon" tapauthd
 else
     usermod -aG tapauthd-clients tapauthd 2>/dev/null || true
@@ -187,7 +197,12 @@ for pam_svc in sudo su polkit-1; do
     if [ ! -f "${pam_file}.tapauth-bak" ]; then
         cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
     fi
-    sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+    # Insert after the PAM-1.0 magic header line (never above it).
+    if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+        sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+    else
+        sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+    fi
 done
 
 %systemd_post tapauthd.socket
@@ -195,10 +210,16 @@ if [ $1 -eq 1 ]; then
     # Start the socket immediately on initial install so auth requests don't hit a dead socket
     systemctl start tapauthd.socket 2>/dev/null || true
 fi
+# Start (or bounce) the daemon so the virtual fprintd bridge is live right
+# away: lock screens and greeters call pam_fprintd.so, which reaches
+# tapauthd over D-Bus — they never touch the IPC socket, so socket
+# activation alone would leave the bridge dead until the first sudo/su/
+# polkit authentication. `start` is a no-op when already running.
+systemctl start tapauthd.service 2>/dev/null || \
+    systemctl try-restart tapauthd.service 2>/dev/null || true
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
     systemctl reload dbus 2>/dev/null || true
 fi
-systemctl try-restart tapauthd.service 2>/dev/null || true
 
 echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
 echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
@@ -219,6 +240,43 @@ restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
+%if 0%{?fedora} || 0%{?rhel}
+if [ $1 -eq 0 ] && command -v authselect >/dev/null 2>&1; then
+    # Upgrade-path migration from TapAuth <= 0.10.x: those releases shipped
+    # authselect vendor profiles (vendor/tapauth, vendor/tapauth-sssd) and
+    # could leave the system selected into one of them. This package no
+    # longer ships authselect profiles, so the selection would dangle (and
+    # the authselect-generated /etc/pam.d/system-auth and password-auth
+    # would keep referencing the now-removed pam_tapauth.so module).
+    # Restore the stock profile the vendor profile was derived from, then
+    # let rpm drop the leftover profile directory. No-op when the system
+    # was never selected into a TapAuth profile.
+    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs || true)
+    case "$current_profile" in
+        vendor/tapauth|custom/tapauth|tapauth)
+            target_profile="local"
+            ;;
+        vendor/tapauth-sssd|custom/tapauth-sssd|tapauth-sssd)
+            target_profile="sssd"
+            ;;
+        *)
+            target_profile=""
+            ;;
+    esac
+    if [ -n "$target_profile" ]; then
+        features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ' || true)
+        authselect select "$target_profile" $features --force 2>/dev/null || \
+            authselect select "$target_profile" --force 2>/dev/null || true
+        # Remove the leftover custom/vendor profile directory if the old
+        # package left it behind (e.g. unclean upgrades).
+        rm -rf /etc/authselect/custom/tapauth /etc/authselect/custom/tapauth-sssd 2>/dev/null || true
+    elif [ -d /etc/authselect/custom/tapauth ] || [ -d /etc/authselect/custom/tapauth-sssd ]; then
+        # Dangling custom profile directory without an active TapAuth
+        # selection: just clean it up.
+        rm -rf /etc/authselect/custom/tapauth /etc/authselect/custom/tapauth-sssd 2>/dev/null || true
+    fi
+fi
+%endif
 if [ $1 -eq 0 ]; then
     # Restore the three PAM services in scope from their pristine backups.
     for pam_svc in sudo su polkit-1; do
@@ -278,6 +336,36 @@ if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinux
     semodule -r tapauth 2>/dev/null || true
 fi
 
+# polkit vendor-drift protection: when the polkit package is installed or
+# upgraded, its PAM vendor stack changes. Depending on the distro release
+# the vendor file is /usr/lib/pam.d/polkit-1 (with our /etc/pam.d override
+# shadowing it forever) or /etc/pam.d/polkit-1 itself (replaced on upgrade,
+# dropping our line). Re-seed the override from the new vendor file (when
+# present) and re-apply the TapAuth line — but only when TapAuth has
+# patched the file before (the .tapauth-bak marker created by the
+# post-install scriptlet). The backup is refreshed so a later removal
+# restores the CURRENT vendor stack. Idempotent; a no-op when TapAuth never
+# touched polkit-1.
+%triggerin -- polkit
+pam_file="/etc/pam.d/polkit-1"
+if [ -f "$pam_file" ] && [ -f "${pam_file}.tapauth-bak" ]; then
+    if [ -f /usr/lib/pam.d/polkit-1 ]; then
+        cp -p /usr/lib/pam.d/polkit-1 "${pam_file}.tapauth-bak" 2>/dev/null || true
+        cp -p /usr/lib/pam.d/polkit-1 "$pam_file" 2>/dev/null || true
+    fi
+    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        # Refresh the pristine backup from the (currently unpatched)
+        # vendor stack, then insert the TapAuth line after the header.
+        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        pam_line="auth        sufficient    pam_tapauth.so"
+        if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+            sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+        else
+            sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+        fi
+    fi
+fi
+
 %files
 %license LICENSE
 %dir %attr(0755, tapauthd, tapauthd) %{_sysconfdir}/tapauth
@@ -297,12 +385,12 @@ fi
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
 %doc %{_datadir}/doc/tapauth/pam-config.example
+%doc %{_datadir}/doc/tapauth/config.toml.example
 %{_datadir}/applications/tapauth-config.desktop
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 %{_datadir}/selinux/packages/tapauth.cil
-%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %changelog

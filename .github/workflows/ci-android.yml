@@ -159,7 +159,7 @@ jobs:
 
       - name: Scan Shipped Debian Binaries for Dev Overrides
         run: |
-          ./scripts/ci/scan-package-artifacts.sh deb /tmp/deb-build
+          SCAN_SELF_TEST=1 ./scripts/ci/scan-package-artifacts.sh deb /tmp/deb-build
 
       - name: Upload Production Debian Packages
         uses: actions/upload-artifact@v7
@@ -231,7 +231,7 @@ jobs:
           docker run --rm \
             -v "$PWD":/workspace \
             fedora:latest \
-            bash -c "dnf install -y binutils cpio rpm-build >/dev/null 2>&1 && cd /workspace && ./scripts/ci/scan-package-artifacts.sh rpm /workspace/pkg-fedora"
+            bash -c "dnf install -y binutils cpio rpm-build >/dev/null 2>&1 && cd /workspace && SCAN_SELF_TEST=1 ./scripts/ci/scan-package-artifacts.sh rpm /workspace/pkg-fedora"
 
       - name: Upload Production Fedora RPM Packages
         uses: actions/upload-artifact@v7
@@ -317,7 +317,7 @@ jobs:
           docker run --rm \
             -v "$PWD":/workspace \
             archlinux:base-devel \
-            bash -c "cd /workspace && ./scripts/ci/scan-package-artifacts.sh arch /workspace/pkg-arch"
+            bash -c "cd /workspace && SCAN_SELF_TEST=1 ./scripts/ci/scan-package-artifacts.sh arch /workspace/pkg-arch"
 
       - name: Upload Production Arch Linux Packages
         uses: actions/upload-artifact@v7

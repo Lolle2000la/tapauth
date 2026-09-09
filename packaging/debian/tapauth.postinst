@@ -1,5 +1,41 @@
 #!/bin/sh
 set -e
+if [ "$1" = "triggered" ]; then
+	# polkit vendor-drift protection (see tapauth.triggers): polkitd was
+	# installed/upgraded, so its PAM vendor stack changed. Depending on
+	# the release the vendor file is /usr/lib/pam.d/polkit-1 (with our
+	# /etc/pam.d override shadowing it forever) or /etc/pam.d/polkit-1
+	# itself (replaced on upgrade, dropping our line). Re-seed the
+	# override from the new vendor file (when present) and re-apply
+	# the TapAuth line — but only when TapAuth has patched the file
+	# before (the .tapauth-bak marker created by the configure step
+	# below). The backup is refreshed so a later removal restores the
+	# CURRENT vendor stack. Idempotent; a no-op when TapAuth never
+	# touched polkit-1.
+	shift
+	for trigger in "$@"; do
+		case "$trigger" in
+			*/polkit-1)
+				pam_file="/etc/pam.d/polkit-1"
+				if [ -f "$pam_file" ] && [ -f "${pam_file}.tapauth-bak" ]; then
+					if [ -f /usr/lib/pam.d/polkit-1 ]; then
+						cp -p /usr/lib/pam.d/polkit-1 "${pam_file}.tapauth-bak" 2>/dev/null || true
+						cp -p /usr/lib/pam.d/polkit-1 "$pam_file" 2>/dev/null || true
+					fi
+					if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+						cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+						pam_line="auth    sufficient    pam_tapauth.so"
+						if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+							sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+						else
+							sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+						fi
+					fi
+				fi
+				;;
+		esac
+	done
+fi
 if [ "$1" = "configure" ]; then
 	if command -v systemd-sysusers >/dev/null 2>&1; then
 		systemd-sysusers /usr/lib/sysusers.d/tapauth.conf || true
@@ -34,6 +70,17 @@ if [ "$1" = "configure" ]; then
 	# gdm-fingerprint, fingerprint-auth) — stay stock: they call
 	# pam_fprintd.so, which resolves to tapauthd's virtual fprintd D-Bus
 	# service (bridge enabled by default).
+	# pam-auth-update migration (upgrade path from TapAuth <= 0.10.x, which
+	# shipped a /usr/share/pam-configs/tapauth profile with priority 512):
+	# dpkg has already removed the profile at this point, so regenerating
+	# the pam-auth-update-managed stacks drops the stale generated tapauth
+	# line from /etc/pam.d/common-auth before it can point at a module
+	# version that is no longer wired that way. Idempotent: when no
+	# tapauth profile is installed (including fresh installs), regenerating
+	# is a no-op. Safe when pam-auth-update is absent.
+	if command -v pam-auth-update >/dev/null 2>&1 && [ -n "$2" ] && [ ! -e /usr/share/pam-configs/tapauth ]; then
+		pam-auth-update --package || true
+	fi
 	pam_line="auth    sufficient    pam_tapauth.so"
 	for pam_svc in sudo su polkit-1; do
 		pam_file="/etc/pam.d/${pam_svc}"

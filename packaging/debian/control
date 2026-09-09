@@ -26,9 +26,13 @@ Description: Local smartphone-based authentication framework
  automatically through the built-in virtual fprintd D-Bus service
  (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
  which resolves to tapauthd. The package deliberately does NOT conflict
- with the real fprintd packages (fprintd, libpam-fprintd) — the real
- daemon simply stays dormant while tapauthd claims the bus name. No
- local fingerprint reader is required.
+ with the real fprintd packages (fprintd, libpam-fprintd) and ships no
+ D-Bus activation file for the bus name, so nothing can collide with
+ fprintd's own activation file: tapauthd is a systemd-managed daemon
+ that owns the bus name while it runs, and real fprintd stays dormant.
+ No local fingerprint reader is required.
  .
- To keep using a real local fingerprint reader instead, set
- enable_fprintd_bridge = false in /etc/tapauth/config.toml.
+ To keep using a real local fingerprint reader instead, install fprintd
+ and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
+ (applies at the next daemon restart): tapauthd then never claims the
+ bus name and real fprintd handles all fingerprint requests again.

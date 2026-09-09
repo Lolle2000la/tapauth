@@ -24,5 +24,24 @@ if [ "$1" = "purge" ]; then
 		delgroup --system tapauthd 2>/dev/null || true
 	fi
 fi
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ] || [ "$1" = "abort-upgrade" ]; then
+	# Upgrade-path migration from TapAuth <= 0.10.x: dpkg has removed the
+	# old /usr/share/pam-configs/tapauth profile by the time postrm runs, so
+	# regenerating the pam-auth-update-managed stacks here drops the stale
+	# generated tapauth line from /etc/pam.d/common-auth. Without this, an
+	# "apt remove"/"apt purge" of a 0.10.x-era package would leave a
+	# common-auth line pointing at the now-deleted pam_tapauth.so module
+	# (system-wide authentication failure). The prerm runs the same
+	# regeneration as a belt-and-braces measure for states where the
+	# profile is already gone, but dpkg only deletes the profile AFTER
+	# prerm, so postrm is the step that guarantees the line is dropped.
+	# Idempotent and safe when pam-auth-update is absent. Note the module
+	# file itself is already gone here — regeneration only rewrites PAM
+	# configuration and does not invoke the module.
+	if command -v pam-auth-update >/dev/null 2>&1 && [ ! -e /usr/share/pam-configs/tapauth ]; then
+		pam-auth-update --package || true
+	fi
+fi
 #DEBHELPER#
 exit 0

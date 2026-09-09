@@ -85,6 +85,15 @@ account include       system-login
 PAMEof
 
 echo "==> 7. Testing installation of base package (tapauth)..."
+echo "Installing the REAL fprintd package first (coexistence P0 test: tapauth"
+echo "must install without file conflicts over fprintd's D-Bus activation file)..."
+pacman -S --noconfirm --needed fprintd
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+echo "Real fprintd activation Exec: $FPRINT_BIN"
+case "$FPRINT_BIN" in
+    *tapauthd*) echo "ERROR: fprintd's activation file points at tapauthd"; exit 1 ;;
+esac
 pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
 
 echo "Checking directory and config file ownership and permissions..."
@@ -110,10 +119,36 @@ test -f /usr/lib/systemd/system/tapauthd.service
 test -f /usr/lib/systemd/system/tapauthd.socket
 test -f /usr/lib/security/pam_tapauth.so
 
-echo "Verifying the virtual fprintd D-Bus files ship in the base package..."
-test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+echo "Verifying the virtual fprintd D-Bus policy ships in the base package..."
 test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+# Deliberately NO D-Bus activation service file shipped by tapauth: fprintd's
+# own package owns /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+# and a same-Name duplicate cannot win activation on dbus-daemon or dbus-broker.
+# Check the tapauth package file list (the path itself may legitimately exist
+# because the coexistence test installs the real fprintd package).
+if pacman -Ql tapauth | grep -q "dbus-1/system-services"; then
+    echo "ERROR: tapauth ships a D-Bus activation service file (must not — fprintd owns the only winning one)"
+    exit 1
+fi
+if [ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ] && \
+   grep -q "tapauthd" /usr/share/dbus-1/system-services/net.reactivated.Fprint.service 2>/dev/null; then
+    echo "ERROR: net.reactivated.Fprint.service contains tapauthd (tapauth must never own that file)"
+    exit 1
+fi
 test ! -e /usr/share/libalpm/hooks/tapauth-fprintd-pam.hook
+# polkit vendor-drift hook must ship.
+test -f /usr/share/libalpm/hooks/tapauth-polkit-pam.hook
+test -f /usr/share/libalpm/scripts/tapauth-polkit-pam
+# No live config.toml may be shipped (only the example; post_install seeds
+# /etc/tapauth/config.toml from it). Shipping a live config causes .pacnew churn.
+if pacman -Ql tapauth | grep -qE "etc/tapauth/config.toml$"; then
+    echo "ERROR: package ships a live /etc/tapauth/config.toml (should only ship config.toml.example)"
+    exit 1
+fi
+if [ ! -f /etc/tapauth/config.toml ]; then
+    echo "ERROR: post_install did not seed /etc/tapauth/config.toml from the example"
+    exit 1
+fi
 if pacman -Qq tapauth-fprintd >/dev/null 2>&1 || pacman -Qq tapauth-fprintd-git >/dev/null 2>&1; then
     echo "ERROR: tapauth-fprintd(-git) subpackage is installed"
     exit 1
@@ -126,6 +161,42 @@ for pam_svc in sudo su polkit-1; do
     test -f "/etc/pam.d/${pam_svc}.tapauth-bak"
     ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}.tapauth-bak"
 done
+
+echo "Verifying fprintd's activation file survived the tapauth install untouched..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec changed after tapauth install: $FPRINT_BIN"; exit 1 ;;
+esac
+
+# Verify the polkit vendor-drift hook script works: simulate a polkit
+# upgrade by rewriting the vendor file, run the hook script, and assert the
+# override was re-seeded with the tapauth line re-applied.
+echo "Verifying the polkit vendor-drift hook script..."
+if [ -f /usr/lib/pam.d/polkit-1 ]; then
+    cp /usr/lib/pam.d/polkit-1 /tmp/polkit-1.vendor
+    cp /etc/pam.d/polkit-1 /tmp/polkit-1.before-hook || true
+    sed -i '1i # SIMULATED POLKIT UPGRADE' /usr/lib/pam.d/polkit-1
+    /usr/share/libalpm/scripts/tapauth-polkit-pam
+    if ! grep -q "pam_tapauth\.so" /etc/pam.d/polkit-1; then
+        echo "ERROR: drift hook did not re-apply the tapauth line after simulated polkit upgrade"
+        cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
+        exit 1
+    fi
+    if ! grep -q "SIMULATED POLKIT UPGRADE" /etc/pam.d/polkit-1; then
+        echo "ERROR: drift hook did not re-seed the override from the new vendor file"
+        cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
+        exit 1
+    fi
+    if ! grep -q "pam_tapauth\.so" /etc/pam.d/polkit-1; then
+        echo "ERROR: re-seeded override lost the tapauth line"
+        cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
+        exit 1
+    fi
+    cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
+    echo "polkit drift hook works."
+fi
 
 echo "Verifying that kde-fingerprint was NOT modified (stays stock)..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
@@ -168,6 +239,18 @@ echo "Verifying that kde-fingerprint still has pam_fprintd.so (stock) after remo
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
+
+echo "Verifying the real fprintd package survived the full tapauth lifecycle untouched..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec changed after tapauth removal: $FPRINT_BIN"; exit 1 ;;
+esac
+if [ -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf ]; then
+    echo "ERROR: tapauth D-Bus policy file survived package removal"
+    exit 1
+fi
 
 echo "=================================================="
 echo "🎉 ALL ARCH LINUX BUILD AND INSTALL TESTS PASSED!"

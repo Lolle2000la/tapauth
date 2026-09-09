@@ -1,0 +1,11 @@
+# polkit vendor-drift protection: polkitd ships the polkit PAM vendor stack
+# (either as an /etc/pam.d/polkit-1 conffile on older releases or as
+# /usr/lib/pam.d/polkit-1 on newer ones). TapAuth seeds/patches
+# /etc/pam.d/polkit-1, which shadows the vendor stack forever; when polkitd
+# is upgraded the override goes stale. These triggers make dpkg re-run this
+# package's postinst ("triggered" state) whenever either vendor path
+# changes, so the override is re-seeded from the new vendor file and the
+# TapAuth line re-applied (only when the .tapauth-bak marker shows TapAuth
+# patched the file before). See packaging/debian/tapauth.postinst.
+interest-noawait /etc/pam.d/polkit-1
+interest-noawait /usr/lib/pam.d/polkit-1

@@ -96,8 +96,9 @@ jobs:
           cp packaging/sysusers.conf rpmbuild/SOURCES/tapauth-sysusers.conf
           cp packaging/tmpfiles.conf rpmbuild/SOURCES/tapauth-tmpfiles.conf
 
-          # Validate spec file with rpmlint
-          rpmlint rpmbuild/SPECS/tapauth.spec || true
+          # Validate spec file with rpmlint (rpmlintrc carries the justified
+          # filters; unused filters are expected on a spec-only run)
+          rpmlint --ignore-unused-rpmlintrc -r packaging/tapauth.rpmlintrc rpmbuild/SPECS/tapauth.spec
 
           # Strip the ./ prefix before adding the versioned directory so
           # older tar (SUSE Leap 15.6) doesn't choke on tapauth-X.Y/./paths

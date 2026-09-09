@@ -18,6 +18,7 @@ addFilter("pam-unauthorized-module")
 addFilter("dangerous-command-in-%post")
 addFilter("dangerous-command-in-%preun")
 addFilter("dangerous-command-in-%postun")
+addFilter("dangerous-command-in-%trigger")
 
 # The tapauthd system user/group is created with a low dynamic uid/gid on
 # purpose (sysusers); rpmlint flags any non-reserved account.

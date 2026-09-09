@@ -39,8 +39,8 @@ if [ "$SKIP_BUILD" = false ]; then
     # Update spec version if needed
     sed -i "s/%{?pkgversion}%{!?pkgversion:0.1.0}/${PKG_VER}/g" /root/rpmbuild/SPECS/tapauth.spec
 
-    echo "==> 3. Running rpmlint on spec file..."
-    rpmlint /root/rpmbuild/SPECS/tapauth.spec
+    echo "==> 3. Running rpmlint on spec file (with the shipped rpmlintrc)..."
+    rpmlint --ignore-unused-rpmlintrc -r "${WORKSPACE_DIR}/packaging/tapauth.rpmlintrc" /root/rpmbuild/SPECS/tapauth.spec
 
     echo "==> 3b. Compile-checking the SELinux policy module against the real policy store..."
     # NOTE: bare `secilc` cannot compile CIL fragments that reference distro
@@ -64,8 +64,8 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "==> 6. Generated RPMs:"
     ls -la /root/rpmbuild/RPMS/*/*.rpm
 
-    echo "==> 7. Running rpmlint on generated RPM packages..."
-    rpmlint /root/rpmbuild/RPMS/*/*.rpm || true
+    echo "==> 7. Running rpmlint on generated RPM packages (with the shipped rpmlintrc; errors are fatal)..."
+    rpmlint --ignore-unused-rpmlintrc -r "${WORKSPACE_DIR}/packaging/tapauth.rpmlintrc" /root/rpmbuild/RPMS/*/*.rpm
     PKG_DIR="/root/rpmbuild/RPMS/*"
 else
     dnf install -y --setopt=install_weak_deps=False sed grep rpmlint || true
@@ -73,6 +73,18 @@ else
 fi
 
 echo "==> 8. Testing installation of base package (tapauth)..."
+echo "Installing the REAL fprintd package first (coexistence P0 test: tapauth"
+echo "must install without file conflicts over fprintd's D-Bus activation file)..."
+if ! rpm -q fprintd >/dev/null 2>&1; then
+    dnf install -y fprintd
+fi
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+echo "Real fprintd activation Exec: $FPRINT_BIN"
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec unexpected: $FPRINT_BIN"; exit 1 ;;
+esac
 dnf install -y "${PKG_DIR}"/tapauth-${PKG_VER}-*.rpm
 
 echo "Checking directory and config file ownership and permissions..."
@@ -111,9 +123,44 @@ echo "Verifying no authselect vendor profile is shipped anymore..."
 test ! -e /usr/share/authselect/vendor/tapauth
 test ! -e /usr/share/authselect/vendor/tapauth-sssd
 
-echo "Verifying the virtual fprintd D-Bus files ship in the base package..."
-test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+echo "Verifying the virtual fprintd D-Bus policy ships in the base package..."
 test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+# Deliberately NO D-Bus activation service file shipped by tapauth: fprintd's
+# own package owns /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+# and a same-Name duplicate cannot win activation (dbus-daemon keeps the
+# first-sorted file; dbus-broker — Fedora's default broker — ignores files
+# not named after the bus name). Check the tapauth package file list (the
+# path itself may legitimately exist because the coexistence test installs
+# the real fprintd package).
+if rpm -ql tapauth | grep -q "dbus-1/system-services"; then
+    echo "ERROR: tapauth ships a D-Bus activation service file (must not — fprintd owns the only winning one)"
+    exit 1
+fi
+if [ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ] && \
+   grep -q "tapauthd" /usr/share/dbus-1/system-services/net.reactivated.Fprint.service 2>/dev/null; then
+    echo "ERROR: net.reactivated.Fprint.service contains tapauthd (tapauth must never own that file)"
+    exit 1
+fi
+
+echo "Verifying coexistence with the real fprintd package (installs first, no conflicts)..."
+if ! rpm -q fprintd >/dev/null 2>&1; then
+    dnf install -y fprintd
+fi
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+echo "Real fprintd activation Exec: $FPRINT_BIN"
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec unexpected: $FPRINT_BIN"; exit 1 ;;
+esac
+
+echo "Verifying fprintd's activation file survived the tapauth install untouched..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec changed after tapauth install: $FPRINT_BIN"; exit 1 ;;
+esac
 
 echo "Verifying PAM scope: only sudo, su and polkit-1 are patched..."
 for pam_svc in sudo su polkit-1; do
@@ -158,8 +205,41 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 
+echo "==> 9c. Upgrade-path test from a published v0.10.0-style package (authselect era)..."
+# v0.10.0 shipped authselect vendor profiles (vendor/tapauth, vendor/
+# tapauth-sssd) that users selected with `authselect select`. This package
+# ships no profiles; removal must roll the selection back to the stock
+# profile and leave no tapauth line in the generated stacks, or
+# system-auth/password-auth would keep referencing the removed module.
+if command -v authselect >/dev/null 2>&1; then
+    rm -rf /etc/authselect/custom/tapauth
+    mkdir -p /etc/authselect/custom/tapauth
+    cp -a /usr/share/authselect/default/local/. /etc/authselect/custom/tapauth/
+    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' /etc/authselect/custom/tapauth/system-auth
+    authselect select custom/tapauth --force
+    grep "pam_tapauth.so" /etc/pam.d/system-auth
+    echo "Simulated v0.10.0 authselect state in place; removing the package now (step 10) must roll back."
+fi
+
 echo "==> 10. Testing complete removal of the base package..."
 rpm -e tapauth
+
+if command -v authselect >/dev/null 2>&1 && [ -d /etc/authselect ]; then
+    CURRENT_PROFILE=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs || true)
+    echo "authselect profile after removal: ${CURRENT_PROFILE:-<none>}"
+    if [ "$CURRENT_PROFILE" = "custom/tapauth" ] || [ "$CURRENT_PROFILE" = "vendor/tapauth" ]; then
+        echo "ERROR: removal did not roll back the TapAuth authselect profile"
+        exit 1
+    fi
+    if [ -d /etc/authselect/custom/tapauth ]; then
+        echo "ERROR: leftover /etc/authselect/custom/tapauth after removal"
+        exit 1
+    fi
+    if [ -f /etc/pam.d/system-auth ] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
+        echo "ERROR: generated system-auth still references pam_tapauth.so after removal (missing-module lockout)"
+        exit 1
+    fi
+fi
 
 echo "Verifying the three PAM services were restored upon removal..."
 for pam_svc in sudo su polkit-1; do
@@ -172,6 +252,18 @@ done
 echo "Verifying that kde-fingerprint is untouched by uninstall..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+
+echo "Verifying the real fprintd package survived the full tapauth lifecycle untouched..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
+case "$FPRINT_BIN" in
+    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
+    *) echo "ERROR: fprintd activation Exec changed after tapauth removal: $FPRINT_BIN"; exit 1 ;;
+esac
+if [ -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf ]; then
+    echo "ERROR: tapauth D-Bus policy file survived package removal"
+    exit 1
+fi
 
 echo "=================================================="
 echo "🎉 ALL FEDORA RPM BUILD, LINT AND INSTALL TESTS PASSED!"

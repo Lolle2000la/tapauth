@@ -55,5 +55,20 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "purge" ]; then
 	fi
 fi
 
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "upgrade" ]; then
+	# pam-auth-update migration (upgrade path from TapAuth <= 0.10.x, which
+	# shipped a /usr/share/pam-configs/tapauth profile): regenerating the
+	# pam-auth-update-managed stacks drops the generated tapauth line from
+	# /etc/pam.d/common-auth now that this package no longer ships the
+	# profile. On remove/deconfigure this MUST run before the module file
+	# disappears, so a plain "apt remove tapauth" can never leave a
+	# common-auth line pointing at a missing pam_tapauth.so (system-wide
+	# auth failure). Idempotent: with no tapauth profile installed,
+	# regenerating is a no-op. Safe when pam-auth-update is absent.
+	if command -v pam-auth-update >/dev/null 2>&1 && [ ! -e /usr/share/pam-configs/tapauth ]; then
+		pam-auth-update --package || true
+	fi
+fi
+
 #DEBHELPER#
 exit 0

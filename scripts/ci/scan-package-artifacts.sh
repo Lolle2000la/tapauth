@@ -28,19 +28,28 @@ case "$PKG_TYPE" in
     deb)
         for deb in "$PKG_DIR"/tapauth_*.deb "$PKG_DIR"/tapauth-*.deb; do
             [ -f "$deb" ] || continue
-            dpkg-deb -x "$deb" "$WORK_DIR"
+            dpkg-deb -x "$deb" "$WORK_DIR" || {
+                echo "❌ ERROR: failed to extract $deb (production-build invariant must fail closed)"
+                exit 1
+            }
         done
         ;;
     rpm)
         for rpm in "$PKG_DIR"/tapauth-[0-9]*.rpm "$PKG_DIR"/tapauth-*.rpm; do
             [ -f "$rpm" ] || continue
-            (cd "$WORK_DIR" && rpm2cpio "$rpm" | cpio -idmv >/dev/null 2>&1 || true)
+            if ! (cd "$WORK_DIR" && rpm2cpio "$rpm" | cpio -idm >/dev/null 2>&1); then
+                echo "❌ ERROR: failed to extract $rpm (production-build invariant must fail closed)"
+                exit 1
+            fi
         done
         ;;
     arch)
         for pkg in "$PKG_DIR"/tapauth-[0-9]*.pkg.tar.zst "$PKG_DIR"/tapauth-*.pkg.tar.zst; do
             [ -f "$pkg" ] || continue
-            tar --zstd -xf "$pkg" -C "$WORK_DIR"
+            tar --zstd -xf "$pkg" -C "$WORK_DIR" || {
+                echo "❌ ERROR: failed to extract $pkg (production-build invariant must fail closed)"
+                exit 1
+            }
         done
         ;;
     *)
@@ -59,6 +68,18 @@ BINARIES=(
 PAM_SO=$(find "$WORK_DIR" -name "pam_tapauth.so" 2>/dev/null | head -1 || true)
 if [ -n "$PAM_SO" ]; then
     BINARIES+=("${PAM_SO#$WORK_DIR/}")
+fi
+
+# Fail closed: a production package MUST contain the shipped binaries. A
+# package payload with none of them means extraction silently produced an
+# empty tree (which used to print success).
+found_any=0
+for rel_bin in "${BINARIES[@]}"; do
+    [ -f "$WORK_DIR/$rel_bin" ] && found_any=1 && break
+done
+if [ "$found_any" -ne 1 ]; then
+    echo "❌ ERROR: no shipped binaries found in $PKG_TYPE package payload from $PKG_DIR — refusing to report success (production-build invariant must fail closed)."
+    exit 1
 fi
 
 fail=0
@@ -82,6 +103,22 @@ done
 if [ "$fail" -ne 0 ]; then
     echo "❌ SECURITY FAILURE: Production $PKG_TYPE packages contain forbidden dev/test overrides!"
     exit 1
+fi
+
+# Positive control: verify the scan itself can detect a planted dev
+# override. If this ever fails, the scan is broken (e.g. strings/grep
+# unavailable) and "clean" results cannot be trusted.
+if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
+    plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
+    mkdir -p "$plant_dir/usr/bin"
+    printf 'placeholder with TAPAUTHD_SOCK dev override\n' > "$plant_dir/usr/bin/tapauthd"
+    if bash "$0" deb "$plant_dir" >/dev/null 2>&1; then
+        echo "❌ ERROR: scan self-test FAILED — a planted dev override was NOT detected; scan is unreliable!"
+        rm -rf "$plant_dir"
+        exit 1
+    fi
+    rm -rf "$plant_dir"
+    echo "✅ Scan self-test passed: planted dev override was correctly detected."
 fi
 
 echo "✅ All shipped $PKG_TYPE binaries are 100% clean of dev/test overrides."

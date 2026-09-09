@@ -6,14 +6,19 @@ This guide covers the installation and uninstallation of TapAuth using the inter
 
 You can install tapauth via native package repositories to receive automatic updates verified by your system's package manager.
 
+### What the packages configure
+
+- **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). `login` is deliberately **not** patched.
+- **Everything else stays stock.** All other PAM stacks — including the fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, `fingerprint-auth`) — are left untouched: they call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service.
+- **Desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No extra package, no manual PAM edits, no local fingerprint reader required.
+- **No D-Bus activation file is shipped for `net.reactivated.Fprint`.** Real fprintd's own activation file is never touched, so the real `fprintd` package can coexist with TapAuth without file conflicts.
+- **Daemon lifecycle:** `tapauthd.socket` is enabled (and started at install); `tapauthd.service` is started at install so the virtual fprintd bridge is live immediately, and started again on boot/IPC activity as configured by the shipped preset.
+
 ### 1. Fedora Linux
 Packages are built and tracked using Fedora COPR.
 ```bash
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
-
-# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
-sudo dnf install tapauth-fprintd
 ```
 * **Group Membership:** To configure TapAuth via the `tapauth-config` GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
   ```bash
@@ -21,17 +26,7 @@ sudo dnf install tapauth-fprintd
   ```
   *(Log out and back in for group membership to take effect).*
 
-* **PAM Configuration:** Fedora uses `authselect` to manage the authentication stack. Do not edit files under `/etc/pam.d/` directly as `authselect` will overwrite your changes. The package ships ready-made authselect vendor profiles that you can enable with a single command:
-  ```bash
-  # For standard workstations (local accounts, Fedora 40+):
-  sudo authselect select tapauth with-silent-lastlog with-mkhomedir --force
-
-  # For environments using SSSD (FreeIPA, Active Directory, LDAP):
-  sudo authselect select tapauth-sssd with-silent-lastlog with-mkhomedir --force
-  ```
-  > **Warning:** Switching profiles will reset any currently enabled authselect features (e.g., fingerprint reader, smartcard, or MFA). To preserve them, check your active features first with `authselect current` and append them to the command (for example: `sudo authselect select tapauth with-fingerprint`).
-
-  You can verify the available profiles with `authselect list` after installation. To revert to the default Fedora profile, run `sudo authselect select local` (or `sssd` if that was your previous profile).
+* **PAM Configuration:** The package scriptlets patch `sudo`, `su` and `polkit-1` directly (with pristine backups). Do **not** use `authselect` vendor profiles with TapAuth — current releases ship no authselect profiles. If you previously enabled one from an older TapAuth release (≤ 0.10.x), removing/upgrading the package rolls the selection back to the stock profile automatically.
 
 * **SELinux Integration:** On Fedora systems with SELinux in Enforcing mode, the package automatically installs the `tapauth.cil` policy module so desktop display managers (GDM, KDE Plasma) can communicate with the daemon socket. If you encounter any AVC denials after a major system update, reload the policy with:
   ```bash
@@ -44,9 +39,6 @@ Packages are published via a Launchpad Personal Package Archive (PPA).
 sudo add-apt-repository ppa:lolle2000la/tapauth
 sudo apt-get update
 sudo apt-get install tapauth
-
-# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
-sudo apt-get install tapauth-fprintd
 ```
 * **Group Membership:** To configure TapAuth via the GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
   ```bash
@@ -54,11 +46,7 @@ sudo apt-get install tapauth-fprintd
   ```
   *(Log out and back in for group membership to take effect).*
 
-* **PAM Configuration:** Installation automatically registers a module profile hook via `pam-auth-update`. To toggle or configure the module non-interactively, run:
-  ```bash
-  sudo pam-auth-update
-  ```
-  > **Note on GDM upgrades:** When `tapauth-fprintd` is installed, it configures `/etc/pam.d/gdm-fingerprint`. When upgrading the `gdm3` package in the future, `dpkg` may notify you that the conffile was modified. Choose **keep your currently-installed version** to maintain TapAuth desktop lock screen unlock.
+* **PAM Configuration:** Installation patches `sudo`, `su` and `polkit-1` directly (originals kept as `<file>.tapauth-bak`). TapAuth does **not** register a `pam-auth-update` profile anymore. Upgrading from TapAuth ≤ 0.10.x (which used `pam-auth-update`) automatically regenerates the managed stacks so the old `common-auth` line is removed — on upgrade and on plain `apt remove tapauth`.
 
 ### 3. Arch Linux / CachyOS
 The packages are available via the Arch User Repository (AUR).
@@ -66,15 +54,8 @@ The packages are available via the Arch User Repository (AUR).
 paru -S tapauth
 # or alternatively
 yay -S tapauth
-
-# Optional: Install virtual fprintd bridge for desktop lock screens (GNOME, KDE Plasma)
-paru -S tapauth-fprintd
-# (or for development/git versions: paru -S tapauth-fprintd-git)
 ```
-* **Service Activation:** Arch Linux does not enable or start services automatically upon installation. Enable and start the TapAuth daemon socket:
-  ```bash
-  sudo systemctl enable --now tapauthd.socket
-  ```
+* **Service Activation:** The install scriptlet applies the shipped systemd preset (`tapauthd.socket` enabled, `tapauthd.service` started at install), so no manual `systemctl enable --now` is required.
 
 * **Group Membership:** Add your user to the `tapauthd-clients` group:
   ```bash
@@ -82,54 +63,31 @@ paru -S tapauth-fprintd
   ```
   *(Log out and back in for group membership to take effect).*
 
-* **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
-  ```text
-  auth      sufficient      pam_tapauth.so
-  ```
-To enable desktop lock screen integration on Arch, see the [Desktop Lock Screen Integration](#desktop-lock-screen-integration-gnome--kde-plasma) section below.
+* **PAM Configuration:** The install scriptlet patches `sudo`, `su` and `polkit-1` (seeding `/etc/pam.d` overrides from `/usr/lib/pam.d` vendor files where applicable, with pristine `.tapauth-bak` backups). A libalpm hook re-applies the polkit-1 override when the `polkit` package is upgraded. No manual PAM editing is required.
 
 ## Desktop Lock Screen Integration (GNOME & KDE Plasma)
 
 Modern Linux desktop lock screens (KDE Plasma's `kscreenlocker` and GNOME's `gdm`/`gnome-shell`) support simultaneous password and biometric authentication through virtual fingerprint emulation.
 
-### Optional Package: `tapauth-fprintd`
-TapAuth includes an embedded virtual `fprintd` D-Bus bridge (`net.reactivated.Fprint`) in the daemon. Installing the optional `tapauth-fprintd` package enables automatic desktop lock screen recognition:
-- **How it works:** When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
+### Built-in virtual fprintd bridge (enabled by default)
 
-> [!WARNING]
-> **Installing `tapauth-fprintd` replaces and conflicts with hardware `fprintd`!**
-> Do not install `tapauth-fprintd` if your system has a built-in physical fingerprint reader that you rely on.
-> Because both services claim the `net.reactivated.Fprint` D-Bus bus name, installing `tapauth-fprintd` will replace `fprintd` and reroute fingerprint biometric requests from desktop lock screens to your paired phone instead of your laptop's physical fingerprint scanner.
-> Standard PAM authentication (`sudo`, terminal logins, polkit) via `pam_tapauth.so` works completely independently without `tapauth-fprintd`.
+TapAuth ships an embedded virtual `fprintd` D-Bus service (`net.reactivated.Fprint`) in the daemon — no extra package is needed. When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
 
-- **Configuration Toggle:** You can disable or enable the virtual bridge anytime in `/etc/tapauth/config.toml` (`enable_fprintd_bridge = true|false`) or dynamically in the `tapauth-config` GUI under **Settings → Connectivity**.
+TapAuth's daemon (`tapauthd`) claims the `net.reactivated.Fprint` bus name while it runs, so the real fprintd daemon stays dormant. The real `fprintd` package may stay installed — TapAuth ships no D-Bus activation file for the bus name, so nothing collides.
 
-### Dual-Stack PAM Setup (Manual Configuration)
-If configuring PAM manually (or on distributions like Arch):
-- **KDE Plasma (`/etc/pam.d/kde-fingerprint`):**
-  ```text
-  #%PAM-1.0
-  auth        [success=done default=bad]    pam_tapauth.so
-  auth        include      system-local-login
-  account     include      system-local-login
-  password    include      system-local-login
-  session     include      system-local-login
-  ```
-- **GNOME / GDM (`/etc/pam.d/gdm-fingerprint`):**
-  ```text
-  #%PAM-1.0
-  auth        [success=done default=bad]    pam_tapauth.so
-  auth        include      system-local-login
-  account     include      system-local-login
-  password    include      system-local-login
-  session     include      system-local-login
-  ```
-  And enable fingerprint authentication in GDM dconf (`/etc/dconf/db/gdm.d/10-tapauth-fingerprint`):
-  ```ini
-  [org/gnome/login-screen]
-  enable-fingerprint-authentication=true
-  ```
-  Then run `sudo dconf update`.
+> **Note:** changes to `enable_fprintd_bridge` (see below) take effect at the next **daemon restart** (`sudo systemctl restart tapauthd.service`), not dynamically.
+
+### Using a real hardware fingerprint reader instead
+
+If your machine has a physical fingerprint reader you want to keep using:
+
+1. Keep (or install) the distribution's real `fprintd` package.
+2. Set `enable_fprintd_bridge = false` in `/etc/tapauth/config.toml`.
+3. Restart the daemon: `sudo systemctl restart tapauthd.service`.
+
+TapAuth then never claims the bus name and real fprintd handles all fingerprint requests again. PAM authentication for `sudo`, `su` and `polkit-1` via your paired phone continues to work independently. `install.sh` performs steps 2–3 automatically when it detects a real fprintd installation.
+
+To return to phone-based lock screen unlock, set `enable_fprintd_bridge = true` and restart the daemon.
 
 ### 4. Android (via F-Droid)
 A custom, unified F-Droid repository delivers the TapAuth Android companion app and update channels without requiring any third-party app store account.
@@ -185,19 +143,19 @@ This will guide you through the installation process with interactive prompts.
 sudo ./install.sh --yes
 ```
 
-This installs everything with default settings (including PAM configuration for login and sudo).
+This installs everything with default settings (including PAM configuration for `sudo`, `su` and `polkit-1`).
 
 ## Installation Script (`install.sh`)
 
 ### Features
 
-- **Privilege Separation**: Builds run as the original user (via `$SUDO_USER`) even when script is run with `sudo`, preventing root-owned files in cargo cache
+- **Privilege Separation**: Builds run as the original user (via `$SUDO_USER`) even when run with `sudo`, preventing root-owned files in the cargo cache
 - **Optimized Build**: Builds all components in release mode with `-C target-cpu=native -C opt-level=3`
 - **Component Installation**: Builds and installs all TapAuth components (PAM module, daemon, Config GUI)
-- **Bluetooth Support (daemon)**: Optional - build the daemon with or without Bluetooth (BLE) support
-- **PAM Configuration**: Optionally configure PAM for login, sudo, polkit, su, GDM, SDDM, LightDM, and KDE
+- **Bluetooth Support (daemon)**: Optional — build the daemon with or without Bluetooth (BLE) support
+- **PAM Configuration**: Patches `sudo`, `su` and `polkit-1` (opt-in per service; `login` deliberately excluded)
 - **TPM Support**: Optional TPM integration for secure key storage
-- **Virtual fprintd Bridge**: Optional lock screen biometric integration emulating fprintd
+- **Virtual fprintd Bridge**: Built-in and enabled by default; automatically disabled when a real hardware fprintd installation is detected
 - **Interactive Mode**: User-friendly prompts for all options
 - **Non-Interactive Mode**: Full automation via command-line flags
 - **Dry Run**: Preview what will be installed without making changes
@@ -211,21 +169,21 @@ OPTIONS:
     -h, --help              Show help message
     -n, --non-interactive   Run in non-interactive mode
     -y, --yes               Answer yes to all prompts (implies --non-interactive)
+    -f, --force             Force installation over existing packages/files without prompting
     --no-ble                Build daemon without Bluetooth support (UDP only)
     --use-tpm               Enable TPM support for key storage
-    --enable-fprintd        Enable virtual fprintd bridge (for desktop lock screen unlock)
-    --configure-login       Configure PAM for login authentication
     --configure-su          Configure PAM for su (root shells via su)
     --configure-sudo        Configure PAM for sudo authentication
-    --configure-su-l        Configure PAM for su-l (root shells via su -)
     --configure-polkit      Configure PAM for polkit authentication
-    --configure-system-auth Configure PAM for system-auth (used by SDDM, lock screens, etc.)
-    --configure-gdm         Configure PAM for GDM (GNOME Display Manager)
-    --configure-sddm        Configure PAM for SDDM
-    --configure-lightdm     Configure PAM for LightDM
-    --configure-kde         Configure PAM for KDE (kscreenlocker)
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
+
+NOTES:
+    All components (PAM module, daemon, configuration GUI) are always installed.
+    Only feature flags (BLE, TPM) and PAM configuration locations are configurable.
+
+    PAM scope is sudo, su and polkit-1 only (see "What the packages configure"
+    above for the lock screen story).
 ```
 
 ### Examples
@@ -235,14 +193,14 @@ OPTIONS:
 sudo ./install.sh
 ```
 
-#### Install with Login and Sudo Authentication
+#### Install Non-Interactively With All PAM Services Configured
 ```bash
-sudo ./install.sh --non-interactive --configure-login --configure-sudo
+sudo ./install.sh --yes
 ```
 
 #### Install Without BLE (daemon only)
 ```bash
-sudo ./install.sh --no-ble --configure-login
+sudo ./install.sh --no-ble --configure-sudo
 ```
 
 #### Build Without Installing
@@ -265,7 +223,7 @@ This will show detailed information about what would be installed, including:
 
 #### Install with TPM Support (Opt-in)
 ```bash
-sudo ./install.sh --use-tpm --configure-login --configure-sudo
+sudo ./install.sh --use-tpm --configure-sudo
 ```
 
 **Note**: TPM support is opt-in and requires:
@@ -357,16 +315,16 @@ If you previously installed TapAuth using `install.sh` and wish to switch to nat
    ```
    This safely cleans up the source binaries and PAM files without wiping `/var/lib/tapauth/` or removing user group memberships.
 2. **Install your distribution's package**:
-   - **Ubuntu / Debian**: `sudo apt install tapauth` (and optionally `tapauth-fprintd`)
-   - **Fedora**: `sudo dnf install tapauth` (and optionally `tapauth-fprintd`)
-   - **Arch Linux**: `yay -S tapauth` (and optionally `tapauth-fprintd`)
+   - **Ubuntu / Debian**: `sudo apt install tapauth`
+   - **Fedora**: `sudo dnf install tapauth`
+   - **Arch Linux**: `yay -S tapauth`
    The newly installed package automatically detects existing pairings in `/var/lib/tapauth/` and configuration in `/etc/tapauth/config.toml`.
 
 #### Switching from Distribution Packages to `install.sh`
 1. **Uninstall the package**:
-   - **Ubuntu / Debian**: `sudo apt remove tapauth tapauth-fprintd` (or `sudo apt purge` to delete configuration)
-   - **Fedora**: `sudo rpm -e tapauth-fprintd tapauth`
-   - **Arch Linux**: `sudo pacman -R tapauth-fprintd tapauth`
+   - **Ubuntu / Debian**: `sudo apt remove tapauth` (or `sudo apt purge` to delete configuration)
+   - **Fedora**: `sudo dnf remove tapauth`
+   - **Arch Linux**: `sudo pacman -R tapauth`
 2. **Build and install with `install.sh`**:
    ```bash
    ./install.sh
@@ -385,6 +343,7 @@ TapAuth uses PAM's `sufficient` control flag, which means:
 
 **Example PAM stack after installation:**
 ```
+#%PAM-1.0
 auth    sufficient    pam_tapauth.so      ← NEW: Try phone authentication first
 auth    sufficient    pam_unix.so         ← EXISTING: Fall back to password
 auth    required      pam_deny.so         ← EXISTING: Deny if all methods fail
@@ -392,7 +351,7 @@ auth    required      pam_deny.so         ← EXISTING: Deny if all methods fail
 
 This is a **safe, non-disruptive** configuration. Your system remains accessible even if:
 - Your phone is off or out of range
-- TapAuth is uninstalled (just remove the line from PAM config)
+- TapAuth is uninstalled (the package scriptlets restore the original stacks from `.tapauth-bak` copies)
 - Network connectivity is unavailable
 
 **For detailed information about PAM integration, security, and troubleshooting, see [PAM_INTEGRATION.md](PAM_INTEGRATION.md).**
@@ -403,7 +362,7 @@ PAM modules are loaded dynamically - **no system restart is required**:
 
 - **sudo**: Changes take effect **immediately** - test right away with `sudo -k && sudo echo test`
 - **polkit**: Changes take effect **immediately** - GUI privilege dialogs will use TapAuth
-- **login**: Changes take effect on **next login session** - you need to logout and login again
+- **Lock screens / greeters**: The virtual fprintd bridge becomes live when `tapauthd` (re)starts — the package scriptlets start the daemon at install; config changes to `enable_fprintd_bridge` require a manual `sudo systemctl restart tapauthd.service`
 
 **Important**: You can test sudo authentication immediately after installation without rebooting!
 
@@ -430,9 +389,6 @@ sudo tapauth-config
 ```bash
 # Test sudo
 sudo -k && sudo echo "Authentication test"
-
-# Test login (in a separate TTY - Ctrl+Alt+F2)
-# Try logging in with your paired device
 ```
 
 ### 3. Keep a Backup Session
@@ -468,7 +424,7 @@ Then run the install script normally with `sudo ./install.sh` - it will now buil
 ### Distribution-Specific Notes
 
 #### Fedora/RHEL/CentOS
-- SELinux: No custom policy is shipped. The installer restores default labels on `/var/lib/tapauth` and `/run/tapauthd` (via `restorecon` if available).
+- SELinux: the package ships and installs a `tapauth.cil` policy module; `install.sh` restores default labels on `/var/lib/tapauth` and `/run/tapauthd` (via `restorecon` if available). See the SELinux note in the Fedora section above.
 
 #### Ubuntu/Debian
 - Ensure `libpam0g-dev` is installed for PAM development
@@ -482,9 +438,13 @@ Then run the install script normally with `sudo ./install.sh` - it will now buil
 
 If you get locked out:
 1. Boot into recovery mode or single-user mode
-2. Edit `/etc/pam.d/login` and `/etc/pam.d/sudo`
-3. Remove lines containing `pam_tapauth.so`
-4. Reboot
+2. Restore the original stacks from the `.tapauth-bak` copies (or remove the `pam_tapauth.so` lines):
+   ```bash
+   for f in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
+       [ -f "$f.tapauth-bak" ] && cp "$f.tapauth-bak" "$f"
+   done
+   ```
+3. Reboot
 
 ### Bluetooth Issues
 
@@ -503,8 +463,7 @@ bluetoothctl power on
 
 Common issues:
 - Bluetooth not enabled: `sudo systemctl start bluetooth`
-- Bluetooth adapter not available or powered off
-- Bluetooth device conflicts (close other BLE applications)
+- Bluetooth adapter not available or powered off (fall back to the Local Network/UDP transport)
 
 For detailed Bluetooth diagnostics, see `scripts/bluetooth-check.sh`.
 
@@ -537,10 +496,10 @@ Edit the build flags in `install.sh`:
 
 ```bash
 # Change from:
-local rustflags="-C target-cpu=native -C opt-level=3"
+local rustflags="-Ctarget-cpu=native -Copt-level=3"
 
 # To (for example, generic x86_64):
-local rustflags="-C target-cpu=x86-64 -C opt-level=3"
+local rustflags="-Ctarget-cpu=x86-64 -Copt-level=3"
 ```
 
 ### TPM Configuration
@@ -583,7 +542,7 @@ The install script adds TapAuth as a `sufficient` module, which means:
 
 ### What Gets Removed
 
-- **Default**: All binaries (`tapauthd`, `tapauth-config`, `tapauth-ipc-cli`, `pam_tapauth.so`), systemd units/sockets, D-Bus activation/policy files, and all PAM configuration entries (all `pam_tapauth.so` references are automatically stripped to prevent system lockouts).
+- **Default**: All binaries (`tapauthd`, `tapauth-config`, `tapauth-ipc-cli`, `pam_tapauth.so`), systemd units/sockets, the D-Bus policy file, and all PAM configuration entries (all `pam_tapauth.so` references are automatically stripped to prevent system lockouts).
 - **Optional (`--purge` / `--remove-user-data`)**: User pairing keys and device pairings in `/var/lib/tapauth/`.
 
 ### What Gets Preserved
@@ -604,7 +563,7 @@ If you encounter issues:
 1. Check the troubleshooting section above
 2. Review system logs: `journalctl -xe`
 3. For BLE issues, run: `./scripts/bluetooth-check.sh`
-4. Verify PAM configuration: `cat /etc/pam.d/login | grep tapauth`
+4. Verify PAM configuration: `grep tapauth /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1`
 
 ### Socket access policy
 

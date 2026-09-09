@@ -52,8 +52,6 @@ FPRINT_DBUS_CONF_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 if [[ -d /usr/share/dbus-1/system.d ]]; then
     FPRINT_DBUS_CONF_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 fi
-FPRINT_SERVICE_SOURCE="packaging/net.reactivated.Fprint.service"
-FPRINT_SERVICE_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -72,12 +70,6 @@ check_hardware_fprintd() {
     if command -v fprintd &>/dev/null || [[ -f /usr/libexec/fprintd || -f /usr/lib/fprintd/fprintd || -f /usr/lib/fprintd || -f /usr/sbin/fprintd ]]; then
         has_hardware_fprintd=true
         return 0
-    fi
-    if [[ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ]]; then
-        if ! grep -q "tapauthd" /usr/share/dbus-1/system-services/net.reactivated.Fprint.service 2>/dev/null; then
-            has_hardware_fprintd=true
-            return 0
-        fi
     fi
     has_hardware_fprintd=false
     return 0
@@ -229,12 +221,16 @@ NOTES:
 
     PAM scope is sudo, su and polkit-1 only. All other PAM stacks —
     including fingerprint stacks (kde-fingerprint, gdm-fingerprint,
-    fingerprint-auth) — stay stock: they call pam_fprintd.so, which resolves
-    to tapauthd's virtual fprintd D-Bus service. Lock screens and greeters
-    (KDE Plasma, GNOME) integrate automatically — no local fingerprint
-    reader required. The real fprintd daemon stays dormant (no conflict).
-    To keep a real local fingerprint reader instead, set
-    enable_fprintd_bridge = false in /etc/tapauth/config.toml.
+    fingerprint-auth) — stay stock: they call pam_fprintd.so, which
+    resolves to tapauthd's virtual fprintd D-Bus service. Lock screens and
+    greeters (KDE Plasma, GNOME) integrate automatically — no local
+    fingerprint reader required. install.sh ships no D-Bus activation
+    file for net.reactivated.Fprint, so the real fprintd package (if
+    installed) coexists without conflicts and stays fully functional.
+    To keep a real local fingerprint reader instead: install fprintd and
+    set enable_fprintd_bridge = false in /etc/tapauth/config.toml
+    (applies at the next daemon restart) — tapauthd then never claims the
+    bus name.
 
 EXAMPLES:
     # Interactive installation (default)
@@ -747,9 +743,9 @@ install_daemon() {
         if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d /etc/dbus-1/system.d ]]; then
             show_command "install -m 0644 $FPRINT_DBUS_CONF_SOURCE $FPRINT_DBUS_CONF_DEST" "Install virtual fprintd D-Bus configuration"
         fi
-        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
-            show_command "install -m 0644 $FPRINT_SERVICE_SOURCE $FPRINT_SERVICE_DEST" "Install virtual fprintd D-Bus activation service"
-        fi
+        # Deliberately no D-Bus activation service file: fprintd's own
+        # package owns the only winning activation file for
+        # net.reactivated.Fprint; tapauthd owns the name while running.
         return
     fi
 
@@ -806,48 +802,62 @@ EOF
         chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
     fi
 
-    # Install virtual fprintd D-Bus policy and service activation files (guarded against real hardware fprintd)
+    # Install virtual fprintd D-Bus policy (bridge enable/disable handled per hardware detection)
     check_hardware_fprintd
 
     if [[ "$has_hardware_fprintd" == true ]]; then
-        print_warning "Physical fprintd installation detected on system. Skipping virtual fprintd D-Bus registration to prevent hardware conflict."
+        print_warning "Real fprintd (hardware fingerprint reader) detected."
+        print_info "Installing the virtual fprintd D-Bus policy file, but writing"
+        print_info "enable_fprintd_bridge = false into /etc/tapauth/config.toml so"
+        print_info "tapauthd never claims the bus name and your hardware reader"
+        print_info "keeps handling all fingerprint requests."
+        # Disable the virtual bridge so tapauthd does not claim
+        # net.reactivated.Fprint; real fprintd (installed on this system)
+        # keeps working. Note: no D-Bus activation service file is shipped
+        # by install.sh at all (see below), so fprintd's own activation
+        # setup stays untouched.
+        if [[ -f /etc/tapauth/config.toml ]] && ! grep -q "^enable_fprintd_bridge" /etc/tapauth/config.toml 2>/dev/null; then
+            printf "\n# Hardware fingerprint reader detected by install.sh:\n# disable the virtual fprintd bridge so the real reader stays in charge.\nenable_fprintd_bridge = false\n" >> /etc/tapauth/config.toml
+            chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+            chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+        fi
     else
-        local dbus_dir
-        dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
-        local DBUS_POLICY_DIR="$dbus_dir"
-        if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
-            print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
-            print_warning "Lock screen integration will not work until the policy file is manually installed."
+        print_info "No hardware fprintd detected; the virtual fprintd bridge stays"
+        print_info "enabled (default) so lock screens and greeters use TapAuth."
+    fi
+    local dbus_dir
+    dbus_dir="$(dirname "$FPRINT_DBUS_CONF_DEST")"
+    local DBUS_POLICY_DIR="$dbus_dir"
+    if [[ ! -d "$DBUS_POLICY_DIR" ]]; then
+        print_warning "D-Bus policy directory $DBUS_POLICY_DIR not found. Virtual fprintd D-Bus policy was NOT installed."
+        print_warning "Lock screen integration will not work until the policy file is manually installed."
+    fi
+    if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
+        print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
+        install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
+        if command -v restorecon &> /dev/null; then
+            restorecon "$FPRINT_DBUS_CONF_DEST" || true
         fi
-        if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d "$dbus_dir" ]]; then
-            print_info "Installing virtual fprintd D-Bus configuration to $FPRINT_DBUS_CONF_DEST"
-            install -m 0644 "$FPRINT_DBUS_CONF_SOURCE" "$FPRINT_DBUS_CONF_DEST"
-            if command -v restorecon &> /dev/null; then
-                restorecon "$FPRINT_DBUS_CONF_DEST" || true
-            fi
-        fi
+    fi
 
-        if [[ -f "$FPRINT_SERVICE_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
-            print_info "Installing virtual fprintd D-Bus system service activation file"
-            install -m 0644 "$FPRINT_SERVICE_SOURCE" "$FPRINT_SERVICE_DEST"
-            if command -v restorecon &> /dev/null; then
-                restorecon "$FPRINT_SERVICE_DEST" || true
-            fi
-        fi
+    # Deliberately NO D-Bus activation service file for
+    # net.reactivated.Fprint: fprintd's own package owns
+    # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service and
+    # a same-Name duplicate cannot win activation anyway — dbus-daemon
+    # keeps the first-sorted file and dbus-broker (Fedora's default
+    # broker) ignores files not named after the bus name. tapauthd is a
+    # systemd-managed daemon that owns the bus name while it runs; the
+    # policy file above authorizes that. Real fprintd stays fully
+    # functional whenever the bridge is disabled or tapauthd is stopped.
 
-        # The virtual fprintd bridge is enabled by default in the daemon —
-        # no config.toml write is needed here. Users who want a real local
-        # fingerprint reader opt out via enable_fprintd_bridge = false.
-
-        # Reload system D-Bus configuration to apply the new policy immediately
-        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
-            systemctl reload dbus 2>/dev/null || true
-        elif command -v dbus-send &>/dev/null; then
-            dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
-        fi
-        if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
-            systemctl try-restart tapauthd.service 2>/dev/null || true
-        fi
+    # Reload system D-Bus configuration to apply the new policy immediately
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+        systemctl reload dbus 2>/dev/null || true
+    elif command -v dbus-send &>/dev/null; then
+        dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+    fi
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet tapauthd.service 2>/dev/null; then
+        systemctl try-restart tapauthd.service 2>/dev/null || true
     fi
 }
 
@@ -1064,6 +1074,8 @@ configure_pam() {
                 backup_pam_file "$su_file"
                 if grep -q "pam_env.so" "$su_file"; then
                     sed -i "/pam_env.so/a $pam_line" "$su_file"
+                elif head -n1 "$su_file" | grep -q '^#%PAM-1.0'; then
+                    sed -i "1a $pam_line" "$su_file"
                 else
                     sed -i "1i $pam_line" "$su_file"
                 fi
@@ -1082,8 +1094,12 @@ configure_pam() {
         if [[ -f /etc/pam.d/sudo ]]; then
             if ! grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
                 backup_pam_file "/etc/pam.d/sudo"
-                # Insert at beginning of auth section
-                sed -i "1i $pam_line" /etc/pam.d/sudo
+                # Insert after the #%PAM-1.0 header line (never above it)
+                if head -n1 /etc/pam.d/sudo | grep -q '^#%PAM-1.0'; then
+                    sed -i "1a $pam_line" /etc/pam.d/sudo
+                else
+                    sed -i "1i $pam_line" /etc/pam.d/sudo
+                fi
                 print_success "Configured PAM for sudo"
             else
                 print_warning "PAM sudo already configured"
@@ -1108,7 +1124,11 @@ configure_pam() {
         if [[ -n "$polkit_pam_file" ]]; then
             if ! grep -q "pam_tapauth.so" "$polkit_pam_file"; then
                 backup_pam_file "$polkit_pam_file"
-                sed -i "1i $pam_line" "$polkit_pam_file"
+                if head -n1 "$polkit_pam_file" | grep -q '^#%PAM-1.0'; then
+                    sed -i "1a $pam_line" "$polkit_pam_file"
+                else
+                    sed -i "1i $pam_line" "$polkit_pam_file"
+                fi
                 print_success "Configured PAM for polkit at $polkit_pam_file"
             else
                 print_warning "PAM polkit already configured at $polkit_pam_file"
@@ -1254,7 +1274,8 @@ create_summary() {
     echo ""
     print_info "Lock screens & greeters: integrated automatically via the built-in"
     print_info "virtual fprintd service (all fingerprint stacks stay stock; no local"
-    print_info "fingerprint reader required — the real fprintd daemon stays dormant)."
+    print_info "fingerprint reader required). No D-Bus activation file is shipped,"
+    print_info "so the real fprintd package coexists without conflicts."
     
     echo ""
     echo "Features enabled:"
