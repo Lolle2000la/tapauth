@@ -22,8 +22,11 @@ fi
 
 echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modules for $(uname -r)..."
 
-# Ensure build essentials, kernel headers, and patchutils are installed
-sudo apt-get update -qq
+# Ensure build essentials, kernel headers, and patchutils are installed.
+# Tolerate partial index-fetch failures (e.g. transient hash-sum mismatches
+# on third-party runner repos like dl.google.com): the packages we need come
+# from the distro mirrors, which refresh fine.
+sudo apt-get update -qq || echo "WARNING: apt-get update reported failures (possibly third-party repos); continuing with available indexes."
 sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" patchutils wget
 
 HDRS="linux-headers-$(uname -r)"
