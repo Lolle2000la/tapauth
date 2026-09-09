@@ -30,7 +30,7 @@ echo "==> Testing Fedora RPM packaging for TapAuth version: ${PKG_VER}..."
 if [ "$SKIP_BUILD" = false ]; then
     echo "==> 1. Installing Fedora build dependencies and rpmlint..."
     dnf install -y --setopt=install_weak_deps=False \
-        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel dbus-devel systemd-rpm-macros authselect sed tar git findutils selinux-policy policycoreutils
+        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel dbus-devel systemd-rpm-macros sed tar git findutils selinux-policy policycoreutils
 
     echo "==> 2. Setting up RPM build directory..."
     mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -68,7 +68,7 @@ if [ "$SKIP_BUILD" = false ]; then
     rpmlint /root/rpmbuild/RPMS/*/*.rpm || true
     PKG_DIR="/root/rpmbuild/RPMS/*"
 else
-    dnf install -y --setopt=install_weak_deps=False authselect sed grep rpmlint || true
+    dnf install -y --setopt=install_weak_deps=False sed grep rpmlint || true
     PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-fedora}"
 fi
 
@@ -84,7 +84,10 @@ test "$DIR_OWNER" = "tapauthd:tapauthd"
 test "$DIR_MODE" = "755"
 
 test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: install must not write enable_fprintd_bridge into config.toml (daemon default is true)"
+    exit 1
+fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 echo "/etc/tapauth/config.toml: $OWNER ($MODE)"
@@ -94,13 +97,37 @@ test "$MODE" = "644"
 echo "Verifying rpm integrity (rpm -V tapauth)..."
 rpm -V tapauth
 
-echo "Testing authselect vendor profile activation..."
-if command -v authselect >/dev/null 2>&1; then
-    authselect select tapauth --force
-    authselect check
+echo "Verifying the tapauth-fprintd subpackage is gone..."
+if ls "${PKG_DIR}"/tapauth-fprintd-*.rpm >/dev/null 2>&1; then
+    echo "ERROR: tapauth-fprintd subpackage was removed but an .rpm for it was still built"
+    exit 1
+fi
+if rpm -q tapauth-fprintd >/dev/null 2>&1; then
+    echo "ERROR: tapauth-fprintd is installed"
+    exit 1
 fi
 
-echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
+echo "Verifying no authselect vendor profile is shipped anymore..."
+test ! -e /usr/share/authselect/vendor/tapauth
+test ! -e /usr/share/authselect/vendor/tapauth-sssd
+
+echo "Verifying the virtual fprintd D-Bus files ship in the base package..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+echo "Verifying PAM scope: only sudo, su and polkit-1 are patched..."
+for pam_svc in sudo su polkit-1; do
+    if [ -f "/etc/pam.d/${pam_svc}" ]; then
+        grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+        test -f "/etc/pam.d/${pam_svc}.tapauth-bak"
+        ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}.tapauth-bak"
+    else
+        echo "ERROR: /etc/pam.d/${pam_svc} missing after install (no /usr/lib/pam.d vendor file either?)"
+        exit 1
+    fi
+done
+
+echo "Creating dummy kde-fingerprint PAM stack to verify it stays STOCK..."
 mkdir -p /etc/pam.d
 cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
 #%PAM-1.0
@@ -108,58 +135,43 @@ auth    sufficient    pam_fprintd.so
 account include       system-auth
 PAMEof
 
-echo "==> 9. Testing installation of subpackage (tapauth-fprintd)..."
-dnf install -y "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.rpm
-
-echo "Checking config file and bridge enablement after subpackage install..."
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
-OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
-MODE=$(stat -c "%a" /etc/tapauth/config.toml)
-test "$OWNER" = "tapauthd:tapauthd"
-test "$MODE" = "644"
-test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-
-echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-
 echo "==> 9b. Testing package upgrade (rpm -Uvh --replacepkgs)..."
 rpm -Uvh --replacepkgs "${PKG_DIR}"/tapauth-${PKG_VER}-*.rpm
-rpm -Uvh --replacepkgs "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.rpm
 
-echo "Verifying %config(noreplace) preserved config.toml and authselect state..."
+echo "Verifying %config(noreplace) preserved config.toml and PAM wiring survived upgrade..."
 test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
-OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
-MODE=$(stat -c "%a" /etc/tapauth/config.toml)
-test "$OWNER" = "tapauthd:tapauthd"
-test "$MODE" = "644"
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-if command -v authselect >/dev/null 2>&1; then
-    authselect check
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: upgrade wrote enable_fprintd_bridge into config.toml"
+    exit 1
 fi
-
-echo "==> 10. Testing removal of subpackage (tapauth-fprintd)..."
-rpm -e tapauth-fprintd
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 test "$OWNER" = "tapauthd:tapauthd"
 test "$MODE" = "644"
+for pam_svc in sudo su polkit-1; do
+    grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+done
 
-echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
+echo "Verifying that kde-fingerprint was NOT modified (stays stock)..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
+test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 
-echo "==> 11. Testing complete removal of base package and authselect rollback..."
+echo "==> 10. Testing complete removal of the base package..."
 rpm -e tapauth
 
-if command -v authselect >/dev/null 2>&1; then
-    echo "Verifying that authselect profile was automatically rolled back to local..."
-    current_prof=$(authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    test "$current_prof" = "local"
-    authselect check
-fi
+echo "Verifying the three PAM services were restored upon removal..."
+for pam_svc in sudo su polkit-1; do
+    if [ -f "/etc/pam.d/${pam_svc}" ]; then
+        ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    fi
+    test ! -e "/etc/pam.d/${pam_svc}.tapauth-bak"
+done
+
+echo "Verifying that kde-fingerprint is untouched by uninstall..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 
 echo "=================================================="
 echo "🎉 ALL FEDORA RPM BUILD, LINT AND INSTALL TESTS PASSED!"

@@ -49,8 +49,6 @@ if [ "$SKIP_BUILD" = false ]; then
 
     cp "${WORKSPACE_DIR}/packaging/arch/PKGBUILD" "${BUILD_DIR}/PKGBUILD"
     cp "${WORKSPACE_DIR}/packaging/arch/tapauth.install" "${BUILD_DIR}/tapauth.install"
-    cp "${WORKSPACE_DIR}/packaging/arch/tapauth-fprintd.install" "${BUILD_DIR}/tapauth-fprintd.install"
-    cp "${WORKSPACE_DIR}/packaging/arch/"*.hook "${BUILD_DIR}/" 2>/dev/null || true
     cp "${WORKSPACE_DIR}/config.toml.example" "${BUILD_DIR}/config.toml.example"
 
     # Adjust PKGBUILD for local tarball build
@@ -72,7 +70,21 @@ else
     PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-arch}"
 fi
 
-echo "==> 6. Testing installation of base package (tapauth)..."
+echo "Verifying the tapauth-fprintd subpackage is gone (only the base package is built)..."
+if ls "${PKG_DIR}"/tapauth-fprintd-*.pkg.tar.zst >/dev/null 2>&1; then
+    echo "ERROR: tapauth-fprintd subpackage was removed but a package for it was still built"
+    exit 1
+fi
+
+echo "Creating dummy kde-fingerprint PAM stack to verify it stays STOCK..."
+mkdir -p /etc/pam.d
+cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
+#%PAM-1.0
+auth    sufficient    pam_fprintd.so
+account include       system-login
+PAMEof
+
+echo "==> 7. Testing installation of base package (tapauth)..."
 pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
 
 echo "Checking directory and config file ownership and permissions..."
@@ -84,7 +96,10 @@ test "$DIR_OWNER" = "tapauthd:tapauthd"
 test "$DIR_MODE" = "755"
 
 test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: install must not write enable_fprintd_bridge into config.toml (daemon default is true)"
+    exit 1
+fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 echo "/etc/tapauth/config.toml: $OWNER ($MODE)"
@@ -95,71 +110,64 @@ test -f /usr/lib/systemd/system/tapauthd.service
 test -f /usr/lib/systemd/system/tapauthd.socket
 test -f /usr/lib/security/pam_tapauth.so
 
-echo "==> 7. Setting up simulated pam_fprintd in kde-fingerprint to verify auto-repair..."
-mkdir -p /etc/pam.d
-cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
-#%PAM-1.0
-auth    sufficient    pam_fprintd.so
-account include       system-login
-PAMEof
-
-echo "==> 8. Testing installation of subpackage (tapauth-fprintd)..."
-pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
-
-echo "Checking config file and bridge enablement after subpackage install..."
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
-OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
-MODE=$(stat -c "%a" /etc/tapauth/config.toml)
-test "$OWNER" = "tapauthd:tapauthd"
-test "$MODE" = "644"
-
+echo "Verifying the virtual fprintd D-Bus files ship in the base package..."
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-test -f /usr/share/libalpm/hooks/tapauth-fprintd-pam.hook
+test ! -e /usr/share/libalpm/hooks/tapauth-fprintd-pam.hook
+if pacman -Qq tapauth-fprintd >/dev/null 2>&1 || pacman -Qq tapauth-fprintd-git >/dev/null 2>&1; then
+    echo "ERROR: tapauth-fprintd(-git) subpackage is installed"
+    exit 1
+fi
 
-echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+echo "Verifying PAM scope: only sudo, su and polkit-1 are patched..."
+for pam_svc in sudo su polkit-1; do
+    test -f "/etc/pam.d/${pam_svc}"
+    grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    test -f "/etc/pam.d/${pam_svc}.tapauth-bak"
+    ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}.tapauth-bak"
+done
 
-echo "==> 8b. Testing package upgrade (exercises post_upgrade)..."
+echo "Verifying that kde-fingerprint was NOT modified (stays stock)..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
+
+echo "==> 8. Testing package upgrade (exercises post_upgrade)..."
 pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
-pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
 
 echo "Verifying permissions, config, and PAM wiring survived upgrade..."
 test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: upgrade wrote enable_fprintd_bridge into config.toml"
+    exit 1
+fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 test "$OWNER" = "tapauthd:tapauthd"
 test "$MODE" = "644"
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+for pam_svc in sudo su polkit-1; do
+    grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+done
 
-echo "==> 9. Testing removal of subpackage (tapauth-fprintd)..."
-pacman -R --noconfirm tapauth-fprintd
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
-OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
-MODE=$(stat -c "%a" /etc/tapauth/config.toml)
-test "$OWNER" = "tapauthd:tapauthd"
-test "$MODE" = "644"
-
-echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
-grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-
-echo "==> 10. Testing simultaneous removal of both packages (order: tapauth-fprintd tapauth)..."
-pacman -U --noconfirm "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-pacman -R --noconfirm tapauth-fprintd tapauth
-echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped after simultaneous removal..."
+echo "Verifying that kde-fingerprint still has pam_fprintd.so (stock) after upgrade..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 
-echo "==> 11. Testing simultaneous removal in reverse order (order: tapauth tapauth-fprintd)..."
-pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst "${PKG_DIR}"/tapauth-fprintd-${PKG_VER}-*.pkg.tar.zst
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-pacman -R --noconfirm tapauth tapauth-fprintd
-echo "Verifying that kde-fingerprint has pam_fprintd.so restored and not wiped in reverse removal order..."
+echo "==> 9. Testing removal of the base package (tapauth)..."
+pacman -R --noconfirm tapauth
+
+echo "Verifying the three PAM services were restored upon removal..."
+for pam_svc in sudo su polkit-1; do
+    if [ -f "/etc/pam.d/${pam_svc}" ]; then
+        ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    fi
+    test ! -e "/etc/pam.d/${pam_svc}.tapauth-bak"
+done
+
+echo "Verifying that kde-fingerprint still has pam_fprintd.so (stock) after removal..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 
 echo "=================================================="
 echo "🎉 ALL ARCH LINUX BUILD AND INSTALL TESTS PASSED!"

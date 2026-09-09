@@ -13,23 +13,11 @@
 # upstream rpmlint whitelist addition).
 addFilter("pam-unauthorized-module")
 
-# The authselect vendor profiles are populated at build time with symlinks
-# into /usr/share/authselect/default/...; they resolve once authselect (a
-# hard Requires) is installed, so "dangling" at package-inspection time is
-# expected.
-addFilter("dangling-symlink")
-
-# Intentionally unversioned: this package provides a virtual fprintd D-Bus
-# service, not a specific fprintd release; a versioned Provides would falsely
-# claim compatibility with a real fprintd version.
-addFilter("unversioned-explicit-provides")
-
 # PAM-stack manipulation inherently uses chown/cp/rm in scriptlets. All
 # commands are guarded and idempotent (see scriptlet comments).
 addFilter("dangerous-command-in-%post")
 addFilter("dangerous-command-in-%preun")
 addFilter("dangerous-command-in-%postun")
-addFilter("dangerous-command-in-%trigger")
 
 # The tapauthd system user/group is created with a low dynamic uid/gid on
 # purpose (sysusers); rpmlint flags any non-reserved account.

@@ -12,26 +12,23 @@ Standards-Version: 4.7.0
 
 Package: tapauth
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd | policykit-1, adduser, libdbus-1-3
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd | policykit-1, adduser, libdbus-1-3, dbus
 Recommends: bluez, iptables
-Suggests: firewalld, tapauth-fprintd
+Suggests: firewalld
 Description: Local smartphone-based authentication framework
  A modern, privacy-preserving local-first authentication system.
-
-Package: tapauth-fprintd
-Architecture: all
-Depends: ${misc:Depends}, tapauth (>= ${source:Version}), dbus
-Conflicts: fprintd
-Provides: fprintd
-Replaces: fprintd
-Description: Virtual fprintd D-Bus bridge for TapAuth lock screen integration
- Virtual net.reactivated.Fprint D-Bus service allowing desktop lock screens
- (GDM, KDE Screenlocker) to unlock via TapAuth smartphone biometric
- verification.
  .
- NOTE: Installing or upgrading this package sets enable_fprintd_bridge = true
- in /etc/tapauth/config.toml (removing the package sets it back to false).
- To turn the bridge off without removing the package, edit the config manually.
+ pam_tapauth.so is wired into sudo, su and polkit-1 only; all other PAM
+ stacks (including fingerprint stacks such as kde-fingerprint,
+ gdm-fingerprint and fingerprint-auth) stay stock.
  .
- WARNING: Installing this package replaces and conflicts with hardware fprintd.
- Do not install if you rely on a physical fingerprint reader.
+ Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
+ automatically through the built-in virtual fprintd D-Bus service
+ (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
+ which resolves to tapauthd. The package deliberately does NOT conflict
+ with the real fprintd packages (fprintd, libpam-fprintd) — the real
+ daemon simply stays dormant while tapauthd claims the bus name. No
+ local fingerprint reader is required.
+ .
+ To keep using a real local fingerprint reader instead, set
+ enable_fprintd_bridge = false in /etc/tapauth/config.toml.

@@ -251,9 +251,9 @@ remove_systemd_units_and_daemon() {
         fi
     fi
 
-    if [[ -f /etc/tapauth/config.toml ]]; then
-        sed -i 's/^enable_fprintd_bridge = .*/enable_fprintd_bridge = false/' /etc/tapauth/config.toml 2>/dev/null || true
-    fi
+    # Note: no config.toml edit here. The virtual fprintd bridge is enabled
+    # by default in the daemon; the daemon is being removed entirely, so a
+    # leftover enable_fprintd_bridge key would be stale either way.
 
     # Remove GDM dconf override
     local updated_dconf=false
@@ -434,6 +434,9 @@ remove_pam_config() {
         if [[ -f /etc/pam.d/kde-smartcard ]]; then
             show_pam_restore_diff "/etc/pam.d/kde-smartcard"
         fi
+        if [[ -f /etc/pam.d/fingerprint-auth ]]; then
+            show_pam_restore_diff "/etc/pam.d/fingerprint-auth"
+        fi
         return
     fi
     
@@ -539,6 +542,28 @@ remove_pam_config() {
     if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
         print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
         sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
+    fi
+
+    # Best-effort legacy cleanup: older versions patched the Fedora
+    # fingerprint-auth stack directly. Restore it from its backup when one
+    # exists; otherwise drop the TapAuth lines.
+    if [[ -f /etc/pam.d/fingerprint-auth ]]; then
+        if grep -q "Managed by TapAuth" /etc/pam.d/fingerprint-auth 2>/dev/null; then
+            print_info "Removing synthetic fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
+            rm -f /etc/pam.d/fingerprint-auth /etc/pam.d/fingerprint-auth.tapauth-bak
+        elif grep -q "pam_tapauth.so" /etc/pam.d/fingerprint-auth 2>/dev/null; then
+            if [ -s /etc/pam.d/fingerprint-auth.tapauth-bak ]; then
+                print_info "Restoring original fingerprint-auth PAM configuration from backup"
+                cp -p /etc/pam.d/fingerprint-auth.tapauth-bak /etc/pam.d/fingerprint-auth
+                rm -f /etc/pam.d/fingerprint-auth.tapauth-bak
+            else
+                print_info "Removing TapAuth from fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
+                sed -i '/pam_tapauth\.so/d' /etc/pam.d/fingerprint-auth
+            fi
+        else
+            # Stack no longer references TapAuth; drop a stale backup.
+            rm -f /etc/pam.d/fingerprint-auth.tapauth-bak 2>/dev/null || true
+        fi
     fi
     
     # Restore PAM backups if present — warn the user since restoring may revert security updates

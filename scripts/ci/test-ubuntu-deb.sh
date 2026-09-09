@@ -5,10 +5,11 @@
 # 2. Base package (tapauth) installation via apt-get
 # 3. Directory & config file permissions (0755/0644) and ownership (tapauthd:tapauthd)
 # 4. Systemd service and socket unit placement
-# 5. Subpackage (tapauth-fprintd) installation and config bridge toggle
-# 6. D-Bus service and policy file placement
-# 7. Subpackage removal and config bridge disablement
-# 8. Base package purge and cleanup of /etc/tapauth
+# 5. PAM scope: only sudo, su, polkit-1 are patched (with .tapauth-bak backups);
+#    common-auth and fingerprint stacks stay stock (virtual fprintd bridge
+#    handles lock screens/greeters via pam_fprintd.so)
+# 6. D-Bus service and policy file placement (shipped in the base package)
+# 7. Base package purge: PAM files restored, state cleaned up
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +40,7 @@ if [ "$SKIP_BUILD" = false ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
-        build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config git tar dpkg-dev polkitd dbus curl ca-certificates
+        build-essential debhelper-compat protobuf-compiler libdbus-1-dev libsystemd-dev libpam0g-dev clang libclang-dev pkg-config git tar dpkg-dev polkitd dbus sudo curl ca-certificates
 
     # Ensure Rust toolchain >= 1.85 is available for lockfile v4
     if ! command -v cargo >/dev/null 2>&1 || [ "$(rustc --version 2>/dev/null | cut -d ' ' -f2 | cut -d. -f2 || echo 0)" -lt 85 ]; then
@@ -64,7 +65,10 @@ test "$DIR_OWNER" = "tapauthd:tapauthd"
 test "$DIR_MODE" = "755"
 
 test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: install must not write enable_fprintd_bridge into config.toml (daemon default is true)"
+    exit 1
+fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 echo "/etc/tapauth/config.toml: $OWNER ($MODE)"
@@ -74,12 +78,34 @@ test "$MODE" = "644"
 test -f /lib/systemd/system/tapauthd.service || test -f /usr/lib/systemd/system/tapauthd.service
 test -f /lib/systemd/system/tapauthd.socket || test -f /usr/lib/systemd/system/tapauthd.socket
 
-echo "Verifying pam-auth-update wired pam_tapauth.so into /etc/pam.d/common-auth..."
-if [ -f /etc/pam.d/common-auth ]; then
-    grep "pam_tapauth.so" /etc/pam.d/common-auth
+echo "Verifying the tapauth-fprintd subpackage is gone..."
+if ls /tmp/deb-build/tapauth-fprintd_*.deb >/dev/null 2>&1; then
+    echo "ERROR: tapauth-fprintd subpackage was removed but a .deb for it was still built"
+    exit 1
+fi
+if dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; then
+    echo "ERROR: tapauth-fprintd is installed"
+    exit 1
 fi
 
-echo "Creating dummy kde-fingerprint PAM stack to verify repair..."
+echo "Verifying the virtual fprintd D-Bus files ship in the base package..."
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+echo "Verifying PAM scope: only sudo, su and polkit-1 are patched..."
+for pam_svc in sudo su polkit-1; do
+    test -f "/etc/pam.d/${pam_svc}"
+    grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    test -f "/etc/pam.d/${pam_svc}.tapauth-bak"
+    ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}.tapauth-bak"
+done
+
+echo "Verifying common-auth is NOT patched (no pam-auth-update profile anymore)..."
+if [ -f /etc/pam.d/common-auth ]; then
+    ! grep "pam_tapauth.so" /etc/pam.d/common-auth
+fi
+
+echo "Creating dummy kde-fingerprint PAM stack to verify it stays STOCK..."
 mkdir -p /etc/pam.d
 cat << 'PAMEof' > /etc/pam.d/kde-fingerprint
 #%PAM-1.0
@@ -87,59 +113,44 @@ auth    sufficient    pam_fprintd.so
 @include common-auth
 PAMEof
 
-echo "==> 4. Testing installation of subpackage (tapauth-fprintd)..."
-apt-get install -y /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
-
-echo "Checking config file and bridge enablement after subpackage install..."
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
-OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
-MODE=$(stat -c "%a" /etc/tapauth/config.toml)
-test "$OWNER" = "tapauthd:tapauthd"
-test "$MODE" = "644"
-test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-
-echo "Verifying that kde-fingerprint was updated to pam_tapauth.so..."
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-
 echo "==> 4b. Testing package upgrade and reconfiguration..."
 dpkg -i /tmp/deb-build/tapauth_${PKG_VER}*.deb
-dpkg -i /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
 
 echo "Verifying configuration, PAM wiring, and permissions survived upgrade..."
-grep "enable_fprintd_bridge = true" /etc/tapauth/config.toml
+test -f /etc/tapauth/config.toml
+if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    echo "ERROR: upgrade wrote enable_fprintd_bridge into config.toml"
+    exit 1
+fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
 MODE=$(stat -c "%a" /etc/tapauth/config.toml)
 test "$OWNER" = "tapauthd:tapauthd"
 test "$MODE" = "644"
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-if [ -f /etc/pam.d/common-auth ]; then
-    grep "pam_tapauth.so" /etc/pam.d/common-auth
-fi
+for pam_svc in sudo su polkit-1; do
+    grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+done
 
-echo "==> 5. Testing removal and purge of subpackage (tapauth-fprintd)..."
-apt-get remove -y tapauth-fprintd
-test -f /etc/tapauth/config.toml
-grep "enable_fprintd_bridge = false" /etc/tapauth/config.toml
-
-echo "Verifying that kde-fingerprint reverted pam_fprintd.so..."
+echo "Verifying that kde-fingerprint was NOT modified (stays stock)..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-
-echo "Re-installing tapauth-fprintd to test apt purge..."
-apt-get install -y /tmp/deb-build/tapauth-fprintd_${PKG_VER}*.deb
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-apt-get purge -y tapauth-fprintd
-grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 
-echo "==> 6. Testing purge of base package (tapauth)..."
+echo "==> 5. Testing purge of base package (tapauth)..."
 apt-get purge -y tapauth
 test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
-if [ -f /etc/pam.d/common-auth ]; then
-    echo "Verifying pam_tapauth.so unwired from common-auth upon purge..."
-    ! grep "pam_tapauth.so" /etc/pam.d/common-auth
-fi
+
+echo "Verifying the three PAM services were restored upon purge..."
+for pam_svc in sudo su polkit-1; do
+    if [ -f "/etc/pam.d/${pam_svc}" ]; then
+        ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    fi
+    test ! -e "/etc/pam.d/${pam_svc}.tapauth-bak"
+done
+
+echo "Verifying that kde-fingerprint is untouched by uninstall..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 
 echo "=================================================="
 echo "🎉 ALL UBUNTU/DEBIAN BUILD AND INSTALL TESTS PASSED!"

@@ -19,10 +19,6 @@ ExclusiveArch:  x86_64 aarch64
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  clang
-%if 0%{?fedora} || 0%{?rhel}
-BuildRequires:  authselect
-Requires:       authselect
-%endif
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
 %else
@@ -38,6 +34,7 @@ Requires(preun): systemd
 Requires(postun): systemd
 Requires:       pam
 Requires:       polkit
+Requires:       dbus
 # firewalld/iptables are optional integrations. They must be Suggests, not
 # Recommends: dnf removes Recommends when the package is removed, which
 # would uninstall the system firewall (and can fail the whole transaction).
@@ -47,25 +44,20 @@ Suggests:       firewalld iptables
 A modern, privacy-preserving local-first authentication system using Rust
 PAM modules, systemd system daemons, and low-level communication links.
 
-%package fprintd
-Summary:        Virtual fprintd D-Bus bridge for TapAuth lock screen integration
-BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
-Requires:       dbus
-Conflicts:      fprintd
-Provides:       fprintd
-%{?systemd_requires}
+pam_tapauth.so is wired into sudo, su and polkit-1 only; all other PAM
+stacks — including fingerprint stacks (kde-fingerprint, gdm-fingerprint,
+fingerprint-auth) — stay stock.
 
-%description fprintd
-Provides a virtual net.reactivated.Fprint D-Bus service enabling TapAuth
-authentication on desktop lock screens (GNOME, KDE Plasma) via fingerprint UI.
+Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
+automatically through the built-in virtual fprintd D-Bus service
+(net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
+which resolves to tapauthd. The package deliberately does NOT conflict
+with the real fprintd package — the real daemon simply stays dormant
+while tapauthd claims the bus name. No local fingerprint reader is
+required.
 
-WARNING: Installing this package replaces and conflicts with hardware fprintd.
-Do not install if you rely on a physical fingerprint reader.
-
-NOTE: Installing or upgrading this subpackage sets enable_fprintd_bridge = true
-in /etc/tapauth/config.toml (removing the subpackage sets it back to false).
-To turn the bridge off without removing the package, edit the config manually.
+To keep using a real local fingerprint reader instead, set
+enable_fprintd_bridge = false in /etc/tapauth/config.toml.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -111,62 +103,13 @@ install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapa
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 # Default Configuration
+# The virtual fprintd bridge is enabled by default in the daemon; do not
+# write enable_fprintd_bridge here. Users who want a real local fingerprint
+# reader opt out via this key in config.toml.
 cat << 'EOF' > %{buildroot}%{_sysconfdir}/tapauth/config.toml
 # TapAuth System Configuration
-enable_fprintd_bridge = false
 EOF
 chmod 0644 %{buildroot}%{_sysconfdir}/tapauth/config.toml
-
-%if 0%{?fedora}
-# Authselect Vendor Profile Generation
-mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
-for f in %{_datadir}/authselect/default/local/*; do
-    [ -e "$f" ] || continue
-    filename=$(basename "$f")
-    case "$filename" in
-        system-auth|password-auth|fingerprint-auth|README) continue ;;
-    esac
-    ln -sf "%{_datadir}/authselect/default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
-done
-install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
-install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
-install -m 0644 %{_datadir}/authselect/default/local/fingerprint-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth
-if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth; then
-    sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
-else
-    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
-fi
-sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
-sed -i 's/pam_fprintd\.so/pam_tapauth.so/g' %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth || exit 1
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/fingerprint-auth || exit 1
-printf "TapAuth Local Authentication\n\nThis profile extends the default local profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
-
-mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
-for f in %{_datadir}/authselect/default/sssd/*; do
-    [ -e "$f" ] || continue
-    filename=$(basename "$f")
-    case "$filename" in
-        system-auth|password-auth|fingerprint-auth|README) continue ;;
-    esac
-    ln -sf "%{_datadir}/authselect/default/sssd/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/$filename
-done
-install -m 0644 %{_datadir}/authselect/default/sssd/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
-install -m 0644 %{_datadir}/authselect/default/sssd/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
-install -m 0644 %{_datadir}/authselect/default/sssd/fingerprint-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth
-if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth; then
-    sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
-else
-    sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth
-fi
-sed -i '/^[[:space:]]*auth.*pam_sss.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth
-sed -i 's/pam_fprintd\.so/pam_tapauth.so/g' %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/system-auth || exit 1
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/password-auth || exit 1
-grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/fingerprint-auth || exit 1
-printf "TapAuth SSSD Authentication\n\nThis profile extends the default sssd profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd/README
-%endif
 
 # System Services and Presets
 install -m 0644 systemd/tapauthd.service %{buildroot}%{_unitdir}/tapauthd.service
@@ -189,7 +132,11 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 mkdir -p %{buildroot}%{_datadir}/selinux/packages
 install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/packages/tapauth.cil
 
-# Virtual fprintd D-Bus Bridge files (subpackage)
+# Virtual fprintd D-Bus bridge files (the bridge is enabled by default, so
+# lock screens and greeters work out of the box). The activation file name
+# differs from fprintd's own, so the real fprintd package can stay
+# installed side by side (its daemon stays dormant while tapauthd owns the
+# net.reactivated.Fprint bus name).
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
 install -m 0644 packaging/net.reactivated.Fprint.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
@@ -212,24 +159,54 @@ chown tapauthd:tapauthd %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0755 %{_sysconfdir}/tapauth 2>/dev/null || true
 chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-# If authselect is active with a TapAuth profile, refresh authselect files on upgrade
-if command -v authselect &>/dev/null; then
-    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
-        authselect apply-changes || true
+
+# Patch only the three PAM services in scope: sudo, su, polkit-1. All other
+# stacks — including fingerprint stacks (kde-fingerprint, gdm-fingerprint,
+# fingerprint-auth) — stay stock: they call pam_fprintd.so, which resolves
+# to tapauthd's virtual fprintd D-Bus service (bridge enabled by default).
+# Vendor PAM files live in /usr/lib/pam.d on Fedora; /etc/pam.d overrides
+# them. When no /etc override exists yet, seed one from the vendor file so
+# the inserted line does not replace the vendor stack.
+pam_line="auth        sufficient    pam_tapauth.so"
+for pam_svc in sudo su polkit-1; do
+    pam_file="/etc/pam.d/${pam_svc}"
+    if [ ! -e "$pam_file" ] && [ ! -e "/usr/lib/pam.d/${pam_svc}" ]; then
+        continue
     fi
-fi
+    if [ ! -e "$pam_file" ]; then
+        install -m 0644 "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || continue
+    fi
+    if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+        continue
+    fi
+    if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        continue
+    fi
+    # Keep a pristine copy for restore on removal (only created once so it
+    # stays the unmodified upstream file).
+    if [ ! -f "${pam_file}.tapauth-bak" ]; then
+        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+    fi
+    sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+done
+
 %systemd_post tapauthd.socket
 if [ $1 -eq 1 ]; then
     # Start the socket immediately on initial install so auth requests don't hit a dead socket
     systemctl start tapauthd.socket 2>/dev/null || true
 fi
+if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+fi
+systemctl try-restart tapauthd.service 2>/dev/null || true
 
-echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
-echo "         add your user to the tapauthd-clients group:"
+echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
+echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
+echo "         stay stock: lock screens and greeters integrate through the"
+echo "         built-in virtual fprintd service (no real reader required)."
+echo "TapAuth: To use the configuration GUI, add your user to the"
+echo "         tapauthd-clients group:"
 echo "         sudo usermod -aG tapauthd-clients \$USER"
-echo "TapAuth: To enable system-wide authentication with authselect:"
-echo "         sudo authselect select tapauth with-silent-lastlog with-mkhomedir --backup=pre-tapauth --force"
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
     echo "TapAuth: SELinux is Enforcing. If GDM/KDM lock screen authentication fails due to AVC denial,"
     echo "         allow GDM to connect to the daemon socket via:"
@@ -242,137 +219,37 @@ restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
-%if 0%{?fedora} || 0%{?rhel}
-if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
-    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
-        target_profile="local"
-        [ "$current_profile" = "tapauth-sssd" ] && target_profile="sssd"
-        features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
-        if ! authselect select "$target_profile" $features --backup=tapauth-uninstall --force 2>/dev/null; then
-            echo "WARNING: Failed to automatically revert authselect profile to $target_profile." >&2
-            echo "         Please run 'sudo authselect select $target_profile' manually to avoid PAM issues." >&2
-        fi
-    fi
-fi
-%endif
-
-%postun
-%systemd_postun_with_restart tapauthd.service tapauthd.socket
-if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinuxenabled ] && /usr/sbin/selinuxenabled 2>/dev/null; then
-    semodule -r tapauth 2>/dev/null || true
-fi
-
-%post fprintd
-# Configure on EVERY %post (initial install AND remove-then-reinstall, where
-# $1 is 0): the subpackage being installed means the bridge must be enabled.
-# Otherwise a reinstall after removal leaves enable_fprintd_bridge = false
-# and lock screens silently lose the virtual fprintd service.
-if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-    if grep -Eq "^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge" %{_sysconfdir}/tapauth/config.toml; then
-        sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' %{_sysconfdir}/tapauth/config.toml
-    else
-        echo "enable_fprintd_bridge = true" >> %{_sysconfdir}/tapauth/config.toml
-    fi
-    chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-    chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-fi
-
-# Wire up PAM stacks for desktop lock screen integration (non-authselect files)
-pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
-for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
-    [ -f "$pam_file" ] || continue
-    [ -L "$pam_file" ] && continue
-    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-        # Always refresh the backup: the current file is the upstream version
-        # (it still references pam_fprintd), so a stale backup would restore
-        # outdated content and silently drop upstream changes later.
-        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
-    fi
-done
-
-# If authselect is active with a TapAuth profile, refresh authselect files
-if command -v authselect &>/dev/null; then
-    current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "tapauth" ] || [ "$current_profile" = "tapauth-sssd" ]; then
-        authselect apply-changes || true
-    fi
-fi
-
-# Create gdm-fingerprint if GDM exists but service file does not
-if [ ! -f /etc/pam.d/gdm-fingerprint ] && { [ -f /etc/pam.d/gdm-password ] || [ -d /etc/gdm ]; }; then
-    cat << 'EOF' > /etc/pam.d/gdm-fingerprint
-#%%PAM-1.0
-# Managed by TapAuth
-auth    [success=done default=bad]    pam_tapauth.so
-auth    include                       system-auth
-account include                       system-auth
-session include                       system-auth
-EOF
-    chmod 0644 /etc/pam.d/gdm-fingerprint
-fi
-
-# Create kde-fingerprint if KDE lock screen exists but service file does not
-if [ ! -f /etc/pam.d/kde-fingerprint ] && { [ -f /etc/pam.d/kscreenlocker ] || [ -f /etc/pam.d/kde ] || [ -d /usr/share/plasma ]; }; then
-    cat << 'EOF' > /etc/pam.d/kde-fingerprint
-#%%PAM-1.0
-# Managed by TapAuth
-auth    [success=done default=bad]    pam_tapauth.so
-auth    include                       system-auth
-account include                       system-auth
-session include                       system-auth
-EOF
-    chmod 0644 /etc/pam.d/kde-fingerprint
-fi
-
-# Enable fingerprint authentication in GDM dconf settings
-if [ -d /etc/dconf/db/gdm.d ]; then
-    mkdir -p /etc/dconf/profile
-    if [ ! -f /etc/dconf/profile/gdm ]; then
-        cat << 'EOF' > /etc/dconf/profile/gdm
-user-db:user
-system-db:gdm
-file-db:/usr/share/gdm/greeter-dconf-defaults
-EOF
-    fi
-    cat << 'EOF' > /etc/dconf/db/gdm.d/10-tapauth-fingerprint
-[org/gnome/login-screen]
-enable-fingerprint-authentication=true
-EOF
-    if command -v dconf &>/dev/null; then
-        dconf update 2>/dev/null || true
-    fi
-fi
-
-if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
-    systemctl reload dbus 2>/dev/null || true
-elif command -v dbus-send &>/dev/null; then
-    dbus-send --system --type=method_call --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
-fi
-systemctl try-restart tapauthd.service 2>/dev/null || true
-
-%triggerin fprintd -- gdm, plasma-workspace
-# Re-patch PAM stacks if desktop manager updates overwrite /etc/pam.d/
-pam_decisive="auth    [success=done default=bad]    pam_tapauth.so"
-for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
-    [ -f "$pam_file" ] || continue
-    [ -L "$pam_file" ] && continue
-    if grep -Eq '^[[:space:]]*auth[[:space:]].*pam_fprintd\.so' "$pam_file" 2>/dev/null && ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-        # Always refresh the backup (see %post fprintd for rationale)
-        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        sed -i -E "s|^[[:space:]]*auth[[:space:]].*pam_fprintd\.so.*|$pam_decisive|" "$pam_file" 2>/dev/null || true
-    fi
-done
-
-%preun fprintd
 if [ $1 -eq 0 ]; then
-    # Restore PAM stacks (non-authselect files)
-    for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/kde-fingerprint; do
-        [ -L "$pam_file" ] && continue
-        [ -f "$pam_file" ] || continue
+    # Restore the three PAM services in scope from their pristine backups.
+    for pam_svc in sudo su polkit-1; do
+        pam_file="/etc/pam.d/${pam_svc}"
+        if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+            continue
+        fi
         if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-            # Active PAM stack was modified to remove TapAuth; drop stale backup without clobbering
+            # Stack no longer references TapAuth; drop a stale backup
+            # without clobbering the file.
+            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            continue
+        fi
+        if [ -s "${pam_file}.tapauth-bak" ]; then
+            if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
+                rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+            fi
+        else
+            sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+        fi
+    done
+    # Best-effort cleanup for upgrades from older versions, which patched
+    # fingerprint stacks (kde-fingerprint, gdm-fingerprint,
+    # gdm3-fingerprint, fingerprint-auth) directly. Restore the original
+    # stack when a backup exists; otherwise drop the TapAuth lines (and
+    # synthetic files).
+    for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/fingerprint-auth; do
+        if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+            continue
+        fi
+        if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
             rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
             continue
         fi
@@ -386,6 +263,7 @@ if [ $1 -eq 0 ]; then
             sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
         fi
     done
+    # Remove the GDM dconf override written by older versions.
     if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
         rm -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
         if command -v dconf &>/dev/null; then
@@ -394,17 +272,10 @@ if [ $1 -eq 0 ]; then
     fi
 fi
 
-%postun fprintd
-if [ $1 -eq 0 ]; then
-    if [ -f %{_sysconfdir}/tapauth/config.toml ]; then
-        sed -i -E 's/^[[:space:]]*#?[[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = false/' %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-        chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-        chmod 0644 %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
-    fi
-    if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
-        systemctl reload dbus 2>/dev/null || true
-    fi
-    systemctl try-restart tapauthd.service 2>/dev/null || true
+%postun
+%systemd_postun_with_restart tapauthd.service tapauthd.socket
+if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinuxenabled ] && /usr/sbin/selinuxenabled 2>/dev/null; then
+    semodule -r tapauth 2>/dev/null || true
 fi
 
 %files
@@ -431,13 +302,6 @@ fi
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 %{_datadir}/selinux/packages/tapauth.cil
-%if 0%{?fedora} || 0%{?rhel}
-%{_datadir}/authselect/vendor/tapauth
-%{_datadir}/authselect/vendor/tapauth-sssd
-%endif
-
-%files fprintd
-%license LICENSE
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 

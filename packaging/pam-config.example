@@ -1,13 +1,15 @@
 # TapAuth PAM module configuration example.
-# Add the following line to your PAM service file (e.g. /etc/pam.d/system-auth
-# for login, or /etc/pam.d/sudo for sudo) to enable phone-based authentication:
+# The distribution packages wire pam_tapauth.so into sudo, su and polkit-1
+# automatically (originals kept as <file>.tapauth-bak). To add the line to
+# another service file manually (e.g. /etc/pam.d/<service>):
 #
 #   auth    sufficient    pam_tapauth.so
 #
-# For Fedora systems using authselect, create a custom profile first:
-#   sudo authselect create-profile tapauth-custom -b sssd
-# then edit /etc/authselect/custom/tapauth-custom/system-auth
-# and apply with: sudo authselect select custom/tapauth-custom
+# All fingerprint stacks (kde-fingerprint, gdm-fingerprint, fingerprint-auth)
+# stay stock: they call pam_fprintd.so, which resolves to tapauthd's virtual
+# fprintd D-Bus service (net.reactivated.Fprint). Lock screens and greeters
+# therefore work out of the box — no local fingerprint reader required, and
+# the real fprintd daemon stays dormant (no package conflict).
 #
-# For Arch Linux, manually add the line to /etc/pam.d/system-auth.
-# For Ubuntu/Debian, use: sudo pam-auth-update
+# To keep a real local fingerprint reader instead, set
+# enable_fprintd_bridge = false in /etc/tapauth/config.toml.

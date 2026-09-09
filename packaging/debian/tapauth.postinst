@@ -19,18 +19,61 @@ if [ "$1" = "configure" ]; then
 	mkdir -p /etc/tapauth
 	if [ -z "$2" ] || [ ! -f /etc/tapauth/config.toml ]; then
 		if [ ! -f /etc/tapauth/config.toml ]; then
-			printf "# TapAuth Configuration\nenable_fprintd_bridge = false\n" > /etc/tapauth/config.toml
+			# The virtual fprintd bridge is enabled by default in the daemon;
+			# do not write enable_fprintd_bridge here. Users who want a real
+			# local fingerprint reader opt out via this key in config.toml.
+			printf "# TapAuth Configuration\n" > /etc/tapauth/config.toml
 		fi
 		chmod 0755 /etc/tapauth 2>/dev/null || true
 		chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
 		chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
 		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
 	fi
-	if command -v pam-auth-update >/dev/null 2>&1; then
-		pam-auth-update --package || true
+	# Patch only the three PAM services in scope: sudo, su, polkit-1.
+	# All other stacks — including fingerprint stacks (kde-fingerprint,
+	# gdm-fingerprint, fingerprint-auth) — stay stock: they call
+	# pam_fprintd.so, which resolves to tapauthd's virtual fprintd D-Bus
+	# service (bridge enabled by default).
+	pam_line="auth    sufficient    pam_tapauth.so"
+	for pam_svc in sudo su polkit-1; do
+		pam_file="/etc/pam.d/${pam_svc}"
+		# Ubuntu (like Fedora) ships some vendor PAM files in /usr/lib/pam.d
+		# (e.g. polkit-1); /etc/pam.d overrides them. Seed an override from
+		# the vendor file so the inserted line does not replace the vendor
+		# stack.
+		if [ ! -f "$pam_file" ] && [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+			mkdir -p /etc/pam.d
+			install -m 0644 "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || continue
+		fi
+		if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+			continue
+		fi
+		if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+			continue
+		fi
+		# Keep a pristine copy for restore on removal. Only create it on the
+		# first patch so it stays the unmodified upstream file.
+		if [ ! -f "${pam_file}.tapauth-bak" ]; then
+			cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+		fi
+		if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+			sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+		else
+			sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+		fi
+	done
+	# The virtual fprintd D-Bus files ship in this package; reload D-Bus and
+	# bounce the daemon so the bridge picks up the policy immediately.
+	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+		deb-systemd-invoke reload dbus || true
+		deb-systemd-invoke try-restart tapauthd.service || true
 	fi
-	echo "TapAuth: To use the configuration GUI or enable lock-screen unlock,"
-	echo "         add your user to the tapauthd-clients group:"
+	echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
+	echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
+	echo "         stay stock: lock screens and greeters integrate through the"
+	echo "         built-in virtual fprintd service (no real reader required)."
+	echo "TapAuth: To use the configuration GUI, add your user to the"
+	echo "         tapauthd-clients group:"
 	echo "         sudo usermod -aG tapauthd-clients \$USER"
 	echo "         Then log out and log back in for the change to take effect."
 fi
