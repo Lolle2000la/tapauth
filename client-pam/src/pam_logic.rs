@@ -380,9 +380,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
     // De-duplicate invocations within the same PAM transaction:
-    // If an earlier module in the same PAM stack (e.g. gdm-fingerprint or kde-fingerprint)
-    // already invoked pam_tapauth, subsequent invocations via common-auth or system-auth
-    // must not trigger a second phone tap prompt or secondary timeout.
+    // If an earlier module in the same PAM stack already invoked pam_tapauth,
+    // subsequent invocations via common-auth or system-auth must not trigger
+    // a second phone tap prompt or a second timeout.
     if unsafe { pam_sys::has_already_attempted(pamh) } {
         tracing::info!(
             "TapAuth: Already attempted within this PAM transaction; returning PAM_IGNORE to allow password fallback"
@@ -399,15 +399,6 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     };
     let has_terminal = tty_file.is_some();
     let pam_context = classify_pam_context(&service, has_terminal);
-
-    if pam_context == PamContext::DisplayManagerBypass {
-        tracing::info!(
-            "TapAuth: Service '{}' is a primary display manager. \
-             Skipping to avoid breaking keyring auto-unlock.",
-            service
-        );
-        return pam_sys::PAM_IGNORE;
-    }
 
     // Mark that an authentication attempt is beginning for this PAM transaction
     unsafe {
@@ -442,7 +433,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             Ok(conv) => conv,
             Err(e) => {
                 tracing::error!("Failed to get PAM conversation function: {}", e);
-                return unavail_or_ignore(pam_context);
+                return pam_sys::PAM_IGNORE;
             }
         }
     };
@@ -468,24 +459,19 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut rid_bytes = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut rid_bytes) {
         tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
-        return unavail_or_ignore(pam_context);
+        return pam_sys::PAM_IGNORE;
     }
     let request_id = hex::encode(rid_bytes);
 
     // Use the configured PAM operation timeout for both the local poll deadline
     // and the daemon's authentication timeout, so they stay in sync.
-    // In DualStackSecondary mode, we use full operation timeout since the primary
-    // worker's password box is completely free and interactive.
-    // GUI contexts without a usable conversation (GuiSequential) get the shorter
-    // GUI deadline so password fallback remains close at hand.
+    // The generic GUI fallback (GuiSequential) gets the shorter GUI deadline so
+    // password fallback remains close at hand.
     let effective_timeout_secs = match pam_context {
-        PamContext::DualStackSecondary | PamContext::PolkitThreaded | PamContext::Terminal => {
-            config.pam_operation_timeout_secs
-        }
+        PamContext::PolkitThreaded | PamContext::Terminal => config.pam_operation_timeout_secs,
         PamContext::GuiSequential => config
             .pam_gui_timeout_secs
             .min(config.pam_operation_timeout_secs),
-        PamContext::DisplayManagerBypass => 0,
     };
     let timeout_secs = {
         let secs = effective_timeout_secs;
@@ -507,7 +493,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
             pam_conv.try_error(msgs.cannot_connect());
-            return unavail_or_ignore(pam_context);
+            return pam_sys::PAM_IGNORE;
         }
     };
     if let Err(e) =
@@ -515,10 +501,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     {
         tracing::error!("Failed to send authenticate request: {}", e);
         pam_conv.try_error(msgs.communication_error());
-        return unavail_or_ignore(pam_context);
+        return pam_sys::PAM_IGNORE;
     }
 
-    // GUI contexts without a usable conversation (e.g. DualStackSecondary or GuiSequential):
+    // GUI contexts without a usable conversation (generic fallback):
     // wait for the daemon on this thread and never touch the conversation.
     // Password fallback happens after this returns, when the next PAM module runs its own conversation.
     if !has_terminal && !supports_threaded_conversation {
@@ -528,17 +514,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
                 Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs, pam_context),
-                None => unavail_or_ignore(pam_context),
+                None => pam_sys::PAM_IGNORE,
             },
             ExitReason::Timeout => {
                 // The daemon runs on the same deadline and broadcasts its own
                 // AuthenticationCancel, so no client-side cancel is needed.
                 pam_conv.try_info(msgs.timed_out());
-                if pam_context == PamContext::DualStackSecondary {
-                    pam_sys::PAM_AUTHINFO_UNAVAIL
-                } else {
-                    pam_sys::PAM_IGNORE
-                }
+                pam_sys::PAM_IGNORE
             }
             _ => {
                 // IPC error: the request may still be in flight daemon-side.
@@ -548,7 +530,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     let _ = c.send_cancel("gui-ipc-error", &request_id);
                 }
                 pam_conv.try_error(msgs.communication_error());
-                unavail_or_ignore(pam_context)
+                pam_sys::PAM_IGNORE
             }
         };
     }
@@ -850,14 +832,8 @@ pub enum PamContext {
     PolkitThreaded,
     /// Terminal / TTY: interactive conversation is safe and direct.
     Terminal,
-    /// Dual-stack secondary biometric service (e.g. `kde-fingerprint`, `gdm-fingerprint`, `sddm-fingerprint`).
-    /// Runs concurrently alongside password worker. Uses full `pam_operation_timeout_secs`
-    /// without touching the conversation.
-    DualStackSecondary,
-    /// Primary display manager login (e.g. `sddm`, `gdm`, `gdm-password`, `lightdm`, `plasmalogin`).
-    /// Bypasses TapAuth to preserve keyring/kwallet auto-unlock via password.
-    DisplayManagerBypass,
-    /// Standalone / single-stack GUI context (e.g. legacy `kscreenlocker`).
+    /// Generic fallback for every TTY-less context that is not `polkit-1`
+    /// (lock screens, custom services, temporary test stacks, ...).
     /// Uses shorter `pam_gui_timeout_secs` sequential wait before falling through to password.
     GuiSequential,
 }
@@ -866,77 +842,23 @@ pub enum PamContext {
 ///
 /// Priority order:
 /// 1. Polkit agent (`polkit-1`).
-/// 2. Secondary biometric stacks (`kde-fingerprint`, `gdm-fingerprint`, `sddm-fingerprint`, etc.).
-/// 3. Primary display manager logins (e.g. `sddm`, `gdm`, `gdm-password`, `plasmalogin`).
-/// 4. Interactive terminal (`/dev/tty` available).
-/// 5. Standalone GUI sequential fallback.
+/// 2. Interactive terminal (`/dev/tty` available).
+/// 3. Generic GUI sequential fallback (everything else).
 pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
-    let service_lower = service.to_ascii_lowercase();
-
     // 1. Polkit Agent
-    if service_lower == "polkit-1" {
+    if service.eq_ignore_ascii_case("polkit-1") {
         return PamContext::PolkitThreaded;
     }
 
-    // 2. Dual-Stack Secondary Biometric Services (Lockscreen workers)
-    const DUAL_STACK_SECONDARY: &[&str] = &[
-        "kde-fingerprint",
-        "kde-smartcard",
-        "kde-face",
-        "kde-u2f",
-        "gdm-fingerprint",
-        "gdm-smartcard",
-        "gdm3-fingerprint",
-        "gdm3-smartcard",
-        "sddm-fingerprint",
-    ];
-    if DUAL_STACK_SECONDARY.iter().any(|s| service_lower == *s) {
-        return PamContext::DualStackSecondary;
-    }
-
-    // 3. Primary Display Manager Logins (Exact matches & primary prefixes)
-    // Note: gdm-password is intentionally included here so the password worker is 100% responsive
-    const DM_SERVICES: &[&str] = &[
-        "sddm",
-        "gdm",
-        "gdm-password",
-        "gdm3",
-        "lightdm",
-        "lxdm",
-        "slim",
-        "xdm",
-        "kdm",
-        "greetd",
-        "ly",
-        "nodm",
-        "entrance",
-        "plasmalogin",
-    ];
-    let is_dm = DM_SERVICES.iter().any(|p| {
-        service_lower == *p
-            || (service_lower.starts_with(p)
-                && service_lower.as_bytes().get(p.len()) == Some(&b'-'))
-    });
-    if is_dm {
-        return PamContext::DisplayManagerBypass;
-    }
-
-    // 4. Interactive Terminal
+    // 2. Interactive Terminal
     if has_terminal {
         return PamContext::Terminal;
     }
 
-    // 5. Standalone / Single-Stack GUI
+    // 3. Generic fallback: every other TTY-less service (lock screens, test
+    // stacks, anything unlisted) waits sequentially for the daemon without
+    // driving the conversation, then falls through to password.
     PamContext::GuiSequential
-}
-
-/// Helper returning `PAM_AUTHINFO_UNAVAIL` in dual-stack secondary mode, or `PAM_IGNORE` otherwise.
-fn unavail_or_ignore(context: PamContext) -> c_int {
-    if context == PamContext::DualStackSecondary {
-        pam_sys::PAM_AUTHINFO_UNAVAIL
-    } else {
-        pam_sys::PAM_IGNORE
-    }
 }
 
 /// Map daemon IPC response outcome to the appropriate PAM return code based on context.
@@ -960,12 +882,7 @@ fn map_pam_outcome(
         }
         shared::ipc::pb::PamOutcome::Timeout => {
             tracing::info!("Authentication timed out for user: {}", username);
-            if context == PamContext::DualStackSecondary {
-                pam_conv.try_info(msgs.timed_out());
-                pam_sys::PAM_AUTHINFO_UNAVAIL
-            } else {
-                pam_sys::PAM_IGNORE
-            }
+            pam_sys::PAM_IGNORE
         }
         shared::ipc::pb::PamOutcome::Ignore => {
             tracing::info!(
@@ -973,11 +890,7 @@ fn map_pam_outcome(
                 username,
                 context
             );
-            if context == PamContext::DualStackSecondary {
-                pam_sys::PAM_AUTHINFO_UNAVAIL
-            } else {
-                pam_sys::PAM_IGNORE
-            }
+            pam_sys::PAM_IGNORE
         }
         shared::ipc::pb::PamOutcome::Error => {
             tracing::error!(
@@ -986,11 +899,7 @@ fn map_pam_outcome(
                 resp.detail
             );
             pam_conv.try_error(&msgs.error(&resp.detail));
-            if context == PamContext::DualStackSecondary {
-                pam_sys::PAM_AUTHINFO_UNAVAIL
-            } else {
-                pam_sys::PAM_IGNORE
-            }
+            pam_sys::PAM_IGNORE
         }
     }
 }
@@ -1009,67 +918,7 @@ mod tests {
 
     #[test]
     fn test_classify_pam_context() {
-        // Dual-stack secondary
-        assert_eq!(
-            classify_pam_context("kde-fingerprint", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("gdm-fingerprint", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("gdm3-fingerprint", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("gdm3-smartcard", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("sddm-fingerprint", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("KDE-FINGERPRINT", false),
-            PamContext::DualStackSecondary
-        );
-        assert_eq!(
-            classify_pam_context("kde-fingerprint", true),
-            PamContext::DualStackSecondary
-        );
-
-        // Display managers
-        assert_eq!(
-            classify_pam_context("sddm", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("sddm-autologin", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("gdm", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("gdm-password", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("gdm3", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("lightdm", false),
-            PamContext::DisplayManagerBypass
-        );
-        assert_eq!(
-            classify_pam_context("plasmalogin", false),
-            PamContext::DisplayManagerBypass
-        );
-
-        // Polkit
+        // Polkit (threaded flow), regardless of TTY availability or case
         assert_eq!(
             classify_pam_context("polkit-1", false),
             PamContext::PolkitThreaded
@@ -1078,13 +927,19 @@ mod tests {
             classify_pam_context("polkit-1", true),
             PamContext::PolkitThreaded
         );
+        assert_eq!(
+            classify_pam_context("POLKIT-1", false),
+            PamContext::PolkitThreaded
+        );
 
-        // Terminal
+        // TTY interactive
         assert_eq!(classify_pam_context("sudo", true), PamContext::Terminal);
         assert_eq!(classify_pam_context("login", true), PamContext::Terminal);
         assert_eq!(classify_pam_context("su", true), PamContext::Terminal);
 
-        // Sequential GUI (single-stack lockscreens)
+        // Generic fallback: any TTY-less service that is not polkit-1.
+        // Formerly special-cased names (legacy lockscreens, biometric
+        // secondaries, display managers) all land here now.
         assert_eq!(
             classify_pam_context("kde", false),
             PamContext::GuiSequential
@@ -1097,6 +952,112 @@ mod tests {
             classify_pam_context("hyprlock", false),
             PamContext::GuiSequential
         );
+        assert_eq!(
+            classify_pam_context("kde-fingerprint", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("gdm-fingerprint", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("sddm-fingerprint", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("sddm", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("gdm-password", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("lightdm", false),
+            PamContext::GuiSequential
+        );
+        // Unlisted / temporary service names (e.g. the E2E suite's pamtester
+        // stacks) also use the generic fallback.
+        assert_eq!(
+            classify_pam_context("tapauth-test-e2e", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(
+            classify_pam_context("tapauth-mixed-stack", false),
+            PamContext::GuiSequential
+        );
+        assert_eq!(classify_pam_context("", false), PamContext::GuiSequential);
+    }
+
+    #[test]
+    fn test_generic_fallback_outcomes_are_unchanged() {
+        let conv = pam_sys::PamConversation::dummy();
+        let msgs = pam_messages::PamMessages::new("en");
+        let context = PamContext::GuiSequential;
+
+        let success_resp = shared::ipc::pb::PamAuthenticateResponse {
+            outcome: shared::ipc::pb::PamOutcome::Success as i32,
+            detail: "Success".to_string(),
+            challenge: vec![],
+        };
+        assert_eq!(
+            map_pam_outcome(&success_resp, "testuser", &conv, &msgs, context),
+            pam_sys::PAM_SUCCESS
+        );
+
+        let denied_resp = shared::ipc::pb::PamAuthenticateResponse {
+            outcome: shared::ipc::pb::PamOutcome::Denied as i32,
+            detail: "Denied".to_string(),
+            challenge: vec![],
+        };
+        assert_eq!(
+            map_pam_outcome(&denied_resp, "testuser", &conv, &msgs, context),
+            pam_sys::PAM_PERM_DENIED
+        );
+
+        let non_success_resp =
+            |outcome: shared::ipc::pb::PamOutcome| shared::ipc::pb::PamAuthenticateResponse {
+                outcome: outcome as i32,
+                detail: "detail".to_string(),
+                challenge: vec![],
+            };
+
+        // Timeout, Ignore, and Error all fall through so the PAM stack's
+        // password module gets a chance.
+        for outcome in [
+            shared::ipc::pb::PamOutcome::Timeout,
+            shared::ipc::pb::PamOutcome::Ignore,
+            shared::ipc::pb::PamOutcome::Error,
+        ] {
+            assert_eq!(
+                map_pam_outcome(
+                    &non_success_resp(outcome),
+                    "testuser",
+                    &conv,
+                    &msgs,
+                    context
+                ),
+                pam_sys::PAM_IGNORE
+            );
+        }
+
+        // The polkit threaded context maps outcomes identically.
+        for outcome in [
+            shared::ipc::pb::PamOutcome::Timeout,
+            shared::ipc::pb::PamOutcome::Ignore,
+            shared::ipc::pb::PamOutcome::Error,
+        ] {
+            assert_eq!(
+                map_pam_outcome(
+                    &non_success_resp(outcome),
+                    "testuser",
+                    &conv,
+                    &msgs,
+                    PamContext::PolkitThreaded
+                ),
+                pam_sys::PAM_IGNORE
+            );
+        }
     }
 }
 
@@ -1402,63 +1363,6 @@ mod gui_loop_tests {
 
         assert_eq!(reason, ExitReason::IpcError);
         assert!(auth_response.is_none());
-    }
-
-    #[test]
-    fn test_dual_stack_secondary_outcomes_are_decisive() {
-        let conv = pam_sys::PamConversation::dummy();
-        let msgs = pam_messages::PamMessages::new("en");
-        let context = PamContext::DualStackSecondary;
-
-        let success_resp = shared::ipc::pb::PamAuthenticateResponse {
-            outcome: shared::ipc::pb::PamOutcome::Success as i32,
-            detail: "Success".to_string(),
-            challenge: vec![],
-        };
-        assert_eq!(
-            map_pam_outcome(&success_resp, "testuser", &conv, &msgs, context),
-            pam_sys::PAM_SUCCESS
-        );
-
-        let denied_resp = shared::ipc::pb::PamAuthenticateResponse {
-            outcome: shared::ipc::pb::PamOutcome::Denied as i32,
-            detail: "Denied".to_string(),
-            challenge: vec![],
-        };
-        assert_eq!(
-            map_pam_outcome(&denied_resp, "testuser", &conv, &msgs, context),
-            pam_sys::PAM_PERM_DENIED
-        );
-
-        let timeout_resp = shared::ipc::pb::PamAuthenticateResponse {
-            outcome: shared::ipc::pb::PamOutcome::Timeout as i32,
-            detail: "Timeout".to_string(),
-            challenge: vec![],
-        };
-        assert_eq!(
-            map_pam_outcome(&timeout_resp, "testuser", &conv, &msgs, context),
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        );
-
-        let ignore_resp = shared::ipc::pb::PamAuthenticateResponse {
-            outcome: shared::ipc::pb::PamOutcome::Ignore as i32,
-            detail: "Ignore".to_string(),
-            challenge: vec![],
-        };
-        assert_eq!(
-            map_pam_outcome(&ignore_resp, "testuser", &conv, &msgs, context),
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        );
-
-        let error_resp = shared::ipc::pb::PamAuthenticateResponse {
-            outcome: shared::ipc::pb::PamOutcome::Error as i32,
-            detail: "Error".to_string(),
-            challenge: vec![],
-        };
-        assert_eq!(
-            map_pam_outcome(&error_resp, "testuser", &conv, &msgs, context),
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        );
     }
 
     #[test]
