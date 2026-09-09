@@ -414,8 +414,9 @@ jobs:
 
       - name: Install Host Ubuntu Debian Package
         run: |
-          sudo apt-get install -y /tmp/deb-build/tapauth_*.deb /tmp/deb-build/tapauth-fprintd_*.deb
-          dpkg -l tapauth tapauth-fprintd
+          # tapauth-fprintd was merged into the base package; only tapauth ships.
+          sudo apt-get install -y /tmp/deb-build/tapauth_*.deb
+          dpkg -l tapauth
           id tapauthd
           getent group tapauthd-clients
           systemctl is-enabled tapauthd.socket
@@ -478,6 +479,6 @@ jobs:
       - name: Verify Package Removal and Purge
         if: always()
         run: |
-          sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
+          sudo apt-get purge -y tapauth 2>/dev/null || true
           sudo rm -rf pkg-fedora pkg-fedora-test pkg-arch pkg-arch-test /tmp/deb-build /tmp/deb-test-build apks packages
           test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]

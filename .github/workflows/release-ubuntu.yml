@@ -85,7 +85,9 @@ jobs:
           DEB_VER="${{ steps.version_vars.outputs.DEB_VERSION }}"
           rm -rf debian
           cp -r packaging/debian debian
-          chmod +x debian/rules debian/tapauth.postinst debian/tapauth.postrm debian/tapauth-fprintd.postinst debian/tapauth-fprintd.prerm debian/tapauth-fprintd.postrm
+          # tapauth-fprintd.{postinst,prerm,postrm} were dropped with the subpackage;
+          # tapauth.prerm handles PAM restore for the three-file scope.
+          chmod +x debian/rules debian/tapauth.postinst debian/tapauth.postrm debian/tapauth.prerm
 
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))

@@ -37,7 +37,7 @@ echo "=================================================="
 echo " [1/3] Running E2E against installed Ubuntu (.deb) package"
 echo "=================================================="
 sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
-sudo apt-get purge -y tapauth-fprintd tapauth 2>/dev/null || true
+sudo apt-get purge -y tapauth 2>/dev/null || true
 
 # Pass emulator auth token to containers so adb emu can authenticate to the console
 AUTH_TOKEN_MOUNT=()

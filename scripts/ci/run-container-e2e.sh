@@ -18,7 +18,9 @@ echo " Starting TapAuth E2E Test on Distro: $DISTRO"
 echo " Package directory: $PACKAGE_DIR"
 echo "=================================================="
 
-# Set up a dummy kde-fingerprint to verify PAM stack repair by tapauth-fprintd
+# Set up a dummy kde-fingerprint to verify it stays STOCK (fingerprint stacks
+# are no longer patched; they resolve pam_fprintd.so to the daemon's built-in
+# virtual fprintd D-Bus service).
 mkdir -p /etc/pam.d
 cat << 'EOF' > /etc/pam.d/kde-fingerprint
 #%PAM-1.0
@@ -31,7 +33,7 @@ case "$DISTRO" in
         dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus dbus-tools procps-ng iproute android-tools systemd bluez bluez-deprecated
 
         echo "==> Installing pre-built Fedora RPM packages..."
-        dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm "$PACKAGE_DIR"/tapauth-fprintd-[0-9]*.rpm
+        dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm
         ;;
 
     arch)
@@ -42,7 +44,7 @@ case "$DISTRO" in
         gcc -o /usr/bin/pamtester "$WORKSPACE_DIR/scripts/ci/pamtester.c" -lpam -lpam_misc
 
         echo "==> Installing pre-built Arch Linux packages..."
-        pacman -U --noconfirm "$PACKAGE_DIR"/tapauth-[0-9]*.pkg.tar.zst "$PACKAGE_DIR"/tapauth-fprintd-[0-9]*.pkg.tar.zst
+        pacman -U --noconfirm "$PACKAGE_DIR"/tapauth-[0-9]*.pkg.tar.zst
         ;;
 
     *)
@@ -51,9 +53,10 @@ case "$DISTRO" in
         ;;
 esac
 
-echo "==> Verifying PAM fingerprint stack was patched by tapauth-fprintd on $DISTRO..."
-grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
-! grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+echo "==> Verifying the fingerprint stack stayed STOCK on $DISTRO (virtual fprintd is built in)..."
+grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
+! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 
 echo "==> Verifying system users, permissions, and directories..."
 id tapauthd
@@ -86,16 +89,17 @@ export TAPAUTH_E2E_DAEMON_MODE=dev
 echo "==> Verifying clean package uninstallation on $DISTRO..."
 case "$DISTRO" in
     fedora)
-        rpm -e tapauth-fprintd tapauth
+        rpm -e tapauth
         ;;
     arch)
-        pacman -R --noconfirm tapauth-fprintd tapauth
+        pacman -R --noconfirm tapauth
         ;;
 esac
 
-echo "==> Verifying PAM fingerprint stack was cleanly restored after simultaneous removal on $DISTRO..."
+echo "==> Verifying the fingerprint stack is still untouched after removal on $DISTRO..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ON DISTRO: $DISTRO"
