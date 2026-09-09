@@ -138,12 +138,21 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### PAM Module (`client-pam`)
 - Built as `libclient_pam.so`, installed to distro-specific PAM dir as `pam_tapauth.so`
+- **Shipping scope: only `sudo`, `su`, `polkit-1`** (never `login`, never fingerprint stacks — lock screens/greeters integrate via the virtual fprintd service instead)
 - Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
 - Wraps all IPC messages in `IpcEnvelope`, unwraps `PamResponse` from envelope
 - Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
+- Context classification is 3 rules (`classify_pam_context`): `polkit-1` → threaded flow, openable `/dev/tty` → interactive (Enter skips to password), everything else → generic sequential fallback
 - **GUI (no-TTY) contexts use one of two flows**:
   - `polkit-1`: password is collected on a background thread while the main thread waits for the phone (polkit-agent-helper-1's conversation is a plain fd fed by a separate process — thread-safe)
-  - All other TTY-less services (e.g. KDE lock screen `kscreenlocker_worker`): the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread for `pam_gui_timeout_secs` (default 30s, clamped to `pam_operation_timeout_secs`), then falls through to password. Driving the conversation from a thread there deadlocks the host's event loop (see `run_sequential_event_loop` docs in `pam_logic.rs`)
+  - All other TTY-less services: the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread for `pam_gui_timeout_secs` (default 30s, clamped to `pam_operation_timeout_secs`), then falls through to password. Driving the conversation from a thread there deadlocks the host's event loop (see `run_sequential_event_loop` docs in `pam_logic.rs`)
+
+### Virtual fprintd Integration (lock screens & greeters)
+- `tapauthd` implements a virtual fprintd device (`tapauthd/src/fprintd.rs`) and **claims the `net.reactivated.Fprint` bus name at startup by default** (`enable_fprintd_bridge = true`) — D-Bus activation can never start real fprintd while the name is owned
+- Stock vendor fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, Fedora `fingerprint-auth`) call `pam_fprintd.so` unmodified, which resolves to the virtual device — **no PAM lines needed for lock screens/greeters**
+- There is deliberately **no `Conflicts: fprintd`**: `pam_fprintd.so` is shipped by fprintd itself and must stay installed
+- `enable_fprintd_bridge = false` in `config.toml` releases the bus name for users who want their real local fingerprint reader
+- Enrollment is unsupported; `ListEnrolledFingers` returns a synthetic print so KDE's KCM displays one
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`
@@ -178,7 +187,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### Replay & DoS Protections
 - **Two replay checks**: nonce cache (primary, 120s TTL) + timestamp window (secondary, 60s).
-- **fprintd-priority dedup**: the fprintd bridge is the priority channel — when a fprintd verify starts it takes over the outstanding same-user broadcast (in-flight PAM requesters get Ignore and fall through; no re-broadcast, no second phone buzz); PAM requests arriving during a fprintd flight are Ignored; PAM-PAM duplicates are deduped within 1s. Outcomes are never mirrored.
+- **One-flight-per-user dedup (channel-aware, no priority/preemption)**: while a flight is active for a user — PAM duplicate within 1s of a PAM flight → immediate `Ignore` (password fall-through); PAM during a fprintd flight (any age) → `Ignore`; fprintd `VerifyStart` during any flight → immediate `verify-no-match` (no broadcast, no hang). After the flight ends, everything broadcasts fresh. **Outcomes are never mirrored/joined** (a latecomer must never ride another flight's grant). Stale flights purge after 300s.
 - **Pre-authentication DoS**: temporal IDs are pre-computed per 60s window into a hash set for O(1) checks before crypto.
 - **Post-authentication rate limiting**: escalating backoff (1s → 2s → 4s → max 5s) per Client public key.
 
@@ -204,7 +213,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
-- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
+- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport), `enable_fprintd_bridge` (default true, virtual fprintd lockscreen/greeter integration; set false to keep a real local fingerprint reader). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
 
 ## Docker Dev Environment
 ```bash
