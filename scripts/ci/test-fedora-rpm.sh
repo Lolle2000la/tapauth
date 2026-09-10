@@ -30,7 +30,7 @@ echo "==> Testing Fedora RPM packaging for TapAuth version: ${PKG_VER}..."
 if [ "$SKIP_BUILD" = false ]; then
     echo "==> 1. Installing Fedora build dependencies and rpmlint..."
     dnf install -y --setopt=install_weak_deps=False \
-        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel dbus-devel systemd-rpm-macros sed tar git findutils selinux-policy policycoreutils
+        rpm-build rpmlint rust cargo protobuf-compiler clang pam-devel systemd-devel dbus-devel systemd-rpm-macros sed tar git findutils selinux-policy policycoreutils
 
     echo "==> 2. Setting up RPM build directory..."
     mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -66,7 +66,9 @@ if [ "$SKIP_BUILD" = false ]; then
 
     echo "==> 7. Running rpmlint on generated RPM packages (with the shipped rpmlintrc; errors are fatal)..."
     rpmlint --ignore-unused-rpmlintrc -r "${WORKSPACE_DIR}/packaging/tapauth.rpmlintrc" /root/rpmbuild/RPMS/*/*.rpm
-    PKG_DIR="/root/rpmbuild/RPMS/*"
+    # NOTE: must be a literal directory (not a glob) — several call sites
+    # quote "${PKG_DIR}" and a quoted glob would never expand.
+    PKG_DIR="$(dirname "$(find /root/rpmbuild/RPMS -name "tapauth-${PKG_VER}-*.rpm" | head -1)")"
 else
     dnf install -y --setopt=install_weak_deps=False sed grep rpmlint || true
     PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-fedora}"
