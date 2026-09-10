@@ -40,12 +40,6 @@ use std::path::Path;
 #[cfg(feature = "fallback-socket")]
 const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 
-#[derive(thiserror::Error, Debug)]
-pub enum DaemonError {
-    #[error("io: {0}")]
-    Io(#[from] io::Error),
-}
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -419,7 +413,7 @@ async fn handle_conn(
     mut stream: UnixStream,
     daemon: Arc<DaemonState>,
     server_state: Arc<ServerState>,
-) -> Result<(), DaemonError> {
+) -> Result<(), io::Error> {
     let (caller_pid, caller_uid) = {
         let raw_fd = stream.as_raw_fd();
         let fd_arg = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -430,8 +424,7 @@ async fn handle_conn(
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "peer cred unavailable",
-                )
-                .into());
+                ));
             }
         }
     };
@@ -447,7 +440,7 @@ async fn handle_conn(
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 tracing::warn!("IPC read timeout - client failed to send request within 3 seconds");
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC read timeout").into());
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC read timeout"));
             }
         };
 
@@ -660,7 +653,7 @@ async fn handle_pam_cancel(
     }
 }
 
-async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {
+async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), io::Error> {
     let mut buf = BytesMut::with_capacity(256);
 
     // Encode message to temporary buffer first to get length
@@ -680,27 +673,20 @@ async fn write_response<M: Message>(
     stream: &mut UnixStream,
     msg: &M,
     client_label: &str,
-) -> Result<(), DaemonError> {
+) -> Result<(), io::Error> {
     match write_framed(stream, msg).await {
         Ok(()) => Ok(()),
-        Err(e) => {
-            if let DaemonError::Io(ref ioe) = e {
-                match ioe.kind() {
-                    ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::UnexpectedEof => {
-                        tracing::debug!(
-                            "{} client disconnected before response could be sent: {}",
-                            client_label,
-                            ioe
-                        );
-                        return Ok(());
-                    }
-                    _ => {}
-                }
+        Err(e) => match e.kind() {
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof => {
+                tracing::debug!(
+                    "{} client disconnected before response could be sent: {}",
+                    client_label,
+                    e
+                );
+                Ok(())
             }
-            Err(e)
-        }
+            _ => Err(e),
+        },
     }
 }
 
@@ -716,14 +702,17 @@ fn envelope_admin_response(response: ipc::AdminResponse) -> ipc::IpcEnvelope {
     }
 }
 
-async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
+async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, io::Error> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
     if len > (10 * 1024 * 1024) {
         // 10 MiB sanity limit
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large").into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
 
     let mut data = vec![0u8; len];

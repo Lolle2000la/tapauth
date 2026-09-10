@@ -36,10 +36,12 @@ pub enum AuthHandlerError {
     Denied,
     #[error("Authentication explicitly denied by user")]
     ExplicitDenial,
-    #[error("No paired devices")]
-    NoPairedDevices,
+    /// Only constructed on the BLE-gated paths (`spawn_auth_tasks`, `transport/ble.rs`).
+    #[cfg(feature = "ble")]
     #[error("Transport disabled by configuration")]
     TransportDisabled,
+    /// Only constructed on the BLE-gated paths (`spawn_auth_tasks`, `transport/ble.rs`).
+    #[cfg(feature = "ble")]
     #[error("BLE error: {0}")]
     BleError(String),
 }
@@ -272,10 +274,7 @@ impl AuthSession {
             state,
             username,
             challenge,
-            transports: TransportsEnabled {
-                network: true,
-                ble: cfg!(feature = "ble"),
-            },
+            transports: TransportsEnabled::from_config(),
             cancel_registry: None,
             request_id: None,
         })
@@ -297,9 +296,9 @@ impl AuthSession {
             request_id: self.request_id.clone(),
         };
 
-        // Read transport toggles fresh from the TOML config so that changes
-        // made via the GUI/admin IPC take effect without a daemon restart.
-        self.transports = TransportsEnabled::from_config();
+        // Check the transport toggles read from the TOML config when the
+        // session was created, so changes made via the GUI/admin IPC take
+        // effect without a daemon restart.
         if !self.transports.any() {
             tracing::info!("All transports (BLE and Local Network) are disabled by configuration");
             return Ok(ipc::PamAuthenticateResponse {
