@@ -628,7 +628,6 @@ async fn run_verify(
     let auth_fut = session.handle_authenticate(
         None,
         Some(req_id.clone()),
-        Some("fprintd-verify".to_string()),
         cancel_registry.clone(),
         internal_cancel_rx,
     );

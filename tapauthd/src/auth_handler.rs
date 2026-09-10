@@ -250,99 +250,6 @@ impl Drop for CancelGuard {
     }
 }
 
-/// Query systemd-logind over system D-Bus to check if the target user has an active
-/// graphical session that is currently locked (`LockedHint == true`).
-async fn is_user_session_locked(username: &str) -> bool {
-    let probe = async {
-        let connection = match zbus::Connection::system().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Failed to connect to system D-Bus for logind query: {}", e);
-                return false;
-            }
-        };
-
-        let user_name = username.to_string();
-        let name_for_task = user_name.clone();
-        let target_uid =
-            match tokio::task::spawn_blocking(move || nix::unistd::User::from_name(&name_for_task))
-                .await
-            {
-                Ok(Ok(Some(u))) => u.uid.as_raw(),
-                _ => {
-                    tracing::warn!(
-                        "Failed to resolve UID for user '{}' during logind probe",
-                        user_name
-                    );
-                    return false;
-                }
-            };
-
-        // Query org.freedesktop.login1.Manager at /org/freedesktop/login1
-        let reply = match connection
-            .call_method(
-                Some("org.freedesktop.login1"),
-                "/org/freedesktop/login1",
-                Some("org.freedesktop.login1.Manager"),
-                "ListSessions",
-                &(),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("logind ListSessions call failed: {}", e);
-                return false;
-            }
-        };
-
-        let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
-            match reply.body().deserialize() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize ListSessions reply: {}", e);
-                    return false;
-                }
-            };
-
-        for (_, uid, _, _, session_path) in sessions {
-            if uid == target_uid {
-                if let Ok(reply) = connection
-                    .call_method(
-                        Some("org.freedesktop.login1"),
-                        session_path.as_str(),
-                        Some("org.freedesktop.DBus.Properties"),
-                        "Get",
-                        &("org.freedesktop.login1.Session", "LockedHint"),
-                    )
-                    .await
-                {
-                    if let Ok(val) = reply.body().deserialize::<zbus::zvariant::OwnedValue>() {
-                        if let Ok(locked) = bool::try_from(val) {
-                            if locked {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    };
-
-    match tokio::time::timeout(Duration::from_secs(2), probe).await {
-        Ok(res) => res,
-        Err(_) => {
-            tracing::warn!(
-                "logind session lock check timed out for user '{}'",
-                username
-            );
-            false
-        }
-    }
-}
-
 /// Per-request authentication session
 pub struct AuthSession {
     state: Arc<DaemonState>,
@@ -379,7 +286,6 @@ impl AuthSession {
         mut self,
         timeout_seconds: Option<u32>,
         request_id: Option<String>,
-        service_name: Option<String>,
         cancel_registry: CancelRegistry,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<ipc::PamAuthenticateResponse, AuthHandlerError> {
@@ -390,30 +296,6 @@ impl AuthSession {
             registry: self.cancel_registry.clone(),
             request_id: self.request_id.clone(),
         };
-
-        // If the request originates from GDM's biometric stack (gdm-fingerprint, gdm3-fingerprint, etc.),
-        // check whether the user already has an active session with LockedHint == true.
-        // If not (initial login screen), return Ignore immediately so the greeter falls through to
-        // password collection, populating PAM_AUTHTOK and unlocking GNOME Keyring.
-        if let Some(ref service) = service_name {
-            if (service == "gdm-fingerprint"
-                || service == "gdm-smartcard"
-                || service == "gdm3-fingerprint"
-                || service == "gdm3-smartcard")
-                && !is_user_session_locked(&self.username).await
-            {
-                tracing::info!(
-                    "GDM initial login screen detected for user '{}' — skipping biometric auth to preserve keyring auto-unlock",
-                    self.username
-                );
-                return Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Ignore as i32,
-                    detail: "GDM initial login screen — password required for keyring auto-unlock"
-                        .to_string(),
-                    challenge: self.challenge.to_vec(),
-                });
-            }
-        }
 
         // Read transport toggles fresh from the TOML config so that changes
         // made via the GUI/admin IPC take effect without a daemon restart.

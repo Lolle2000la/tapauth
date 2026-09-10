@@ -602,7 +602,6 @@ async fn handle_pam_authenticate(
         Ok(sess) => Box::pin(sess.handle_authenticate(
             timeout,
             Some(req.request_id.clone()),
-            Some(req.service_name.clone()),
             server_state.cancel_registry.clone(),
             cancel_rx,
         )),
