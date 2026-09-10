@@ -254,16 +254,21 @@ restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
 %if 0%{?fedora} || 0%{?rhel}
-if [ $1 -eq 0 ] && command -v authselect >/dev/null 2>&1; then
-    # Upgrade-path migration from TapAuth <= 0.10.x: those releases shipped
+if { [ "$1" -eq 0 ] || [ "$1" -eq 1 ]; } && command -v authselect >/dev/null 2>&1; then
+    # Upgrade migration from TapAuth <= 0.10.x: those releases shipped
     # authselect vendor profiles (vendor/tapauth, vendor/tapauth-sssd) and
     # could leave the system selected into one of them. This package no
     # longer ships authselect profiles, so the selection would dangle (and
     # the authselect-generated /etc/pam.d/system-auth and password-auth
     # would keep referencing the now-removed pam_tapauth.so module).
-    # Restore the stock profile the vendor profile was derived from, then
-    # let rpm drop the leftover profile directory. No-op when the system
-    # was never selected into a TapAuth profile.
+    # Restore the stock profile the vendor profile was derived from on BOTH
+    # erase ($1 -eq 0) and upgrade ($1 -eq 1: the new package's %post runs
+    # after this %preun and re-patches the three in-scope PAM services, so
+    # the rollback must happen first — mirroring the Debian maintainer
+    # scripts, which regenerate the pam-auth-update stacks on upgrade too).
+    # The profile checks below keep this a no-op for systems that were
+    # never selected into a TapAuth profile. rpm then drops the leftover
+    # profile directory.
     current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs || true)
     case "$current_profile" in
         vendor/tapauth|custom/tapauth|tapauth)

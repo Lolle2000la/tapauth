@@ -221,16 +221,50 @@ test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
 echo "==> 9c. Upgrade-path test from a published v0.10.0-style package (authselect era)..."
 # v0.10.0 shipped authselect vendor profiles (vendor/tapauth, vendor/
 # tapauth-sssd) that users selected with `authselect select`. This package
-# ships no profiles; removal must roll the selection back to the stock
-# profile and leave no tapauth line in the generated stacks, or
+# ships no profiles; the selection would dangle, so the %preun scriptlet
+# must roll it back to the stock profile on BOTH upgrade ($1 -eq 1) and
+# erase ($1 -eq 0) and leave no tapauth line in the generated stacks, or
 # system-auth/password-auth would keep referencing the removed module.
 if command -v authselect >/dev/null 2>&1; then
-    rm -rf /etc/authselect/custom/tapauth
-    mkdir -p /etc/authselect/custom/tapauth
-    cp -a /usr/share/authselect/default/local/. /etc/authselect/custom/tapauth/
-    sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' /etc/authselect/custom/tapauth/system-auth
-    authselect select custom/tapauth --force
-    grep "pam_tapauth.so" /etc/pam.d/system-auth
+    simulate_v010_authselect_state() {
+        rm -rf /etc/authselect/custom/tapauth
+        mkdir -p /etc/authselect/custom/tapauth
+        cp -a /usr/share/authselect/default/local/. /etc/authselect/custom/tapauth/
+        sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' /etc/authselect/custom/tapauth/system-auth
+        authselect select custom/tapauth --force
+        grep "pam_tapauth.so" /etc/pam.d/system-auth
+    }
+    assert_tapauth_profile_rolled_back() {
+        local phase="$1"
+        local CURRENT_PROFILE
+        CURRENT_PROFILE=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs || true)
+        echo "authselect profile after ${phase}: ${CURRENT_PROFILE:-<none>}"
+        if [ "$CURRENT_PROFILE" = "custom/tapauth" ] || [ "$CURRENT_PROFILE" = "vendor/tapauth" ]; then
+            echo "ERROR: ${phase} did not roll back the TapAuth authselect profile"
+            exit 1
+        fi
+        if [ -d /etc/authselect/custom/tapauth ]; then
+            echo "ERROR: leftover /etc/authselect/custom/tapauth after ${phase}"
+            exit 1
+        fi
+        if [ -f /etc/pam.d/system-auth ] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
+            echo "ERROR: generated system-auth still references pam_tapauth.so after ${phase} (missing-module lockout)"
+            exit 1
+        fi
+    }
+
+    echo "==> 9c-b. Testing that an UPGRADE (rpm -Uvh, %preun with \$1 -eq 1) rolls the authselect selection back..."
+    simulate_v010_authselect_state
+    echo "Simulated v0.10.0 authselect state in place; upgrading the package now must roll back."
+    rpm -Uvh --replacepkgs "${PKG_DIR}"/tapauth-${PKG_VER}-*.rpm
+    assert_tapauth_profile_rolled_back "upgrade"
+    # The new package's %post must have re-patched the three in-scope services.
+    for pam_svc in sudo su polkit-1; do
+        grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}"
+    done
+
+    echo "Re-simulating the v0.10.0 authselect state for the erase (step 10) path..."
+    simulate_v010_authselect_state
     echo "Simulated v0.10.0 authselect state in place; removing the package now (step 10) must roll back."
 fi
 
@@ -238,20 +272,7 @@ echo "==> 10. Testing complete removal of the base package..."
 rpm -e tapauth
 
 if command -v authselect >/dev/null 2>&1 && [ -d /etc/authselect ]; then
-    CURRENT_PROFILE=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs || true)
-    echo "authselect profile after removal: ${CURRENT_PROFILE:-<none>}"
-    if [ "$CURRENT_PROFILE" = "custom/tapauth" ] || [ "$CURRENT_PROFILE" = "vendor/tapauth" ]; then
-        echo "ERROR: removal did not roll back the TapAuth authselect profile"
-        exit 1
-    fi
-    if [ -d /etc/authselect/custom/tapauth ]; then
-        echo "ERROR: leftover /etc/authselect/custom/tapauth after removal"
-        exit 1
-    fi
-    if [ -f /etc/pam.d/system-auth ] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth; then
-        echo "ERROR: generated system-auth still references pam_tapauth.so after removal (missing-module lockout)"
-        exit 1
-    fi
+    assert_tapauth_profile_rolled_back "removal"
 fi
 
 echo "Verifying the three PAM services were restored upon removal..."
