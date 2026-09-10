@@ -194,7 +194,7 @@ echo "Verifying fprintd's activation file survived the tapauth install untouched
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
 case "$FPRINT_BIN" in
-    /usr/libexec/fprintd) : ;;
+    /usr/libexec/fprintd|/usr/lib/fprintd) : ;;
     *) echo "ERROR: fprintd activation Exec changed after tapauth install: $FPRINT_BIN"; exit 1 ;;
 esac
 
@@ -272,7 +272,7 @@ echo "Verifying the real fprintd package survived the full tapauth lifecycle unt
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
 case "$FPRINT_BIN" in
-    /usr/libexec/fprintd) : ;;
+    /usr/libexec/fprintd|/usr/lib/fprintd) : ;;
     *) echo "ERROR: fprintd activation Exec changed after tapauth removal: $FPRINT_BIN"; exit 1 ;;
 esac
 echo "Verifying tapauth's renamed D-Bus files were removed with the package..."
