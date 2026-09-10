@@ -381,24 +381,14 @@ jobs:
 
       - name: Arrange Distro Packages
         run: |
+          # Both the production and the test/e2e artifacts are uploaded
+          # unconditionally by the build jobs (all four are in `needs:`, and
+          # download-artifact fails on a missing artifact), so every artifact
+          # directory exists here — no fallback branches.
           mkdir -p pkg-fedora pkg-arch /tmp/deb-build
-          if find packages -type f -name "*.deb" | grep -q "pkg-ubuntu-test"; then
-            find packages -type f -path "*pkg-ubuntu-test*/*.deb" -exec cp {} /tmp/deb-build/ \;
-          else
-            find packages -type f -name "*.deb" -exec cp {} /tmp/deb-build/ \;
-          fi
-
-          if find packages -type f -name "*.rpm" | grep -q "pkg-fedora-test"; then
-            find packages -type f -path "*pkg-fedora-test*/*.rpm" -exec cp {} pkg-fedora/ \;
-          else
-            find packages -type f -name "*.rpm" -exec cp {} pkg-fedora/ \;
-          fi
-
-          if find packages -type f -name "*.pkg.tar.zst" | grep -q "pkg-arch-test"; then
-            find packages -type f -path "*pkg-arch-test*/*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
-          else
-            find packages -type f -name "*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
-          fi
+          find packages -type f -path "*pkg-ubuntu-test*/*.deb" -exec cp {} /tmp/deb-build/ \;
+          find packages -type f -path "*pkg-fedora-test*/*.rpm" -exec cp {} pkg-fedora/ \;
+          find packages -type f -path "*pkg-arch-test*/*.pkg.tar.zst" -exec cp {} pkg-arch/ \;
           ls -la /tmp/deb-build/ pkg-fedora/ pkg-arch/
 
       - name: Install Host E2E Dependencies & Bumble
@@ -479,6 +469,7 @@ jobs:
       - name: Verify Package Removal and Purge
         if: always()
         run: |
-          sudo apt-get purge -y tapauth 2>/dev/null || true
+          # The e2e run itself (scripts/ci/run-all-e2e.sh) already purges the
+          # tapauth package; this step only asserts the leftover state.
           sudo rm -rf pkg-fedora pkg-fedora-test pkg-arch pkg-arch-test /tmp/deb-build /tmp/deb-test-build apks packages
           test ! -d /etc/tapauth || [ -z "$(ls -A /etc/tapauth 2>/dev/null)" ]
