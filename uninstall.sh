@@ -174,7 +174,8 @@ remove_systemd_units_and_daemon() {
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         show_file_removal "/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf" "Virtual fprintd D-Bus policy"
-        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation service"
+        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service" "Virtual fprintd D-Bus activation service (renamed, content-guarded)"
+        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation service (legacy pre-rename name, content-guarded)"
         show_file_removal "/etc/dconf/db/gdm.d/10-tapauth-fingerprint" "GDM dconf override"
         show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override (legacy)"
         
@@ -236,14 +237,23 @@ remove_systemd_units_and_daemon() {
         fi
     done
 
-    local fprint_srv="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
-    if [[ -f "$fprint_srv" ]]; then
-        if grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
-            print_info "Removing virtual fprintd D-Bus service activation file"
+    # Remove TapAuth's D-Bus activation files. The RENAMED
+    # net.reactivated.Fprint.tapauth.service is what current releases ship;
+    # the un-renamed net.reactivated.Fprint.service is the filename of
+    # pre-rename installs (and of the real fprintd package). BOTH are
+    # content-guarded (Exec must reference tapauthd) so a hypothetical
+    # identically-named foreign file — above all real fprintd's own — is
+    # never deleted, mirroring the .tapauth.conf handling above.
+    for fprint_srv in \
+        /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service \
+        /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+    do
+        if [[ -f "$fprint_srv" ]] && grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
+            print_info "Removing virtual fprintd D-Bus service activation file ($fprint_srv)"
             rm -f "$fprint_srv"
             removed_fprint_dbus=true
         fi
-    fi
+    done
 
     if [[ "$removed_fprint_dbus" == true ]]; then
         if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
