@@ -2,47 +2,13 @@
 # Builds TapAuth Debian packages (.deb) into /tmp/deb-build/
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Shared workspace detection, argument parsing and dev-feature guard
+PKG_COMMON_DISTRO="Debian"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_pkg-common.sh"
 
-PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
-CARGO_FEATURES="${CARGO_FEATURES:-}"
+pkg_common_parse_args "$@"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/deb-build}"
-ALLOW_TEST_FEATURES=false
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --features)
-            CARGO_FEATURES="$2"
-            shift 2
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        --allow-test-features)
-            ALLOW_TEST_FEATURES=true
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1"
-            exit 1
-            ;;
-    esac
-done
-
-# Guard: reject dev/test features in production package builds unless explicitly allowed
-DEV_FEATURE_PATTERNS=("dev-" "fallback-socket")
-if [ "$ALLOW_TEST_FEATURES" = false ] && [ -n "$CARGO_FEATURES" ]; then
-    for pattern in "${DEV_FEATURE_PATTERNS[@]}"; do
-        if echo "$CARGO_FEATURES" | grep -q "$pattern"; then
-            echo "❌ ERROR: Cannot build production Debian package with test feature: '$CARGO_FEATURES'"
-            echo "   Production packages must never contain dev overrides."
-            echo "   Pass --allow-test-features if this is an explicit test build."
-            exit 1
-        fi
-    done
-fi
+enforce_prod_feature_guard "Debian"
 
 export CARGO_FEATURES
 
