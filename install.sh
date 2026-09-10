@@ -103,9 +103,11 @@ print_header() {
 # Dry-run helper functions
 show_file_creation() {
     local file="$1"
-    local description="$2"
+    local description="${2:-}"
     echo -e "${BLUE}[CREATE]${NC} $file"
-    [[ -n "$description" ]] && echo "  → $description"
+    if [[ -n "$description" ]]; then
+        echo "  → $description"
+    fi
 }
 
 show_file_copy() {
@@ -116,9 +118,11 @@ show_file_copy() {
 
 show_command() {
     local cmd="$1"
-    local description="$2"
+    local description="${2:-}"
     echo -e "${BLUE}[EXEC]${NC} $cmd"
-    [[ -n "$description" ]] && echo "  → $description"
+    if [[ -n "$description" ]]; then
+        echo "  → $description"
+    fi
 }
 
 show_pam_diff() {

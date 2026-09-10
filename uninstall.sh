@@ -14,10 +14,6 @@ NC='\033[0m' # No Color
 
 # Default values
 INTERACTIVE=true
-# All components are always removed
-REMOVE_PAM=true
-REMOVE_CONFIG_GUI=true
-REMOVE_DAEMON=true
 # PAM configurations are always removed to prevent inconsistent state
 # Only user data removal is configurable
 REMOVE_USER_DATA=false
@@ -74,10 +70,12 @@ print_header() {
 # Dry-run helper functions
 show_file_removal() {
     local file="$1"
-    local description="$2"
+    local description="${2:-}"
     if [[ -f "$file" ]] || [[ -d "$file" ]]; then
         echo -e "${RED}[REMOVE]${NC} $file"
-        [[ -n "$description" ]] && echo "  → $description"
+        if [[ -n "$description" ]]; then
+            echo "  → $description"
+        fi
     else
         echo -e "${YELLOW}[SKIP]${NC} $file (does not exist)"
     fi
@@ -85,9 +83,11 @@ show_file_removal() {
 
 show_command() {
     local cmd="$1"
-    local description="$2"
+    local description="${2:-}"
     echo -e "${BLUE}[EXEC]${NC} $cmd"
-    [[ -n "$description" ]] && echo "  → $description"
+    if [[ -n "$description" ]]; then
+        echo "  → $description"
+    fi
 }
 
 show_pam_restore_diff() {
@@ -396,114 +396,57 @@ check_root() {
 remove_pam_config() {
     print_header "Removing PAM Configuration"
     print_info "Cleaning up all TapAuth PAM configurations..."
-    
+
+    # Plain stacks: remove the pam_tapauth.so line only. The synthetic /
+    # special-case stacks (gdm-fingerprint, gdm3-fingerprint, kde-fingerprint,
+    # fingerprint-auth) are handled separately below.
+    local pam_cleanup_files=(
+        /etc/pam.d/login
+        /etc/pam.d/su
+        /etc/pam.d/su-l
+        /etc/pam.d/sudo
+        /etc/pam.d/polkit-1
+        /usr/lib/pam.d/polkit-1
+        /etc/pam.d/system-auth
+        /etc/pam.d/gdm-password
+        /etc/pam.d/gdm
+        /etc/pam.d/sddm
+        /etc/pam.d/lightdm
+        /etc/pam.d/kde
+        /etc/pam.d/kscreenlocker
+        /etc/pam.d/kde-smartcard
+    )
+
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove TapAuth from all PAM configurations"
         echo ""
-        
-        show_pam_restore_diff "/etc/pam.d/login"
-        show_pam_restore_diff "/etc/pam.d/su"
-        show_pam_restore_diff "/etc/pam.d/su-l"
-        show_pam_restore_diff "/etc/pam.d/sudo"
-        
-        # Check both possible polkit locations
-        if [[ -f /etc/pam.d/polkit-1 ]]; then
-            show_pam_restore_diff "/etc/pam.d/polkit-1"
-        elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-            show_pam_restore_diff "/usr/lib/pam.d/polkit-1"
-        fi
-        
-        if [[ -f /etc/pam.d/system-auth ]]; then
-            show_pam_restore_diff "/etc/pam.d/system-auth"
-        fi
-        
-        if [[ -f /etc/pam.d/gdm-password ]]; then
-            show_pam_restore_diff "/etc/pam.d/gdm-password"
-        elif [[ -f /etc/pam.d/gdm ]]; then
-            show_pam_restore_diff "/etc/pam.d/gdm"
-        fi
-        
-        if [[ -f /etc/pam.d/sddm ]]; then
-            show_pam_restore_diff "/etc/pam.d/sddm"
-        fi
-        
-        if [[ -f /etc/pam.d/lightdm ]]; then
-            show_pam_restore_diff "/etc/pam.d/lightdm"
-        fi
-        
-        # KDE uses multiple PAM files
-        if [[ -f /etc/pam.d/kde ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde"
-        fi
-        if [[ -f /etc/pam.d/kscreenlocker ]]; then
-            show_pam_restore_diff "/etc/pam.d/kscreenlocker"
-        fi
-        if [[ -f /etc/pam.d/kde-fingerprint ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde-fingerprint"
-        fi
-        if [[ -f /etc/pam.d/kde-smartcard ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde-smartcard"
-        fi
-        if [[ -f /etc/pam.d/fingerprint-auth ]]; then
-            show_pam_restore_diff "/etc/pam.d/fingerprint-auth"
-        fi
+
+        for pam_file in "${pam_cleanup_files[@]}"; do
+            if [[ -f "$pam_file" ]]; then
+                show_pam_restore_diff "$pam_file"
+            fi
+        done
+
+        # Synthetic/special stacks (may be deleted or restored from backup)
+        for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint \
+                        /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+            if [[ -f "$pam_file" ]]; then
+                show_pam_restore_diff "$pam_file"
+            fi
+        done
         return
     fi
-    
+
     # Always remove from all PAM files to prevent inconsistent state
-    
-    # Remove from login
-    if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-        print_info "Removing TapAuth from login PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
-    fi
+    for pam_file in "${pam_cleanup_files[@]}"; do
+        if [[ -f "$pam_file" ]] && grep -q "pam_tapauth.so" "$pam_file" 2>/dev/null; then
+            print_info "Removing TapAuth from PAM configuration ($pam_file)"
+            sed -i '/pam_tapauth\.so/d' "$pam_file"
+        fi
+    done
 
-    # Remove from su
-    if [[ -f /etc/pam.d/su ]] && grep -q "pam_tapauth.so" /etc/pam.d/su 2>/dev/null; then
-        print_info "Removing TapAuth from su PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su
-    fi
-
-    # Remove from su-l
-    if [[ -f /etc/pam.d/su-l ]] && grep -q "pam_tapauth.so" /etc/pam.d/su-l 2>/dev/null; then
-        print_info "Removing TapAuth from su-l PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su-l
-    fi
-    
-    # Remove from sudo
-    if [[ -f /etc/pam.d/sudo ]] && grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-        print_info "Removing TapAuth from sudo PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sudo
-    fi
-    
-    # Remove from polkit (check both locations)
-    if [[ -f /etc/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /etc/pam.d/polkit-1 2>/dev/null; then
-        print_info "Removing TapAuth from polkit PAM configuration (/etc/pam.d/polkit-1)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/polkit-1
-    fi
-    
-    if [[ -f /usr/lib/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /usr/lib/pam.d/polkit-1 2>/dev/null; then
-        print_info "Removing TapAuth from polkit PAM configuration (/usr/lib/pam.d/polkit-1)"
-        sed -i '/pam_tapauth\.so/d' /usr/lib/pam.d/polkit-1
-    fi
-    
-    # Remove from system-auth
-    if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
-        print_info "Removing TapAuth from system-auth PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/system-auth
-    fi
-    
-    # Remove from GDM
-    if [[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null; then
-        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm-password)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-password
-    fi
-    
-    if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
-        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
-    fi
-
+    # Synthetic GDM fingerprint stacks: remove outright when they are ours,
+    # otherwise strip the TapAuth line.
     for gdm_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint; do
         if [[ -f "$gdm_file" ]]; then
             if grep -q "Managed by TapAuth" "$gdm_file" 2>/dev/null; then
@@ -515,30 +458,9 @@ remove_pam_config() {
             fi
         fi
     done
-    
-    # Remove from SDDM
-    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-        print_info "Removing TapAuth from SDDM PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
-    fi
-    
-    # Remove from LightDM
-    if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
-        print_info "Removing TapAuth from LightDM PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
-    fi
-    
-    # Remove from KDE (multiple PAM files)
-    if [[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null; then
-        print_info "Removing TapAuth from KDE PAM configuration (/etc/pam.d/kde)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde
-    fi
-    
-    if [[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null; then
-        print_info "Removing TapAuth from KDE screen locker PAM configuration (/etc/pam.d/kscreenlocker)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
-    fi
-    
+
+    # Synthetic KDE fingerprint stack: remove outright when it is ours,
+    # otherwise strip the TapAuth line.
     if [[ -f /etc/pam.d/kde-fingerprint ]]; then
         if grep -q "Managed by TapAuth" /etc/pam.d/kde-fingerprint 2>/dev/null; then
             print_info "Removing synthetic KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
@@ -547,11 +469,6 @@ remove_pam_config() {
             print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
             sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
         fi
-    fi
-    
-    if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
-        print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
     fi
 
     # Best-effort legacy cleanup: older versions patched the Fedora
