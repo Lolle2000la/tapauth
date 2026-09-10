@@ -1294,8 +1294,11 @@ create_summary() {
     echo ""
     print_info "Lock screens & greeters: integrated automatically via the built-in"
     print_info "virtual fprintd service (all fingerprint stacks stay stock; no local"
-    print_info "fingerprint reader required). No D-Bus activation file is shipped,"
-    print_info "so the real fprintd package coexists without conflicts."
+    print_info "fingerprint reader required). A RENAMED D-Bus activation file"
+    print_info "(net.reactivated.Fprint.tapauth.service) is shipped and inert for"
+    print_info "activation — both dbus-daemon and dbus-broker only use files named"
+    print_info "exactly after the bus name — so the real fprintd package coexists"
+    print_info "without conflicts."
     
     echo ""
     echo "Features enabled:"

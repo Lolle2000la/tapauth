@@ -61,10 +61,11 @@ cd server-android && ./gradlew connectedE2eAndroidTest
 
 The e2e app build (only; `BuildConfig.E2E_TESTING` is false in debug/release)
 exposes deterministic grant control for the E2E suite: the exported receiver
-handles `ACTION_DEV_GRANT` (sign + approve every pending request) and
+handles `ACTION_DEV_GRANT` (sign + approve every pending request),
+`ACTION_DEV_DENY` (explicit denial of every pending request) and
 `ACTION_DEV_SUPPRESS_AUTO_APPROVE` / `ACTION_DEV_RESTORE_AUTO_APPROVE` (toggle
 the 1s auto-approve fallback so a request can stay pending while the app is
-alive). `scripts/ci/emulator-bio-helper.sh` wraps these as the `grant`,
+alive). `scripts/ci/emulator-bio-helper.sh` wraps these as the `grant`, `deny`,
 `suppress-auto-approve` and `restore-auto-approve` subcommands.
 
 ## Feature Flags (critical)

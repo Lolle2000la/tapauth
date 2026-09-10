@@ -26,10 +26,15 @@ Description: Local smartphone-based authentication framework
  automatically through the built-in virtual fprintd D-Bus service
  (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
  which resolves to tapauthd. The package deliberately does NOT conflict
- with the real fprintd packages (fprintd, libpam-fprintd) and ships no
- D-Bus activation file for the bus name, so nothing can collide with
- fprintd's own activation file: tapauthd is a systemd-managed daemon
- that owns the bus name while it runs, and real fprintd stays dormant.
+ with the real fprintd packages (fprintd, libpam-fprintd). It ships a
+ renamed D-Bus activation file
+ (net.reactivated.Fprint.tapauth.service) so nothing can collide with
+ fprintd's own activation file: both dbus-daemon and dbus-broker only
+ use activation files named exactly after the bus name, so the renamed
+ file is an inert, collision-free placeholder and real fprintd keeps
+ full control of on-demand activation. tapauthd is a systemd-managed
+ daemon that owns the bus name while it runs (and restarts on failure),
+ so the virtual bridge needs no activation support from the file.
  No local fingerprint reader is required.
  .
  To keep using a real local fingerprint reader instead, install fprintd

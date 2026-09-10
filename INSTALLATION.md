@@ -125,7 +125,7 @@ Before installing, you can preview all changes that will be made:
 ./install.sh --dry-run --yes
 ```
 
-This shows detailed diffs of PAM configuration changes, files that will be created, and commands that will be executed. See [DRY_RUN_EXAMPLES.md](DRY_RUN_EXAMPLES.md) for more information.
+This shows detailed diffs of PAM configuration changes, files that will be created, and commands that will be executed.
 
 **No root access required for dry-run mode.**
 
@@ -354,7 +354,7 @@ This is a **safe, non-disruptive** configuration. Your system remains accessible
 - TapAuth is uninstalled (the package scriptlets restore the original stacks from `.tapauth-bak` copies)
 - Network connectivity is unavailable
 
-**For detailed information about PAM integration, security, and troubleshooting, see [PAM_INTEGRATION.md](PAM_INTEGRATION.md).**
+**For detailed information about PAM integration, security, and troubleshooting, see the design document [Desktop & Lockscreen Integration Plan](docs/design-documents/desktop-and-lockscreen-integration-plan.md), the distro packaging scriptlets in `packaging/` (the source of truth for the PAM wiring), and [SELINUX.md](docs/SELINUX.md) for SELinux troubleshooting.**
 
 ### When Do Changes Take Effect?
 
