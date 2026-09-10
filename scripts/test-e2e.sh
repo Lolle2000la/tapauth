@@ -812,6 +812,13 @@ sleep 3
 # All sleeps below that separate sequential same-user auth phases exist to
 # keep them safely outside that dedup window.
 
+# Wait out the 1s same-user dedup window left by the previous auth phase
+# ($1 = previous phase label for the call-site comment; $2 = sleep seconds,
+# default 3).
+settle_for_dedup() {
+    sleep "${2:-3}"
+}
+
 PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
     PAM_TESTABLE="true"
@@ -853,7 +860,7 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     echo ""
     echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2b).
-    sleep 3
+    settle_for_dedup "Phase 2b"
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
 
     set +e
@@ -910,7 +917,7 @@ echo "╚═══════════════════════�
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2e).
-    sleep 3
+    settle_for_dedup "Phase 2e"
 
     # Timing note: on images where real enrollment is unavailable (API 36+;
     # emulator-bio-helper.sh setup falls back to leaving no biometrics
@@ -978,7 +985,7 @@ echo "╚═══════════════════════�
 if [ "$CAPTURE_OK" = "1" ]; then
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2c).
-    sleep 3
+    settle_for_dedup "Phase 2c"
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     TAMPER_REQUEST_ID="e2e-tamper-$$"
@@ -1042,7 +1049,7 @@ echo "╚═══════════════════════�
 
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2d).
-sleep 3
+settle_for_dedup "Phase 2d"
 
 LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 DISCONNECT_REQ_ID="e2e-disconnect-$$"
@@ -1063,30 +1070,30 @@ assert_log_since "$LOG_BASE" "IPC client disconnected while authentication" \
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
 sleep 1
 
-# Step 6g: Phase 2g - Dual-Stack Secondary PAM stack
+# Step 6g: Phase 2g - Decisive-Stack Secondary PAM stack
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  PHASE 2g: Dual-Stack Secondary PAM Return Code & Behavior    ║"
+echo "║  PHASE 2g: Decisive-Stack Secondary PAM Return Code & Behavior ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 if [ "$PAM_TESTABLE" = "true" ]; then
-    DUAL_STACK_SERVICE="kde-fingerprint"
-    DUAL_STACK_PAM_PATH="/etc/pam.d/${DUAL_STACK_SERVICE}"
-    
+    DECISIVE_STACK_SERVICE="tapauth-decisive"
+    DECISIVE_STACK_PAM_PATH="/etc/pam.d/${DECISIVE_STACK_SERVICE}"
+
     # Backup pre-existing PAM file if present
     ORIG_PAM_BACKUP=""
-    if [ -f "$DUAL_STACK_PAM_PATH" ]; then
-        ORIG_PAM_BACKUP=$(cat "$DUAL_STACK_PAM_PATH")
+    if [ -f "$DECISIVE_STACK_PAM_PATH" ]; then
+        ORIG_PAM_BACKUP=$(cat "$DECISIVE_STACK_PAM_PATH")
     fi
 
-    restore_dual_stack_pam() {
+    restore_decisive_stack_pam() {
         if [ -n "$ORIG_PAM_BACKUP" ]; then
-            printf "%s\n" "$ORIG_PAM_BACKUP" > "$DUAL_STACK_PAM_PATH"
+            printf "%s\n" "$ORIG_PAM_BACKUP" > "$DECISIVE_STACK_PAM_PATH"
         else
-            rm -f "$DUAL_STACK_PAM_PATH"
+            rm -f "$DECISIVE_STACK_PAM_PATH"
         fi
     }
-    trap restore_dual_stack_pam EXIT INT TERM
+    trap restore_decisive_stack_pam EXIT INT TERM
 
     # Distro-aware include
     INCLUDES="account include common-account\npassword include common-password\nsession include common-session"
@@ -1095,23 +1102,23 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     elif [ -f /etc/pam.d/system-auth ]; then
         INCLUDES="account include system-auth\npassword include system-auth\nsession include system-auth"
     fi
-    
-    echo "==> Configuring temporary decisive PAM service for ${DUAL_STACK_SERVICE}..."
-    printf "#%%PAM-1.0\nauth        [success=done default=bad]    %s\n%b\n" "$PAM_LIB" "$INCLUDES" > "$DUAL_STACK_PAM_PATH"
 
-    echo "==> Testing successful dual-stack authentication via pamtester..."
+    echo "==> Configuring temporary decisive PAM service for ${DECISIVE_STACK_SERVICE}..."
+    printf "#%%PAM-1.0\nauth        [success=done default=bad]    %s\n%b\n" "$PAM_LIB" "$INCLUDES" > "$DECISIVE_STACK_PAM_PATH"
+
+    echo "==> Testing successful decisive-stack authentication via pamtester..."
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
 
-    if "${PAM_ENV[@]}" pamtester -v "$DUAL_STACK_SERVICE" "$TEST_USER" authenticate < <(sleep 30); then
-        echo "✅ Dual-stack secondary service returned PAM_SUCCESS on phone approval."
+    if "${PAM_ENV[@]}" pamtester -v "$DECISIVE_STACK_SERVICE" "$TEST_USER" authenticate < <(sleep 30); then
+        echo "✅ Decisive-stack secondary service returned PAM_SUCCESS on phone approval."
     else
-        echo "❌ ERROR: expected PAM_SUCCESS on dual-stack authentication."
-        restore_dual_stack_pam
+        echo "❌ ERROR: expected PAM_SUCCESS on decisive-stack authentication."
+        restore_decisive_stack_pam
         exit 1
     fi
 
-    restore_dual_stack_pam
+    restore_decisive_stack_pam
     # Reset exit trap back to general cleanup if cleanup() is defined
     trap cleanup EXIT INT TERM
 else
@@ -1138,7 +1145,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # authenticate as TEST_USER. The pam_unix fall-through needs a locally
     # known password, so temporarily set TEST_USER's password and restore the
     # original shadow hash on every exit path (same pattern as Phase 2g's
-    # restore_dual_stack_pam).
+    # restore_decisive_stack_pam).
     restore_test_user_password() {
         usermod -p "$ROOT_SHADOW_HASH" "$TEST_USER" 2>/dev/null || true
     }
@@ -1161,7 +1168,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # itself would be answered with Ignore.
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" suppress-auto-approve "$APP_PKG"
-    sleep 3
+    settle_for_dedup "Phase 2g"
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 
@@ -1312,8 +1319,8 @@ if command -v dbus-send >/dev/null 2>&1; then
             if [ -f "$SCRIPT_DIR/ci/test-fprint-verify.py" ] && python3 -c "from gi.repository import Gio" >/dev/null 2>&1; then
                 echo "==> Testing Claim -> VerifyStart -> VerifyStatus('verify-match') -> Release lifecycle..."
                 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
-                # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2g).
-                sleep 2.5
+                # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auths: Phase 2i).
+                settle_for_dedup "Phase 2i" 2.5
                 if python3 "$SCRIPT_DIR/ci/test-fprint-verify.py" "$DEV_PATH" "$TEST_USER" 15 > "${TEST_DIR}/fprint_verify.log" 2>&1; then
                     cat "${TEST_DIR}/fprint_verify.log"
                     echo "✅ Virtual fprintd full Claim -> VerifyStart -> VerifyStatus('verify-match') cycle verified!"
@@ -1348,8 +1355,8 @@ echo "╔═══════════════════════�
 echo "║  PHASE 3: Bluetooth Low Energy (BLE) Authentication           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth above).
-sleep 3
+# Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2h fprintd verify).
+settle_for_dedup "Phase 2h"
 
 # Check if system D-Bus and BlueZ are accessible (e.g., host environment with BlueZ).
 # In container environments, host D-Bus rejects cross-container Unix socket connections
@@ -1393,7 +1400,7 @@ echo "║  PHASE 4: Parallel Discovery Race (UDP + BLE Simultaneous)    ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 3).
-sleep 3
+settle_for_dedup "Phase 3"
 
 if [ "$BLE_AVAILABLE" = false ]; then
     echo "ℹ️  SKIPPED: System D-Bus / BlueZ not accessible in this environment (verified on host)."
@@ -1421,7 +1428,7 @@ echo "╚═══════════════════════�
 # Stop auto-grant watcher
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 4).
-sleep 3
+settle_for_dedup "Phase 4"
 
 echo "==> Setting transport config: UDP enabled, BLE disabled..."
 "$CLI_BIN" set-transports --ble false --network true
@@ -1467,7 +1474,7 @@ echo "║  PHASE 5b: Authentication Timeout Verification                ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 5).
-sleep 2
+settle_for_dedup "Phase 5" 2
 # Stop the Android app so that no server responds to the broadcast, verifying daemon timeout handling
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
 sleep 1
@@ -1504,7 +1511,7 @@ else
 fi
 
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 5b).
-sleep 3
+settle_for_dedup "Phase 5b"
 echo "==> Verifying authentication returns PAM_IGNORE when no devices are configured..."
 UNPAIRED_AUTH_LOG="${TEST_DIR}/unpaired-cli.log"
 "$CLI_BIN" pam-auth "$TEST_USER" 5 > "$UNPAIRED_AUTH_LOG" 2>&1 || true
