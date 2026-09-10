@@ -27,6 +27,9 @@ done
 PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
 echo "==> Testing Fedora RPM packaging for TapAuth version: ${PKG_VER}..."
 
+# Shared virtual-fprintd D-Bus coexistence verification helpers
+source "${WORKSPACE_DIR}/scripts/ci/verify-fprintd-coexistence.sh"
+
 if [ "$SKIP_BUILD" = false ]; then
     echo "==> 1. Installing Fedora build dependencies and rpmlint..."
     dnf install -y --setopt=install_weak_deps=False \
@@ -81,12 +84,9 @@ if ! rpm -q fprintd >/dev/null 2>&1; then
     dnf install -y fprintd
 fi
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
-echo "Real fprintd activation Exec: $FPRINT_BIN"
-case "$FPRINT_BIN" in
-    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
-    *) echo "ERROR: fprintd activation Exec unexpected: $FPRINT_BIN"; exit 1 ;;
-esac
+assert_fprintd_exec_matches /usr/share/dbus-1/system-services/net.reactivated.Fprint.service \
+    "fprintd activation Exec unexpected before tapauth install" \
+    /usr/libexec/fprintd /usr/lib/fprintd/fprintd /usr/sbin/fprintd
 dnf install -y "${PKG_DIR}"/tapauth-${PKG_VER}-*.rpm
 
 echo "Checking directory and config file ownership and permissions..."
@@ -126,54 +126,19 @@ test ! -e /usr/share/authselect/vendor/tapauth
 test ! -e /usr/share/authselect/vendor/tapauth-sssd
 
 echo "Verifying the virtual fprintd D-Bus policy + renamed activation file ship in the base package..."
-test -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
-# The activation file is RENAMED (net.reactivated.Fprint.tapauth.service) so
-# it can never collide with real fprintd's own
-# net.reactivated.Fprint.service. Container-verified semantics: BOTH
-# dbus-daemon (1.12.20 & 1.14.10) and dbus-broker (36 — Fedora's default
-# broker) require the service file's filename to match the bus name, so the
-# renamed file is an inert, collision-free placeholder — neither broker
-# uses it for activation; real fprintd keeps full control of on-demand
-# activation. The file still ships (never zero activation files) for
-# forward compatibility.
-test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
-grep -q '^Name=net.reactivated.Fprint$' /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
-grep -q '^Exec=/usr/bin/tapauthd$' /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
-grep -q '^User=tapauthd$' /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
-grep -q '^SystemdService=tapauthd.service$' /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
-# tapauth must never own (or overwrite) fprintd's exact activation filename.
-# The un-renamed file may legitimately exist on disk because the
-# coexistence test installs the real fprintd package.
-if rpm -ql tapauth | grep -q "system-services/net.reactivated.Fprint.service$"; then
-    echo "ERROR: tapauth ships the un-renamed net.reactivated.Fprint.service (collision with fprintd)"
-    exit 1
-fi
-if [ -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service ]; then
-    FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
-    case "$FPRINT_BIN" in
-        *tapauthd*) echo "ERROR: net.reactivated.Fprint.service points at tapauthd (tapauth must never own that file)"; exit 1 ;;
-    esac
-fi
+verify_fprintd_coexistence rpm
 
 echo "Verifying coexistence with the real fprintd package (installs first, no conflicts)..."
 if ! rpm -q fprintd >/dev/null 2>&1; then
     dnf install -y fprintd
 fi
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
-echo "Real fprintd activation Exec: $FPRINT_BIN"
-case "$FPRINT_BIN" in
-    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
-    *) echo "ERROR: fprintd activation Exec unexpected: $FPRINT_BIN"; exit 1 ;;
-esac
 
 echo "Verifying fprintd's activation file survived the tapauth install untouched..."
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
-case "$FPRINT_BIN" in
-    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
-    *) echo "ERROR: fprintd activation Exec changed after tapauth install: $FPRINT_BIN"; exit 1 ;;
-esac
+assert_fprintd_exec_matches /usr/share/dbus-1/system-services/net.reactivated.Fprint.service \
+    "fprintd activation Exec changed after tapauth install" \
+    /usr/libexec/fprintd /usr/lib/fprintd/fprintd /usr/sbin/fprintd
 
 echo "Verifying PAM scope: only sudo, su and polkit-1 are patched..."
 for pam_svc in sudo su polkit-1; do
@@ -289,11 +254,9 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 
 echo "Verifying the real fprintd package survived the full tapauth lifecycle untouched..."
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-FPRINT_BIN=$(grep -m1 '^Exec=' /usr/share/dbus-1/system-services/net.reactivated.Fprint.service | sed 's/^Exec=//;s/ .*//')
-case "$FPRINT_BIN" in
-    /usr/libexec/fprintd|/usr/lib/fprintd/fprintd|/usr/sbin/fprintd) : ;;
-    *) echo "ERROR: fprintd activation Exec changed after tapauth removal: $FPRINT_BIN"; exit 1 ;;
-esac
+assert_fprintd_exec_matches /usr/share/dbus-1/system-services/net.reactivated.Fprint.service \
+    "fprintd activation Exec changed after tapauth removal" \
+    /usr/libexec/fprintd /usr/lib/fprintd/fprintd /usr/sbin/fprintd
 echo "Verifying tapauth's renamed D-Bus files were removed with the package..."
 test ! -e /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 test ! -e /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
