@@ -131,7 +131,6 @@ install -m 0644 systemd/polkit-agent-helper@.service.d/tapauth.conf %{buildroot}
 # Structural Declarations
 install -m 0644 packaging/sysusers.conf %{buildroot}%{_sysusersdir}/tapauth.conf
 install -m 0644 packaging/tmpfiles.conf %{buildroot}%{_tmpfilesdir}/tapauth.conf
-install -m 0644 packaging/pam-config.example %{buildroot}%{_datadir}/doc/tapauth/pam-config.example
 install -m 0644 config.toml.example %{buildroot}%{_datadir}/doc/tapauth/config.toml.example
 install -m 0644 client-config-gui/tapauth-config.desktop %{buildroot}%{_datadir}/applications/tapauth-config.desktop
 install -m 0644 client-config-gui/assets/tapauth-config.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
@@ -402,7 +401,6 @@ fi
 %{_unitdir}/polkit-agent-helper@.service.d/tapauth.conf
 %{_sysusersdir}/tapauth.conf
 %{_tmpfilesdir}/tapauth.conf
-%doc %{_datadir}/doc/tapauth/pam-config.example
 %doc %{_datadir}/doc/tapauth/config.toml.example
 %{_datadir}/applications/tapauth-config.desktop
 %{_datadir}/icons/hicolor/scalable/apps/tapauth-config.svg
