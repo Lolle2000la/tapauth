@@ -17,6 +17,22 @@ class AuthActionReceiver : BroadcastReceiver() {
         const val ACTION_NOTIFICATION_ACTION = "dev.rourunisen.tapauth.ACTION_NOTIFICATION_ACTION"
         /** Debug-only action to simulate explicit denial from automated test runners. */
         const val ACTION_DEV_DENY = "dev.rourunisen.tapauth.ACTION_DEV_DENY"
+
+        /**
+         * E2E-only action to explicitly grant every pending authentication request from automated
+         * test runners (mirrors [ACTION_DEV_DENY], but signs and approves instead of denying).
+         */
+        const val ACTION_DEV_GRANT = "dev.rourunisen.tapauth.ACTION_DEV_GRANT"
+
+        /**
+         * E2E-only actions to toggle the auto-approve fallback (see
+         * [AuthRequestManager.autoApproveInE2e]): suppression lets a request stay pending while the
+         * app is alive; restoration returns to deterministic default behavior.
+         */
+        const val ACTION_DEV_SUPPRESS_AUTO_APPROVE =
+            "dev.rourunisen.tapauth.ACTION_DEV_SUPPRESS_AUTO_APPROVE"
+        const val ACTION_DEV_RESTORE_AUTO_APPROVE =
+            "dev.rourunisen.tapauth.ACTION_DEV_RESTORE_AUTO_APPROVE"
     }
 
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -33,6 +49,28 @@ class AuthActionReceiver : BroadcastReceiver() {
                     explicitDenial = true,
                 )
             }
+            return
+        }
+        if (intent.action == ACTION_DEV_GRANT && dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) {
+            Log.d(TAG, "Handling dev explicit grant broadcast")
+            val manager = AuthRequestManager.getInstance()
+            context?.let { manager.approveAllPendingInE2e(it) }
+            return
+        }
+        if (
+            intent.action == ACTION_DEV_SUPPRESS_AUTO_APPROVE &&
+                dev.rourunisen.tapauth.BuildConfig.E2E_TESTING
+        ) {
+            Log.d(TAG, "Handling dev suppress-auto-approve broadcast")
+            AuthRequestManager.getInstance().suppressAutoApproveInE2e()
+            return
+        }
+        if (
+            intent.action == ACTION_DEV_RESTORE_AUTO_APPROVE &&
+                dev.rourunisen.tapauth.BuildConfig.E2E_TESTING
+        ) {
+            Log.d(TAG, "Handling dev restore-auto-approve broadcast")
+            AuthRequestManager.getInstance().restoreAutoApproveInE2e()
             return
         }
         if (intent.action != ACTION_NOTIFICATION_ACTION) return

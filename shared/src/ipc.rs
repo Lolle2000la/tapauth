@@ -21,21 +21,25 @@ mod tests {
             udp_port: 36692,
             enable_ble: None,
             enable_network: None,
+            enable_fprintd_bridge: None,
         };
 
         let decoded = SaveConfigRequest::decode(req.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.enable_ble, None);
         assert_eq!(decoded.enable_network, None);
+        assert_eq!(decoded.enable_fprintd_bridge, None);
 
         let req = SaveConfigRequest {
             enable_ble: Some(false),
             enable_network: Some(true),
+            enable_fprintd_bridge: Some(false),
             ..req
         };
 
         let decoded = SaveConfigRequest::decode(req.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.enable_ble, Some(false));
         assert_eq!(decoded.enable_network, Some(true));
+        assert_eq!(decoded.enable_fprintd_bridge, Some(false));
     }
 
     /// GetConfigResponse always carries the toggles (implicit presence).
@@ -46,10 +50,12 @@ mod tests {
             udp_port: 1234,
             enable_ble: true,
             enable_network: false,
+            enable_fprintd_bridge: true,
         };
 
         let decoded = GetConfigResponse::decode(resp.encode_to_vec().as_slice()).unwrap();
         assert!(decoded.enable_ble);
         assert!(!decoded.enable_network);
+        assert!(decoded.enable_fprintd_bridge);
     }
 }

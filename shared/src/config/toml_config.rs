@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -135,6 +134,16 @@ pub struct TapAuthConfig {
     /// authentication.
     pub enable_ble: bool,
 
+    /// Whether the virtual fprintd D-Bus bridge is enabled (default: true).
+    ///
+    /// When enabled, the daemon exposes the `net.reactivated.Fprint` D-Bus
+    /// interface, allowing desktop environments like GNOME Shell to query
+    /// and trigger TapAuth biometrics seamlessly. Set this to false only if
+    /// you use a real local fingerprint reader — real fprintd then owns the
+    /// bus name. Requires a daemon restart to acquire or release the D-Bus
+    /// bus name.
+    pub enable_fprintd_bridge: bool,
+
     /// Whether to use TPM for key storage
     /// Requires TPM 2.0 hardware and tpm2-tools installed
     #[cfg(feature = "tpm")]
@@ -159,6 +168,7 @@ impl Default for TapAuthConfig {
             udp_port: DEFAULT_UDP_PORT,
             enable_network: DEFAULT_TRANSPORT_ENABLED,
             enable_ble: DEFAULT_TRANSPORT_ENABLED,
+            enable_fprintd_bridge: true,
             #[cfg(feature = "tpm")]
             use_tpm: false,
             #[cfg(feature = "tpm")]
@@ -269,11 +279,6 @@ impl TapAuthConfig {
 
         Ok(())
     }
-
-    /// Get the operation timeout as a Duration.
-    pub fn operation_timeout(&self) -> Duration {
-        Duration::from_secs(self.pam_operation_timeout_secs)
-    }
 }
 
 #[cfg(test)]
@@ -299,7 +304,6 @@ mod tests {
             assert!(!config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard);
         }
-        assert_eq!(config.operation_timeout(), Duration::from_secs(120));
     }
 
     #[test]
@@ -368,6 +372,7 @@ mod tests {
             udp_port: 54321,
             enable_network: false,
             enable_ble: true,
+            enable_fprintd_bridge: true,
             #[cfg(feature = "tpm")]
             use_tpm: true,
             #[cfg(feature = "tpm")]
@@ -385,6 +390,7 @@ mod tests {
         assert_eq!(parsed.udp_port, config.udp_port);
         assert_eq!(parsed.enable_network, config.enable_network);
         assert_eq!(parsed.enable_ble, config.enable_ble);
+        assert_eq!(parsed.enable_fprintd_bridge, config.enable_fprintd_bridge);
         #[cfg(feature = "tpm")]
         {
             assert_eq!(parsed.use_tpm, config.use_tpm);

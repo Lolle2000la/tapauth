@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/pam.d/polkit-1
+
+[Action]
+Description = Re-applying TapAuth PAM integration to polkit-1 after polkit change...
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/tapauth-polkit-pam

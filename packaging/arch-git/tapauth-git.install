@@ -1,0 +1,200 @@
+post_install() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  elif [ -f /etc/tapauth/config.toml.example ]; then
+    # The daemon runs on defaults without a config file; seed one from the
+    # shipped example so users have a documented starting point.
+    cp -p /etc/tapauth/config.toml.example /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  # Apply the shipped preset so both units are enabled after install,
+  # matching the Debian/RPM packages (the preset enables tapauthd.socket and
+  # tapauthd.service — the service must run at boot for the virtual fprintd
+  # bridge; see packaging/90-tapauthd.preset)
+  systemctl preset tapauthd.socket tapauthd.service >/dev/null 2>&1 || true
+  # Start the socket immediately so IPC works before the first reboot
+  # (matches the Debian/RPM scriptlets; preset only enables, does not start)
+  systemctl start tapauthd.socket >/dev/null 2>&1 || true
+  # Also start the daemon so the virtual fprintd bridge is live right away:
+  # lock screens and greeters call pam_fprintd.so, which reaches tapauthd
+  # over D-Bus — they never touch the IPC socket, so socket activation
+  # alone would leave the bridge dead until the first sudo/su/polkit
+  # authentication. `start` is a no-op when already running.
+  systemctl start tapauthd.service >/dev/null 2>&1 || true
+  # Patch only the three PAM services in scope: sudo, su, polkit-1.
+  # All other stacks — including fingerprint stacks (kde-fingerprint,
+  # gdm-fingerprint, fingerprint-auth) — stay stock: they call
+  # pam_fprintd.so, which resolves to tapauthd's virtual fprintd D-Bus
+  # service (bridge enabled by default).
+  local pam_line="auth    sufficient    pam_tapauth.so"
+  local failed_files=()
+  for pam_svc in sudo su polkit-1; do
+    local pam_file="/etc/pam.d/${pam_svc}"
+    # Modern Arch ships some vendor PAM files in /usr/lib/pam.d (e.g.
+    # polkit-1); /etc/pam.d overrides them. Seed an override from the vendor
+    # file so the inserted line does not replace the vendor stack.
+    if [ ! -f "$pam_file" ] && [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+      install -m 0644 "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || true
+    fi
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null && continue
+    # Keep a pristine copy for restore on removal (only created once so it
+    # stays the unmodified upstream file).
+    [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+    # Insert after the #%PAM-1.0 header line (never above it).
+    if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+      sed -i "1a $pam_line" "$pam_file" 2>/dev/null
+    else
+      sed -i "1i $pam_line" "$pam_file" 2>/dev/null
+    fi
+    if [ $? -eq 0 ]; then
+      echo ":: Configured PAM for ${pam_svc} (original kept as ${pam_file}.tapauth-bak)"
+    else
+      failed_files+=("$pam_file")
+    fi
+  done
+  if [ ${#failed_files[@]} -gt 0 ]; then
+    echo ":: WARNING: Could not automatically patch the following PAM services:"
+    for f in "${failed_files[@]}"; do echo "::   $f"; done
+    echo ":: Add 'auth    sufficient    pam_tapauth.so' to them manually."
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+  fi
+  echo ":: TapAuth installed successfully."
+  echo ":: The tapauthd.socket has been enabled via the systemd preset."
+  echo ":: pam_tapauth.so covers sudo, su and polkit-1; all fingerprint stacks stay stock."
+  echo ":: KDE/GNOME lock screens and greeters integrate automatically through the built-in"
+  echo "::   virtual fprintd service (net.reactivated.Fprint) — no extra package and no local"
+  echo "::   fingerprint reader required. TapAuth's D-Bus activation file is renamed"
+  echo "::   (net.reactivated.Fprint.tapauth.service) so it never collides with real"
+  echo "::   fprintd's own file (both dbus-daemon and dbus-broker only use files"
+  echo "::   named exactly after the bus name, so the renamed file is a collision-free"
+  echo "::   placeholder)."
+  echo ":: To keep a real local fingerprint reader instead: install fprintd, set"
+  echo "::   enable_fprintd_bridge = false in /etc/tapauth/config.toml and restart the daemon"
+  echo "::   (systemctl restart tapauthd.service) — tapauthd then never claims the bus name."
+  echo ":: To allow your user to configure TapAuth via GUI, add yourself to the tapauthd-clients group:"
+  echo "::   sudo usermod -aG tapauthd-clients \$USER"
+}
+
+post_upgrade() {
+  systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+  chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+  if [ -f /etc/tapauth/config.toml ]; then
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+    chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+  elif [ -f /etc/tapauth/config.toml.example ]; then
+    cp -p /etc/tapauth/config.toml.example /etc/tapauth/config.toml
+    chmod 644 /etc/tapauth/config.toml
+    chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  systemctl try-restart tapauthd.service 2>/dev/null || true
+  # tapauth-fprintd has been merged into the base package (the virtual
+  # fprintd bridge is enabled by default): apply the PAM patching the old
+  # subpackage performed — but only for the three in-scope services.
+  local pam_line="auth    sufficient    pam_tapauth.so"
+  for pam_svc in sudo su polkit-1; do
+    local pam_file="/etc/pam.d/${pam_svc}"
+    if [ ! -f "$pam_file" ] && [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+      install -m 0644 "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || true
+    fi
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null && continue
+    [ -f "${pam_file}.tapauth-bak" ] || cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+    # Insert after the #%PAM-1.0 header line (never above it).
+    if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+      sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+    else
+      sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+    fi
+  done
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dbus 2>/dev/null; then
+    systemctl reload dbus 2>/dev/null || true
+  fi
+  if pacman -Qq tapauth-fprintd-git >/dev/null 2>&1; then
+    echo ":: NOTICE: tapauth-fprintd(-git) has been merged into the base tapauth package."
+    echo "::   Remove it with:  sudo pacman -R tapauth-fprintd-git."
+    echo "::   The virtual fprintd bridge is now enabled by default; to keep a real local"
+    echo "::   fingerprint reader instead, install fprintd, set enable_fprintd_bridge = false"
+    echo "::   in /etc/tapauth/config.toml and restart tapauthd.service."
+  fi
+}
+
+pre_remove() {
+  systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
+  # Restore the three PAM services in scope from their pristine backups,
+  # then best-effort clean up legacy fingerprint-stack edits from older
+  # versions (kde-fingerprint, gdm-fingerprint, gdm3-fingerprint,
+  # fingerprint-auth) so no stale pam_tapauth.so lines remain.
+  local failed_files=()
+  for pam_file in /etc/pam.d/*; do
+    [ -f "$pam_file" ] || continue
+    [ -L "$pam_file" ] && continue
+    # Never edit our own backup files
+    [[ "$pam_file" == *.tapauth-bak ]] && continue
+    grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null || continue
+    case "$(basename "$pam_file")" in
+      sudo|su|polkit-1)
+        if [ -s "${pam_file}.tapauth-bak" ]; then
+          cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
+        else
+          if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+            echo ":: Removed pam_tapauth.so from $pam_file"
+          else
+            failed_files+=("$pam_file")
+          fi
+        fi
+        ;;
+      kde-fingerprint|gdm-fingerprint|gdm3-fingerprint|fingerprint-auth)
+        # Legacy stacks patched by older versions. Restore the original
+        # stack when a backup exists; otherwise drop the TapAuth lines.
+        if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+          rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+          echo ":: Removed synthetic TapAuth stack $pam_file"
+        elif [ -s "${pam_file}.tapauth-bak" ]; then
+          cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
+        else
+          if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+            echo ":: Removed pam_tapauth.so from $pam_file"
+          else
+            failed_files+=("$pam_file")
+          fi
+        fi
+        ;;
+      *)
+        if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+          echo ":: Removed pam_tapauth.so from $pam_file"
+        else
+          failed_files+=("$pam_file")
+        fi
+        ;;
+    esac
+  done
+  if [ ${#failed_files[@]} -gt 0 ]; then
+    echo ":: WARNING: Could not automatically remove pam_tapauth.so from:"
+    for f in "${failed_files[@]}"; do echo "::   $f"; done
+    echo ":: Please remove these references manually to avoid authentication lockouts!"
+  fi
+  # Clean up orphaned .tapauth-bak backups of PAM stacks that no longer
+  # reference pam_tapauth.so (e.g. upstream replaced the file again, or the
+  # backup was already restored). Files whose restore failed keep their
+  # backup, since they still reference pam_tapauth.so.
+  for backup in /etc/pam.d/*.tapauth-bak; do
+    [ -f "$backup" ] || continue
+    pam_file="${backup%.tapauth-bak}"
+    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+      rm -f "$backup" 2>/dev/null || true
+    fi
+  done
+}

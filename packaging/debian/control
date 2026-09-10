@@ -1,0 +1,43 @@
+Source: tapauth
+Section: admin
+Priority: optional
+Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
+# NOTE: the Rust toolchain must be >= 1.85 (Cargo lockfile v4). Debian
+# stable archives (e.g. noble) ship older cargo/rustc; builds rely on
+# rustup (PATH via debian/rules) or a rust PPA (cargo-1.91/rustc-1.91
+# alternates below). Plain `apt-get build-dep` on stock noble is NOT
+# sufficient — see scripts/ci/build-debian-packages.sh.
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91, rustc (>= 1.85) | rustc-1.91, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
+Standards-Version: 4.7.0
+
+Package: tapauth
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd | policykit-1, adduser, libdbus-1-3, dbus
+Recommends: bluez, iptables
+Suggests: firewalld
+Description: Local smartphone-based authentication framework
+ A modern, privacy-preserving local-first authentication system.
+ .
+ pam_tapauth.so is wired into sudo, su and polkit-1 only; all other PAM
+ stacks (including fingerprint stacks such as kde-fingerprint,
+ gdm-fingerprint and fingerprint-auth) stay stock.
+ .
+ Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
+ automatically through the built-in virtual fprintd D-Bus service
+ (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
+ which resolves to tapauthd. The package deliberately does NOT conflict
+ with the real fprintd packages (fprintd, libpam-fprintd). It ships a
+ renamed D-Bus activation file
+ (net.reactivated.Fprint.tapauth.service) so nothing can collide with
+ fprintd's own activation file: both dbus-daemon and dbus-broker only
+ use activation files named exactly after the bus name, so the renamed
+ file is an inert, collision-free placeholder and real fprintd keeps
+ full control of on-demand activation. tapauthd is a systemd-managed
+ daemon that owns the bus name while it runs (and restarts on failure),
+ so the virtual bridge needs no activation support from the file.
+ No local fingerprint reader is required.
+ .
+ To keep using a real local fingerprint reader instead, install fprintd
+ and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
+ (applies at the next daemon restart): tapauthd then never claims the
+ bus name and real fprintd handles all fingerprint requests again.

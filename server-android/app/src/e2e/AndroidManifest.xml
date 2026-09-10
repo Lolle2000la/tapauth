@@ -14,6 +14,9 @@
         tools:node="merge">
       <intent-filter>
         <action android:name="dev.rourunisen.tapauth.ACTION_DEV_DENY" />
+        <action android:name="dev.rourunisen.tapauth.ACTION_DEV_GRANT" />
+        <action android:name="dev.rourunisen.tapauth.ACTION_DEV_SUPPRESS_AUTO_APPROVE" />
+        <action android:name="dev.rourunisen.tapauth.ACTION_DEV_RESTORE_AUTO_APPROVE" />
       </intent-filter>
     </receiver>
   </application>
