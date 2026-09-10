@@ -59,19 +59,20 @@ override_dh_auto_install:
 		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \
 	fi
 	
-	# Virtual fprintd D-Bus bridge policy ships in the base package: the
-	# bridge is enabled by default, and tapauthd claims the
-	# net.reactivated.Fprint bus name at startup (the real fprintd daemon
-	# stays dormant — no Conflicts with fprintd). We deliberately ship NO
-	# D-Bus activation service file for the bus name: fprintd's own
-	# /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-	# stays untouched, and a same-Name duplicate cannot win activation
-	# anyway (dbus-daemon keeps the first-sorted file; dbus-broker ignores
-	# files not named after the bus name). tapauthd is a systemd-managed
-	# daemon that owns the bus name while it runs; the policy file below
-	# authorizes that. With real fprintd installed the two coexist without
-	# file conflicts, and real fprintd stays fully functional whenever the
-	# bridge is disabled (enable_fprintd_bridge = false) or tapauthd is
-	# stopped.
+	# Virtual fprintd D-Bus bridge files ship in the base package: the bridge
+	# is enabled by default, and tapauthd claims the net.reactivated.Fprint
+	# bus name at startup (the real fprintd daemon stays dormant — no
+	# Conflicts with fprintd). The activation file is RENAMED
+	# (net.reactivated.Fprint.tapauth.service) so it never collides with
+	# fprintd's own /usr/share/dbus-1/system-services/
+	# net.reactivated.Fprint.service. Empirically verified duplicate-Name
+	# semantics: dbus-daemon keeps the FIRST-sorted file, so with real
+	# fprintd installed its file wins activation while tapauthd is down;
+	# dbus-broker ignores files not named after the bus name (our file is
+	# inert there; the daemon is systemd-managed instead). While tapauthd
+	# runs it owns the name; the file provides on-demand start / crash
+	# resilience when no owner exists and fprintd is not installed.
+	mkdir -p debian/tapauth/usr/share/dbus-1/system-services
 	mkdir -p debian/tapauth/usr/share/dbus-1/system.d
+	cp packaging/net.reactivated.Fprint.tapauth.service debian/tapauth/usr/share/dbus-1/system-services/
 	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth/usr/share/dbus-1/system.d/

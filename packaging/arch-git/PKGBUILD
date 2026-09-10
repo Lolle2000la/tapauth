@@ -81,14 +81,15 @@ package_tapauth-git() {
   install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "${pkgdir}/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
   install -Dm0644 packaging/50-tapauthd.rules "${pkgdir}/usr/share/polkit-1/rules.d/50-tapauthd.rules"
 
-  # Virtual fprintd D-Bus bridge policy (merged from the former
+  # Virtual fprintd D-Bus bridge files (merged from the former
   # tapauth-fprintd(-git) subpackage): the bridge is enabled by default, so
-  # lock screens and greeters work out of the box. Deliberately NO
-  # /usr/share/dbus-1/system-services activation file — that path+name is
-  # owned by the real fprintd package and a same-Name duplicate cannot
-  # win activation on either dbus-daemon or dbus-broker. See the comment
-  # on conflicts= above.
+  # lock screens and greeters work out of the box. The activation file is
+  # RENAMED (net.reactivated.Fprint.tapauth.service) so it never collides
+  # with real fprintd's own activation file; see packaging/arch/PKGBUILD
+  # for the empirically verified duplicate-Name semantics (first-sorted
+  # wins on dbus-daemon; dbus-broker ignores mismatched filenames).
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
+  install -Dm0644 packaging/net.reactivated.Fprint.tapauth.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
 
   # polkit vendor-drift protection (see packaging/arch/PKGBUILD comment).
   install -Dm0644 packaging/tapauth-polkit-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-polkit-pam.hook"

@@ -137,19 +137,27 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 mkdir -p %{buildroot}%{_datadir}/selinux/packages
 install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/packages/tapauth.cil
 
-# Virtual fprintd D-Bus bridge policy (the bridge is enabled by default, so
-# lock screens and greeters work out of the box). We deliberately ship NO
-# D-Bus activation service file for net.reactivated.Fprint: fprintd's own
-# package owns /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
-# and a second activation file with the same Name= cannot win anyway —
-# dbus-daemon keeps the first-sorted file (fprintd's sorts first) and
-# dbus-broker (Fedora's default broker) ignores files not named after the
-# bus name. Instead, tapauthd is a systemd-managed daemon that owns the bus
-# name while it runs; the shipped policy file below is what authorizes
-# tapauthd to do so. With real fprintd installed the two coexist without
-# file conflicts, and real fprintd remains fully functional whenever the
-# bridge is disabled (enable_fprintd_bridge = false) or tapauthd is stopped.
+# Virtual fprintd D-Bus bridge files (the bridge is enabled by default, so
+# lock screens and greeters work out of the box). The activation file is
+# renamed (net.reactivated.Fprint.tapauth.service) so it can never collide
+# with the real fprintd package's own
+# /usr/share/dbus-1/system-services/net.reactivated.Fprint.service.
+# EMPIRICALLY VERIFIED duplicate-Name semantics (dbus 1.14.10 container
+# probe; dbus-broker 37 on a systemd container with real fprintd):
+#  - dbus-daemon keeps the FIRST-sorted file for duplicate Name= entries, so
+#    with real fprintd installed, fprintd's own file wins activation and
+#    serves the name while tapauthd is down (tapauthd reclaims it on its
+#    next start).
+#  - dbus-broker ignores service files whose filename does not match the
+#    bus name, so our file is inert there (no activation); on Fedora the
+#    daemon is systemd-managed (started at install, Restart=on-failure).
+# While tapauthd runs it OWNS net.reactivated.Fprint (authorized by the
+# system.d policy file below) and the activation file is irrelevant. The
+# file's load-bearing role: on-demand start / crash resilience when no
+# other process owns the name and real fprintd is not installed.
+mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
+install -m 0644 packaging/net.reactivated.Fprint.tapauth.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %pre
@@ -391,6 +399,7 @@ fi
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 %{_datadir}/selinux/packages/tapauth.cil
+%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %changelog
