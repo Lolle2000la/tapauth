@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -280,11 +279,6 @@ impl TapAuthConfig {
 
         Ok(())
     }
-
-    /// Get the operation timeout as a Duration.
-    pub fn operation_timeout(&self) -> Duration {
-        Duration::from_secs(self.pam_operation_timeout_secs)
-    }
 }
 
 #[cfg(test)]
@@ -310,7 +304,6 @@ mod tests {
             assert!(!config.use_tpm);
             assert_eq!(config.tpm_pcr_policy, TpmPcrPolicy::Standard);
         }
-        assert_eq!(config.operation_timeout(), Duration::from_secs(120));
     }
 
     #[test]

@@ -25,7 +25,6 @@ enum FprintError {
     ClaimDevice(String),
     Internal(String),
     NoEnrolledPrints(String),
-    NoActionInProgress(String),
     PermissionDenied(String),
     #[zbus(error)]
     ZBus(zbus::Error),
@@ -788,21 +787,6 @@ mod tests {
             all_devs.first().map(|d| d.as_str()),
             Some(FPRINT_DEVICE_PATH)
         );
-    }
-
-    #[test]
-    fn test_device_state_initial() {
-        let state = DeviceState {
-            claimed_user: None,
-            claimed_owner: None,
-            verifying: false,
-            cancel_token: None,
-            session_id: 0,
-            last_verify_time: None,
-        };
-        assert!(!state.verifying);
-        assert!(state.claimed_user.is_none());
-        assert!(state.claimed_owner.is_none());
     }
 
     #[test]

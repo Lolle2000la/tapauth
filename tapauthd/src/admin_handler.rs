@@ -109,8 +109,6 @@ pub struct PendingPairing {
     pub listener: TcpListener,
     pub firewall_guard: Option<Arc<FirewallGuard>>,
     pub session: ClientPairingSession,
-    #[allow(dead_code)]
-    pub url: String,
     pub port: u16,
     pub generation: u64,
 }
@@ -323,7 +321,6 @@ async fn handle_start_pairing(
         listener,
         firewall_guard,
         session,
-        url: url.clone(),
         port,
         generation: gen,
     };

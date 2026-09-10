@@ -44,10 +44,6 @@ const DEFAULT_SOCKET_PATH: &str = "/run/tapauthd/tapauthd.sock";
 pub enum DaemonError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("prost: {0}")]
-    Prost(#[from] prost::DecodeError),
-    #[error("auth handler: {0}")]
-    AuthHandler(#[from] auth_handler::AuthHandlerError),
 }
 
 use std::collections::HashMap;
@@ -159,7 +155,7 @@ pub(crate) async fn auth_flight_finish(registry: &AuthFlightRegistry, username: 
 struct ServerState {
     daemon: Arc<RwLock<Arc<DaemonState>>>,
     cancel_registry: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    recent_requests: AuthFlightRegistry,
+    auth_flights: AuthFlightRegistry,
     pending_pairing: Arc<Mutex<Option<PairingState>>>,
 }
 
@@ -308,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_state = Arc::new(ServerState {
         daemon: shared_daemon,
         cancel_registry,
-        recent_requests: auth_flights,
+        auth_flights,
         pending_pairing: Arc::new(Mutex::new(None)),
     });
 
@@ -571,7 +567,7 @@ async fn handle_pam_authenticate(
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> ipc::PamAuthenticateResponse {
     if auth_flight_is_duplicate(
-        &server_state.recent_requests,
+        &server_state.auth_flights,
         &req.username,
         FlightChannel::Pam,
     )
@@ -591,7 +587,7 @@ async fn handle_pam_authenticate(
         };
     }
     auth_flight_start(
-        &server_state.recent_requests,
+        &server_state.auth_flights,
         &req.username,
         FlightChannel::Pam,
     )
@@ -609,7 +605,7 @@ async fn handle_pam_authenticate(
             let mut reg = server_state.cancel_registry.lock().await;
             reg.remove(&req.request_id);
             drop(reg);
-            auth_flight_finish(&server_state.recent_requests, &req.username).await;
+            auth_flight_finish(&server_state.auth_flights, &req.username).await;
             tracing::error!("Failed to create authentication session: {}", e);
             return ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Error as i32,
@@ -622,7 +618,7 @@ async fn handle_pam_authenticate(
     // The PAM request owns its flight end-to-end: await the session outcome,
     // then free the flight slot. Other channels never join or abort it.
     let result = auth_fut.await;
-    auth_flight_finish(&server_state.recent_requests, &req.username).await;
+    auth_flight_finish(&server_state.auth_flights, &req.username).await;
     flatten_auth_result(result)
 }
 
