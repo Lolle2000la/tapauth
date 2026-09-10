@@ -13,10 +13,6 @@ NC='\033[0m' # No Color
 
 # Default values
 INTERACTIVE=true
-# All components are always installed
-INSTALL_PAM=true
-INSTALL_CONFIG_GUI=true
-INSTALL_DAEMON=true
 # Only features and PAM configuration are configurable.
 # PAM scope is sudo/su/polkit-1 only — all other PAM stacks (including
 # fingerprint stacks) stay stock: they call pam_fprintd.so, which resolves
@@ -116,13 +112,6 @@ show_file_copy() {
     local source="$1"
     local dest="$2"
     echo -e "${BLUE}[COPY]${NC} $source → $dest"
-}
-
-show_file_edit() {
-    local file="$1"
-    local description="$2"
-    echo -e "${YELLOW}[EDIT]${NC} $file"
-    [[ -n "$description" ]] && echo "  → $description"
 }
 
 show_command() {
@@ -777,36 +766,6 @@ install_daemon() {
         if command -v restorecon &> /dev/null; then
             restorecon /usr/share/polkit-1/rules.d/50-tapauthd.rules || true
         fi
-    fi
-
-    # Seed default /etc/tapauth/config.toml if missing
-    mkdir -p /etc/tapauth
-    if [[ ! -f /etc/tapauth/config.toml ]]; then
-        print_info "Creating default /etc/tapauth/config.toml"
-        cat << 'EOF' > /etc/tapauth/config.toml
-# TapAuth System Configuration
-# See https://github.com/Lolle2000la/tapauth for documentation.
-
-# Authentication timeout in seconds (default: 120)
-# pam_operation_timeout_secs = 120
-
-# GUI authentication timeout in seconds (default: 30)
-# pam_gui_timeout_secs = 30
-
-# UDP port for local network transport (default: 36692)
-# udp_port = 36692
-
-# Enable Local Network transport (default: true)
-# enable_network = true
-
-# Enable Bluetooth Low Energy transport (default: true)
-# enable_ble = true
-
-# Enable virtual fprintd D-Bus bridge for desktop lock screens (default: true).
-# Set enable_fprintd_bridge = false to keep a real local fingerprint reader.
-EOF
-        chmod 644 /etc/tapauth/config.toml
-        chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
     fi
 
     # Install virtual fprintd D-Bus policy (bridge enable/disable handled per hardware detection)
