@@ -513,7 +513,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
-                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs, pam_context),
+                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs),
                 None => pam_sys::PAM_IGNORE,
             },
             ExitReason::Timeout => {
@@ -672,7 +672,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         }
 
         if let Some(resp) = auth_response {
-            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs, pam_context);
+            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
         }
 
         if exit_reason == ExitReason::Timeout {
@@ -738,13 +738,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
-                                return map_pam_outcome(
-                                    &resp,
-                                    &username,
-                                    &pam_conv,
-                                    &msgs,
-                                    pam_context,
-                                )
+                                return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
                             }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
@@ -861,13 +855,12 @@ pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
     PamContext::GuiSequential
 }
 
-/// Map daemon IPC response outcome to the appropriate PAM return code based on context.
+/// Map daemon IPC response outcome to the appropriate PAM return code.
 fn map_pam_outcome(
     resp: &shared::ipc::pb::PamAuthenticateResponse,
     username: &str,
     pam_conv: &pam_sys::PamConversation,
     msgs: &pam_messages::PamMessages,
-    context: PamContext,
 ) -> c_int {
     match resp.outcome() {
         shared::ipc::pb::PamOutcome::Success => {
@@ -885,11 +878,7 @@ fn map_pam_outcome(
             pam_sys::PAM_IGNORE
         }
         shared::ipc::pb::PamOutcome::Ignore => {
-            tracing::info!(
-                "Daemon indicated IGNORE for user: {} (context: {:?})",
-                username,
-                context
-            );
+            tracing::info!("Daemon indicated IGNORE for user: {}", username);
             pam_sys::PAM_IGNORE
         }
         shared::ipc::pb::PamOutcome::Error => {
@@ -993,7 +982,6 @@ mod tests {
     fn test_generic_fallback_outcomes_are_unchanged() {
         let conv = pam_sys::PamConversation::dummy();
         let msgs = pam_messages::PamMessages::new("en");
-        let context = PamContext::GuiSequential;
 
         let success_resp = shared::ipc::pb::PamAuthenticateResponse {
             outcome: shared::ipc::pb::PamOutcome::Success as i32,
@@ -1001,7 +989,7 @@ mod tests {
             challenge: vec![],
         };
         assert_eq!(
-            map_pam_outcome(&success_resp, "testuser", &conv, &msgs, context),
+            map_pam_outcome(&success_resp, "testuser", &conv, &msgs),
             pam_sys::PAM_SUCCESS
         );
 
@@ -1011,7 +999,7 @@ mod tests {
             challenge: vec![],
         };
         assert_eq!(
-            map_pam_outcome(&denied_resp, "testuser", &conv, &msgs, context),
+            map_pam_outcome(&denied_resp, "testuser", &conv, &msgs),
             pam_sys::PAM_PERM_DENIED
         );
 
@@ -1030,31 +1018,7 @@ mod tests {
             shared::ipc::pb::PamOutcome::Error,
         ] {
             assert_eq!(
-                map_pam_outcome(
-                    &non_success_resp(outcome),
-                    "testuser",
-                    &conv,
-                    &msgs,
-                    context
-                ),
-                pam_sys::PAM_IGNORE
-            );
-        }
-
-        // The polkit threaded context maps outcomes identically.
-        for outcome in [
-            shared::ipc::pb::PamOutcome::Timeout,
-            shared::ipc::pb::PamOutcome::Ignore,
-            shared::ipc::pb::PamOutcome::Error,
-        ] {
-            assert_eq!(
-                map_pam_outcome(
-                    &non_success_resp(outcome),
-                    "testuser",
-                    &conv,
-                    &msgs,
-                    PamContext::PolkitThreaded
-                ),
+                map_pam_outcome(&non_success_resp(outcome), "testuser", &conv, &msgs),
                 pam_sys::PAM_IGNORE
             );
         }
