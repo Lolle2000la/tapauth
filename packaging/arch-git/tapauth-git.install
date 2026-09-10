@@ -13,8 +13,10 @@ post_install() {
     chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
   fi
   systemctl daemon-reload
-  # Apply the shipped preset so the daemon is enabled after install, matching
-  # the Debian/RPM packages (preset enables tapauthd.socket, disables service)
+  # Apply the shipped preset so both units are enabled after install,
+  # matching the Debian/RPM packages (the preset enables tapauthd.socket and
+  # tapauthd.service — the service must run at boot for the virtual fprintd
+  # bridge; see packaging/90-tapauthd.preset)
   systemctl preset tapauthd.socket tapauthd.service >/dev/null 2>&1 || true
   # Start the socket immediately so IPC works before the first reboot
   # (matches the Debian/RPM scriptlets; preset only enables, does not start)
@@ -71,8 +73,11 @@ post_install() {
   echo ":: pam_tapauth.so covers sudo, su and polkit-1; all fingerprint stacks stay stock."
   echo ":: KDE/GNOME lock screens and greeters integrate automatically through the built-in"
   echo "::   virtual fprintd service (net.reactivated.Fprint) — no extra package and no local"
-  echo "::   fingerprint reader required. No D-Bus activation file is shipped, so the real"
-  echo "::   fprintd package can coexist without conflicts."
+  echo "::   fingerprint reader required. TapAuth's D-Bus activation file is renamed"
+  echo "::   (net.reactivated.Fprint.tapauth.service) so it never collides with real"
+  echo "::   fprintd's own file (both dbus-daemon and dbus-broker only use files"
+  echo "::   named exactly after the bus name, so the renamed file is a collision-free"
+  echo "::   placeholder)."
   echo ":: To keep a real local fingerprint reader instead: install fprintd, set"
   echo "::   enable_fprintd_bridge = false in /etc/tapauth/config.toml and restart the daemon"
   echo "::   (systemctl restart tapauthd.service) — tapauthd then never claims the bus name."

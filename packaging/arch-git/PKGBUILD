@@ -49,11 +49,13 @@ package_tapauth-git() {
   conflicts=('tapauth' 'tapauth-fprintd' 'tapauth-fprintd-git')
   # tapauth-fprintd(-git) was merged into the base package: the virtual
   # fprintd bridge is enabled by default. NOTE: no conflict with real
-  # fprintd, and no D-Bus activation file is shipped (see packaging/arch/
-  # PKGBUILD for the full rationale: a same-Name duplicate activation file
-  # cannot win on dbus-daemon and is ignored by dbus-broker). tapauthd is
-  # a systemd-managed daemon that owns the bus name while it runs; the
-  # shipped system.d policy file authorizes that.
+  # fprintd. The activation file is RENAMED
+  # (net.reactivated.Fprint.tapauth.service) so it never collides with
+  # fprintd's own activation file (see packaging/arch/PKGBUILD for the
+  # container-verified rationale: both dbus-daemon and dbus-broker require
+  # the filename to match the bus name, so the renamed file is an inert,
+  # collision-free placeholder; availability comes from systemd, not D-Bus
+  # activation).
   replaces=('tapauth-fprintd' 'tapauth-fprintd-git')
   install=tapauth-git.install
 
@@ -86,8 +88,10 @@ package_tapauth-git() {
   # lock screens and greeters work out of the box. The activation file is
   # RENAMED (net.reactivated.Fprint.tapauth.service) so it never collides
   # with real fprintd's own activation file; see packaging/arch/PKGBUILD
-  # for the empirically verified duplicate-Name semantics (first-sorted
-  # wins on dbus-daemon; dbus-broker ignores mismatched filenames).
+  # for the container-verified duplicate-Name semantics (both dbus-daemon
+  # and dbus-broker require the filename to match the bus name, so the
+  # renamed file is an inert, collision-free placeholder; availability
+  # comes from systemd, not D-Bus activation).
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
 

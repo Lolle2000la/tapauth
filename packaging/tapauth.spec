@@ -52,10 +52,15 @@ Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
 automatically through the built-in virtual fprintd D-Bus service
 (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
 which resolves to tapauthd. The package deliberately does NOT conflict
-with the real fprintd package and ships no D-Bus activation file for
-the bus name, so nothing can collide with fprintd's own activation
-file: tapauthd is a systemd-managed daemon that owns the bus name while
-it runs, and real fprintd stays dormant. No local fingerprint reader
+with the real fprintd package. It ships a renamed D-Bus activation file
+(net.reactivated.Fprint.tapauth.service) so nothing can collide with
+fprintd's own activation file; verified with dbus-daemon and
+dbus-broker, both require the activation file's filename to match the
+bus name, so the renamed file is an inert, collision-free placeholder
+and real fprintd keeps full control of on-demand activation whenever it
+is installed. tapauthd is a systemd-managed daemon that owns the bus
+name while it runs (and restarts on failure), so the virtual bridge
+needs no activation support from the file. No local fingerprint reader
 is required.
 
 To keep using a real local fingerprint reader instead, install fprintd
@@ -142,19 +147,19 @@ install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/pa
 # renamed (net.reactivated.Fprint.tapauth.service) so it can never collide
 # with the real fprintd package's own
 # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service.
-# EMPIRICALLY VERIFIED duplicate-Name semantics (dbus 1.14.10 container
-# probe; dbus-broker 37 on a systemd container with real fprintd):
-#  - dbus-daemon keeps the FIRST-sorted file for duplicate Name= entries, so
-#    with real fprintd installed, fprintd's own file wins activation and
-#    serves the name while tapauthd is down (tapauthd reclaims it on its
-#    next start).
-#  - dbus-broker ignores service files whose filename does not match the
-#    bus name, so our file is inert there (no activation); on Fedora the
-#    daemon is systemd-managed (started at install, Restart=on-failure).
-# While tapauthd runs it OWNS net.reactivated.Fprint (authorized by the
-# system.d policy file below) and the activation file is irrelevant. The
-# file's load-bearing role: on-demand start / crash resilience when no
-# other process owns the name and real fprintd is not installed.
+# VERIFIED IN CONTAINERS (dbus-daemon 1.12.20 & 1.14.10, dbus-broker 36 on a
+# systemd container with real fprintd): BOTH implementations require the
+# service file's filename to match the bus name, so this renamed file is an
+# inert, collision-free placeholder — neither broker uses it for activation
+# (dbus-daemon logs a load-time warning and returns Spawn.ServiceNotFound;
+# dbus-broker logs "not named after the D-Bus name" and reports the name as
+# not activatable). With real fprintd installed, activation of
+# net.reactivated.Fprint started real fprintd via its own file and
+# SystemdService= while the renamed file's Exec was never run. The file is
+# still shipped (never zero activation files) so a broker that honors
+# Name= from any filename gets on-demand start / crash resilience for
+# free; tapauthd's availability is guaranteed by systemd (started at
+# install, Restart=on-failure), not by D-Bus activation.
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service

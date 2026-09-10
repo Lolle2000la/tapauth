@@ -11,8 +11,8 @@ You can install tapauth via native package repositories to receive automatic upd
 - **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). `login` is deliberately **not** patched.
 - **Everything else stays stock.** All other PAM stacks — including the fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, `fingerprint-auth`) — are left untouched: they call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service.
 - **Desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No extra package, no manual PAM edits, no local fingerprint reader required.
-- **No D-Bus activation file is shipped for `net.reactivated.Fprint`.** Real fprintd's own activation file is never touched, so the real `fprintd` package can coexist with TapAuth without file conflicts.
-- **Daemon lifecycle:** `tapauthd.socket` is enabled (and started at install); `tapauthd.service` is started at install so the virtual fprintd bridge is live immediately, and started again on boot/IPC activity as configured by the shipped preset.
+- **Collision-free D-Bus activation file.** TapAuth ships a renamed activation file (`net.reactivated.Fprint.tapauth.service`) that can never collide with real fprintd's own `net.reactivated.Fprint.service`. Verified with `dbus-daemon` and `dbus-broker`: both only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder and real fprintd keeps full control of on-demand activation.
+- **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot for the lock-screen bridge); `tapauthd.service` is additionally started at install so the virtual fprintd bridge is live immediately.
 
 ### 1. Fedora Linux
 Packages are built and tracked using Fedora COPR.
@@ -73,7 +73,7 @@ Modern Linux desktop lock screens (KDE Plasma's `kscreenlocker` and GNOME's `gdm
 
 TapAuth ships an embedded virtual `fprintd` D-Bus service (`net.reactivated.Fprint`) in the daemon — no extra package is needed. When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
 
-TapAuth's daemon (`tapauthd`) claims the `net.reactivated.Fprint` bus name while it runs, so the real fprintd daemon stays dormant. The real `fprintd` package may stay installed — TapAuth ships no D-Bus activation file for the bus name, so nothing collides.
+TapAuth's daemon (`tapauthd`) claims the `net.reactivated.Fprint` bus name while it runs, so the real fprintd daemon stays dormant. The real `fprintd` package may stay installed — TapAuth's D-Bus activation file is renamed (`net.reactivated.Fprint.tapauth.service`) so it never collides with fprintd's own file (both `dbus-daemon` and `dbus-broker` only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder).
 
 > **Note:** changes to `enable_fprintd_bridge` (see below) take effect at the next **daemon restart** (`sudo systemctl restart tapauthd.service`), not dynamically.
 

@@ -52,6 +52,10 @@ FPRINT_DBUS_CONF_DEST="/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 if [[ -d /usr/share/dbus-1/system.d ]]; then
     FPRINT_DBUS_CONF_DEST="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 fi
+# Renamed D-Bus activation file (collision-free with real fprintd; see the
+# install_daemon comments for the verified broker semantics).
+FPRINT_ACTIVATION_SOURCE="packaging/net.reactivated.Fprint.tapauth.service"
+FPRINT_ACTIVATION_DEST="/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
 UNINSTALL_SCRIPT_SOURCE="uninstall.sh"
 UNINSTALL_SCRIPT_DEST="/usr/share/tapauth/uninstall.sh"
 
@@ -224,13 +228,16 @@ NOTES:
     fingerprint-auth) — stay stock: they call pam_fprintd.so, which
     resolves to tapauthd's virtual fprintd D-Bus service. Lock screens and
     greeters (KDE Plasma, GNOME) integrate automatically — no local
-    fingerprint reader required. install.sh ships no D-Bus activation
-    file for net.reactivated.Fprint, so the real fprintd package (if
-    installed) coexists without conflicts and stays fully functional.
-    To keep a real local fingerprint reader instead: install fprintd and
-    set enable_fprintd_bridge = false in /etc/tapauth/config.toml
-    (applies at the next daemon restart) — tapauthd then never claims the
-    bus name.
+    fingerprint reader required. install.sh ships a RENAMED D-Bus
+    activation file (net.reactivated.Fprint.tapauth.service) so nothing
+    collides with the real fprintd package's own activation file (both
+    dbus-daemon and dbus-broker only use activation files named exactly
+    after the bus name, so the renamed file is a collision-free
+    placeholder and real fprintd keeps full control of on-demand
+    activation). To keep a real local fingerprint reader instead: install
+    fprintd and set enable_fprintd_bridge = false in
+    /etc/tapauth/config.toml (applies at the next daemon restart) —
+    tapauthd then never claims the bus name.
 
 EXAMPLES:
     # Interactive installation (default)
@@ -743,9 +750,9 @@ install_daemon() {
         if [[ -f "$FPRINT_DBUS_CONF_SOURCE" && -d /etc/dbus-1/system.d ]]; then
             show_command "install -m 0644 $FPRINT_DBUS_CONF_SOURCE $FPRINT_DBUS_CONF_DEST" "Install virtual fprintd D-Bus configuration"
         fi
-        # Deliberately no D-Bus activation service file: fprintd's own
-        # package owns the only winning activation file for
-        # net.reactivated.Fprint; tapauthd owns the name while running.
+        if [[ -f "$FPRINT_ACTIVATION_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+            show_command "install -m 0644 $FPRINT_ACTIVATION_SOURCE $FPRINT_ACTIVATION_DEST" "Install virtual fprintd D-Bus activation file (renamed, collision-free)"
+        fi
         return
     fi
 
@@ -813,9 +820,11 @@ EOF
         print_info "keeps handling all fingerprint requests."
         # Disable the virtual bridge so tapauthd does not claim
         # net.reactivated.Fprint; real fprintd (installed on this system)
-        # keeps working. Note: no D-Bus activation service file is shipped
-        # by install.sh at all (see below), so fprintd's own activation
-        # setup stays untouched.
+        # keeps working. The activation file installed below is renamed
+        # and collision-free, and is an inert placeholder under current
+        # dbus-daemon and dbus-broker (both require the filename to match
+        # the bus name), so fprintd's own activation setup stays in full
+        # control.
         if [[ -f /etc/tapauth/config.toml ]] && ! grep -q "^enable_fprintd_bridge" /etc/tapauth/config.toml 2>/dev/null; then
             printf "\n# Hardware fingerprint reader detected by install.sh:\n# disable the virtual fprintd bridge so the real reader stays in charge.\nenable_fprintd_bridge = false\n" >> /etc/tapauth/config.toml
             chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
@@ -840,15 +849,26 @@ EOF
         fi
     fi
 
-    # Deliberately NO D-Bus activation service file for
-    # net.reactivated.Fprint: fprintd's own package owns
-    # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service and
-    # a same-Name duplicate cannot win activation anyway — dbus-daemon
-    # keeps the first-sorted file and dbus-broker (Fedora's default
-    # broker) ignores files not named after the bus name. tapauthd is a
-    # systemd-managed daemon that owns the bus name while it runs; the
-    # policy file above authorizes that. Real fprintd stays fully
-    # functional whenever the bridge is disabled or tapauthd is stopped.
+    # Install the RENAMED D-Bus activation file. It never collides with
+    # real fprintd's own
+    # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service.
+    # Verified in containers (dbus-daemon 1.12.20 & 1.14.10, dbus-broker
+    # 36): BOTH implementations require the service file's filename to
+    # match the bus name, so this renamed file is an inert, collision-free
+    # placeholder — neither broker uses it for activation. On-demand
+    # activation of net.reactivated.Fprint belongs to real fprintd's own
+    # file when fprintd is installed. The file is still installed (never
+    # zero activation files) so a broker that honors Name= from any
+    # filename gets on-demand start / crash resilience for free;
+    # tapauthd's availability is guaranteed by systemd (started at
+    # install, Restart=on-failure), not by D-Bus activation.
+    if [[ -f "$FPRINT_ACTIVATION_SOURCE" && -d /usr/share/dbus-1/system-services ]]; then
+        print_info "Installing virtual fprintd D-Bus activation file (renamed, collision-free) to $FPRINT_ACTIVATION_DEST"
+        install -m 0644 "$FPRINT_ACTIVATION_SOURCE" "$FPRINT_ACTIVATION_DEST"
+        if command -v restorecon &> /dev/null; then
+            restorecon "$FPRINT_ACTIVATION_DEST" || true
+        fi
+    fi
 
     # Reload system D-Bus configuration to apply the new policy immediately
     if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then

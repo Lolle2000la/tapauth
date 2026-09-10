@@ -35,14 +35,16 @@ package_tapauth() {
   conflicts=('tapauth-git' 'tapauth-fprintd' 'tapauth-fprintd-git')
   # tapauth-fprintd / -git were merged into the base package: the virtual
   # fprintd bridge is enabled by default. NOTE: no conflict with real
-  # fprintd, and no D-Bus activation file is shipped (fprintd's own
-  # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service stays
-  # untouched; a second activation file for the same Name= cannot win —
-  # dbus-daemon keeps the first-sorted file and dbus-broker ignores files
-  # not named after the bus name). tapauthd is a systemd-managed daemon
-  # that owns the bus name while it runs; the shipped system.d policy file
-  # authorizes that. Real fprintd stays functional whenever the bridge is
-  # disabled (enable_fprintd_bridge = false) or tapauthd is stopped.
+  # fprintd. The activation file is RENAMED
+  # (net.reactivated.Fprint.tapauth.service) so it never collides with
+  # fprintd's own /usr/share/dbus-1/system-services/
+  # net.reactivated.Fprint.service. Verified in containers (dbus-daemon
+  # 1.12.20 & 1.14.10, dbus-broker 36): BOTH dbus-daemon and dbus-broker
+  # require the activation file's filename to match the bus name, so the
+  # renamed file is an inert, collision-free placeholder — real fprintd
+  # keeps full control of on-demand activation whenever it is installed,
+  # and tapauthd's availability is guaranteed by systemd (started at
+  # install, Restart=on-failure) instead of D-Bus activation.
   replaces=('tapauth-fprintd' 'tapauth-fprintd-git')
   install=tapauth.install
 
@@ -75,14 +77,11 @@ package_tapauth() {
   # tapauth-fprintd subpackage): the bridge is enabled by default, so
   # lock screens and greeters work out of the box. The activation file is
   # RENAMED (net.reactivated.Fprint.tapauth.service) so it never collides
-  # with real fprintd's own
-  # /usr/share/dbus-1/system-services/net.reactivated.Fprint.service.
-  # Empirically verified duplicate-Name semantics: dbus-daemon keeps the
-  # FIRST-sorted file (with real fprintd installed, its file wins activation
-  # while tapauthd is down); dbus-broker ignores files not named after the
-  # bus name (our file is inert there). While tapauthd runs it OWNS the
-  # name; the file provides on-demand start / crash resilience when no
-  # owner exists and fprintd is not installed.
+  # with real fprintd's own activation file; see the package_tapauth()
+  # comment for the container-verified semantics (both dbus-daemon and
+  # dbus-broker require the filename to match the bus name, so the
+  # renamed file is an inert, collision-free placeholder; availability
+  # comes from systemd, not D-Bus activation).
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
 

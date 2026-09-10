@@ -11,13 +11,12 @@ CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
 
 # NOTE on dh_installsystemd (checked, deliberately unchanged): dh would
 # enable+start tapauthd.service on install. The shipped preset
-# (90-tapauthd.preset) already disables the service, so `enable` is a no-op;
-# the install-time `start` is KEPT on purpose: the virtual fprintd bridge is
-# enabled by default and lock screens/greeters reach tapauthd over D-Bus —
-# they never touch the IPC socket, so a purely socket-activated daemon
-# would stay dead (bridge unusable) until the first sudo/su/polkit
-# authentication. tapauthd.service keeps its [Install] section and the
-# default dh_installsystemd behavior.
+# (90-tapauthd.preset) enables BOTH units (the virtual fprintd bridge is
+# enabled by default and must be live after a reboot — lock screens and
+# greeters reach tapauthd over D-Bus, not the IPC socket), so `enable`
+# enables both; the install-time `start` is KEPT on purpose so the bridge
+# is live immediately without waiting for a reboot. tapauthd.service keeps
+# its [Install] section and the default dh_installsystemd behavior.
 
 override_dh_clean:
 	dh_clean -Xvendor/
@@ -65,13 +64,19 @@ override_dh_auto_install:
 	# Conflicts with fprintd). The activation file is RENAMED
 	# (net.reactivated.Fprint.tapauth.service) so it never collides with
 	# fprintd's own /usr/share/dbus-1/system-services/
-	# net.reactivated.Fprint.service. Empirically verified duplicate-Name
-	# semantics: dbus-daemon keeps the FIRST-sorted file, so with real
-	# fprintd installed its file wins activation while tapauthd is down;
-	# dbus-broker ignores files not named after the bus name (our file is
-	# inert there; the daemon is systemd-managed instead). While tapauthd
-	# runs it owns the name; the file provides on-demand start / crash
-	# resilience when no owner exists and fprintd is not installed.
+	# net.reactivated.Fprint.service. Verified in containers (dbus-daemon
+	# 1.12.20 and 1.14.10, dbus-broker 36): BOTH implementations require the
+	# service file's filename to match the bus name, so this renamed file is
+	# an inert, collision-free placeholder — neither broker uses it for
+	# activation (dbus-daemon logs a load-time warning and returns
+	# Spawn.ServiceNotFound; dbus-broker logs "not named after the D-Bus
+	# name" and reports the name as not activatable). On-demand activation
+	# of the bus name therefore belongs to real fprintd's own file when
+	# fprintd is installed. The file is still shipped (never zero
+	# activation files) so a broker that honors Name= from any filename
+	# gets on-demand start / crash resilience for free; tapauthd's
+	# availability is guaranteed by systemd (started at install,
+	# Restart=on-failure), not by D-Bus activation.
 	mkdir -p debian/tapauth/usr/share/dbus-1/system-services
 	mkdir -p debian/tapauth/usr/share/dbus-1/system.d
 	cp packaging/net.reactivated.Fprint.tapauth.service debian/tapauth/usr/share/dbus-1/system-services/
