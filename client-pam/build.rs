@@ -53,6 +53,11 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
+        // The generated bindings are an internal build artifact included via
+        // `include!`, so no external formatter is required. `Formatter::None`
+        // also keeps the CI runner's minimal Rust profile (no rustfmt) working;
+        // bindgen's default would shell out to rustfmt.
+        .formatter(bindgen::Formatter::None)
         .allowlist_function("pam_.*")
         .override_abi(bindgen::Abi::CUnwind, "^pam_get_authtok$")
         .allowlist_type("pam_.*")
