@@ -34,7 +34,14 @@ fluent.workspace = true
 unic-langid.workspace = true
 
 [build-dependencies]
-bindgen = "0.72"
+# `prettyplease` is disabled on purpose: bindgen 0.73 allows `syn >=2, <4` and
+# resolves to `syn` 3 when any proc-macro in the graph needs it, but the only
+# `prettyplease` version `prost-build` lets us use (^0.2) still depends on
+# `syn` 2. Mixing the two makes bindgen 0.73 fail to compile with
+# `syn::file::File: ParseQuote is not satisfied`. We do not need prettyplease
+# formatting for generated bindings, so drop it (see the `formatter` call in
+# build.rs). Re-enable once prost-build permits `prettyplease` 0.3+.
+bindgen = { version = "0.73", default-features = false, features = ["logging", "runtime"] }
 
 [features]
 default = []
