@@ -108,8 +108,13 @@ package_tapauth-fprintd-emulation() {
   # The Arch fprintd package is monolithic (daemon + PAM module), so the
   # emulation split package replaces it wholesale. The base tapauth package
   # is deliberately left non-conflicting with fprintd.
+  #
+  # Deliberately NO provides=('fprintd'): a package that both provides and
+  # conflicts with the same name has its conflict satisfied by its own
+  # provide, so pacman would NOT remove the real fprintd. Without the
+  # provide, conflicts forces the user to confirm the swap; replaces covers
+  # the sysupgrade path.
   conflicts=('fprintd')
-  provides=('fprintd')
   replaces=('fprintd')
   # NOTE: no install= scriptlet here on purpose. install= is a per-package
   # override; package_tapauth() sets install=tapauth.install and this

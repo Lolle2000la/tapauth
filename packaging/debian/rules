@@ -3,11 +3,12 @@
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 CARGO_FEATURES ?=
-comma := ,
 # Features for the second (opt-in) client-pam build installed as
-# pam_fprintd.so by the tapauth-fprintd-emulation package: always enable
-# replace-fprintd-pam, plus whatever feature set the base build requested.
-FPRINTD_EMULATION_CARGO_FEATURES := --features replace-fprintd-pam$(if $(CARGO_FEATURES),$(comma)$(CARGO_FEATURES))
+# pam_fprintd.so by the tapauth-fprintd-emulation package. It must NOT reuse
+# CARGO_FEATURES: those may be package-qualified workspace features
+# (e.g. tapauthd/dev-udp-loopback) that the client-pam package does not
+# define. The emulation build needs no extra feature.
+FPRINTD_EMULATION_CARGO_FEATURES := --features replace-fprintd-pam
 
 CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
 
@@ -32,9 +33,8 @@ override_dh_auto_build:
 	# is installed as pam_fprintd.so and deliberately uses a separate target
 	# dir (target/fprintd-emulation) so it can never clobber the base
 	# artifact target/release/libclient_pam.so, which is installed as
-	# pam_tapauth.so. replace-fprintd-pam is appended to whatever feature set
-	# the base build requested; with an empty CARGO_FEATURES this is simply
-	# "replace-fprintd-pam".
+	# pam_tapauth.so. Only replace-fprintd-pam is enabled here; the workspace
+	# CARGO_FEATURES are daemon/package-qualified and not valid for client-pam.
 	$(CARGO) build -p client-pam --release $(if $(wildcard vendor),--offline --frozen,--locked) $(FPRINTD_EMULATION_CARGO_FEATURES) --target-dir target/fprintd-emulation
 
 override_dh_auto_install:

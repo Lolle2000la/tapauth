@@ -226,7 +226,15 @@ verify_fprintd_emulation_pkg() {
     esac
 
     _assert_emulation_files_contain_module "$files"
-    _assert_emulation_meta_mentions "Provides" "$provide" "$provider"
+    # Debian and RPM can express exclusivity as Provides + Conflicts: dpkg and
+    # rpm both exclude a package's own provides from its conflict check, so the
+    # conflict still fires against the installed provider. Arch cannot: a
+    # provides=fprintd would satisfy its own conflicts=fprintd, so the
+    # emulation PKGBUILD deliberately omits the provide and relies on
+    # conflicts/replaces instead.
+    case "$pkg_manager" in
+        deb|rpm) _assert_emulation_meta_mentions "Provides" "$provide" "$provider" ;;
+    esac
     # Exclusivity may be expressed either as Conflicts (alternative provider;
     # the user explicitly confirms the swap) or as Obsoletes/Replaces
     # (automatic replacement). Accept either.
@@ -235,5 +243,5 @@ verify_fprintd_emulation_pkg() {
         echo "ERROR: tapauth-fprintd-emulation must declare Conflicts or Replaces against ${provider} (conflicts: ${conflict:-<none>}; replaces: ${replace:-<none>})"
         exit 1
     fi
-    echo "tapauth-fprintd-emulation: ships pam_fprintd.so, provides ${provider}, and declares it as a conflict or replacement."
+    echo "tapauth-fprintd-emulation: ships pam_fprintd.so and declares exclusivity with ${provider} (conflicts/replaces)."
 }

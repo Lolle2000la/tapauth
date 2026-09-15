@@ -110,9 +110,10 @@ cargo build --workspace --release --locked %{?cargo_features}
 # Opt-in second client-pam build backing the fprintd-emulation subpackage.
 # Uses a separate target dir (under CARGO_TARGET_DIR) so the base
 # libclient_pam.so installed as pam_tapauth.so is never clobbered.
-# replace-fprintd-pam is appended to whatever feature set the base build
-# requested; cargo unions repeated --features flags.
-cargo build -p client-pam --release --locked %{?cargo_features} --features replace-fprintd-pam \
+# %{?cargo_features} is deliberately NOT reused: it may contain
+# package-qualified workspace features (e.g. tapauthd/dev-udp-loopback)
+# that the client-pam package does not define.
+cargo build -p client-pam --release --locked --features replace-fprintd-pam \
     --target-dir "${CARGO_TARGET_DIR}/fprintd-emulation"
 if command -v sccache >/dev/null 2>&1; then
     sccache --show-stats || true

@@ -40,6 +40,5 @@ pkgname = tapauth-git
 pkgname = tapauth-fprintd-emulation-git
 	pkgdesc = Optional fprintd PAM emulation for TapAuth (Development/Git version; installs pam_fprintd.so)
 	depends = tapauth-git
-	provides = fprintd
 	conflicts = fprintd
 	replaces = fprintd
