@@ -25,6 +25,32 @@ const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 /// Default UDP port for authentication
 const DEFAULT_UDP_PORT: u16 = 36692;
 
+/// Marker file shipped by the optional `tapauth-fprintd-emulation` package
+/// (world-readable, fixed path).
+///
+/// Its presence is what makes the virtual fprintd D-Bus bridge default to
+/// enabled when `enable_fprintd_bridge` is left unset. The base packages do
+/// NOT ship it, so a base install leaves the `net.reactivated.Fprint` bus name
+/// to a real local fprintd unless the user opts in explicitly.
+pub const FPRINTD_EMULATION_MARKER_PATH: &str = "/usr/share/tapauth/fprintd-emulation.enabled";
+
+/// Resolve the tri-state `enable_fprintd_bridge` setting into an effective
+/// boolean.
+///
+/// - An explicit value (`Some`) always wins (user override).
+/// - When unset (`None`), the bridge is enabled iff `marker_exists`, i.e. the
+///   optional `tapauth-fprintd-emulation` package installed its marker file.
+///
+/// Pure so the policy is unit-testable without touching the filesystem.
+pub fn resolve_enable_fprintd_bridge(explicit: Option<bool>, marker_exists: bool) -> bool {
+    explicit.unwrap_or(marker_exists)
+}
+
+/// Whether [`FPRINTD_EMULATION_MARKER_PATH`] exists on this system.
+pub fn fprintd_emulation_marker_exists() -> bool {
+    Path::new(FPRINTD_EMULATION_MARKER_PATH).exists()
+}
+
 /// Transports are enabled by default
 const DEFAULT_TRANSPORT_ENABLED: bool = true;
 
@@ -134,15 +160,26 @@ pub struct TapAuthConfig {
     /// authentication.
     pub enable_ble: bool,
 
-    /// Whether the virtual fprintd D-Bus bridge is enabled (default: true).
+    /// Whether the virtual fprintd D-Bus bridge is enabled.
+    ///
+    /// Tri-state:
+    /// - unset (`None`): enabled only when the optional
+    ///   `tapauth-fprintd-emulation` package has installed
+    ///   [`FPRINTD_EMULATION_MARKER_PATH`]
+    ///   (`/usr/share/tapauth/fprintd-emulation.enabled`). This is the base
+    ///   install default, so the bus name stays with a real local fprintd.
+    /// - `Some(true)`: always enabled (explicit user override).
+    /// - `Some(false)`: always disabled (explicit user override; wins over the
+    ///   marker).
     ///
     /// When enabled, the daemon exposes the `net.reactivated.Fprint` D-Bus
-    /// interface, allowing desktop environments like GNOME Shell to query
-    /// and trigger TapAuth biometrics seamlessly. Set this to false only if
-    /// you use a real local fingerprint reader — real fprintd then owns the
-    /// bus name. Requires a daemon restart to acquire or release the D-Bus
-    /// bus name.
-    pub enable_fprintd_bridge: bool,
+    /// interface, allowing desktop environments like GNOME Shell to query and
+    /// trigger TapAuth biometrics seamlessly. Requires a daemon restart to
+    /// acquire or release the D-Bus bus name.
+    ///
+    /// Use [`TapAuthConfig::fprintd_bridge_enabled`] for the effective value
+    /// rather than reading this field directly.
+    pub enable_fprintd_bridge: Option<bool>,
 
     /// Whether to use TPM for key storage
     /// Requires TPM 2.0 hardware and tpm2-tools installed
@@ -168,7 +205,7 @@ impl Default for TapAuthConfig {
             udp_port: DEFAULT_UDP_PORT,
             enable_network: DEFAULT_TRANSPORT_ENABLED,
             enable_ble: DEFAULT_TRANSPORT_ENABLED,
-            enable_fprintd_bridge: true,
+            enable_fprintd_bridge: None,
             #[cfg(feature = "tpm")]
             use_tpm: false,
             #[cfg(feature = "tpm")]
@@ -178,6 +215,19 @@ impl Default for TapAuthConfig {
 }
 
 impl TapAuthConfig {
+    /// Effective value of the virtual fprintd D-Bus bridge toggle.
+    ///
+    /// Resolves the tri-state [`TapAuthConfig::enable_fprintd_bridge`] against
+    /// the presence of the `tapauth-fprintd-emulation` marker file. Callers
+    /// that decide whether to claim the `net.reactivated.Fprint` bus name must
+    /// use this rather than reading the raw field.
+    pub fn fprintd_bridge_enabled(&self) -> bool {
+        resolve_enable_fprintd_bridge(
+            self.enable_fprintd_bridge,
+            fprintd_emulation_marker_exists(),
+        )
+    }
+
     /// Load configuration, from `TAPAUTH_STATE_DIR/config.toml` (dev builds only) or
     /// [`DEFAULT_CONFIG_PATH`].
     pub fn load() -> Self {
@@ -299,6 +349,8 @@ mod tests {
         assert_eq!(config.udp_port, 36692);
         assert!(config.enable_network);
         assert!(config.enable_ble);
+        // Tri-state default: unset, resolved against the emulation marker.
+        assert_eq!(config.enable_fprintd_bridge, None);
         #[cfg(feature = "tpm")]
         {
             assert!(!config.use_tpm);
@@ -372,7 +424,7 @@ mod tests {
             udp_port: 54321,
             enable_network: false,
             enable_ble: true,
-            enable_fprintd_bridge: true,
+            enable_fprintd_bridge: Some(true),
             #[cfg(feature = "tpm")]
             use_tpm: true,
             #[cfg(feature = "tpm")]
@@ -424,5 +476,52 @@ mod tests {
         assert_eq!(reloaded.udp_port, 36692);
         assert!(!reloaded.enable_ble);
         assert!(rewritten.contains("pam_gui_timeout_secs = 45"));
+    }
+
+    /// The tri-state resolution: explicit values always win; when unset the
+    /// bridge follows the `tapauth-fprintd-emulation` marker file.
+    #[test]
+    fn test_resolve_enable_fprintd_bridge() {
+        // Explicit override wins in both directions, regardless of the marker.
+        assert!(resolve_enable_fprintd_bridge(Some(true), false));
+        assert!(resolve_enable_fprintd_bridge(Some(true), true));
+        assert!(!resolve_enable_fprintd_bridge(Some(false), false));
+        assert!(!resolve_enable_fprintd_bridge(Some(false), true));
+
+        // Unset: base install (no marker) is off, emulation package (marker) on.
+        assert!(!resolve_enable_fprintd_bridge(None, false));
+        assert!(resolve_enable_fprintd_bridge(None, true));
+    }
+
+    /// Serde compatibility: existing configs containing an explicit boolean
+    /// still parse (as an override), and an absent key stays `None`.
+    #[test]
+    fn test_parse_fprintd_bridge_presence() {
+        let unset: TapAuthConfig = toml::from_str("udp_port = 36692").unwrap();
+        assert_eq!(unset.enable_fprintd_bridge, None);
+
+        let enabled: TapAuthConfig = toml::from_str("enable_fprintd_bridge = true").unwrap();
+        assert_eq!(enabled.enable_fprintd_bridge, Some(true));
+
+        let disabled: TapAuthConfig = toml::from_str("enable_fprintd_bridge = false").unwrap();
+        assert_eq!(disabled.enable_fprintd_bridge, Some(false));
+    }
+
+    /// An unset bridge must serialize without an `enable_fprintd_bridge` key so
+    /// the daemon's whole-file SaveConfig rewrite does not turn "auto" into an
+    /// explicit value. Explicit overrides must survive.
+    #[test]
+    fn test_serialize_fprintd_bridge_tristate() {
+        let mut config = TapAuthConfig::default();
+        let unset = toml::to_string_pretty(&config).unwrap();
+        assert!(!unset.contains("enable_fprintd_bridge"));
+
+        config.enable_fprintd_bridge = Some(false);
+        let disabled = toml::to_string_pretty(&config).unwrap();
+        assert!(disabled.contains("enable_fprintd_bridge = false"));
+
+        config.enable_fprintd_bridge = Some(true);
+        let enabled = toml::to_string_pretty(&config).unwrap();
+        assert!(enabled.contains("enable_fprintd_bridge = true"));
     }
 }

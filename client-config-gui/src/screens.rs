@@ -110,7 +110,7 @@ impl Screen {
                             udp_port: default_toml.udp_port,
                             enable_ble: default_toml.enable_ble,
                             enable_network: default_toml.enable_network,
-                            enable_fprintd_bridge: default_toml.enable_fprintd_bridge,
+                            enable_fprintd_bridge: default_toml.fprintd_bridge_enabled(),
                         })
                     }
                 })

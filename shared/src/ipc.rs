@@ -43,6 +43,12 @@ mod tests {
     }
 
     /// GetConfigResponse always carries the toggles (implicit presence).
+    ///
+    /// `enable_fprintd_bridge` here is the **effective** value the daemon
+    /// resolved from the tri-state on-disk setting (explicit override, else the
+    /// presence of the tapauth-fprintd-emulation marker file), not the raw
+    /// `Option<bool>`. `SaveConfigRequest::enable_fprintd_bridge` remains an
+    /// explicit-presence override.
     #[test]
     fn get_config_response_carries_transport_toggles() {
         let resp = GetConfigResponse {

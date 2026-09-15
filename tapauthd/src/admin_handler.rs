@@ -654,6 +654,14 @@ async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
 /// Transport toggles (BLE / Local Network) are only written when the request
 /// carries them (explicit presence), so older clients cannot accidentally
 /// disable transports.
+///
+/// fprintd bridge shape: the on-disk setting is tri-state (`Option<bool>`), but
+/// admin IPC keeps explicit presence. `SaveConfigRequest` always carries an
+/// explicit `bool` for the bridge (the GUI always sends its toggle), so a save
+/// writes an explicit user override (`true`/`false`) — it never reverts to the
+/// marker-derived "auto" state. In the other direction, `GetConfigResponse`
+/// reports the **effective** value, so the GUI toggle reflects what the daemon
+/// will actually do (explicit override, else the fprintd-emulation marker).
 async fn handle_save_config(
     daemon: &Arc<DaemonState>,
     req: ipc::SaveConfigRequest,
@@ -679,7 +687,8 @@ async fn handle_save_config(
         toml_config.enable_network = enable_network;
     }
     if let Some(enable_fprintd_bridge) = req.enable_fprintd_bridge {
-        toml_config.enable_fprintd_bridge = enable_fprintd_bridge;
+        // Explicit override: Some(true)/Some(false) wins over the emulation marker.
+        toml_config.enable_fprintd_bridge = Some(enable_fprintd_bridge);
     }
     if let Err(e) = toml_config.save() {
         return err_resp(
@@ -703,7 +712,7 @@ async fn handle_save_config(
         "Transports: BLE={}, LocalNetwork={}, FprintdBridge={}",
         toml_config.enable_ble,
         toml_config.enable_network,
-        toml_config.enable_fprintd_bridge
+        toml_config.fprintd_bridge_enabled()
     );
 
     empty_success()
@@ -738,7 +747,7 @@ async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
         toml_config.udp_port as u32,
         toml_config.enable_ble,
         toml_config.enable_network,
-        toml_config.enable_fprintd_bridge,
+        toml_config.fprintd_bridge_enabled(),
     )
 }
 

@@ -174,7 +174,7 @@ impl VirtualFprintDevice {
         };
 
         let toml_config = shared::config::TapAuthConfig::load();
-        if !toml_config.enable_fprintd_bridge {
+        if !toml_config.fprintd_bridge_enabled() {
             return Err(FprintError::NoEnrolledPrints(
                 "Virtual fprintd bridge is disabled in configuration".to_string(),
             ));
@@ -202,7 +202,7 @@ impl VirtualFprintDevice {
         username: String,
     ) -> Result<(), FprintError> {
         let toml_config = shared::config::TapAuthConfig::load();
-        if !toml_config.enable_fprintd_bridge {
+        if !toml_config.fprintd_bridge_enabled() {
             return Err(FprintError::NoEnrolledPrints(
                 "Virtual fprintd bridge is disabled in configuration".to_string(),
             ));

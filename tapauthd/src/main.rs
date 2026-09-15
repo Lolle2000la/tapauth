@@ -266,10 +266,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(Mutex::new(HashMap::new()));
 
     // Start the virtual fprintd D-Bus service (non-fatal: daemon functions without it).
-    // The daemon claims net.reactivated.Fprint by default; set
-    // enable_fprintd_bridge = false if you use a real local fingerprint reader
-    // (real fprintd then owns the bus name).
-    let _fprintd_conn = if toml_config.enable_fprintd_bridge {
+    // The bridge is opt-in: it is enabled when `enable_fprintd_bridge = true` is set
+    // explicitly, or, when the setting is unset, when the optional
+    // tapauth-fprintd-emulation package has installed its marker file. A base
+    // install therefore leaves the net.reactivated.Fprint bus name to a real fprintd.
+    let _fprintd_conn = if toml_config.fprintd_bridge_enabled() {
         match fprintd::start_fprintd_service(AuthState {
             daemon: shared_daemon.clone(),
             auth_flights: auth_flights.clone(),
@@ -290,7 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         tracing::debug!(
-            "Virtual fprintd D-Bus bridge is disabled in configuration (enable_fprintd_bridge = false)"
+            "Virtual fprintd D-Bus bridge is disabled (enable_fprintd_bridge unset without the fprintd-emulation marker, or set to false)"
         );
         None
     };

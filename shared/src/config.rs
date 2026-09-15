@@ -20,7 +20,10 @@
 
 mod toml_config;
 
-pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH};
+pub use toml_config::{
+    fprintd_emulation_marker_exists, resolve_enable_fprintd_bridge, TapAuthConfig,
+    DEFAULT_CONFIG_PATH, FPRINTD_EMULATION_MARKER_PATH,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
