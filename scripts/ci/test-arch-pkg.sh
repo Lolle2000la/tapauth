@@ -172,9 +172,13 @@ test -f /usr/lib/security/pam_tapauth.so
 echo "Verifying the base package ships the virtual fprintd D-Bus policy (and no activation file/marker)..."
 verify_fprintd_coexistence arch
 test ! -e /usr/share/libalpm/hooks/tapauth-fprintd-pam.hook
-# polkit vendor-drift hook must ship.
-test -f /usr/share/libalpm/hooks/tapauth-polkit-pam.hook
-test -f /usr/share/libalpm/scripts/tapauth-polkit-pam
+# PAM vendor-drift hook (generalized from the old polkit-only hook) must ship.
+test -f /usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook
+test -f /usr/share/libalpm/scripts/tapauth-pam-vendor-drift
+# The hook must target all three in-scope services.
+grep -q '^Target = usr/lib/pam.d/polkit-1$' /usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook
+grep -q '^Target = etc/pam.d/sudo$' /usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook
+grep -q '^Target = etc/pam.d/su$' /usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook
 # No live config.toml may be shipped (only the example; post_install seeds
 # /etc/tapauth/config.toml from it). Shipping a live config causes .pacnew churn.
 if pacman -Ql tapauth | grep -qE "etc/tapauth/config.toml$"; then
@@ -207,15 +211,17 @@ assert_fprintd_exec_matches /usr/share/dbus-1/system-services/net.reactivated.Fp
     "fprintd activation Exec changed after tapauth install" \
     /usr/libexec/fprintd /usr/lib/fprintd
 
-# Verify the polkit vendor-drift hook script works: simulate a polkit
-# upgrade by rewriting the vendor file, run the hook script, and assert the
-# override was re-seeded with the tapauth line re-applied.
-echo "Verifying the polkit vendor-drift hook script..."
+# Verify the PAM vendor-drift hook script works: simulate vendor upgrades by
+# rewriting the polkit vendor file (override path) and by stripping the
+# tapauth line from the su vendor file (in-place path), run the hook script,
+# and assert the tapauth line was re-applied.
+echo "Verifying the PAM vendor-drift hook script..."
+DRIFT_SCRIPT=/usr/share/libalpm/scripts/tapauth-pam-vendor-drift
 if [ -f /usr/lib/pam.d/polkit-1 ]; then
     cp /usr/lib/pam.d/polkit-1 /tmp/polkit-1.vendor
     cp /etc/pam.d/polkit-1 /tmp/polkit-1.before-hook || true
     sed -i '1i # SIMULATED POLKIT UPGRADE' /usr/lib/pam.d/polkit-1
-    /usr/share/libalpm/scripts/tapauth-polkit-pam
+    "$DRIFT_SCRIPT"
     if ! grep -q "pam_tapauth\.so" /etc/pam.d/polkit-1; then
         echo "ERROR: drift hook did not re-apply the tapauth line after simulated polkit upgrade"
         cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
@@ -234,6 +240,18 @@ if [ -f /usr/lib/pam.d/polkit-1 ]; then
     cp /tmp/polkit-1.vendor /usr/lib/pam.d/polkit-1
     echo "polkit drift hook works."
 fi
+# su: simulate a util-linux upgrade replacing /etc/pam.d/su without our line.
+cp /etc/pam.d/su /tmp/su.before-drift
+sed -i '/pam_tapauth\.so/d' /etc/pam.d/su
+"$DRIFT_SCRIPT"
+if ! grep -q "pam_tapauth\.so" /etc/pam.d/su; then
+    echo "ERROR: drift hook did not re-apply the tapauth line to su"
+    cp /tmp/su.before-drift /etc/pam.d/su
+    exit 1
+fi
+# And the re-applied su line must still sit after pam_rootok/pam_wheel.
+assert_su_line_after_rootok /etc/pam.d/su
+echo "sudo/su drift hook works."
 
 echo "Verifying that kde-fingerprint was NOT modified (stays stock)..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint

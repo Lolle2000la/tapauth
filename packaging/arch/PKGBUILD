@@ -84,13 +84,15 @@ package_tapauth() {
   # tapauthd availability comes from systemd.
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 
-  # polkit vendor-drift protection: when the polkit package is upgraded it
-  # ships a new /usr/lib/pam.d/polkit-1 vendor file, but our /etc/pam.d/
-  # override shadows it forever. The hook re-seeds the override from the
-  # new vendor file and re-applies the TapAuth line (only when TapAuth has
-  # patched the file before, i.e. the .tapauth-bak marker exists).
-  install -Dm0644 packaging/tapauth-polkit-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-polkit-pam.hook"
-  install -Dm0755 packaging/tapauth-polkit-pam.sh "${pkgdir}/usr/share/libalpm/scripts/tapauth-polkit-pam"
+  # PAM vendor-drift protection: when a package owning one of the PAM
+  # service files TapAuth patched is upgraded (polkit -> /usr/lib/pam.d/
+  # polkit-1, sudo -> /etc/pam.d/sudo, util-linux -> /etc/pam.d/su), the
+  # vendor stack changes while our line/override would otherwise shadow or
+  # drop it. The hook re-seeds the override from the new vendor file (when
+  # present) and re-applies the TapAuth line, only when the .tapauth-bak
+  # marker shows TapAuth patched the file before. Idempotent.
+  install -Dm0644 packaging/tapauth-pam-vendor-drift.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook"
+  install -Dm0755 packaging/tapauth-pam-vendor-drift.sh "${pkgdir}/usr/share/libalpm/scripts/tapauth-pam-vendor-drift"
 
   install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

@@ -92,9 +92,10 @@ package_tapauth-git() {
   # bridge is enabled). No D-Bus activation file; see packaging/arch/PKGBUILD.
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
 
-  # polkit vendor-drift protection (see packaging/arch/PKGBUILD comment).
-  install -Dm0644 packaging/tapauth-polkit-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-polkit-pam.hook"
-  install -Dm0755 packaging/tapauth-polkit-pam.sh "${pkgdir}/usr/share/libalpm/scripts/tapauth-polkit-pam"
+  # PAM vendor-drift protection (see packaging/arch/PKGBUILD comment):
+  # generalized to /etc/pam.d/{sudo,su,polkit-1}.
+  install -Dm0644 packaging/tapauth-pam-vendor-drift.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-pam-vendor-drift.hook"
+  install -Dm0755 packaging/tapauth-pam-vendor-drift.sh "${pkgdir}/usr/share/libalpm/scripts/tapauth-pam-vendor-drift"
 
   install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

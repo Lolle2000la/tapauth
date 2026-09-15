@@ -183,10 +183,15 @@ post_upgrade() {
 
 pre_remove() {
   systemctl disable --now tapauthd.socket tapauthd.service 2>/dev/null || true
-  # Restore the three PAM services in scope from their pristine backups,
-  # then best-effort clean up legacy fingerprint-stack edits from older
-  # versions (kde-fingerprint, gdm-fingerprint, gdm3-fingerprint,
-  # fingerprint-auth) so no stale pam_tapauth.so lines remain.
+  # Strip the TapAuth-inserted line(s) from the PAM stacks we patched and
+  # drop the one-time .tapauth-bak snapshots. The snapshots are deliberately
+  # NOT copied back over the files: each was taken once at install time, so
+  # restoring it would silently revert every admin edit and vendor/distro
+  # update made since. Only our own line is removed, so this cannot lock
+  # anyone out. Legacy fingerprint-stack edits from older versions
+  # (kde-fingerprint, gdm-fingerprint, gdm3-fingerprint, fingerprint-auth)
+  # are cleaned up the same way; synthetic "# Managed by TapAuth" files are
+  # deleted outright. Best-effort so removal never fails.
   local failed_files=()
   for pam_file in /etc/pam.d/*; do
     [ -f "$pam_file" ] || continue
@@ -196,26 +201,22 @@ pre_remove() {
     grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null || continue
     case "$(basename "$pam_file")" in
       sudo|su|polkit-1)
-        if [ -s "${pam_file}.tapauth-bak" ]; then
-          cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
+        if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+          rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+          echo ":: Removed pam_tapauth.so from $pam_file"
         else
-          if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
-            echo ":: Removed pam_tapauth.so from $pam_file"
-          else
-            failed_files+=("$pam_file")
-          fi
+          failed_files+=("$pam_file")
         fi
         ;;
       kde-fingerprint|gdm-fingerprint|gdm3-fingerprint|fingerprint-auth)
-        # Legacy stacks patched by older versions. Restore the original
-        # stack when a backup exists; otherwise drop the TapAuth lines.
+        # Legacy stacks patched by older versions. Synthetic files are ours
+        # and are deleted; real vendor stacks have only our line stripped.
         if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
           rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
           echo ":: Removed synthetic TapAuth stack $pam_file"
-        elif [ -s "${pam_file}.tapauth-bak" ]; then
-          cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null && rm -f "${pam_file}.tapauth-bak" 2>/dev/null && echo ":: Restored original $pam_file" || failed_files+=("$pam_file")
         else
           if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
             echo ":: Removed pam_tapauth.so from $pam_file"
           else
             failed_files+=("$pam_file")
@@ -224,6 +225,7 @@ pre_remove() {
         ;;
       *)
         if sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null; then
+          rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
           echo ":: Removed pam_tapauth.so from $pam_file"
         else
           failed_files+=("$pam_file")
@@ -231,6 +233,18 @@ pre_remove() {
         ;;
     esac
   done
+  # If TapAuth seeded the /etc/pam.d/polkit-1 override from a vendor file in
+  # /usr/lib/pam.d, stripping the line can leave the override byte-identical
+  # to that vendor stack. In that case delete the override so the vendor file
+  # applies again. cmp -s is what makes this safe (any admin edit anywhere in
+  # the file keeps the override); skip entirely when cmp is unavailable.
+  if [ -f /etc/pam.d/polkit-1 ] && [ ! -L /etc/pam.d/polkit-1 ] \
+      && [ -f /usr/lib/pam.d/polkit-1 ] && command -v cmp >/dev/null 2>&1; then
+    if cmp -s /etc/pam.d/polkit-1 /usr/lib/pam.d/polkit-1; then
+      rm -f /etc/pam.d/polkit-1 2>/dev/null || true
+      echo ":: Removed TapAuth-created /etc/pam.d/polkit-1 override (matches vendor stack)"
+    fi
+  fi
   if [ ${#failed_files[@]} -gt 0 ]; then
     echo ":: WARNING: Could not automatically remove pam_tapauth.so from:"
     for f in "${failed_files[@]}"; do echo "::   $f"; done
@@ -238,7 +252,7 @@ pre_remove() {
   fi
   # Clean up orphaned .tapauth-bak backups of PAM stacks that no longer
   # reference pam_tapauth.so (e.g. upstream replaced the file again, or the
-  # backup was already restored). Files whose restore failed keep their
+  # strip above already cleaned it). Files whose strip failed keep their
   # backup, since they still reference pam_tapauth.so.
   for backup in /etc/pam.d/*.tapauth-bak; do
     [ -f "$backup" ] || continue

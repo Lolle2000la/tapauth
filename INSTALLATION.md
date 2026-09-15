@@ -8,7 +8,7 @@ You can install tapauth via native package repositories to receive automatic upd
 
 ### What the packages configure
 
-- **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). In `su` the line is inserted **after** `pam_rootok.so`/`pam_wheel.so` (and after `pam_env.so` when present), because `PAM_USER` for `su` is the target user — inserting it first would let a phone grant for `root` bypass the wheel/root checks. `login` is deliberately **not** patched.
+- **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks and keep a one-time `<file>.tapauth-bak` snapshot. On removal they **strip only the TapAuth line** and delete the snapshot (they never copy the snapshot back, so later admin/vendor changes survive); an explicit rollback is available via `uninstall.sh --restore-pam-backups`. Vendor-drift triggers/hooks re-apply the line after an upgrade of the owning package. In `su` the line is inserted **after** `pam_rootok.so`/`pam_wheel.so` (and after `pam_env.so` when present), because `PAM_USER` for `su` is the target user — inserting it first would let a phone grant for `root` bypass the wheel/root checks. `login` is deliberately **not** patched.
 - **The virtual fprintd bridge is opt-in and off by default.** The base packages ship no marker and no D-Bus activation file — only the D-Bus **policy** file that lets `tapauthd` own `net.reactivated.Fprint` when enabled. A base install therefore leaves the bus name to a real local fprintd. Install the optional `tapauth-fprintd-emulation` package (which ships the marker `/usr/share/tapauth/fprintd-emulation.enabled`) or set `enable_fprintd_bridge = true` to enable it. (On machines with no physical fingerprint reader, the optional package can also ship `pam_fprintd.so` itself — see [No physical fingerprint reader? Optional emulation package](#no-physical-fingerprint-reader-optional-emulation-package) below.)
 - **When enabled, desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No manual PAM edits and no local fingerprint reader required; stock fingerprint stacks call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service. The bridge state is read at `tapauthd` startup, so it applies on the next daemon restart.
 - **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot so the opt-in bridge can be claimed at startup); `tapauthd.service` is additionally started at install so the daemon answers IPC immediately.
@@ -26,7 +26,7 @@ sudo dnf install tapauth
   ```
   *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
-* **PAM Configuration:** The package scriptlets patch `sudo`, `su` and `polkit-1` directly (with pristine backups). Do **not** use `authselect` vendor profiles with TapAuth — current releases ship no authselect profiles. If you previously enabled one from an older TapAuth release (≤ 0.10.x), removing/upgrading the package rolls the selection back to the stock profile automatically.
+* **PAM Configuration:** The package scriptlets patch `sudo`, `su` and `polkit-1` directly (one-time `.tapauth-bak` snapshots). Removal strips only the TapAuth line and deletes the snapshots; a `%triggerin` re-applies the line after an upgrade of the owning package (`polkit`, `sudo`, `util-linux`/`coreutils`). Do **not** use `authselect` vendor profiles with TapAuth — current releases ship no authselect profiles. If you previously enabled one from an older TapAuth release (≤ 0.10.x), removing/upgrading the package rolls the selection back to the stock profile automatically.
 
 * **SELinux Integration:** On Fedora systems with SELinux in Enforcing mode, the package automatically installs the `tapauth.cil` policy module so desktop display managers (GDM, KDE Plasma) can communicate with the daemon socket. If you encounter any AVC denials after a major system update, reload the policy with:
   ```bash
@@ -46,7 +46,8 @@ sudo apt-get install tapauth
   ```
   *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
-* **PAM Configuration:** Installation patches `sudo`, `su` and `polkit-1` directly (originals kept as `<file>.tapauth-bak`). TapAuth does **not** register a `pam-auth-update` profile anymore. Upgrading from TapAuth ≤ 0.10.x (which used `pam-auth-update`) automatically regenerates the managed stacks so the old `common-auth` line is removed — on upgrade and on plain `apt remove tapauth`.
+* **PAM Configuration:** Installation patches `sudo`, `su` and `polkit-1` directly (one-time `<file>.tapauth-bak` snapshots; removal strips only the TapAuth line and deletes the snapshots). TapAuth does **not** register a `pam-auth-update` profile anymore. Upgrading from TapAuth ≤ 0.10.x (which used `pam-auth-update`) automatically regenerates the managed stacks so the old `common-auth` line is removed — on upgrade and on plain `apt remove tapauth`.
+* **Debian/Ubuntu PAM integration and policy note:** TapAuth edits PAM conffiles owned by other packages (`sudo`, `util-linux`, `policykit-1`), a deliberate, minimal deviation from Debian Policy §10.7.3/§10.7.4. It does not use `pam-auth-update` because that mechanism only manages the shared `common-*` stacks (and previously also hit `login`); the three-file scope is intentional. The reasoning, the one-time backup/removal-strip behaviour, the vendor-drift re-apply triggers and the manual `tapauthd-clients` opt-in are documented in the package's `/usr/share/doc/tapauth/README.Debian` (source: `packaging/debian/README.Debian`).
 
 ### 3. Arch Linux / CachyOS
 The packages are available via the Arch User Repository (AUR).
@@ -63,7 +64,7 @@ yay -S tapauth
   ```
   *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
-* **PAM Configuration:** The install scriptlet patches `sudo`, `su` and `polkit-1` (seeding `/etc/pam.d` overrides from `/usr/lib/pam.d` vendor files where applicable, with pristine `.tapauth-bak` backups). A libalpm hook re-applies the polkit-1 override when the `polkit` package is upgraded. No manual PAM editing is required.
+* **PAM Configuration:** The install scriptlet patches `sudo`, `su` and `polkit-1` (seeding `/etc/pam.d` overrides from `/usr/lib/pam.d` vendor files where applicable, with one-time `.tapauth-bak` snapshots). Removal strips only the TapAuth line and deletes the snapshots. A libalpm hook (`tapauth-pam-vendor-drift`) re-applies the line for `sudo`, `su` and `polkit-1` when the owning package is upgraded. No manual PAM editing is required.
 
 ## Desktop Lock Screen Integration (GNOME & KDE Plasma)
 
@@ -312,7 +313,9 @@ OPTIONS:
     -n, --non-interactive       Run in non-interactive mode
     -y, --yes                   Answer yes to all prompts (non-interactive; does NOT remove user data)
     --purge, --remove-user-data Remove user configuration data (keys, pairings; use with caution)
-    --restore-pam-backups       Restore original PAM configurations from .tapauth-bak files
+    --restore-pam-backups       Roll PAM files back to their install-time
+                                .tapauth-bak snapshots (default: strip only the
+                                TapAuth-inserted lines and delete the snapshots)
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
     --dry-run                   Show what would be done without doing it
 ```
@@ -394,7 +397,7 @@ auth    required      pam_deny.so         ← EXISTING: Deny if all methods fail
 
 This is a **safe, non-disruptive** configuration. Your system remains accessible even if:
 - Your phone is off or out of range
-- TapAuth is uninstalled (the package scriptlets restore the original stacks from `.tapauth-bak` copies)
+- TapAuth is uninstalled (the package scriptlets strip only the `pam_tapauth.so` lines; the `.tapauth-bak` snapshots are not copied back)
 - Network connectivity is unavailable
 
 **For detailed information about PAM integration, security, and troubleshooting, see the design document [Desktop & Lockscreen Integration Plan](docs/design-documents/desktop-and-lockscreen-integration-plan.md), the distro packaging scriptlets in `packaging/` (the source of truth for the PAM wiring), and [SELINUX.md](docs/SELINUX.md) for SELinux troubleshooting.**
@@ -481,10 +484,16 @@ Then run the install script normally with `sudo ./install.sh` - it will now buil
 
 If you get locked out:
 1. Boot into recovery mode or single-user mode
-2. Restore the original stacks from the `.tapauth-bak` copies (or remove the `pam_tapauth.so` lines):
+2. Strip the `pam_tapauth.so` lines (this is what package removal does by default):
    ```bash
    for f in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
-       [ -f "$f.tapauth-bak" ] && cp "$f.tapauth-bak" "$f"
+       [ -f "$f" ] && sed -i '/pam_tapauth\.so/d' "$f"
+   done
+   ```
+   Or, if a `.tapauth-bak` snapshot still exists and you explicitly want the install-time state back:
+   ```bash
+   for f in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
+       [ -s "$f.tapauth-bak" ] && cp -p "$f.tapauth-bak" "$f"
    done
    ```
 3. Reboot
@@ -592,8 +601,9 @@ The install script adds TapAuth as a `sufficient` module, which means:
 
 By default, the uninstall script preserves:
 - User encryption keys and paired devices in `/var/lib/tapauth/` (retained for reinstallation unless `--purge` is passed)
-- Pre-installation PAM backup files (`.tapauth-bak`) unless `--restore-pam-backups` is passed
 - System accounts (`tapauthd`, `tapauthd-clients`) when `--preserve-system-accounts` is passed
+
+By default it **deletes** the one-time `.tapauth-bak` snapshots after stripping the TapAuth lines; pass `--restore-pam-backups` to roll those files back to the snapshots instead.
 
 To completely purge everything including pairing keys:
 ```bash

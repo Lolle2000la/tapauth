@@ -1,0 +1,40 @@
+tapauth (0.11.0) unstable; urgency=medium
+
+  * The virtual fprintd bridge is now opt-in and off by default. A base
+    install ships no D-Bus activation file and no emulation marker, claims
+    no D-Bus name, and therefore leaves net.reactivated.Fprint to a real
+    local fprintd; a physical fingerprint reader is never shadowed. Set
+    enable_fprintd_bridge = true in /etc/tapauth/config.toml (or install the
+    optional package below) to enable it.
+
+  * The new optional tapauth-fprintd-emulation package enables the bridge
+    (it ships /usr/share/tapauth/fprintd-emulation.enabled) and, on machines
+    without (or not wanting) a physical reader, ships its own
+    pam_fprintd.so so stock fingerprint PAM stacks are served by TapAuth.
+    The base package deliberately does not conflict with fprintd or
+    libpam-fprintd.
+
+  * pam_tapauth.so is now inserted after pam_rootok.so/pam_wheel.so in
+    /etc/pam.d/su (and after pam_env.so when present), before the first auth
+    include. Because PAM_USER for su is the target user, the previous
+    top-of-stack insertion could let a phone grant for root bypass
+    pam_rootok/pam_wheel.
+
+  * Membership in the tapauthd-clients group is no longer granted
+    automatically. Each desktop user who needs the configuration GUI or
+    user-session lock-screen unlock must opt in and log back in:
+    sudo usermod -aG tapauthd-clients $USER. (install.sh adds only the user
+    who ran it.) Membership is not removed on uninstall/purge.
+
+  * tapauth-ipc-cli is no longer shipped by any package. It was a
+    testing-only admin tool and is left untouched on upgrade.
+
+  * Removing the package now strips only the TapAuth-inserted PAM line(s)
+    from /etc/pam.d/{sudo,su,polkit-1} and deletes the one-time
+    .tapauth-bak snapshots, instead of copying the snapshots back over the
+    files. This preserves any administrator or vendor changes made after
+    install. Vendor-drift triggers/hooks re-apply the line (guarded and
+    idempotent) when the owning package is upgraded. An explicit rollback is
+    available via the standalone uninstall.sh --restore-pam-backups.
+
+ -- Luca Auer <lolle2000.la+tapauth@gmail.com>  Tue, 15 Sep 2026 12:00:00 +0000

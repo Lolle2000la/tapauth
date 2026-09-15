@@ -143,7 +143,9 @@ OPTIONS:
     -y, --yes               Answer yes to all prompts (non-interactive; does NOT remove user data)
     -f, --force             Force uninstallation over package-managed files without prompting
     --purge, --remove-user-data Remove user data including pairing keys (use with caution)
-    --restore-pam-backups   Restore original PAM configurations from .tapauth-bak files
+    --restore-pam-backups   Roll PAM files back to their install-time
+                            .tapauth-bak snapshots (default: strip only the
+                            TapAuth-inserted lines and delete the snapshots)
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
     --fprintd-emulation     Remove the TapAuth pam_fprintd.so replacement and
                             restore the distro module from pam_fprintd.so.fprintd-bak
@@ -157,6 +159,12 @@ NOTES:
     - PAM configurations (all modified PAM files)
     - Configuration GUI
     
+    By default, PAM cleanup removes only the pam_tapauth.so lines from the
+    patched stacks and deletes the one-time .tapauth-bak snapshots. The
+    snapshots are NOT copied back, because they were taken once at install
+    time and would revert any later admin/vendor changes. Pass
+    --restore-pam-backups to roll the files back to those snapshots instead.
+
     If install.sh --fprintd-emulation was used, the pam_fprintd.so replacement
     is removed and any saved distro fprintd module is restored. This is
     auto-detected; a genuine distro pam_fprintd.so is never deleted.
@@ -464,13 +472,22 @@ remove_pam_config() {
             fi
         done
 
-        # Synthetic/special stacks (may be deleted or restored from backup)
+        # Synthetic/special stacks (may be deleted or stripped)
         for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint \
                         /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
             if [[ -f "$pam_file" ]]; then
                 show_pam_restore_diff "$pam_file"
             fi
         done
+
+        # One-time .tapauth-bak snapshots are deleted by default (removal
+        # strips only the TapAuth line); --restore-pam-backups opts into the
+        # rollback instead.
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            print_info "[DRY RUN] Would RESTORE PAM files from .tapauth-bak backups (--restore-pam-backups)"
+        else
+            print_info "[DRY RUN] Would delete stale .tapauth-bak backup files (default)"
+        fi
         return
     fi
 
@@ -481,6 +498,19 @@ remove_pam_config() {
             sed -i '/pam_tapauth\.so/d' "$pam_file"
         fi
     done
+
+    # If install.sh seeded the /etc/pam.d/polkit-1 override from a vendor
+    # file in /usr/lib/pam.d, stripping the line can leave the override
+    # byte-identical to that vendor stack. Delete it so the vendor file
+    # applies again; cmp -s keeps any admin edit, and a symlink is never
+    # removed here.
+    if [[ -f /etc/pam.d/polkit-1 && ! -L /etc/pam.d/polkit-1 \
+        && -f /usr/lib/pam.d/polkit-1 ]] && command -v cmp >/dev/null 2>&1; then
+        if cmp -s /etc/pam.d/polkit-1 /usr/lib/pam.d/polkit-1; then
+            print_info "Removing TapAuth-created /etc/pam.d/polkit-1 override (matches vendor stack)"
+            rm -f /etc/pam.d/polkit-1
+        fi
+    fi
 
     # Synthetic GDM fingerprint stacks: remove outright when they are ours,
     # otherwise strip the TapAuth line.
@@ -509,61 +539,48 @@ remove_pam_config() {
     fi
 
     # Best-effort legacy cleanup: older versions patched the Fedora
-    # fingerprint-auth stack directly. Restore it from its backup when one
-    # exists; otherwise drop the TapAuth lines.
+    # fingerprint-auth stack directly. Strip only the TapAuth lines (never
+    # copy the snapshot back); synthetic files are ours and are deleted.
     if [[ -f /etc/pam.d/fingerprint-auth ]]; then
         if grep -q "Managed by TapAuth" /etc/pam.d/fingerprint-auth 2>/dev/null; then
             print_info "Removing synthetic fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
             rm -f /etc/pam.d/fingerprint-auth /etc/pam.d/fingerprint-auth.tapauth-bak
         elif grep -q "pam_tapauth.so" /etc/pam.d/fingerprint-auth 2>/dev/null; then
-            if [ -s /etc/pam.d/fingerprint-auth.tapauth-bak ]; then
-                print_info "Restoring original fingerprint-auth PAM configuration from backup"
-                cp -p /etc/pam.d/fingerprint-auth.tapauth-bak /etc/pam.d/fingerprint-auth
-                rm -f /etc/pam.d/fingerprint-auth.tapauth-bak
-            else
-                print_info "Removing TapAuth from fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
-                sed -i '/pam_tapauth\.so/d' /etc/pam.d/fingerprint-auth
-            fi
+            print_info "Removing TapAuth from fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/fingerprint-auth
+            rm -f /etc/pam.d/fingerprint-auth.tapauth-bak 2>/dev/null || true
         else
             # Stack no longer references TapAuth; drop a stale backup.
             rm -f /etc/pam.d/fingerprint-auth.tapauth-bak 2>/dev/null || true
         fi
     fi
-    
-    # Restore PAM backups if present — warn the user since restoring may revert security updates
+
+    # Handle the one-time .tapauth-bak snapshots. The default is to DELETE
+    # them: removal above strips only the TapAuth-inserted line, so the
+    # snapshots are stale and copying one back would revert later admin or
+    # vendor edits. --restore-pam-backups explicitly opts into the rollback.
+    # Both /etc/pam.d and /usr/lib/pam.d are scanned: install.sh patches the
+    # vendor file under /usr/lib/pam.d directly when no /etc override exists.
     local bak_files=()
-    for bak in /etc/pam.d/*.tapauth-bak; do
+    for bak in /etc/pam.d/*.tapauth-bak /usr/lib/pam.d/*.tapauth-bak; do
         [[ -f "$bak" ]] && bak_files+=("$bak")
     done
-    
+
     if [[ ${#bak_files[@]} -gt 0 ]]; then
-        print_warning "Found PAM backup files from original TapAuth installation:"
-        for bak in "${bak_files[@]}"; do
-            echo "  - $bak"
-        done
-        print_warning "Restoring these may revert security updates made after TapAuth was installed."
-        
-        local restore="false"
         if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
-            restore="true"
-        elif [[ "$INTERACTIVE" == false ]]; then
-            restore="false"
-            print_info "Non-interactive mode: skipping PAM backup restoration (use --restore-pam-backups to restore)."
-        else
-            read -rp "Restore original PAM files from backups? [y/N] " confirm
-            [[ "$confirm" =~ ^[Yy]$ ]] && restore="true"
-        fi
-        
-        if [[ "$restore" == true ]]; then
+            print_warning "Restoring original PAM files from .tapauth-bak backups (--restore-pam-backups)"
+            print_warning "This rolls back any PAM changes made after TapAuth was installed."
             for bak in "${bak_files[@]}"; do
                 local orig="${bak%.tapauth-bak}"
                 print_info "Restoring original PAM configuration for $orig"
-                cp -p "$bak" "$orig"
+                cp -p "$bak" "$orig" 2>/dev/null || true
                 rm -f "$bak"
             done
         else
+            print_info "Removing stale PAM backup files (default; pass --restore-pam-backups to restore instead)"
             for bak in "${bak_files[@]}"; do
-                print_info "Leaving backup file: $bak (delete manually if not needed)"
+                print_info "Removing backup file: $bak"
+                rm -f "$bak" 2>/dev/null || true
             done
         fi
     fi
@@ -987,6 +1004,11 @@ main() {
         echo ""
         echo "PAM configurations:"
         echo "  ✓ All PAM files will be cleaned (login, sudo, polkit, system-auth, display managers, etc.)"
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            echo "  ✓ .tapauth-bak snapshots will be restored (--restore-pam-backups)"
+        else
+            echo "  ✓ .tapauth-bak snapshots will be deleted (use --restore-pam-backups to restore)"
+        fi
         
         echo ""
         echo "User data:"

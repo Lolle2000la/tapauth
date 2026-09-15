@@ -381,47 +381,55 @@ if { [ "$1" -eq 0 ] || [ "$1" -eq 1 ]; } && command -v authselect >/dev/null 2>&
 fi
 %endif
 if [ $1 -eq 0 ]; then
-    # Restore the three PAM services in scope from their pristine backups.
+    # Strip the TapAuth-inserted line(s) from the three PAM services in
+    # scope (sudo, su, polkit-1) and drop the one-time snapshot. The
+    # .tapauth-bak copy is deliberately NOT restored over the file: it was
+    # taken once at install time, so copying it back would silently revert
+    # every admin edit and vendor/distro update made since. (An admin who
+    # really wants the install-time snapshot back can restore it manually
+    # from the .tapauth-bak copy — or via the standalone uninstall.sh
+    # --restore-pam-backups path.) Removing only our line cannot lock
+    # anyone out, and stays best-effort so removal never fails.
     for pam_svc in sudo su polkit-1; do
         pam_file="/etc/pam.d/${pam_svc}"
         if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
             continue
         fi
-        if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-            # Stack no longer references TapAuth; drop a stale backup
-            # without clobbering the file.
-            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-            continue
-        fi
-        if [ -s "${pam_file}.tapauth-bak" ]; then
-            if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
-                rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-            fi
-        else
-            sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
-        fi
+        sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+        rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
     done
+    # If TapAuth seeded the /etc/pam.d/polkit-1 override from a vendor file
+    # in /usr/lib/pam.d, stripping the line can leave the override
+    # byte-identical to that vendor stack. In that case delete the override
+    # so the vendor file applies again. cmp -s is what makes this safe (any
+    # admin edit anywhere in the file keeps the override); skip entirely
+    # when cmp is unavailable. Never remove a symlink.
+    if [ -f /etc/pam.d/polkit-1 ] && [ ! -L /etc/pam.d/polkit-1 ] \
+        && [ -f /usr/lib/pam.d/polkit-1 ] && command -v cmp >/dev/null 2>&1; then
+        if cmp -s /etc/pam.d/polkit-1 /usr/lib/pam.d/polkit-1; then
+            rm -f /etc/pam.d/polkit-1 2>/dev/null || true
+        fi
+    fi
     # Best-effort cleanup for upgrades from older versions, which patched
     # fingerprint stacks (kde-fingerprint, gdm-fingerprint,
-    # gdm3-fingerprint, fingerprint-auth) directly. Restore the original
-    # stack when a backup exists; otherwise drop the TapAuth lines (and
-    # synthetic files).
+    # gdm3-fingerprint, fingerprint-auth) directly. Synthetic
+    # "# Managed by TapAuth" files are deleted; real vendor stacks have only
+    # the TapAuth lines stripped (the snapshot is dropped, never copied
+    # back — see above).
     for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/fingerprint-auth; do
         if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
             continue
         fi
-        if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null \
+            && ! grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
             rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
             continue
         fi
         if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
             rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        elif [ -s "${pam_file}.tapauth-bak" ]; then
-            if cp -p "${pam_file}.tapauth-bak" "$pam_file" 2>/dev/null; then
-                rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
-            fi
         else
             sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+            rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
         fi
     done
     # Remove the GDM dconf override written by older versions.
@@ -447,35 +455,61 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl try-restart tapauthd.service 2>/dev/null || true
 fi
 
-# polkit vendor-drift protection: when the polkit package is installed or
-# upgraded, its PAM vendor stack changes. Depending on the distro release
-# the vendor file is /usr/lib/pam.d/polkit-1 (with our /etc/pam.d override
-# shadowing it forever) or /etc/pam.d/polkit-1 itself (replaced on upgrade,
-# dropping our line). Re-seed the override from the new vendor file (when
-# present) and re-apply the TapAuth line — but only when TapAuth has
-# patched the file before (the .tapauth-bak marker created by the
-# post-install scriptlet). The backup is refreshed so a later removal
-# restores the CURRENT vendor stack. Idempotent; a no-op when TapAuth never
-# touched polkit-1.
-%triggerin -- polkit
-pam_file="/etc/pam.d/polkit-1"
-if [ -f "$pam_file" ] && [ -f "${pam_file}.tapauth-bak" ]; then
-    if [ -f /usr/lib/pam.d/polkit-1 ]; then
-        cp -p /usr/lib/pam.d/polkit-1 "${pam_file}.tapauth-bak" 2>/dev/null || true
-        cp -p /usr/lib/pam.d/polkit-1 "$pam_file" 2>/dev/null || true
+# PAM vendor-drift protection: when the package owning one of the PAM
+# service files TapAuth patched is installed or upgraded (polkit -> polkit-1,
+# sudo -> sudo, util-linux/coreutils -> su), its vendor stack changes.
+# Depending on the distro release the vendor file is /usr/lib/pam.d/<svc>
+# (with our /etc/pam.d override shadowing it forever) or /etc/pam.d/<svc>
+# itself (replaced on upgrade, dropping our line). Re-seed the override from
+# the new vendor file (when present) and re-apply the TapAuth line — but only
+# when TapAuth has patched that file before (the .tapauth-bak marker created
+# by the post-install scriptlet), and only when the line is missing
+# (idempotent). For `su` the same insertion rule as the post-install
+# scriptlet applies (after pam_rootok/pam_wheel, before the first auth
+# include). The snapshot is refreshed from the current unpatched file, which
+# also keeps the explicit rollback path current. Idempotent; a no-op when
+# TapAuth never touched the file.
+%triggerin -- polkit sudo util-linux coreutils
+pam_line="auth        sufficient    pam_tapauth.so"
+for pam_svc in sudo su polkit-1; do
+    pam_file="/etc/pam.d/${pam_svc}"
+    if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+        continue
     fi
-    if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
-        # Refresh the pristine backup from the (currently unpatched)
-        # vendor stack, then insert the TapAuth line after the header.
-        cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
-        pam_line="auth        sufficient    pam_tapauth.so"
-        if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+    if [ ! -f "${pam_file}.tapauth-bak" ]; then
+        continue
+    fi
+    if [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+        cp -p "/usr/lib/pam.d/${pam_svc}" "${pam_file}.tapauth-bak" 2>/dev/null || true
+        cp -p "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || true
+    fi
+    if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+        continue
+    fi
+    # Refresh the snapshot from the current (unpatched) stack so a later
+    # explicit rollback / removal keeps a current copy, then insert the line.
+    cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+    if [ "$pam_svc" = "su" ]; then
+        # PAM_USER for su is the TARGET user: insert after the
+        # pam_rootok/pam_wheel block and before the first auth include
+        # (system-auth / common-auth / @include), never at the top.
+        pam_anchor=$(awk '
+            /^[[:space:]]*#/ { next }
+            /(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+        ' "$pam_file")
+        if [ -n "$pam_anchor" ]; then
+            sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+        elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
             sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
         else
             sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
         fi
+    elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+        sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+    else
+        sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
     fi
-fi
+done
 
 %files
 %license LICENSE

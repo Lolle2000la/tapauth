@@ -1,31 +1,51 @@
 #!/bin/sh
 set -e
 if [ "$1" = "triggered" ]; then
-	# polkit vendor-drift protection (see tapauth.triggers): polkitd was
-	# installed/upgraded, so its PAM vendor stack changed. Depending on
-	# the release the vendor file is /usr/lib/pam.d/polkit-1 (with our
-	# /etc/pam.d override shadowing it forever) or /etc/pam.d/polkit-1
-	# itself (replaced on upgrade, dropping our line). Re-seed the
-	# override from the new vendor file (when present) and re-apply
-	# the TapAuth line — but only when TapAuth has patched the file
-	# before (the .tapauth-bak marker created by the configure step
-	# below). The backup is refreshed so a later removal restores the
-	# CURRENT vendor stack. Idempotent; a no-op when TapAuth never
-	# touched polkit-1.
+	# PAM vendor-drift protection (see tapauth.triggers): the package that
+	# owns one of the PAM service files TapAuth patched (sudo, su, polkit-1)
+	# was installed/upgraded, so its vendor stack changed. Depending on the
+	# distro/release the vendor file is in /usr/lib/pam.d (with our
+	# /etc/pam.d override shadowing it forever) or is /etc/pam.d/<service>
+	# itself (replaced on upgrade, dropping our line). Re-seed the override
+	# from the new vendor file (when present) and re-apply the TapAuth line
+	# — but only when TapAuth has patched that file before (the
+	# .tapauth-bak marker created by the configure step below), and only
+	# when the line is missing (idempotent). The snapshot is refreshed from
+	# the current unpatched file, which also keeps the explicit
+	# --restore-pam-backups path (install.sh/uninstall.sh) current.
 	shift
 	for trigger in "$@"; do
 		case "$trigger" in
-			*/polkit-1)
-				pam_file="/etc/pam.d/polkit-1"
-				if [ -f "$pam_file" ] && [ -f "${pam_file}.tapauth-bak" ]; then
-					if [ -f /usr/lib/pam.d/polkit-1 ]; then
-						cp -p /usr/lib/pam.d/polkit-1 "${pam_file}.tapauth-bak" 2>/dev/null || true
-						cp -p /usr/lib/pam.d/polkit-1 "$pam_file" 2>/dev/null || true
+			*/sudo|*/su|*/polkit-1)
+				pam_svc="${trigger##*/}"
+				pam_file="/etc/pam.d/${pam_svc}"
+				if [ -f "$pam_file" ] && [ ! -L "$pam_file" ] \
+					&& [ -f "${pam_file}.tapauth-bak" ]; then
+					if [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+						cp -p "/usr/lib/pam.d/${pam_svc}" "${pam_file}.tapauth-bak" 2>/dev/null || true
+						cp -p "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || true
 					fi
 					if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
 						cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
 						pam_line="auth    sufficient    pam_tapauth.so"
-						if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+						if [ "$pam_svc" = "su" ]; then
+							# PAM_USER for su is the TARGET user, so the
+							# same insertion rule as the configure step
+							# applies: after pam_rootok/pam_wheel, before
+							# the first auth include (common-auth /
+							# system-auth / @include).
+							pam_anchor=$(awk '
+								/^[[:space:]]*#/ { next }
+								/(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+							' "$pam_file")
+							if [ -n "$pam_anchor" ]; then
+								sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+							elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+								sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+							else
+								sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+							fi
+						elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
 							sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
 						else
 							sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
