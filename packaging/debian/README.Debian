@@ -33,8 +33,8 @@ Debian's `pam-auth-update` mechanism manages the shared `common-*` stacks
 (`common-auth`, `common-account`, ...), not the service files
 `/etc/pam.d/{sudo,su,polkit-1}`. Registering a `pam-auth-update` profile
 therefore cannot express TapAuth's intended scope: in earlier releases it
-also ended up wiring the module into `login`. Since TapAuth 0.11.0 no
-profile is shipped and the three-file scope above is applied directly, which
+also ended up wiring the module into `login`. No profile is shipped any
+more and the three-file scope above is applied directly, which
 is deliberate. Upgrading from a <= 0.10.x release that shipped a
 `/usr/share/pam-configs/tapauth` profile automatically regenerates the
 pam-auth-update-managed stacks so the stale generated line in

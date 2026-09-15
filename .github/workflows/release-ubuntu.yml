@@ -91,6 +91,13 @@ jobs:
           chmod +x debian/rules debian/tapauth.postinst debian/tapauth.postrm debian/tapauth.prerm \
             debian/tapauth-fprintd-emulation.postinst debian/tapauth-fprintd-emulation.postrm
 
+          # The release tag drives the version (Cargo.toml's is only a CI-test
+          # placeholder); keep the Debian NEWS header in lockstep so dpkg shows
+          # the entry when upgrading to this release.
+          if [ -f debian/NEWS ]; then
+            sed -i "1s/^tapauth ([^)]*)/tapauth (${{ steps.version_vars.outputs.VERSION }})/" debian/NEWS
+          fi
+
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))
           cd ..
