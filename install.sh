@@ -584,6 +584,7 @@ create_system_users() {
         if [[ -n "$install_user" ]]; then
             echo "  • usermod -aG tapauthd-clients $install_user"
         fi
+        echo "  • usermod -aG tapauthd-clients <each existing interactive local user>"
         
         echo "  • mkdir -p $CONFIG_DIR && chown -R tapauthd:tapauthd $CONFIG_DIR && chmod 700 $CONFIG_DIR"
         echo "  • mkdir -p /var/log/tapauth && chown tapauthd:tapauthd /var/log/tapauth && chmod 755 /var/log/tapauth"
@@ -632,6 +633,29 @@ create_system_users() {
     else
         print_warning "Could not determine installing user - you may need to manually add your user to the tapauthd-clients group:"
         print_warning "  sudo usermod -aG tapauthd-clients \$USER"
+    fi
+
+    # Extend the same rule to every existing interactive local user (parity
+    # with the distro packages): user-session components like KDE's
+    # kscreenlocker_worker run as the logged-in user and can only reach the
+    # daemon socket for the opt-in pam_fprintd.so emulation path when they are
+    # in tapauthd-clients. Root auth helpers/greeters are unaffected.
+    local added_users=()
+    while IFS= read -r member; do
+        [[ -n "$member" ]] || continue
+        if [[ -n "$install_user" && "$member" == "$install_user" ]]; then
+            continue
+        fi
+        if id -nG "$member" 2>/dev/null | grep -qw tapauthd-clients; then
+            continue
+        fi
+        if usermod -aG tapauthd-clients "$member" 2>/dev/null; then
+            added_users+=("$member")
+        fi
+    done < <(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' || true)
+    if [[ ${#added_users[@]} -gt 0 ]]; then
+        print_info "Added existing interactive users to 'tapauthd-clients': ${added_users[*]}"
+        print_warning "They must log out and back in for group membership to take effect"
     fi
 
     # Ensure configuration directory ownership and permissions

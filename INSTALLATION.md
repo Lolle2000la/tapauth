@@ -13,6 +13,7 @@ You can install tapauth via native package repositories to receive automatic upd
 - **Desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No extra package, no manual PAM edits, no local fingerprint reader required.
 - **Collision-free D-Bus activation file.** TapAuth ships a renamed activation file (`net.reactivated.Fprint.tapauth.service`) that can never collide with real fprintd's own `net.reactivated.Fprint.service`. Verified with `dbus-daemon` and `dbus-broker`: both only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder and real fprintd keeps full control of on-demand activation.
 - **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot for the lock-screen bridge); `tapauthd.service` is additionally started at install so the virtual fprintd bridge is live immediately.
+- **Socket access for desktop users:** on install/upgrade the package automatically adds every existing interactive local user (UID ≥ 1000 and a real login shell) to the `tapauthd-clients` group, so user-session components (e.g. KDE's `kscreenlocker_worker`, which runs as the logged-in user) can reach `/run/tapauthd/tapauthd.sock` (`root:tapauthd-clients`, mode `0660`). Users created later are picked up on the next package upgrade. The change is non-fatal and idempotent, and the membership is **not** removed on uninstall/purge. **The affected users must log out and back in** (or otherwise re-initialise their process's group list) for it to take effect. This only matters for user-session lockers / the opt-in `pam_fprintd.so` emulation path — greeters and auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
 
 ### 1. Fedora Linux
 Packages are built and tracked using Fedora COPR.
@@ -20,11 +21,11 @@ Packages are built and tracked using Fedora COPR.
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
 ```
-* **Group Membership:** To configure TapAuth via the `tapauth-config` GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
+* **Group Membership:** The package automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group on install/upgrade. To add any remaining user manually (or grant GUI/admin access explicitly):
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in for group membership to take effect).*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
 
 * **PAM Configuration:** The package scriptlets patch `sudo`, `su` and `polkit-1` directly (with pristine backups). Do **not** use `authselect` vendor profiles with TapAuth — current releases ship no authselect profiles. If you previously enabled one from an older TapAuth release (≤ 0.10.x), removing/upgrading the package rolls the selection back to the stock profile automatically.
 
@@ -40,11 +41,11 @@ sudo add-apt-repository ppa:lolle2000la/tapauth
 sudo apt-get update
 sudo apt-get install tapauth
 ```
-* **Group Membership:** To configure TapAuth via the GUI and authorize authentication requests, add your user to the `tapauthd-clients` group:
+* **Group Membership:** The package automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group on install/upgrade, (users created later are picked up on the next package upgrade). To add any remaining user manually (or grant GUI/admin access explicitly):
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in for group membership to take effect).*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
 
 * **PAM Configuration:** Installation patches `sudo`, `su` and `polkit-1` directly (originals kept as `<file>.tapauth-bak`). TapAuth does **not** register a `pam-auth-update` profile anymore. Upgrading from TapAuth ≤ 0.10.x (which used `pam-auth-update`) automatically regenerates the managed stacks so the old `common-auth` line is removed — on upgrade and on plain `apt remove tapauth`.
 
@@ -57,11 +58,11 @@ yay -S tapauth
 ```
 * **Service Activation:** The install scriptlet applies the shipped systemd preset (`tapauthd.socket` enabled, `tapauthd.service` started at install), so no manual `systemctl enable --now` is required.
 
-* **Group Membership:** Add your user to the `tapauthd-clients` group:
+* **Group Membership:** The install/upgrade scriptlet automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group. To add any remaining user manually (or grant GUI/admin access explicitly):
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in for group membership to take effect).*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
 
 * **PAM Configuration:** The install scriptlet patches `sudo`, `su` and `polkit-1` (seeding `/etc/pam.d` overrides from `/usr/lib/pam.d` vendor files where applicable, with pristine `.tapauth-bak` backups). A libalpm hook re-applies the polkit-1 override when the `polkit` package is upgraded. No manual PAM editing is required.
 
@@ -609,8 +610,9 @@ If you encounter issues:
 ### Socket access policy
 
 The IPC socket `/run/tapauthd/tapauthd.sock` is created as `root:tapauthd-clients` with mode `0660`.
-- The installer creates the group `tapauthd-clients` and automatically adds the installing user to it.
-- A logout/login cycle is required for the new group membership to take effect.
+- Every install method creates the group `tapauthd-clients` and adds the relevant users to it: `install.sh` adds the installing user plus every existing interactive local user; the distribution packages do the same in their post-install scriptlet (users created later are picked up on the next package upgrade).
+- A logout/login cycle (or otherwise re-initialising the process's group list) is required for the new group membership to take effect.
+- Membership is intentionally **not** removed on uninstall/purge (only the group itself is removed on purge), so a reinstall does not have to re-add every user.
 - If you need to grant access to additional users, add them manually:
   ```bash
   sudo usermod -aG tapauthd-clients $USER

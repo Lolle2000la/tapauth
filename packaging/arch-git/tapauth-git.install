@@ -1,3 +1,34 @@
+# Add existing interactive local users to tapauthd-clients so user-session
+# components (e.g. KDE's kscreenlocker_worker, which runs as the logged-in
+# user) can reach /run/tapauthd/tapauthd.sock (root:tapauthd-clients 0660).
+# This matters for the opt-in pam_fprintd.so emulation path; greeters and
+# auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
+# Non-fatal and idempotent; memberships are left in place on removal.
+add_desktop_users_to_clients_group() {
+  if ! command -v usermod >/dev/null 2>&1 || ! getent group tapauthd-clients >/dev/null 2>&1; then
+    echo ":: Could not add existing users to tapauthd-clients (group or usermod unavailable)."
+    echo "::   Add them manually with:  sudo usermod -aG tapauthd-clients \$USER"
+    return 0
+  fi
+  local added="" member
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    id -nG "$member" 2>/dev/null | grep -qw tapauthd-clients && continue
+    if usermod -aG tapauthd-clients "$member" 2>/dev/null; then
+      added="$added $member"
+    fi
+  done <<EOF
+$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' || true)
+EOF
+  if [ -n "$added" ]; then
+    echo ":: Added existing interactive users to tapauthd-clients:$added"
+    echo "::   They must log out and back in (or re-init their groups) for it to take effect."
+  else
+    echo ":: No existing interactive users needed adding to tapauthd-clients."
+  fi
+  return 0
+}
+
 post_install() {
   systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
   systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
@@ -81,8 +112,9 @@ post_install() {
   echo ":: To keep a real local fingerprint reader instead: install fprintd, set"
   echo "::   enable_fprintd_bridge = false in /etc/tapauth/config.toml and restart the daemon"
   echo "::   (systemctl restart tapauthd.service) — tapauthd then never claims the bus name."
-  echo ":: To allow your user to configure TapAuth via GUI, add yourself to the tapauthd-clients group:"
-  echo "::   sudo usermod -aG tapauthd-clients \$USER"
+  # Grant existing desktop users access to the daemon socket (GUI + the
+  # opt-in pam_fprintd.so emulation path); see the helper above.
+  add_desktop_users_to_clients_group
 }
 
 post_upgrade() {
@@ -129,6 +161,8 @@ post_upgrade() {
     echo "::   fingerprint reader instead, install fprintd, set enable_fprintd_bridge = false"
     echo "::   in /etc/tapauth/config.toml and restart tapauthd.service."
   fi
+  # Also cover users created/missed on earlier installs.
+  add_desktop_users_to_clients_group
 }
 
 pre_remove() {

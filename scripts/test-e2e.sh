@@ -931,7 +931,8 @@ assert_log_since() {
 
 # Helper: block until a pattern appears in the daemon log after `base`, or
 # fail after `max_ticks` tenths of a second. Used to synchronise with the
-# daemon deterministically instead of sleeping a fixed guess.
+# daemon deterministically instead of sleeping a fixed guess. Returns 1 on
+# timeout so callers can dump their own client logs before failing.
 wait_for_log_line() {
     local base=$1 pattern=$2 max_ticks=$3 label=$4
     local tick=0
@@ -943,7 +944,7 @@ wait_for_log_line() {
         tick=$((tick + 1))
     done
     echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log within $((max_ticks / 10))s."
-    exit 1
+    return 1
 }
 
 # ── BLE scan resiliency helpers ───────────────────────────────────────────────
@@ -1280,8 +1281,21 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ] && [ -n "$ROOT_SHADOW_HA
     # is confirmed — waiting on the audit line keeps the race tight and
     # deterministic (a fixed sleep could drift past the 1s window on a slow
     # runner).
-    wait_for_log_line "$LOG_BASE" "server(s) authorized for user $TEST_USER" 100 \
-        "auth #1 broadcast start"
+    if ! wait_for_log_line "$LOG_BASE" "server(s) authorized for user $TEST_USER" 100 \
+        "auth #1 broadcast start"; then
+        echo "❌ ERROR: auth #1 never reached the daemon (no broadcast observed) — test inconclusive."
+        echo "--- auth #1 client log ($DUP1_LOG) ---"
+        cat "$DUP1_LOG" 2>/dev/null || true
+        echo "--- caller identity (root) ---"
+        id 2>/dev/null || true
+        id -nG 2>/dev/null || true
+        echo "--- daemon log tail ---"
+        tail -n 40 "$DAEMON_LOG" 2>/dev/null || true
+        kill -9 "$DUP1_PID" 2>/dev/null || true
+        restore_test_user_password
+        trap cleanup EXIT INT TERM
+        exit 1
+    fi
     if ! kill -0 "$DUP1_PID" 2>/dev/null; then
         echo "❌ ERROR: auth #1 did not stay in flight — test inconclusive."
         restore_test_user_password
@@ -1518,7 +1532,8 @@ fprintd_emu_run_pamtester() {
 # broadcasting for `pam_user`, fires the given emulator-bio-helper action
 # (grant/deny), then waits for pamtester. $1 action, $2 run-as (empty=root),
 # $3 PAM username, $4 timeout seconds, $5 log file, $6 label, $7 optional
-# service name. Returns pamtester's exit code.
+# service name. Returns pamtester's exit code, or 1 if the client never
+# reached the daemon (the failure is dumped to the log before returning).
 fprintd_emu_auth_with_action() {
     local action="$1" run_as="$2" pam_user="$3" tmo="$4" log="$5" label="$6" svc="${7:-$FPRINTD_EMU_SERVICE}"
     local base pid rc
@@ -1536,8 +1551,28 @@ fprintd_emu_auth_with_action() {
     fi
     pid=$!
     # Wait for the daemon to actually broadcast (deterministic, unlike a sleep).
-    wait_for_log_line "$base" "server(s) authorized for user $pam_user" 200 \
-        "fprintd emulation ${label}: daemon broadcast"
+    # A timeout means the client never reached the daemon (e.g. runuser/pamtester
+    # missing): dump the client log and caller identity so the cause is obvious,
+    # then return non-success instead of killing the suite from inside a helper.
+    if ! wait_for_log_line "$base" "server(s) authorized for user $pam_user" 200 \
+        "fprintd emulation ${label}: daemon broadcast"; then
+        echo "❌ ERROR (fprintd emulation ${label}): the client never reached the daemon (no broadcast observed)."
+        echo "--- client/pamtester log ($log) ---"
+        cat "$log" 2>/dev/null || echo "(no log produced)"
+        echo "--- run-as identity (${run_as:-current user}) ---"
+        if [ -n "$run_as" ]; then
+            id "$run_as" 2>/dev/null || true
+            id -nG "$run_as" 2>/dev/null || true
+        else
+            id 2>/dev/null || true
+            id -nG 2>/dev/null || true
+        fi
+        echo "--- daemon log tail ---"
+        tail -n 40 "$DAEMON_LOG" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+    fi
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" "$action" "$APP_PKG"
     set +e
     wait_pid_with_timeout "$pid" "$((tmo + 5))"
@@ -1623,6 +1658,15 @@ if [ "$FPRINTD_EMU_TESTABLE" = "1" ]; then
     if ! getent group tapauthd-clients >/dev/null 2>&1; then
         echo "⚠️  Non-root socket cases skipped: group 'tapauthd-clients' does not exist."
     else
+        # Preflight: every non-root case below runs pamtester through `runuser`.
+        # If it is missing (e.g. a minimal container without util-linux), fail
+        # immediately with an actionable message instead of a 20s opaque
+        # timeout inside the auth helper.
+        if ! command -v runuser >/dev/null 2>&1; then
+            echo "❌ ERROR: non-root socket cases require 'runuser' but it is not installed."
+            echo "   Install util-linux (provides runuser/su/setpriv), or run on a host that has it."
+            exit 1
+        fi
         for _fprintd_emu_user in "$FPRINTD_EMU_MEMBER_USER" "$FPRINTD_EMU_OUTSIDER_USER"; do
             if ! id "$_fprintd_emu_user" >/dev/null 2>&1; then
                 if useradd -m "$_fprintd_emu_user" >/dev/null 2>&1; then
@@ -1658,17 +1702,37 @@ if [ "$FPRINTD_EMU_TESTABLE" = "1" ]; then
 
         # 2j-4: non-root caller OUTSIDE tapauthd-clients -> fast non-success
         echo "==> Phase 2j-4: non-root caller outside 'tapauthd-clients' must fail fast (no hang)..."
+        FPRINTD_EMU_OUTSIDER_LOG="${TEST_DIR}/fprintd-emu-outsider.log"
+        rm -f "$FPRINTD_EMU_OUTSIDER_LOG"
         FPRINTD_EMU_START=$SECONDS
-        if fprintd_emu_run_pamtester "$FPRINTD_EMU_OUTSIDER_USER" "$TEST_USER" 20 "${TEST_DIR}/fprintd-emu-outsider.log"; then
+        if fprintd_emu_run_pamtester "$FPRINTD_EMU_OUTSIDER_USER" "$TEST_USER" 20 "$FPRINTD_EMU_OUTSIDER_LOG"; then
             echo "❌ ERROR: a caller outside tapauthd-clients reached the daemon and authenticated."
             exit 1
         else
             FPRINTD_EMU_ELAPSED=$(( SECONDS - FPRINTD_EMU_START ))
-            cat "${TEST_DIR}/fprintd-emu-outsider.log" 2>/dev/null || true
-            if [ "$FPRINTD_EMU_ELAPSED" -le 25 ]; then
+            echo "--- outsider pamtester log ($FPRINTD_EMU_OUTSIDER_LOG) ---"
+            cat "$FPRINTD_EMU_OUTSIDER_LOG" 2>/dev/null || echo "(no log produced)"
+            echo "--- outsider identity ---"
+            id "$FPRINTD_EMU_OUTSIDER_USER" 2>/dev/null || true
+            id -nG "$FPRINTD_EMU_OUTSIDER_USER" 2>/dev/null || true
+            if [ ! -s "$FPRINTD_EMU_OUTSIDER_LOG" ]; then
+                echo "❌ ERROR: outsider pamtester produced no output — the client never ran (pamtester/runuser missing?)."
+                exit 1
+            fi
+            if [ "$FPRINTD_EMU_ELAPSED" -gt 25 ]; then
+                echo "❌ ERROR: outsider took ${FPRINTD_EMU_ELAPSED}s (expected a fast socket-permission failure)."
+                exit 1
+            fi
+            # The non-success must actually be the socket gate rejecting the
+            # connect, not (say) a missing module or a client that never ran.
+            # The emulation build's user-facing text is pam-cannot-connect in
+            # client-pam/locales/en/main.ftl ("TapAuth: Cannot connect to
+            # daemon, trying password..."), and pam_logic.rs logs the underlying
+            # connect error ("Failed to connect to tapauthd: ...").
+            if grep -qiE 'cannot connect|failed to connect|permission denied|connection refused' "$FPRINTD_EMU_OUTSIDER_LOG"; then
                 echo "✅ Outsider ('${FPRINTD_EMU_OUTSIDER_USER}') was denied by the socket gate in ${FPRINTD_EMU_ELAPSED}s."
             else
-                echo "❌ ERROR: outsider took ${FPRINTD_EMU_ELAPSED}s (expected a fast socket-permission failure)."
+                echo "❌ ERROR: outsider failed for a reason other than the socket gate (no connect/permission failure in the log)."
                 exit 1
             fi
         fi

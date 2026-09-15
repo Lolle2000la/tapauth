@@ -30,7 +30,7 @@ EOF
 case "$DISTRO" in
     fedora)
         echo "==> Installing Fedora runtime requirements..."
-        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus dbus-tools procps-ng iproute android-tools systemd bluez bluez-deprecated
+        dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus dbus-tools procps-ng iproute android-tools systemd bluez bluez-deprecated util-linux
 
         echo "==> Installing pre-built Fedora RPM packages..."
         dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm

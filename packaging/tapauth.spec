@@ -277,9 +277,39 @@ echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
 echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
 echo "         stay stock: lock screens and greeters integrate through the"
 echo "         built-in virtual fprintd service (no real reader required)."
-echo "TapAuth: To use the configuration GUI, add your user to the"
-echo "         tapauthd-clients group:"
-echo "         sudo usermod -aG tapauthd-clients \$USER"
+# Add existing interactive local users to tapauthd-clients so user-session
+# components (e.g. KDE's kscreenlocker_worker, which runs as the logged-in
+# user) can reach /run/tapauthd/tapauthd.sock (root:tapauthd-clients 0660).
+# This matters for the opt-in pam_fprintd.so emulation path; greeters and
+# auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
+# Non-fatal by design: a failure must never abort the RPM transaction.
+# Membership is deliberately left in place on removal/purge (only the
+# sysusers group itself is removed on %preun/erase).
+if command -v usermod >/dev/null 2>&1 && getent group tapauthd-clients >/dev/null 2>&1; then
+    added_users=""
+    while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        if id -nG "$member" 2>/dev/null | grep -qw tapauthd-clients; then
+            continue
+        fi
+        if usermod -aG tapauthd-clients "$member" 2>/dev/null; then
+            added_users="${added_users} ${member}"
+        fi
+    done <<EOF
+$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' || true)
+EOF
+    if [ -n "$added_users" ]; then
+        echo "TapAuth: added existing interactive users to tapauthd-clients:${added_users}"
+        echo "         They must log out and back in (or re-init their groups)"
+        echo "         before this takes effect."
+    else
+        echo "TapAuth: no existing interactive users needed adding to tapauthd-clients."
+    fi
+else
+    echo "TapAuth: could not add existing users to tapauthd-clients automatically"
+    echo "         (group or usermod unavailable). Add them manually with:"
+    echo "         sudo usermod -aG tapauthd-clients \$USER"
+fi
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
     echo "TapAuth: SELinux is Enforcing. If GDM/KDM lock screen authentication fails due to AVC denial,"
     echo "         allow GDM to connect to the daemon socket via:"
