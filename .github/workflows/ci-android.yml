@@ -45,9 +45,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Setup Virtual Bluetooth Kernel Module (hci_vhci fail-fast)
-        run: ./scripts/ci/build-kernel-vhci.sh
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
