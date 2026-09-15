@@ -12,6 +12,20 @@
 //! 4. On skip, send IPC cancel to daemon (best effort) plus network cancel
 //! 5. Return `PAM_SUCCESS` on authentication, `PAM_IGNORE` to allow fallback to password
 //!
+//! ## Optional fprintd emulation (`replace-fprintd-pam`)
+//!
+//! The optional `replace-fprintd-pam` feature builds the same module for
+//! installation as `pam_fprintd.so`. PAM stacks that hardcode the vendor
+//! fingerprint module (`gdm-fingerprint`, `gdm3-fingerprint`,
+//! `kde-fingerprint`, `budgie-fingerprint`, Fedora's `fingerprint-auth`, and
+//! `pam_fprintd.so` lines inside `system-auth` / `common-auth`) then route to
+//! TapAuth without a real fprintd.
+//!
+//! Fingerprint service names are recognised by [`is_fingerprint_service`] and
+//! are forced onto the TTY-less sequential path using the full
+//! `pam_operation_timeout_secs`, so the greeter/locker can wait for the phone
+//! and still fall through to the next PAM module on timeout.
+//!
 //! ## Threading
 //!
 //! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
@@ -391,8 +405,15 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
-    let is_polkit = service == "polkit-1";
-    let tty_file = if !is_polkit {
+
+    // `replace-fprintd-pam`: when this build is installed as `pam_fprintd.so`
+    // and invoked from a fingerprint stack, force the TTY-less, non-polkit
+    // sequential flow. Greeters/lockers own the password conversation, so the
+    // module must not open `/dev/tty` nor run the threaded conversation, and it
+    // may wait for the phone for the full operation timeout.
+    let fprintd_emulation = is_fprintd_emulation_service(&service);
+    let is_polkit = !fprintd_emulation && service == "polkit-1";
+    let tty_file = if !is_polkit && !fprintd_emulation {
         std::fs::File::open("/dev/tty").ok()
     } else {
         None
@@ -467,11 +488,18 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // and the daemon's authentication timeout, so they stay in sync.
     // The generic GUI fallback (GuiSequential) gets the shorter GUI deadline so
     // password fallback remains close at hand.
-    let effective_timeout_secs = match pam_context {
-        PamContext::PolkitThreaded | PamContext::Terminal => config.pam_operation_timeout_secs,
-        PamContext::GuiSequential => config
-            .pam_gui_timeout_secs
-            .min(config.pam_operation_timeout_secs),
+    let effective_timeout_secs = if fprintd_emulation {
+        // The fprintd-emulation build must give the user the full operation
+        // timeout to reach their phone; the greeter/locker falls back to its
+        // own password prompt after this module returns.
+        config.pam_operation_timeout_secs
+    } else {
+        match pam_context {
+            PamContext::PolkitThreaded | PamContext::Terminal => config.pam_operation_timeout_secs,
+            PamContext::GuiSequential => config
+                .pam_gui_timeout_secs
+                .min(config.pam_operation_timeout_secs),
+        }
     };
     let timeout_secs = {
         let secs = effective_timeout_secs;
@@ -855,6 +883,33 @@ pub fn classify_pam_context(service: &str, has_terminal: bool) -> PamContext {
     PamContext::GuiSequential
 }
 
+/// Returns `true` when `service` names a fingerprint (biometric) PAM stack.
+///
+/// The match is case-insensitive and recognises the two naming conventions used
+/// by the stock vendor stacks that reference the `replace-fprintd-pam` build
+/// (installed as `pam_fprintd.so`):
+///
+/// * a `-fingerprint` suffix, e.g. `gdm-fingerprint`, `gdm3-fingerprint`,
+///   `kde-fingerprint`, `budgie-fingerprint`, `sddm-fingerprint`;
+/// * the exact Fedora `fingerprint-auth` service.
+///
+/// Primary services such as `gdm-password`, `sudo`, `su`, `polkit-1`, `login`
+/// and `kde` are deliberately *not* fingerprint services.
+pub fn is_fingerprint_service(service: &str) -> bool {
+    let service = service.to_ascii_lowercase();
+    service.ends_with("-fingerprint") || service == "fingerprint-auth"
+}
+
+/// Whether this invocation should run as the fprintd-emulation variant, i.e.
+/// the `replace-fprintd-pam` feature is enabled *and* the calling service is a
+/// fingerprint stack.
+///
+/// Compiles to a plain `false` in the default build, so the default behavior is
+/// unchanged.
+fn is_fprintd_emulation_service(service: &str) -> bool {
+    cfg!(feature = "replace-fprintd-pam") && is_fingerprint_service(service)
+}
+
 /// Map daemon IPC response outcome to the appropriate PAM return code.
 fn map_pam_outcome(
     resp: &shared::ipc::pb::PamAuthenticateResponse,
@@ -976,6 +1031,40 @@ mod tests {
             PamContext::GuiSequential
         );
         assert_eq!(classify_pam_context("", false), PamContext::GuiSequential);
+    }
+
+    #[test]
+    fn test_is_fingerprint_service_positive() {
+        for service in [
+            "gdm-fingerprint",
+            "gdm3-fingerprint",
+            "kde-fingerprint",
+            "fingerprint-auth",
+            "budgie-fingerprint",
+        ] {
+            assert!(
+                is_fingerprint_service(service),
+                "{service} should be a fingerprint service"
+            );
+        }
+
+        // Case-insensitive.
+        assert!(is_fingerprint_service("GDM-Fingerprint"));
+        assert!(is_fingerprint_service("FINGERPRINT-AUTH"));
+    }
+
+    #[test]
+    fn test_is_fingerprint_service_negative() {
+        for service in ["gdm-password", "sudo", "su", "polkit-1", "login", "kde"] {
+            assert!(
+                !is_fingerprint_service(service),
+                "{service} should not be a fingerprint service"
+            );
+        }
+
+        // Suffix must be the whole component, not a bare substring.
+        assert!(!is_fingerprint_service("fingerprint"));
+        assert!(!is_fingerprint_service("fingerprint-auth-extra"));
     }
 
     #[test]

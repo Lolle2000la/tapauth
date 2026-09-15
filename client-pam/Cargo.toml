@@ -44,3 +44,15 @@ tpm = ["shared/tpm"]
 # must NOT enable this feature, as it would allow environment-controlled
 # socket redirection which could bypass authentication.
 dev-socket-override = []
+
+# replace-fprintd-pam: build the optional "fprintd emulation" variant of this
+# module, intended to be installed as `pam_fprintd.so`.  PAM stacks that
+# hardcode the vendor fingerprint module (e.g. `gdm-fingerprint`,
+# `gdm3-fingerprint`, `kde-fingerprint`, `budgie-fingerprint`, Fedora's
+# `fingerprint-auth`, and `pam_fprintd.so` lines inside `system-auth` /
+# `common-auth`) then route to TapAuth without a real fprintd.  Fingerprint
+# service names are never bypassed and are forced onto the TTY-less sequential
+# path with the full `pam_operation_timeout_secs`, so the greeter/locker can
+# wait for the phone.  This is opt-in: the default build is unchanged.
+# Deliberately independent of `tpm` and `dev-socket-override`.
+replace-fprintd-pam = []

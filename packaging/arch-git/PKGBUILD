@@ -1,6 +1,6 @@
 # Maintainer: Lolle2000la
 pkgbase=tapauth-git
-pkgname=('tapauth-git')
+pkgname=('tapauth-git' 'tapauth-fprintd-emulation-git')
 pkgver=0.10.0.r14.g1e0eb73
 pkgrel=1
 arch=('x86_64' 'aarch64')
@@ -35,6 +35,12 @@ build() {
   export CARGO_HOME="${srcdir}/cargo-home"
   export CARGO_PROFILE_RELEASE_STRIP=true
   cargo build --frozen --workspace --release --locked
+  # Second, opt-in client-pam build for the tapauth-fprintd-emulation-git
+  # split package. A separate target dir (target/fprintd-emulation) keeps it
+  # from clobbering the base target/release/libclient_pam.so that is
+  # installed as pam_tapauth.so.
+  cargo build --frozen -p client-pam --release --locked \
+    --features replace-fprintd-pam --target-dir target/fprintd-emulation
 }
 
 package_tapauth-git() {
@@ -98,6 +104,29 @@ package_tapauth-git() {
   # polkit vendor-drift protection (see packaging/arch/PKGBUILD comment).
   install -Dm0644 packaging/tapauth-polkit-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-polkit-pam.hook"
   install -Dm0755 packaging/tapauth-polkit-pam.sh "${pkgdir}/usr/share/libalpm/scripts/tapauth-polkit-pam"
+
+  install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
+
+package_tapauth-fprintd-emulation-git() {
+  pkgdesc="Optional fprintd PAM emulation for TapAuth (Development/Git version; installs pam_fprintd.so)"
+  depends=('tapauth-git')
+  # The Arch fprintd package is monolithic (daemon + PAM module), so the
+  # emulation split package replaces it wholesale. The base tapauth-git
+  # package is deliberately left non-conflicting with fprintd.
+  conflicts=('fprintd')
+  provides=('fprintd')
+  replaces=('fprintd')
+  # NOTE: no install= scriptlet here on purpose. install= is a per-package
+  # override; package_tapauth-git() sets install=tapauth-git.install and
+  # this package must not inherit the base PAM-wiring scriptlet.
+
+  cd "${srcdir}/tapauth"
+  # Same client-pam crate as the base package, built with
+  # replace-fprintd-pam into a separate target dir and installed under
+  # fprintd's module name.
+  install -Dm0755 target/fprintd-emulation/release/libclient_pam.so \
+    "${pkgdir}/usr/lib/security/pam_fprintd.so"
 
   install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

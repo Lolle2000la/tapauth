@@ -51,8 +51,10 @@ fingerprint-auth) — stay stock.
 Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
 automatically through the built-in virtual fprintd D-Bus service
 (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
-which resolves to tapauthd. The package deliberately does NOT conflict
-with the real fprintd package. It ships a renamed D-Bus activation file
+which resolves to tapauthd. This base package deliberately does NOT
+conflict with the real fprintd package; the optional
+tapauth-fprintd-emulation subpackage instead replaces the fprintd-pam
+provider. It ships a renamed D-Bus activation file
 (net.reactivated.Fprint.tapauth.service) so nothing can collide with
 fprintd's own activation file; verified with dbus-daemon and
 dbus-broker, both require the activation file's filename to match the
@@ -68,6 +70,31 @@ and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
 (applies at the next daemon restart): tapauthd then never claims the
 bus name and real fprintd handles all fingerprint requests again.
 
+%package fprintd-emulation
+Summary:        Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
+# The optional emulation subpackage replaces the distro fprintd-pam
+# subpackage (which owns pam_fprintd.so) with a TapAuth build.
+# Obsoletes handles the older fprintd-pam releases; the versioned
+# Conflicts covers the newer ones and is deliberately constrained so it
+# cannot self-conflict with the Provides below (our Provides version is
+# 0.x, far below the 1.94.5 boundary).
+Provides:       fprintd-pam = %{version}-%{release}
+Obsoletes:      fprintd-pam < 1.94.5
+Conflicts:      fprintd-pam >= 1.94.5
+Requires:       %{name} = %{version}-%{release}
+
+%description fprintd-emulation
+This optional subpackage ships a second build of the TapAuth PAM module,
+installed as pam_fprintd.so, taking over the file normally provided by
+the fprintd-pam subpackage.
+
+It exists for the opt-in case where stock fingerprint PAM stacks must be
+served by TapAuth instead of a real local fingerprint reader. It
+Provides, Obsoletes and Conflicts fprintd-pam so the two providers of
+pam_fprintd.so can never coexist. The fprintd daemon package itself is
+deliberately NOT conflicted with, and the base tapauth package stays
+unchanged (it keeps shipping pam_tapauth.so).
+
 %prep
 %setup -q -n %{name}-%{version}
 
@@ -80,6 +107,13 @@ if command -v sccache >/dev/null 2>&1; then
     export SCCACHE_DIR="%{?_sccache_dir}%{!?_sccache_dir:${SCCACHE_DIR:-%{_builddir}/sccache}}"
 fi
 cargo build --workspace --release --locked %{?cargo_features}
+# Opt-in second client-pam build backing the fprintd-emulation subpackage.
+# Uses a separate target dir (under CARGO_TARGET_DIR) so the base
+# libclient_pam.so installed as pam_tapauth.so is never clobbered.
+# replace-fprintd-pam is appended to whatever feature set the base build
+# requested; cargo unions repeated --features flags.
+cargo build -p client-pam --release --locked %{?cargo_features} --features replace-fprintd-pam \
+    --target-dir "${CARGO_TARGET_DIR}/fprintd-emulation"
 if command -v sccache >/dev/null 2>&1; then
     sccache --show-stats || true
 fi
@@ -110,6 +144,11 @@ install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapa
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-ipc-cli" %{buildroot}%{_bindir}/tapauth-ipc-cli
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
+
+# fprintd-emulation subpackage: the second (opt-in) client-pam build,
+# installed under fprintd's module name. The base %files lists only
+# pam_tapauth.so, so the two packages never share a path.
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/fprintd-emulation/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_fprintd.so
 
 # Default Configuration
 # The virtual fprintd bridge is enabled by default in the daemon; do not
@@ -409,6 +448,11 @@ fi
 %{_datadir}/selinux/packages/tapauth.cil
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+%files fprintd-emulation
+# The base tapauth package already ships the shared %license LICENSE;
+# listing it here too would make the two subpackages co-own the same path.
+%{_libdir}/security/pam_fprintd.so
 
 %changelog
 * Wed Sep 02 2026 Luca Auer <lolle2000.la+tapauth@gmail.com> - 0.1.0-1

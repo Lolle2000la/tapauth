@@ -13,6 +13,14 @@
 # upstream rpmlint whitelist addition).
 addFilter("pam-unauthorized-module")
 
+# The optional fprintd-emulation subpackage intentionally Provides
+# fprintd-pam while also Obsoleting older fprintd-pam releases (the Fedora
+# Provides+Obsoletes replacement idiom). rpmlint's self-obsoletion check
+# ignores version ranges, so it fires even though the version we provide
+# (0.x) can never fall inside the obsoleted range (< 1.94.5). Intentional
+# false positive.
+addFilter("self-obsoletion")
+
 # PAM-stack manipulation inherently uses chown/cp/rm in scriptlets. All
 # commands are guarded and idempotent (see scriptlet comments).
 addFilter("dangerous-command-in-%post")

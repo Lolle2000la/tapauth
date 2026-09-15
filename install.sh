@@ -25,11 +25,19 @@ USE_BLE=true
 BUILD_ONLY=false
 DRY_RUN=false
 FORCE=false
+# Opt-in: additionally build/install the `replace-fprintd-pam` variant as
+# pam_fprintd.so so stock fingerprint PAM stacks route to TapAuth. Off by
+# default — the base install stays unchanged and never touches fprintd.
+FPRINTD_EMULATION=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
 PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
+FPRINTD_SO_NAME="pam_fprintd.so"
+FPRINTD_SO_PATH=""  # Will be set after detection (only used with --fprintd-emulation)
+FPRINTD_EMULATION_TARGET_DIR="target/fprintd-emulation"
+FPRINTD_EMULATION_SO_PATH="$FPRINTD_EMULATION_TARGET_DIR/release/libclient_pam.so"
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
@@ -73,6 +81,15 @@ check_hardware_fprintd() {
     fi
     has_hardware_fprintd=false
     return 0
+}
+
+# Return success when the given PAM module was built by TapAuth. Used to decide
+# whether it is safe to overwrite/remove an existing pam_fprintd.so: a genuine
+# distro fprintd module must never be clobbered without a backup.
+is_tapauth_pam_module() {
+    local module="$1"
+    [[ -f "$module" ]] || return 1
+    grep -qa "tapauth" "$module" 2>/dev/null
 }
 
 # Print functions
@@ -211,6 +228,9 @@ OPTIONS:
     --configure-polkit      Configure PAM for polkit authentication
     --build-only            Only build, don't install
     --dry-run               Show what would be done without doing it
+    --fprintd-emulation     Also build/install the opt-in pam_fprintd.so
+                            replacement (routes stock fingerprint stacks to
+                            TapAuth). Off by default.
 
 NOTES:
     All components (PAM module, daemon, configuration GUI) are always installed.
@@ -232,6 +252,17 @@ NOTES:
     /etc/tapauth/config.toml (applies at the next daemon restart) —
     tapauthd then never claims the bus name.
 
+    --fprintd-emulation is an opt-in, mutually exclusive alternative to the
+    virtual bridge above: it builds client-pam with the replace-fprintd-pam
+    feature and installs the result as pam_fprintd.so itself, so stock
+    fingerprint PAM stacks (kde-fingerprint, gdm-fingerprint,
+    fingerprint-auth, ...) route to TapAuth even on systems without the
+    virtual fprintd D-Bus bridge. Any existing distro pam_fprintd.so is
+    backed up to pam_fprintd.so.fprintd-bak first (and restored by
+    uninstall.sh). On Debian/Ubuntu the libpam-fprintd pam-auth-update
+    profile may need to be removed manually; this script only warns and
+    never removes packages.
+
 EXAMPLES:
     # Interactive installation (default)
     sudo $0
@@ -241,6 +272,9 @@ EXAMPLES:
 
     # Install without Bluetooth support
     sudo $0 --no-ble --configure-sudo
+
+    # Also replace pam_fprintd.so so stock fingerprint stacks use TapAuth
+    sudo $0 --fprintd-emulation
 
     # Build only without installing
     $0 --build-only
@@ -298,6 +332,10 @@ parse_args() {
                 ;;
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --fprintd-emulation)
+                FPRINTD_EMULATION=true
                 shift
                 ;;
             *)
@@ -359,6 +397,7 @@ detect_pam_directory() {
     # Honor environment variable override if provided and valid
     if [[ -n "${PAM_MODULE_DIR:-}" && -d "$PAM_MODULE_DIR" ]]; then
         PAM_SO_PATH="$PAM_MODULE_DIR/$PAM_SO_NAME"
+        FPRINTD_SO_PATH="$PAM_MODULE_DIR/$FPRINTD_SO_NAME"
         print_success "Using overridden PAM directory: $PAM_MODULE_DIR"
         return
     fi
@@ -381,6 +420,7 @@ detect_pam_directory() {
             if ls "$dir"/pam_*.so &> /dev/null; then
                 PAM_MODULE_DIR="$dir"
                 PAM_SO_PATH="$dir/$PAM_SO_NAME"
+                FPRINTD_SO_PATH="$dir/$FPRINTD_SO_NAME"
                 print_success "Found PAM directory: $PAM_MODULE_DIR"
                 return
             fi
@@ -417,11 +457,11 @@ check_existing_installation() {
 
     # Check if installed via system package manager
     local pkg_manager=""
-    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; }; then
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd-emulation 2>/dev/null | grep -q '^ii'; }; then
         pkg_manager="dpkg / apt"
-    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd >/dev/null 2>&1; }; then
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd-emulation >/dev/null 2>&1; }; then
         pkg_manager="rpm / dnf"
-    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
         pkg_manager="pacman"
     fi
 
@@ -893,7 +933,15 @@ build_components() {
             echo ""
             print_info "Build would run as current user"
         fi
-        
+
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo ""
+            print_info "fprintd emulation build requested"
+            print_info "  • Would build client-pam with replace-fprintd-pam"
+            print_info "  • Using --target-dir $FPRINTD_EMULATION_TARGET_DIR so the normal"
+            print_info "    libclient_pam.so build used for pam_tapauth.so is not clobbered"
+        fi
+
         return
     fi
     
@@ -937,7 +985,24 @@ build_components() {
     print_info "Building PAM module with features: $pam_features"
     $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags -p client-pam $pam_features
     print_success "PAM module built"
-    
+
+    # Optionally build the fprintd-emulation variant (installed as
+    # pam_fprintd.so, never pam_tapauth.so). A separate --target-dir keeps it
+    # from clobbering the normal build consumed by install_pam. Feature
+    # handling mirrors pam_features above, with replace-fprintd-pam added.
+    if [[ "$FPRINTD_EMULATION" == true ]]; then
+        local fprintd_features=""
+        if [[ "$USE_TPM" == true ]]; then
+            fprintd_features="--features tpm,replace-fprintd-pam"
+        else
+            fprintd_features="--no-default-features --features replace-fprintd-pam"
+        fi
+        print_info "Building fprintd emulation PAM module with features: $fprintd_features"
+        $build_cmd_prefix env RUSTFLAGS="$rustflags" cargo build $build_flags \
+            --target-dir "$FPRINTD_EMULATION_TARGET_DIR" -p client-pam $fprintd_features
+        print_success "fprintd emulation PAM module built"
+    fi
+
     # Build configuration GUI with same TPM feature
     local gui_features=""
     if [[ "$USE_TPM" == true ]]; then
@@ -952,6 +1017,68 @@ build_components() {
     unset RUSTFLAGS
 }
 
+# Install the opt-in fprintd emulation build as pam_fprintd.so. Any genuine
+# distro module is backed up first; packages are never removed automatically.
+install_fprintd_emulation_pam() {
+    if [[ -z "$FPRINTD_SO_PATH" ]]; then
+        print_error "PAM module directory not detected"
+        exit 1
+    fi
+
+    if [[ ! -f "$FPRINTD_EMULATION_SO_PATH" ]]; then
+        print_error "fprintd emulation module not built: $FPRINTD_EMULATION_SO_PATH not found"
+        exit 1
+    fi
+
+    local fprintd_bak="${FPRINTD_SO_PATH}.fprintd-bak"
+
+    # Preserve an existing distro fprintd PAM module exactly once. A module
+    # that is already a TapAuth build needs no backup.
+    if [[ -e "$FPRINTD_SO_PATH" ]]; then
+        if is_tapauth_pam_module "$FPRINTD_SO_PATH"; then
+            print_info "Existing $FPRINTD_SO_PATH is a TapAuth build; replacing it"
+        elif [[ -e "$fprintd_bak" ]]; then
+            print_warning "Backup $fprintd_bak already exists; leaving it untouched"
+        else
+            print_warning "Replacing the distro fprintd PAM module at $FPRINTD_SO_PATH"
+            print_info "Backing it up to $fprintd_bak"
+            cp -p "$FPRINTD_SO_PATH" "$fprintd_bak"
+        fi
+    else
+        print_info "No existing $FPRINTD_SO_NAME found; installing the emulation module"
+    fi
+
+    print_info "Installing fprintd emulation PAM module to $FPRINTD_SO_PATH"
+    cp "$FPRINTD_EMULATION_SO_PATH" "$FPRINTD_SO_PATH"
+    chmod 644 "$FPRINTD_SO_PATH"
+
+    # Restore SELinux context if available
+    if command -v restorecon &> /dev/null; then
+        restorecon "$FPRINTD_SO_PATH" || true
+    fi
+
+    print_success "fprintd emulation PAM module installed to $FPRINTD_SO_PATH"
+
+    # Debian/Ubuntu: libpam-fprintd ships a pam-auth-update profile that may
+    # re-assert its own pam_fprintd.so registration. Warn about it (packages
+    # are never removed automatically) and refresh profiles when possible.
+    case "${DISTRO_ID:-}" in
+        debian|ubuntu|linuxmint|pop|elementary|zorin|kali|raspbian)
+            if [[ -e /usr/share/pam-configs/fprintd ]]; then
+                print_warning "Debian/Ubuntu detected: /usr/share/pam-configs/fprintd exists"
+                print_warning "and belongs to libpam-fprintd. It may re-register the distro"
+                print_warning "module via pam-auth-update. Consider removing libpam-fprintd or"
+                print_warning "updating /usr/share/pam-configs/fprintd. No packages were removed"
+                print_warning "automatically."
+                if command -v pam-auth-update &> /dev/null; then
+                    print_info "Refreshing PAM profiles with 'pam-auth-update --package'"
+                    pam-auth-update --package || print_warning "pam-auth-update --package did not complete; verify PAM manually"
+                fi
+            fi
+            ;;
+    esac
+}
+
 # Install PAM module
 install_pam() {
     print_header "Installing PAM Module"
@@ -964,6 +1091,15 @@ install_pam() {
         show_file_creation "$CONFIG_DIR" "TapAuth configuration directory (mode 700)"
         if [[ ! -f "$KEY_PATH" ]]; then
             show_file_creation "$KEY_PATH" "Client key file (created on first pairing)"
+        fi
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo ""
+            print_info "[DRY RUN] Would install fprintd emulation module"
+            show_file_copy "$FPRINTD_EMULATION_SO_PATH" "$FPRINTD_SO_PATH"
+            show_command "chmod 644 $FPRINTD_SO_PATH" "Set fprintd emulation module permissions"
+            if [[ -e "$FPRINTD_SO_PATH" ]] && ! is_tapauth_pam_module "$FPRINTD_SO_PATH"; then
+                show_file_copy "$FPRINTD_SO_PATH" "$FPRINTD_SO_PATH.fprintd-bak" "Back up distro fprintd PAM module"
+            fi
         fi
         return
     fi
@@ -999,7 +1135,13 @@ install_pam() {
     if [[ ! -f "$KEY_PATH" ]]; then
         print_info "Key file will be created on first pairing"
     fi
-    
+
+    # Opt-in: also install the dedicated build as pam_fprintd.so so stock
+    # fingerprint PAM stacks route to TapAuth.
+    if [[ "$FPRINTD_EMULATION" == true ]]; then
+        install_fprintd_emulation_pam
+    fi
+
     print_success "PAM module installed to $PAM_SO_PATH"
 }
 
@@ -1247,6 +1389,9 @@ create_summary() {
     echo "Components installed:"
     echo "  ✓ Daemon"
     echo "  ✓ PAM module"
+    if [[ "$FPRINTD_EMULATION" == true ]]; then
+        echo "  ✓ fprintd emulation module (installed as $FPRINTD_SO_NAME)"
+    fi
     echo "  ✓ Configuration GUI"
     
     echo ""
@@ -1272,6 +1417,9 @@ create_summary() {
     print_info "Installation locations:"
     echo "  - Daemon: /usr/bin/tapauthd"
     echo "  - PAM module: $PAM_SO_PATH"
+    if [[ "$FPRINTD_EMULATION" == true ]]; then
+        echo "  - fprintd emulation module: $FPRINTD_SO_PATH"
+    fi
     echo "  - Config GUI: $CONFIG_GUI_PATH"
     echo "  - Configuration: $CONFIG_DIR"
     echo "  - Daemon socket: /run/tapauthd/tapauthd.sock (root:tapauthd-clients, 0660)"
@@ -1370,6 +1518,9 @@ main() {
         # Also restore contexts for all installed binaries
         restorecon "$DAEMON_PATH" || true
         restorecon "$PAM_SO_PATH" || true
+        if [[ "$FPRINTD_EMULATION" == true && -n "$FPRINTD_SO_PATH" ]]; then
+            restorecon "$FPRINTD_SO_PATH" || true
+        fi
         restorecon "$CONFIG_GUI_PATH" || true
     fi
     
@@ -1381,6 +1532,9 @@ main() {
         echo "Components to install:"
         echo "  ✓ Daemon → /usr/bin/tapauthd"
         echo "  ✓ PAM module → $PAM_SO_PATH"
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo "  ✓ fprintd emulation module → $FPRINTD_SO_PATH"
+        fi
         echo "  ✓ Configuration GUI → $CONFIG_GUI_PATH"
         
         echo ""
@@ -1404,6 +1558,11 @@ main() {
             echo "  • TPM support: enabled"
         else
             echo "  • TPM support: disabled"
+        fi
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo "  • fprintd emulation: enabled ($FPRINTD_SO_NAME replacement)"
+        else
+            echo "  • fprintd emulation: disabled (virtual fprintd bridge stays default)"
         fi
         
         echo ""

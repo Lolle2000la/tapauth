@@ -84,6 +84,9 @@ jobs:
       - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
 
+      - name: "Run clippy (client PAM, replace-fprintd-pam feature)"
+        run: cargo clippy -p client-pam --features replace-fprintd-pam --all-targets -- -D warnings
+
       - name: Verify production binaries contain no dev/test overrides
         run: ./scripts/ci/check-production-build.sh
 
@@ -131,6 +134,9 @@ jobs:
       - name: "Build client PAM module (no features)"
         run: cargo build --manifest-path client-pam/Cargo.toml --no-default-features --verbose
 
+      - name: "Build client PAM module (replace-fprintd-pam feature)"
+        run: cargo build --manifest-path client-pam/Cargo.toml --features replace-fprintd-pam --verbose
+
       - name: Build client config GUI
         run: cargo build --manifest-path client-config-gui/Cargo.toml --verbose
 
@@ -145,6 +151,9 @@ jobs:
 
       - name: Run tests for client PAM module
         run: cargo test --manifest-path client-pam/Cargo.toml --verbose
+
+      - name: "Run tests for client PAM module (replace-fprintd-pam feature)"
+        run: cargo test --manifest-path client-pam/Cargo.toml --features replace-fprintd-pam --verbose
 
       - name: Run tests for client config GUI
         run: cargo test --manifest-path client-config-gui/Cargo.toml --verbose

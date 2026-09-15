@@ -9,7 +9,7 @@ You can install tapauth via native package repositories to receive automatic upd
 ### What the packages configure
 
 - **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). `login` is deliberately **not** patched.
-- **Everything else stays stock.** All other PAM stacks — including the fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, `fingerprint-auth`) — are left untouched: they call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service.
+- **Everything else stays stock.** All other PAM stacks — including the fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, `fingerprint-auth`) — are left untouched: they call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service. (On machines with no physical fingerprint reader, the optional `tapauth-fprintd-emulation` package can instead ship `pam_fprintd.so` itself — see [No physical fingerprint reader? Optional emulation package](#no-physical-fingerprint-reader-optional-emulation-package) below.)
 - **Desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No extra package, no manual PAM edits, no local fingerprint reader required.
 - **Collision-free D-Bus activation file.** TapAuth ships a renamed activation file (`net.reactivated.Fprint.tapauth.service`) that can never collide with real fprintd's own `net.reactivated.Fprint.service`. Verified with `dbus-daemon` and `dbus-broker`: both only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder and real fprintd keeps full control of on-demand activation.
 - **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot for the lock-screen bridge); `tapauthd.service` is additionally started at install so the virtual fprintd bridge is live immediately.
@@ -85,9 +85,50 @@ If your machine has a physical fingerprint reader you want to keep using:
 2. Set `enable_fprintd_bridge = false` in `/etc/tapauth/config.toml`.
 3. Restart the daemon: `sudo systemctl restart tapauthd.service`.
 
-TapAuth then never claims the bus name and real fprintd handles all fingerprint requests again. PAM authentication for `sudo`, `su` and `polkit-1` via your paired phone continues to work independently. `install.sh` performs steps 2–3 automatically when it detects a real fprintd installation.
+TapAuth then never claims the bus name and real fprintd handles all fingerprint requests again. PAM authentication for `sudo`, `su` and `polkit-1` via your paired phone continues to work independently. `install.sh` performs steps 2–3 automatically when it detects a real fprintd installation. If you previously installed the optional `tapauth-fprintd-emulation` package, remove it as well (see below) so the distribution's real `pam_fprintd.so` is restored.
 
 To return to phone-based lock screen unlock, set `enable_fprintd_bridge = true` and restart the daemon.
+
+### No physical fingerprint reader? Optional emulation package
+
+The default setup above already covers lock screens and greeters on machines with **no** fingerprint reader, via the built-in virtual fprintd D-Bus bridge. Some distributions, however, only offer biometric login when a PAM module named `pam_fprintd.so` is present on disk. For that case TapAuth publishes an **optional, opt-in** package that installs a second build of its PAM module under that exact name, so stock fingerprint PAM stacks route to your phone without any real fprintd hardware:
+
+| Install path | Package / flag |
+| :--- | :--- |
+| **Fedora Linux (COPR)** | `tapauth-fprintd-emulation` |
+| **Ubuntu / Debian (PPA)** | `tapauth-fprintd-emulation` |
+| **Arch Linux / CachyOS (AUR)** | `tapauth-fprintd-emulation` or `tapauth-fprintd-emulation-git` |
+| **Source install (`install.sh`)** | `sudo ./install.sh --fprintd-emulation` |
+
+For example:
+
+```bash
+# Fedora
+sudo dnf install tapauth-fprintd-emulation
+# Ubuntu / Debian
+sudo apt-get install tapauth-fprintd-emulation
+# Arch Linux / CachyOS
+paru -S tapauth-fprintd-emulation
+# Source install
+sudo ./install.sh --fprintd-emulation
+```
+
+This package **conflicts with, replaces and provides** the distribution's own fingerprint PAM provider (`libpam-fprintd` on Debian/Ubuntu, `fprintd-pam` on Fedora/RHEL, monolithic `fprintd` on Arch), because only one package can own `pam_fprintd.so`. The base `tapauth` package is unchanged and still deliberately does **not** conflict with fprintd.
+
+> **Prefer a physical reader if you have one.** The emulation package is intended only for machines without (or not wanting to use) a real fingerprint sensor. If your hardware has one, keep the base package and the distribution's real fprintd.
+
+To undo the emulation package, remove it and reinstall the distribution's fingerprint PAM provider:
+
+```bash
+# Fedora
+sudo dnf remove tapauth-fprintd-emulation && sudo dnf install fprintd-pam
+# Ubuntu / Debian
+sudo apt-get remove tapauth-fprintd-emulation && sudo apt-get install libpam-fprintd
+# Arch Linux / CachyOS
+sudo pacman -R tapauth-fprintd-emulation && sudo pacman -S fprintd
+```
+
+For a source install, `sudo ./uninstall.sh --fprintd-emulation` removes the replacement and restores any backed-up distro `pam_fprintd.so`.
 
 ### 4. Android (via F-Droid)
 A custom, unified F-Droid repository delivers the TapAuth Android companion app and update channels without requiring any third-party app store account.

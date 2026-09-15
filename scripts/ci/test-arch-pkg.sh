@@ -73,9 +73,16 @@ else
     PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-arch}"
 fi
 
-echo "Verifying the tapauth-fprintd subpackage is gone (only the base package is built)..."
-if ls "${PKG_DIR}"/tapauth-fprintd-*.pkg.tar.zst >/dev/null 2>&1; then
-    echo "ERROR: tapauth-fprintd subpackage was removed but a package for it was still built"
+echo "Verifying the legacy tapauth-fprintd subpackage is gone (only the base package and the optional emulation package are built)..."
+# Match ONLY the removed legacy names (tapauth-fprintd-<version> and
+# tapauth-fprintd-git-<version>); the opt-in replacement package
+# tapauth-fprintd-emulation(-git) is expected and must not trip this check.
+LEGACY_FPRINTD_PKGS=$(find "${PKG_DIR}" -maxdepth 1 \
+    -name 'tapauth-fprintd-*.pkg.tar.zst' \
+    ! -name 'tapauth-fprintd-emulation-*' 2>/dev/null || true)
+if [ -n "$LEGACY_FPRINTD_PKGS" ]; then
+    echo "ERROR: legacy tapauth-fprintd subpackage was removed but a package for it was still built:"
+    printf '%s\n' "$LEGACY_FPRINTD_PKGS"
     exit 1
 fi
 
@@ -203,7 +210,46 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 
-echo "==> 8. Testing package upgrade (exercises post_upgrade)..."
+echo "==> 8. Testing the opt-in tapauth-fprintd-emulation package..."
+EMU_PKG=$(find "${PKG_DIR}" -maxdepth 1 \
+    -name 'tapauth-fprintd-emulation-*.pkg.tar.zst' \
+    ! -name 'tapauth-fprintd-emulation-git-*' | head -1 || true)
+if [ -z "$EMU_PKG" ]; then
+    echo "ERROR: tapauth-fprintd-emulation package was expected but was not built"
+    exit 1
+fi
+verify_fprintd_emulation_pkg arch "${PKG_DIR}"
+
+echo "Verifying the emulation package's fprintd conflict is honored..."
+# The real fprintd package is installed at this point. pacman must never allow
+# both pam_fprintd.so providers to be installed at once: it either replaces
+# fprintd (replaces= metadata) or refuses the transaction.
+if pacman -U --noconfirm "$EMU_PKG"; then
+    if pacman -Qq fprintd >/dev/null 2>&1; then
+        echo "ERROR: fprintd and tapauth-fprintd-emulation are installed simultaneously (conflict ignored)"
+        exit 1
+    fi
+    echo "Emulation package replaced the real fprintd package (replaces honored)."
+else
+    echo "pacman refused the emulation install while fprintd was present (conflict honored); removing fprintd first..."
+    pacman -R --noconfirm fprintd
+    pacman -U --noconfirm "$EMU_PKG"
+fi
+test -f /usr/lib/security/pam_fprintd.so
+if pacman -Qq fprintd >/dev/null 2>&1; then
+    echo "ERROR: fprintd is still installed alongside tapauth-fprintd-emulation"
+    exit 1
+fi
+
+echo "Verifying the emulation package removes cleanly..."
+pacman -R --noconfirm tapauth-fprintd-emulation
+test ! -e /usr/lib/security/pam_fprintd.so
+
+echo "Reinstalling the real fprintd package so the coexistence checks below stay valid..."
+pacman -S --noconfirm --needed fprintd
+test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+
+echo "==> 8b. Testing package upgrade (exercises post_upgrade)..."
 pacman -U --noconfirm "${PKG_DIR}"/tapauth-${PKG_VER}-*.pkg.tar.zst
 
 echo "Verifying permissions, config, and PAM wiring survived upgrade..."

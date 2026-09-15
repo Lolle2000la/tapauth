@@ -21,11 +21,18 @@ PRESERVE_SYSTEM_ACCOUNTS=false
 RESTORE_PAM_BACKUPS=false
 DRY_RUN=false
 FORCE=false
+# Opt-in fprintd emulation (installed by install.sh --fprintd-emulation):
+# remove our pam_fprintd.so replacement and restore any backed-up distro
+# module. Auto-detected during remove_pam; the flag only forces/reports it.
+FPRINTD_EMULATION=false
+FPRINTD_EMULATION_REMOVED=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
 PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
+FPRINTD_SO_NAME="pam_fprintd.so"
+FPRINTD_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
@@ -65,6 +72,15 @@ print_header() {
     echo -e "${GREEN}$1${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
+}
+
+# Return success when the given PAM module was built by TapAuth. Used to decide
+# whether it is safe to remove an existing pam_fprintd.so: a genuine distro
+# fprintd module must never be deleted.
+is_tapauth_pam_module() {
+    local module="$1"
+    [[ -f "$module" ]] || return 1
+    grep -qa "tapauth" "$module" 2>/dev/null
 }
 
 # Dry-run helper functions
@@ -129,6 +145,9 @@ OPTIONS:
     --purge, --remove-user-data Remove user data including pairing keys (use with caution)
     --restore-pam-backups   Restore original PAM configurations from .tapauth-bak files
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
+    --fprintd-emulation     Remove the TapAuth pam_fprintd.so replacement and
+                            restore the distro module from pam_fprintd.so.fprintd-bak
+                            (auto-detected; this flag is for clarity only)
     --dry-run               Show what would be done without doing it
 
 NOTES:
@@ -138,6 +157,10 @@ NOTES:
     - PAM configurations (all modified PAM files)
     - Configuration GUI
     
+    If install.sh --fprintd-emulation was used, the pam_fprintd.so replacement
+    is removed and any saved distro fprintd module is restored. This is
+    auto-detected; a genuine distro pam_fprintd.so is never deleted.
+
     By default, system users and groups are also removed.
     Use --preserve-system-accounts during upgrades to avoid recreating them.
     
@@ -310,6 +333,10 @@ parse_args() {
                 RESTORE_PAM_BACKUPS=true
                 shift
                 ;;
+            --fprintd-emulation)
+                FPRINTD_EMULATION=true
+                shift
+                ;;
             --preserve-system-accounts)
                 PRESERVE_SYSTEM_ACCOUNTS=true
                 shift
@@ -360,6 +387,7 @@ detect_pam_directory() {
         if [[ -f "$dir/$PAM_SO_NAME" ]]; then
             PAM_MODULE_DIR="$dir"
             PAM_SO_PATH="$dir/$PAM_SO_NAME"
+            FPRINTD_SO_PATH="$dir/$FPRINTD_SO_NAME"
             print_success "Found TapAuth PAM module at: $PAM_SO_PATH"
             return
         fi
@@ -371,6 +399,7 @@ detect_pam_directory() {
             if ls "$dir"/pam_*.so &> /dev/null; then
                 PAM_MODULE_DIR="$dir"
                 PAM_SO_PATH="$dir/$PAM_SO_NAME"
+                FPRINTD_SO_PATH="$dir/$FPRINTD_SO_NAME"
                 print_warning "PAM directory found at $PAM_MODULE_DIR but TapAuth module not installed"
                 return
             fi
@@ -537,7 +566,17 @@ remove_pam_config() {
 # Remove PAM module
 remove_pam() {
     print_header "Removing PAM Module"
-    
+
+    # Possible PAM module directories for different distributions
+    local pam_dirs=(
+        "/lib/x86_64-linux-gnu/security"
+        "/usr/lib/x86_64-linux-gnu/security"
+        "/lib64/security"
+        "/usr/lib64/security"
+        "/usr/lib/security"
+        "/lib/security"
+    )
+
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove PAM module"
         echo ""
@@ -545,15 +584,6 @@ remove_pam() {
         if [[ -n "$PAM_SO_PATH" ]]; then
             show_file_removal "$PAM_SO_PATH" "TapAuth PAM module"
         else
-            # Check all possible locations
-            local pam_dirs=(
-                "/lib/x86_64-linux-gnu/security"
-                "/usr/lib/x86_64-linux-gnu/security"
-                "/lib64/security"
-                "/usr/lib64/security"
-                "/usr/lib/security"
-                "/lib/security"
-            )
             local found_any=false
             for dir in "${pam_dirs[@]}"; do
                 if [[ -f "$dir/$PAM_SO_NAME" ]]; then
@@ -565,6 +595,18 @@ remove_pam() {
                 echo -e "${GREEN}[INFO]${NC} No PAM module found to remove"
             fi
         fi
+
+        # Opt-in fprintd emulation module and any saved distro module.
+        for dir in "${pam_dirs[@]}"; do
+            local dry_run_fprintd="$dir/$FPRINTD_SO_NAME"
+            if is_tapauth_pam_module "$dry_run_fprintd"; then
+                show_file_removal "$dry_run_fprintd" "TapAuth fprintd emulation PAM module"
+            fi
+            if [[ -f "${dry_run_fprintd}.fprintd-bak" ]]; then
+                echo -e "${BLUE}[RESTORE]${NC} ${dry_run_fprintd}.fprintd-bak → $dry_run_fprintd"
+                show_file_removal "${dry_run_fprintd}.fprintd-bak" "Saved distro fprintd PAM module"
+            fi
+        done
         return
     fi
     
@@ -578,19 +620,31 @@ remove_pam() {
     fi
     
     # Also check all possible locations to be thorough
-    local pam_dirs=(
-        "/lib/x86_64-linux-gnu/security"
-        "/usr/lib/x86_64-linux-gnu/security"
-        "/lib64/security"
-        "/usr/lib64/security"
-        "/usr/lib/security"
-        "/lib/security"
-    )
-    
     for dir in "${pam_dirs[@]}"; do
         if [[ -f "$dir/$PAM_SO_NAME" ]]; then
             print_info "Removing PAM module from $dir/$PAM_SO_NAME"
             rm -f "$dir/$PAM_SO_NAME"
+            found=true
+        fi
+    done
+
+    # Opt-in fprintd emulation: only remove our own pam_fprintd.so and restore
+    # any distro module we backed up. A genuine distro fprintd module (no
+    # TapAuth marker) is never deleted.
+    for dir in "${pam_dirs[@]}"; do
+        local fprintd_path="$dir/$FPRINTD_SO_NAME"
+        local fprintd_bak="${fprintd_path}.fprintd-bak"
+        if is_tapauth_pam_module "$fprintd_path"; then
+            print_info "Removing TapAuth fprintd emulation module from $fprintd_path"
+            rm -f "$fprintd_path"
+            FPRINTD_EMULATION_REMOVED=true
+            found=true
+        fi
+        if [[ -f "$fprintd_bak" ]]; then
+            print_info "Restoring original fprintd PAM module from $fprintd_bak"
+            cp -p "$fprintd_bak" "$fprintd_path"
+            rm -f "$fprintd_bak"
+            FPRINTD_EMULATION_REMOVED=true
             found=true
         fi
     done
@@ -798,6 +852,12 @@ create_summary() {
     echo "Components removed:"
     echo "  ✓ Daemon"
     echo "  ✓ PAM module"
+    if [[ "$FPRINTD_EMULATION_REMOVED" == true || "$FPRINTD_EMULATION" == true ]]; then
+        echo "  ✓ fprintd emulation module (distro module restored if backed up)"
+        if [[ -n "$FPRINTD_SO_PATH" ]]; then
+            echo "      location: $FPRINTD_SO_PATH"
+        fi
+    fi
     echo "  ✓ Configuration GUI"
     if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
         echo "  ✓ System users and groups"
@@ -862,12 +922,12 @@ main() {
 
     # Check if installed via system package manager
     local pkg_manager=""
-    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; }; then
-        pkg_manager="apt-get remove tapauth tapauth-fprintd"
-    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd >/dev/null 2>&1; }; then
-        pkg_manager="dnf remove tapauth tapauth-fprintd"
-    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
-        pkg_manager="pacman -R tapauth tapauth-fprintd"
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd-emulation 2>/dev/null | grep -q '^ii'; }; then
+        pkg_manager="apt-get remove tapauth tapauth-fprintd-emulation"
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd-emulation >/dev/null 2>&1; }; then
+        pkg_manager="dnf remove tapauth tapauth-fprintd-emulation"
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
+        pkg_manager="pacman -R tapauth tapauth-fprintd-emulation"
     fi
 
     if [[ -n "$pkg_manager" ]]; then
@@ -906,6 +966,9 @@ main() {
         echo "Components to remove:"
         echo "  ✓ Daemon (tapauthd, tapauthd.socket/service)"
         echo "  ✓ PAM module"
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo "  ✓ fprintd emulation module (distro module restored from backup)"
+        fi
         echo "  ✓ Configuration GUI"
         if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
             echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"

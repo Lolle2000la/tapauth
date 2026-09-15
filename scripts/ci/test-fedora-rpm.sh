@@ -111,9 +111,15 @@ test "$MODE" = "644"
 echo "Verifying rpm integrity (rpm -V tapauth)..."
 rpm -V tapauth
 
-echo "Verifying the tapauth-fprintd subpackage is gone..."
-if ls "${PKG_DIR}"/tapauth-fprintd-*.rpm >/dev/null 2>&1; then
-    echo "ERROR: tapauth-fprintd subpackage was removed but an .rpm for it was still built"
+echo "Verifying the legacy tapauth-fprintd subpackage is gone (the emulation package is expected)..."
+# Match ONLY the removed legacy name tapauth-fprintd-<version>; the opt-in
+# replacement package tapauth-fprintd-emulation-<version> must not trip this.
+LEGACY_FPRINTD_RPMS=$(find "${PKG_DIR}" -maxdepth 1 \
+    -name 'tapauth-fprintd-*.rpm' \
+    ! -name 'tapauth-fprintd-emulation-*' 2>/dev/null || true)
+if [ -n "$LEGACY_FPRINTD_RPMS" ]; then
+    echo "ERROR: legacy tapauth-fprintd subpackage was removed but an .rpm for it was still built:"
+    printf '%s\n' "$LEGACY_FPRINTD_RPMS"
     exit 1
 fi
 if rpm -q tapauth-fprintd >/dev/null 2>&1; then
@@ -182,6 +188,43 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+
+echo "==> 9b-2. Testing the opt-in tapauth-fprintd-emulation package..."
+EMU_RPM=$(find "${PKG_DIR}" -maxdepth 1 -name 'tapauth-fprintd-emulation-*.rpm' | head -1 || true)
+if [ -z "$EMU_RPM" ]; then
+    echo "ERROR: tapauth-fprintd-emulation package was expected but was not built"
+    exit 1
+fi
+verify_fprintd_emulation_pkg rpm "${PKG_DIR}"
+
+echo "Verifying the emulation package's fprintd-pam conflict is honored..."
+# The emulation package declares conflicts/replaces/provides against the
+# distro fprintd-pam provider; the two providers must never be installed at
+# the same time.
+if ! rpm -q fprintd-pam >/dev/null 2>&1; then
+    dnf install -y fprintd-pam || true
+fi
+if rpm -q fprintd-pam >/dev/null 2>&1; then
+    if ! dnf install -y "$EMU_RPM"; then
+        echo "dnf refused the emulation install while fprintd-pam was present (conflict honored); removing fprintd-pam first..."
+        dnf remove -y fprintd-pam
+        dnf install -y "$EMU_RPM"
+    fi
+else
+    dnf install -y "$EMU_RPM"
+fi
+test -f /usr/lib64/security/pam_fprintd.so
+if rpm -q fprintd-pam >/dev/null 2>&1; then
+    echo "ERROR: fprintd-pam is installed alongside tapauth-fprintd-emulation"
+    exit 1
+fi
+
+echo "Verifying the emulation package removes cleanly..."
+dnf remove -y tapauth-fprintd-emulation
+test ! -e /usr/lib64/security/pam_fprintd.so
+# fprintd-pam is intentionally left absent: the base-package coexistence
+# checks that follow only depend on the real fprintd daemon package, which
+# stays installed throughout.
 
 echo "==> 9c. Upgrade-path test from a published v0.10.0-style package (authselect era)..."
 # v0.10.0 shipped authselect vendor profiles (vendor/tapauth, vendor/

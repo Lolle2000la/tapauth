@@ -91,9 +91,15 @@ test "$MODE" = "644"
 test -f /lib/systemd/system/tapauthd.service || test -f /usr/lib/systemd/system/tapauthd.service
 test -f /lib/systemd/system/tapauthd.socket || test -f /usr/lib/systemd/system/tapauthd.socket
 
-echo "Verifying the tapauth-fprintd subpackage is gone..."
-if ls /tmp/deb-build/tapauth-fprintd_*.deb >/dev/null 2>&1; then
-    echo "ERROR: tapauth-fprintd subpackage was removed but a .deb for it was still built"
+echo "Verifying the legacy tapauth-fprintd subpackage is gone (the emulation package is expected)..."
+# Match ONLY the removed legacy name tapauth-fprintd_<version>; the opt-in
+# replacement package tapauth-fprintd-emulation_<version> must not trip this.
+LEGACY_FPRINTD_DEBS=$(find /tmp/deb-build -maxdepth 1 \
+    -name 'tapauth-fprintd_*.deb' \
+    ! -name 'tapauth-fprintd-emulation*' 2>/dev/null || true)
+if [ -n "$LEGACY_FPRINTD_DEBS" ]; then
+    echo "ERROR: legacy tapauth-fprintd subpackage was removed but a .deb for it was still built:"
+    printf '%s\n' "$LEGACY_FPRINTD_DEBS"
     exit 1
 fi
 if dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; then
@@ -161,6 +167,45 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 ! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
 test ! -e /etc/pam.d/kde-fingerprint.tapauth-bak
 test ! -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+
+echo "==> 4b-2. Testing the opt-in tapauth-fprintd-emulation package..."
+EMU_DEB=$(find /tmp/deb-build -maxdepth 1 -name 'tapauth-fprintd-emulation_*.deb' | head -1 || true)
+if [ -z "$EMU_DEB" ]; then
+    echo "ERROR: tapauth-fprintd-emulation package was expected but was not built"
+    exit 1
+fi
+verify_fprintd_emulation_pkg deb /tmp/deb-build
+
+echo "Verifying the emulation package's libpam-fprintd conflict is honored..."
+# The emulation package declares conflicts/replaces/provides against the
+# distro libpam-fprintd provider; the two providers must never be installed
+# at the same time.
+if apt-get install -y libpam-fprintd >/dev/null 2>&1; then
+    if ! apt-get install -y "$EMU_DEB"; then
+        echo "apt refused the emulation install while libpam-fprintd was present (conflict honored); removing libpam-fprintd first..."
+        apt-get remove -y libpam-fprintd
+        apt-get install -y "$EMU_DEB"
+    fi
+else
+    apt-get install -y "$EMU_DEB"
+fi
+PAM_FPRINTD_SO=$(find /usr/lib /lib -name pam_fprintd.so 2>/dev/null | head -1 || true)
+if [ -z "$PAM_FPRINTD_SO" ]; then
+    echo "ERROR: tapauth-fprintd-emulation did not install pam_fprintd.so"
+    exit 1
+fi
+if dpkg -s libpam-fprintd 2>/dev/null | grep -q '^Status: install ok installed'; then
+    echo "ERROR: libpam-fprintd is installed alongside tapauth-fprintd-emulation"
+    exit 1
+fi
+
+echo "Verifying the emulation package removes cleanly..."
+apt-get remove -y tapauth-fprintd-emulation
+PAM_FPRINTD_SO=$(find /usr/lib /lib -name pam_fprintd.so 2>/dev/null | head -1 || true)
+if [ -n "$PAM_FPRINTD_SO" ]; then
+    echo "ERROR: pam_fprintd.so survived removal of tapauth-fprintd-emulation: $PAM_FPRINTD_SO"
+    exit 1
+fi
 
 echo "==> 4c. Testing upgrade from a published v0.10.0-style package (pam-auth-update era)..."
 # v0.10.0 shipped a /usr/share/pam-configs/tapauth profile and ran

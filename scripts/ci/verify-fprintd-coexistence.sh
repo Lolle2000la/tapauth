@@ -90,3 +90,137 @@ verify_fprintd_coexistence() {
             "net.reactivated.Fprint.service points at tapauthd (tapauth must never own that file)"
     fi
 }
+
+# fprintd_distro_provider <deb|rpm|arch>
+# Prints the distro package that owns pam_fprintd.so (the provider the
+# optional tapauth-fprintd-emulation package must conflict with/replace/provide).
+# Maps to deb -> libpam-fprintd, rpm -> fprintd-pam, arch -> fprintd.
+fprintd_distro_provider() {
+    case "$1" in
+        deb)  printf '%s\n' "libpam-fprintd" ;;
+        rpm)  printf '%s\n' "fprintd-pam" ;;
+        arch) printf '%s\n' "fprintd" ;;
+        *) echo "ERROR: unknown package manager '$1' (expected deb|rpm|arch)" >&2; return 1 ;;
+    esac
+}
+
+# _assert_emulation_files_contain_module <file-list>
+# The emulation package must install its PAM module as
+# .../security/pam_fprintd.so in every supported layout.
+_assert_emulation_files_contain_module() {
+    if ! printf '%s\n' "$1" | grep -Eq 'security/pam_fprintd\.so$'; then
+        echo "ERROR: tapauth-fprintd-emulation does not ship security/pam_fprintd.so"
+        exit 1
+    fi
+}
+
+# _assert_emulation_meta_mentions <field-label> <metadata-blob> <provider>
+# Fails unless the given dependency metadata declares the distro provider
+# (version constraints and comma separators are tolerated).
+_assert_emulation_meta_mentions() {
+    local field="$1" blob="$2" provider="$3"
+    if ! printf '%s\n' "$blob" | grep -Eq "(^|[ ,])${provider}([ ,=<>()]|$)"; then
+        echo "ERROR: tapauth-fprintd-emulation does not declare ${field} against ${provider} (got: ${blob:-<none>})"
+        exit 1
+    fi
+}
+
+# verify_fprintd_emulation_pkg <deb|rpm|arch> [package-dir]
+# Asserts the optional tapauth-fprintd-emulation package:
+#   * ships its PAM module as .../security/pam_fprintd.so, and
+#   * declares the distro fprintd PAM provider as conflict/replace/provide
+#     (deb: libpam-fprintd, rpm: fprintd-pam, arch: fprintd).
+# When package-dir is given the built package file is inspected; otherwise the
+# installed package metadata is queried.
+verify_fprintd_emulation_pkg() {
+    local pkg_manager="$1"
+    local pkg_dir="${2:-}"
+    local provider
+    provider=$(fprintd_distro_provider "$pkg_manager") || exit 1
+    local emu_pkg="tapauth-fprintd-emulation"
+    local files conflict replace provide
+
+    case "$pkg_manager" in
+        deb)
+            if [ -n "$pkg_dir" ]; then
+                local deb
+                deb=$(find "$pkg_dir" -maxdepth 1 -name 'tapauth-fprintd-emulation_*.deb' | head -1 || true)
+                if [ -z "$deb" ]; then
+                    echo "ERROR: tapauth-fprintd-emulation .deb not found in $pkg_dir"
+                    exit 1
+                fi
+                files=$(dpkg-deb -c "$deb")
+                conflict=$(dpkg-deb -f "$deb" Conflicts)
+                replace=$(dpkg-deb -f "$deb" Replaces)
+                provide=$(dpkg-deb -f "$deb" Provides)
+            else
+                if ! dpkg -s "$emu_pkg" >/dev/null 2>&1; then
+                    echo "ERROR: $emu_pkg is not installed and no package-dir was given"
+                    exit 1
+                fi
+                files=$(dpkg -L "$emu_pkg")
+                conflict=$(dpkg-query -W -f='${Conflicts}' "$emu_pkg")
+                replace=$(dpkg-query -W -f='${Replaces}' "$emu_pkg")
+                provide=$(dpkg-query -W -f='${Provides}' "$emu_pkg")
+            fi
+            ;;
+        rpm)
+            if [ -n "$pkg_dir" ]; then
+                local rpmf
+                rpmf=$(find "$pkg_dir" -maxdepth 1 -name 'tapauth-fprintd-emulation-*.rpm' | head -1 || true)
+                if [ -z "$rpmf" ]; then
+                    echo "ERROR: tapauth-fprintd-emulation .rpm not found in $pkg_dir"
+                    exit 1
+                fi
+                files=$(rpm -qpl "$rpmf")
+                conflict=$(rpm -qp --conflicts "$rpmf")
+                replace=$(rpm -qp --obsoletes "$rpmf")
+                provide=$(rpm -qp --provides "$rpmf")
+            else
+                if ! rpm -q "$emu_pkg" >/dev/null 2>&1; then
+                    echo "ERROR: $emu_pkg is not installed and no package-dir was given"
+                    exit 1
+                fi
+                files=$(rpm -ql "$emu_pkg")
+                conflict=$(rpm -q --conflicts "$emu_pkg")
+                replace=$(rpm -q --obsoletes "$emu_pkg")
+                provide=$(rpm -q --provides "$emu_pkg")
+            fi
+            ;;
+        arch)
+            if [ -n "$pkg_dir" ]; then
+                local pkgf
+                pkgf=$(find "$pkg_dir" -maxdepth 1 \
+                    -name 'tapauth-fprintd-emulation-*.pkg.tar.zst' \
+                    ! -name 'tapauth-fprintd-emulation-git-*' | head -1 || true)
+                if [ -z "$pkgf" ]; then
+                    echo "ERROR: tapauth-fprintd-emulation package not found in $pkg_dir"
+                    exit 1
+                fi
+                files=$(tar --zstd -tf "$pkgf")
+                local pkginfo
+                pkginfo=$(tar --zstd -xOf "$pkgf" .PKGINFO)
+                conflict=$(printf '%s\n' "$pkginfo" | sed -n 's/^conflict = //p')
+                replace=$(printf '%s\n' "$pkginfo" | sed -n 's/^replaces = //p')
+                provide=$(printf '%s\n' "$pkginfo" | sed -n 's/^provides = //p')
+            else
+                if ! pacman -Qq "$emu_pkg" >/dev/null 2>&1; then
+                    echo "ERROR: $emu_pkg is not installed and no package-dir was given"
+                    exit 1
+                fi
+                files=$(pacman -Ql "$emu_pkg")
+                local qi
+                qi=$(LC_ALL=C pacman -Qi "$emu_pkg")
+                conflict=$(printf '%s\n' "$qi" | sed -n 's/^Conflicts With *: *//p')
+                replace=$(printf '%s\n' "$qi" | sed -n 's/^Replaces *: *//p')
+                provide=$(printf '%s\n' "$qi" | sed -n 's/^Provides *: *//p')
+            fi
+            ;;
+    esac
+
+    _assert_emulation_files_contain_module "$files"
+    _assert_emulation_meta_mentions "Conflicts" "$conflict" "$provider"
+    _assert_emulation_meta_mentions "Replaces" "$replace" "$provider"
+    _assert_emulation_meta_mentions "Provides" "$provide" "$provider"
+    echo "tapauth-fprintd-emulation: ships pam_fprintd.so and declares Conflicts/Replaces/Provides against ${provider}."
+}
