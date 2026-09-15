@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# The optional emulation package ships the marker file
+# /usr/share/tapauth/fprintd-emulation.enabled, which makes the daemon's
+# tri-state `enable_fprintd_bridge` default to "on". The daemon claims or
+# releases the net.reactivated.Fprint bus name only at startup, so a running
+# daemon must be bounced after the file is in place. Guarded and non-fatal: an
+# offline/container install (or a system without systemd) must never fail the
+# dpkg transaction.
+if [ "$1" = "configure" ]; then
+	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+		deb-systemd-invoke try-restart tapauthd.service || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl try-restart tapauthd.service 2>/dev/null || true
+	fi
+fi
+
+#DEBHELPER#
+exit 0

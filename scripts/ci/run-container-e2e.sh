@@ -93,6 +93,7 @@ case "$DISTRO" in
             fi
             dnf install -y "$EMU_RPM"
             test -f /usr/lib64/security/pam_fprintd.so
+            test -f /usr/share/tapauth/fprintd-emulation.enabled
             EMU_INSTALLED=true
         else
             echo "⚠️  tapauth-fprintd-emulation RPM not found in $PACKAGE_DIR; Phase 2j will be skipped."
@@ -111,6 +112,7 @@ case "$DISTRO" in
             fi
             pacman -U --noconfirm "$EMU_PKG"
             test -f /usr/lib/security/pam_fprintd.so
+            test -f /usr/share/tapauth/fprintd-emulation.enabled
             EMU_INSTALLED=true
         else
             echo "⚠️  tapauth-fprintd-emulation package not found in $PACKAGE_DIR; Phase 2j will be skipped."
@@ -145,6 +147,17 @@ if [ "$EMU_INSTALLED" = true ]; then
         fedora) rpm -e tapauth-fprintd-emulation 2>/dev/null || dnf remove -y tapauth-fprintd-emulation || true ;;
         arch)   pacman -R --noconfirm tapauth-fprintd-emulation ;;
     esac
+    # Removing the package removes its bridge marker, so the daemon's
+    # tri-state default flips back to "off". Only assert once the package is
+    # actually gone (the Fedora removal above tolerates a failure).
+    _emu_still_installed=false
+    case "$DISTRO" in
+        fedora) rpm -q tapauth-fprintd-emulation >/dev/null 2>&1 && _emu_still_installed=true || true ;;
+        arch)   pacman -Qq tapauth-fprintd-emulation >/dev/null 2>&1 && _emu_still_installed=true || true ;;
+    esac
+    if [ "$_emu_still_installed" = false ]; then
+        test ! -e /usr/share/tapauth/fprintd-emulation.enabled
+    fi
     if [ -n "$FPRINTD_PROVIDER_RESTORE" ]; then
         echo "==> Restoring distro fprintd PAM provider '$FPRINTD_PROVIDER_RESTORE'..."
         case "$DISTRO" in

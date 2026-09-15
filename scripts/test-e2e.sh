@@ -112,6 +112,18 @@ if [ "$E2E_DAEMON_MODE" = "dev" ]; then
         CONFIG_ASSERT_FILE="${TAPAUTH_STATE_DIR}/config.toml"
         chown -R tapauthd:tapauthd "$TEST_DIR" 2>/dev/null || true
     fi
+    # Phase 2h asserts the virtual fprintd D-Bus interface. The bridge is
+    # opt-in now (unset = on only with the emulation marker), and the D-Bus
+    # name is claimed exactly once at daemon startup — a later
+    # `set-transports --fprintd-bridge true` writes config but cannot (re)start
+    # the service. Seed an explicit override before Step 4 launches the daemon
+    # so Phase 2h works both with the emulation package (marker) and in the
+    # standalone dev sandbox (no marker).
+    if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
+        printf 'enable_fprintd_bridge = true\n' > "$CONFIG_ASSERT_FILE"
+        chmod 644 "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+        chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+    fi
 else
     CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
 fi
@@ -442,7 +454,15 @@ EOF
             chmod 644 "$CONFIG_ASSERT_FILE" 2>/dev/null || true
         else
             if ! grep -q "^[[:space:]]*enable_fprintd_bridge[[:space:]]*=[[:space:]]*true" "$CONFIG_ASSERT_FILE"; then
-                sed -i 's/^[#[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+                if grep -q "^[[:space:]#]*enable_fprintd_bridge" "$CONFIG_ASSERT_FILE" 2>/dev/null; then
+                    sed -i 's/^[#[:space:]]*enable_fprintd_bridge[[:space:]]*=.*/enable_fprintd_bridge = true/' "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+                else
+                    # Tri-state: an absent key means auto (marker-derived). This
+                    # mode runs Phase 2h, so pin it on explicitly.
+                    printf '\nenable_fprintd_bridge = true\n' >> "$CONFIG_ASSERT_FILE"
+                fi
+                chmod 644 "$CONFIG_ASSERT_FILE" 2>/dev/null || true
+                chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE" 2>/dev/null || true
             fi
         fi
     else

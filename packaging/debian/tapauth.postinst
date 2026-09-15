@@ -55,9 +55,13 @@ if [ "$1" = "configure" ]; then
 	mkdir -p /etc/tapauth
 	if [ -z "$2" ] || [ ! -f /etc/tapauth/config.toml ]; then
 		if [ ! -f /etc/tapauth/config.toml ]; then
-			# The virtual fprintd bridge is enabled by default in the daemon;
-			# do not write enable_fprintd_bridge here. Users who want a real
-			# local fingerprint reader opt out via this key in config.toml.
+			# The virtual fprintd bridge is opt-in, so do not write
+			# enable_fprintd_bridge here. With the key unset the daemon follows
+			# the presence of the marker file shipped by the optional
+			# tapauth-fprintd-emulation package (absent for a base install):
+			# a base install therefore leaves the net.reactivated.Fprint bus
+			# name to a real local fprintd. Users can force the bridge with an
+			# explicit enable_fprintd_bridge = true.
 			printf "# TapAuth Configuration\n" > /etc/tapauth/config.toml
 		fi
 		chmod 0755 /etc/tapauth 2>/dev/null || true
@@ -69,7 +73,7 @@ if [ "$1" = "configure" ]; then
 	# All other stacks — including fingerprint stacks (kde-fingerprint,
 	# gdm-fingerprint, fingerprint-auth) — stay stock: they call
 	# pam_fprintd.so, which resolves to tapauthd's virtual fprintd D-Bus
-	# service (bridge enabled by default).
+	# service when the bridge is enabled (opt-in; see the emulation package).
 	# pam-auth-update migration (upgrade path from TapAuth <= 0.10.x, which
 	# shipped a /usr/share/pam-configs/tapauth profile with priority 512):
 	# dpkg has already removed the profile at this point, so regenerating
@@ -103,58 +107,60 @@ if [ "$1" = "configure" ]; then
 		if [ ! -f "${pam_file}.tapauth-bak" ]; then
 			cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
 		fi
-		if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+		if [ "$pam_svc" = "su" ]; then
+			# PAM_USER for su is the TARGET user, so inserting at the top
+			# would let a phone grant for root bypass pam_rootok.so /
+			# pam_wheel.so (and would prompt for root's own `su`). Insert
+			# after the pam_env.so / pam_rootok.so / pam_wheel.so block and
+			# before the first auth include (common-auth / system-auth /
+			# @include). On Debian/Ubuntu this lands after pam_env.so; on
+			# stacks without pam_env.so (e.g. Fedora) it lands after
+			# pam_rootok/pam_wheel and before system-auth.
+			pam_anchor=$(awk '
+				/^[[:space:]]*#/ { next }
+				/(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+			' "$pam_file")
+			if [ -n "$pam_anchor" ]; then
+				sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+			elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+				sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+			else
+				sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+			fi
+		elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
 			sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
 		else
 			sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
 		fi
 	done
-	# The virtual fprintd D-Bus files ship in this package; reload D-Bus and
-	# bounce the daemon so the bridge picks up the policy immediately.
+	# The D-Bus policy file ships in this package; reload D-Bus and bounce the
+	# daemon so the policy is picked up and the (opt-in) bridge is evaluated
+	# at startup. The optional emulation package bounces the daemon again when
+	# its marker file is added/removed.
 	if command -v deb-systemd-invoke >/dev/null 2>&1; then
 		deb-systemd-invoke reload dbus || true
 		deb-systemd-invoke try-restart tapauthd.service || true
 	fi
 	echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
-	echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
-	echo "         stay stock: lock screens and greeters integrate through the"
-	echo "         built-in virtual fprintd service (no real reader required)."
-	# Add existing interactive local users to tapauthd-clients so user-session
-	# components (e.g. KDE's kscreenlocker_worker, which runs as the logged-in
-	# user) can reach /run/tapauthd/tapauthd.sock (root:tapauthd-clients 0660).
-	# This matters for the opt-in pam_fprintd.so emulation path; greeters and
-	# auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
-	# Non-fatal by design: a failure must never abort the package transaction.
-	# Membership is deliberately left in place on removal/purge (only the
-	# sysusers group itself is removed on purge).
-	if command -v usermod >/dev/null 2>&1 && getent group tapauthd-clients >/dev/null 2>&1; then
-		added_users=""
-		while IFS= read -r member; do
-			[ -n "$member" ] || continue
-			if id -nG "$member" 2>/dev/null | grep -qw tapauthd-clients; then
-				continue
-			fi
-			if usermod -aG tapauthd-clients "$member" 2>/dev/null; then
-				added_users="${added_users} ${member}"
-			fi
-		done <<EOF
-$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' || true)
-EOF
-		if [ -n "$added_users" ]; then
-			echo "TapAuth: added existing interactive users to tapauthd-clients:${added_users}"
-			echo "         They must log out and back in (or re-init their groups)"
-			echo "         before this takes effect."
-		else
-			echo "TapAuth: no existing interactive users needed adding to tapauthd-clients."
-		fi
-	else
-		echo "TapAuth: could not add existing users to tapauthd-clients automatically"
-		echo "         (group or usermod unavailable). Add them manually with:"
-		echo "         sudo usermod -aG tapauthd-clients \$USER"
-	fi
-	# Newly created accounts are covered on the next package upgrade (postinst
-	# runs again and picks up any new interactive users). We deliberately do
-	# not edit /etc/adduser.conf: it is a conffile owned by the adduser package.
+	echo "         (originals kept as <file>.tapauth-bak; in su it is inserted"
+	echo "         after pam_rootok/pam_wheel so it cannot bypass them)."
+	echo "         Fingerprint stacks stay stock; the virtual fprintd bridge is"
+	echo "         opt-in (install tapauth-fprintd-emulation, or set"
+	echo "         enable_fprintd_bridge = true, then restart tapauthd)."
+	# Membership is a manual, per-user opt-in: the scriptlet never modifies
+	# group membership. Needed for the configuration GUI and for user-session
+	# lock-screen unlock (e.g. KDE's kscreenlocker_worker, which runs as the
+	# logged-in user, reaches /run/tapauthd/tapauthd.sock as
+	# root:tapauthd-clients 0660). Root-run greeters/auth helpers
+	# (GDM/SDDM/LightDM) are unaffected. Memberships are deliberately left in
+	# place on removal/purge (only the sysusers group itself is removed on
+	# purge).
+	echo "TapAuth: To use the configuration GUI and to unlock user-session"
+	echo "         lock screens, add your user to the tapauthd-clients group:"
+	echo "         sudo usermod -aG tapauthd-clients \$USER"
+	echo "         Then log out and log back in for the change to take effect."
+	echo "         Membership is not granted automatically. Root-run greeters and"
+	echo "         auth helpers (GDM/SDDM/LightDM) are unaffected."
 fi
 #DEBHELPER#
 exit 0

@@ -197,8 +197,8 @@ remove_systemd_units_and_daemon() {
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
         show_file_removal "/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf" "Virtual fprintd D-Bus policy"
-        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service" "Virtual fprintd D-Bus activation service (renamed, content-guarded)"
-        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation service (legacy pre-rename name, content-guarded)"
+        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation file (legacy pre-rename install, content-guarded)"
+        show_file_removal "/usr/share/tapauth/fprintd-emulation.enabled" "fprintd-emulation bridge marker"
         show_file_removal "/etc/dconf/db/gdm.d/10-tapauth-fingerprint" "GDM dconf override"
         show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override (legacy)"
         
@@ -260,23 +260,31 @@ remove_systemd_units_and_daemon() {
         fi
     done
 
-    # Remove TapAuth's D-Bus activation files. The RENAMED
-    # net.reactivated.Fprint.tapauth.service is what current releases ship;
-    # the un-renamed net.reactivated.Fprint.service is the filename of
-    # pre-rename installs (and of the real fprintd package). BOTH are
-    # content-guarded (Exec must reference tapauthd) so a hypothetical
-    # identically-named foreign file — above all real fprintd's own — is
-    # never deleted, mirroring the .tapauth.conf handling above.
+    # Remove the legacy pre-rename D-Bus activation file if an older TapAuth
+    # release installed it. Current releases ship no activation file at all
+    # (dbus-daemon and dbus-broker only activate files named exactly after the
+    # bus name, so tapauthd's availability comes from systemd). Content-guarded:
+    # the filename is real fprintd's own, so only a file whose Exec references
+    # tapauthd — necessarily an old TapAuth artifact — is deleted.
     for fprint_srv in \
-        /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service \
         /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
     do
         if [[ -f "$fprint_srv" ]] && grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
-            print_info "Removing virtual fprintd D-Bus service activation file ($fprint_srv)"
+            print_info "Removing legacy virtual fprintd D-Bus activation file ($fprint_srv)"
             rm -f "$fprint_srv"
             removed_fprint_dbus=true
         fi
     done
+
+    # Remove the fprintd-emulation marker installed by
+    # install.sh --fprintd-emulation. Its absence restores the tri-state
+    # enable_fprintd_bridge default to "off".
+    if [[ -f "/usr/share/tapauth/fprintd-emulation.enabled" ]]; then
+        print_info "Removing fprintd-emulation bridge marker (/usr/share/tapauth/fprintd-emulation.enabled)"
+        rm -f "/usr/share/tapauth/fprintd-emulation.enabled"
+        removed_fprint_dbus=true
+    fi
+    rmdir /usr/share/tapauth 2>/dev/null || true
 
     if [[ "$removed_fprint_dbus" == true ]]; then
         if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
@@ -284,9 +292,9 @@ remove_systemd_units_and_daemon() {
         fi
     fi
 
-    # Note: no config.toml edit here. The virtual fprintd bridge is enabled
-    # by default in the daemon; the daemon is being removed entirely, so a
-    # leftover enable_fprintd_bridge key would be stale either way.
+    # Note: no config.toml edit here. enable_fprintd_bridge is tri-state
+    # (unset = auto, following the marker above); the daemon is being removed
+    # entirely, so a leftover key would be stale either way.
 
     # Remove GDM dconf override
     local updated_dconf=false

@@ -1,0 +1,31 @@
+# shellcheck shell=bash
+# Scriptlet for the optional tapauth-fprintd-emulation-git split package.
+#
+# This package ships the marker file
+# /usr/share/tapauth/fprintd-emulation.enabled, which makes the daemon's
+# tri-state `enable_fprintd_bridge` default to "on". tapauthd claims (or
+# releases) the net.reactivated.Fprint bus name only at startup, so a running
+# daemon must be bounced after the marker appears or disappears.
+#
+# A dedicated scriptlet is used instead of sharing tapauth-git.install:
+# `install=` is per-package (verified with `makepkg --printsrcinfo`), and the
+# base package's pre_remove is destructive (disables the units, restores the
+# PAM stacks). Sharing it would tear down TapAuth when only this optional
+# package is removed. Guarded and non-fatal throughout.
+tapauth_emulation_restart_daemon() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart tapauthd.service >/dev/null 2>&1 || true
+  fi
+}
+
+post_install() {
+  tapauth_emulation_restart_daemon
+}
+
+post_upgrade() {
+  tapauth_emulation_restart_daemon
+}
+
+post_remove() {
+  tapauth_emulation_restart_daemon
+}

@@ -41,6 +41,7 @@ jobs:
           # Synchronize from repository packaging/arch-git/
           cp packaging/arch-git/PKGBUILD aur-repo/PKGBUILD
           cp packaging/arch-git/tapauth-git.install aur-repo/tapauth-git.install
+          cp packaging/arch-git/tapauth-fprintd-emulation-git.install aur-repo/tapauth-fprintd-emulation-git.install
 
           # Dynamically compute git pkgver matching PKGBUILD pkgver()
           GIT_DESC=$(git describe --long --tags 2>/dev/null || echo "")

@@ -86,8 +86,10 @@ jobs:
           rm -rf debian
           cp -r packaging/debian debian
           # tapauth-fprintd.{postinst,prerm,postrm} were dropped with the subpackage;
-          # tapauth.prerm handles PAM restore for the three-file scope.
-          chmod +x debian/rules debian/tapauth.postinst debian/tapauth.postrm debian/tapauth.prerm
+          # tapauth.prerm handles PAM restore for the three-file scope. The
+          # tapauth-fprintd-emulation maintainer scripts own the bridge marker.
+          chmod +x debian/rules debian/tapauth.postinst debian/tapauth.postrm debian/tapauth.prerm \
+            debian/tapauth-fprintd-emulation.postinst debian/tapauth-fprintd-emulation.postrm
 
           # Build and upload per target series so Launchpad rebuilds for each
           PARENT_DIR=$(basename $(pwd))

@@ -8,12 +8,11 @@ You can install tapauth via native package repositories to receive automatic upd
 
 ### What the packages configure
 
-- **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). `login` is deliberately **not** patched.
-- **Everything else stays stock.** All other PAM stacks — including the fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, `fingerprint-auth`) — are left untouched: they call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service. (On machines with no physical fingerprint reader, the optional `tapauth-fprintd-emulation` package can instead ship `pam_fprintd.so` itself — see [No physical fingerprint reader? Optional emulation package](#no-physical-fingerprint-reader-optional-emulation-package) below.)
-- **Desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No extra package, no manual PAM edits, no local fingerprint reader required.
-- **Collision-free D-Bus activation file.** TapAuth ships a renamed activation file (`net.reactivated.Fprint.tapauth.service`) that can never collide with real fprintd's own `net.reactivated.Fprint.service`. Verified with `dbus-daemon` and `dbus-broker`: both only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder and real fprintd keeps full control of on-demand activation.
-- **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot for the lock-screen bridge); `tapauthd.service` is additionally started at install so the virtual fprintd bridge is live immediately.
-- **Socket access for desktop users:** on install/upgrade the package automatically adds every existing interactive local user (UID ≥ 1000 and a real login shell) to the `tapauthd-clients` group, so user-session components (e.g. KDE's `kscreenlocker_worker`, which runs as the logged-in user) can reach `/run/tapauthd/tapauthd.sock` (`root:tapauthd-clients`, mode `0660`). Users created later are picked up on the next package upgrade. The change is non-fatal and idempotent, and the membership is **not** removed on uninstall/purge. **The affected users must log out and back in** (or otherwise re-initialise their process's group list) for it to take effect. This only matters for user-session lockers / the opt-in `pam_fprintd.so` emulation path — greeters and auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
+- **PAM scope: `sudo`, `su` and `polkit-1` only.** The package scriptlets insert `auth sufficient pam_tapauth.so` into those three stacks (originals kept as `<file>.tapauth-bak` and restored on removal). In `su` the line is inserted **after** `pam_rootok.so`/`pam_wheel.so` (and after `pam_env.so` when present), because `PAM_USER` for `su` is the target user — inserting it first would let a phone grant for `root` bypass the wheel/root checks. `login` is deliberately **not** patched.
+- **The virtual fprintd bridge is opt-in and off by default.** The base packages ship no marker and no D-Bus activation file — only the D-Bus **policy** file that lets `tapauthd` own `net.reactivated.Fprint` when enabled. A base install therefore leaves the bus name to a real local fprintd. Install the optional `tapauth-fprintd-emulation` package (which ships the marker `/usr/share/tapauth/fprintd-emulation.enabled`) or set `enable_fprintd_bridge = true` to enable it. (On machines with no physical fingerprint reader, the optional package can also ship `pam_fprintd.so` itself — see [No physical fingerprint reader? Optional emulation package](#no-physical-fingerprint-reader-optional-emulation-package) below.)
+- **When enabled, desktop lock screens and greeters (KDE Plasma, GNOME) integrate automatically.** No manual PAM edits and no local fingerprint reader required; stock fingerprint stacks call `pam_fprintd.so`, which resolves to TapAuth's built-in virtual fprintd service. The bridge state is read at `tapauthd` startup, so it applies on the next daemon restart.
+- **Daemon lifecycle:** both `tapauthd.socket` and `tapauthd.service` are enabled via the shipped systemd preset (the service must run at boot so the opt-in bridge can be claimed at startup); `tapauthd.service` is additionally started at install so the daemon answers IPC immediately.
+- **Socket access for desktop users:** the `tapauthd-clients` group owns `/run/tapauthd/tapauthd.sock` (`root:tapauthd-clients`, mode `0660`). Membership is **not** granted automatically: each desktop user who needs the configuration GUI or user-session lock-screen unlock (e.g. KDE's `kscreenlocker_worker`, which runs as the logged-in user) must add themselves (see the per-distro rows below) and **log out and back in** (or otherwise re-initialise their process's group list) for it to take effect. The source `install.sh` is the sole exception — it adds only the installing user, never every interactive user. This only matters for user-session lockers / the opt-in `pam_fprintd.so` emulation path — greeters and auth helpers that run as root (GDM/SDDM/LightDM) are unaffected. The membership is **not** removed on uninstall/purge.
 
 ### 1. Fedora Linux
 Packages are built and tracked using Fedora COPR.
@@ -21,11 +20,11 @@ Packages are built and tracked using Fedora COPR.
 sudo dnf copr enable lolle2000la/tapauth
 sudo dnf install tapauth
 ```
-* **Group Membership:** The package automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group on install/upgrade. To add any remaining user manually (or grant GUI/admin access explicitly):
+* **Group Membership:** The `tapauthd-clients` group owns the daemon socket (`/run/tapauthd/tapauthd.sock`, mode `0660`). Membership is **not** granted automatically; add yourself to use the configuration GUI or unlock a user-session lock screen:
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
 * **PAM Configuration:** The package scriptlets patch `sudo`, `su` and `polkit-1` directly (with pristine backups). Do **not** use `authselect` vendor profiles with TapAuth — current releases ship no authselect profiles. If you previously enabled one from an older TapAuth release (≤ 0.10.x), removing/upgrading the package rolls the selection back to the stock profile automatically.
 
@@ -41,11 +40,11 @@ sudo add-apt-repository ppa:lolle2000la/tapauth
 sudo apt-get update
 sudo apt-get install tapauth
 ```
-* **Group Membership:** The package automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group on install/upgrade, (users created later are picked up on the next package upgrade). To add any remaining user manually (or grant GUI/admin access explicitly):
+* **Group Membership:** The `tapauthd-clients` group owns the daemon socket (`/run/tapauthd/tapauthd.sock`, mode `0660`). Membership is **not** granted automatically; add yourself to use the configuration GUI or unlock a user-session lock screen:
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
 * **PAM Configuration:** Installation patches `sudo`, `su` and `polkit-1` directly (originals kept as `<file>.tapauth-bak`). TapAuth does **not** register a `pam-auth-update` profile anymore. Upgrading from TapAuth ≤ 0.10.x (which used `pam-auth-update`) automatically regenerates the managed stacks so the old `common-auth` line is removed — on upgrade and on plain `apt remove tapauth`.
 
@@ -58,11 +57,11 @@ yay -S tapauth
 ```
 * **Service Activation:** The install scriptlet applies the shipped systemd preset (`tapauthd.socket` enabled, `tapauthd.service` started at install), so no manual `systemctl enable --now` is required.
 
-* **Group Membership:** The install/upgrade scriptlet automatically adds all existing interactive local users (UID ≥ 1000 with a real login shell) to the `tapauthd-clients` group. To add any remaining user manually (or grant GUI/admin access explicitly):
+* **Group Membership:** The `tapauthd-clients` group owns the daemon socket (`/run/tapauthd/tapauthd.sock`, mode `0660`). Membership is **not** granted automatically; add yourself to use the configuration GUI or unlock a user-session lock screen:
   ```bash
   sudo usermod -aG tapauthd-clients $USER
   ```
-  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket, i.e. the opt-in `pam_fprintd.so` emulation path; root auth helpers/greeters are unaffected.)*
+  *(Log out and back in — or otherwise re-initialise the process's group list — for group membership to take effect. This matters for user-session components such as a lock-screen worker reaching the daemon socket; root auth helpers/greeters (GDM/SDDM/LightDM) are unaffected.)*
 
 * **PAM Configuration:** The install scriptlet patches `sudo`, `su` and `polkit-1` (seeding `/etc/pam.d` overrides from `/usr/lib/pam.d` vendor files where applicable, with pristine `.tapauth-bak` backups). A libalpm hook re-applies the polkit-1 override when the `polkit` package is upgraded. No manual PAM editing is required.
 
@@ -70,29 +69,31 @@ yay -S tapauth
 
 Modern Linux desktop lock screens (KDE Plasma's `kscreenlocker` and GNOME's `gdm`/`gnome-shell`) support simultaneous password and biometric authentication through virtual fingerprint emulation.
 
-### Built-in virtual fprintd bridge (enabled by default)
+### Built-in virtual fprintd bridge (opt-in)
 
-TapAuth ships an embedded virtual `fprintd` D-Bus service (`net.reactivated.Fprint`) in the daemon — no extra package is needed. When your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
+TapAuth ships an embedded virtual `fprintd` D-Bus service (`net.reactivated.Fprint`) in the daemon — no extra package is needed. **The bridge is opt-in and off by default**: a base install ships no marker file, so the `net.reactivated.Fprint` bus name stays with a real local `fprintd` (if installed) and a physical reader is never shadowed. Enable it by installing the optional `tapauth-fprintd-emulation` package (it ships the marker `/usr/share/tapauth/fprintd-emulation.enabled`), or by setting `enable_fprintd_bridge = true` explicitly.
 
-TapAuth's daemon (`tapauthd`) claims the `net.reactivated.Fprint` bus name while it runs, so the real fprintd daemon stays dormant. The real `fprintd` package may stay installed — TapAuth's D-Bus activation file is renamed (`net.reactivated.Fprint.tapauth.service`) so it never collides with fprintd's own file (both `dbus-daemon` and `dbus-broker` only use activation files named exactly after the bus name, so the renamed file is an inert, collision-free placeholder).
+Once enabled, when your screen is locked, Plasma and GNOME query `net.reactivated.Fprint` on D-Bus. If paired phones exist for your user, the desktop shows biometric authentication prompts in parallel with the password prompt. Approving on your phone immediately unlocks the session; typing your password also unlocks immediately and cancels the pending phone request.
 
-> **Note:** changes to `enable_fprintd_bridge` (see below) take effect at the next **daemon restart** (`sudo systemctl restart tapauthd.service`), not dynamically.
+TapAuth's daemon (`tapauthd`) claims the `net.reactivated.Fprint` bus name while it runs **only when the bridge is enabled**, so a real fprintd daemon stays in charge otherwise. The base packages ship **no D-Bus activation file** (only the D-Bus policy): both `dbus-daemon` and `dbus-broker` only use activation files named exactly after the bus name, so real fprintd's own `net.reactivated.Fprint.service` keeps full control of on-demand activation and tapauthd's availability comes from systemd.
 
-### Using a real hardware fingerprint reader instead
+> **Note:** `enable_fprintd_bridge` is **tri-state** — unset (default) follows the emulation marker, `true` forces the bridge on, `false` forces it off. Any change takes effect at the next **daemon restart** (`sudo systemctl restart tapauthd.service`), not dynamically.
 
-If your machine has a physical fingerprint reader you want to keep using:
+### Using a real hardware fingerprint reader
+
+A base install already leaves a real local fingerprint reader in charge (no marker → bridge off). If you enabled the bridge and want the reader back:
 
 1. Keep (or install) the distribution's real `fprintd` package.
-2. Set `enable_fprintd_bridge = false` in `/etc/tapauth/config.toml`.
+2. Either remove the optional `tapauth-fprintd-emulation` package, **or** set `enable_fprintd_bridge = false` in `/etc/tapauth/config.toml`.
 3. Restart the daemon: `sudo systemctl restart tapauthd.service`.
 
-TapAuth then never claims the bus name and real fprintd handles all fingerprint requests again. PAM authentication for `sudo`, `su` and `polkit-1` via your paired phone continues to work independently. `install.sh` performs steps 2–3 automatically when it detects a real fprintd installation. If you previously installed the optional `tapauth-fprintd-emulation` package, remove it as well (see below) so the distribution's real `pam_fprintd.so` is restored.
+TapAuth then never claims the bus name and real fprintd handles all fingerprint requests again. PAM authentication for `sudo`, `su` and `polkit-1` via your paired phone continues to work independently. `install.sh` writes `enable_fprintd_bridge = false` automatically when it detects a real fprintd installation.
 
-To return to phone-based lock screen unlock, set `enable_fprintd_bridge = true` and restart the daemon.
+To return to phone-based lock screen unlock, install `tapauth-fprintd-emulation` (or set `enable_fprintd_bridge = true`) and restart the daemon.
 
 ### No physical fingerprint reader? Optional emulation package
 
-The default setup above already covers lock screens and greeters on machines with **no** fingerprint reader, via the built-in virtual fprintd D-Bus bridge. Some distributions, however, only offer biometric login when a PAM module named `pam_fprintd.so` is present on disk. For that case TapAuth publishes an **optional, opt-in** package that installs a second build of its PAM module under that exact name, so stock fingerprint PAM stacks route to your phone without any real fprintd hardware:
+On machines with **no** fingerprint reader, the built-in virtual fprintd D-Bus bridge above provides lock-screen integration once it is enabled. Some distributions, however, only offer biometric login when a PAM module named `pam_fprintd.so` is present on disk. For that case TapAuth publishes an **optional, opt-in** package that installs a second build of its PAM module under that exact name, so stock fingerprint PAM stacks route to your phone without any real fprintd hardware. The same package **also ships the bridge marker** `/usr/share/tapauth/fprintd-emulation.enabled`, so installing it enables the virtual fprintd bridge (for lock-screen discovery) as a side effect. Its package scriptlets bounce `tapauthd` so the bus name is claimed/released immediately:
 
 | Install path | Package / flag |
 | :--- | :--- |
@@ -114,11 +115,11 @@ paru -S tapauth-fprintd-emulation
 sudo ./install.sh --fprintd-emulation
 ```
 
-This package **conflicts with, replaces and provides** the distribution's own fingerprint PAM provider (`libpam-fprintd` on Debian/Ubuntu, `fprintd-pam` on Fedora/RHEL, monolithic `fprintd` on Arch), because only one package can own `pam_fprintd.so`. The base `tapauth` package is unchanged and still deliberately does **not** conflict with fprintd.
+This package **conflicts with, replaces and provides** the distribution's own fingerprint PAM provider (`libpam-fprintd` on Debian/Ubuntu, `fprintd-pam` on Fedora/RHEL, monolithic `fprintd` on Arch), because only one package can own `pam_fprintd.so`. The base `tapauth` package is unchanged: it still deliberately does **not** conflict with fprintd, ships no bridge marker, and ships no D-Bus activation file.
 
 > **Prefer a physical reader if you have one.** The emulation package is intended only for machines without (or not wanting to use) a real fingerprint sensor. If your hardware has one, keep the base package and the distribution's real fprintd.
 
-To undo the emulation package, remove it and reinstall the distribution's fingerprint PAM provider:
+To undo the emulation package, remove it and reinstall the distribution's fingerprint PAM provider (removing the package also removes the bridge marker, and its scriptlets bounce `tapauthd` so it releases the bus name):
 
 ```bash
 # Fedora
@@ -197,7 +198,7 @@ This installs everything with default settings (including PAM configuration for 
 - **Bluetooth Support (daemon)**: Optional — build the daemon with or without Bluetooth (BLE) support
 - **PAM Configuration**: Patches `sudo`, `su` and `polkit-1` (opt-in per service; `login` deliberately excluded)
 - **TPM Support**: Optional TPM integration for secure key storage
-- **Virtual fprintd Bridge**: Built-in and enabled by default; automatically disabled when a real hardware fprintd installation is detected
+- **Virtual fprintd Bridge**: Built-in and **opt-in** (off by default); enabled by the `tapauth-fprintd-emulation` package's marker or an explicit `enable_fprintd_bridge = true`, and automatically forced off when a real hardware fprintd installation is detected
 - **Interactive Mode**: User-friendly prompts for all options
 - **Non-Interactive Mode**: Full automation via command-line flags
 - **Dry Run**: Preview what will be installed without making changes
@@ -404,7 +405,7 @@ PAM modules are loaded dynamically - **no system restart is required**:
 
 - **sudo**: Changes take effect **immediately** - test right away with `sudo -k && sudo echo test`
 - **polkit**: Changes take effect **immediately** - GUI privilege dialogs will use TapAuth
-- **Lock screens / greeters**: The virtual fprintd bridge becomes live when `tapauthd` (re)starts — the package scriptlets start the daemon at install; config changes to `enable_fprintd_bridge` require a manual `sudo systemctl restart tapauthd.service`
+- **Lock screens / greeters**: When the bridge is enabled, it becomes live when `tapauthd` (re)starts — install `tapauth-fprintd-emulation` (its scriptlets restart the daemon) or set `enable_fprintd_bridge = true` and run `sudo systemctl restart tapauthd.service`
 
 **Important**: You can test sudo authentication immediately after installation without rebooting!
 
@@ -610,7 +611,7 @@ If you encounter issues:
 ### Socket access policy
 
 The IPC socket `/run/tapauthd/tapauthd.sock` is created as `root:tapauthd-clients` with mode `0660`.
-- Every install method creates the group `tapauthd-clients` and adds the relevant users to it: `install.sh` adds the installing user plus every existing interactive local user; the distribution packages do the same in their post-install scriptlet (users created later are picked up on the next package upgrade).
+- Every install method creates the group `tapauthd-clients`, but membership is a manual, per-user opt-in: the distribution packages add nobody, and `install.sh` adds only the installing user (the one who ran it).
 - A logout/login cycle (or otherwise re-initialising the process's group list) is required for the new group membership to take effect.
 - Membership is intentionally **not** removed on uninstall/purge (only the group itself is removed on purge), so a reinstall does not have to re-add every user.
 - If you need to grant access to additional users, add them manually:

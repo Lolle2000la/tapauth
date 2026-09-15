@@ -6,11 +6,12 @@
 # 3. Directory & config file permissions (0755/0644) and ownership (tapauthd:tapauthd)
 # 4. Systemd service and socket unit placement
 # 5. PAM scope: only sudo, su, polkit-1 are patched (with .tapauth-bak backups);
-#    common-auth and fingerprint stacks stay stock (virtual fprintd bridge
-#    handles lock screens/greeters via pam_fprintd.so)
-# 6. D-Bus policy file + RENAMED activation service file
-#    (net.reactivated.Fprint.tapauth.service — collision-free with real
-#    fprintd's own net.reactivated.Fprint.service) shipped in the base package
+#    common-auth and fingerprint stacks stay stock. In su, the TapAuth line
+#    must land after pam_rootok/pam_wheel (no root bypass).
+# 6. D-Bus policy file shipped in the base package; NO activation file and NO
+#    emulation marker in the base package (bridge opt-in); the optional
+#    tapauth-fprintd-emulation package ships the marker
+#    /usr/share/tapauth/fprintd-emulation.enabled
 # 7. Coexistence with the real fprintd package: fprintd installs first,
 #    tapauth installs/removes without touching fprintd's activation file
 # 8. Upgrade from a published v0.10.0-style package: stale pam-auth-update
@@ -69,6 +70,30 @@ apt-get install -y fprintd
 test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 apt-get install -y /tmp/deb-build/tapauth_${PKG_VER}*.deb
 
+echo "Verifying the scriptlets do NOT auto-add interactive users to tapauthd-clients..."
+# Membership is a manual, per-user opt-in: the postinst prints an advisory and
+# must never modify group membership itself.
+AUTO_ADDED=""
+while IFS=: read -r _user _pw _uid _gid _gecos _home _shell; do
+    [ "$_uid" -ge 1000 ] 2>/dev/null || continue
+    [ "$_uid" -lt 65534 ] || continue
+    case "$_shell" in */nologin|*/false) continue ;; esac
+    if id -nG "$_user" 2>/dev/null | tr ' ' '\n' | grep -qx tapauthd-clients; then
+        AUTO_ADDED="${AUTO_ADDED} ${_user}"
+    fi
+done < <(getent passwd)
+if [ -n "$AUTO_ADDED" ]; then
+    echo "ERROR: postinst auto-added interactive user(s) to tapauthd-clients:${AUTO_ADDED}"
+    exit 1
+fi
+echo "OK: no interactive user was auto-added to tapauthd-clients"
+
+echo "Verifying the shipped postinst carries the manual-membership advisory..."
+DEB_PKG=$(ls /tmp/deb-build/tapauth_${PKG_VER}*.deb | head -1)
+rm -rf /tmp/tapauth-deb-control
+dpkg-deb -e "$DEB_PKG" /tmp/tapauth-deb-control
+grep -q "sudo usermod -aG tapauthd-clients" /tmp/tapauth-deb-control/postinst
+
 echo "Checking directory and config file ownership and permissions..."
 test -d /etc/tapauth
 DIR_OWNER=$(stat -c "%U:%G" /etc/tapauth)
@@ -79,7 +104,11 @@ test "$DIR_MODE" = "755"
 
 test -f /etc/tapauth/config.toml
 if grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
-    echo "ERROR: install must not write enable_fprintd_bridge into config.toml (daemon default is true)"
+    echo "ERROR: install must not write enable_fprintd_bridge into config.toml (tri-state default: auto/marker-derived)"
+    exit 1
+fi
+if [ -e /usr/share/tapauth/fprintd-emulation.enabled ]; then
+    echo "ERROR: base install shipped the fprintd-emulation marker (bridge would default on)"
     exit 1
 fi
 OWNER=$(stat -c "%U:%G" /etc/tapauth/config.toml)
@@ -107,7 +136,7 @@ if dpkg -l tapauth-fprintd 2>/dev/null | grep -q '^ii'; then
     exit 1
 fi
 
-echo "Verifying the virtual fprintd D-Bus policy + renamed activation file ship in the base package..."
+echo "Verifying the base package ships the virtual fprintd D-Bus policy (and no activation file/marker)..."
 verify_fprintd_coexistence deb
 
 echo "Verifying coexistence with the real fprintd package (installs first, no conflicts)..."
@@ -131,6 +160,9 @@ for pam_svc in sudo su polkit-1; do
     test -f "/etc/pam.d/${pam_svc}.tapauth-bak"
     ! grep "pam_tapauth.so" "/etc/pam.d/${pam_svc}.tapauth-bak"
 done
+# su must not bypass pam_rootok/pam_wheel (PAM_USER is the target user).
+echo "Verifying su insertion lands after pam_rootok/pam_wheel..."
+assert_su_line_after_rootok /etc/pam.d/su
 
 echo "Verifying common-auth is NOT patched (no pam-auth-update profile anymore)..."
 if [ -f /etc/pam.d/common-auth ]; then
@@ -199,6 +231,20 @@ if dpkg -s libpam-fprintd 2>/dev/null | grep -q '^Status: install ok installed';
     exit 1
 fi
 
+echo "Verifying the emulation package ships the bridge marker (tri-state default -> on)..."
+test -f /usr/share/tapauth/fprintd-emulation.enabled
+
+echo "Verifying enable_fprintd_bridge = false is preserved as an explicit override..."
+# The Rust resolver (shared::config::resolve_enable_fprintd_bridge, unit-tested
+# in shared/src/config/toml_config.rs) gives explicit values precedence over the
+# marker; here we assert the marker and an explicit key can coexist on disk and
+# the daemon does not get a rewritten/removed key.
+if ! grep -Eq '^enable_fprintd_bridge' /etc/tapauth/config.toml; then
+    printf 'enable_fprintd_bridge = false\n' >> /etc/tapauth/config.toml
+fi
+grep -Eq '^enable_fprintd_bridge[[:space:]]*=[[:space:]]*false' /etc/tapauth/config.toml
+sed -i '/^enable_fprintd_bridge[[:space:]]*=[[:space:]]*false/d' /etc/tapauth/config.toml
+
 echo "Verifying the emulation package removes cleanly..."
 apt-get remove -y tapauth-fprintd-emulation
 PAM_FPRINTD_SO=$(find /usr/lib /lib -name pam_fprintd.so 2>/dev/null | head -1 || true)
@@ -206,6 +252,7 @@ if [ -n "$PAM_FPRINTD_SO" ]; then
     echo "ERROR: pam_fprintd.so survived removal of tapauth-fprintd-emulation: $PAM_FPRINTD_SO"
     exit 1
 fi
+verify_no_emulation_marker
 
 echo "==> 4c. Testing upgrade from a published v0.10.0-style package (pam-auth-update era)..."
 # v0.10.0 shipped a /usr/share/pam-configs/tapauth profile and ran
@@ -267,9 +314,10 @@ test -f /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
 assert_fprintd_exec_matches /usr/share/dbus-1/system-services/net.reactivated.Fprint.service \
     "fprintd activation Exec changed after tapauth removal" \
     /usr/libexec/fprintd /usr/lib/fprintd/fprintd /usr/sbin/fprintd
-echo "Verifying tapauth's renamed D-Bus files were removed with the package..."
+echo "Verifying tapauth's D-Bus files were removed with the package (policy gone too)..."
 test ! -e /usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 test ! -e /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+test ! -e /usr/share/tapauth/fprintd-emulation.enabled
 if [ -f /usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf ]; then
     echo "ERROR: tapauth D-Bus policy file survived package removal"
     exit 1

@@ -53,15 +53,12 @@ package_tapauth-git() {
   )
   provides=("tapauth=${pkgver}")
   conflicts=('tapauth' 'tapauth-fprintd' 'tapauth-fprintd-git')
-  # tapauth-fprintd(-git) was merged into the base package: the virtual
-  # fprintd bridge is enabled by default. NOTE: no conflict with real
-  # fprintd. The activation file is RENAMED
-  # (net.reactivated.Fprint.tapauth.service) so it never collides with
-  # fprintd's own activation file (see packaging/arch/PKGBUILD for the
-  # container-verified rationale: both dbus-daemon and dbus-broker require
-  # the filename to match the bus name, so the renamed file is an inert,
-  # collision-free placeholder; availability comes from systemd, not D-Bus
-  # activation).
+  # tapauth-fprintd(-git) was merged into the base package. NOTE: no conflict
+  # with real fprintd and no D-Bus activation file (dbus-daemon and dbus-broker
+  # only activate files named exactly after the bus name, so a renamed file
+  # would be inert; availability comes from systemd, not D-Bus activation). The
+  # base package ships only the D-Bus policy file and no emulation marker, so
+  # the virtual bridge is off by default.
   replaces=('tapauth-fprintd' 'tapauth-fprintd-git')
   install=tapauth-git.install
 
@@ -90,17 +87,10 @@ package_tapauth-git() {
   install -Dm0644 tapauthd/dev.rourunisen.tapauth.config.admin.policy "${pkgdir}/usr/share/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy"
   install -Dm0644 packaging/50-tapauthd.rules "${pkgdir}/usr/share/polkit-1/rules.d/50-tapauthd.rules"
 
-  # Virtual fprintd D-Bus bridge files (merged from the former
-  # tapauth-fprintd(-git) subpackage): the bridge is enabled by default, so
-  # lock screens and greeters work out of the box. The activation file is
-  # RENAMED (net.reactivated.Fprint.tapauth.service) so it never collides
-  # with real fprintd's own activation file; see packaging/arch/PKGBUILD
-  # for the container-verified duplicate-Name semantics (both dbus-daemon
-  # and dbus-broker require the filename to match the bus name, so the
-  # renamed file is an inert, collision-free placeholder; availability
-  # comes from systemd, not D-Bus activation).
+  # Virtual fprintd D-Bus bridge: only the policy file ships in the base
+  # package (functionally required so tapauthd may own the bus name when the
+  # bridge is enabled). No D-Bus activation file; see packaging/arch/PKGBUILD.
   install -Dm0644 packaging/net.reactivated.Fprint.tapauth.conf "${pkgdir}/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
-  install -Dm0644 packaging/net.reactivated.Fprint.tapauth.service "${pkgdir}/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
 
   # polkit vendor-drift protection (see packaging/arch/PKGBUILD comment).
   install -Dm0644 packaging/tapauth-polkit-pam.hook "${pkgdir}/usr/share/libalpm/hooks/tapauth-polkit-pam.hook"
@@ -123,9 +113,10 @@ package_tapauth-fprintd-emulation-git() {
   # the sysupgrade path.
   conflicts=('fprintd')
   replaces=('fprintd')
-  # NOTE: no install= scriptlet here on purpose. install= is a per-package
-  # override; package_tapauth-git() sets install=tapauth-git.install and
-  # this package must not inherit the base PAM-wiring scriptlet.
+  # Dedicated scriptlet: `install=` is per-package (verified with
+  # `makepkg --printsrcinfo`), so this subpackage gets its own tiny .install
+  # instead of sharing tapauth-git.install, whose pre_remove is destructive.
+  install=tapauth-fprintd-emulation-git.install
 
   cd "${srcdir}/tapauth"
   # Same client-pam crate as the base package, built with
@@ -133,6 +124,10 @@ package_tapauth-fprintd-emulation-git() {
   # fprintd's module name.
   install -Dm0755 target/fprintd-emulation/release/libclient_pam.so \
     "${pkgdir}/usr/lib/security/pam_fprintd.so"
+
+  # Marker that flips the daemon's tri-state enable_fprintd_bridge default to
+  # "on". Owned by this split package only.
+  install -Dm0644 /dev/null "${pkgdir}/usr/share/tapauth/fprintd-emulation.enabled"
 
   install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

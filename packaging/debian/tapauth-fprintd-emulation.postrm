@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Removing the optional emulation package removes its marker file, so the
+# tri-state `enable_fprintd_bridge` default flips back to "off". Bounce a
+# running daemon so it releases the net.reactivated.Fprint bus name (real
+# fprintd, if installed, can then take it). try-restart never starts a daemon
+# that was not already running, so a daemonless system is untouched. Guarded
+# and non-fatal.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ] || [ "$1" = "abort-install" ] || [ "$1" = "abort-upgrade" ]; then
+	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+		deb-systemd-invoke try-restart tapauthd.service || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl try-restart tapauthd.service 2>/dev/null || true
+	fi
+fi
+
+#DEBHELPER#
+exit 0

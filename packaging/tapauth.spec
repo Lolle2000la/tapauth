@@ -48,27 +48,26 @@ pam_tapauth.so is wired into sudo, su and polkit-1 only; all other PAM
 stacks — including fingerprint stacks (kde-fingerprint, gdm-fingerprint,
 fingerprint-auth) — stay stock.
 
-Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
-automatically through the built-in virtual fprintd D-Bus service
+Desktop lock screens and greeters (KDE Plasma, GNOME) can integrate
+through the built-in virtual fprintd D-Bus service
 (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
 which resolves to tapauthd. This base package deliberately does NOT
-conflict with the real fprintd package; the optional
-tapauth-fprintd-emulation subpackage instead replaces the fprintd-pam
-provider. It ships a renamed D-Bus activation file
-(net.reactivated.Fprint.tapauth.service) so nothing can collide with
-fprintd's own activation file; verified with dbus-daemon and
-dbus-broker, both require the activation file's filename to match the
-bus name, so the renamed file is an inert, collision-free placeholder
-and real fprintd keeps full control of on-demand activation whenever it
-is installed. tapauthd is a systemd-managed daemon that owns the bus
+conflict with the real fprintd package and does NOT ship a D-Bus
+activation file; tapauthd is a systemd-managed daemon that owns the bus
 name while it runs (and restarts on failure), so the virtual bridge
-needs no activation support from the file. No local fingerprint reader
-is required.
+needs no activation support from D-Bus. It ships only the D-Bus policy
+file that lets tapauthd own the name.
 
-To keep using a real local fingerprint reader instead, install fprintd
-and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
-(applies at the next daemon restart): tapauthd then never claims the
-bus name and real fprintd handles all fingerprint requests again.
+The virtual bridge is opt-in. With enable_fprintd_bridge unset (the
+default), it is enabled only when the optional tapauth-fprintd-emulation
+subpackage is installed (it ships the marker file
+/usr/share/tapauth/fprintd-emulation.enabled); the base package ships no
+marker, so a real local fingerprint reader is never shadowed by a base
+install and real fprintd keeps the bus name. Set enable_fprintd_bridge
+= true or = false in /etc/tapauth/config.toml to force the bridge on or
+off explicitly (applies at the next daemon restart). The optional
+tapauth-fprintd-emulation subpackage replaces the fprintd PAM provider
+and ships the marker. No local fingerprint reader is required.
 
 %package fprintd-emulation
 Summary:        Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
@@ -81,6 +80,10 @@ Summary:        Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
 Provides:       fprintd-pam = %{version}-%{release}
 Conflicts:      fprintd-pam
 Requires:       %{name} = %{version}-%{release}
+# %post/%postun bounce tapauthd so the marker-derived bridge default is
+# re-evaluated at daemon startup.
+Requires(post): systemd
+Requires(postun): systemd
 
 %description fprintd-emulation
 This optional subpackage ships a second build of the TapAuth PAM module,
@@ -93,7 +96,15 @@ Provides and Conflicts fprintd-pam so the two providers of pam_fprintd.so
 can never coexist and installing it requires explicitly replacing the
 distro module. The fprintd daemon package itself is deliberately NOT
 conflicted with, and the base tapauth package stays unchanged (it keeps
-shipping pam_tapauth.so).
+shipping pam_tapauth.so and ships no D-Bus activation file).
+
+It also ships the marker file /usr/share/tapauth/fprintd-emulation.enabled
+which turns the daemon's tri-state enable_fprintd_bridge default into "on"
+(the D-Bus name net.reactivated.Fprint is claimed at tapauthd startup), so
+lock screens/greeters can discover the virtual fingerprint device. Its
+scriptlets restart tapauthd so the claim/release takes effect immediately.
+With enable_fprintd_bridge = false in /etc/tapauth/config.toml the marker
+is overridden and the bridge stays off.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -153,9 +164,11 @@ install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libc
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/fprintd-emulation/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_fprintd.so
 
 # Default Configuration
-# The virtual fprintd bridge is enabled by default in the daemon; do not
-# write enable_fprintd_bridge here. Users who want a real local fingerprint
-# reader opt out via this key in config.toml.
+# The virtual fprintd bridge is opt-in: with enable_fprintd_bridge unset the
+# daemon follows the marker file shipped by the optional fprintd-emulation
+# subpackage (absent for a base install), so a base install does not claim the
+# net.reactivated.Fprint bus name. Do not write enable_fprintd_bridge here;
+# users can force it with an explicit key in config.toml.
 cat << 'EOF' > %{buildroot}%{_sysconfdir}/tapauth/config.toml
 # TapAuth System Configuration
 EOF
@@ -182,28 +195,23 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 mkdir -p %{buildroot}%{_datadir}/selinux/packages
 install -m 0644 packaging/selinux/tapauth.cil %{buildroot}%{_datadir}/selinux/packages/tapauth.cil
 
-# Virtual fprintd D-Bus bridge files (the bridge is enabled by default, so
-# lock screens and greeters work out of the box). The activation file is
-# renamed (net.reactivated.Fprint.tapauth.service) so it can never collide
-# with the real fprintd package's own
-# /usr/share/dbus-1/system-services/net.reactivated.Fprint.service.
-# VERIFIED IN CONTAINERS (dbus-daemon 1.12.20 & 1.14.10, dbus-broker 36 on a
-# systemd container with real fprintd): BOTH implementations require the
-# service file's filename to match the bus name, so this renamed file is an
-# inert, collision-free placeholder — neither broker uses it for activation
-# (dbus-daemon logs a load-time warning and returns Spawn.ServiceNotFound;
-# dbus-broker logs "not named after the D-Bus name" and reports the name as
-# not activatable). With real fprintd installed, activation of
-# net.reactivated.Fprint started real fprintd via its own file and
-# SystemdService= while the renamed file's Exec was never run. The file is
-# still shipped (never zero activation files) so a broker that honors
-# Name= from any filename gets on-demand start / crash resilience for
-# free; tapauthd's availability is guaranteed by systemd (started at
-# install, Restart=on-failure), not by D-Bus activation.
-mkdir -p %{buildroot}%{_datadir}/dbus-1/system-services
+# Virtual fprintd D-Bus bridge: the base package ships only the D-Bus policy
+# file (functionally required so tapauthd may own the net.reactivated.Fprint
+# bus name when the bridge is enabled). No D-Bus activation file is shipped:
+# dbus-daemon and dbus-broker only activate files named exactly after the bus
+# name, so a renamed TapAuth file would be inert, and real fprintd's own
+# net.reactivated.Fprint.service keeps full control of on-demand activation.
+# tapauthd's availability comes from systemd (started at install,
+# Restart=on-failure), not from D-Bus activation.
 mkdir -p %{buildroot}%{_datadir}/dbus-1/system.d
-install -m 0644 packaging/net.reactivated.Fprint.tapauth.service %{buildroot}%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 install -m 0644 packaging/net.reactivated.Fprint.tapauth.conf %{buildroot}%{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
+
+# Optional fprintd-emulation marker: its presence (and only its presence)
+# flips the daemon's tri-state enable_fprintd_bridge default to "on". Empty
+# file; the %files fprintd-emulation section owns the directory and the file.
+mkdir -p %{buildroot}%{_datadir}/tapauth
+: > %{buildroot}%{_datadir}/tapauth/fprintd-emulation.enabled
+chmod 0644 %{buildroot}%{_datadir}/tapauth/fprintd-emulation.enabled
 
 %pre
 %sysusers_create_compat %{SOURCE1}
@@ -225,11 +233,12 @@ chown tapauthd:tapauthd %{_sysconfdir}/tapauth/config.toml 2>/dev/null || true
 
 # Patch only the three PAM services in scope: sudo, su, polkit-1. All other
 # stacks — including fingerprint stacks (kde-fingerprint, gdm-fingerprint,
-# fingerprint-auth) — stay stock: they call pam_fprintd.so, which resolves
-# to tapauthd's virtual fprintd D-Bus service (bridge enabled by default).
-# Vendor PAM files live in /usr/lib/pam.d on Fedora; /etc/pam.d overrides
-# them. When no /etc override exists yet, seed one from the vendor file so
-# the inserted line does not replace the vendor stack.
+# fingerprint-auth) — stay stock: they call pam_fprintd.so, which resolves to
+# tapauthd's virtual fprintd D-Bus service when the bridge is enabled (opt-in;
+# see the fprintd-emulation subpackage). Vendor PAM files live in
+# /usr/lib/pam.d on Fedora; /etc/pam.d overrides them. When no /etc override
+# exists yet, seed one from the vendor file so the inserted line does not
+# replace the vendor stack.
 pam_line="auth        sufficient    pam_tapauth.so"
 for pam_svc in sudo su polkit-1; do
     pam_file="/etc/pam.d/${pam_svc}"
@@ -250,8 +259,24 @@ for pam_svc in sudo su polkit-1; do
     if [ ! -f "${pam_file}.tapauth-bak" ]; then
         cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
     fi
-    # Insert after the PAM-1.0 magic header line (never above it).
-    if head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+    if [ "$pam_svc" = "su" ]; then
+        # PAM_USER for su is the TARGET user, so inserting at the top would
+        # let a phone grant for root bypass pam_rootok.so / pam_wheel.so (and
+        # would prompt for root's own `su`). Fedora's su has no pam_env.so, so
+        # insert after the pam_rootok/pam_wheel block and before the first
+        # auth include (system-auth / common-auth / @include).
+        pam_anchor=$(awk '
+            /^[[:space:]]*#/ { next }
+            /(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+        ' "$pam_file")
+        if [ -n "$pam_anchor" ]; then
+            sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+        elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+            sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+        else
+            sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+        fi
+    elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
         sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
     else
         sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
@@ -263,11 +288,9 @@ if [ $1 -eq 1 ]; then
     # Start the socket immediately on initial install so auth requests don't hit a dead socket
     systemctl start tapauthd.socket 2>/dev/null || true
 fi
-# Start (or bounce) the daemon so the virtual fprintd bridge is live right
-# away: lock screens and greeters call pam_fprintd.so, which reaches
-# tapauthd over D-Bus — they never touch the IPC socket, so socket
-# activation alone would leave the bridge dead until the first sudo/su/
-# polkit authentication. `start` is a no-op when already running.
+# Start (or bounce) the daemon so the IPC socket answers right away and the
+# (opt-in) virtual fprintd bridge is evaluated at startup (the D-Bus name is
+# claimed only then). `start` is a no-op when already running.
 systemctl start tapauthd.service 2>/dev/null || \
     systemctl try-restart tapauthd.service 2>/dev/null || true
 if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
@@ -275,42 +298,24 @@ if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/n
 fi
 
 echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
-echo "         (originals kept as <file>.tapauth-bak). Fingerprint stacks"
-echo "         stay stock: lock screens and greeters integrate through the"
-echo "         built-in virtual fprintd service (no real reader required)."
-# Add existing interactive local users to tapauthd-clients so user-session
-# components (e.g. KDE's kscreenlocker_worker, which runs as the logged-in
-# user) can reach /run/tapauthd/tapauthd.sock (root:tapauthd-clients 0660).
-# This matters for the opt-in pam_fprintd.so emulation path; greeters and
-# auth helpers that run as root (GDM/SDDM/LightDM) are unaffected.
-# Non-fatal by design: a failure must never abort the RPM transaction.
-# Membership is deliberately left in place on removal/purge (only the
-# sysusers group itself is removed on %preun/erase).
-if command -v usermod >/dev/null 2>&1 && getent group tapauthd-clients >/dev/null 2>&1; then
-    added_users=""
-    while IFS= read -r member; do
-        [ -n "$member" ] || continue
-        if id -nG "$member" 2>/dev/null | grep -qw tapauthd-clients; then
-            continue
-        fi
-        if usermod -aG tapauthd-clients "$member" 2>/dev/null; then
-            added_users="${added_users} ${member}"
-        fi
-    done <<EOF
-$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1 }' || true)
-EOF
-    if [ -n "$added_users" ]; then
-        echo "TapAuth: added existing interactive users to tapauthd-clients:${added_users}"
-        echo "         They must log out and back in (or re-init their groups)"
-        echo "         before this takes effect."
-    else
-        echo "TapAuth: no existing interactive users needed adding to tapauthd-clients."
-    fi
-else
-    echo "TapAuth: could not add existing users to tapauthd-clients automatically"
-    echo "         (group or usermod unavailable). Add them manually with:"
-    echo "         sudo usermod -aG tapauthd-clients \$USER"
-fi
+echo "         (originals kept as <file>.tapauth-bak; in su it is inserted"
+echo "         after pam_rootok/pam_wheel so it cannot bypass them)."
+echo "         Fingerprint stacks stay stock; the virtual fprintd bridge is"
+echo "         opt-in (install tapauth-fprintd-emulation, or set"
+echo "         enable_fprintd_bridge = true, then restart tapauthd)."
+# Membership is a manual, per-user opt-in: the scriptlet never modifies group
+# membership. Needed for the configuration GUI and for user-session lock-screen
+# unlock (e.g. KDE's kscreenlocker_worker, which runs as the logged-in user,
+# reaches /run/tapauthd/tapauthd.sock as root:tapauthd-clients 0660). Root-run
+# greeters/auth helpers (GDM/SDDM/LightDM) are unaffected. Memberships are
+# deliberately left in place on removal/purge (only the sysusers group itself
+# is removed on %preun/erase).
+echo "TapAuth: To use the configuration GUI and to unlock user-session"
+echo "         lock screens, add your user to the tapauthd-clients group:"
+echo "         sudo usermod -aG tapauthd-clients \$USER"
+echo "         Then log out and log back in for the change to take effect."
+echo "         Membership is not granted automatically. Root-run greeters and"
+echo "         auth helpers (GDM/SDDM/LightDM) are unaffected."
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
     echo "TapAuth: SELinux is Enforcing. If GDM/KDM lock screen authentication fails due to AVC denial,"
     echo "         allow GDM to connect to the daemon socket via:"
@@ -320,6 +325,16 @@ if command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinuxenabled ] && /us
     semodule -i %{_datadir}/selinux/packages/tapauth.cil 2>/dev/null || true
 fi
 restorecon -R /run/tapauthd %{_sharedstatedir}/tapauth %{_sysconfdir}/tapauth 2>/dev/null || true
+
+# The optional fprintd-emulation subpackage ships the marker file that flips
+# the daemon's tri-state enable_fprintd_bridge default to "on". The daemon
+# claims/releases the net.reactivated.Fprint bus name only at startup, so a
+# running daemon must be bounced after the file is added/removed. Guarded and
+# non-fatal (no systemd, or daemon not running, must not fail the transaction).
+%post fprintd-emulation
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart tapauthd.service 2>/dev/null || true
+fi
 
 %preun
 %systemd_preun tapauthd.service tapauthd.socket
@@ -424,6 +439,14 @@ if [ $1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && [ -x /usr/sbin/selinux
     semodule -r tapauth 2>/dev/null || true
 fi
 
+# Removal (or upgrade) of the optional emulation subpackage adds/removes the
+# bridge marker; bounce a running daemon so the tri-state default is
+# re-evaluated at startup. Guarded and non-fatal.
+%postun fprintd-emulation
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart tapauthd.service 2>/dev/null || true
+fi
+
 # polkit vendor-drift protection: when the polkit package is installed or
 # upgraded, its PAM vendor stack changes. Depending on the distro release
 # the vendor file is /usr/lib/pam.d/polkit-1 (with our /etc/pam.d override
@@ -477,13 +500,17 @@ fi
 %{_datadir}/polkit-1/actions/dev.rourunisen.tapauth.config.admin.policy
 %{_datadir}/polkit-1/rules.d/50-tapauthd.rules
 %{_datadir}/selinux/packages/tapauth.cil
-%{_datadir}/dbus-1/system-services/net.reactivated.Fprint.tapauth.service
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf
 
 %files fprintd-emulation
 # The base tapauth package already ships the shared %license LICENSE;
 # listing it here too would make the two subpackages co-own the same path.
 %{_libdir}/security/pam_fprintd.so
+# Marker that flips the daemon's tri-state enable_fprintd_bridge default to
+# "on". Owned by this subpackage only; the base package ships no
+# %{_datadir}/tapauth directory.
+%dir %{_datadir}/tapauth
+%{_datadir}/tapauth/fprintd-emulation.enabled
 
 %changelog
 * Wed Sep 02 2026 Luca Auer <lolle2000.la+tapauth@gmail.com> - 0.1.0-1

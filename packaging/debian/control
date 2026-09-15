@@ -22,27 +22,27 @@ Description: Local smartphone-based authentication framework
  stacks (including fingerprint stacks such as kde-fingerprint,
  gdm-fingerprint and fingerprint-auth) stay stock.
  .
- Desktop lock screens and greeters (KDE Plasma, GNOME) integrate
- automatically through the built-in virtual fprintd D-Bus service
+ Desktop lock screens and greeters (KDE Plasma, GNOME) can integrate
+ through the built-in virtual fprintd D-Bus service
  (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
  which resolves to tapauthd. This base package deliberately does NOT
- conflict with the real fprintd packages (fprintd, libpam-fprintd); the
- optional tapauth-fprintd-emulation package instead replaces the fprintd
- PAM provider (libpam-fprintd) with a TapAuth-built pam_fprintd.so. It
- ships a renamed D-Bus activation file
- (net.reactivated.Fprint.tapauth.service) so nothing can collide with
- fprintd's own activation file: both dbus-daemon and dbus-broker only
- use activation files named exactly after the bus name, so the renamed
- file is an inert, collision-free placeholder and real fprintd keeps
- full control of on-demand activation. tapauthd is a systemd-managed
+ conflict with the real fprintd packages (fprintd, libpam-fprintd) and
+ does NOT ship a D-Bus activation file; tapauthd is a systemd-managed
  daemon that owns the bus name while it runs (and restarts on failure),
- so the virtual bridge needs no activation support from the file.
- No local fingerprint reader is required.
+ so the virtual bridge needs no activation support from D-Bus. It ships
+ only the D-Bus policy file that lets tapauthd own the name.
  .
- To keep using a real local fingerprint reader instead, install fprintd
- and set enable_fprintd_bridge = false in /etc/tapauth/config.toml
- (applies at the next daemon restart): tapauthd then never claims the
- bus name and real fprintd handles all fingerprint requests again.
+ The virtual bridge is opt-in. With enable_fprintd_bridge unset (the
+ default), it is enabled only when the optional tapauth-fprintd-emulation
+ package is installed (it ships the marker file
+ /usr/share/tapauth/fprintd-emulation.enabled); the base package ships no
+ marker, so a real local fingerprint reader is never shadowed by a base
+ install and real fprintd keeps the bus name. Set enable_fprintd_bridge
+ = true or = false in /etc/tapauth/config.toml to force the bridge on or
+ off explicitly (applies at the next daemon restart). The optional
+ tapauth-fprintd-emulation package replaces the fprintd PAM provider
+ (libpam-fprintd) with a TapAuth-built pam_fprintd.so and ships the
+ marker. No local fingerprint reader is required.
 
 Package: tapauth-fprintd-emulation
 Architecture: any
@@ -61,8 +61,17 @@ Description: Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
  of pam_fprintd.so can never coexist; the fprintd daemon package itself is
  deliberately NOT conflicted with.
  .
- The base tapauth package is unchanged: it keeps shipping pam_tapauth.so
- and keeps not conflicting with fprintd or libpam-fprintd.
+ It also ships the marker file /usr/share/tapauth/fprintd-emulation.enabled
+ which turns the daemon's tri-state enable_fprintd_bridge default into "on"
+ (the D-Bus name net.reactivated.Fprint is claimed at tapauthd startup), so
+ lock screens/greeters can discover the virtual fingerprint device. Its
+ maintainer scripts restart tapauthd so the claim/release takes effect
+ immediately. Installed but with enable_fprintd_bridge = false in
+ /etc/tapauth/config.toml, the marker is overridden and the bridge stays off.
+ .
+ The base tapauth package is unchanged: it ships no marker and no D-Bus
+ activation file, keeps shipping pam_tapauth.so, and keeps not conflicting
+ with fprintd or libpam-fprintd.
  .
  To go back to a real local fingerprint reader, remove this package and
  reinstall libpam-fprintd (and fprintd).

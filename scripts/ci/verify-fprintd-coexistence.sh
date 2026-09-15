@@ -1,11 +1,13 @@
-# Shared verification of the virtual-fprintd D-Bus coexistence invariants.
+# shellcheck shell=bash
+# Shared verification of the virtual-fprintd D-Bus and PAM invariants.
 # Sourced by scripts/ci/test-{ubuntu-deb,fedora-rpm,arch-pkg}.sh (the distro
 # containers mount the whole workspace, so sourcing from there works).
 #
-# Every distro container test must assert the same thing: the base package
-# ships the RENAMED activation file, never owns fprintd's exact filename, and
-# real fprintd's own activation file keeps pointing at fprintd — regardless of
-# the package manager used to list/verify ownership.
+# Every distro container test must assert the same things: the base package
+# ships the D-Bus policy but NO activation file (and no emulation marker), it
+# never owns fprintd's exact filename, real fprintd's own activation file keeps
+# pointing at fprintd, the optional emulation package ships the bridge marker,
+# and the `su` PAM line is inserted after pam_rootok/pam_wheel.
 #
 # No set -e here: callers already run with set -euo pipefail, and sourcing
 # would otherwise flip their options. All functions exit non-zero on failure.
@@ -48,14 +50,15 @@ assert_exec_not_tapauth() {
 
 # verify_fprintd_coexistence <pkg-manager: deb|rpm|arch>
 # Asserts the installed base package ships the virtual-fprintd D-Bus policy
-# plus the RENAMED activation file with the expected content, and that the
-# package does NOT own the un-renamed activation filename belonging to the
-# real fprintd package.
+# but NOT the emulation marker and NOT any D-Bus activation file, and that the
+# package does NOT own the un-renamed activation filename belonging to the real
+# fprintd package.
 verify_fprintd_coexistence() {
     local pkg_manager="$1"
     local conf="/usr/share/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf"
     local renamed="/usr/share/dbus-1/system-services/net.reactivated.Fprint.tapauth.service"
     local unrenamed="/usr/share/dbus-1/system-services/net.reactivated.Fprint.service"
+    local marker="/usr/share/tapauth/fprintd-emulation.enabled"
     local pkg_list_cmd
     case "$pkg_manager" in
         deb)  pkg_list_cmd=(dpkg -L tapauth) ;;
@@ -65,19 +68,30 @@ verify_fprintd_coexistence() {
     esac
 
     test -f "$conf"
-    # The activation file is RENAMED (net.reactivated.Fprint.tapauth.service) so
-    # it can never collide with real fprintd's own
-    # net.reactivated.Fprint.service. Container-verified semantics: BOTH
-    # dbus-daemon (1.12.20 & 1.14.10) and dbus-broker (36) require the service
-    # file's filename to match the bus name, so the renamed file is an inert,
-    # collision-free placeholder — neither broker uses it for activation; real
-    # fprintd keeps full control of on-demand activation. The file still ships
-    # (never zero activation files) for forward compatibility.
-    test -f "$renamed"
-    grep -q '^Name=net.reactivated.Fprint$' "$renamed"
-    grep -q '^Exec=/usr/bin/tapauthd$' "$renamed"
-    grep -q '^User=tapauthd$' "$renamed"
-    grep -q '^SystemdService=tapauthd.service$' "$renamed"
+    # The bridge is opt-in: the base package ships only the D-Bus policy, no
+    # activation file and no emulation marker. tapauthd claims the bus name
+    # solely at startup, and only when enable_fprintd_bridge is true or the
+    # emulation package's marker exists. No D-Bus activation file is shipped
+    # (both dbus-daemon and dbus-broker require the filename to match the bus
+    # name, so a renamed file would be inert); real fprintd keeps full control
+    # of on-demand activation.
+    if [ -e "$renamed" ]; then
+        echo "ERROR: base package shipped the (removed) renamed activation file $renamed"
+        exit 1
+    fi
+    if "${pkg_list_cmd[@]}" | grep -q "system-services/net.reactivated.Fprint.tapauth.service$"; then
+        echo "ERROR: tapauth still owns the removed renamed activation file"
+        exit 1
+    fi
+    # The emulation marker must never be shipped by the base package.
+    if [ -e "$marker" ]; then
+        echo "ERROR: base package shipped the emulation marker $marker (bridge would default on)"
+        exit 1
+    fi
+    if "${pkg_list_cmd[@]}" | grep -q "share/tapauth/fprintd-emulation.enabled$"; then
+        echo "ERROR: tapauth owns the emulation marker (must belong to tapauth-fprintd-emulation only)"
+        exit 1
+    fi
     # tapauth must never own (or overwrite) fprintd's exact activation filename.
     # The un-renamed file may legitimately exist on disk because the
     # coexistence test installs the real fprintd package.
@@ -88,6 +102,33 @@ verify_fprintd_coexistence() {
     if [ -f "$unrenamed" ]; then
         assert_exec_not_tapauth "$unrenamed" \
             "net.reactivated.Fprint.service points at tapauthd (tapauth must never own that file)"
+    fi
+}
+
+# verify_no_emulation_marker
+# After the optional emulation package is removed, its marker must be gone so
+# the daemon's tri-state default flips back to "off".
+verify_no_emulation_marker() {
+    if [ -e /usr/share/tapauth/fprintd-emulation.enabled ]; then
+        echo "ERROR: emulation marker survived removal of tapauth-fprintd-emulation"
+        exit 1
+    fi
+}
+
+# assert_su_line_after_rootok <pam-file>
+# The TapAuth line in `su` must not land before pam_rootok.so / pam_wheel.so.
+# PAM_USER for su is the target user, so inserting first would let a phone
+# grant for root bypass those checks. Tolerates su stacks without rootok.
+assert_su_line_after_rootok() {
+    local pam_file="$1"
+    test -f "$pam_file" || return 0
+    local tapauth_ln rootok_ln
+    tapauth_ln=$(grep -n 'pam_tapauth\.so' "$pam_file" | head -1 | cut -d: -f1 || true)
+    rootok_ln=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_(rootok|wheel)\.so' "$pam_file" | head -1 | cut -d: -f1 || true)
+    if [ -n "$rootok_ln" ] && [ -n "$tapauth_ln" ] && [ "$tapauth_ln" -lt "$rootok_ln" ]; then
+        echo "ERROR: pam_tapauth.so appears before pam_rootok/pam_wheel in $pam_file (root bypass)"
+        grep -n '' "$pam_file"
+        exit 1
     fi
 }
 
@@ -114,6 +155,17 @@ _assert_emulation_files_contain_module() {
     fi
 }
 
+# _assert_emulation_files_contain_marker <file-list>
+# The emulation package must ship the bridge marker at the exact path the Rust
+# config constant uses: /usr/share/tapauth/fprintd-emulation.enabled. It is the
+# marker's presence alone that flips the tri-state default to "on".
+_assert_emulation_files_contain_marker() {
+    if ! printf '%s\n' "$1" | grep -Eq '(^|/)usr/share/tapauth/fprintd-emulation\.enabled$'; then
+        echo "ERROR: tapauth-fprintd-emulation does not ship /usr/share/tapauth/fprintd-emulation.enabled"
+        exit 1
+    fi
+}
+
 # _emulation_meta_mentions <metadata-blob> <provider>
 # Returns 0 if the given dependency metadata declares the distro provider
 # (version constraints and comma separators are tolerated).
@@ -134,7 +186,8 @@ _assert_emulation_meta_mentions() {
 
 # verify_fprintd_emulation_pkg <deb|rpm|arch> [package-dir]
 # Asserts the optional tapauth-fprintd-emulation package:
-#   * ships its PAM module as .../security/pam_fprintd.so, and
+#   * ships its PAM module as .../security/pam_fprintd.so,
+#   * ships the bridge marker /usr/share/tapauth/fprintd-emulation.enabled, and
 #   * declares the distro fprintd PAM provider as conflict/replace/provide
 #     (deb: libpam-fprintd, rpm: fprintd-pam, arch: fprintd).
 # When package-dir is given the built package file is inspected; otherwise the
@@ -226,6 +279,7 @@ verify_fprintd_emulation_pkg() {
     esac
 
     _assert_emulation_files_contain_module "$files"
+    _assert_emulation_files_contain_marker "$files"
     # Debian and RPM can express exclusivity as Provides + Conflicts: dpkg and
     # rpm both exclude a package's own provides from its conflict check, so the
     # conflict still fires against the installed provider. Arch cannot: a

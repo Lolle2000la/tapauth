@@ -63,6 +63,7 @@ jobs:
           
           # Copy source packaging files
           cp packaging/arch/tapauth.install aur-repo/tapauth.install
+          cp packaging/arch/tapauth-fprintd-emulation.install aur-repo/tapauth-fprintd-emulation.install
           cp packaging/arch/PKGBUILD aur-repo/PKGBUILD
           cp config.toml.example aur-repo/config.toml.example
 
