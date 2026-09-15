@@ -76,6 +76,14 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Upstream workaround: cmdline-tools 20.0 (the action's new default)
+          # made the action's built-in license acceptance fail with
+          # "sdkmanager ... failed with exit code 1". Accept licenses below.
+          accept-android-sdk-licenses: false
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
       - name: Install Android NDK
         run: |
@@ -429,6 +437,14 @@ jobs:
 
       - name: Setup Android SDK (platform-tools / adb)
         uses: android-actions/setup-android@v4
+        with:
+          # Upstream workaround: cmdline-tools 20.0 (the action's new default)
+          # made the action's built-in license acceptance fail with
+          # "sdkmanager ... failed with exit code 1". Accept licenses below.
+          accept-android-sdk-licenses: false
+
+      - name: Accept Android SDK licenses (platform-tools / adb)
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
       - name: Enable KVM (for Android Emulator)
         run: |
