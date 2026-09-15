@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/pam.d/polkit-1
+Target = etc/pam.d/sudo
+Target = etc/pam.d/su
+
+[Action]
+Description = Re-applying TapAuth PAM integration after a vendor PAM change...
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/tapauth-pam-vendor-drift

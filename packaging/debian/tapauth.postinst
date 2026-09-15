@@ -1,0 +1,186 @@
+#!/bin/sh
+set -e
+if [ "$1" = "triggered" ]; then
+	# PAM vendor-drift protection (see tapauth.triggers): the package that
+	# owns one of the PAM service files TapAuth patched (sudo, su, polkit-1)
+	# was installed/upgraded, so its vendor stack changed. Depending on the
+	# distro/release the vendor file is in /usr/lib/pam.d (with our
+	# /etc/pam.d override shadowing it forever) or is /etc/pam.d/<service>
+	# itself (replaced on upgrade, dropping our line). Re-seed the override
+	# from the new vendor file (when present) and re-apply the TapAuth line
+	# — but only when TapAuth has patched that file before (the
+	# .tapauth-bak marker created by the configure step below), and only
+	# when the line is missing (idempotent). The snapshot is refreshed from
+	# the current unpatched file, which also keeps the explicit
+	# --restore-pam-backups path (install.sh/uninstall.sh) current.
+	shift
+	for trigger in "$@"; do
+		case "$trigger" in
+			*/sudo|*/su|*/polkit-1)
+				pam_svc="${trigger##*/}"
+				pam_file="/etc/pam.d/${pam_svc}"
+				if [ -f "$pam_file" ] && [ ! -L "$pam_file" ] \
+					&& [ -f "${pam_file}.tapauth-bak" ]; then
+					if [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+						cp -p "/usr/lib/pam.d/${pam_svc}" "${pam_file}.tapauth-bak" 2>/dev/null || true
+						cp -p "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || true
+					fi
+					if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+						cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+						pam_line="auth    sufficient    pam_tapauth.so"
+						if [ "$pam_svc" = "su" ]; then
+							# PAM_USER for su is the TARGET user, so the
+							# same insertion rule as the configure step
+							# applies: after pam_rootok/pam_wheel, before
+							# the first auth include (common-auth /
+							# system-auth / @include).
+							pam_anchor=$(awk '
+								/^[[:space:]]*#/ { next }
+								/(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+							' "$pam_file")
+							if [ -n "$pam_anchor" ]; then
+								sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+							elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+								sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+							else
+								sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+							fi
+						elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+							sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+						else
+							sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+						fi
+					fi
+				fi
+				;;
+		esac
+	done
+fi
+if [ "$1" = "configure" ]; then
+	if command -v systemd-sysusers >/dev/null 2>&1; then
+		systemd-sysusers /usr/lib/sysusers.d/tapauth.conf || true
+	else
+		getent group tapauthd >/dev/null 2>&1 || addgroup --system tapauthd || true
+		getent group tapauthd-clients >/dev/null 2>&1 || addgroup --system tapauthd-clients || true
+		getent passwd tapauthd >/dev/null 2>&1 || adduser --system --home /nonexistent --ingroup tapauthd --no-create-home --shell /usr/sbin/nologin tapauthd || true
+	fi
+	if command -v systemd-tmpfiles >/dev/null 2>&1; then
+		systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf || true
+	else
+		# /run/tapauthd is created by tapauthd.socket (RuntimeDirectory=) and
+		# /var/log/tapauth by tapauthd.service (LogsDirectory=) at runtime.
+		mkdir -p /var/lib/tapauth /etc/tapauth
+		chown tapauthd:tapauthd /var/lib/tapauth /etc/tapauth 2>/dev/null || true
+	fi
+	mkdir -p /etc/tapauth
+	if [ -z "$2" ] || [ ! -f /etc/tapauth/config.toml ]; then
+		if [ ! -f /etc/tapauth/config.toml ]; then
+			# The virtual fprintd bridge is opt-in, so do not write
+			# enable_fprintd_bridge here. With the key unset the daemon follows
+			# the presence of the marker file shipped by the optional
+			# tapauth-fprintd-emulation package (absent for a base install):
+			# a base install therefore leaves the net.reactivated.Fprint bus
+			# name to a real local fprintd. Users can force the bridge with an
+			# explicit enable_fprintd_bridge = true.
+			printf "# TapAuth Configuration\n" > /etc/tapauth/config.toml
+		fi
+		chmod 0755 /etc/tapauth 2>/dev/null || true
+		chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
+		chmod 644 /etc/tapauth/config.toml 2>/dev/null || true
+		chown tapauthd:tapauthd /etc/tapauth/config.toml 2>/dev/null || true
+	fi
+	# Patch only the three PAM services in scope: sudo, su, polkit-1.
+	# All other stacks — including fingerprint stacks (kde-fingerprint,
+	# gdm-fingerprint, fingerprint-auth) — stay stock: they call
+	# pam_fprintd.so, which resolves to tapauthd's virtual fprintd D-Bus
+	# service when the bridge is enabled (opt-in; see the emulation package).
+	# pam-auth-update migration (upgrade path from TapAuth <= 0.10.x, which
+	# shipped a /usr/share/pam-configs/tapauth profile with priority 512):
+	# dpkg has already removed the profile at this point, so regenerating
+	# the pam-auth-update-managed stacks drops the stale generated tapauth
+	# line from /etc/pam.d/common-auth before it can point at a module
+	# version that is no longer wired that way. Idempotent: when no
+	# tapauth profile is installed (including fresh installs), regenerating
+	# is a no-op. Safe when pam-auth-update is absent.
+	if command -v pam-auth-update >/dev/null 2>&1 && [ -n "$2" ] && [ ! -e /usr/share/pam-configs/tapauth ]; then
+		pam-auth-update --package || true
+	fi
+	pam_line="auth    sufficient    pam_tapauth.so"
+	for pam_svc in sudo su polkit-1; do
+		pam_file="/etc/pam.d/${pam_svc}"
+		# Ubuntu (like Fedora) ships some vendor PAM files in /usr/lib/pam.d
+		# (e.g. polkit-1); /etc/pam.d overrides them. Seed an override from
+		# the vendor file so the inserted line does not replace the vendor
+		# stack.
+		if [ ! -f "$pam_file" ] && [ -f "/usr/lib/pam.d/${pam_svc}" ]; then
+			mkdir -p /etc/pam.d
+			install -m 0644 "/usr/lib/pam.d/${pam_svc}" "$pam_file" 2>/dev/null || continue
+		fi
+		if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+			continue
+		fi
+		if grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null; then
+			continue
+		fi
+		# Keep a pristine copy for restore on removal. Only create it on the
+		# first patch so it stays the unmodified upstream file.
+		if [ ! -f "${pam_file}.tapauth-bak" ]; then
+			cp -p "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+		fi
+		if [ "$pam_svc" = "su" ]; then
+			# PAM_USER for su is the TARGET user, so inserting at the top
+			# would let a phone grant for root bypass pam_rootok.so /
+			# pam_wheel.so (and would prompt for root's own `su`). Insert
+			# after the pam_env.so / pam_rootok.so / pam_wheel.so block and
+			# before the first auth include (common-auth / system-auth /
+			# @include). On Debian/Ubuntu this lands after pam_env.so; on
+			# stacks without pam_env.so (e.g. Fedora) it lands after
+			# pam_rootok/pam_wheel and before system-auth.
+			pam_anchor=$(awk '
+				/^[[:space:]]*#/ { next }
+				/(common-auth|system-auth)/ || ($1 == "auth" && /(include|substack)/) { print NR; exit }
+			' "$pam_file")
+			if [ -n "$pam_anchor" ]; then
+				sed -i "${pam_anchor}i $pam_line" "$pam_file" 2>/dev/null || true
+			elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+				sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+			else
+				sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+			fi
+		elif head -n1 "$pam_file" | grep -q '^#%PAM-1.0'; then
+			sed -i "1a $pam_line" "$pam_file" 2>/dev/null || true
+		else
+			sed -i "1i $pam_line" "$pam_file" 2>/dev/null || true
+		fi
+	done
+	# The D-Bus policy file ships in this package; reload D-Bus and bounce the
+	# daemon so the policy is picked up and the (opt-in) bridge is evaluated
+	# at startup. The optional emulation package bounces the daemon again when
+	# its marker file is added/removed.
+	if command -v deb-systemd-invoke >/dev/null 2>&1; then
+		deb-systemd-invoke reload dbus || true
+		deb-systemd-invoke try-restart tapauthd.service || true
+	fi
+	echo "TapAuth: pam_tapauth.so was wired into sudo, su and polkit-1"
+	echo "         (originals kept as <file>.tapauth-bak; in su it is inserted"
+	echo "         after pam_rootok/pam_wheel so it cannot bypass them)."
+	echo "         Fingerprint stacks stay stock; the virtual fprintd bridge is"
+	echo "         opt-in (install tapauth-fprintd-emulation, or set"
+	echo "         enable_fprintd_bridge = true, then restart tapauthd)."
+	# Membership is a manual, per-user opt-in: the scriptlet never modifies
+	# group membership. Needed for the configuration GUI and for user-session
+	# lock-screen unlock (e.g. KDE's kscreenlocker_worker, which runs as the
+	# logged-in user, reaches /run/tapauthd/tapauthd.sock as
+	# root:tapauthd-clients 0660). Root-run greeters/auth helpers
+	# (GDM/SDDM/LightDM) are unaffected. Memberships are deliberately left in
+	# place on removal/purge (only the sysusers group itself is removed on
+	# purge).
+	echo "TapAuth: To use the configuration GUI and to unlock user-session"
+	echo "         lock screens, add your user to the tapauthd-clients group:"
+	echo "         sudo usermod -aG tapauthd-clients \$USER"
+	echo "         Then log out and log back in for the change to take effect."
+	echo "         Membership is not granted automatically. Root-run greeters and"
+	echo "         auth helpers (GDM/SDDM/LightDM) are unaffected."
+fi
+#DEBHELPER#
+exit 0

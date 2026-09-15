@@ -195,6 +195,7 @@ the root path, which is bypassed by design in this build.
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.
+- `tapauth-ipc-cli` is a testing-only admin harness and is deliberately **not** shipped by the distro packages. The E2E runner builds it from the workspace and the container runs reuse that binary through the mounted workspace (`scripts/ci/run-all-e2e.sh`).
 
 **CI Artifacts**:
 - `tapauth-debug-apk`: Standard safe debug build.

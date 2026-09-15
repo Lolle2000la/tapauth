@@ -1,0 +1,84 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "purge" ]; then
+	# Strip the TapAuth-inserted line(s) from the three PAM service files
+	# TapAuth patched (sudo, su, polkit-1) and drop the one-time snapshot.
+	# The .tapauth-bak copy is deliberately NOT restored over the file: it
+	# was taken once at install time, so copying it back would silently
+	# revert every admin edit and vendor/distro update made since. (A user
+	# who really wants the install-time snapshot back can use
+	# uninstall.sh --restore-pam-backups, or restore it manually.) Removing
+	# only our line cannot lock anyone out, and stays best-effort so a
+	# removal never fails the transaction.
+	for pam_file in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
+		if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+			continue
+		fi
+		sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+		rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+	done
+
+	# If TapAuth seeded the /etc/pam.d/polkit-1 override from a vendor file
+	# in /usr/lib/pam.d, stripping the line can leave the override
+	# byte-identical to that vendor stack. In that case delete the override
+	# so the vendor file applies again. cmp -s is what makes this safe (any
+	# admin edit anywhere in the file keeps the override); skip entirely
+	# when cmp is unavailable. Never remove a symlink.
+	if [ -f /etc/pam.d/polkit-1 ] && [ ! -L /etc/pam.d/polkit-1 ] \
+		&& [ -f /usr/lib/pam.d/polkit-1 ] && command -v cmp >/dev/null 2>&1; then
+		if cmp -s /etc/pam.d/polkit-1 /usr/lib/pam.d/polkit-1; then
+			rm -f /etc/pam.d/polkit-1 2>/dev/null || true
+		fi
+	fi
+
+	# Best-effort cleanup for upgrades from older versions, which patched
+	# fingerprint stacks (kde-fingerprint, gdm-fingerprint, gdm3-fingerprint,
+	# fingerprint-auth) directly. Synthetic "# Managed by TapAuth" files are
+	# deleted; real vendor stacks have only the TapAuth lines stripped (the
+	# snapshot is dropped, never copied back — see above).
+	for pam_file in /etc/pam.d/kde-fingerprint /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint /etc/pam.d/fingerprint-auth; do
+		if [ ! -f "$pam_file" ] || [ -L "$pam_file" ]; then
+			continue
+		fi
+		if ! grep -q "pam_tapauth\.so" "$pam_file" 2>/dev/null \
+			&& ! grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+			rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+			continue
+		fi
+		if grep -q "# Managed by TapAuth" "$pam_file" 2>/dev/null; then
+			# Synthetic file created by TapAuth: delete it outright.
+			rm -f "$pam_file" "${pam_file}.tapauth-bak" 2>/dev/null || true
+		else
+			# Real vendor stack: strip our line, keep the file.
+			sed -i '/pam_tapauth\.so/d' "$pam_file" 2>/dev/null || true
+			rm -f "${pam_file}.tapauth-bak" 2>/dev/null || true
+		fi
+	done
+
+	# Remove the GDM dconf override written by older versions.
+	if [ -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint ]; then
+		rm -f /etc/dconf/db/gdm.d/10-tapauth-fingerprint
+		if command -v dconf >/dev/null 2>&1; then
+			dconf update 2>/dev/null || true
+		fi
+	fi
+fi
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ] || [ "$1" = "upgrade" ]; then
+	# pam-auth-update migration (upgrade path from TapAuth <= 0.10.x, which
+	# shipped a /usr/share/pam-configs/tapauth profile): regenerating the
+	# pam-auth-update-managed stacks drops the generated tapauth line from
+	# /etc/pam.d/common-auth now that this package no longer ships the
+	# profile. On remove/deconfigure this MUST run before the module file
+	# disappears, so a plain "apt remove tapauth" can never leave a
+	# common-auth line pointing at a missing pam_tapauth.so (system-wide
+	# auth failure). Idempotent: with no tapauth profile installed,
+	# regenerating is a no-op. Safe when pam-auth-update is absent.
+	if command -v pam-auth-update >/dev/null 2>&1 && [ ! -e /usr/share/pam-configs/tapauth ]; then
+		pam-auth-update --package || true
+	fi
+fi
+
+#DEBHELPER#
+exit 0

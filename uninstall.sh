@@ -1,5 +1,6 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+FORCE=false
 
 # TapAuth Interactive Uninstallation Script
 # This script removes all TapAuth components and optionally their configurations
@@ -13,20 +14,25 @@ NC='\033[0m' # No Color
 
 # Default values
 INTERACTIVE=true
-# All components are always removed
-REMOVE_PAM=true
-REMOVE_CONFIG_GUI=true
-REMOVE_DAEMON=true
 # PAM configurations are always removed to prevent inconsistent state
 # Only user data removal is configurable
 REMOVE_USER_DATA=false
 PRESERVE_SYSTEM_ACCOUNTS=false
+RESTORE_PAM_BACKUPS=false
 DRY_RUN=false
+FORCE=false
+# Opt-in fprintd emulation (installed by install.sh --fprintd-emulation):
+# remove our pam_fprintd.so replacement and restore any backed-up distro
+# module. Auto-detected during remove_pam; the flag only forces/reports it.
+FPRINTD_EMULATION=false
+FPRINTD_EMULATION_REMOVED=false
 
 # Installation paths (some will be detected at runtime)
 PAM_MODULE_DIR=""  # Will be detected based on distribution
 PAM_SO_NAME="pam_tapauth.so"
 PAM_SO_PATH=""  # Will be set after detection
+FPRINTD_SO_NAME="pam_fprintd.so"
+FPRINTD_SO_PATH=""  # Will be set after detection
 CONFIG_GUI_PATH="/usr/bin/tapauth-config"
 CONFIG_DESKTOP_PATH="/usr/share/applications/tapauth-config.desktop"
 CONFIG_ICON_PATH="/usr/share/icons/hicolor/scalable/apps/tapauth-config.svg"
@@ -68,13 +74,24 @@ print_header() {
     echo ""
 }
 
+# Return success when the given PAM module was built by TapAuth. Used to decide
+# whether it is safe to remove an existing pam_fprintd.so: a genuine distro
+# fprintd module must never be deleted.
+is_tapauth_pam_module() {
+    local module="$1"
+    [[ -f "$module" ]] || return 1
+    grep -qa "tapauth" "$module" 2>/dev/null
+}
+
 # Dry-run helper functions
 show_file_removal() {
     local file="$1"
-    local description="$2"
+    local description="${2:-}"
     if [[ -f "$file" ]] || [[ -d "$file" ]]; then
         echo -e "${RED}[REMOVE]${NC} $file"
-        [[ -n "$description" ]] && echo "  → $description"
+        if [[ -n "$description" ]]; then
+            echo "  → $description"
+        fi
     else
         echo -e "${YELLOW}[SKIP]${NC} $file (does not exist)"
     fi
@@ -82,9 +99,11 @@ show_file_removal() {
 
 show_command() {
     local cmd="$1"
-    local description="$2"
+    local description="${2:-}"
     echo -e "${BLUE}[EXEC]${NC} $cmd"
-    [[ -n "$description" ]] && echo "  → $description"
+    if [[ -n "$description" ]]; then
+        echo "  → $description"
+    fi
 }
 
 show_pam_restore_diff() {
@@ -121,9 +140,16 @@ Usage: $0 [OPTIONS]
 OPTIONS:
     -h, --help              Show this help message
     -n, --non-interactive   Run in non-interactive mode
-    -y, --yes               Answer yes to all prompts (implies --non-interactive)
-    --remove-user-data      Remove user configuration data (keys, pairings)
+    -y, --yes               Answer yes to all prompts (non-interactive; does NOT remove user data)
+    -f, --force             Force uninstallation over package-managed files without prompting
+    --purge, --remove-user-data Remove user data including pairing keys (use with caution)
+    --restore-pam-backups   Roll PAM files back to their install-time
+                            .tapauth-bak snapshots (default: strip only the
+                            TapAuth-inserted lines and delete the snapshots)
     --preserve-system-accounts  Preserve system user and group (tapauthd, tapauthd-clients)
+    --fprintd-emulation     Remove the TapAuth pam_fprintd.so replacement and
+                            restore the distro module from pam_fprintd.so.fprintd-bak
+                            (auto-detected; this flag is for clarity only)
     --dry-run               Show what would be done without doing it
 
 NOTES:
@@ -133,6 +159,16 @@ NOTES:
     - PAM configurations (all modified PAM files)
     - Configuration GUI
     
+    By default, PAM cleanup removes only the pam_tapauth.so lines from the
+    patched stacks and deletes the one-time .tapauth-bak snapshots. The
+    snapshots are NOT copied back, because they were taken once at install
+    time and would revert any later admin/vendor changes. Pass
+    --restore-pam-backups to roll the files back to those snapshots instead.
+
+    If install.sh --fprintd-emulation was used, the pam_fprintd.so replacement
+    is removed and any saved distro fprintd module is restored. This is
+    auto-detected; a genuine distro pam_fprintd.so is never deleted.
+
     By default, system users and groups are also removed.
     Use --preserve-system-accounts during upgrades to avoid recreating them.
     
@@ -168,6 +204,11 @@ remove_systemd_units_and_daemon() {
         show_file_removal "$DAEMON_PATH" "TapAuth daemon binary"
         show_file_removal "/run/tapauthd/tapauthd.sock" "Runtime socket (if present)"
         show_file_removal "/usr/share/polkit-1/rules.d/50-tapauthd.rules" "Polkit firewalld rules"
+        show_file_removal "/etc/dbus-1/system.d/net.reactivated.Fprint.tapauth.conf" "Virtual fprintd D-Bus policy"
+        show_file_removal "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service" "Virtual fprintd D-Bus activation file (legacy pre-rename install, content-guarded)"
+        show_file_removal "/usr/share/tapauth/fprintd-emulation.enabled" "fprintd-emulation bridge marker"
+        show_file_removal "/etc/dconf/db/gdm.d/10-tapauth-fingerprint" "GDM dconf override"
+        show_file_removal "/etc/dconf/db/gdm.d/01-tapauth" "GDM dconf override (legacy)"
         
         local polkit_dropin="/etc/systemd/system/polkit-agent-helper@.service.d/tapauth.conf"
         if [[ -f "$polkit_dropin" ]]; then
@@ -217,6 +258,65 @@ remove_systemd_units_and_daemon() {
         rm -f "$rules_file"
     fi
 
+    # Remove virtual fprintd files
+    local removed_fprint_dbus=false
+    for conf_dir in /etc/dbus-1/system.d /usr/share/dbus-1/system.d; do
+        if [[ -f "$conf_dir/net.reactivated.Fprint.tapauth.conf" ]]; then
+            print_info "Removing virtual fprintd D-Bus configuration ($conf_dir/net.reactivated.Fprint.tapauth.conf)"
+            rm -f "$conf_dir/net.reactivated.Fprint.tapauth.conf"
+            removed_fprint_dbus=true
+        fi
+    done
+
+    # Remove the legacy pre-rename D-Bus activation file if an older TapAuth
+    # release installed it. Current releases ship no activation file at all
+    # (dbus-daemon and dbus-broker only activate files named exactly after the
+    # bus name, so tapauthd's availability comes from systemd). Content-guarded:
+    # the filename is real fprintd's own, so only a file whose Exec references
+    # tapauthd — necessarily an old TapAuth artifact — is deleted.
+    for fprint_srv in \
+        /usr/share/dbus-1/system-services/net.reactivated.Fprint.service
+    do
+        if [[ -f "$fprint_srv" ]] && grep -q "tapauthd" "$fprint_srv" 2>/dev/null; then
+            print_info "Removing legacy virtual fprintd D-Bus activation file ($fprint_srv)"
+            rm -f "$fprint_srv"
+            removed_fprint_dbus=true
+        fi
+    done
+
+    # Remove the fprintd-emulation marker installed by
+    # install.sh --fprintd-emulation. Its absence restores the tri-state
+    # enable_fprintd_bridge default to "off".
+    if [[ -f "/usr/share/tapauth/fprintd-emulation.enabled" ]]; then
+        print_info "Removing fprintd-emulation bridge marker (/usr/share/tapauth/fprintd-emulation.enabled)"
+        rm -f "/usr/share/tapauth/fprintd-emulation.enabled"
+        removed_fprint_dbus=true
+    fi
+    rmdir /usr/share/tapauth 2>/dev/null || true
+
+    if [[ "$removed_fprint_dbus" == true ]]; then
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet dbus 2>/dev/null; then
+            systemctl reload dbus 2>/dev/null || true
+        fi
+    fi
+
+    # Note: no config.toml edit here. enable_fprintd_bridge is tri-state
+    # (unset = auto, following the marker above); the daemon is being removed
+    # entirely, so a leftover key would be stale either way.
+
+    # Remove GDM dconf override
+    local updated_dconf=false
+    for gdm_dconf in /etc/dconf/db/gdm.d/10-tapauth-fingerprint /etc/dconf/db/gdm.d/01-tapauth; do
+        if [[ -f "$gdm_dconf" ]]; then
+            print_info "Removing GDM dconf override ($gdm_dconf)"
+            rm -f "$gdm_dconf"
+            updated_dconf=true
+        fi
+    done
+    if [[ "$updated_dconf" == true ]] && command -v dconf &> /dev/null; then
+        dconf update || true
+    fi
+
     print_success "Daemon and systemd units removed (if present)"
 }
 
@@ -232,13 +332,25 @@ parse_args() {
                 INTERACTIVE=false
                 shift
                 ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
             -y|--yes)
                 INTERACTIVE=false
+                # Note: --yes does NOT imply user data deletion; use --purge for that
+                shift
+                ;;
+            --purge|--remove-user-data)
                 REMOVE_USER_DATA=true
                 shift
                 ;;
-            --remove-user-data)
-                REMOVE_USER_DATA=true
+            --restore-pam-backups)
+                RESTORE_PAM_BACKUPS=true
+                shift
+                ;;
+            --fprintd-emulation)
+                FPRINTD_EMULATION=true
                 shift
                 ;;
             --preserve-system-accounts)
@@ -291,6 +403,7 @@ detect_pam_directory() {
         if [[ -f "$dir/$PAM_SO_NAME" ]]; then
             PAM_MODULE_DIR="$dir"
             PAM_SO_PATH="$dir/$PAM_SO_NAME"
+            FPRINTD_SO_PATH="$dir/$FPRINTD_SO_NAME"
             print_success "Found TapAuth PAM module at: $PAM_SO_PATH"
             return
         fi
@@ -302,6 +415,7 @@ detect_pam_directory() {
             if ls "$dir"/pam_*.so &> /dev/null; then
                 PAM_MODULE_DIR="$dir"
                 PAM_SO_PATH="$dir/$PAM_SO_NAME"
+                FPRINTD_SO_PATH="$dir/$FPRINTD_SO_NAME"
                 print_warning "PAM directory found at $PAM_MODULE_DIR but TapAuth module not installed"
                 return
             fi
@@ -327,142 +441,148 @@ check_root() {
 remove_pam_config() {
     print_header "Removing PAM Configuration"
     print_info "Cleaning up all TapAuth PAM configurations..."
-    
+
+    # Plain stacks: remove the pam_tapauth.so line only. The synthetic /
+    # special-case stacks (gdm-fingerprint, gdm3-fingerprint, kde-fingerprint,
+    # fingerprint-auth) are handled separately below.
+    local pam_cleanup_files=(
+        /etc/pam.d/login
+        /etc/pam.d/su
+        /etc/pam.d/su-l
+        /etc/pam.d/sudo
+        /etc/pam.d/polkit-1
+        /usr/lib/pam.d/polkit-1
+        /etc/pam.d/system-auth
+        /etc/pam.d/gdm-password
+        /etc/pam.d/gdm
+        /etc/pam.d/sddm
+        /etc/pam.d/lightdm
+        /etc/pam.d/kde
+        /etc/pam.d/kscreenlocker
+        /etc/pam.d/kde-smartcard
+    )
+
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove TapAuth from all PAM configurations"
         echo ""
-        
-        show_pam_restore_diff "/etc/pam.d/login"
-        show_pam_restore_diff "/etc/pam.d/su"
-        show_pam_restore_diff "/etc/pam.d/su-l"
-        show_pam_restore_diff "/etc/pam.d/sudo"
-        
-        # Check both possible polkit locations
-        if [[ -f /etc/pam.d/polkit-1 ]]; then
-            show_pam_restore_diff "/etc/pam.d/polkit-1"
-        elif [[ -f /usr/lib/pam.d/polkit-1 ]]; then
-            show_pam_restore_diff "/usr/lib/pam.d/polkit-1"
-        fi
-        
-        if [[ -f /etc/pam.d/system-auth ]]; then
-            show_pam_restore_diff "/etc/pam.d/system-auth"
-        fi
-        
-        if [[ -f /etc/pam.d/gdm-password ]]; then
-            show_pam_restore_diff "/etc/pam.d/gdm-password"
-        elif [[ -f /etc/pam.d/gdm ]]; then
-            show_pam_restore_diff "/etc/pam.d/gdm"
-        fi
-        
-        if [[ -f /etc/pam.d/sddm ]]; then
-            show_pam_restore_diff "/etc/pam.d/sddm"
-        fi
-        
-        if [[ -f /etc/pam.d/lightdm ]]; then
-            show_pam_restore_diff "/etc/pam.d/lightdm"
-        fi
-        
-        # KDE uses multiple PAM files
-        if [[ -f /etc/pam.d/kde ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde"
-        fi
-        if [[ -f /etc/pam.d/kscreenlocker ]]; then
-            show_pam_restore_diff "/etc/pam.d/kscreenlocker"
-        fi
-        if [[ -f /etc/pam.d/kde-fingerprint ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde-fingerprint"
-        fi
-        if [[ -f /etc/pam.d/kde-smartcard ]]; then
-            show_pam_restore_diff "/etc/pam.d/kde-smartcard"
+
+        for pam_file in "${pam_cleanup_files[@]}"; do
+            if [[ -f "$pam_file" ]]; then
+                show_pam_restore_diff "$pam_file"
+            fi
+        done
+
+        # Synthetic/special stacks (may be deleted or stripped)
+        for pam_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint \
+                        /etc/pam.d/kde-fingerprint /etc/pam.d/fingerprint-auth; do
+            if [[ -f "$pam_file" ]]; then
+                show_pam_restore_diff "$pam_file"
+            fi
+        done
+
+        # One-time .tapauth-bak snapshots are deleted by default (removal
+        # strips only the TapAuth line); --restore-pam-backups opts into the
+        # rollback instead.
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            print_info "[DRY RUN] Would RESTORE PAM files from .tapauth-bak backups (--restore-pam-backups)"
+        else
+            print_info "[DRY RUN] Would delete stale .tapauth-bak backup files (default)"
         fi
         return
     fi
-    
+
     # Always remove from all PAM files to prevent inconsistent state
-    
-    # Remove from login
-    if [[ -f /etc/pam.d/login ]] && grep -q "pam_tapauth.so" /etc/pam.d/login 2>/dev/null; then
-        print_info "Removing TapAuth from login PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/login
+    for pam_file in "${pam_cleanup_files[@]}"; do
+        if [[ -f "$pam_file" ]] && grep -q "pam_tapauth.so" "$pam_file" 2>/dev/null; then
+            print_info "Removing TapAuth from PAM configuration ($pam_file)"
+            sed -i '/pam_tapauth\.so/d' "$pam_file"
+        fi
+    done
+
+    # If install.sh seeded the /etc/pam.d/polkit-1 override from a vendor
+    # file in /usr/lib/pam.d, stripping the line can leave the override
+    # byte-identical to that vendor stack. Delete it so the vendor file
+    # applies again; cmp -s keeps any admin edit, and a symlink is never
+    # removed here.
+    if [[ -f /etc/pam.d/polkit-1 && ! -L /etc/pam.d/polkit-1 \
+        && -f /usr/lib/pam.d/polkit-1 ]] && command -v cmp >/dev/null 2>&1; then
+        if cmp -s /etc/pam.d/polkit-1 /usr/lib/pam.d/polkit-1; then
+            print_info "Removing TapAuth-created /etc/pam.d/polkit-1 override (matches vendor stack)"
+            rm -f /etc/pam.d/polkit-1
+        fi
     fi
 
-    # Remove from su
-    if [[ -f /etc/pam.d/su ]] && grep -q "pam_tapauth.so" /etc/pam.d/su 2>/dev/null; then
-        print_info "Removing TapAuth from su PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su
+    # Synthetic GDM fingerprint stacks: remove outright when they are ours,
+    # otherwise strip the TapAuth line.
+    for gdm_file in /etc/pam.d/gdm-fingerprint /etc/pam.d/gdm3-fingerprint; do
+        if [[ -f "$gdm_file" ]]; then
+            if grep -q "Managed by TapAuth" "$gdm_file" 2>/dev/null; then
+                print_info "Removing synthetic GDM fingerprint PAM configuration ($gdm_file)"
+                rm -f "$gdm_file"
+            elif grep -q "pam_tapauth.so" "$gdm_file" 2>/dev/null; then
+                print_info "Removing TapAuth from GDM fingerprint PAM configuration ($gdm_file)"
+                sed -i '/pam_tapauth\.so/d' "$gdm_file"
+            fi
+        fi
+    done
+
+    # Synthetic KDE fingerprint stack: remove outright when it is ours,
+    # otherwise strip the TapAuth line.
+    if [[ -f /etc/pam.d/kde-fingerprint ]]; then
+        if grep -q "Managed by TapAuth" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+            print_info "Removing synthetic KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+            rm -f /etc/pam.d/kde-fingerprint
+        elif grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
+            print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
+        fi
     fi
 
-    # Remove from su-l
-    if [[ -f /etc/pam.d/su-l ]] && grep -q "pam_tapauth.so" /etc/pam.d/su-l 2>/dev/null; then
-        print_info "Removing TapAuth from su-l PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/su-l
+    # Best-effort legacy cleanup: older versions patched the Fedora
+    # fingerprint-auth stack directly. Strip only the TapAuth lines (never
+    # copy the snapshot back); synthetic files are ours and are deleted.
+    if [[ -f /etc/pam.d/fingerprint-auth ]]; then
+        if grep -q "Managed by TapAuth" /etc/pam.d/fingerprint-auth 2>/dev/null; then
+            print_info "Removing synthetic fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
+            rm -f /etc/pam.d/fingerprint-auth /etc/pam.d/fingerprint-auth.tapauth-bak
+        elif grep -q "pam_tapauth.so" /etc/pam.d/fingerprint-auth 2>/dev/null; then
+            print_info "Removing TapAuth from fingerprint-auth PAM configuration (/etc/pam.d/fingerprint-auth)"
+            sed -i '/pam_tapauth\.so/d' /etc/pam.d/fingerprint-auth
+            rm -f /etc/pam.d/fingerprint-auth.tapauth-bak 2>/dev/null || true
+        else
+            # Stack no longer references TapAuth; drop a stale backup.
+            rm -f /etc/pam.d/fingerprint-auth.tapauth-bak 2>/dev/null || true
+        fi
     fi
-    
-    # Remove from sudo
-    if [[ -f /etc/pam.d/sudo ]] && grep -q "pam_tapauth.so" /etc/pam.d/sudo 2>/dev/null; then
-        print_info "Removing TapAuth from sudo PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sudo
-    fi
-    
-    # Remove from polkit (check both locations)
-    if [[ -f /etc/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /etc/pam.d/polkit-1 2>/dev/null; then
-        print_info "Removing TapAuth from polkit PAM configuration (/etc/pam.d/polkit-1)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/polkit-1
-    fi
-    
-    if [[ -f /usr/lib/pam.d/polkit-1 ]] && grep -q "pam_tapauth.so" /usr/lib/pam.d/polkit-1 2>/dev/null; then
-        print_info "Removing TapAuth from polkit PAM configuration (/usr/lib/pam.d/polkit-1)"
-        sed -i '/pam_tapauth\.so/d' /usr/lib/pam.d/polkit-1
-    fi
-    
-    # Remove from system-auth
-    if [[ -f /etc/pam.d/system-auth ]] && grep -q "pam_tapauth.so" /etc/pam.d/system-auth 2>/dev/null; then
-        print_info "Removing TapAuth from system-auth PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/system-auth
-    fi
-    
-    # Remove from GDM
-    if [[ -f /etc/pam.d/gdm-password ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm-password 2>/dev/null; then
-        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm-password)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm-password
-    fi
-    
-    if [[ -f /etc/pam.d/gdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/gdm 2>/dev/null; then
-        print_info "Removing TapAuth from GDM PAM configuration (/etc/pam.d/gdm)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/gdm
-    fi
-    
-    # Remove from SDDM
-    if [[ -f /etc/pam.d/sddm ]] && grep -q "pam_tapauth.so" /etc/pam.d/sddm 2>/dev/null; then
-        print_info "Removing TapAuth from SDDM PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/sddm
-    fi
-    
-    # Remove from LightDM
-    if [[ -f /etc/pam.d/lightdm ]] && grep -q "pam_tapauth.so" /etc/pam.d/lightdm 2>/dev/null; then
-        print_info "Removing TapAuth from LightDM PAM configuration"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/lightdm
-    fi
-    
-    # Remove from KDE (multiple PAM files)
-    if [[ -f /etc/pam.d/kde ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde 2>/dev/null; then
-        print_info "Removing TapAuth from KDE PAM configuration (/etc/pam.d/kde)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde
-    fi
-    
-    if [[ -f /etc/pam.d/kscreenlocker ]] && grep -q "pam_tapauth.so" /etc/pam.d/kscreenlocker 2>/dev/null; then
-        print_info "Removing TapAuth from KDE screen locker PAM configuration (/etc/pam.d/kscreenlocker)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kscreenlocker
-    fi
-    
-    if [[ -f /etc/pam.d/kde-fingerprint ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint 2>/dev/null; then
-        print_info "Removing TapAuth from KDE fingerprint PAM configuration (/etc/pam.d/kde-fingerprint)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-fingerprint
-    fi
-    
-    if [[ -f /etc/pam.d/kde-smartcard ]] && grep -q "pam_tapauth.so" /etc/pam.d/kde-smartcard 2>/dev/null; then
-        print_info "Removing TapAuth from KDE smartcard PAM configuration (/etc/pam.d/kde-smartcard)"
-        sed -i '/pam_tapauth\.so/d' /etc/pam.d/kde-smartcard
+
+    # Handle the one-time .tapauth-bak snapshots. The default is to DELETE
+    # them: removal above strips only the TapAuth-inserted line, so the
+    # snapshots are stale and copying one back would revert later admin or
+    # vendor edits. --restore-pam-backups explicitly opts into the rollback.
+    # Both /etc/pam.d and /usr/lib/pam.d are scanned: install.sh patches the
+    # vendor file under /usr/lib/pam.d directly when no /etc override exists.
+    local bak_files=()
+    for bak in /etc/pam.d/*.tapauth-bak /usr/lib/pam.d/*.tapauth-bak; do
+        [[ -f "$bak" ]] && bak_files+=("$bak")
+    done
+
+    if [[ ${#bak_files[@]} -gt 0 ]]; then
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            print_warning "Restoring original PAM files from .tapauth-bak backups (--restore-pam-backups)"
+            print_warning "This rolls back any PAM changes made after TapAuth was installed."
+            for bak in "${bak_files[@]}"; do
+                local orig="${bak%.tapauth-bak}"
+                print_info "Restoring original PAM configuration for $orig"
+                cp -p "$bak" "$orig" 2>/dev/null || true
+                rm -f "$bak"
+            done
+        else
+            print_info "Removing stale PAM backup files (default; pass --restore-pam-backups to restore instead)"
+            for bak in "${bak_files[@]}"; do
+                print_info "Removing backup file: $bak"
+                rm -f "$bak" 2>/dev/null || true
+            done
+        fi
     fi
     
     print_success "PAM configurations cleaned up"
@@ -471,7 +591,17 @@ remove_pam_config() {
 # Remove PAM module
 remove_pam() {
     print_header "Removing PAM Module"
-    
+
+    # Possible PAM module directories for different distributions
+    local pam_dirs=(
+        "/lib/x86_64-linux-gnu/security"
+        "/usr/lib/x86_64-linux-gnu/security"
+        "/lib64/security"
+        "/usr/lib64/security"
+        "/usr/lib/security"
+        "/lib/security"
+    )
+
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove PAM module"
         echo ""
@@ -479,15 +609,6 @@ remove_pam() {
         if [[ -n "$PAM_SO_PATH" ]]; then
             show_file_removal "$PAM_SO_PATH" "TapAuth PAM module"
         else
-            # Check all possible locations
-            local pam_dirs=(
-                "/lib/x86_64-linux-gnu/security"
-                "/usr/lib/x86_64-linux-gnu/security"
-                "/lib64/security"
-                "/usr/lib64/security"
-                "/usr/lib/security"
-                "/lib/security"
-            )
             local found_any=false
             for dir in "${pam_dirs[@]}"; do
                 if [[ -f "$dir/$PAM_SO_NAME" ]]; then
@@ -499,6 +620,18 @@ remove_pam() {
                 echo -e "${GREEN}[INFO]${NC} No PAM module found to remove"
             fi
         fi
+
+        # Opt-in fprintd emulation module and any saved distro module.
+        for dir in "${pam_dirs[@]}"; do
+            local dry_run_fprintd="$dir/$FPRINTD_SO_NAME"
+            if is_tapauth_pam_module "$dry_run_fprintd"; then
+                show_file_removal "$dry_run_fprintd" "TapAuth fprintd emulation PAM module"
+            fi
+            if [[ -f "${dry_run_fprintd}.fprintd-bak" ]]; then
+                echo -e "${BLUE}[RESTORE]${NC} ${dry_run_fprintd}.fprintd-bak → $dry_run_fprintd"
+                show_file_removal "${dry_run_fprintd}.fprintd-bak" "Saved distro fprintd PAM module"
+            fi
+        done
         return
     fi
     
@@ -512,19 +645,31 @@ remove_pam() {
     fi
     
     # Also check all possible locations to be thorough
-    local pam_dirs=(
-        "/lib/x86_64-linux-gnu/security"
-        "/usr/lib/x86_64-linux-gnu/security"
-        "/lib64/security"
-        "/usr/lib64/security"
-        "/usr/lib/security"
-        "/lib/security"
-    )
-    
     for dir in "${pam_dirs[@]}"; do
         if [[ -f "$dir/$PAM_SO_NAME" ]]; then
             print_info "Removing PAM module from $dir/$PAM_SO_NAME"
             rm -f "$dir/$PAM_SO_NAME"
+            found=true
+        fi
+    done
+
+    # Opt-in fprintd emulation: only remove our own pam_fprintd.so and restore
+    # any distro module we backed up. A genuine distro fprintd module (no
+    # TapAuth marker) is never deleted.
+    for dir in "${pam_dirs[@]}"; do
+        local fprintd_path="$dir/$FPRINTD_SO_NAME"
+        local fprintd_bak="${fprintd_path}.fprintd-bak"
+        if is_tapauth_pam_module "$fprintd_path"; then
+            print_info "Removing TapAuth fprintd emulation module from $fprintd_path"
+            rm -f "$fprintd_path"
+            FPRINTD_EMULATION_REMOVED=true
+            found=true
+        fi
+        if [[ -f "$fprintd_bak" ]]; then
+            print_info "Restoring original fprintd PAM module from $fprintd_bak"
+            cp -p "$fprintd_bak" "$fprintd_path"
+            rm -f "$fprintd_bak"
+            FPRINTD_EMULATION_REMOVED=true
             found=true
         fi
     done
@@ -588,7 +733,8 @@ remove_user_data() {
     if [[ "$DRY_RUN" == true ]]; then
         print_info "[DRY RUN] Would remove user data"
         echo ""
-        show_file_removal "$CONFIG_DIR" "System configuration directory (contains keys and config)"
+        show_file_removal "$CONFIG_DIR" "System state directory (contains keys and paired devices)"
+        show_file_removal "/etc/tapauth" "System configuration directory (/etc/tapauth)"
         
         # Check for user-specific configs
         for home_dir in /home/*; do
@@ -604,7 +750,12 @@ remove_user_data() {
         rm -rf "$CONFIG_DIR"
         print_success "User data removed"
     else
-        print_info "No user data found"
+        print_info "No user data found in $CONFIG_DIR"
+    fi
+
+    if [[ -d "/etc/tapauth" ]]; then
+        print_info "Removing system configuration directory /etc/tapauth"
+        rm -rf "/etc/tapauth"
     fi
     
     # Remove log directory
@@ -726,6 +877,12 @@ create_summary() {
     echo "Components removed:"
     echo "  ✓ Daemon"
     echo "  ✓ PAM module"
+    if [[ "$FPRINTD_EMULATION_REMOVED" == true || "$FPRINTD_EMULATION" == true ]]; then
+        echo "  ✓ fprintd emulation module (distro module restored if backed up)"
+        if [[ -n "$FPRINTD_SO_PATH" ]]; then
+            echo "      location: $FPRINTD_SO_PATH"
+        fi
+    fi
     echo "  ✓ Configuration GUI"
     if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
         echo "  ✓ System users and groups"
@@ -787,6 +944,35 @@ main() {
     fi
     
     check_root
+
+    # Check if installed via system package manager
+    local pkg_manager=""
+    if command -v dpkg >/dev/null 2>&1 && { dpkg -l tapauth 2>/dev/null | grep -q '^ii' || dpkg -l tapauth-fprintd-emulation 2>/dev/null | grep -q '^ii'; }; then
+        pkg_manager="apt-get remove tapauth tapauth-fprintd-emulation"
+    elif command -v rpm >/dev/null 2>&1 && { rpm -q tapauth >/dev/null 2>&1 || rpm -q tapauth-fprintd-emulation >/dev/null 2>&1; }; then
+        pkg_manager="dnf remove tapauth tapauth-fprintd-emulation"
+    elif command -v pacman >/dev/null 2>&1 && { pacman -Q tapauth >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation >/dev/null 2>&1 || pacman -Q tapauth-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-emulation-git >/dev/null 2>&1 || pacman -Q tapauth-fprintd-git >/dev/null 2>&1; }; then
+        pkg_manager="pacman -R tapauth tapauth-fprintd-emulation"
+    fi
+
+    if [[ -n "$pkg_manager" ]]; then
+        print_warning "TapAuth appears to have been installed via your system package manager."
+        print_warning "Running this standalone script will delete package-managed binaries without updating"
+        print_warning "the package database, which may cause errors during package updates or removal."
+        if [[ "$FORCE" == true ]]; then
+            print_info "Continuing due to --force flag."
+        elif [[ "$INTERACTIVE" == false ]]; then
+            print_error "Cannot uninstall package-managed TapAuth ($pkg_manager) in non-interactive mode without --force."
+            print_info "Use your distribution package manager to uninstall TapAuth, or pass --force."
+            exit 1
+        else
+            read -p "Proceed with manual uninstallation anyway? [y/N]: " pkg_uninst_confirm
+            if [[ ! "$pkg_uninst_confirm" =~ ^[Yy]$ ]]; then
+                print_info "Uninstallation cancelled. Please use your package manager (sudo $pkg_manager)."
+                exit 0
+            fi
+        fi
+    fi
     
     # Remove in reverse order of installation
     remove_systemd_units_and_daemon
@@ -805,6 +991,9 @@ main() {
         echo "Components to remove:"
         echo "  ✓ Daemon (tapauthd, tapauthd.socket/service)"
         echo "  ✓ PAM module"
+        if [[ "$FPRINTD_EMULATION" == true ]]; then
+            echo "  ✓ fprintd emulation module (distro module restored from backup)"
+        fi
         echo "  ✓ Configuration GUI"
         if [[ "$PRESERVE_SYSTEM_ACCOUNTS" == false ]]; then
             echo "  ✓ System users and groups (tapauthd, tapauthd-clients)"
@@ -815,6 +1004,11 @@ main() {
         echo ""
         echo "PAM configurations:"
         echo "  ✓ All PAM files will be cleaned (login, sudo, polkit, system-auth, display managers, etc.)"
+        if [[ "$RESTORE_PAM_BACKUPS" == true ]]; then
+            echo "  ✓ .tapauth-bak snapshots will be restored (--restore-pam-backups)"
+        else
+            echo "  ✓ .tapauth-bak snapshots will be deleted (use --restore-pam-backups to restore)"
+        fi
         
         echo ""
         echo "User data:"

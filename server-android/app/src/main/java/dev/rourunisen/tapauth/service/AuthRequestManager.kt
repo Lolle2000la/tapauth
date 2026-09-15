@@ -27,6 +27,10 @@ class AuthRequestManager private constructor() {
     private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
     private val scope = CoroutineScope(Dispatchers.IO)
 
+    // E2E-only: when true, autoApproveInE2e skips its auto-approval so pending
+    // requests stay pending while the app is alive (explicit grant control).
+    @Volatile private var autoApproveSuppressed = false
+
     // Index challenges (Base64) to request IDs for fast cancel-by-challenge
     private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
 
@@ -408,6 +412,37 @@ class AuthRequestManager private constructor() {
     fun getActiveRequestIds(): Set<String> = pendingRequests.keys.toSet()
 
     /**
+     * E2E-only: suppress the auto-approve fallback so a request can stay pending while the app is
+     * alive, letting the E2E harness resolve it via an explicit grant broadcast. Suppression is
+     * sticky until [restoreAutoApproveInE2e] is called, so the harness scopes it to one phase.
+     */
+    fun suppressAutoApproveInE2e() {
+        if (!dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) return
+        autoApproveSuppressed = true
+        Log.i(TAG, "Auto-approve suppressed for E2E explicit-grant control")
+    }
+
+    /** E2E-only: re-enable the auto-approve fallback after [suppressAutoApproveInE2e]. */
+    fun restoreAutoApproveInE2e() {
+        if (!dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) return
+        autoApproveSuppressed = false
+        Log.i(TAG, "Auto-approve restored for E2E explicit-grant control")
+    }
+
+    /**
+     * E2E-only: sign and approve every pending request (explicit grant broadcast). This mirrors
+     * what a real biometric approval does — the challenge is signed with the device private key —
+     * without touching the biometric stack.
+     */
+    fun approveAllPendingInE2e(context: Context) {
+        if (!dev.rourunisen.tapauth.BuildConfig.E2E_TESTING) return
+        for (pending in pendingRequests.values.toList()) {
+            Log.i(TAG, "E2E explicit grant for request ${pending.authRequest.requestId}")
+            signAndSubmit(context, pending.authRequest)
+        }
+    }
+
+    /**
      * Cancel all pending requests that match the given challenge This is used when an
      * AuthenticationCancel message is received
      *
@@ -582,7 +617,9 @@ class AuthRequestManager private constructor() {
          * [dev.rourunisen.tapauth.MainActivity] and
          * [dev.rourunisen.tapauth.BiometricPromptActivity] (which pass their own
          * `onGracePeriodElapsed`). Waits [DEBUG_AUTO_APPROVE_DELAY_MS] so the E2E harness can
-         * inject an explicit denial broadcast first, then approves if the request is still pending.
+         * inject an explicit denial broadcast first, then approves if the request is still pending
+         * and auto-approval has not been suppressed via [suppressAutoApproveInE2e] (suppressed
+         * requests are left pending for the harness's explicit grant broadcast).
          */
         fun autoApproveInE2e(
             activity: FragmentActivity,
@@ -597,8 +634,18 @@ class AuthRequestManager private constructor() {
             activity.lifecycleScope.launch {
                 delay(DEBUG_AUTO_APPROVE_DELAY_MS)
                 if (getInstance().hasPendingRequest(authRequest.requestId)) {
-                    Log.i(TAG, "Auto-approving request ${authRequest.requestId} in E2E test mode")
-                    approveRequest(activity, authRequest)
+                    if (getInstance().autoApproveSuppressed) {
+                        Log.i(
+                            TAG,
+                            "Auto-approve suppressed; awaiting explicit grant for request ${authRequest.requestId}",
+                        )
+                    } else {
+                        Log.i(
+                            TAG,
+                            "Auto-approving request ${authRequest.requestId} in E2E test mode",
+                        )
+                        approveRequest(activity, authRequest)
+                    }
                 }
                 onGracePeriodElapsed()
             }
@@ -609,6 +656,11 @@ class AuthRequestManager private constructor() {
          * through AuthRequestManager.
          */
         fun approveRequest(context: Context, authRequest: AuthRequest) {
+            signAndSubmit(context, authRequest)
+        }
+
+        /** Shared sign-and-submit body used by [approveRequest] and [AuthRequestManager]. */
+        private fun signAndSubmit(context: Context, authRequest: AuthRequest) {
             try {
                 val keypairRepo = KeypairRepository(context)
                 val privateKey = keypairRepo.getPrivateKey()

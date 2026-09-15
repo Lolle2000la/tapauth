@@ -1,0 +1,183 @@
+TapAuth and the Debian PAM stack
+================================
+
+TapAuth ships a PAM module (`pam_tapauth.so`) that lets a paired Android
+phone approve an authentication request. To make it reachable from the
+places where it matters, the `tapauth` package patches three PAM service
+files:
+
+    /etc/pam.d/sudo       (conffile owned by the "sudo" package)
+    /etc/pam.d/su         (conffile owned by the "util-linux" package)
+    /etc/pam.d/polkit-1   (conffile owned by policykit-1/polkitd; on some
+                           releases the vendor stack is shipped as
+                           /usr/lib/pam.d/polkit-1 instead, and tapauth
+                           seeds an /etc/pam.d/polkit-1 override from it)
+
+Into each file it inserts one line:
+
+    auth    sufficient    pam_tapauth.so
+
+`sufficient` means a successful TapAuth approval authenticates the request,
+while every other method (password, etc.) keeps working exactly as before if
+the phone is unavailable. The package deliberately does not touch any other
+stack: `login` is never patched, and fingerprint stacks (kde-fingerprint,
+gdm-fingerprint, fingerprint-auth, ...) stay stock. Lock screens and greeters
+are served by the opt-in virtual fprintd bridge described below, not by
+patching their PAM files.
+
+
+Why not pam-auth-update?
+------------------------
+
+Debian's `pam-auth-update` mechanism manages the shared `common-*` stacks
+(`common-auth`, `common-account`, ...), not the service files
+`/etc/pam.d/{sudo,su,polkit-1}`. Registering a `pam-auth-update` profile
+therefore cannot express TapAuth's intended scope: in earlier releases it
+also ended up wiring the module into `login`. No profile is shipped any
+more and the three-file scope above is applied directly, which
+is deliberate. Upgrading from a <= 0.10.x release that shipped a
+`/usr/share/pam-configs/tapauth` profile automatically regenerates the
+pam-auth-update-managed stacks so the stale generated line in
+`/etc/pam.d/common-auth` is removed (on upgrade and on plain `apt remove`).
+
+
+One-time backups (.tapauth-bak)
+-------------------------------
+
+The first time TapAuth patches one of the three files it takes a one-time
+snapshot next to it:
+
+    /etc/pam.d/<service>.tapauth-bak
+
+The snapshot is created once and never refreshed on ordinary upgrades, so it
+represents the pre-TapAuth state. It is *not* used to restore the file on
+removal (see below).
+
+
+Removal: strip, don't restore
+-----------------------------
+
+On removal the maintainer scripts remove only the TapAuth-inserted
+`pam_tapauth.so` line(s) from the three files and delete the
+`.tapauth-bak` snapshots. They deliberately do **not** copy the snapshot
+back over the file: because the snapshot was taken once at install time,
+restoring it would silently revert every administrator edit and every
+vendor/distribution update made since. Removing only the inserted line
+cannot leave a dangling reference to a removed module, so it cannot lock
+anyone out.
+
+If the `/etc/pam.d/polkit-1` file was itself seeded by TapAuth from
+`/usr/lib/pam.d/polkit-1`, then after stripping the line the override is
+byte-identical to the vendor stack and is deleted (guarded by `cmp -s`), so
+the vendor file applies again.
+
+The standalone `install.sh`/`uninstall.sh` tooling offers an explicit,
+opt-in rollback (`uninstall.sh --restore-pam-backups`) for users who really
+want the install-time snapshot copied back. The distribution packages do not
+do this automatically.
+
+
+Vendor-drift re-apply
+---------------------
+
+Because the three files are conffiles, a distribution upgrade of the owning
+package can legitimately replace a vendor file (losing our line) or ship a
+new `/usr/lib/pam.d/polkit-1` (which our override would otherwise shadow
+forever). To keep TapAuth wired across such upgrades, the package registers
+dpkg triggers on `/etc/pam.d/{sudo,su,polkit-1}` and
+`/usr/lib/pam.d/{sudo,su,polkit-1}`. When one fires, the `postinst` ("triggered"
+state) re-seeds the override from the new vendor file when one exists and
+re-applies the TapAuth line, but **only** when the `.tapauth-bak` snapshot
+shows TapAuth patched that file before, and only when the line is missing
+(idempotent). For `su` the line is re-inserted after `pam_rootok.so` /
+`pam_wheel.so` and before the first auth include, matching the install-time
+rule, so a phone grant for `root` can never bypass those checks. The Fedora
+and Arch packages carry equivalent `%triggerin` / libalpm hook machinery.
+
+
+Opt-in virtual fprintd bridge
+-----------------------------
+
+The base package does **not** claim the `net.reactivated.Fprint` D-Bus name
+and ships no D-Bus activation file, so a real local `fprintd` (and a
+physical fingerprint reader) is never shadowed. The daemon's
+`enable_fprintd_bridge` setting is tri-state:
+
+  * unset (default) - the bridge is enabled only if the marker file
+    /usr/share/tapauth/fprintd-emulation.enabled exists;
+  * true  - force the bridge on;
+  * false - force it off.
+
+The optional `tapauth-fprintd-emulation` package ships that marker (and a
+second build of the module installed as `pam_fprintd.so`), which turns the
+bridge on and lets stock fingerprint PAM stacks be served by TapAuth. The
+state is read at daemon startup, so a change takes effect on the next
+`tapauthd` restart. The base package declares no `Conflicts` against fprintd
+or libpam-fprintd; only the optional emulation package does.
+
+
+Socket access is a manual, per-user opt-in
+------------------------------------------
+
+The daemon socket `/run/tapauthd/tapauthd.sock` is owned
+`root:tapauthd-clients` with mode 0660. Membership in `tapauthd-clients` is
+**not** granted automatically - neither the packages nor `install.sh` add
+every interactive user. Each desktop user who needs the configuration GUI or
+user-session lock-screen unlock (for example KDE's `kscreenlocker_worker`,
+which runs as the logged-in user) must opt in and re-login:
+
+    sudo usermod -aG tapauthd-clients $USER
+
+The source `install.sh` adds only the user who ran it. Root-run greeters and
+auth helpers (GDM/SDDM/LightDM) are unaffected. Membership is not removed on
+uninstall or purge (only the group itself is removed on purge).
+
+
+Relationship to Debian Policy
+-----------------------------
+
+Debian Policy §10.7.3 ("Behavior") requires that local changes to
+configuration files be preserved during upgrades and that conffiles be
+preserved on removal (deleted only on purge). It also states that maintainer
+scripts must not alter a conffile of *any* package, including their own.
+§10.7.4 ("Sharing configuration files") explains that when several packages
+need to modify the same file, one package should own it and provide a
+modification helper, and that packages directly modifying another package's
+conffile should otherwise conflict.
+
+TapAuth knowingly deviates from the strict form of that rule: its whole
+purpose is to wire a PAM module into conffiles owned by `sudo`,
+`util-linux` and `policykit-1`, and there is no shared helper available for
+those service files (pam-auth-update only covers `common-*`; see above).
+The deviation is kept as small and as reversible as policy allows:
+
+  * edits are limited to a single inserted line per file;
+  * a one-time `.tapauth-bak` snapshot is kept for manual rollback;
+  * removal strips only the inserted line and never clobbers the file with
+    the snapshot, so administrator and vendor changes survive;
+  * the vendor-drift triggers re-apply only when TapAuth patched the file
+    before, and only when the line is missing.
+
+Administrators who prefer not to have TapAuth edit those files can remove
+the inserted lines manually after installation (the module keeps working for
+any stack that calls it) or simply not install the package.
+
+
+Manual recovery
+---------------
+
+If you are locked out, boot a rescue shell and restore the pre-TapAuth
+state. Prefer stripping TapAuth's own line:
+
+    for f in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
+        [ -f "$f" ] && sed -i '/pam_tapauth\.so/d' "$f"
+    done
+
+Or, if a `.tapauth-bak` snapshot still exists and you explicitly want the
+install-time state back:
+
+    for f in /etc/pam.d/sudo /etc/pam.d/su /etc/pam.d/polkit-1; do
+        [ -s "$f.tapauth-bak" ] && cp -p "$f.tapauth-bak" "$f"
+    done
+
+ -- Luca Auer <lolle2000.la+tapauth@gmail.com>

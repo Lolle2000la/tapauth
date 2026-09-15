@@ -41,6 +41,24 @@ enable_network = true
 # Default: true
 enable_ble = true
 
+# Virtual fprintd D-Bus Bridge
+# Exposes the net.reactivated.Fprint D-Bus service, allowing desktop
+# environments (like GNOME Shell and KDE Plasma lockscreens) to query and trigger TapAuth
+# biometrics in parallel with password entry.
+#
+# Tri-state:
+#   unset - enabled only when the optional tapauth-fprintd-emulation package is
+#           installed, which ships the marker file
+#           /usr/share/tapauth/fprintd-emulation.enabled. This is the base
+#           install default: the net.reactivated.Fprint bus name stays with a
+#           real local fprintd.
+#   true  - force the virtual bridge on (explicit override)
+#   false - force the virtual bridge off, so a real local fingerprint reader
+#           owns the bus name (explicit override; wins over the marker file)
+#
+# Applies at the next daemon restart.
+# enable_fprintd_bridge = true
+
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.
 # When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).

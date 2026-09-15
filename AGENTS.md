@@ -59,13 +59,22 @@ cd server-android && ./gradlew test
 cd server-android && ./gradlew connectedE2eAndroidTest
 ```
 
+The e2e app build (only; `BuildConfig.E2E_TESTING` is false in debug/release)
+exposes deterministic grant control for the E2E suite: the exported receiver
+handles `ACTION_DEV_GRANT` (sign + approve every pending request),
+`ACTION_DEV_DENY` (explicit denial of every pending request) and
+`ACTION_DEV_SUPPRESS_AUTO_APPROVE` / `ACTION_DEV_RESTORE_AUTO_APPROVE` (toggle
+the 1s auto-approve fallback so a request can stay pending while the app is
+alive). `scripts/ci/emulator-bio-helper.sh` wraps these as the `grant`, `deny`,
+`suppress-auto-approve` and `restore-auto-approve` subcommands.
+
 ## Feature Flags (critical)
 
 | Crate | Default | Features |
 |-------|---------|----------|
 | `shared` | `[]` | `jni`, `tpm`, `firewall`, `dev-state-override`, `dev-udp-loopback` |
 | `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override` |
-| `client-pam` | `[]` | `tpm`, `dev-socket-override` |
+| `client-pam` | `[]` | `tpm`, `dev-socket-override`, `replace-fprintd-pam` |
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
 
 Each dev knob is **separately** feature-gated so a test build can enable exactly one
@@ -78,11 +87,12 @@ environment alone:
 | `dev-state-override` (`shared`, `tapauthd`) | `TAPAUTH_STATE_DIR` | Relocates the state dir (and `config.toml` inside it) |
 | `dev-udp-loopback` (`shared`, `tapauthd`) | `TAPAUTH_DEV_UDP_TARGET` | Unicasts packets to a local peer and accepts locally-sourced replies (emulator) |
 | `dev-polkit-bypass` (`tapauthd`) | `TAPAUTH_DEV_MODE` | Skips the PolKit check for same-UID/root callers so headless harnesses need no agent |
-| `dev-socket-override` (`client-pam`, `client-config-gui`, `tapauthd`) | `TAPAUTHD_SOCK` | Redirects the IPC client to another socket. On `tapauthd` the feature only affects the `tapauth-ipc-cli` admin tool; the daemon itself always uses the systemd-activated socket in production |
+| `dev-socket-override` (`client-pam`, `client-config-gui`, `tapauthd`) | `TAPAUTHD_SOCK` | Redirects the IPC client to another socket. On `tapauthd` the feature only affects the `tapauth-ipc-cli` admin tool (testing-only; **not shipped** by any distro package — the E2E harness builds it from the workspace); the daemon itself always uses the systemd-activated socket in production |
 
 **Gotchas:**
 - `--all-features` **may not work locally** — it pulls in `jni` which requires `libjvm`/JDK headers. If you have a JDK installed, it should compile; otherwise use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
+- **`replace-fprintd-pam`** (`client-pam`) builds the opt-in "fprintd emulation" variant of the module, installed as `pam_fprintd.so` by the optional `tapauth-fprintd-emulation` package (or `install.sh --fprintd-emulation`). It recognises fingerprint PAM service names (`*-fingerprint`, `fingerprint-auth`) and forces the TTY-less sequential flow with the full `pam_operation_timeout_secs`. It is off by default; the default build is unchanged and never claims a fingerprint stack.
 - **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Pulls in all four daemon dev knobs above (`dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override`) — i.e. it is a full local sandbox build.
 - The **E2E suite's systemd mode** deliberately enables only `dev-udp-loopback,dev-polkit-bypass` (NOT `dev-state-override`), so state/config/socket paths stay production while the emulator transport shim works.
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
@@ -127,15 +137,29 @@ cargo build --manifest-path client-pam/Cargo.toml
 - The `tapauthd` user is registered as an action owner (`org.freedesktop.policykit.owner`) via `tapauthd/dev.rourunisen.tapauth.config.admin.policy` to permit cross-identity queries
 - Falls back to UID==0 check when D-Bus/PolKit is unavailable
 - Socket permissions serve as an additional access gate: `root:tapauthd-clients 0660`
+- `tapauthd-clients` membership is **not** granted automatically. Users who need the configuration GUI or user-session lock-screen unlock must add themselves (`sudo usermod -aG tapauthd-clients $USER`) and log out/back in (or otherwise re-initialise their process's group list) for it to take effect. The source `install.sh` is the sole exception: it adds only the installing user (the one who ran it), never every interactive user. It only matters for user-session components / the opt-in `pam_fprintd.so` emulation path — root greeters/auth helpers (GDM/SDDM/LightDM) are unaffected. Membership is deliberately **not** removed on uninstall/purge (only the group itself is, on purge).
 
 ### PAM Module (`client-pam`)
 - Built as `libclient_pam.so`, installed to distro-specific PAM dir as `pam_tapauth.so`
+- **Shipping scope (base `pam_tapauth.so`): only `sudo`, `su`, `polkit-1`** (never `login`, never fingerprint stacks — lock screens/greeters integrate via the opt-in virtual fprintd service instead). In `su` the module is inserted after `pam_rootok`/`pam_wheel` (`PAM_USER` is the target user, so it must not bypass them). Fingerprint stacks are served **only** by the opt-in `replace-fprintd-pam` build installed as `pam_fprintd.so` (see below), never by `pam_tapauth.so`.
 - Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
 - Wraps all IPC messages in `IpcEnvelope`, unwraps `PamResponse` from envelope
 - Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
+- Context classification is 3 rules (`classify_pam_context`): `polkit-1` → threaded flow, openable `/dev/tty` → interactive (Enter skips to password), everything else → generic sequential fallback
 - **GUI (no-TTY) contexts use one of two flows**:
   - `polkit-1`: password is collected on a background thread while the main thread waits for the phone (polkit-agent-helper-1's conversation is a plain fd fed by a separate process — thread-safe)
-  - All other TTY-less services (e.g. KDE lock screen `kscreenlocker_worker`): the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread for `pam_gui_timeout_secs` (default 30s, clamped to `pam_operation_timeout_secs`), then falls through to password. Driving the conversation from a thread there deadlocks the host's event loop (see `run_sequential_event_loop` docs in `pam_logic.rs`)
+  - All other TTY-less services: the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread for `pam_gui_timeout_secs` (default 30s, clamped to `pam_operation_timeout_secs`), then falls through to password. Driving the conversation from a thread there deadlocks the host's event loop (see `run_sequential_event_loop` docs in `pam_logic.rs`)
+- **Optional fprintd-emulation build (`replace-fprintd-pam`, off by default)**: the same crate compiled for installation as `pam_fprintd.so`, shipped by the optional `tapauth-fprintd-emulation` package (or `install.sh --fprintd-emulation`). It recognises fingerprint service names — a `-fingerprint` suffix (`gdm-fingerprint`, `gdm3-fingerprint`, `kde-fingerprint`, `budgie-fingerprint`, …) or Fedora's `fingerprint-auth` — and forces the TTY-less sequential flow with the full `pam_operation_timeout_secs`, so stock fingerprint stacks route to TapAuth on machines without (or not wanting) a physical reader. The default build is unchanged.
+
+### Virtual fprintd Integration (lock screens & greeters)
+- `tapauthd` implements a virtual fprintd device (`tapauthd/src/fprintd.rs`) and claims the `net.reactivated.Fprint` bus name at startup **only when the bridge is enabled** (`tapauthd.service` is enabled at boot via `90-tapauthd.preset`; the bridge state is read once at startup).
+- `enable_fprintd_bridge` in `config.toml` is **tri-state**: **unset = auto** (enabled iff the marker file `/usr/share/tapauth/fprintd-emulation.enabled` exists — i.e. the optional `tapauth-fprintd-emulation` package is installed), `true` = forced on, `false` = forced off. A base install ships **no** marker, so a real local fingerprint reader is **not shadowed**: real fprintd keeps the bus name. Changes take effect on daemon restart.
+- The base packages ship only the D-Bus **policy** file (`net.reactivated.Fprint.tapauth.conf`) that lets `tapauthd` own the name. There is **no D-Bus activation file**: dbus-daemon and dbus-broker only activate files named exactly after the bus name, so a renamed TapAuth file would be inert; lockscreen availability comes from the boot-enabled systemd service, and real fprintd's own `net.reactivated.Fprint.service` keeps full control of on-demand activation.
+- Stock vendor fingerprint stacks (`kde-fingerprint`, `gdm-fingerprint`, Fedora `fingerprint-auth`) call `pam_fprintd.so` unmodified, which resolves to the virtual device when the bridge is on — **no PAM lines needed for lock screens/greeters**
+- User-session lockers (e.g. KDE `kscreenlocker_worker`, which runs as the logged-in user) reach `tapauthd` over `/run/tapauthd/tapauthd.sock` and therefore need membership in `tapauthd-clients`; this is a manual, per-user opt-in (`sudo usermod -aG tapauthd-clients $USER`) — only `install.sh` adds the installing user, and a re-login is required for it to take effect
+- The **base** package deliberately declares **no `Conflicts: fprintd`**: `pam_fprintd.so` is shipped by fprintd itself and must stay installed for the stock stacks to load it.
+- The **optional** `tapauth-fprintd-emulation` package instead ships its *own* `pam_fprintd.so` (the `replace-fprintd-pam` build) and `Conflicts`/`Replaces`/`Provides` the distribution's fingerprint PAM provider — `libpam-fprintd` on Debian/Ubuntu, `fprintd-pam` on Fedora/RHEL, monolithic `fprintd` on Arch. It also ships the bridge marker `/usr/share/tapauth/fprintd-emulation.enabled` (so the D-Bus bridge defaults on for lock-screen discovery) and its scriptlets bounce `tapauthd` to re-evaluate the claim. It is strictly opt-in for machines without (or not wanting) a physical reader; the two providers of `pam_fprintd.so` can never coexist.
+- Enrollment is unsupported; `ListEnrolledFingers` returns a synthetic print so KDE's KCM displays one
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`
@@ -170,6 +194,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### Replay & DoS Protections
 - **Two replay checks**: nonce cache (primary, 120s TTL) + timestamp window (secondary, 60s).
+- **One-flight-per-user dedup (channel-aware, no priority/preemption)**: while a flight is active for a user — PAM duplicate within 1s of a PAM flight → immediate `Ignore` (password fall-through); PAM during a fprintd flight (any age) → `Ignore`; fprintd `VerifyStart` during any flight → immediate `verify-no-match` (no broadcast, no hang). After the flight ends, everything broadcasts fresh. **Outcomes are never mirrored/joined** (a latecomer must never ride another flight's grant). Stale flights purge after 300s.
 - **Pre-authentication DoS**: temporal IDs are pre-computed per 60s window into a hash set for O(1) checks before crypto.
 - **Post-authentication rate limiting**: escalating backoff (1s → 2s → 4s → max 5s) per Client public key.
 
@@ -195,7 +220,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
-- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
+- Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport), `enable_fprintd_bridge` (tri-state: unset/auto = on iff `/usr/share/tapauth/fprintd-emulation.enabled` exists, i.e. the optional emulation package is installed; `true`/`false` force it on/off. Applies at the next daemon restart). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
 
 ## Docker Dev Environment
 ```bash

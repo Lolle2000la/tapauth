@@ -9,6 +9,11 @@ SocketUser=root
 SocketGroup=tapauthd-clients
 SocketMode=0660
 DirectoryMode=0750
+# Create the runtime directory with tight permissions (replaces the packaged
+# /run/tapauthd entry and the tmpfiles.d rule); the ExecStartPost chgrp below
+# fixes the group afterwards
+RuntimeDirectory=tapauthd
+RuntimeDirectoryMode=0750
 RemoveOnStop=yes
 # Fix directory group ownership after creation
 ExecStartPost=/usr/bin/chgrp tapauthd-clients /run/tapauthd

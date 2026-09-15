@@ -1,0 +1,10 @@
+# Default systemd preset for TapAuth
+# Both units are enabled: tapauthd.service must run at boot because the
+# virtual fprintd bridge is enabled by default — lock screens and greeters
+# call pam_fprintd.so, which reaches tapauthd over D-Bus (net.reactivated.
+# Fprint), NOT over the IPC socket; socket activation alone would leave the
+# bridge dead until the first sudo/su/polkit authentication after a reboot.
+# tapauthd.socket stays enabled for lazy IPC activation (it is also pulled
+# in by the service via Requires=/Sockets=).
+enable tapauthd.socket
+enable tapauthd.service

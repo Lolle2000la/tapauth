@@ -261,6 +261,7 @@ pub async fn save_config(
     udp_port: u16,
     enable_ble: bool,
     enable_network: bool,
+    enable_fprintd_bridge: bool,
 ) -> Result<(), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::SaveConfig(
@@ -269,6 +270,7 @@ pub async fn save_config(
                 udp_port: udp_port as u32,
                 enable_ble: Some(enable_ble),
                 enable_network: Some(enable_network),
+                enable_fprintd_bridge: Some(enable_fprintd_bridge),
             },
         )),
     };
@@ -333,6 +335,8 @@ pub struct ClientConfigValues {
     pub enable_ble: bool,
     /// Whether the Local Network (UDP) transport may be used for authentication
     pub enable_network: bool,
+    /// Whether the virtual fprintd D-Bus bridge is enabled for desktop lock screen integration
+    pub enable_fprintd_bridge: bool,
 }
 
 pub async fn get_config() -> Result<ClientConfigValues, GuiIpcError> {
@@ -354,6 +358,7 @@ pub async fn get_config() -> Result<ClientConfigValues, GuiIpcError> {
             udp_port: resp.udp_port as u16,
             enable_ble: resp.enable_ble,
             enable_network: resp.enable_network,
+            enable_fprintd_bridge: resp.enable_fprintd_bridge,
         }),
         _ => Err(GuiIpcError::UnexpectedResponse),
     }

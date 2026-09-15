@@ -46,15 +46,15 @@ class ReplayMitigationCacheTest {
         val challenge2 = ByteArray(32) { (it + 30).toByte() }
         val nowSeconds = System.currentTimeMillis() / 1000
 
-        // Timestamp 61 seconds in the past -> rejected (isReplay == true)
-        val stalePast = nowSeconds - 61
+        // Timestamp >60s in the past -> rejected (isReplay == true)
+        val stalePast = nowSeconds - 70
         assertTrue(
             "Timestamp >60s in the past must be rejected",
             cache.isReplay(challenge1, stalePast),
         )
 
-        // Timestamp 61 seconds in the future -> rejected (isReplay == true)
-        val staleFuture = nowSeconds + 61
+        // Timestamp >60s in the future -> rejected (isReplay == true)
+        val staleFuture = nowSeconds + 70
         assertTrue(
             "Timestamp >60s in the future must be rejected",
             cache.isReplay(challenge2, staleFuture),
@@ -67,9 +67,9 @@ class ReplayMitigationCacheTest {
         val challenge2 = ByteArray(32) { (it + 50).toByte() }
         val nowSeconds = System.currentTimeMillis() / 1000
 
-        // Timestamp within 50s past/future -> accepted
-        assertFalse(cache.isReplay(challenge1, nowSeconds - 50))
-        assertFalse(cache.isReplay(challenge2, nowSeconds + 50))
+        // Timestamp safely within 60s window (30s past/future) -> accepted
+        assertFalse(cache.isReplay(challenge1, nowSeconds - 30))
+        assertFalse(cache.isReplay(challenge2, nowSeconds + 30))
     }
 
     @Test

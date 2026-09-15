@@ -1,0 +1,77 @@
+Source: tapauth
+Section: admin
+Priority: optional
+Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
+# NOTE: the Rust toolchain must be >= 1.85 (Cargo lockfile v4). Debian
+# stable archives (e.g. noble) ship older cargo/rustc; builds rely on
+# rustup (PATH via debian/rules) or a rust PPA (cargo-1.91/rustc-1.91
+# alternates below). Plain `apt-get build-dep` on stock noble is NOT
+# sufficient — see scripts/ci/build-debian-packages.sh.
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.85) | cargo-1.91, rustc (>= 1.85) | rustc-1.91, protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev, pkg-config
+Standards-Version: 4.7.0
+
+Package: tapauth
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd | policykit-1, adduser, libdbus-1-3, dbus
+Recommends: bluez, iptables
+Suggests: firewalld
+Description: Local smartphone-based authentication framework
+ A modern, privacy-preserving local-first authentication system.
+ .
+ pam_tapauth.so is wired into sudo, su and polkit-1 only; all other PAM
+ stacks (including fingerprint stacks such as kde-fingerprint,
+ gdm-fingerprint and fingerprint-auth) stay stock.
+ .
+ Desktop lock screens and greeters (KDE Plasma, GNOME) can integrate
+ through the built-in virtual fprintd D-Bus service
+ (net.reactivated.Fprint): stock fingerprint stacks call pam_fprintd.so,
+ which resolves to tapauthd. This base package deliberately does NOT
+ conflict with the real fprintd packages (fprintd, libpam-fprintd) and
+ does NOT ship a D-Bus activation file; tapauthd is a systemd-managed
+ daemon that owns the bus name while it runs (and restarts on failure),
+ so the virtual bridge needs no activation support from D-Bus. It ships
+ only the D-Bus policy file that lets tapauthd own the name.
+ .
+ The virtual bridge is opt-in. With enable_fprintd_bridge unset (the
+ default), it is enabled only when the optional tapauth-fprintd-emulation
+ package is installed (it ships the marker file
+ /usr/share/tapauth/fprintd-emulation.enabled); the base package ships no
+ marker, so a real local fingerprint reader is never shadowed by a base
+ install and real fprintd keeps the bus name. Set enable_fprintd_bridge
+ = true or = false in /etc/tapauth/config.toml to force the bridge on or
+ off explicitly (applies at the next daemon restart). The optional
+ tapauth-fprintd-emulation package replaces the fprintd PAM provider
+ (libpam-fprintd) with a TapAuth-built pam_fprintd.so and ships the
+ marker. No local fingerprint reader is required.
+
+Package: tapauth-fprintd-emulation
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, tapauth (= ${binary:Version})
+Conflicts: libpam-fprintd
+Replaces: libpam-fprintd
+Provides: libpam-fprintd
+Description: Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
+ This optional package ships a second build of the TapAuth PAM module,
+ installed as pam_fprintd.so, taking over the file normally provided by
+ the libpam-fprintd package.
+ .
+ It exists for the opt-in case where stock fingerprint PAM stacks must be
+ served by TapAuth instead of a real local fingerprint reader. It
+ Conflicts with, Replaces and Provides libpam-fprintd so the two providers
+ of pam_fprintd.so can never coexist; the fprintd daemon package itself is
+ deliberately NOT conflicted with.
+ .
+ It also ships the marker file /usr/share/tapauth/fprintd-emulation.enabled
+ which turns the daemon's tri-state enable_fprintd_bridge default into "on"
+ (the D-Bus name net.reactivated.Fprint is claimed at tapauthd startup), so
+ lock screens/greeters can discover the virtual fingerprint device. Its
+ maintainer scripts restart tapauthd so the claim/release takes effect
+ immediately. Installed but with enable_fprintd_bridge = false in
+ /etc/tapauth/config.toml, the marker is overridden and the bridge stays off.
+ .
+ The base tapauth package is unchanged: it ships no marker and no D-Bus
+ activation file, keeps shipping pam_tapauth.so, and keeps not conflicting
+ with fprintd or libpam-fprintd.
+ .
+ To go back to a real local fingerprint reader, remove this package and
+ reinstall libpam-fprintd (and fprintd).

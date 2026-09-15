@@ -1,0 +1,95 @@
+#!/usr/bin/make -f
+
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+CARGO_FEATURES ?=
+# Features for the second (opt-in) client-pam build installed as
+# pam_fprintd.so by the tapauth-fprintd-emulation package. It must NOT reuse
+# CARGO_FEATURES: those may be package-qualified workspace features
+# (e.g. tapauthd/dev-udp-loopback) that the client-pam package does not
+# define. The emulation build needs no extra feature.
+FPRINTD_EMULATION_CARGO_FEATURES := --features replace-fprintd-pam
+
+CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
+
+%:
+	dh $@
+
+# NOTE on dh_installsystemd (checked, deliberately unchanged): dh would
+# enable+start tapauthd.service on install. The shipped preset
+# (90-tapauthd.preset) enables BOTH units (lock screens and greeters reach
+# tapauthd over D-Bus, not the IPC socket; the bridge becomes live only at
+# daemon startup), so `enable` enables both; the install-time `start` is KEPT
+# on purpose so the daemon answers IPC immediately without waiting for a
+# reboot. tapauthd.service keeps its [Install] section and the default
+# dh_installsystemd behavior.
+
+override_dh_clean:
+	dh_clean -Xvendor/
+
+override_dh_auto_build:
+	$(CARGO) build --workspace --release $(if $(wildcard vendor),--offline --frozen,--locked) $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES))
+	# Second, opt-in build backing the tapauth-fprintd-emulation package. It
+	# is installed as pam_fprintd.so and deliberately uses a separate target
+	# dir (target/fprintd-emulation) so it can never clobber the base
+	# artifact target/release/libclient_pam.so, which is installed as
+	# pam_tapauth.so. Only replace-fprintd-pam is enabled here; the workspace
+	# CARGO_FEATURES are daemon/package-qualified and not valid for client-pam.
+	$(CARGO) build -p client-pam --release $(if $(wildcard vendor),--offline --frozen,--locked) $(FPRINTD_EMULATION_CARGO_FEATURES) --target-dir target/fprintd-emulation
+
+override_dh_auto_install:
+	mkdir -p debian/tapauth/usr/bin
+	mkdir -p debian/tapauth/lib/$(DEB_HOST_MULTIARCH)/security
+	mkdir -p debian/tapauth/lib/systemd/system
+	mkdir -p debian/tapauth/usr/lib/sysusers.d
+	mkdir -p debian/tapauth/usr/lib/tmpfiles.d
+	mkdir -p debian/tapauth/usr/share/applications
+	mkdir -p debian/tapauth/usr/share/icons/hicolor/scalable/apps
+	mkdir -p debian/tapauth/usr/share/polkit-1/actions
+	mkdir -p debian/tapauth/usr/share/polkit-1/rules.d
+	mkdir -p debian/tapauth/usr/share/doc/tapauth/examples
+	cp config.toml.example debian/tapauth/usr/share/doc/tapauth/examples/config.toml.example
+	mkdir -p debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d
+	cp systemd/polkit-agent-helper@.service.d/tapauth.conf debian/tapauth/lib/systemd/system/polkit-agent-helper@.service.d/
+	cp target/release/tapauthd debian/tapauth/usr/bin/
+	cp target/release/tapauth-config debian/tapauth/usr/bin/
+	cp target/release/libclient_pam.so debian/tapauth/lib/$(DEB_HOST_MULTIARCH)/security/pam_tapauth.so
+	cp systemd/tapauthd.service debian/tapauth/lib/systemd/system/
+	cp systemd/tapauthd.socket debian/tapauth/lib/systemd/system/
+	cp packaging/sysusers.conf debian/tapauth/usr/lib/sysusers.d/tapauth.conf
+	cp packaging/tmpfiles.conf debian/tapauth/usr/lib/tmpfiles.d/tapauth.conf
+	cp client-config-gui/tapauth-config.desktop debian/tapauth/usr/share/applications/
+	cp client-config-gui/assets/tapauth-config.svg debian/tapauth/usr/share/icons/hicolor/scalable/apps/
+	cp tapauthd/dev.rourunisen.tapauth.config.admin.policy debian/tapauth/usr/share/polkit-1/actions/
+	mkdir -p debian/tapauth/lib/systemd/system-preset
+	cp packaging/90-tapauthd.preset debian/tapauth/lib/systemd/system-preset/90-tapauthd.preset
+	cp packaging/50-tapauthd.rules debian/tapauth/usr/share/polkit-1/rules.d/
+
+	if [ "$$(dpkg-parsechangelog -S Distribution 2>/dev/null)" = "jammy" ] && [ -f packaging/tapauthd.pkla ]; then \
+		mkdir -p debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d; \
+		cp packaging/tapauthd.pkla debian/tapauth/var/lib/polkit-1/localauthority/10-vendor.d/; \
+	fi
+	
+	# Virtual fprintd D-Bus bridge: the base package ships only the policy
+	# file (functionally required so tapauthd may own the bus name when the
+	# bridge is enabled). No D-Bus activation file is shipped: dbus-daemon and
+	# dbus-broker only activate files named exactly after the bus name, so a
+	# renamed TapAuth file is inert, and real fprintd's own
+	# net.reactivated.Fprint.service keeps full control of on-demand
+	# activation. tapauthd's availability comes from systemd, not activation.
+	# The bridge itself is opt-in: it is enabled when enable_fprintd_bridge is
+	# true, or (unset) when the optional tapauth-fprintd-emulation package has
+	# installed its marker file. This base package ships no marker.
+	mkdir -p debian/tapauth/usr/share/dbus-1/system.d
+	cp packaging/net.reactivated.Fprint.tapauth.conf debian/tapauth/usr/share/dbus-1/system.d/
+
+	# tapauth-fprintd-emulation: the second client-pam build from
+	# target/fprintd-emulation, installed under fprintd's module name, plus
+	# the marker file that makes the daemon's tri-state enable_fprintd_bridge
+	# default to "on" (so lock screens/greeters can discover the virtual
+	# net.reactivated.Fprint D-Bus device). Staged directly into the package
+	# directory (same convention as the base package above); the base staging
+	# is intentionally untouched.
+	mkdir -p debian/tapauth-fprintd-emulation/lib/$(DEB_HOST_MULTIARCH)/security
+	cp target/fprintd-emulation/release/libclient_pam.so debian/tapauth-fprintd-emulation/lib/$(DEB_HOST_MULTIARCH)/security/pam_fprintd.so
+	install -Dm0644 /dev/null debian/tapauth-fprintd-emulation/usr/share/tapauth/fprintd-emulation.enabled
