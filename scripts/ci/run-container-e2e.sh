@@ -38,7 +38,7 @@ case "$DISTRO" in
 
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
-        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils
+        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
 
         echo "==> Building standalone pamtester..."
         gcc -o /usr/bin/pamtester "$WORKSPACE_DIR/scripts/ci/pamtester.c" -lpam -lpam_misc

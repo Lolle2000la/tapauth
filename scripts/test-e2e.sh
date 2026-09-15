@@ -197,7 +197,7 @@ cleanup() {
     fi
     if [ "$EXIT_CODE" -ne 0 ]; then
         echo "=== ANDROID LOGCAT DUMP ==="
-        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* 2>/dev/null || true
+        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* AuthActionReceiver:* TemporalIdCache:* 2>/dev/null || true
         echo "==========================="
     fi
     if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
@@ -1529,15 +1529,35 @@ fprintd_emu_run_pamtester() {
 }
 
 # Starts pamtester in the background, waits until the daemon has begun
-# broadcasting for `pam_user`, fires the given emulator-bio-helper action
-# (grant/deny), then waits for pamtester. $1 action, $2 run-as (empty=root),
-# $3 PAM username, $4 timeout seconds, $5 log file, $6 label, $7 optional
-# service name. Returns pamtester's exit code, or 1 if the client never
-# reached the daemon (the failure is dumped to the log before returning).
+# broadcasting for `pam_user`, waits (bounded) for the Android app to register
+# the pending request, fires the given emulator-bio-helper action (grant/deny),
+# then waits for pamtester.
+#
+# The daemon logs "server(s) authorized" when it *sends* the broadcast, but the
+# phone can register the request noticeably later: across a 60s temporal-ID
+# window boundary the emulator (whose clock lags the container) silently drops
+# the first packets and only accepts them after retransmission. The dev
+# grant/deny receiver acts only on requests that are already pending (and never
+# retries), so acting at the instant the daemon logs races the registration.
+# This helper therefore polls the app's logcat for "Submitted auth request"
+# (emitted by AuthRequestManager right after the request is stored in its
+# pending map) before acting, and additionally re-fires the idempotent `grant`
+# action until the client exits so a late registration still lands. `deny`
+# stays one-shot: the helper also sends KEYCODE_BACK/finger touches, which must
+# not be re-issued, and the logcat wait above already guarantees a pending
+# request to deny.
+#
+# $1 action, $2 run-as (empty=root), $3 PAM username, $4 timeout seconds, $5 log
+# file, $6 label, $7 optional service name. Returns pamtester's exit code, or 1
+# if the client never reached the daemon (the failure is dumped to the log
+# before returning).
 fprintd_emu_auth_with_action() {
     local action="$1" run_as="$2" pam_user="$3" tmo="$4" log="$5" label="$6" svc="${7:-$FPRINTD_EMU_SERVICE}"
-    local base pid rc
+    local base pid rc logcat_base android_ready=0 deadline action_deadline
     base=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+    # Snapshot the Android logcat offset before the client runs so only a
+    # registration caused by this request can satisfy the wait below.
+    logcat_base=$( { adb logcat -d 2>/dev/null || true; } | wc -l )
     if [ -n "$run_as" ]; then
         timeout -k 5 "$tmo" \
             runuser -u "$run_as" -- env TAPAUTH_LOG_LEVEL=debug \
@@ -1573,7 +1593,49 @@ fprintd_emu_auth_with_action() {
         wait "$pid" 2>/dev/null || true
         return 1
     fi
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" "$action" "$APP_PKG"
+    # Bounded wait for the app to store this request in its pending map. The
+    # loop also stops early if the client exits, and never outlives its timeout.
+    deadline=$((SECONDS + 6))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        # grep -c (not -q) drains the stream, so this probe is safe even if the
+        # script is ever run with `set -o pipefail`: no command gets SIGPIPE.
+        if [ "$(adb logcat -d 2>/dev/null | tail -n +"$((logcat_base + 1))" \
+            | grep -c "Submitted auth request" || true)" -gt 0 ]; then
+            android_ready=1
+            break
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$android_ready" = "1" ]; then
+        echo "    Android app registered the pending request before '${action}'."
+    else
+        echo "    ⚠️  Did not observe 'Submitted auth request' within 6s; relying on bounded '${action}' handling."
+    fi
+    if [ "$action" = "grant" ]; then
+        # `grant` only signs/approves pending requests and is idempotent, so
+        # re-fire it until pamtester exits (bounded by the client's own timeout
+        # plus its kill grace) to cover a registration that lands after the
+        # logcat wait. The loop always fires once and can never outlive the
+        # phase budget.
+        action_deadline=$((SECONDS + tmo + 5))
+        while :; do
+            "$SCRIPT_DIR/ci/emulator-bio-helper.sh" "$action" "$APP_PKG"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            if [ "$SECONDS" -ge "$action_deadline" ]; then
+                break
+            fi
+            sleep 0.7
+        done
+    else
+        # `deny` stays one-shot (see the header comment). The bounded logcat
+        # wait above already guarantees the request is pending when it lands.
+        "$SCRIPT_DIR/ci/emulator-bio-helper.sh" "$action" "$APP_PKG"
+    fi
     set +e
     wait_pid_with_timeout "$pid" "$((tmo + 5))"
     rc=$?
