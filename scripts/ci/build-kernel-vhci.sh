@@ -58,9 +58,34 @@ BASE="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$SRCPKG/$SRCVER
 ORIG="${SRCPKG}_${UPSTREAM}.orig.tar.gz"
 DIFF="${SRCPKG}_${SRCVER}.diff.gz"
 
-echo "    Downloading $ORIG and $DIFF from Launchpad..."
-wget -q "$BASE/$ORIG"
-wget -q "$BASE/$DIFF"
+# Bound the download. wget's defaults are ~20 tries with a ~15 min read
+# timeout, so a stalled Launchpad transfer can hang this step for many
+# minutes (observed >19 min). Cap per-connection stalls, retry a few times,
+# and resume partial files. A slower-but-steadier Ubuntu archive mirror is
+# only tried if Launchpad fails outright (a 404/5xx fails fast; this does
+# not slow the normal path).
+WGET_ARGS=(--quiet --continue --connect-timeout=20 --read-timeout=60 --tries=3 --waitretry=5)
+POOL_DIR=$(apt-cache show "$HDRS" 2>/dev/null | sed -n 's/^Filename: \(pool\/[^ ]*\)\/[^/]*$/\1/p' | head -1 || true)
+ARCHIVE_BASE="https://archive.ubuntu.com/ubuntu"
+
+fetch_source() {
+    local name="$1"
+    echo "    Fetching $name..."
+    if wget "${WGET_ARGS[@]}" "$BASE/$name"; then
+        return 0
+    fi
+    if [ -n "$POOL_DIR" ]; then
+        echo "    Launchpad fetch failed; retrying $name from the Ubuntu archive mirror..."
+        if wget "${WGET_ARGS[@]}" "$ARCHIVE_BASE/$POOL_DIR/$name"; then
+            return 0
+        fi
+    fi
+    echo "❌ ERROR: Could not download $name (Launchpad and archive mirror both failed)."
+    return 1
+}
+
+fetch_source "$ORIG"
+fetch_source "$DIFF"
 
 TOPDIR=$(tar tzf "$ORIG" 2>/dev/null | head -1 | cut -d/ -f1 || true)
 if [ -z "$TOPDIR" ]; then
