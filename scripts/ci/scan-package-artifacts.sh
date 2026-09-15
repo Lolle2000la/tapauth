@@ -58,10 +58,11 @@ case "$PKG_TYPE" in
         ;;
 esac
 
+# Shipped binaries only: tapauth-ipc-cli is a testing-only admin tool and is
+# deliberately not shipped by any distro package, so it is not scanned here.
 BINARIES=(
     "usr/bin/tapauthd"
     "usr/bin/tapauth-config"
-    "usr/bin/tapauth-ipc-cli"
 )
 
 # Find pam_tapauth.so across multiarch or standard security dirs

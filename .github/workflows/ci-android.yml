@@ -373,6 +373,12 @@ jobs:
       - name: Setup Virtual Bluetooth Kernel Module (hci_vhci fail-fast)
         run: ./scripts/ci/build-kernel-vhci.sh
 
+      # tapauth-ipc-cli is a testing-only admin tool that the distro packages
+      # deliberately do not ship; the E2E harness builds it from the workspace
+      # (see scripts/ci/run-all-e2e.sh).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Download Android APKs
         uses: actions/download-artifact@v7
         with:
@@ -409,7 +415,7 @@ jobs:
           sudo apt-get install -y \
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
-            libdbus-1-dev pkg-config \
+            libdbus-1-dev pkg-config protobuf-compiler \
             policykit-1 qrencode
           python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
             || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
@@ -422,7 +428,10 @@ jobs:
           id tapauthd
           getent group tapauthd-clients
           systemctl is-enabled tapauthd.socket
-          ls -la /lib/x86_64-linux-gnu/security/pam_tapauth.so /usr/bin/tapauthd /usr/bin/tapauth-ipc-cli
+          ls -la /lib/x86_64-linux-gnu/security/pam_tapauth.so /usr/bin/tapauthd
+          # tapauth-ipc-cli is a testing-only admin tool: the distro package must
+          # NOT ship it (the E2E harness builds it from the workspace instead).
+          test ! -e /usr/bin/tapauth-ipc-cli
 
       - name: Free disk space & Pre-pull Distro Images for Fast E2E
         run: |

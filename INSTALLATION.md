@@ -584,7 +584,7 @@ The install script adds TapAuth as a `sufficient` module, which means:
 
 ### What Gets Removed
 
-- **Default**: All binaries (`tapauthd`, `tapauth-config`, `tapauth-ipc-cli`, `pam_tapauth.so`), systemd units/sockets, the D-Bus policy file, and all PAM configuration entries (all `pam_tapauth.so` references are automatically stripped to prevent system lockouts).
+- **Default**: All shipped binaries (`tapauthd`, `tapauth-config`, `pam_tapauth.so`), systemd units/sockets, the D-Bus policy file, and all PAM configuration entries (all `pam_tapauth.so` references are automatically stripped to prevent system lockouts). Note: `tapauth-ipc-cli` is a testing-only admin tool, is not installed by `install.sh` or any distro package, and is left untouched.
 - **Optional (`--purge` / `--remove-user-data`)**: User pairing keys and device pairings in `/var/lib/tapauth/`.
 
 ### What Gets Preserved

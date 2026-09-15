@@ -339,11 +339,18 @@ fi
 if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
     echo "==> Step 1: Using pre-installed distro packages for E2E tests..."
     TAPAUTHD_BIN="/usr/bin/tapauthd"
-    CLI_BIN="$(command -v tapauth-ipc-cli || true)"
-    if [ -z "$CLI_BIN" ] && [ -x /usr/bin/tapauth-ipc-cli ]; then
-        CLI_BIN="/usr/bin/tapauth-ipc-cli"
-    elif [ -z "$CLI_BIN" ] && [ -x /usr/local/bin/tapauth-ipc-cli ]; then
-        CLI_BIN="/usr/local/bin/tapauth-ipc-cli"
+
+    # tapauth-ipc-cli is a testing-only admin harness and is deliberately NOT
+    # shipped by the distro packages, so it is resolved from the workspace
+    # instead of the installed payload. In installed-package mode the daemon
+    # always listens on the production socket path, which the CLI's default
+    # (non-dev) build already targets, so no dev feature is required. The CI
+    # E2E containers have no Rust toolchain and reuse the binary the host built
+    # through the bind-mounted workspace target dir (see run-all-e2e.sh).
+    export CARGO_TARGET_DIR="${PROJECT_ROOT}/target"
+    CLI_BIN="${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli"
+    if [ ! -x "$CLI_BIN" ] && command -v cargo >/dev/null 2>&1; then
+        cargo build -p tapauthd --bin tapauth-ipc-cli
     fi
 
     PAM_LIB=""
@@ -366,11 +373,14 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
         exit 1
     fi
     if [ ! -x "$CLI_BIN" ]; then
-        echo "❌ ERROR: tapauth-ipc-cli binary not found"
+        echo "❌ ERROR: tapauth-ipc-cli not found at $CLI_BIN"
+        echo "   It is a testing-only tool and is not shipped by the distro packages."
+        echo "   Build it from the workspace with:"
+        echo "   cargo build -p tapauthd --bin tapauth-ipc-cli"
         exit 1
     fi
     echo "    Found installed tapauthd:       $TAPAUTHD_BIN"
-    echo "    Found installed tapauth-ipc-cli: $CLI_BIN"
+    echo "    Using workspace-built CLI:      $CLI_BIN"
     echo "    Found installed pam_tapauth.so:  $PAM_LIB"
 
     # Capability probe: detect whether the installed daemon contains dev-mode shims

@@ -141,9 +141,10 @@ mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
 # (the install section runs in the source dir; the cargo target dir mirrors the build one)
+# NOTE: tapauth-ipc-cli is a testing-only admin tool and is deliberately NOT
+# installed/shipped here. It is built from the workspace by the E2E harness.
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauthd" %{buildroot}%{_bindir}/tapauthd
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
-install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-ipc-cli" %{buildroot}%{_bindir}/tapauth-ipc-cli
 install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 # fprintd-emulation subpackage: the second (opt-in) client-pam build,
@@ -462,7 +463,6 @@ fi
 # units (RuntimeDirectory= / LogsDirectory=), not packaged.
 %{_bindir}/tapauthd
 %{_bindir}/tapauth-config
-%{_bindir}/tapauth-ipc-cli
 %{_libdir}/security/pam_tapauth.so
 %{_unitdir}/tapauthd.service
 %{_unitdir}/tapauthd.socket

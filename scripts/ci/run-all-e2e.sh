@@ -32,6 +32,14 @@ if grep -q "FAILURES!!!" /tmp/jni-test.log || ! grep -q "OK (" /tmp/jni-test.log
 fi
 echo "✅ JNI Crypto Instrumentation Tests Passed!"
 
+# Build tapauth-ipc-cli from the workspace: it is a testing-only admin tool
+# that the distro packages deliberately do not ship. Installed-package mode
+# always uses the production socket path, so the default (non-dev) build is
+# sufficient. The containers below have no Rust toolchain and reuse this binary
+# through the bind-mounted /workspace/target directory.
+export CARGO_TARGET_DIR="$WORKSPACE_DIR/target"
+cargo build -p tapauthd --bin tapauth-ipc-cli
+
 # 2. Run E2E against installed Ubuntu (.deb) package on host
 echo "=================================================="
 echo " [1/3] Running E2E against installed Ubuntu (.deb) package"

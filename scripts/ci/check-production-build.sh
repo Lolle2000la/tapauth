@@ -79,11 +79,14 @@ check_artifact() {
 
 echo "==> Checking debug artifacts"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauthd" "${DEV_VARS_DAEMON[@]}"
+# tapauth-ipc-cli is a testing-only admin tool, deliberately NOT shipped by the
+# distro packages; it is built here anyway and scanned so no dev override can
+# leak into a workspace/test binary either.
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-config" "${DEV_VARS_CLIENT[@]}"
 
-echo "==> Checking release artifacts (shipping binaries)"
+echo "==> Checking release artifacts (shipping binaries + the test-only IPC CLI)"
 check_artifact "${CARGO_TARGET_DIR}/release/tapauthd" "${DEV_VARS_DAEMON[@]}"
 check_artifact "${CARGO_TARGET_DIR}/release/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/release/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
