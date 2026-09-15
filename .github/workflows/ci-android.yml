@@ -77,13 +77,14 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          # Upstream workaround: cmdline-tools 20.0 (the action's new default)
-          # made the action's built-in license acceptance fail with
-          # "sdkmanager ... failed with exit code 1". Accept licenses below.
-          accept-android-sdk-licenses: false
-
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # Pin the cmdline-tools version. The action's new default (20.0,
+          # build 14742923) no longer resolves the legacy 'tools' package and
+          # breaks the action's license step; 12.0 (11076708) is the
+          # preinstalled version this workflow used before the default changed.
+          cmdline-tools-version: 11076708
+          # The legacy 'tools' package is no longer resolvable; modern builds
+          # only need platform-tools.
+          packages: 'platform-tools'
 
       - name: Install Android NDK
         run: |
@@ -438,13 +439,14 @@ jobs:
       - name: Setup Android SDK (platform-tools / adb)
         uses: android-actions/setup-android@v4
         with:
-          # Upstream workaround: cmdline-tools 20.0 (the action's new default)
-          # made the action's built-in license acceptance fail with
-          # "sdkmanager ... failed with exit code 1". Accept licenses below.
-          accept-android-sdk-licenses: false
-
-      - name: Accept Android SDK licenses (platform-tools / adb)
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # Pin the cmdline-tools version. The action's new default (20.0,
+          # build 14742923) no longer resolves the legacy 'tools' package and
+          # breaks the action's license step; 12.0 (11076708) is the
+          # preinstalled version this workflow used before the default changed.
+          cmdline-tools-version: 11076708
+          # The legacy 'tools' package is no longer resolvable; modern builds
+          # only need platform-tools.
+          packages: 'platform-tools'
 
       - name: Enable KVM (for Android Emulator)
         run: |
