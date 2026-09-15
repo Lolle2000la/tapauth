@@ -116,6 +116,27 @@ else
     CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
 fi
 
+# ── Optional fprintd-emulation phase (Phase 2j) ───────────────────────────────
+# Enabled by scripts/ci/run-container-e2e.sh after it installs the optional
+# tapauth-fprintd-emulation package (a second client-pam build installed as
+# pam_fprintd.so). The phase proves the real phone-auth path
+# `pam_fprintd.so -> Unix socket -> tapauthd`, including the socket-permission
+# gate that silently falls non-root callers back to password.
+#
+# The service name deliberately ends in `-fingerprint`: the emulation build only
+# takes its fingerprint-specific (TTY-less, full-timeout) branch for the vendor
+# fingerprint service names, so a plain name would exercise the generic path.
+FPRINTD_EMU_ENABLED="${TAPAUTH_E2E_FPRINTD_EMULATION:-0}"
+FPRINTD_EMU_SERVICE="tapauth-emulation-fingerprint"
+FPRINTD_EMU_PAM_PATH="/etc/pam.d/${FPRINTD_EMU_SERVICE}"
+FPRINTD_EMU_SOCK="${TAPAUTHD_SOCK:-/run/tapauthd/tapauthd.sock}"
+FPRINTD_EMU_MEMBER_USER="tapauth-e2e-fprintd-member"
+FPRINTD_EMU_OUTSIDER_USER="tapauth-e2e-fprintd-outsider"
+FPRINTD_EMU_CREATED_USERS=()
+FPRINTD_EMU_MEMBER_GROUP_ADDED=0
+FPRINTD_EMU_SOCK_ORIG_GROUP=""
+FPRINTD_EMU_OK=0
+
 # Detect test username (matches caller UID for daemon IPC authorization)
 TEST_USER="$(whoami)"
 
@@ -197,6 +218,9 @@ cleanup() {
         wait "$CAPTURE_PID" 2>/dev/null || true
     fi
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant 2>/dev/null || true
+    # Phase 2j (and Phase 2i) can leave the e2e app's auto-approve fallback
+    # suppressed; always restore it so a later phase never hangs.
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" restore-auto-approve "${APP_PKG:-dev.rourunisen.tapauth.e2e}" 2>/dev/null || true
     if [ "${E2E_KEEP_BLE_BRIDGE:-0}" != "1" ]; then
         if [ -f /tmp/bumble-bridge.pid ]; then
             kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
@@ -244,6 +268,20 @@ cleanup() {
     if [ -w "$PAM_MIXED_CONFIG_PATH" ]; then
         rm -f "$PAM_MIXED_CONFIG_PATH" 2>/dev/null || true
     fi
+    # Phase 2j: never leave the optional fprintd-emulation PAM service, the
+    # probe users, or an adjusted socket group behind.
+    if [ -n "${FPRINTD_EMU_PAM_PATH:-}" ] && [ -w "$FPRINTD_EMU_PAM_PATH" ]; then
+        rm -f "$FPRINTD_EMU_PAM_PATH" 2>/dev/null || true
+    fi
+    if [ -n "${FPRINTD_EMU_SOCK_ORIG_GROUP:-}" ] && [ -n "${FPRINTD_EMU_SOCK:-}" ] && [ -S "$FPRINTD_EMU_SOCK" ]; then
+        chgrp "$FPRINTD_EMU_SOCK_ORIG_GROUP" "$FPRINTD_EMU_SOCK" 2>/dev/null || true
+    fi
+    if [ "${FPRINTD_EMU_MEMBER_GROUP_ADDED:-0}" = "1" ] && getent group tapauthd-clients >/dev/null 2>&1; then
+        gpasswd -d "$FPRINTD_EMU_MEMBER_USER" tapauthd-clients >/dev/null 2>&1 || true
+    fi
+    for _fprintd_emu_user in ${FPRINTD_EMU_CREATED_USERS[@]+"${FPRINTD_EMU_CREATED_USERS[@]}"}; do
+        userdel -r "$_fprintd_emu_user" >/dev/null 2>&1 || true
+    done
     if id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
         passwd -l "$PAM_FALLBACK_USER" >/dev/null 2>&1 || true
         userdel -r "$PAM_FALLBACK_USER" >/dev/null 2>&1 || true
@@ -1349,6 +1387,284 @@ else
     echo "ℹ️  SKIPPED (dbus-send not found)."
 fi
 
+# Step 6j: Phase 2j - Optional fprintd-emulation PAM module (pam_fprintd.so)
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  PHASE 2j: fprintd-emulation pam_fprintd.so (phone auth)      ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+
+# Resolve the installed pam_fprintd.so across the distro security-module
+# layouts (mirrors the pam_tapauth.so probe in Step 1).
+resolve_pam_fprintd_module() {
+    local candidate
+    for candidate in \
+        "/lib/x86_64-linux-gnu/security/pam_fprintd.so" \
+        "/usr/lib/x86_64-linux-gnu/security/pam_fprintd.so" \
+        "/usr/lib/security/pam_fprintd.so" \
+        "/lib/security/pam_fprintd.so" \
+        "/usr/lib64/security/pam_fprintd.so" \
+        "/lib64/security/pam_fprintd.so"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The replace-fprintd-pam build embeds the production IPC socket path; the
+# stock fprintd PAM module does not. Used to confirm the ACTIVE pam_fprintd.so
+# really is the TapAuth emulation build.
+fprintd_module_is_tapauth() {
+    grep -aq '/run/tapauthd/tapauthd.sock' "$1" 2>/dev/null
+}
+
+# Best-effort package-ownership lookup for diagnostics only.
+fprintd_module_owner() {
+    local so="$1"
+    if command -v rpm >/dev/null 2>&1 && rpm -q tapauth-fprintd-emulation >/dev/null 2>&1; then
+        rpm -qf "$so" 2>/dev/null || true
+    elif command -v dpkg >/dev/null 2>&1 && dpkg -s tapauth-fprintd-emulation >/dev/null 2>&1; then
+        dpkg -S "$so" 2>/dev/null | cut -d: -f1 || true
+    elif command -v pacman >/dev/null 2>&1 && pacman -Qq tapauth-fprintd-emulation >/dev/null 2>&1; then
+        pacman -Qo "$so" 2>/dev/null | awk '{print $5}' || true
+    fi
+}
+
+# Runs pamtester for a given PAM service under a hard timeout.
+# $1 run-as user (empty = current/root caller), $2 PAM username, $3 timeout
+# seconds, $4 log file, $5 optional service name. Returns pamtester's (or
+# timeout's) exit code; always captures output to $4.
+fprintd_emu_run_pamtester() {
+    local run_as="$1" pam_user="$2" tmo="$3" log="$4" svc="${5:-$FPRINTD_EMU_SERVICE}" rc
+    set +e
+    if [ -n "$run_as" ]; then
+        timeout -k 5 "$tmo" \
+            runuser -u "$run_as" -- env TAPAUTH_LOG_LEVEL=debug \
+            pamtester "$svc" "$pam_user" authenticate \
+            < <(sleep "$tmo") > "$log" 2>&1
+    else
+        timeout -k 5 "$tmo" \
+            env TAPAUTH_LOG_LEVEL=debug \
+            pamtester "$svc" "$pam_user" authenticate \
+            < <(sleep "$tmo") > "$log" 2>&1
+    fi
+    rc=$?
+    set -e
+    return "$rc"
+}
+
+# Starts pamtester in the background, waits until the daemon has begun
+# broadcasting for `pam_user`, fires the given emulator-bio-helper action
+# (grant/deny), then waits for pamtester. $1 action, $2 run-as (empty=root),
+# $3 PAM username, $4 timeout seconds, $5 log file, $6 label, $7 optional
+# service name. Returns pamtester's exit code.
+fprintd_emu_auth_with_action() {
+    local action="$1" run_as="$2" pam_user="$3" tmo="$4" log="$5" label="$6" svc="${7:-$FPRINTD_EMU_SERVICE}"
+    local base pid rc
+    base=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+    if [ -n "$run_as" ]; then
+        timeout -k 5 "$tmo" \
+            runuser -u "$run_as" -- env TAPAUTH_LOG_LEVEL=debug \
+            pamtester "$svc" "$pam_user" authenticate \
+            < <(sleep "$tmo") > "$log" 2>&1 &
+    else
+        timeout -k 5 "$tmo" \
+            env TAPAUTH_LOG_LEVEL=debug \
+            pamtester "$svc" "$pam_user" authenticate \
+            < <(sleep "$tmo") > "$log" 2>&1 &
+    fi
+    pid=$!
+    # Wait for the daemon to actually broadcast (deterministic, unlike a sleep).
+    wait_for_log_line "$base" "server(s) authorized for user $pam_user" 200 \
+        "fprintd emulation ${label}: daemon broadcast"
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" "$action" "$APP_PKG"
+    set +e
+    wait_pid_with_timeout "$pid" "$((tmo + 5))"
+    rc=$?
+    set -e
+    cat "$log"
+    return "$rc"
+}
+
+FPRINTD_EMU_TESTABLE=0
+if [ "$FPRINTD_EMU_ENABLED" != "1" ]; then
+    echo "ℹ️  SKIPPED (TAPAUTH_E2E_FPRINTD_EMULATION != 1; the optional emulation package is not installed by this run)."
+elif [ "$(id -u)" -ne 0 ]; then
+    echo "ℹ️  SKIPPED (root is required to create PAM services/users and switch users)."
+elif ! command -v pamtester >/dev/null 2>&1; then
+    echo "ℹ️  SKIPPED (pamtester not installed)."
+elif [ ! -w /etc/pam.d ]; then
+    echo "ℹ️  SKIPPED (/etc/pam.d is not writable)."
+elif [ ! -S "$FPRINTD_EMU_SOCK" ]; then
+    echo "ℹ️  SKIPPED (no IPC socket at $FPRINTD_EMU_SOCK)."
+elif [ "$FPRINTD_EMU_SOCK" != "/run/tapauthd/tapauthd.sock" ]; then
+    echo "ℹ️  SKIPPED (the emulation module always talks to the production socket; this run redirects it to $FPRINTD_EMU_SOCK)."
+else
+    FPRINTD_EMU_MODULE="$(resolve_pam_fprintd_module || true)"
+    if [ -z "$FPRINTD_EMU_MODULE" ]; then
+        echo "ℹ️  SKIPPED (no pam_fprintd.so installed; tapauth-fprintd-emulation is absent)."
+    elif ! fprintd_module_is_tapauth "$FPRINTD_EMU_MODULE"; then
+        echo "ℹ️  SKIPPED ($FPRINTD_EMU_MODULE is not the TapAuth emulation build)."
+    else
+        FPRINTD_EMU_TESTABLE=1
+    fi
+fi
+
+if [ "$FPRINTD_EMU_TESTABLE" = "1" ]; then
+    echo "==> Active pam_fprintd.so: $FPRINTD_EMU_MODULE"
+    echo "    Package owner:        $(fprintd_module_owner "$FPRINTD_EMU_MODULE")"
+    echo "    IPC socket:           $FPRINTD_EMU_SOCK ($(stat -c '%a %U %G' "$FPRINTD_EMU_SOCK" 2>/dev/null || echo missing))"
+
+    # Model the production socket gate (root:tapauthd-clients 0660). systemd
+    # socket activation creates it that way; the fallback-socket dev daemon
+    # binds with its own primary group (tapauthd), so align the group here so
+    # non-root access is exercised exactly as in production.
+    FPRINTD_EMU_SOCK_ORIG_GROUP="$(stat -c '%G' "$FPRINTD_EMU_SOCK" 2>/dev/null || true)"
+    if [ "$FPRINTD_EMU_SOCK_ORIG_GROUP" != "tapauthd-clients" ] && getent group tapauthd-clients >/dev/null 2>&1; then
+        echo "==> Aligning socket group to 'tapauthd-clients' (production gate; was '$FPRINTD_EMU_SOCK_ORIG_GROUP')..."
+        chgrp tapauthd-clients "$FPRINTD_EMU_SOCK" 2>/dev/null || true
+        chmod 0660 "$FPRINTD_EMU_SOCK" 2>/dev/null || true
+    fi
+
+    # Deterministic dedicated stack (same jump idiom as Phase 2e/6b):
+    #   grant               -> module SUCCESS jumps over pam_deny to pam_permit (exit 0)
+    #   ignore/deny/timeout -> default=ignore falls through to pam_deny (exit != 0)
+    printf 'auth [success=1 default=ignore] pam_fprintd.so\nauth required pam_deny.so\nauth required pam_permit.so\naccount required pam_permit.so\n' > "$FPRINTD_EMU_PAM_PATH"
+
+    "$CLI_BIN" set-transports --ble false --network true >/dev/null 2>&1 || true
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" suppress-auto-approve "$APP_PKG"
+    settle_for_dedup "Phase 2h" 3
+
+    # 2j-1: root caller, phone grants -> PAM_SUCCESS
+    echo "==> Phase 2j-1: root caller + phone grant must authenticate..."
+    if fprintd_emu_auth_with_action grant "" "$TEST_USER" 40 "${TEST_DIR}/fprintd-emu-grant.log" "root grant"; then
+        echo "✅ pam_fprintd.so -> socket -> tapauthd -> phone grant authenticated."
+    else
+        echo "❌ ERROR: fprintd-emulation grant did not authenticate."
+        exit 1
+    fi
+    settle_for_dedup "Phase 2j-1" 2
+
+    # 2j-2: root caller, phone denies -> non-success (falls through to pam_deny)
+    echo "==> Phase 2j-2: root caller + phone denial must NOT authenticate..."
+    if fprintd_emu_auth_with_action deny "" "$TEST_USER" 40 "${TEST_DIR}/fprintd-emu-deny.log" "root deny"; then
+        echo "❌ ERROR: a denied request authenticated (exit 0)."
+        exit 1
+    else
+        echo "✅ Denial returned non-success; the stack fell through to pam_deny."
+    fi
+    settle_for_dedup "Phase 2j-2" 2
+
+    # Probe users for the socket-permission gate. Create them only if absent and
+    # remember exactly what we changed so cleanup never leaves the system modified.
+    FPRINTD_EMU_NONROOT_READY=0
+    if ! getent group tapauthd-clients >/dev/null 2>&1; then
+        echo "⚠️  Non-root socket cases skipped: group 'tapauthd-clients' does not exist."
+    else
+        for _fprintd_emu_user in "$FPRINTD_EMU_MEMBER_USER" "$FPRINTD_EMU_OUTSIDER_USER"; do
+            if ! id "$_fprintd_emu_user" >/dev/null 2>&1; then
+                if useradd -m "$_fprintd_emu_user" >/dev/null 2>&1; then
+                    FPRINTD_EMU_CREATED_USERS+=("$_fprintd_emu_user")
+                else
+                    echo "⚠️  Could not create user '$_fprintd_emu_user'; non-root socket cases will be skipped."
+                fi
+            fi
+        done
+        if id "$FPRINTD_EMU_MEMBER_USER" >/dev/null 2>&1 && id "$FPRINTD_EMU_OUTSIDER_USER" >/dev/null 2>&1; then
+            if ! id -nG "$FPRINTD_EMU_MEMBER_USER" | tr ' ' '\n' | grep -qx tapauthd-clients; then
+                usermod -aG tapauthd-clients "$FPRINTD_EMU_MEMBER_USER" >/dev/null 2>&1 || true
+                FPRINTD_EMU_MEMBER_GROUP_ADDED=1
+            fi
+            if id -nG "$FPRINTD_EMU_MEMBER_USER" | tr ' ' '\n' | grep -qx tapauthd-clients; then
+                FPRINTD_EMU_NONROOT_READY=1
+            else
+                echo "⚠️  Could not add '${FPRINTD_EMU_MEMBER_USER}' to tapauthd-clients; member case skipped."
+            fi
+        fi
+    fi
+
+    if [ "$FPRINTD_EMU_NONROOT_READY" = "1" ]; then
+        # 2j-3: non-root caller IN tapauthd-clients -> PAM_SUCCESS
+        echo "==> Phase 2j-3: non-root caller in 'tapauthd-clients' + grant must authenticate..."
+        if fprintd_emu_auth_with_action grant "$FPRINTD_EMU_MEMBER_USER" "$TEST_USER" 40 "${TEST_DIR}/fprintd-emu-member.log" "member grant"; then
+            echo "✅ Non-root group member ('${FPRINTD_EMU_MEMBER_USER}') authenticated through the real socket."
+        else
+            echo "❌ ERROR: non-root group member could not authenticate through the socket."
+            exit 1
+        fi
+        settle_for_dedup "Phase 2j-3" 2
+
+        # 2j-4: non-root caller OUTSIDE tapauthd-clients -> fast non-success
+        echo "==> Phase 2j-4: non-root caller outside 'tapauthd-clients' must fail fast (no hang)..."
+        FPRINTD_EMU_START=$SECONDS
+        if fprintd_emu_run_pamtester "$FPRINTD_EMU_OUTSIDER_USER" "$TEST_USER" 20 "${TEST_DIR}/fprintd-emu-outsider.log"; then
+            echo "❌ ERROR: a caller outside tapauthd-clients reached the daemon and authenticated."
+            exit 1
+        else
+            FPRINTD_EMU_ELAPSED=$(( SECONDS - FPRINTD_EMU_START ))
+            cat "${TEST_DIR}/fprintd-emu-outsider.log" 2>/dev/null || true
+            if [ "$FPRINTD_EMU_ELAPSED" -le 25 ]; then
+                echo "✅ Outsider ('${FPRINTD_EMU_OUTSIDER_USER}') was denied by the socket gate in ${FPRINTD_EMU_ELAPSED}s."
+            else
+                echo "❌ ERROR: outsider took ${FPRINTD_EMU_ELAPSED}s (expected a fast socket-permission failure)."
+                exit 1
+            fi
+        fi
+        settle_for_dedup "Phase 2j-4" 2
+    else
+        echo "ℹ️  Non-root socket-permission cases skipped (could not create/label the probe users)."
+    fi
+
+    # 2j-5: a real stock vendor stack, if the environment ships one, is served by
+    # the same emulation module (secondary, non-fatal if the file is absent).
+    if [ -f /etc/pam.d/kde-fingerprint ] \
+        && grep -q 'pam_fprintd\.so' /etc/pam.d/kde-fingerprint \
+        && ! grep -q 'pam_tapauth\.so' /etc/pam.d/kde-fingerprint; then
+        echo "==> Phase 2j-5: stock kde-fingerprint stack + grant must authenticate..."
+        if fprintd_emu_auth_with_action grant "" "$TEST_USER" 40 "${TEST_DIR}/fprintd-emu-stock.log" "stock grant" kde-fingerprint; then
+            echo "✅ Stock vendor stack served by the TapAuth emulation module (grant authenticated)."
+        else
+            echo "❌ ERROR: stock kde-fingerprint stack did not authenticate on grant."
+            exit 1
+        fi
+        settle_for_dedup "Phase 2j-5" 2
+    else
+        echo "ℹ️  Stock vendor fingerprint stack not present; secondary check skipped."
+    fi
+
+    # 2j-6: no response (auto-approve suppressed) must return non-success in a
+    # bounded time. Run last: the killed client tears the daemon flight down via
+    # the IPC-disconnect cancel path, so it cannot leak into Phase 3.
+    echo "==> Phase 2j-6: unanswered request must fail within the harness timeout..."
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" suppress-auto-approve "$APP_PKG"
+    settle_for_dedup "Phase 2j-6" 2
+    FPRINTD_EMU_NORESPONSE_TIMEOUT=20
+    FPRINTD_EMU_START=$SECONDS
+    if fprintd_emu_run_pamtester "" "$TEST_USER" "$FPRINTD_EMU_NORESPONSE_TIMEOUT" "${TEST_DIR}/fprintd-emu-timeout.log"; then
+        echo "❌ ERROR: an unanswered request authenticated."
+        exit 1
+    else
+        FPRINTD_EMU_ELAPSED=$(( SECONDS - FPRINTD_EMU_START ))
+        cat "${TEST_DIR}/fprintd-emu-timeout.log" 2>/dev/null || true
+        if [ "$FPRINTD_EMU_ELAPSED" -le "$((FPRINTD_EMU_NORESPONSE_TIMEOUT + 10))" ]; then
+            echo "✅ Unanswered request returned non-success in ${FPRINTD_EMU_ELAPSED}s (bounded, no hang)."
+        else
+            echo "❌ ERROR: unanswered request took ${FPRINTD_EMU_ELAPSED}s (expected <= $((FPRINTD_EMU_NORESPONSE_TIMEOUT + 10))s)."
+            exit 1
+        fi
+    fi
+
+    # Restore deterministic auto-approve (and the watcher) for Phase 3 onward.
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" restore-auto-approve "$APP_PKG"
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+    rm -f "$FPRINTD_EMU_PAM_PATH" 2>/dev/null || true
+    FPRINTD_EMU_OK=1
+    echo "✅ Phase 2j (fprintd-emulation pam_fprintd.so) passed."
+fi
+
 # Step 7: Phase 3 - Bluetooth Low Energy (BLE) Authentication
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -1634,6 +1950,11 @@ if [ "${DEDUP_OK:-0}" = "1" ]; then
 echo "║  Phase 2i: Concurrent Same-User Dedup:           PASSED       ║"
 else
 echo "║  Phase 2i: Concurrent Same-User Dedup:           SKIPPED      ║"
+fi
+if [ "${FPRINTD_EMU_OK:-0}" = "1" ]; then
+echo "║  Phase 2j: fprintd-emulation pam_fprintd.so:     PASSED       ║"
+else
+echo "║  Phase 2j: fprintd-emulation pam_fprintd.so:     SKIPPED      ║"
 fi
 if [ "$CAPTURE_OK" = "1" ]; then
 echo "║  Phase 2c: Adversarial Replay + PamCancel:       PASSED       ║"

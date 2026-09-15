@@ -72,15 +72,14 @@ bus name and real fprintd handles all fingerprint requests again.
 
 %package fprintd-emulation
 Summary:        Optional fprintd PAM emulation for TapAuth (pam_fprintd.so)
-# The optional emulation subpackage replaces the distro fprintd-pam
-# subpackage (which owns pam_fprintd.so) with a TapAuth build.
-# Obsoletes handles the older fprintd-pam releases; the versioned
-# Conflicts covers the newer ones and is deliberately constrained so it
-# cannot self-conflict with the Provides below (our Provides version is
-# 0.x, far below the 1.94.5 boundary).
+# The optional emulation subpackage is an alternative provider of
+# pam_fprintd.so: it Provides fprintd-pam while Conflicting with the
+# distro fprintd-pam, so the two providers can never be installed at once
+# and the user must explicitly confirm the swap. There is deliberately no
+# Obsoletes: replacing the distro module is an opt-in choice, not an
+# automatic upgrade.
 Provides:       fprintd-pam = %{version}-%{release}
-Obsoletes:      fprintd-pam < 1.94.5
-Conflicts:      fprintd-pam >= 1.94.5
+Conflicts:      fprintd-pam
 Requires:       %{name} = %{version}-%{release}
 
 %description fprintd-emulation
@@ -90,10 +89,11 @@ the fprintd-pam subpackage.
 
 It exists for the opt-in case where stock fingerprint PAM stacks must be
 served by TapAuth instead of a real local fingerprint reader. It
-Provides, Obsoletes and Conflicts fprintd-pam so the two providers of
-pam_fprintd.so can never coexist. The fprintd daemon package itself is
-deliberately NOT conflicted with, and the base tapauth package stays
-unchanged (it keeps shipping pam_tapauth.so).
+Provides and Conflicts fprintd-pam so the two providers of pam_fprintd.so
+can never coexist and installing it requires explicitly replacing the
+distro module. The fprintd daemon package itself is deliberately NOT
+conflicted with, and the base tapauth package stays unchanged (it keeps
+shipping pam_tapauth.so).
 
 %prep
 %setup -q -n %{name}-%{version}

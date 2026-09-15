@@ -114,12 +114,19 @@ _assert_emulation_files_contain_module() {
     fi
 }
 
+# _emulation_meta_mentions <metadata-blob> <provider>
+# Returns 0 if the given dependency metadata declares the distro provider
+# (version constraints and comma separators are tolerated).
+_emulation_meta_mentions() {
+    printf '%s\n' "$1" | grep -Eq "(^|[ ,])$2([ ,=<>()]|$)"
+}
+
 # _assert_emulation_meta_mentions <field-label> <metadata-blob> <provider>
 # Fails unless the given dependency metadata declares the distro provider
 # (version constraints and comma separators are tolerated).
 _assert_emulation_meta_mentions() {
     local field="$1" blob="$2" provider="$3"
-    if ! printf '%s\n' "$blob" | grep -Eq "(^|[ ,])${provider}([ ,=<>()]|$)"; then
+    if ! _emulation_meta_mentions "$blob" "$provider"; then
         echo "ERROR: tapauth-fprintd-emulation does not declare ${field} against ${provider} (got: ${blob:-<none>})"
         exit 1
     fi
@@ -219,8 +226,14 @@ verify_fprintd_emulation_pkg() {
     esac
 
     _assert_emulation_files_contain_module "$files"
-    _assert_emulation_meta_mentions "Conflicts" "$conflict" "$provider"
-    _assert_emulation_meta_mentions "Replaces" "$replace" "$provider"
     _assert_emulation_meta_mentions "Provides" "$provide" "$provider"
-    echo "tapauth-fprintd-emulation: ships pam_fprintd.so and declares Conflicts/Replaces/Provides against ${provider}."
+    # Exclusivity may be expressed either as Conflicts (alternative provider;
+    # the user explicitly confirms the swap) or as Obsoletes/Replaces
+    # (automatic replacement). Accept either.
+    if ! _emulation_meta_mentions "$conflict" "$provider" \
+        && ! _emulation_meta_mentions "$replace" "$provider"; then
+        echo "ERROR: tapauth-fprintd-emulation must declare Conflicts or Replaces against ${provider} (conflicts: ${conflict:-<none>}; replaces: ${replace:-<none>})"
+        exit 1
+    fi
+    echo "tapauth-fprintd-emulation: ships pam_fprintd.so, provides ${provider}, and declares it as a conflict or replacement."
 }
