@@ -175,6 +175,10 @@ E2E_OWNED_STATE=false
 CREATED_CONFIG=false
 UNITS_PREEXISTED=false
 BINARY_PREEXISTED=false
+# Set when this run stages the test-only tapauth-ipc-cli at /usr/local/bin so the
+# unprivileged Phase 7 cases (runuser -u ...) can execute it.
+INSTALLED_TEST_CLI=false
+CLI_BIN_PREEXISTED=false
 
 # Env prefix for pamtester invocations: dev mode points the PAM module (and the
 # CLI, whose TAPAUTHD_SOCK override is compiled in via fallback-socket ->
@@ -274,6 +278,10 @@ cleanup() {
             echo "   ./install.sh or your distro package) before using TapAuth again."
         fi
     fi
+    # Remove the test-only CLI this run staged for the unprivileged cases.
+    if [ "$INSTALLED_TEST_CLI" = true ] && [ "$CLI_BIN_PREEXISTED" != true ]; then
+        rm -f /usr/local/bin/tapauth-ipc-cli 2>/dev/null || true
+    fi
     if [ -w "$PAM_CONFIG_PATH" ]; then
         rm -f "$PAM_CONFIG_PATH" 2>/dev/null || true
     fi
@@ -360,8 +368,8 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
     # E2E containers have no Rust toolchain and reuse the binary the host built
     # through the bind-mounted workspace target dir (see run-all-e2e.sh).
     export CARGO_TARGET_DIR="${PROJECT_ROOT}/target"
-    CLI_BIN="${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli"
-    if [ ! -x "$CLI_BIN" ] && command -v cargo >/dev/null 2>&1; then
+    CLI_BIN_SRC="${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli"
+    if [ ! -x "$CLI_BIN_SRC" ] && command -v cargo >/dev/null 2>&1; then
         cargo build -p tapauthd --bin tapauth-ipc-cli
     fi
 
@@ -384,15 +392,25 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
         echo "❌ ERROR: tapauthd binary not found at $TAPAUTHD_BIN"
         exit 1
     fi
-    if [ ! -x "$CLI_BIN" ]; then
-        echo "❌ ERROR: tapauth-ipc-cli not found at $CLI_BIN"
+    if [ ! -x "$CLI_BIN_SRC" ]; then
+        echo "❌ ERROR: tapauth-ipc-cli not found at $CLI_BIN_SRC"
         echo "   It is a testing-only tool and is not shipped by the distro packages."
         echo "   Build it from the workspace with:"
         echo "   cargo build -p tapauthd --bin tapauth-ipc-cli"
         exit 1
     fi
+    # Phase 7 runs the CLI as unprivileged users (runuser -u ...), which cannot
+    # traverse the workspace target dir, so stage the test-only binary at a
+    # world-executable path for the duration of the run. cleanup() removes it
+    # again unless it was already there.
+    if [ -e /usr/local/bin/tapauth-ipc-cli ]; then
+        CLI_BIN_PREEXISTED=true
+    fi
+    install -Dm0755 "$CLI_BIN_SRC" /usr/local/bin/tapauth-ipc-cli
+    CLI_BIN="/usr/local/bin/tapauth-ipc-cli"
+    INSTALLED_TEST_CLI=true
     echo "    Found installed tapauthd:       $TAPAUTHD_BIN"
-    echo "    Using workspace-built CLI:      $CLI_BIN"
+    echo "    Using workspace-built CLI:      $CLI_BIN (from $CLI_BIN_SRC)"
     echo "    Found installed pam_tapauth.so:  $PAM_LIB"
 
     # Capability probe: detect whether the installed daemon contains dev-mode shims
@@ -508,6 +526,9 @@ EOF
         # 2. Install binaries + units + PolKit policy as the packages would
         install -Dm0755 "$TAPAUTHD_BIN" /usr/bin/tapauthd
         install -Dm0755 "$CLI_BIN" /usr/local/bin/tapauth-ipc-cli
+        # Use the world-executable copy everywhere so the unprivileged Phase 7
+        # cases (runuser -u ...) can execute it.
+        CLI_BIN="/usr/local/bin/tapauth-ipc-cli"
         install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.service" /etc/systemd/system/tapauthd.service
         install -Dm0644 "$PROJECT_ROOT/systemd/tapauthd.socket" /etc/systemd/system/tapauthd.socket
         # Only register the policy if it is not already installed: cleanup() deletes
