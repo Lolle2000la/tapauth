@@ -1,9 +1,18 @@
 package dev.rourunisen.tapauth.network
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
+import android.os.Build
+import androidx.core.content.ContextCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.rourunisen.tapauth.BuildConfig
+import dev.rourunisen.tapauth.service.AuthenticationService
+import dev.rourunisen.tapauth.service.ServiceStatusManager
+import dev.rourunisen.tapauth.service.TransportLockManager
 import java.net.DatagramPacket
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -13,7 +22,9 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -21,11 +32,11 @@ import org.junit.runner.RunWith
 
 /**
  * One-time **connected** test proving the custom TapAuth discovery multicast groups round-trip on
- * real hardware over both IPv4 and IPv6.
+ * real hardware over both IPv4 and IPv6, plus the power-management lifecycle of the UDP transport.
  *
- * It is intentionally self-contained (send + receive on the device, using the same
- * `MulticastSocket` join/send calls as `AuthenticationService`) so it needs no host helper and can
- * be driven from one `adb` invocation:
+ * The round-trip tests are intentionally self-contained (send + receive on the device, using the
+ * same `MulticastSocket` join/send calls as `AuthenticationService`) so they need no host helper
+ * and can be driven from one `adb` invocation:
  * ```
  * ./gradlew assembleE2e assembleE2eAndroidTest -Pandroid.injected.build.abi=arm64-v8a
  * adb install -r app/build/outputs/apk/e2e/app-e2e.apk
@@ -138,5 +149,155 @@ class MulticastReachabilityTest {
         assumeTrue("device has no IPv6 multicast interface", iface != null)
         assertNotNull(iface)
         withMulticastLock { roundTrip("IPv6", InetAddress.getByName(ipv6Group), iface!!) }
+    }
+
+    /**
+     * The Wi-Fi multicast lock must track explicit acquire/release and must not be reference
+     * counted, otherwise repeated screen/network transitions could leak it and keep the radio out
+     * of power save while the device is locked.
+     */
+    @Test
+    fun multicastLockTracksExplicitAcquireAndRelease() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        assumeTrue(
+            "device has no Wi-Fi service",
+            context.getSystemService(Context.WIFI_SERVICE) is WifiManager,
+        )
+
+        val manager = TransportLockManager(context)
+        manager.releaseMulticastLock()
+        assertFalse("lock must not be held before acquire", manager.isMulticastHeld)
+
+        manager.acquireMulticastLock()
+        assertTrue("lock must be held after acquire", manager.isMulticastHeld)
+
+        // setReferenceCounted(false): a redundant acquire must not add a reference...
+        manager.acquireMulticastLock()
+        assertTrue("lock must remain held after a redundant acquire", manager.isMulticastHeld)
+        // ...so a single release drops it.
+        manager.releaseMulticastLock()
+        assertFalse("one release must drop a non-reference-counted lock", manager.isMulticastHeld)
+
+        // A redundant release must be a safe no-op (never an underflow/crash).
+        manager.releaseMulticastLock()
+        assertFalse(manager.isMulticastHeld)
+    }
+
+    private fun sendLifecycle(context: Context, start: Boolean) {
+        val intent =
+            Intent(AuthenticationService.ACTION_TEST_UDP_LIFECYCLE).apply {
+                setPackage(context.packageName)
+                putExtra(AuthenticationService.EXTRA_TEST_UDP_START, start)
+            }
+        context.sendBroadcast(intent)
+    }
+
+    private fun awaitUdpRunning(expected: Boolean, timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (ServiceStatusManager.udpRunning.value == expected) return true
+            Thread.sleep(100)
+        }
+        return ServiceStatusManager.udpRunning.value == expected
+    }
+
+    /**
+     * Re-sends the control action until the expected transport state is observed. The service
+     * registers its receiver asynchronously after `startForegroundService()`, so the first action
+     * can race ahead of registration. Both start and stop are idempotent, so re-sending is safe.
+     */
+    private fun driveLifecycleUntil(
+        context: Context,
+        start: Boolean,
+        expected: Boolean,
+        timeoutMs: Long,
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            sendLifecycle(context, start)
+            val stepDeadline = System.currentTimeMillis() + 1_000
+            while (System.currentTimeMillis() < stepDeadline) {
+                if (ServiceStatusManager.udpRunning.value == expected) return true
+                Thread.sleep(50)
+            }
+        }
+        return ServiceStatusManager.udpRunning.value == expected
+    }
+
+    /**
+     * Drives the exact `startUdpTransport()` / `stopUdpTransport()` paths used by
+     * `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` and asserts the socket is bound on screen-on and
+     * unbound on screen-off.
+     *
+     * Protected system broadcasts cannot be injected from instrumentation, so the service exposes
+     * an E2E-build-only control action (`ACTION_TEST_UDP_LIFECYCLE`) that routes to the same
+     * methods.
+     */
+    @Test
+    fun udpTransportBindsOnScreenOnAndUnbindsOnScreenOff() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        assumeTrue("control action is only registered in the e2e build", BuildConfig.E2E_TESTING)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Some OEM builds block `adb shell pm grant` (the shell user lacks
+            // GRANT_RUNTIME_PERMISSIONS), so try the instrumentation path before giving up.
+            if (
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                try {
+                    instrumentation.uiAutomation.grantRuntimePermission(
+                        context.packageName,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    )
+                    println("Granted POST_NOTIFICATIONS via UiAutomation")
+                } catch (t: Throwable) {
+                    println("UiAutomation POST_NOTIFICATIONS grant failed: ${t.message}")
+                }
+            }
+            assumeTrue(
+                "POST_NOTIFICATIONS not granted; foreground service would stop itself",
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) == PackageManager.PERMISSION_GRANTED,
+            )
+        }
+
+        // Clean slate: make sure no previous run left the transport up.
+        context.stopService(Intent(context, AuthenticationService::class.java))
+        awaitUdpRunning(expected = false, timeoutMs = 5_000)
+
+        val serviceIntent = Intent(context, AuthenticationService::class.java)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+        } catch (e: Exception) {
+            assumeTrue(
+                "foreground service start not permitted in this environment: ${e.message}",
+                false,
+            )
+            return
+        }
+
+        // Screen-on path -> socket binds.
+        assertTrue(
+            "UDP socket did not bind after simulated screen-on (udpRunning=" +
+                "${ServiceStatusManager.udpRunning.value})",
+            driveLifecycleUntil(context, start = true, expected = true, timeoutMs = 15_000),
+        )
+
+        // Screen-off path -> socket unbinds.
+        assertTrue(
+            "UDP socket did not unbind after simulated screen-off (udpRunning=" +
+                "${ServiceStatusManager.udpRunning.value})",
+            driveLifecycleUntil(context, start = false, expected = false, timeoutMs = 15_000),
+        )
     }
 }
