@@ -38,6 +38,11 @@ echo ""
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
+# IPv6 host changes this run may make, reverted in cleanup() below so a root run
+# on a developer machine does not leave networking modified.
+IPV6_SYSCTL_RESTORE=()
+IPV6_ADDRS_ADDED=()
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 # UDP_PORT      the daemon's port (written to the config file, used for packet
 #               capture and for injecting adversarial packets).
@@ -134,6 +139,16 @@ if [ "$(id -u)" -eq 0 ]; then
     if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" = "1" ] \
         || ! ip -6 addr show 2>/dev/null | grep -q 'inet6 fe80'; then
         echo "ℹ️  Enabling IPv6 for multicast verification..."
+        # Record the current values so cleanup() can restore them.
+        for _scope in all default; do
+            _orig="$(cat "/proc/sys/net/ipv6/conf/${_scope}/disable_ipv6" 2>/dev/null || true)"
+            [ -n "$_orig" ] && IPV6_SYSCTL_RESTORE+=("${_scope}=${_orig}")
+        done
+        for _if in /sys/class/net/*; do
+            _name="$(basename "$_if")"
+            _orig="$(cat "/proc/sys/net/ipv6/conf/${_name}/disable_ipv6" 2>/dev/null || true)"
+            [ -n "$_orig" ] && IPV6_SYSCTL_RESTORE+=("${_name}=${_orig}")
+        done
         sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
         sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
         for _if in /sys/class/net/*; do
@@ -152,7 +167,9 @@ if [ "$(id -u)" -eq 0 ]; then
                 continue
             fi
             if ! ip -6 addr show dev "$_name" 2>/dev/null | grep -q 'inet6'; then
-                ip -6 addr add "fe80::a17:1/64" dev "$_name" nodad 2>/dev/null || true
+                if ip -6 addr add "fe80::a17:1/64" dev "$_name" nodad 2>/dev/null; then
+                    IPV6_ADDRS_ADDED+=("$_name")
+                fi
             fi
         done
         sleep 1
@@ -278,6 +295,14 @@ cleanup() {
     if id "$ADMIN_DENY_USER" >/dev/null 2>&1; then
         userdel -r "$ADMIN_DENY_USER" >/dev/null 2>&1 || true
     fi
+    # Undo any IPv6 host changes this run made (see the enablement block above),
+    # so a root run on a developer machine leaves networking as it found it.
+    for _name in "${IPV6_ADDRS_ADDED[@]}"; do
+        ip -6 addr del fe80::a17:1/64 dev "$_name" 2>/dev/null || true
+    done
+    for _entry in "${IPV6_SYSCTL_RESTORE[@]}"; do
+        sysctl -w "net.ipv6.conf.${_entry%%=*}.disable_ipv6=${_entry##*=}" >/dev/null 2>&1 || true
+    done
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
@@ -651,6 +676,10 @@ fi
 # Step 5b: Ensure runtime permissions and start Android app/background services
 echo "==> Starting Android foreground services for authentication..."
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
+# Clear the log buffer so the group-configuration line the next phase asserts on
+# is guaranteed to still be present even on a noisy runner (the logcat ring buffer
+# can rotate between app start and Phase 2).
+adb logcat -c 2>/dev/null || true
 adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity"
 sleep 2
 

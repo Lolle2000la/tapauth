@@ -34,9 +34,10 @@ pub const IPV4_MULTICAST_ADDR: &str = "239.255.26.44";
 /// and fall inside the IANA "Reserved for Private Use" dynamic range
 /// (`0xFD000000`-`0xFDFFFFFF`, RFC 10028), so no IANA allocation can collide.
 ///
-/// Derived from `SHA-256("org.tapauth.multicast.group.v1")` bytes 0-2. This is
-/// a link-local address, so sends must specify an interface scope (handled by
-/// `send_udp_multicast_all_interfaces`).
+/// The `0xFD` prefix is what places the group ID inside the private-use range;
+/// the remaining 24 bits are `SHA-256("org.tapauth.multicast.group.v1")` bytes
+/// 0-2. This is a link-local address, so sends must specify an interface scope
+/// (handled by `send_udp_multicast_all_interfaces`).
 ///
 /// Must stay in sync with `IPV6_MULTICAST_GROUP` in
 /// `server-android/.../service/AuthenticationService.kt`.

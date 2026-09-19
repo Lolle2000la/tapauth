@@ -40,16 +40,41 @@ struct InterfaceCache {
 
 /// Represents a network interface suitable for IP multicast.
 ///
-/// An interface is included when it is up, is not loopback, and has at least
-/// one IPv4 or IPv6 address. The addresses are recorded so an IPv4 multicast
-/// send can pin `IP_MULTICAST_IF` on that interface and an IPv6 send can use
-/// the interface index as its scope.
+/// An interface is included when it is not loopback and has at least one IPv4 or
+/// IPv6 address; oper-status and point-to-point are not filtered (see
+/// [`get_multicast_interfaces`]). The selected addresses are recorded so an IPv4
+/// multicast send can pin `IP_MULTICAST_IF` on that interface and an IPv6 send
+/// can use the interface index as its scope.
 #[derive(Debug, Clone)]
 pub struct MulticastInterface {
     pub name: String,
     pub index: u32,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
+}
+
+/// Addresses collected for one interface before a single one per family is
+/// selected. Interfaces may carry several addresses of the same family (e.g. a
+/// routable address plus APIPA).
+#[derive(Debug, Default)]
+struct InterfaceAddrs {
+    v4: Vec<Ipv4Addr>,
+    v6: Vec<Ipv6Addr>,
+}
+
+/// Choose the IPv4 address used as the multicast source for an interface.
+///
+/// A routable address is preferred over APIPA (`169.254.0.0/16`): the address
+/// chosen here becomes the source of the discovery datagram and therefore the
+/// unicast reply target the phone uses, and an unroutable source would send the
+/// reply nowhere. The smallest address wins, so the result does not depend on
+/// `getifaddrs` ordering.
+fn select_ipv4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| !addr.is_link_local())
+        .or_else(|| addrs.first().copied())
 }
 
 /// Get all network interfaces suitable for IP multicast.
@@ -60,7 +85,7 @@ pub struct MulticastInterface {
 /// the signal that matters. Callers skip interfaces lacking the address family
 /// they need, and per-interface send failures are logged rather than fatal.
 pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
-    let mut by_name: std::collections::HashMap<String, (Option<Ipv4Addr>, Option<Ipv6Addr>)> =
+    let mut by_name: std::collections::HashMap<String, InterfaceAddrs> =
         std::collections::HashMap::new();
 
     match if_addrs::get_if_addrs() {
@@ -77,11 +102,19 @@ pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
                 match &iface.addr {
                     if_addrs::IfAddr::V4(v4) => {
                         tracing::trace!("  Interface {} has IPv4 {}", iface.name, v4.ip);
-                        by_name.entry(iface.name.clone()).or_default().0 = Some(v4.ip);
+                        by_name
+                            .entry(iface.name.clone())
+                            .or_default()
+                            .v4
+                            .push(v4.ip);
                     }
                     if_addrs::IfAddr::V6(v6) => {
                         tracing::trace!("  Interface {} has IPv6 {}", iface.name, v6.ip);
-                        by_name.entry(iface.name.clone()).or_default().1 = Some(v6.ip);
+                        by_name
+                            .entry(iface.name.clone())
+                            .or_default()
+                            .v6
+                            .push(v6.ip);
                     }
                 }
             }
@@ -92,10 +125,23 @@ pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
     }
 
     let mut interfaces = Vec::new();
-    for (name, (ipv4, ipv6)) in by_name {
+    for (name, mut addrs) in by_name {
+        addrs.v4.sort_unstable();
+        addrs.v4.dedup();
+        addrs.v6.sort_unstable();
+        addrs.v6.dedup();
+
         match get_interface_index(&name) {
             Ok(index) => {
-                tracing::trace!("  Added interface {} with index {}", name, index);
+                let ipv4 = select_ipv4(&addrs.v4);
+                let ipv6 = addrs.v6.first().copied();
+                tracing::trace!(
+                    "  Added interface {} with index {} (ipv4={:?}, ipv6={:?})",
+                    name,
+                    index,
+                    ipv4,
+                    ipv6
+                );
                 interfaces.push(MulticastInterface {
                     name,
                     index,
@@ -108,6 +154,10 @@ pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
             }
         }
     }
+
+    // Stable ordering so logs/tests are deterministic regardless of HashMap
+    // iteration order.
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name));
 
     tracing::trace!(
         "Found {} suitable multicast interface(s): {:?}",
@@ -502,13 +552,14 @@ pub async fn receive_udp_packet(
             }),
         };
 
-        // A multicast datagram could be looped back by the kernel with our own
-        // address AND our own source port. Such an exact self-echo is never a
-        // legitimate peer packet; processing it would make the retransmission
-        // loop spin at full speed (each echo looks like a fast "no valid
-        // response yet" outcome). This check is independent of the dev-mode
-        // local-address filter below, which must stay permissive so loopback
-        // test harnesses (Android emulator over SLIRP) keep working.
+        // A locally-sourced datagram whose source port equals the port this
+        // socket is bound to is a loopback/echo artefact, never a legitimate
+        // remote peer; processing it would make the retransmission loop spin
+        // (each echo looks like a fast "no valid response yet" outcome). The
+        // daemon's own multicast sends use ephemeral source ports and do not
+        // join these groups, so this is purely defensive. It is independent of
+        // the dev-mode local-address filter below, which must stay permissive
+        // so loopback test harnesses (Android emulator over SLIRP) keep working.
         if local_port == Some(addr.port()) && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-echoed UDP packet from {}", addr);
             // drop and continue waiting for next packet
@@ -652,6 +703,20 @@ mod tests {
             // Every returned interface carries at least one usable address.
             assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    #[test]
+    fn test_select_ipv4_prefers_routable_over_apipa() {
+        let apipa = Ipv4Addr::new(169, 254, 1, 2);
+        let routable = Ipv4Addr::new(192, 168, 1, 10);
+
+        // A routable address wins so the phone's unicast reply has a routable
+        // destination.
+        assert_eq!(select_ipv4(&[apipa, routable]), Some(routable));
+        assert_eq!(select_ipv4(&[routable, apipa]), Some(routable));
+        // APIPA is still usable when it is all the interface has.
+        assert_eq!(select_ipv4(&[apipa]), Some(apipa));
+        assert_eq!(select_ipv4(&[]), None);
     }
 
     #[tokio::test]

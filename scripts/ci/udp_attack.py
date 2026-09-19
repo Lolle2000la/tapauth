@@ -251,6 +251,10 @@ def is_broadcast_dst(dst: str) -> bool:
     except ValueError:
         return False
     if isinstance(addr, ipaddress.IPv4Address):
+        # `is_multicast` covers 224.0.0.0/4. `255.255.255.255` is the limited
+        # broadcast address; the `.255` suffix is a conservative heuristic for a
+        # subnet-directed broadcast (no netmask is available at this capture
+        # layer). Kept so stray LAN broadcasts are not mistaken for grants.
         return addr.is_multicast or dst == "255.255.255.255" or dst.endswith(".255")
     return addr.is_multicast
 
