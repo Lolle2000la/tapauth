@@ -13,14 +13,15 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
+import dev.rourunisen.tapauth.BuildConfig
 import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.net.DatagramPacket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketException
@@ -35,11 +36,35 @@ class AuthenticationService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var udpSocket: MulticastSocket? = null
     @Volatile private var isRunning = false
+
+    /** Set once [onDestroy] starts so teardown does not re-post the foreground notification. */
+    @Volatile private var isDestroyed = false
+
     private lateinit var deviceRepository: DeviceRepository
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val retransmissionManager = RetransmissionManager.getInstance()
-    private val transportLockManager = TransportLockManager.getInstance()
+
+    /**
+     * Wins a challenge for the UDP transport so a duplicate BLE delivery is ignored. (Unrelated to
+     * the Wi-Fi multicast lock below, but historically both lived under the same class name.)
+     */
+    private val transportClaimManager = TransportClaimManager.getInstance()
+
+    /** Owns the Wi-Fi multicast lock tied to the UDP socket lifetime. */
+    private val transportLockManager by lazy { TransportLockManager(this) }
+
+    private val keyguardManager by lazy {
+        getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+    }
+
+    /**
+     * E2E builds run with power-management gating disabled so the harness can never be stalled by a
+     * keyguard or a screen timeout mid-suite. Production builds (debug/release) keep the real
+     * keyguard gating.
+     */
+    private val keyguardGatingEnabled = !BuildConfig.E2E_TESTING
+
     private val requestRateLimiter = RequestRateLimiter()
     private lateinit var temporalIdCache: TemporalIdCache
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
@@ -47,20 +72,43 @@ class AuthenticationService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var rejoinJob: Job? = null
     @Volatile private var listenerJob: Job? = null
-    private val multicastLockLock = Any()
-    @Volatile private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+    private val transportStateLock = Any()
 
     private val screenStateReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_ON -> {
-                        Log.d(TAG, "Screen on - acquiring multicast lock")
-                        acquireMulticastLock()
+                    Intent.ACTION_USER_PRESENT -> {
+                        Log.i(TAG, "Device unlocked. Starting UDP transport.")
+                        startUdpTransport()
                     }
                     Intent.ACTION_SCREEN_OFF -> {
-                        Log.d(TAG, "Screen off - releasing multicast lock")
-                        releaseMulticastLock()
+                        if (keyguardGatingEnabled) {
+                            Log.i(TAG, "Screen off. Stopping UDP transport.")
+                            stopUdpTransport()
+                        } else {
+                            Log.d(TAG, "E2E build: ignoring screen-off for UDP transport")
+                        }
+                    }
+                    Intent.ACTION_SCREEN_ON -> {
+                        // Devices without a keyguard never emit ACTION_USER_PRESENT, so start on
+                        // screen-on when the device is genuinely unlocked. When a keyguard is
+                        // present this is a no-op; ACTION_USER_PRESENT starts the transport later.
+                        if (isUdpTransportAllowed()) {
+                            Log.i(TAG, "Screen on and device unlocked. Starting UDP transport.")
+                            startUdpTransport()
+                        }
+                    }
+                    ACTION_TEST_UDP_LIFECYCLE -> {
+                        // E2E-only (see registerScreenStateReceiver): drive the same
+                        // start/stop paths without injecting protected system broadcasts.
+                        if (intent.getBooleanExtra(EXTRA_TEST_UDP_START, false)) {
+                            Log.i(TAG, "Test action: starting UDP transport")
+                            startUdpTransport()
+                        } else {
+                            Log.i(TAG, "Test action: stopping UDP transport")
+                            stopUdpTransport()
+                        }
                     }
                 }
             }
@@ -86,6 +134,15 @@ class AuthenticationService : Service() {
             "dev.rourunisen.tapauth.ACTION_CANCEL_BLE_CONNECTION"
         const val EXTRA_CHALLENGE = "challenge"
         const val EXTRA_DEVICE_ID = "device_id"
+
+        /**
+         * E2E-build-only action used by instrumentation tests to drive the UDP transport lifecycle
+         * deterministically. Protected system broadcasts (ACTION_USER_PRESENT / ACTION_SCREEN_OFF)
+         * cannot be injected by tests, so this exercises the exact same start/stop paths.
+         * Registered only when [BuildConfig.E2E_TESTING] is true.
+         */
+        const val ACTION_TEST_UDP_LIFECYCLE = "dev.rourunisen.tapauth.ACTION_TEST_UDP_LIFECYCLE"
+        const val EXTRA_TEST_UDP_START = "start"
 
         fun start(context: Context) {
             val intent = Intent(context, AuthenticationService::class.java)
@@ -179,11 +236,14 @@ class AuthenticationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!isRunning) {
-            // Foreground notification already started in onCreate()
-            // Just start the UDP listener
-            startListening()
+        // Foreground notification already started in onCreate().
+        // The UDP transport is bound only while the device is unlocked; if the keyguard is up we
+        // wait for ACTION_USER_PRESENT (see screenStateReceiver).
+        if (isUdpTransportAllowed()) {
+            startUdpTransport()
             Log.d(TAG, "Authentication service started")
+        } else {
+            Log.i(TAG, "Device is locked; deferring UDP transport until the user unlocks")
         }
         return START_STICKY
     }
@@ -192,9 +252,10 @@ class AuthenticationService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isDestroyed = true
         unregisterScreenStateReceiver()
         unregisterNetworkCallback()
-        stopListening()
+        stopUdpTransport()
         retransmissionManager.stopAll()
         // Check if initialized before accessing
         if (::temporalIdCache.isInitialized) {
@@ -204,13 +265,33 @@ class AuthenticationService : Service() {
         Log.d(TAG, "Authentication service destroyed")
     }
 
-    private fun startListening() {
-        synchronized(multicastLockLock) {
-            isRunning = true
-            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (powerManager?.isInteractive == true) {
-                acquireMulticastLock()
+    /**
+     * True when no keyguard is currently locking the device (also true when no keyguard exists).
+     */
+    private fun isDeviceUnlocked(): Boolean = keyguardManager?.isKeyguardLocked != true
+
+    /** Whether the UDP transport may be bound right now (always true in the E2E test build). */
+    private fun isUdpTransportAllowed(): Boolean = !keyguardGatingEnabled || isDeviceUnlocked()
+
+    /**
+     * Bind the UDP multicast transport and start the receive loop. The Wi-Fi multicast lock is held
+     * for exactly as long as the socket is bound, and the transport is only started while the
+     * device is unlocked.
+     *
+     * No-op when already running, unless [forceRestart] is set (used to rebind after a network
+     * change).
+     */
+    private fun startUdpTransport(forceRestart: Boolean = false) {
+        synchronized(transportStateLock) {
+            if (isRunning && !forceRestart) {
+                Log.d(TAG, "UDP transport already running; ignoring start request")
+                return
             }
+            isRunning = true
+
+            // Kernel network interrupts wake the SoC for socket traffic, so the only Wi-Fi lock
+            // we need is the multicast lock, held only while the socket is bound.
+            transportLockManager.acquireMulticastLock()
 
             val oldJob = listenerJob
             oldJob?.cancel()
@@ -241,7 +322,7 @@ class AuthenticationService : Service() {
                     return@launch
                 }
                 val newSocket = tempSocket
-                synchronized(multicastLockLock) {
+                synchronized(transportStateLock) {
                     if (!isRunning || !isActive) {
                         newSocket.close()
                         return@launch
@@ -330,7 +411,7 @@ class AuthenticationService : Service() {
                 } catch (e: Exception) {
                     if (isActive && isRunning) {
                         Log.e(TAG, "Failed to start UDP listener", e)
-                        stopListening()
+                        stopUdpTransport()
                     }
                 } finally {
                     newSocket.close()
@@ -342,76 +423,79 @@ class AuthenticationService : Service() {
         }
     }
 
-    private fun stopListening() {
-        synchronized(multicastLockLock) {
+    /**
+     * Tear down the UDP transport: leave the discovery groups, close the socket and release the
+     * Wi-Fi multicast lock. Safe to call when the transport is not running.
+     */
+    private fun stopUdpTransport() {
+        synchronized(transportStateLock) {
             isRunning = false
 
-            releaseMulticastLock()
+            // Cancel any pending network-change rebind first so it cannot restart us.
+            rejoinJob?.cancel()
+            rejoinJob = null
+
+            val socket = udpSocket
+            if (socket != null) {
+                leaveMulticastGroups(socket)
+            }
 
             listenerJob?.cancel()
             listenerJob = null
 
-            // Cancel any pending rejoin operation
-            rejoinJob?.cancel()
-            rejoinJob = null
-
             try {
-                udpSocket?.close()
+                socket?.close()
             } catch (e: Exception) {
                 Log.w(TAG, "Error closing socket: ${e.message}")
             }
             udpSocket = null
-            Log.d(TAG, "Stopped listening")
+
+            transportLockManager.releaseMulticastLock()
+
+            Log.d(TAG, "Stopped UDP transport")
             try {
                 dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning({ this }, false)
+                if (!isDestroyed) {
+                    updateNotification()
+                }
             } catch (_: Exception) {}
         }
     }
 
-    private fun acquireMulticastLock() {
-        if (!isRunning) return
-        synchronized(multicastLockLock) {
-            if (multicastLock == null) {
-                try {
-                    val wifiManager =
-                        applicationContext.getSystemService(Context.WIFI_SERVICE)
-                            as? android.net.wifi.WifiManager
-                    multicastLock =
-                        wifiManager?.createMulticastLock("TapAuthMulticastLock")?.apply {
-                            setReferenceCounted(false)
-                            acquire()
-                        }
-                    if (multicastLock != null) {
-                        Log.d(TAG, "Acquired Wifi MulticastLock for UDP multicast reception")
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to acquire Wifi MulticastLock: ${e.message}")
-                }
-            }
-        }
-    }
-
-    private fun releaseMulticastLock() {
-        synchronized(multicastLockLock) {
-            try {
-                multicastLock?.let {
-                    if (it.isHeld) {
-                        it.release()
-                        Log.d(TAG, "Released Wifi MulticastLock")
+    /**
+     * Best-effort explicit leave of the discovery groups before the socket is closed. Closing the
+     * socket also drops memberships, but leaving first avoids leaving the Wi-Fi filter in a
+     * multicast-promiscuous state while teardown completes.
+     */
+    private fun leaveMulticastGroups(socket: MulticastSocket) {
+        try {
+            NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
+                for (group in listOf(IPV6_MULTICAST_GROUP, IPV4_MULTICAST_GROUP)) {
+                    try {
+                        socket.leaveGroup(
+                            InetSocketAddress(group, appConfig.udpPort),
+                            networkInterface,
+                        )
+                    } catch (_: Exception) {
+                        // Not a member on this interface (or socket already closing); close()
+                        // below is the guaranteed fallback.
                     }
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error while releasing MulticastLock: ${e.message}")
             }
-            multicastLock = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to leave multicast groups: ${e.message}")
         }
     }
 
     private fun registerScreenStateReceiver() {
         val filter =
             IntentFilter().apply {
+                addAction(Intent.ACTION_USER_PRESENT)
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
+                if (BuildConfig.E2E_TESTING) {
+                    addAction(ACTION_TEST_UDP_LIFECYCLE)
+                }
             }
         // RECEIVER_EXPORTED is used intentionally: while AOSP documents that system broadcasts
         // bypass the export flag, some OEM implementations (Samsung, Xiaomi, etc.) have been
@@ -424,7 +508,7 @@ class AuthenticationService : Service() {
             filter,
             androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
         )
-        Log.d(TAG, "Registered screen state receiver")
+        Log.d(TAG, "Registered screen/keyguard state receiver")
     }
 
     private fun unregisterScreenStateReceiver() {
@@ -503,15 +587,23 @@ class AuthenticationService : Service() {
      * low-power state transitions.
      *
      * Uses debouncing to prevent overlapping operations when multiple network callbacks fire in
-     * quick succession (e.g., onAvailable followed by onCapabilitiesChanged).
+     * quick succession (e.g., onAvailable followed by onCapabilitiesChanged). The rebind is skipped
+     * while the device is locked: the transport is meant to stay down until the user unlocks.
      */
     private fun rejoinMulticastGroups() {
-        synchronized(multicastLockLock) {
+        if (!isUdpTransportAllowed()) {
+            Log.d(
+                TAG,
+                "Network changed while device locked; deferring multicast rebind until unlock",
+            )
+            return
+        }
+        synchronized(transportStateLock) {
             rejoinJob?.cancel()
             rejoinJob = serviceScope.launch {
                 delay(REJOIN_DEBOUNCE_MS)
                 Log.d(TAG, "Recreating UDP socket after network change")
-                startListening()
+                startUdpTransport(forceRestart = true)
             }
         }
     }
@@ -809,7 +901,7 @@ class AuthenticationService : Service() {
 
             // Transport lock - ensure only one channel handles this request
             if (
-                !transportLockManager.tryClaimTransport(
+                !transportClaimManager.tryClaimTransport(
                     challengeBytes,
                     dev.rourunisen.tapauth.data.TransportType.UDP,
                 )
@@ -912,7 +1004,7 @@ class AuthenticationService : Service() {
                         )
 
                         // Release transport lock after successful grant
-                        transportLockManager.releaseLock(challengeBytes)
+                        transportClaimManager.releaseLock(challengeBytes)
 
                         // Start retransmission (500ms fixed interval per spec)
                         udpSocket?.let { socket ->
@@ -970,7 +1062,7 @@ class AuthenticationService : Service() {
                         )
 
                         // Release transport lock after denial
-                        transportLockManager.releaseLock(challengeBytes)
+                        transportClaimManager.releaseLock(challengeBytes)
 
                         // Start retransmission (500ms fixed interval per spec)
                         udpSocket?.let { socket ->
@@ -994,7 +1086,7 @@ class AuthenticationService : Service() {
                     // Reset rate limiter since request was resolved
                     requestRateLimiter.resetClient(device.publicKey.toHex())
                     // Release transport lock even on timeout
-                    transportLockManager.releaseLock(challengeBytes)
+                    transportClaimManager.releaseLock(challengeBytes)
                 }
             }
         } catch (e: Exception) {

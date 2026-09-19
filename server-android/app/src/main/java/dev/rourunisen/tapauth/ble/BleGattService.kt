@@ -19,7 +19,7 @@ import dev.rourunisen.tapauth.biometric.BiometricHelper
 import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
-import dev.rourunisen.tapauth.service.TransportLockManager
+import dev.rourunisen.tapauth.service.TransportClaimManager
 import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.withLock
@@ -97,7 +97,7 @@ class BleGattService : Service() {
     private lateinit var keypairRepository: dev.rourunisen.tapauth.data.KeypairRepository
     private lateinit var biometricHelper: BiometricHelper
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
-    private val transportLockManager = TransportLockManager.getInstance()
+    private val transportClaimManager = TransportClaimManager.getInstance()
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -824,10 +824,10 @@ class BleGattService : Service() {
                 dev.rourunisen.tapauth.service.RetransmissionManager.getInstance()
             retransmissionManager.stopRetransmission(challengeBytes)
 
-            // Release transport lock
-            val transportLockManager =
-                dev.rourunisen.tapauth.service.TransportLockManager.getInstance()
-            transportLockManager.releaseLock(challengeBytes)
+            // Release transport claim
+            val transportClaimManager =
+                dev.rourunisen.tapauth.service.TransportClaimManager.getInstance()
+            transportClaimManager.releaseLock(challengeBytes)
 
             Log.d(TAG, "BLE: Cancelled auth request and dismissed notification")
 
@@ -903,7 +903,7 @@ class BleGattService : Service() {
 
             // Step 5: Transport lock - ensure only one channel handles this request
             if (
-                !transportLockManager.tryClaimTransport(
+                !transportClaimManager.tryClaimTransport(
                     challengeBytes,
                     dev.rourunisen.tapauth.data.TransportType.BLE,
                 )
@@ -1003,7 +1003,13 @@ class BleGattService : Service() {
                 "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})",
             )
 
-            // Step 8: Request biometric authentication via AuthRequestManager
+            // Step 8: Request biometric authentication via AuthRequestManager.
+            //
+            // This path deliberately keeps working while the screen is off / device locked: the UDP
+            // transport is torn down on ACTION_SCREEN_OFF, but BLE scanning stays registered. When
+            // a handshake arrives while locked, AuthRequestManager posts a high-priority
+            // notification, and BiometricPromptActivity is marked showWhenLocked/turnScreenOn so
+            // the user can approve without first unlocking the device.
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
             authRequestManager.submitRequest(
                 context = this,
@@ -1041,7 +1047,7 @@ class BleGattService : Service() {
                         Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
 
                         // Release transport lock after successful grant
-                        transportLockManager.releaseLock(challengeBytes)
+                        transportClaimManager.releaseLock(challengeBytes)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
                         // Ensure disconnection on error
@@ -1072,7 +1078,7 @@ class BleGattService : Service() {
                         Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
 
                         // Release transport lock after denial
-                        transportLockManager.releaseLock(challengeBytes)
+                        transportClaimManager.releaseLock(challengeBytes)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
                         // Ensure disconnection on error
@@ -1083,7 +1089,7 @@ class BleGattService : Service() {
                     Log.d(TAG, "BLE auth request timed out or failed - disconnecting silently")
                     disconnectGatt(gatt)
                     // Release transport lock even on timeout
-                    transportLockManager.releaseLock(challengeBytes)
+                    transportClaimManager.releaseLock(challengeBytes)
                 }
             }
         } catch (e: Exception) {
