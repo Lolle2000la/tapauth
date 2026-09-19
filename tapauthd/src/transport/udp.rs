@@ -1,16 +1,16 @@
-//! UDP transport using broadcast (IPv4) and multicast (IPv6)
+//! UDP transport using IPv4 + IPv6 multicast
 
 use super::{ReceiveResult, Transport};
 use crate::auth_handler::AuthHandlerError as AuthError;
 use shared::network::{
-    is_ipv6_available, send_udp_broadcast, send_udp_multicast_all_interfaces,
-    try_receive_udp_packet, IPV6_MULTICAST_ADDR,
+    is_ipv6_available, send_udp_multicast_all_interfaces, send_udp_multicast_v4_all_interfaces,
+    try_receive_udp_packet, IPV4_MULTICAST_ADDR, IPV6_MULTICAST_ADDR,
 };
 use shared::protocol::pb::EncryptedPacket;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// UDP transport using broadcast (IPv4) and multicast (IPv6)
+/// UDP transport using multicast on both address families.
 ///
 /// Always wraps a socket owned by `DaemonState`; it never closes the socket
 /// itself.
@@ -27,6 +27,32 @@ impl UdpTransport {
     /// * `port` - The UDP port the socket is bound to
     pub fn from_socket(socket: Arc<tokio::net::UdpSocket>, port: u16) -> Self {
         Self { socket, port }
+    }
+
+    /// Send `packet` to the IPv4 and IPv6 discovery groups on every suitable
+    /// interface. Failures on either family are logged, never fatal: the
+    /// devices may be reachable over the other transport (BLE) or the still
+    /// configured IPv4/IPv6 pair.
+    async fn send_to_multicast_groups(&self, packet: &EncryptedPacket) {
+        if let Err(e) =
+            send_udp_multicast_v4_all_interfaces(IPV4_MULTICAST_ADDR, self.port, packet).await
+        {
+            tracing::warn!("Failed to send IPv4 multicast: {}", e);
+        }
+
+        if is_ipv6_available() {
+            match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await {
+                Ok(count) if count > 0 => {
+                    tracing::trace!("Sent IPv6 multicast on {} interface(s)", count);
+                }
+                Ok(_) => {
+                    tracing::debug!("No suitable IPv6 interfaces found for multicast");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to send IPv6 multicast: {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -73,28 +99,10 @@ fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
 
 impl Transport for UdpTransport {
     async fn send_request(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        // Send broadcast on IPv4
-        if let Err(e) = send_udp_broadcast(&self.socket, self.port, packet).await {
-            tracing::warn!("Failed to send IPv4 broadcast: {}", e);
-        }
-
         #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
-        // Send multicast on IPv6 (on all available interfaces)
-        if is_ipv6_available() {
-            match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await {
-                Ok(count) if count > 0 => {
-                    tracing::trace!("Sent IPv6 multicast on {} interface(s)", count);
-                }
-                Ok(_) => {
-                    tracing::debug!("No suitable IPv6 interfaces found for multicast");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to send IPv6 multicast: {}", e);
-                }
-            }
-        }
+        self.send_to_multicast_groups(packet).await;
 
         Ok(())
     }
@@ -110,30 +118,18 @@ impl Transport for UdpTransport {
     }
 
     async fn send_confirmation(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        // Send on both IPv4 and IPv6
-        send_udp_broadcast(&self.socket, self.port, packet).await?;
-
         #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
-        if is_ipv6_available() {
-            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
-        }
-
+        self.send_to_multicast_groups(packet).await;
         Ok(())
     }
 
     async fn send_cancel(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
-        // Send on both IPv4 and IPv6
-        send_udp_broadcast(&self.socket, self.port, packet).await?;
-
         #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
-        if is_ipv6_available() {
-            let _ = send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await;
-        }
-
+        self.send_to_multicast_groups(packet).await;
         Ok(())
     }
 }

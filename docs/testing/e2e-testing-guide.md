@@ -42,7 +42,7 @@ graph TB
     end
 
     DAEMON <-->|"TCP Pairing Handshake (Ephemeral Port)<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
-    DAEMON <-->|"UDP Broadcast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
+    DAEMON <-->|"UDP Multicast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
     DAEMON <-->|"BLE GATT Service (b4ad84c0...)<br/>/dev/vhci ◄► Bumble ◄► Netsim"| BLE_SRV
 ```
 
@@ -73,10 +73,11 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 ### Phase 2: Local Network (UDP) End-to-End Authentication
 1. Desktop enables UDP transport and disables BLE via admin IPC (`set-transports --network true --ble false`).
 2. Authentication is requested for the test user via `tapauth-ipc-cli pam-auth <user> 20`.
-3. `tapauthd` broadcasts `EncryptedPacket` on UDP port 36692 (and forwards to emulator port `36695` via dev shim).
-4. `AuthenticationService` on Android receives packet, validates temporal ID via `TemporalIdCache`, decrypts `AuthRequest`, and prompts for biometrics.
-5. Android verifies biometrics and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
-6. `tapauthd` verifies signature, responds with `GrantConfirmation` (up to 3 times), and returns `SUCCESS` (0) to PAM client.
+3. `tapauthd` multicasts `EncryptedPacket` to the IPv4 (`239.255.26.44`) and IPv6 (`ff12::fdec:fc27`) discovery groups on UDP port 36692 (and forwards to emulator port `36695` via dev shim).
+4. An AF_PACKET watcher asserts the daemon really emitted a packet to **both** groups (the emulator delivery itself goes through the dev shim, not LAN multicast).
+5. `AuthenticationService` on Android receives packet, validates temporal ID via `TemporalIdCache`, decrypts `AuthRequest`, and prompts for biometrics.
+6. Android verifies biometrics and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
+7. `tapauthd` verifies signature, responds with `GrantConfirmation` (up to 3 times), and returns `SUCCESS` (0) to PAM client.
 
 ### Phase 2b: Real PAM Module Authentication (`pamtester`)
 1. Test suite creates temporary PAM service definition at `/etc/pam.d/tapauth-test-e2e` pointing to `libclient_pam.so`.

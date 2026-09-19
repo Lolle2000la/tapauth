@@ -51,7 +51,7 @@ pub enum AuthHandlerError {
 /// restart.
 #[derive(Debug, Clone, Copy)]
 struct TransportsEnabled {
-    /// Local Network (UDP broadcast/multicast) transport
+    /// Local Network (UDP multicast) transport
     network: bool,
     /// Bluetooth Low Energy transport (always false when the daemon is
     /// built without the `ble` feature)

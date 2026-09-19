@@ -5,7 +5,7 @@
 This document specifies the network protocol for authenticating a user on a **Client** (e.g., a Linux desktop) using a paired **Server** (e.g., an Android phone). The protocol is designed for the lowest possible latency and high privacy by default.
 
 The core design is a **parallel discovery model**:
-* The Client initiates the process by simultaneously attempting discovery over both the **Local IP Network (IPv4 Broadcast & IPv6 Multicast)** and **Bluetooth Low Energy (BLE)**.
+* The Client initiates the process by simultaneously attempting discovery over both the **Local IP Network (IPv4 & IPv6 Multicast)** and **Bluetooth Low Energy (BLE)**.
 * The first successful discovery path triggers the authentication flow. All subsequent communication for that session continues over the successful transport.
 * This "race" approach ensures the fastest possible connection without waiting for timeouts, providing a seamless and highly responsive user experience.
 
@@ -16,8 +16,8 @@ sequenceDiagram
     participant Server B (Phone 2)
 
     par
-        Client (Desktop)->>Server A (Phone 1): EncryptedPacket (IP Broadcast)
-        Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Broadcast)
+        Client (Desktop)->>Server A (Phone 1): EncryptedPacket (IP Multicast)
+        Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Multicast)
     and
         Client (Desktop)->>Server A (Phone 1): BLE Discovery (Advertising Ping)
         Client (Desktop)->>Server B (Phone 2): BLE Discovery (Advertising Ping)
@@ -30,7 +30,7 @@ sequenceDiagram
     end
     
     Note over Client (Desktop), Server A (Phone 1): Client accepts the grant from Server A and logs in.
-    Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Broadcast Cancel) & BLE Cancel
+    Client (Desktop)->>Server B (Phone 2): EncryptedPacket (IP Multicast Cancel) & BLE Cancel
     Note over Server B (Phone 2): Server B receives cancelation and dismisses its prompt.
 ```
 
@@ -93,8 +93,8 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 * **IP Network (Wired Ethernet or Wi-Fi)**:
     * **Port**: Uses UDP on port **`36692`**. This default port **must** be user-configurable.
-    * **IPv4**: The Client sends to the broadcast address `255.255.255.255`.
-    * **IPv6**: The Client sends to the link-local multicast address **`ff02::1`** (all nodes on local network segment).
+    * **IPv4**: The Client sends to the multicast group **`239.255.26.44`** (inside the IPv4 Local Scope `239.255.0.0/16`, RFC 2365). Servers join this group on every multicast-capable interface; the address is not an IANA assignment.
+    * **IPv6**: The Client sends to the link-local multicast group **`ff12::fdec:fc27`** on every IPv6-capable interface. The group is transient (not an IANA permanent assignment) and its low 32-bit group ID lies in the IANA "Reserved for Private Use" dynamic range `0xFD000000`-`0xFDFFFFFF` (RFC 10028).
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
 
 * **Bluetooth Low Energy (BLE)**:
@@ -107,7 +107,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 ### Step 1: Parallel Discovery (Client)
 
-* When the PAM module is activated, the Client immediately begins broadcasting/advertising the `EncryptedPacket` containing the `AuthenticationRequest` on all available channels.
+* When the PAM module is activated, the Client immediately begins multicasting/advertising the `EncryptedPacket` containing the `AuthenticationRequest` on all available channels.
 
 ### Step 2: Request Handling (Server)
 

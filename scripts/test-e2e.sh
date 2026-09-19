@@ -50,6 +50,12 @@ DEV_HOST_PORT="${TAPAUTH_E2E_DEV_HOST_PORT:-36695}"
 export TAPAUTH_E2E_UDP_PORT="$UDP_PORT"
 export TAPAUTH_E2E_DEV_HOST_PORT="$DEV_HOST_PORT"
 
+# Discovery multicast groups. MUST stay in sync with shared/src/network.rs
+# (IPV4_MULTICAST_ADDR / IPV6_MULTICAST_ADDR) and the Android
+# AuthenticationService: Phase 2 asserts tapauthd really emits packets to both.
+IPV4_MCAST="239.255.26.44"
+IPV6_MCAST="ff12::fdec:fc27"
+
 # Ensure adb is in PATH
 if ! command -v adb &> /dev/null; then
     for p in "/usr/local/lib/android/sdk/platform-tools" "$ANDROID_HOME/platform-tools" "$ANDROID_SDK_ROOT/platform-tools" "$HOME/Android/Sdk/platform-tools"; do
@@ -120,11 +126,44 @@ fi
 echo "ℹ️  Sandbox Dir:    $TEST_DIR"
 echo ""
 
+# ── IPv6 availability for multicast verification ──────────────────────────────
+# GitHub-hosted runners disable IPv6 by default, which makes tapauthd skip the
+# IPv6 multicast branch entirely (is_ipv6_available() -> false). Enable IPv6 so
+# Phase 2 can verify that both discovery groups actually egress.
+if [ "$(id -u)" -eq 0 ]; then
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" = "1" ] \
+        || ! ip -6 addr show 2>/dev/null | grep -q 'inet6 fe80'; then
+        echo "ℹ️  Enabling IPv6 for multicast verification..."
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+        for _if in /sys/class/net/*; do
+            sysctl -w "net.ipv6.conf.$(basename "$_if").disable_ipv6=0" >/dev/null 2>&1 || true
+        done
+        # Some images also disable automatic link-local generation. Ensure every
+        # non-loopback interface owns an IPv6 address so tapauthd has somewhere
+        # to send the IPv6 group (DAD is skipped to avoid a tentative window).
+        for _if in /sys/class/net/*; do
+            _name="$(basename "$_if")"
+            [ "$_name" = "lo" ] && continue
+            if ! ip -6 addr show dev "$_name" 2>/dev/null | grep -q 'inet6'; then
+                ip -6 addr add "fe80::a17:1/64" dev "$_name" nodad 2>/dev/null || true
+            fi
+        done
+        sleep 1
+    fi
+    if ip -6 addr show 2>/dev/null | grep -q 'inet6 fe80'; then
+        echo "✅ IPv6 link-local address present for multicast verification."
+    else
+        echo "⚠️  No IPv6 link-local address after enable attempt; IPv6 multicast will not be observable."
+    fi
+fi
+
 # Background processes this suite owns directly; the BLE/biometric helpers track
 # their own PIDs in /tmp and are torn down through their own subcommands.
 DAEMON_PID=""
 JOURNAL_PID=""
 CAPTURE_PID=""
+GROUPS_PID=""
 
 # systemd-mode teardown bookkeeping: only undo what this run actually installed.
 # (Set for real in the systemd setup block below; defaults keep cleanup() safe if
@@ -181,6 +220,10 @@ cleanup() {
     if [ -n "$CAPTURE_PID" ]; then
         kill "$CAPTURE_PID" 2>/dev/null || true
         wait "$CAPTURE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$GROUPS_PID" ]; then
+        kill "$GROUPS_PID" 2>/dev/null || true
+        wait "$GROUPS_PID" 2>/dev/null || true
     fi
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant 2>/dev/null || true
     if [ -f /tmp/bumble-bridge.pid ]; then
@@ -615,6 +658,28 @@ echo "╔═══════════════════════�
 echo "║  PHASE 2: Local Network (UDP) End-to-End Authentication       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
+# Assert the Android app is configured for the same discovery groups as the
+# daemon. The service logs the group pair unconditionally when it starts
+# listening (see AuthenticationService.startListening), which makes this a
+# config-level check that does not depend on any interface being joinable.
+echo "==> Verifying Android app discovery multicast groups..."
+ANDROID_GROUPS_OK=0
+for _ in $(seq 1 20); do
+    if adb logcat -d 2>/dev/null \
+        | grep -q "Multicast groups: IPv4=${IPV4_MCAST}, IPv6=${IPV6_MCAST}"; then
+        ANDROID_GROUPS_OK=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$ANDROID_GROUPS_OK" = "1" ]; then
+    echo "✅ Android AuthenticationService uses IPv4=${IPV4_MCAST}, IPv6=${IPV6_MCAST}."
+else
+    echo "❌ ERROR: Android app did not log the expected discovery multicast groups."
+    adb logcat -d -v time -s AuthenticationService:* 2>/dev/null | tail -n 40 || true
+    exit 1
+fi
+
 echo "==> Setting transport config: UDP enabled, BLE disabled..."
 "$CLI_BIN" set-transports --ble false --network true
 
@@ -643,6 +708,16 @@ if [ "$(id -u)" -eq 0 ]; then
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" sniff --port "$UDP_PORT" --duration 30 \
         > "$TEST_DIR/grants.hex" 2> "$TEST_DIR/sniff.err" &
     CAPTURE_PID=$!
+
+    # Independently observe the daemon's discovery traffic on the wire so we can
+    # prove it targets the custom multicast groups (rather than 255.255.255.255
+    # / ff02::1). This works even though the emulator delivery goes through the
+    # dev-udp-loopback shim rather than real LAN multicast.
+    echo "==> Starting multicast-group egress watcher (IPv4 ${IPV4_MCAST}, IPv6 ${IPV6_MCAST})..."
+    "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" watch-groups \
+        --ipv4 "$IPV4_MCAST" --ipv6 "$IPV6_MCAST" --port "$UDP_PORT" --duration 30 \
+        > "$TEST_DIR/groups.txt" 2> "$TEST_DIR/groups.err" &
+    GROUPS_PID=$!
 fi
 
 echo "==> Requesting authentication for user '$TEST_USER'..."
@@ -682,6 +757,34 @@ elif [ "$CAPTURE_MANDATORY" = "1" ]; then
     exit 1
 else
     echo "ℹ️  Adversarial UDP phases will be skipped (not running as root)."
+fi
+
+# Verify the daemon actually emitted discovery packets to the configured
+# multicast groups. The watcher only records a family when it observes an
+# EncryptedPacket addressed to that group on the wire.
+if [ -n "$GROUPS_PID" ]; then
+    kill "$GROUPS_PID" 2>/dev/null || true
+    wait "$GROUPS_PID" 2>/dev/null || true
+    GROUPS_PID=""
+    echo "==> Multicast-group egress observations:"
+    cat "$TEST_DIR/groups.txt" 2>/dev/null || true
+    if grep -q "^SEEN_IPV4 ${IPV4_MCAST}$" "$TEST_DIR/groups.txt" 2>/dev/null; then
+        echo "✅ Daemon emitted an EncryptedPacket to the IPv4 discovery group ${IPV4_MCAST}."
+    else
+        echo "❌ ERROR: no EncryptedPacket observed for IPv4 group ${IPV4_MCAST}."
+        echo "--- watcher stderr:"; cat "$TEST_DIR/groups.err" 2>/dev/null || true
+        exit 1
+    fi
+    if grep -q "^SEEN_IPV6 ${IPV6_MCAST}$" "$TEST_DIR/groups.txt" 2>/dev/null; then
+        echo "✅ Daemon emitted an EncryptedPacket to the IPv6 discovery group ${IPV6_MCAST}."
+    else
+        echo "❌ ERROR: no EncryptedPacket observed for IPv6 group ${IPV6_MCAST}."
+        echo "--- watcher stderr:"; cat "$TEST_DIR/groups.err" 2>/dev/null || true
+        echo "--- host IPv6 addresses:"; ip -6 addr show 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "ℹ️  Multicast-group egress verification skipped (not running as root)."
 fi
 
 # Step 6b: Phase 2b - Real PAM Module Authentication (pamtester)
@@ -1197,6 +1300,7 @@ echo "║  E2E TEST MATRIX SUMMARY                                      ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  Phase 1: Real TCP Pairing & SAS Anti-MITM:      PASSED       ║"
 echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
+echo "║  Phase 2: Custom multicast groups (v4 + v6):     PASSED       ║"
 if [ "$PAM_TESTABLE" = "true" ]; then
 echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
 if [ "$PAM_GRANT_STACK_OK" = "1" ]; then
