@@ -67,14 +67,15 @@ struct InterfaceAddrs {
 /// A routable address is preferred over APIPA (`169.254.0.0/16`): the address
 /// chosen here becomes the source of the discovery datagram and therefore the
 /// unicast reply target the phone uses, and an unroutable source would send the
-/// reply nowhere. The smallest address wins, so the result does not depend on
-/// `getifaddrs` ordering.
+/// reply nowhere. The smallest non-link-local address wins, independent of the
+/// input order.
 fn select_ipv4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
     addrs
         .iter()
         .copied()
-        .find(|addr| !addr.is_link_local())
-        .or_else(|| addrs.first().copied())
+        .filter(|addr| !addr.is_link_local())
+        .min()
+        .or_else(|| addrs.iter().copied().min())
 }
 
 /// Get all network interfaces suitable for IP multicast.
@@ -82,8 +83,11 @@ fn select_ipv4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
 /// Returns every non-loopback interface that has at least one IPv4 or IPv6
 /// address. That is the only filter: point-to-point links and interfaces whose
 /// oper-status is not "up" are deliberately left in, because address presence is
-/// the signal that matters. Callers skip interfaces lacking the address family
-/// they need, and per-interface send failures are logged rather than fatal.
+/// the signal that matters. Virtual/container interfaces (`docker0`, `veth*`,
+/// `br-*`, …) are likewise not excluded by name heuristics — a legitimate bridge
+/// can carry real peers, and a send with no receivers is harmless. Callers skip
+/// interfaces lacking the address family they need, and per-interface send
+/// failures are logged rather than fatal.
 pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
     let mut by_name: std::collections::HashMap<String, InterfaceAddrs> =
         std::collections::HashMap::new();
@@ -708,12 +712,15 @@ mod tests {
     #[test]
     fn test_select_ipv4_prefers_routable_over_apipa() {
         let apipa = Ipv4Addr::new(169, 254, 1, 2);
-        let routable = Ipv4Addr::new(192, 168, 1, 10);
+        let routable_a = Ipv4Addr::new(192, 168, 1, 10);
+        let routable_b = Ipv4Addr::new(10, 0, 0, 5);
 
-        // A routable address wins so the phone's unicast reply has a routable
-        // destination.
-        assert_eq!(select_ipv4(&[apipa, routable]), Some(routable));
-        assert_eq!(select_ipv4(&[routable, apipa]), Some(routable));
+        // A routable address wins over APIPA regardless of slice order.
+        assert_eq!(select_ipv4(&[apipa, routable_a]), Some(routable_a));
+        assert_eq!(select_ipv4(&[routable_a, apipa]), Some(routable_a));
+        // Among routable addresses the smallest wins, independent of order.
+        assert_eq!(select_ipv4(&[routable_a, routable_b]), Some(routable_b));
+        assert_eq!(select_ipv4(&[routable_b, routable_a]), Some(routable_b));
         // APIPA is still usable when it is all the interface has.
         assert_eq!(select_ipv4(&[apipa]), Some(apipa));
         assert_eq!(select_ipv4(&[]), None);

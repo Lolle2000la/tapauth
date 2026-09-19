@@ -34,29 +34,19 @@ impl UdpTransport {
     /// devices may be reachable over the other transport (BLE) or the still
     /// configured IPv4/IPv6 pair.
     async fn send_to_multicast_groups(&self, packet: &EncryptedPacket) {
+        // The send helpers log the per-family success count themselves; only the
+        // cases the caller cannot otherwise observe are surfaced here.
         match send_udp_multicast_v4_all_interfaces(IPV4_MULTICAST_ADDR, self.port, packet).await {
-            Ok(count) if count > 0 => {
-                tracing::trace!("Sent IPv4 multicast on {} interface(s)", count);
-            }
-            Ok(_) => {
-                tracing::debug!("No suitable IPv4 interfaces found for multicast");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to send IPv4 multicast: {}", e);
-            }
+            Ok(0) => tracing::debug!("No suitable IPv4 interfaces found for multicast"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to send IPv4 multicast: {}", e),
         }
 
         if is_ipv6_available() {
             match send_udp_multicast_all_interfaces(IPV6_MULTICAST_ADDR, self.port, packet).await {
-                Ok(count) if count > 0 => {
-                    tracing::trace!("Sent IPv6 multicast on {} interface(s)", count);
-                }
-                Ok(_) => {
-                    tracing::debug!("No suitable IPv6 interfaces found for multicast");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to send IPv6 multicast: {}", e);
-                }
+                Ok(0) => tracing::debug!("No suitable IPv6 interfaces found for multicast"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Failed to send IPv6 multicast: {}", e),
             }
         }
     }

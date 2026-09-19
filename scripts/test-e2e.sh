@@ -187,6 +187,9 @@ DAEMON_PID=""
 JOURNAL_PID=""
 CAPTURE_PID=""
 GROUPS_PID=""
+# Set to 1 only when the on-wire multicast egress assertions actually pass, so
+# the summary matrix does not claim PASSED for a skipped (non-root) run.
+MULTICAST_VERIFIED=0
 
 # systemd-mode teardown bookkeeping: only undo what this run actually installed.
 # (Set for real in the systemd setup block below; defaults keep cleanup() safe if
@@ -826,6 +829,7 @@ if [ -n "$GROUPS_PID" ]; then
         echo "--- host IPv6 addresses:"; ip -6 addr show 2>/dev/null || true
         exit 1
     fi
+    MULTICAST_VERIFIED=1
 else
     echo "ℹ️  Multicast-group egress verification skipped (not running as root)."
 fi
@@ -1343,7 +1347,11 @@ echo "║  E2E TEST MATRIX SUMMARY                                      ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  Phase 1: Real TCP Pairing & SAS Anti-MITM:      PASSED       ║"
 echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
+if [ "$MULTICAST_VERIFIED" = "1" ]; then
 echo "║  Phase 2: Custom multicast groups (v4 + v6):     PASSED       ║"
+else
+echo "║  Phase 2: Custom multicast groups (v4 + v6):     SKIPPED      ║"
+fi
 if [ "$PAM_TESTABLE" = "true" ]; then
 echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
 if [ "$PAM_GRANT_STACK_OK" = "1" ]; then

@@ -22,7 +22,7 @@ enum HashAlgorithm {
 // -- Core Authentication Messages --
 
 /**
- * An AuthenticationRequest is broadcast by the Client (desktop) to
+ * An AuthenticationRequest is multicast by the Client (desktop) to
  * any available Server (phone), requesting authentication.
  */
 message AuthenticationRequest {
@@ -64,7 +64,7 @@ message GrantConfirmation {
 }
 
 /**
- * An AuthenticationCancel is broadcast by the Client once it has been
+ * An AuthenticationCancel is multicast by the Client once it has been
  * unlocked, telling all other Servers to dismiss their pending prompts.
  */
 message AuthenticationCancel {
@@ -172,7 +172,7 @@ message WrapperMessage {
 
 /**
  * The final container for an encrypted message sent over the network.
- * This is the message that is broadcast.
+ * Discovery messages are multicast; replies are unicast.
  */
 message EncryptedPacket {
   // A temporary, rotating identifier that prevents passive tracking.
