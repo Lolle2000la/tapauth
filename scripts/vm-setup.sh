@@ -446,7 +446,7 @@ runcmd:
     fi
     
     echo "Starting PAM test..."
-    echo "You should see BLE advertisement and UDP broadcasts in logs"
+    echo "You should see BLE advertisement and UDP multicast in logs"
     echo "Use your paired Android device to authenticate"
     echo ""
     

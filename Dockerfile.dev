@@ -205,7 +205,7 @@ EOF\n\
 fi\n\
 \n\
 echo "Starting PAM test..."\n\
-echo "You should see BLE advertisement and UDP broadcasts in logs"\n\
+echo "You should see BLE advertisement and UDP multicast in logs"\n\
 echo "Use your paired Android device to authenticate"\n\
 echo ""\n\
 \n\

@@ -138,4 +138,4 @@ An incoming `AuthenticationRequest` **must** be validated against two independen
 
 ### Step 5: Cancelation (All Transports)
 
-* If the client is unlocked (e.g., through a successful `AuthenticationGrant`), it broadcasts/multicasts a final `EncryptedPacket` containing an `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.
+* If the client is unlocked (e.g., through a successful `AuthenticationGrant`), it multicasts a final `EncryptedPacket` containing an `AuthenticationCancel` message to ensure all other Servers dismiss their pending user prompts.

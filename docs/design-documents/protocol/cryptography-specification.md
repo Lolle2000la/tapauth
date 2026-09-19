@@ -62,6 +62,6 @@ The protocol uses two distinct types of symmetric keys:
 *   **Client Symmetric Key (`CSK`)**:
     *   **Scope**: Long-term.
     *   **Generation**: A cryptographically secure 32-byte key generated once by the Client application, typically upon first pairing.
-    *   **Purpose**: This is the primary key used to encrypt all post-pairing communication. It is shared by a single Client with all of its paired Servers, allowing the Client to broadcast a single encrypted message that can be decrypted by any authorized Server.
+    *   **Purpose**: This is the primary key used to encrypt all post-pairing communication. It is shared by a single Client with all of its paired Servers, allowing the Client to multicast a single encrypted message that can be decrypted by any authorized Server.
     *   **Lifecycle**: The `CSK` is stored securely on the Client and on all paired Servers until a device is explicitly un-paired or the key is rotated.
 
