@@ -67,17 +67,27 @@ install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/
 
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation
+#
+# RHEL 10 / Fedora 40 and newer ship the local-only profile as "local",
+# while RHEL 9 and older call the equivalent profile "minimal". Pick
+# whichever one the build host provides so the vendor profile can be
+# generated on every supported release.
+AUTHSELECT_LOCAL="local"
+if [ ! -e %{_datadir}/authselect/default/local/system-auth ]; then
+    AUTHSELECT_LOCAL="minimal"
+fi
+
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
-for f in %{_datadir}/authselect/default/local/*; do
+for f in %{_datadir}/authselect/default/$AUTHSELECT_LOCAL/*; do
     [ -e "$f" ] || continue
     filename=$(basename "$f")
     case "$filename" in
         system-auth|password-auth|README) continue ;;
     esac
-    ln -sf "../../default/local/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
+    ln -sf "../../default/$AUTHSELECT_LOCAL/$filename" %{buildroot}%{_datadir}/authselect/vendor/tapauth/$filename
 done
-install -m 0644 %{_datadir}/authselect/default/local/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
-install -m 0644 %{_datadir}/authselect/default/local/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
+install -m 0644 %{_datadir}/authselect/default/$AUTHSELECT_LOCAL/system-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
+install -m 0644 %{_datadir}/authselect/default/$AUTHSELECT_LOCAL/password-auth %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 if grep -q '^[[:space:]]*auth.*pam_localuser.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth; then
     sed -i '/^[[:space:]]*auth.*pam_localuser.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth
 else
@@ -86,7 +96,7 @@ fi
 sed -i '/^[[:space:]]*auth.*pam_unix.so/i auth        sufficient    pam_tapauth.so' %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/system-auth || exit 1
 grep -q "pam_tapauth.so" %{buildroot}%{_datadir}/authselect/vendor/tapauth/password-auth || exit 1
-printf "TapAuth Local Authentication\n\nThis profile extends the default local profile with smartphone-based TapAuth authentication.\n" > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
+printf "TapAuth Local Authentication\n\nThis profile extends the default %s profile with smartphone-based TapAuth authentication.\n" "$AUTHSELECT_LOCAL" > %{buildroot}%{_datadir}/authselect/vendor/tapauth/README
 
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth-sssd
 for f in %{_datadir}/authselect/default/sssd/*; do
