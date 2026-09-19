@@ -226,7 +226,7 @@ class MulticastReachabilityTest {
 
     /**
      * Drives the exact `startUdpTransport()` / `stopUdpTransport()` paths used by
-     * `ACTION_USER_PRESENT` / `ACTION_SCREEN_OFF` and asserts the socket is bound on unlock and
+     * `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` and asserts the socket is bound on screen-on and
      * unbound on screen-off.
      *
      * Protected system broadcasts cannot be injected from instrumentation, so the service exposes
@@ -234,7 +234,7 @@ class MulticastReachabilityTest {
      * methods.
      */
     @Test
-    fun udpTransportBindsOnUnlockAndUnbindsOnScreenOff() {
+    fun udpTransportBindsOnScreenOnAndUnbindsOnScreenOff() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         assumeTrue("control action is only registered in the e2e build", BuildConfig.E2E_TESTING)
@@ -286,9 +286,9 @@ class MulticastReachabilityTest {
             return
         }
 
-        // Unlock path -> socket binds.
+        // Screen-on path -> socket binds.
         assertTrue(
-            "UDP socket did not bind after simulated unlock (udpRunning=" +
+            "UDP socket did not bind after simulated screen-on (udpRunning=" +
                 "${ServiceStatusManager.udpRunning.value})",
             driveLifecycleUntil(context, start = true, expected = true, timeoutMs = 15_000),
         )

@@ -13,6 +13,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.BuildConfig
@@ -54,16 +55,15 @@ class AuthenticationService : Service() {
     /** Owns the Wi-Fi multicast lock tied to the UDP socket lifetime. */
     private val transportLockManager by lazy { TransportLockManager(this) }
 
-    private val keyguardManager by lazy {
-        getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+    private val powerManager by lazy {
+        getSystemService(Context.POWER_SERVICE) as? PowerManager
     }
 
     /**
-     * E2E builds run with power-management gating disabled so the harness can never be stalled by a
-     * keyguard or a screen timeout mid-suite. Production builds (debug/release) keep the real
-     * keyguard gating.
+     * E2E builds run with screen-state gating disabled so the harness can never be stalled by a
+     * screen timeout mid-suite. Production builds (debug/release) keep the real gating.
      */
-    private val keyguardGatingEnabled = !BuildConfig.E2E_TESTING
+    private val screenStateGatingEnabled = !BuildConfig.E2E_TESTING
 
     private val requestRateLimiter = RequestRateLimiter()
     private lateinit var temporalIdCache: TemporalIdCache
@@ -78,25 +78,21 @@ class AuthenticationService : Service() {
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    Intent.ACTION_USER_PRESENT -> {
-                        Log.i(TAG, "Device unlocked. Starting UDP transport.")
+                    Intent.ACTION_SCREEN_ON -> {
+                        // SCREEN_ON / SCREEN_OFF are a matched pair. SCREEN_ON is used
+                        // deliberately (rather than USER_PRESENT): a tap or power press is enough
+                        // to open the socket, so the prompt can appear over the lock screen
+                        // without the user unlocking first. AOD/doze does not emit SCREEN_ON, so
+                        // the radio still sleeps while the panel is dark.
+                        Log.i(TAG, "Screen on. Starting UDP transport.")
                         startUdpTransport()
                     }
                     Intent.ACTION_SCREEN_OFF -> {
-                        if (keyguardGatingEnabled) {
+                        if (screenStateGatingEnabled) {
                             Log.i(TAG, "Screen off. Stopping UDP transport.")
                             stopUdpTransport()
                         } else {
                             Log.d(TAG, "E2E build: ignoring screen-off for UDP transport")
-                        }
-                    }
-                    Intent.ACTION_SCREEN_ON -> {
-                        // Devices without a keyguard never emit ACTION_USER_PRESENT, so start on
-                        // screen-on when the device is genuinely unlocked. When a keyguard is
-                        // present this is a no-op; ACTION_USER_PRESENT starts the transport later.
-                        if (isUdpTransportAllowed()) {
-                            Log.i(TAG, "Screen on and device unlocked. Starting UDP transport.")
-                            startUdpTransport()
                         }
                     }
                     ACTION_TEST_UDP_LIFECYCLE -> {
@@ -137,7 +133,7 @@ class AuthenticationService : Service() {
 
         /**
          * E2E-build-only action used by instrumentation tests to drive the UDP transport lifecycle
-         * deterministically. Protected system broadcasts (ACTION_USER_PRESENT / ACTION_SCREEN_OFF)
+         * deterministically. Protected system broadcasts (ACTION_SCREEN_ON / ACTION_SCREEN_OFF)
          * cannot be injected by tests, so this exercises the exact same start/stop paths.
          * Registered only when [BuildConfig.E2E_TESTING] is true.
          */
@@ -237,13 +233,13 @@ class AuthenticationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Foreground notification already started in onCreate().
-        // The UDP transport is bound only while the device is unlocked; if the keyguard is up we
-        // wait for ACTION_USER_PRESENT (see screenStateReceiver).
+        // The UDP transport is bound only while the screen is on; if the screen is off we wait for
+        // ACTION_SCREEN_ON (see screenStateReceiver).
         if (isUdpTransportAllowed()) {
             startUdpTransport()
             Log.d(TAG, "Authentication service started")
         } else {
-            Log.i(TAG, "Device is locked; deferring UDP transport until the user unlocks")
+            Log.i(TAG, "Screen is off; deferring UDP transport until ACTION_SCREEN_ON")
         }
         return START_STICKY
     }
@@ -265,18 +261,17 @@ class AuthenticationService : Service() {
         Log.d(TAG, "Authentication service destroyed")
     }
 
-    /**
-     * True when no keyguard is currently locking the device (also true when no keyguard exists).
-     */
-    private fun isDeviceUnlocked(): Boolean = keyguardManager?.isKeyguardLocked != true
+    /** True while the screen is interactive (on); false during screen-off and AOD/doze. */
+    private fun isScreenInteractive(): Boolean = powerManager?.isInteractive == true
 
     /** Whether the UDP transport may be bound right now (always true in the E2E test build). */
-    private fun isUdpTransportAllowed(): Boolean = !keyguardGatingEnabled || isDeviceUnlocked()
+    private fun isUdpTransportAllowed(): Boolean =
+        !screenStateGatingEnabled || isScreenInteractive()
 
     /**
      * Bind the UDP multicast transport and start the receive loop. The Wi-Fi multicast lock is held
      * for exactly as long as the socket is bound, and the transport is only started while the
-     * device is unlocked.
+     * screen is on.
      *
      * No-op when already running, unless [forceRestart] is set (used to rebind after a network
      * change).
@@ -490,7 +485,6 @@ class AuthenticationService : Service() {
     private fun registerScreenStateReceiver() {
         val filter =
             IntentFilter().apply {
-                addAction(Intent.ACTION_USER_PRESENT)
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
                 if (BuildConfig.E2E_TESTING) {
@@ -508,7 +502,7 @@ class AuthenticationService : Service() {
             filter,
             androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
         )
-        Log.d(TAG, "Registered screen/keyguard state receiver")
+        Log.d(TAG, "Registered screen state receiver")
     }
 
     private fun unregisterScreenStateReceiver() {
@@ -588,13 +582,13 @@ class AuthenticationService : Service() {
      *
      * Uses debouncing to prevent overlapping operations when multiple network callbacks fire in
      * quick succession (e.g., onAvailable followed by onCapabilitiesChanged). The rebind is skipped
-     * while the device is locked: the transport is meant to stay down until the user unlocks.
+     * while the screen is off: the transport is meant to stay down until the screen turns on.
      */
     private fun rejoinMulticastGroups() {
         if (!isUdpTransportAllowed()) {
             Log.d(
                 TAG,
-                "Network changed while device locked; deferring multicast rebind until unlock",
+                "Network changed while screen off; deferring multicast rebind until screen on",
             )
             return
         }

@@ -8,8 +8,8 @@ import android.util.Log
  * Owns the Wi-Fi [WifiManager.MulticastLock] required by the UDP multicast listener.
  *
  * Holding this lock forces the Wi-Fi baseband to disable its hardware multicast filter (APF), so
- * the lock must only be held while the UDP socket is actually bound — i.e. while the device is
- * unlocked. See [AuthenticationService] for the screen/keyguard-driven lifecycle.
+ * the lock must only be held while the UDP socket is actually bound — i.e. while the screen is on.
+ * See [AuthenticationService] for the screen-driven lifecycle.
  *
  * Deliberately does **not** use a [WifiManager.WifiLock] (`WIFI_MODE_FULL_HIGH_PERF` /
  * `WIFI_MODE_FULL_LOW_LATENCY`): those keep the Wi-Fi chip awake for the whole screen-on period and
