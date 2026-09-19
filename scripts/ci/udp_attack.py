@@ -145,6 +145,10 @@ def watch_groups(ipv4: str, ipv6: str, port: int, duration: float) -> int:
         print("ERROR: no capturable interfaces found", file=sys.stderr)
         return 1
 
+    # Signal readiness so the harness can avoid a startup race with the first
+    # (possibly only) transmission.
+    print("READY", flush=True)
+
     seen4 = False
     seen6 = False
     deadline = time.time() + duration
@@ -186,7 +190,8 @@ def sniff(port: int, duration: float) -> int:
 
     Opens one raw socket per network interface (lo included) and prints one
     hex-encoded UDP payload per line (flushed immediately) for every datagram
-    whose destination port matches and that is not a broadcast or multicast.
+    whose destination port matches and that is not a multicast or broadcast
+    destination.
     Requires root (CAP_NET_RAW). This deliberately replaces tcpdump in the
     E2E: tcpdump's -Z privilege drop plus per-run buffering behaved
     nondeterministically on CI runners (occasionally writing only the 24-byte

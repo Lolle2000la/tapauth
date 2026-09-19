@@ -96,6 +96,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
     * **IPv4**: The Client sends to the multicast group **`239.255.26.44`** (inside the IPv4 Local Scope `239.255.0.0/16`, RFC 2365). Servers join this group on every multicast-capable interface; the address is not an IANA assignment.
     * **IPv6**: The Client sends to the link-local multicast group **`ff12::fdec:fc27`** on every IPv6-capable interface. The group is transient (not an IANA permanent assignment) and its low 32-bit group ID lies in the IANA "Reserved for Private Use" dynamic range `0xFD000000`-`0xFDFFFFFF` (RFC 10028).
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
+    * **Source port**: Request, confirmation and cancel datagrams are sent from an **ephemeral** source port — the client opens one socket per outgoing interface so it can pin the IPv4/IPv6 multicast interface. Servers **must** therefore reply to the configured UDP port (`udp_port`), never to the observed source port.
 
 * **Bluetooth Low Energy (BLE)**:
     * The Client acts in the **Advertiser/Peripheral** role.

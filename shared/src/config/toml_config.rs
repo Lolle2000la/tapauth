@@ -123,7 +123,7 @@ pub struct TapAuthConfig {
     /// Whether the Local Network (UDP multicast) transport may be
     /// used for authentication attempts (default: true).
     ///
-    /// When disabled, the daemon will not broadcast authentication requests
+    /// When disabled, the daemon will not multicast authentication requests
     /// over UDP and will not open the firewall port for them.
     pub enable_network: bool,
 

@@ -139,7 +139,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`
-2. `tapauthd` broadcasts via UDP (port 36692) **and** starts BLE advertising simultaneously
+2. `tapauthd` multicasts via UDP (port 36692) **and** starts BLE advertising simultaneously
 3. Android device replies on the same transport
 4. First valid `Grant` wins; `tapauthd` signals `client-pam`
 

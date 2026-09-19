@@ -54,10 +54,11 @@ pub struct MulticastInterface {
 
 /// Get all network interfaces suitable for IP multicast.
 ///
-/// Returns interfaces that are:
-/// - UP (active)
-/// - Not loopback
-/// - Have at least one IPv4 or IPv6 address
+/// Returns every non-loopback interface that has at least one IPv4 or IPv6
+/// address. That is the only filter: point-to-point links and interfaces whose
+/// oper-status is not "up" are deliberately left in, because address presence is
+/// the signal that matters. Callers skip interfaces lacking the address family
+/// they need, and per-interface send failures are logged rather than fatal.
 pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
     let mut by_name: std::collections::HashMap<String, (Option<Ipv4Addr>, Option<Ipv6Addr>)> =
         std::collections::HashMap::new();
@@ -646,7 +647,34 @@ mod tests {
         for iface in interfaces {
             assert!(iface.index > 0);
             assert!(!iface.name.is_empty());
+            // Loopback is always excluded.
+            assert_ne!(iface.name, "lo");
+            // Every returned interface carries at least one usable address.
+            assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_udp_multicast_rejects_invalid_addresses() {
+        use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
+
+        let packet = EncryptedPacket {
+            temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0u8; 64],
+        };
+
+        // A malformed group must fail fast rather than silently send nothing.
+        assert!(
+            send_udp_multicast_v4_all_interfaces("not-an-ip", 36692, &packet)
+                .await
+                .is_err()
+        );
+        assert!(
+            send_udp_multicast_all_interfaces("not-an-ip", 36692, &packet)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

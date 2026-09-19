@@ -115,9 +115,9 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 4. `tapauthd` returns `DENIED` outcome to PAM module.
 
 ### Phase 5b: Authentication Timeout Verification
-1. Android app is stopped so no device responds to the auth broadcast.
+1. Android app is stopped so no device responds to the auth multicast.
 2. Authentication is requested with a 2-second timeout.
-3. `tapauthd` detects deadline expiry, broadcasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
+3. `tapauthd` detects deadline expiry, multicasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
 
 ### Phase 6: Device Removal / Un-pairing Lifecycle
 1. Desktop invokes `remove-device <server_public_key>` via admin IPC.
@@ -187,7 +187,7 @@ E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and
 CI runs in **systemd mode**: the daemon is installed as the real `tapauthd.service`/`tapauthd.socket`
 units, is socket-activated (no `fallback-socket`), runs as the unprivileged `tapauthd` user, and keeps
 state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`. The binary enables only two dev
-features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN broadcast path into the
+features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN multicast path into the
 emulator) and `dev-polkit-bypass` (so the root harness needs no authentication agent). `dev-state-override`
 is **off**, so `TAPAUTH_STATE_DIR` is not compiled in at all and every path is the production one. Phase 7
 therefore proves that PolKit still denies unprivileged non-owner callers; it does not prove anything about

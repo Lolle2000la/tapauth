@@ -1,10 +1,10 @@
 #!/bin/bash
 # Sets up the UDP port redirection the E2E suite needs to reach the Android guest.
 #
-# The daemon (built with dev-udp-loopback) unicasts every packet it broadcasts to
+# The daemon (built with dev-udp-loopback) unicasts every packet it multicasts to
 # TAPAUTH_DEV_UDP_TARGET = 127.0.0.1:$HOST_PORT; adb forwards that host port to the
 # guest's $GUEST_PORT. Replies go back out directly to 10.0.2.2:<daemon port>, so no
-# broadcast reflection is involved.
+# multicast reflection is involved.
 set -e
 
 # Kept in sync with scripts/test-e2e.sh (which exports both).

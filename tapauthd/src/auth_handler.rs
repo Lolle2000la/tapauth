@@ -418,7 +418,7 @@ impl AuthSession {
             }
             Err(_) => {
                 tracing::warn!("Authentication timeout for user {}", self.username);
-                // Broadcast AuthenticationCancel so servers stop retransmitting
+                // Multicast AuthenticationCancel so servers stop retransmitting
                 if let Ok(cancel_packet) = self.create_cancel_packet() {
                     if self.transports.network {
                         let udp_socket = self.state.udp_socket.clone();
@@ -661,7 +661,7 @@ impl AuthSession {
                         Ok(Ok(())) => {
                             tracing::info!("BLE authentication succeeded");
                             udp_abort.abort();
-                            self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                            self.multicast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
                                 .await;
                             return Ok(());
                         }
@@ -687,7 +687,7 @@ impl AuthSession {
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication succeeded");
                             ble_abort.abort();
-                            self.broadcast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
+                            self.multicast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
                                 .await;
                             return Ok(());
                         }
@@ -718,7 +718,7 @@ impl AuthSession {
     }
 
     #[cfg(feature = "ble")]
-    async fn broadcast_cancel_on_success(
+    async fn multicast_cancel_on_success(
         &self,
         ble_transport: &Option<Arc<crate::transport::BleTransport>>,
         udp_transport: &Arc<crate::transport::UdpTransport>,
@@ -772,12 +772,10 @@ impl AuthSession {
         );
 
         if self.transports.network {
-            tracing::info!("Broadcasting AuthenticationCancel over UDP");
-            if let Err(e) = udp_transport.send_cancel(cancel_packet).await {
-                tracing::warn!("UDP cancel broadcast failed: {}", e);
-            } else {
-                tracing::debug!("UDP cancel broadcast sent");
-            }
+            // UdpTransport logs per-interface multicast failures internally, so
+            // there is no error to act on here.
+            tracing::info!("Multicasting AuthenticationCancel over UDP");
+            let _ = udp_transport.send_cancel(cancel_packet).await;
         }
 
         // Disconnect BLE clients (non-blocking)
