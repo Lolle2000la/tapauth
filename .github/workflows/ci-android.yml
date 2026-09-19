@@ -124,7 +124,7 @@ jobs:
           # production one. Only two dev knobs are compiled in, both still requiring
           # TAPAUTH_DEV_MODE at runtime:
           #   dev-udp-loopback   - the emulator UDP delivery shim (a hosted runner
-          #                        has no LAN broadcast path into the emulator)
+          #                        has no LAN multicast path into the emulator)
           #   dev-polkit-bypass  - lets the root test harness administer the daemon
           #                        without an authentication agent; PolKit is still
           #                        enforced for non-root callers (asserted by Phase 7)

@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create global UDP socket for the daemon's lifetime.
     // Created even when the Local Network transport is disabled so that
     // re-enabling it at runtime does not require a daemon restart.
-    let udp_socket = shared::network::create_broadcast_socket(udp_port).await?;
+    let udp_socket = shared::network::create_multicast_socket(udp_port).await?;
     tracing::info!("Created global UDP socket on port {}", udp_port);
 
     // Load daemon state (config, keys, etc.)

@@ -42,7 +42,7 @@ graph TB
     end
 
     DAEMON <-->|"TCP Pairing Handshake (Ephemeral Port)<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
-    DAEMON <-->|"UDP Broadcast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
+    DAEMON <-->|"UDP Multicast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
     DAEMON <-->|"BLE GATT Service (b4ad84c0...)<br/>/dev/vhci ◄► Bumble ◄► Netsim"| BLE_SRV
 ```
 
@@ -73,10 +73,11 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 ### Phase 2: Local Network (UDP) End-to-End Authentication
 1. Desktop enables UDP transport and disables BLE via admin IPC (`set-transports --network true --ble false`).
 2. Authentication is requested for the test user via `tapauth-ipc-cli pam-auth <user> 20`.
-3. `tapauthd` broadcasts `EncryptedPacket` on UDP port 36692 (and forwards to emulator port `36695` via dev shim).
-4. `AuthenticationService` on Android receives packet, validates temporal ID via `TemporalIdCache`, decrypts `AuthRequest`, and prompts for biometrics.
-5. Android verifies biometrics and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
-6. `tapauthd` verifies signature, responds with `GrantConfirmation` (up to 3 times), and returns `SUCCESS` (0) to PAM client.
+3. `tapauthd` multicasts `EncryptedPacket` to the IPv4 (`239.255.26.44`) and IPv6 (`ff12::fdec:fc27`) discovery groups on UDP port 36692 (and forwards to emulator port `36695` via dev shim).
+4. An AF_PACKET watcher asserts the daemon really emitted a packet to **both** groups (the emulator delivery itself goes through the dev shim, not LAN multicast).
+5. `AuthenticationService` on Android receives packet, validates temporal ID via `TemporalIdCache`, decrypts `AuthRequest`, and prompts for biometrics.
+6. Android verifies biometrics and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
+7. `tapauthd` verifies signature, responds with `GrantConfirmation` (up to 3 times), and returns `SUCCESS` (0) to PAM client.
 
 ### Phase 2b: Real PAM Module Authentication (`pamtester`)
 1. Test suite creates temporary PAM service definition at `/etc/pam.d/tapauth-test-e2e` pointing to `libclient_pam.so`.
@@ -114,9 +115,9 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 4. `tapauthd` returns `DENIED` outcome to PAM module.
 
 ### Phase 5b: Authentication Timeout Verification
-1. Android app is stopped so no device responds to the auth broadcast.
+1. Android app is stopped so no device responds to the auth multicast.
 2. Authentication is requested with a 2-second timeout.
-3. `tapauthd` detects deadline expiry, broadcasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
+3. `tapauthd` detects deadline expiry, multicasts `AuthenticationCancel`, and returns `TIMEOUT` outcome.
 
 ### Phase 6: Device Removal / Un-pairing Lifecycle
 1. Desktop invokes `remove-device <server_public_key>` via admin IPC.
@@ -186,7 +187,7 @@ E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and
 CI runs in **systemd mode**: the daemon is installed as the real `tapauthd.service`/`tapauthd.socket`
 units, is socket-activated (no `fallback-socket`), runs as the unprivileged `tapauthd` user, and keeps
 state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`. The binary enables only two dev
-features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN broadcast path into the
+features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN multicast path into the
 emulator) and `dev-polkit-bypass` (so the root harness needs no authentication agent). `dev-state-override`
 is **off**, so `TAPAUTH_STATE_DIR` is not compiled in at all and every path is the production one. Phase 7
 therefore proves that PolKit still denies unprivileged non-owner callers; it does not prove anything about

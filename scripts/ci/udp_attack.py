@@ -9,6 +9,12 @@ Two subcommands:
       AuthenticationGrant). One hex string per line; the first line is the first
       captured grant. Requires root (CAP_NET_RAW).
 
+  watch-groups --ipv4 A --ipv6 B [--port N] [--duration SECS]
+      Watch AF_PACKET for EncryptedPacket datagrams addressed to the configured
+      discovery multicast groups, printing SEEN_IPV4/SEEN_IPV6 once per group.
+      The E2E uses this to prove tapauthd targets the custom groups. Requires
+      root (CAP_NET_RAW).
+
   send <hex_payload> [--corrupt] [--host H] [--port N]
       Re-inject a captured datagram. With --corrupt, the last byte (inside the
       AES-GCM tag region) is flipped so that AEAD verification must fail while
@@ -26,6 +32,7 @@ the daemon, which is why loopback injection is accepted.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import socket
 import struct
 import sys
@@ -99,12 +106,92 @@ def looks_like_encrypted_packet(payload: bytes) -> bool:
     return len(payload) >= MIN_ENCRYPTED_PACKET_LEN and payload[0] == 0x0A and payload[1] == 0x10
 
 
+def open_packet_sockets() -> list[socket.socket]:
+    """Open one AF_PACKET raw socket per capturable interface (lo included)."""
+    sockets = []
+    for _if_index, if_name in socket.if_nameindex():
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+        try:
+            s.bind((if_name, 0))
+        except OSError:
+            continue  # interface went away or cannot be captured on
+        s.setblocking(False)
+        sockets.append(s)
+    return sockets
+
+
+def watch_groups(ipv4: str, ipv6: str, port: int, duration: float) -> int:
+    """Watch the wire for TapAuth packets sent to the discovery groups.
+
+    Prints exactly one ``SEEN_IPV4 <addr>`` / ``SEEN_IPV6 <addr>`` line for each
+    group once an EncryptedPacket datagram addressed to it (and the configured
+    port) is observed. The E2E uses this to prove the daemon actually emits
+    traffic to the configured multicast groups rather than the all-nodes
+    broadcast/multicast used previously.
+
+    Requires root (CAP_NET_RAW).
+    """
+    import select
+
+    targets4 = {ipaddress.IPv4Address(ipv4)}
+    targets6 = {ipaddress.IPv6Address(ipv6)}
+
+    try:
+        sockets = open_packet_sockets()
+    except PermissionError:
+        print("ERROR: AF_PACKET capture requires root", file=sys.stderr)
+        return 1
+    if not sockets:
+        print("ERROR: no capturable interfaces found", file=sys.stderr)
+        return 1
+
+    # Signal readiness so the harness can avoid a startup race with the first
+    # (possibly only) transmission.
+    print("READY", flush=True)
+
+    seen4 = False
+    seen6 = False
+    deadline = time.time() + duration
+    try:
+        while time.time() < deadline and not (seen4 and seen6):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select(sockets, [], [], min(0.5, remaining))
+            for s in readable:
+                frame = s.recv(65535)
+                l3 = strip_link_layer(frame)
+                if l3 is None:
+                    continue
+                parsed = parse_ipv4(l3)
+                family = 4
+                if parsed is None:
+                    parsed = parse_ipv6(l3)
+                    family = 6
+                if parsed is None:
+                    continue
+                _src, dst, _sport, dport, payload = parsed
+                if dport != port or not looks_like_encrypted_packet(payload):
+                    continue
+                if family == 4 and not seen4 and ipaddress.IPv4Address(dst) in targets4:
+                    seen4 = True
+                    print(f"SEEN_IPV4 {dst}", flush=True)
+                elif family == 6 and not seen6 and ipaddress.IPv6Address(dst) in targets6:
+                    seen6 = True
+                    print(f"SEEN_IPV6 {dst}", flush=True)
+    finally:
+        for s in sockets:
+            s.close()
+    return 0
+
+
 def sniff(port: int, duration: float) -> int:
     """Capture server->client EncryptedPacket datagrams via AF_PACKET.
 
     Opens one raw socket per network interface (lo included) and prints one
     hex-encoded UDP payload per line (flushed immediately) for every datagram
-    whose destination port matches and that is not a broadcast or multicast.
+    whose destination port matches and that is not a multicast or broadcast
+    destination.
     Requires root (CAP_NET_RAW). This deliberately replaces tcpdump in the
     E2E: tcpdump's -Z privilege drop plus per-run buffering behaved
     nondeterministically on CI runners (occasionally writing only the 24-byte
@@ -113,15 +200,7 @@ def sniff(port: int, duration: float) -> int:
     import select
 
     try:
-        sockets = []
-        for _if_index, if_name in socket.if_nameindex():
-            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
-            try:
-                s.bind((if_name, 0))
-            except OSError:
-                continue  # interface went away or cannot be captured on
-            s.setblocking(False)
-            sockets.append(s)
+        sockets = open_packet_sockets()
     except PermissionError:
         print("ERROR: AF_PACKET capture requires root", file=sys.stderr)
         return 1
@@ -159,7 +238,25 @@ def sniff(port: int, duration: float) -> int:
 
 
 def is_broadcast_dst(dst: str) -> bool:
-    return dst in ("255.255.255.255", "ff02::1") or dst.endswith(".255")
+    """True for IPv4 broadcast and any IPv4/IPv6 multicast destination.
+
+    The daemon now targets explicit multicast groups (see
+    IPV4_MULTICAST_ADDR / IPV6_MULTICAST_ADDR in shared/src/network.rs) rather
+    than the limited broadcast address, so a generic multicast check is needed
+    to keep the grant sniffer from misclassifying the daemon's own outgoing
+    requests.
+    """
+    try:
+        addr = ipaddress.ip_address(dst)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv4Address):
+        # `is_multicast` covers 224.0.0.0/4. `255.255.255.255` is the limited
+        # broadcast address; the `.255` suffix is a conservative heuristic for a
+        # subnet-directed broadcast (no netmask is available at this capture
+        # layer). Kept so stray LAN broadcasts are not mistaken for grants.
+        return addr.is_multicast or dst == "255.255.255.255" or dst.endswith(".255")
+    return addr.is_multicast
 
 
 def send_packet(hex_payload: str, host: str, port: int, corrupt: bool) -> None:
@@ -187,9 +284,20 @@ def main() -> int:
     p_sniff.add_argument("--port", type=int, default=36692)
     p_sniff.add_argument("--duration", type=float, default=30.0)
 
+    p_watch = sub.add_parser(
+        "watch-groups",
+        help="assert the daemon sends to the configured multicast groups (requires root)",
+    )
+    p_watch.add_argument("--ipv4", required=True, help="expected IPv4 multicast group")
+    p_watch.add_argument("--ipv6", required=True, help="expected IPv6 multicast group")
+    p_watch.add_argument("--port", type=int, default=36692)
+    p_watch.add_argument("--duration", type=float, default=30.0)
+
     args = parser.parse_args()
     if args.command == "sniff":
         return sniff(args.port, args.duration)
+    if args.command == "watch-groups":
+        return watch_groups(args.ipv4, args.ipv6, args.port, args.duration)
     if args.command == "send":
         send_packet(args.hex_payload, args.host, args.port, args.corrupt)
         return 0

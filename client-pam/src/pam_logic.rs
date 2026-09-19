@@ -513,7 +513,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 None => pam_sys::PAM_IGNORE,
             },
             ExitReason::Timeout => {
-                // The daemon runs on the same deadline and broadcasts its own
+                // The daemon runs on the same deadline and multicasts its own
                 // AuthenticationCancel, so no client-side cancel is needed.
                 pam_conv.try_info(msgs.timed_out());
                 pam_sys::PAM_IGNORE

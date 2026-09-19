@@ -1,7 +1,7 @@
 # AGENTS.md - TapAuth
 
 ## Overview
-**TapAuth** is a local-first authentication system: a Linux desktop (**Client**) unlocks via a paired Android device (**Server**) over UDP broadcast/multicast or BLE.
+**TapAuth** is a local-first authentication system: a Linux desktop (**Client**) unlocks via a paired Android device (**Server**) over UDP multicast or BLE.
 
 | Term | Role | Path | Stack |
 | :--- | :--- | :--- | :--- |
@@ -139,7 +139,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`
-2. `tapauthd` broadcasts via UDP (port 36692) **and** starts BLE advertising simultaneously
+2. `tapauthd` multicasts via UDP (port 36692) **and** starts BLE advertising simultaneously
 3. Android device replies on the same transport
 4. First valid `Grant` wins; `tapauthd` signals `client-pam`
 
@@ -154,7 +154,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 - Authorization is enforced daemon-side via PolKit; socket permissions gate access.
 
 ### Transport Details
-- **UDP port 36692** (default, user-configurable). IPv4 broadcast (`255.255.255.255`) + IPv6 multicast (`ff02::1`).
+- **UDP port 36692** (default, user-configurable). IPv4 multicast **`239.255.26.44`** (IPv4 Local Scope, RFC 2365) + IPv6 multicast **`ff12::fdec:fc27`** (transient link-local; low 32 bits in the IANA private-use group-ID range, RFC 10028). The daemon sends on every suitable interface; paired Android devices join both groups.
 - **BLE**: Service UUID `b4ad84c0-2adb-4876-8315-b39d983b2bde`. GATT characteristic UUIDs are in `docs/design-documents/protocol/ble-gatt-specification.md`.
 - **Pairing uses TCP** (not UDP). QR code URL format: `tapauth://pair?v=1&pk=<hex>&p=<port>&ip4=<ipv4>&ip6=<ipv6>`.
 

@@ -38,77 +38,136 @@ struct InterfaceCache {
     last_refresh: Instant,
 }
 
-/// Represents a network interface suitable for IPv6 multicast
+/// Represents a network interface suitable for IP multicast.
+///
+/// An interface is included when it is not loopback and has at least one IPv4 or
+/// IPv6 address; oper-status and point-to-point are not filtered (see
+/// [`get_multicast_interfaces`]). The selected addresses are recorded so an IPv4
+/// multicast send can pin `IP_MULTICAST_IF` on that interface and an IPv6 send
+/// can use the interface index as its scope.
 #[derive(Debug, Clone)]
 pub struct MulticastInterface {
     pub name: String,
     pub index: u32,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
 }
 
-/// Get all network interfaces suitable for IPv6 multicast
-/// Returns interfaces that are:
-/// - UP (active)
-/// - Not loopback
-/// - Support IPv6
-/// - Not point-to-point links
+/// Addresses collected for one interface before a single one per family is
+/// selected. Interfaces may carry several addresses of the same family (e.g. a
+/// routable address plus APIPA).
+#[derive(Debug, Default)]
+struct InterfaceAddrs {
+    v4: Vec<Ipv4Addr>,
+    v6: Vec<Ipv6Addr>,
+}
+
+/// Choose the IPv4 address used as the multicast source for an interface.
+///
+/// A routable address is preferred over APIPA (`169.254.0.0/16`): the address
+/// chosen here becomes the source of the discovery datagram and therefore the
+/// unicast reply target the phone uses, and an unroutable source would send the
+/// reply nowhere. The smallest non-link-local address wins, independent of the
+/// input order.
+fn select_ipv4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    addrs
+        .iter()
+        .copied()
+        .filter(|addr| !addr.is_link_local())
+        .min()
+        .or_else(|| addrs.iter().copied().min())
+}
+
+/// Get all network interfaces suitable for IP multicast.
+///
+/// Returns every non-loopback interface that has at least one IPv4 or IPv6
+/// address. That is the only filter: point-to-point links and interfaces whose
+/// oper-status is not "up" are deliberately left in, because address presence is
+/// the signal that matters. Virtual/container interfaces (`docker0`, `veth*`,
+/// `br-*`, …) are likewise not excluded by name heuristics — a legitimate bridge
+/// can carry real peers, and a send with no receivers is harmless. Callers skip
+/// interfaces lacking the address family they need, and per-interface send
+/// failures are logged rather than fatal.
 pub fn get_multicast_interfaces() -> Vec<MulticastInterface> {
-    let mut interfaces = Vec::new();
-    let mut ipv6_interface_names = std::collections::HashSet::new();
+    let mut by_name: std::collections::HashMap<String, InterfaceAddrs> =
+        std::collections::HashMap::new();
 
     match if_addrs::get_if_addrs() {
         Ok(addrs) => {
-            tracing::trace!("Enumerating network interfaces for IPv6 multicast");
+            tracing::trace!("Enumerating network interfaces for IP multicast");
 
-            // First pass: collect all interface names that have IPv6 addresses
             for iface in &addrs {
-                tracing::trace!(
-                    "Found interface: {} (loopback: {}, addr: {:?})",
-                    iface.name,
-                    iface.is_loopback(),
-                    iface.addr
-                );
-
                 // Skip loopback interfaces
                 if iface.is_loopback() {
                     tracing::trace!("  Skipping {} - loopback", iface.name);
                     continue;
                 }
 
-                // Check if this address is IPv6
-                if matches!(iface.addr, if_addrs::IfAddr::V6(_)) {
-                    tracing::trace!("  Interface {} has IPv6 address", iface.name);
-                    ipv6_interface_names.insert(iface.name.clone());
-                }
-            }
-
-            tracing::trace!("Interfaces with IPv6: {:?}", ipv6_interface_names);
-
-            // Second pass: get interface indices for IPv6-capable interfaces
-            for name in ipv6_interface_names {
-                match get_interface_index(&name) {
-                    Ok(index) => {
-                        tracing::trace!("  Added interface {} with index {}", name, index);
-                        interfaces.push(MulticastInterface {
-                            name: name.clone(),
-                            index,
-                        });
+                match &iface.addr {
+                    if_addrs::IfAddr::V4(v4) => {
+                        tracing::trace!("  Interface {} has IPv4 {}", iface.name, v4.ip);
+                        by_name
+                            .entry(iface.name.clone())
+                            .or_default()
+                            .v4
+                            .push(v4.ip);
                     }
-                    Err(e) => {
-                        tracing::trace!("  Failed to get index for {}: {}", name, e);
+                    if_addrs::IfAddr::V6(v6) => {
+                        tracing::trace!("  Interface {} has IPv6 {}", iface.name, v6.ip);
+                        by_name
+                            .entry(iface.name.clone())
+                            .or_default()
+                            .v6
+                            .push(v6.ip);
                     }
                 }
             }
-
-            tracing::trace!(
-                "Found {} suitable IPv6 interface(s): {:?}",
-                interfaces.len(),
-                interfaces.iter().map(|i| &i.name).collect::<Vec<_>>()
-            );
         }
         Err(e) => {
             tracing::warn!("Failed to enumerate network interfaces: {}", e);
         }
     }
+
+    let mut interfaces = Vec::new();
+    for (name, mut addrs) in by_name {
+        addrs.v4.sort_unstable();
+        addrs.v4.dedup();
+        addrs.v6.sort_unstable();
+        addrs.v6.dedup();
+
+        match get_interface_index(&name) {
+            Ok(index) => {
+                let ipv4 = select_ipv4(&addrs.v4);
+                let ipv6 = addrs.v6.first().copied();
+                tracing::trace!(
+                    "  Added interface {} with index {} (ipv4={:?}, ipv6={:?})",
+                    name,
+                    index,
+                    ipv4,
+                    ipv6
+                );
+                interfaces.push(MulticastInterface {
+                    name,
+                    index,
+                    ipv4,
+                    ipv6,
+                });
+            }
+            Err(e) => {
+                tracing::trace!("  Failed to get index for {}: {}", name, e);
+            }
+        }
+    }
+
+    // Stable ordering so logs/tests are deterministic regardless of HashMap
+    // iteration order.
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+
+    tracing::trace!(
+        "Found {} suitable multicast interface(s): {:?}",
+        interfaces.len(),
+        interfaces.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
 
     interfaces
 }
@@ -217,15 +276,18 @@ pub fn is_ipv6_available() -> bool {
     available
 }
 
-/// Create a UDP socket for broadcasting/multicasting (async)
-/// Binds to the configured UDP port to receive responses on that port
-pub async fn create_broadcast_socket(port: u16) -> Result<UdpSocket, NetworkError> {
-    let std_socket = bind_dual_stack_socket(port, true)?;
+/// Create the daemon's dual-stack UDP socket for multicast discovery (async).
+///
+/// Binds to the configured UDP port so unicast responses from paired servers
+/// are received on that port. The daemon only *sends* to multicast groups;
+/// replies are always unicast, so no group membership is required here.
+pub async fn create_multicast_socket(port: u16) -> Result<UdpSocket, NetworkError> {
+    let std_socket = bind_dual_stack_socket(port)?;
     let socket = UdpSocket::from_std(std_socket)?;
 
     let local_addr = socket.local_addr()?;
     tracing::info!(
-        "Created broadcast socket on {} (listening for responses on configured port)",
+        "Created multicast socket on {} (listening for responses on configured port)",
         local_addr
     );
 
@@ -234,27 +296,100 @@ pub async fn create_broadcast_socket(port: u16) -> Result<UdpSocket, NetworkErro
 
 /// Create a UDP socket for listening on a specific port (async)
 pub async fn create_listen_socket(port: u16) -> Result<UdpSocket, NetworkError> {
-    let std_socket = bind_dual_stack_socket(port, false)?;
+    let std_socket = bind_dual_stack_socket(port)?;
     let socket = UdpSocket::from_std(std_socket)?;
     Ok(socket)
 }
 
-/// Send an encrypted packet via UDP broadcast (IPv4) - async
-pub async fn send_udp_broadcast(
-    socket: &UdpSocket,
+/// Send an encrypted packet to the IPv4 multicast group on all available
+/// interfaces.
+///
+/// `IP_MULTICAST_IF` is pinned per interface so a multi-homed host reaches
+/// every segment (mirroring the IPv6 path below).
+pub async fn send_udp_multicast_v4_all_interfaces(
+    multicast_addr: &str,
     port: u16,
     packet: &EncryptedPacket,
-) -> Result<(), NetworkError> {
+) -> Result<usize, NetworkError> {
     let data = packet.encode_to_vec();
-    let addr = SocketAddr::from((Ipv4Addr::BROADCAST, port));
-    socket.send_to(&data, addr).await?;
-    Ok(())
+
+    let multicast_ip: Ipv4Addr = multicast_addr.parse().map_err(|_| {
+        NetworkError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid IPv4 multicast address",
+        ))
+    })?;
+
+    let interfaces = get_multicast_interfaces();
+    let mut success_count = 0;
+
+    for iface in interfaces {
+        // Only interfaces with an IPv4 address can carry an IPv4 group.
+        let Some(iface_ip) = iface.ipv4 else {
+            continue;
+        };
+
+        let socket = match socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Failed to create IPv4 socket for {}: {}", iface.name, e);
+                continue;
+            }
+        };
+
+        let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        if let Err(e) = socket.bind(&bind_addr.into()) {
+            tracing::debug!("Failed to bind IPv4 socket for {}: {}", iface.name, e);
+            continue;
+        }
+
+        // Do not loop multicast back to ourselves: the daemon does not join
+        // these groups, so a self-delivery would only be redundant traffic.
+        if let Err(e) = socket.set_multicast_loop_v4(false) {
+            tracing::trace!(
+                "Failed to disable IPv4 multicast loop for {}: {}",
+                iface.name,
+                e
+            );
+        }
+
+        if let Err(e) = socket.set_multicast_if_v4(&iface_ip) {
+            tracing::debug!(
+                "Failed to set multicast interface for {}: {}",
+                iface.name,
+                e
+            );
+            continue;
+        }
+
+        let dest_addr = SocketAddr::from((multicast_ip, port));
+        match socket.send_to(&data, &dest_addr.into()) {
+            Ok(_) => {
+                tracing::trace!(
+                    "Sent IPv4 multicast on interface {} ({})",
+                    iface.name,
+                    iface_ip
+                );
+                success_count += 1;
+            }
+            Err(e) => {
+                tracing::debug!("Failed to send IPv4 multicast on {}: {}", iface.name, e);
+            }
+        }
+    }
+
+    if success_count > 0 {
+        tracing::trace!("Sent IPv4 multicast on {} interface(s)", success_count);
+    }
+
+    Ok(success_count)
 }
 
-fn bind_dual_stack_socket(
-    port: u16,
-    enable_broadcast: bool,
-) -> Result<std::net::UdpSocket, std::io::Error> {
+fn bind_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, std::io::Error> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
 
     // Allow the socket to accept both IPv4 and IPv6 traffic
@@ -263,10 +398,6 @@ fn bind_dual_stack_socket(
 
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
-
-    if enable_broadcast {
-        socket.set_broadcast(true)?;
-    }
 
     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     socket.bind(&SockAddr::from(addr))?;
@@ -305,6 +436,12 @@ pub async fn send_udp_multicast_all_interfaces(
 
     // Send on each interface by setting the multicast interface option
     for iface in interfaces {
+        // Link-local IPv6 groups can only be sent on interfaces that have an
+        // IPv6 address.
+        if iface.ipv6.is_none() {
+            continue;
+        }
+
         // Create a UDP socket for IPv6
         let socket_addr = match "[::]:0".parse::<std::net::SocketAddr>() {
             Ok(addr) => addr,
@@ -419,14 +556,14 @@ pub async fn receive_udp_packet(
             }),
         };
 
-        // A broadcast/multicast sent by this very socket can be looped back by
-        // the kernel with our own address AND our own source port. Such an
-        // exact self-echo is never a legitimate peer packet; processing it
-        // would make the retransmission loop spin at full speed (each echo
-        // looks like a fast "no valid response yet" outcome). This check is
-        // independent of the dev-mode local-address filter below, which must
-        // stay permissive so loopback test harnesses (Android emulator over
-        // SLIRP) keep working.
+        // A locally-sourced datagram whose source port equals the port this
+        // socket is bound to is a loopback/echo artefact, never a legitimate
+        // remote peer; processing it would make the retransmission loop spin
+        // (each echo looks like a fast "no valid response yet" outcome). The
+        // daemon's own multicast sends use ephemeral source ports and do not
+        // join these groups, so this is purely defensive. It is independent of
+        // the dev-mode local-address filter below, which must stay permissive
+        // so loopback test harnesses (Android emulator over SLIRP) keep working.
         if local_port == Some(addr.port()) && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-echoed UDP packet from {}", addr);
             // drop and continue waiting for next packet
@@ -496,9 +633,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_sockets() {
-        // Test creating broadcast socket on an ephemeral port (0 = OS assigns)
-        let broadcast_socket = create_broadcast_socket(0).await;
-        assert!(broadcast_socket.is_ok());
+        // Test creating the daemon's multicast socket on an ephemeral port
+        // (0 = OS assigns)
+        let multicast_socket = create_multicast_socket(0).await;
+        assert!(multicast_socket.is_ok());
 
         // Test creating listen socket on a random port
         let listen_socket = create_listen_socket(0).await;
@@ -506,12 +644,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_udp_broadcast() {
+    async fn test_send_udp_multicast_v4_all_interfaces() {
         use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
-
-        // Use ephemeral port (0) to avoid conflicts when tests run in parallel
-        let socket = create_broadcast_socket(0).await.unwrap();
-        let local_port = socket.local_addr().unwrap().port();
 
         let packet = EncryptedPacket {
             temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
@@ -519,10 +653,44 @@ mod tests {
             ciphertext: vec![0u8; 64],
         };
 
-        let result = send_udp_broadcast(&socket, local_port, &packet).await;
+        let result = send_udp_multicast_v4_all_interfaces(
+            crate::network::IPV4_MULTICAST_ADDR,
+            36692,
+            &packet,
+        )
+        .await;
 
-        // Accept any result — network conditions vary across test environments
-        drop(result);
+        // Should succeed or return 0 if no suitable interfaces
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multicast_group_constants() {
+        use crate::network::{IPV4_MULTICAST_ADDR, IPV6_MULTICAST_ADDR};
+
+        // IPv4 group must be a multicast address inside the IPv4 Local Scope
+        // (239.255.0.0/16, RFC 2365), not the limited broadcast address.
+        let v4: Ipv4Addr = IPV4_MULTICAST_ADDR.parse().unwrap();
+        assert!(v4.is_multicast());
+        assert_eq!(v4.octets()[0], 239);
+        assert_eq!(v4.octets()[1], 255);
+
+        // IPv6 group must be multicast, transient (flag = 1) and link-local
+        // (scope = 2) => ff12::/16.
+        let v6: Ipv6Addr = IPV6_MULTICAST_ADDR.parse().unwrap();
+        assert!(v6.is_multicast());
+        let second_byte = v6.octets()[1];
+        assert_eq!(second_byte >> 4, 0x1, "IPv6 group must be transient");
+        assert_eq!(second_byte & 0x0f, 0x2, "IPv6 group must be link-local");
+
+        // The low 32 bits are the IPv6 group ID and must be inside the IANA
+        // "Reserved for Private Use" dynamic range 0xFD000000-0xFDFFFFFF.
+        let o = v6.octets();
+        let low32 = u32::from_be_bytes([o[12], o[13], o[14], o[15]]);
+        assert!(
+            (0xFD00_0000..=0xFDFF_FFFF).contains(&low32),
+            "IPv6 group ID 0x{low32:08X} is outside the private-use range"
+        );
     }
 
     #[tokio::test]
@@ -534,7 +702,51 @@ mod tests {
         for iface in interfaces {
             assert!(iface.index > 0);
             assert!(!iface.name.is_empty());
+            // Loopback is always excluded.
+            assert_ne!(iface.name, "lo");
+            // Every returned interface carries at least one usable address.
+            assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    #[test]
+    fn test_select_ipv4_prefers_routable_over_apipa() {
+        let apipa = Ipv4Addr::new(169, 254, 1, 2);
+        let routable_a = Ipv4Addr::new(192, 168, 1, 10);
+        let routable_b = Ipv4Addr::new(10, 0, 0, 5);
+
+        // A routable address wins over APIPA regardless of slice order.
+        assert_eq!(select_ipv4(&[apipa, routable_a]), Some(routable_a));
+        assert_eq!(select_ipv4(&[routable_a, apipa]), Some(routable_a));
+        // Among routable addresses the smallest wins, independent of order.
+        assert_eq!(select_ipv4(&[routable_a, routable_b]), Some(routable_b));
+        assert_eq!(select_ipv4(&[routable_b, routable_a]), Some(routable_b));
+        // APIPA is still usable when it is all the interface has.
+        assert_eq!(select_ipv4(&[apipa]), Some(apipa));
+        assert_eq!(select_ipv4(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn test_send_udp_multicast_rejects_invalid_addresses() {
+        use crate::protocol::pb::{EncryptedPacket, SymmetricAlgorithm};
+
+        let packet = EncryptedPacket {
+            temporal_identifier: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0u8; 64],
+        };
+
+        // A malformed group must fail fast rather than silently send nothing.
+        assert!(
+            send_udp_multicast_v4_all_interfaces("not-an-ip", 36692, &packet)
+                .await
+                .is_err()
+        );
+        assert!(
+            send_udp_multicast_all_interfaces("not-an-ip", 36692, &packet)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -547,7 +759,9 @@ mod tests {
             ciphertext: vec![0u8; 64],
         };
 
-        let result = send_udp_multicast_all_interfaces("ff02::1", 36692, &packet).await;
+        let result =
+            send_udp_multicast_all_interfaces(crate::network::IPV6_MULTICAST_ADDR, 36692, &packet)
+                .await;
 
         // Should succeed or return 0 if no suitable interfaces
         assert!(result.is_ok());

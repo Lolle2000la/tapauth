@@ -205,7 +205,7 @@ EOF\n\
 fi\n\
 \n\
 echo "Starting PAM test..."\n\
-echo "You should see BLE advertisement and UDP broadcasts in logs"\n\
+echo "You should see BLE advertisement and UDP multicast in logs"\n\
 echo "Use your paired Android device to authenticate"\n\
 echo ""\n\
 \n\
@@ -315,7 +315,7 @@ Configuration:\n\
 \n\
 Network:\n\
   UDP Port:       36692 (default)\n\
-  IPv6 Multicast: ff02::1 (all nodes on local segment)\n\
+  Multicast:      IPv4 239.255.26.44 / IPv6 ff12::fdec:fc27\n\
 \n\
 Bluetooth:\n\
   Service UUID:   b4ad84c0-2adb-4876-8315-b39d983b2bde\n\

@@ -44,7 +44,11 @@ tracing.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 chrono = { workspace = true, features = ["serde"] }
-if-addrs.workspace = true
+# `link-local` makes get_if_addrs return fe80:: addresses. Without it the
+# interface enumeration silently drops IPv6 link-local addresses, which are the
+# only IPv6 addresses on many hosts — and exactly what link-local multicast
+# groups (ff12::/16) need an interface for.
+if-addrs = { workspace = true, features = ["link-local"] }
 hostname = { workspace = true }
 socket2.workspace = true
 nix.workspace = true

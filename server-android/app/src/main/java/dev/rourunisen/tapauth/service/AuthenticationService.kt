@@ -70,8 +70,14 @@ class AuthenticationService : Service() {
         private const val TAG = "AuthenticationService"
         // Use the global shared notification ID to avoid duplicate notifications
         private const val NOTIFICATION_ID = TapAuthApplication.FOREGROUND_NOTIFICATION_ID
-        // Cached IPv6 multicast address to avoid repeated DNS lookups
-        private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff02::1")
+        // Discovery multicast groups. These MUST match IPV4_MULTICAST_ADDR /
+        // IPV6_MULTICAST_ADDR in shared/src/network.rs:
+        //   IPv4: IPv4 Local Scope (239.255.0.0/16, RFC 2365), unassigned by IANA.
+        //   IPv6: transient link-local (ff12::/16); low 32 bits are inside the
+        //         IANA "Reserved for Private Use" dynamic group-id range
+        //         (0xFD000000-0xFDFFFFFF, RFC 10028).
+        private val IPV4_MULTICAST_GROUP: InetAddress = InetAddress.getByName("239.255.26.44")
+        private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff12::fdec:fc27")
         // Debounce delay for multicast rejoin operations (milliseconds)
         private const val REJOIN_DEBOUNCE_MS = 500L
 
@@ -244,39 +250,44 @@ class AuthenticationService : Service() {
                 }
 
                 try {
-                    newSocket.broadcast = true
+                    // Log the configured groups unconditionally so the E2E can
+                    // assert the app uses the same groups as the daemon even on
+                    // interfaces that cannot join them.
+                    Log.d(
+                        TAG,
+                        "Multicast groups: IPv4=${IPV4_MULTICAST_GROUP.hostAddress}, IPv6=${IPV6_MULTICAST_GROUP.hostAddress}",
+                    )
 
                     try {
                         NetworkInterface.getNetworkInterfaces()?.toList()?.forEach {
                             networkInterface ->
                             if (networkInterface.isUp && networkInterface.supportsMulticast()) {
-                                try {
-                                    newSocket.joinGroup(
-                                        java.net.InetSocketAddress(
-                                            IPV6_MULTICAST_GROUP,
-                                            appConfig.udpPort,
-                                        ),
-                                        networkInterface,
-                                    )
-                                    Log.d(
-                                        TAG,
-                                        "Joined IPv6 multicast group ff02::1 on ${networkInterface.name}",
-                                    )
-                                } catch (e: Exception) {
-                                    Log.w(
-                                        TAG,
-                                        "Failed to join multicast on ${networkInterface.name}: ${e.message}",
-                                    )
+                                for (group in listOf(IPV6_MULTICAST_GROUP, IPV4_MULTICAST_GROUP)) {
+                                    try {
+                                        newSocket.joinGroup(
+                                            java.net.InetSocketAddress(group, appConfig.udpPort),
+                                            networkInterface,
+                                        )
+                                        Log.d(
+                                            TAG,
+                                            "Joined multicast group ${group.hostAddress} on ${networkInterface.name}",
+                                        )
+                                    } catch (e: Exception) {
+                                        Log.w(
+                                            TAG,
+                                            "Failed to join multicast group ${group.hostAddress} on ${networkInterface.name}: ${e.message}",
+                                        )
+                                    }
                                 }
                             }
                         }
                     } catch (e: Exception) {
-                        Log.w(TAG, "Failed to set up IPv6 multicast: ${e.message}")
+                        Log.w(TAG, "Failed to set up multicast: ${e.message}")
                     }
 
                     Log.d(TAG, "Listening for auth requests on UDP port ${appConfig.udpPort}")
-                    Log.d(TAG, "  - IPv4 broadcast: enabled")
-                    Log.d(TAG, "  - IPv6 multicast: ff02::1")
+                    Log.d(TAG, "  - IPv4 multicast: ${IPV4_MULTICAST_GROUP.hostAddress}")
+                    Log.d(TAG, "  - IPv6 multicast: ${IPV6_MULTICAST_GROUP.hostAddress}")
 
                     try {
                         dev.rourunisen.tapauth.service.ServiceStatusManager.setUdpRunning(

@@ -120,10 +120,10 @@ pub struct TapAuthConfig {
     /// UDP port for authentication (default: 36692)
     pub udp_port: u16,
 
-    /// Whether the Local Network (UDP broadcast/multicast) transport may be
+    /// Whether the Local Network (UDP multicast) transport may be
     /// used for authentication attempts (default: true).
     ///
-    /// When disabled, the daemon will not broadcast authentication requests
+    /// When disabled, the daemon will not multicast authentication requests
     /// over UDP and will not open the firewall port for them.
     pub enable_network: bool,
 

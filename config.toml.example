@@ -24,8 +24,8 @@ pam_gui_timeout_secs = 30
 udp_port = 36692
 
 # Local Network Transport
-# Enable authentication over the local network (UDP broadcast/multicast).
-# When disabled, the daemon will not broadcast authentication requests over
+# Enable authentication over the local network (UDP multicast).
+# When disabled, the daemon will not multicast authentication requests over
 # UDP and will not open the firewall port for authentication attempts.
 # Can also be toggled at runtime via the tapauth-config GUI (requires admin
 # authorization) without restarting the daemon.
