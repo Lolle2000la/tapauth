@@ -150,28 +150,17 @@ class AuthenticationService : Service() {
             try {
                 val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
                 config.udpLastStartMillis = System.currentTimeMillis()
-                config.udpRunning = true
-                // broadcast running state change
-                val b =
-                    Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
-                        putExtra("udp_running", true)
-                    }
-                context.sendBroadcast(b)
+                // Do not write config.udpRunning here: the socket may stay unbound until the screen
+                // turns on. ServiceStatusManager.setUdpRunning() owns that flag and reflects the
+                // real socket lifecycle.
             } catch (_: Exception) {}
         }
 
         fun stop(context: Context) {
             val intent = Intent(context, AuthenticationService::class.java)
             context.stopService(intent)
-            try {
-                val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
-                config.udpRunning = false
-                val b =
-                    Intent("dev.rourunisen.tapauth.ACTION_SERVICE_STATE_CHANGE").apply {
-                        putExtra("udp_running", false)
-                    }
-                context.sendBroadcast(b)
-            } catch (_: Exception) {}
+            // ServiceStatusManager.setUdpRunning(false) is persisted from onDestroy ->
+            // stopUdpTransport(); no eager write here so the status tracks the socket.
         }
     }
 
@@ -282,6 +271,12 @@ class AuthenticationService : Service() {
                 Log.d(TAG, "UDP transport already running; ignoring start request")
                 return
             }
+            // A network-change rebind can race a screen-off: re-check the gating here, inside the
+            // state lock, so a stale rejoin coroutine can never re-bind while the screen is off.
+            if (forceRestart && !isUdpTransportAllowed()) {
+                Log.i(TAG, "Skipping multicast rebind: screen is off")
+                return
+            }
             isRunning = true
 
             // Kernel network interrupts wake the SoC for socket traffic, so the only Wi-Fi lock
@@ -291,10 +286,12 @@ class AuthenticationService : Service() {
             val oldJob = listenerJob
             oldJob?.cancel()
             val oldSocket = udpSocket
+            // Clear the reference *before* closing so the old receive loop cannot mistake this
+            // deliberate close for an unexpected failure.
+            udpSocket = null
             try {
                 oldSocket?.close()
             } catch (_: Exception) {}
-            udpSocket = null
 
             listenerJob = serviceScope.launch {
                 try {
@@ -341,7 +338,7 @@ class AuthenticationService : Service() {
                                 for (group in listOf(IPV6_MULTICAST_GROUP, IPV4_MULTICAST_GROUP)) {
                                     try {
                                         newSocket.joinGroup(
-                                            java.net.InetSocketAddress(group, appConfig.udpPort),
+                                            InetSocketAddress(group, appConfig.udpPort),
                                             networkInterface,
                                         )
                                         Log.d(
@@ -396,6 +393,15 @@ class AuthenticationService : Service() {
 
                             launch { handleIncomingPacket(data, senderAddress, senderPort) }
                         } catch (e: SocketException) {
+                            // The socket closed underneath us. Only tear down if this loop is still
+                            // the active generation: during an explicit stop or a force-restart
+                            // rebind this job is already cancelled and its socket reference is
+                            // cleared, so the exception is expected and must not stop the new
+                            // generation.
+                            if (isActive && isRunning && udpSocket === newSocket) {
+                                Log.w(TAG, "UDP socket closed unexpectedly; stopping transport", e)
+                                stopUdpTransport()
+                            }
                             break
                         } catch (e: Exception) {
                             if (isActive && isRunning) {
@@ -419,8 +425,12 @@ class AuthenticationService : Service() {
     }
 
     /**
-     * Tear down the UDP transport: leave the discovery groups, close the socket and release the
-     * Wi-Fi multicast lock. Safe to call when the transport is not running.
+     * Tear down the UDP transport: close the socket and release the Wi-Fi multicast lock. Safe to
+     * call when the transport is not running.
+     *
+     * `MulticastSocket.close()` drops all group memberships, so no explicit `leaveGroup` calls are
+     * needed. Avoiding them keeps this path free of blocking interface enumeration on the main
+     * thread, which matters now that it runs on every `ACTION_SCREEN_OFF`.
      */
     private fun stopUdpTransport() {
         synchronized(transportStateLock) {
@@ -430,20 +440,16 @@ class AuthenticationService : Service() {
             rejoinJob?.cancel()
             rejoinJob = null
 
-            val socket = udpSocket
-            if (socket != null) {
-                leaveMulticastGroups(socket)
-            }
-
             listenerJob?.cancel()
             listenerJob = null
 
+            val socket = udpSocket
+            udpSocket = null
             try {
                 socket?.close()
             } catch (e: Exception) {
                 Log.w(TAG, "Error closing socket: ${e.message}")
             }
-            udpSocket = null
 
             transportLockManager.releaseMulticastLock()
 
@@ -454,31 +460,6 @@ class AuthenticationService : Service() {
                     updateNotification()
                 }
             } catch (_: Exception) {}
-        }
-    }
-
-    /**
-     * Best-effort explicit leave of the discovery groups before the socket is closed. Closing the
-     * socket also drops memberships, but leaving first avoids leaving the Wi-Fi filter in a
-     * multicast-promiscuous state while teardown completes.
-     */
-    private fun leaveMulticastGroups(socket: MulticastSocket) {
-        try {
-            NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-                for (group in listOf(IPV6_MULTICAST_GROUP, IPV4_MULTICAST_GROUP)) {
-                    try {
-                        socket.leaveGroup(
-                            InetSocketAddress(group, appConfig.udpPort),
-                            networkInterface,
-                        )
-                    } catch (_: Exception) {
-                        // Not a member on this interface (or socket already closing); close()
-                        // below is the guaranteed fallback.
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to leave multicast groups: ${e.message}")
         }
     }
 
@@ -596,6 +577,12 @@ class AuthenticationService : Service() {
             rejoinJob?.cancel()
             rejoinJob = serviceScope.launch {
                 delay(REJOIN_DEBOUNCE_MS)
+                // Re-check after the debounce: the screen may have turned off while we waited, in
+                // which case the transport must stay down (startUdpTransport re-checks too).
+                if (!isUdpTransportAllowed()) {
+                    Log.d(TAG, "Screen off during debounce; skipping multicast rebind")
+                    return@launch
+                }
                 Log.d(TAG, "Recreating UDP socket after network change")
                 startUdpTransport(forceRestart = true)
             }
