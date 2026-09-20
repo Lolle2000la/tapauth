@@ -45,7 +45,19 @@ systemd system daemons, and low-level communication links.
 %setup -q -n %{name}-%{version}
 
 %build
-cargo build --workspace --release
+# Allow CI to point cargo at a persistent cache (scripts/ci/build-fedora-packages.sh
+# passes these as rpm defines when the mounted cache dirs exist).
+export CARGO_HOME="%{?_cargo_home}%{!?_cargo_home:${CARGO_HOME:-%{_builddir}/cargo-home}}"
+export CARGO_PROFILE_RELEASE_STRIP=true
+export CARGO_TARGET_DIR="%{?_cargo_target_dir}%{!?_cargo_target_dir:${CARGO_TARGET_DIR:-target}}"
+if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER=sccache
+    export SCCACHE_DIR="%{?_sccache_dir}%{!?_sccache_dir:${SCCACHE_DIR:-%{_builddir}/sccache}}"
+fi
+cargo build --workspace --release --locked %{?cargo_features}
+if command -v sccache >/dev/null 2>&1; then
+    sccache --show-stats || true
+fi
 
 %install
 mkdir -p %{buildroot}%{_bindir}
@@ -61,9 +73,9 @@ mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
-install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
-install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
-install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauthd" %{buildroot}%{_bindir}/tapauthd
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation

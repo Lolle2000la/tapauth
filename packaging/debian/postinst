@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+	systemd-sysusers /usr/lib/sysusers.d/tapauth.conf
+	systemd-tmpfiles --create /usr/lib/tmpfiles.d/tapauth.conf
+	if command -v pam-auth-update >/dev/null 2>&1; then
+		pam-auth-update --package
+	fi
+fi
+#DEBHELPER#
+exit 0
