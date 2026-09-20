@@ -292,14 +292,30 @@ async fn handle_start_pairing(
         }
     };
 
-    let firewall_guard = match FirewallGuard::new(port, Protocol::Tcp) {
+    // Opening the pairing firewall port is best-effort only in test builds
+    // (containers/user-namespaces without usable iptables). Production builds
+    // keep the original strict behaviour: a firewall error aborts pairing rather
+    // than leaving the ephemeral TCP listener reachable without a rule.
+    #[cfg(feature = "dev-firewall-bypass")]
+    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
         Ok(g) => Some(g),
         Err(e) => {
             tracing::warn!(
-                "Failed to open firewall port for pairing (continuing anyway): {}",
+                "Failed to open firewall port for pairing (continuing anyway; dev-firewall-bypass): {}",
                 e
             );
             None
+        }
+    };
+
+    #[cfg(not(feature = "dev-firewall-bypass"))]
+    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!("Firewall error: {}", e),
+            )
         }
     };
 
