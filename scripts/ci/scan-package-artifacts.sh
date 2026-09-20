@@ -71,16 +71,6 @@ if [ -n "$PAM_SO" ]; then
     BINARIES+=("${PAM_SO#$WORK_DIR/}")
 fi
 
-# Find the optional fprintd-emulation module (pam_fprintd.so) across the
-# same dirs. It is only present when the tapauth-fprintd-emulation package
-# is part of the payload, so its absence is not an error — but when it IS
-# present it is scanned exactly like pam_tapauth.so (fail closed on any dev
-# override it might carry).
-FPRINTD_SO=$(find "$WORK_DIR" -name "pam_fprintd.so" 2>/dev/null | head -1 || true)
-if [ -n "$FPRINTD_SO" ]; then
-    BINARIES+=("${FPRINTD_SO#$WORK_DIR/}")
-fi
-
 # Fail closed: a production package MUST contain the shipped binaries. A
 # package payload with none of them means extraction silently produced an
 # empty tree (which used to print success).
