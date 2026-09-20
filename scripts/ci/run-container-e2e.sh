@@ -18,6 +18,11 @@ echo " Starting TapAuth E2E Test on Distro: $DISTRO"
 echo " Package directory: $PACKAGE_DIR"
 echo "=================================================="
 
+# Keep the host's Bumble bridge alive: cleanup in test-e2e.sh would otherwise
+# kill it through the shared /tmp/bumble-bridge.pid with --pid=host, forcing
+# run-all-e2e.sh to restart it for every container.
+export E2E_KEEP_BLE_BRIDGE=1
+
 # Plant a dummy fingerprint stack to prove the distro package never rewrites
 # unrelated/vendor PAM files (TapAuth only touches the services it opts into).
 mkdir -p /etc/pam.d

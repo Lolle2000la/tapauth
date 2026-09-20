@@ -193,6 +193,13 @@ is **off**, so `TAPAUTH_STATE_DIR` is not compiled in at all and every path is t
 therefore proves that PolKit still denies unprivileged non-owner callers; it does not prove anything about
 the root path, which is bypassed by design in this build.
 
+The Fedora and Arch passes run inside containers with no systemd, so they instead install the
+`fallback-socket` sandbox build (which enables `dev-state-override`, `dev-udp-loopback`,
+`dev-polkit-bypass`, `dev-firewall-bypass` and `dev-socket-override`) and run in `dev` mode against the
+manually bound production socket. Container passes skip the BLE phases (host D-Bus is unreachable across
+the container boundary) and Phase 7 (PolKit, which needs the systemd-mode build); both are covered by the
+Ubuntu host run.
+
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.

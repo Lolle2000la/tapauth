@@ -29,14 +29,16 @@ if ! command -v "$STRINGS_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Variable names that must never appear in a shipped binary. All of these are
-# read only behind dev Cargo features (dev-state-override, dev-udp-loopback,
-# dev-socket-override, dev-polkit-bypass, fallback-socket), so a clean scan
-# proves no dev knob was compiled into the artifact. TAPAUTH_DEV_MODE matters
-# in particular because it is the ONLY runtime string of dev-polkit-bypass:
-# without it, an accidental dev-polkit-bypass build would pass the scan.
+# Variable names / feature tags that must never appear in a shipped binary. All
+# of these are read only behind dev Cargo features (dev-state-override,
+# dev-udp-loopback, dev-socket-override, dev-polkit-bypass, dev-firewall-bypass,
+# fallback-socket), so a clean scan proves no dev knob was compiled into the
+# artifact. TAPAUTH_DEV_MODE matters in particular because it is the ONLY
+# runtime string of dev-polkit-bypass: without it, an accidental
+# dev-polkit-bypass build would pass the scan. dev-firewall-bypass has no env
+# var at all, so its cfg'd warning literal carries the tag that is scanned for.
 DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
-DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
+DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE" "dev-firewall-bypass")
 
 echo "==> Building production artifacts (per crate, default features, debug & release)"
 # Mirrors install.sh: each crate is built on its own so no dev feature can be

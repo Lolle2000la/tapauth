@@ -19,7 +19,7 @@ if ! command -v "$STRINGS_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-DEV_VARS=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
+DEV_VARS=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE" "dev-firewall-bypass")
 
 # Only ever delete an extraction dir we created ourselves; never the caller's
 # input directory (the "dir" mode scans it in place).

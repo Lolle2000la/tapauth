@@ -148,6 +148,8 @@ group_exists() {
 # ── State paths ───────────────────────────────────────────────────────────────
 ETC_TAPAUTH="/etc/tapauth"
 ETC_SENTINEL="$ETC_TAPAUTH/persist-check"
+STATE_DIR="/var/lib/tapauth"
+STATE_SENTINEL="$STATE_DIR/lifecycle-sentinel"
 PAM_PROFILE="/usr/share/pam-configs/tapauth"
 COMMON_AUTH="/etc/pam.d/common-auth"
 
@@ -156,8 +158,9 @@ cleanup() {
     if package_known; then
         "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive dpkg -P tapauth >/dev/null 2>&1 || true
     fi
-    # Remove the sentinel this test created; leave anything a real install owns.
+    # Remove the sentinels this test created; leave anything a real install owns.
     rm -f "$ETC_SENTINEL" 2>/dev/null || true
+    "${SUDO[@]}" rm -f "$STATE_SENTINEL" 2>/dev/null || true
     rmdir "$ETC_TAPAUTH" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -367,6 +370,15 @@ else
     fail "cannot seed sentinel: $ETC_TAPAUTH is missing"
 fi
 
+# /var/lib/tapauth is tmpfiles-managed. `dpkg -r` must preserve it (only purge
+# removes state), so seed a file and assert it survives removal below.
+if [ -d "$STATE_DIR" ]; then
+    "${SUDO[@]}" bash -c "printf 'lifecycle-test state sentinel\n' > '$STATE_SENTINEL'"
+    pass "seeded $STATE_SENTINEL"
+else
+    note "$STATE_DIR is absent (tmpfiles did not run); skipping state-preservation assertion"
+fi
+
 # ── Phase 4: upgrade / reinstall ──────────────────────────────────────────────
 section "Upgrade (dpkg -i same packages again)"
 if "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive dpkg -i "${DEBS[@]}"; then
@@ -397,6 +409,12 @@ fi
 assert_absent "$PAM_PROFILE" "pam-config profile removed by dpkg -r"
 assert_dir "$ETC_TAPAUTH" "$ETC_TAPAUTH survives package removal"
 assert_file "$ETC_SENTINEL" "user data under $ETC_TAPAUTH survives package removal"
+# State is intentionally preserved by `dpkg -r`; only purge removes it.
+if [ -d "$STATE_DIR" ]; then
+    assert_file "$STATE_SENTINEL" "user state under $STATE_DIR survives package removal"
+else
+    skip "$STATE_DIR was absent before removal; not asserting preservation"
+fi
 
 # ── Phase 6: purge ────────────────────────────────────────────────────────────
 section "Package purge (dpkg -P)"
@@ -411,6 +429,7 @@ fi
 # must hold regardless of whether the host runs systemd.
 assert_absent /var/lib/tapauth "/var/lib/tapauth removed on purge"
 assert_absent /var/log/tapauth "/var/log/tapauth removed on purge"
+assert_absent "$STATE_SENTINEL" "state sentinel removed with the purge"
 assert_dir "$ETC_TAPAUTH" "$ETC_TAPAUTH survives package purge"
 assert_file "$ETC_SENTINEL" "user data under $ETC_TAPAUTH survives package purge"
 

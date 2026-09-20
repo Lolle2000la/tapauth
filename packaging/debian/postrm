@@ -10,7 +10,7 @@ if [ "$1" = "purge" ]; then
 	# runs, so `systemd-tmpfiles --remove` cannot find it. Remove the managed
 	# runtime/state directories directly so purge leaves nothing behind.
 	systemd-tmpfiles --remove /usr/lib/tmpfiles.d/tapauth.conf 2>/dev/null || true
-	rm -rf /var/lib/tapauth /var/log/tapauth /run/tapauthd
+	rm -rf -- /var/lib/tapauth /var/log/tapauth /run/tapauthd
 fi
 #DEBHELPER#
 exit 0

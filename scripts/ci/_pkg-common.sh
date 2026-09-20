@@ -7,7 +7,9 @@
 #
 # Contract with the caller:
 # - may define pkg_extra_option() for distro-specific flags (receives the
-#   unknown option name, returns 0 when it consumed the argument);
+#   unknown option token; returns 0 when it consumed that single token — it
+#   cannot consume a following value, so only valueless extra options are
+#   supported here);
 # - must call pkg_common_parse_args "$@" after sourcing;
 # - must apply its own OUTPUT_DIR default afterwards (the default path differs
 #   per distro), e.g. OUTPUT_DIR="${OUTPUT_DIR:-/tmp/arch-build}";
@@ -18,14 +20,20 @@
 _PKG_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$_PKG_COMMON_DIR/../.." && pwd)"
 
-# Version comes from the crate manifest; fall back to the workspace manifest for
-# the (future) `version.workspace = true` layout.
+# Version comes from the crate manifest; fall back to a `[workspace.package]`
+# version for the `version.workspace = true` layout.
 PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
 if [ -z "$PKG_VER" ]; then
-    PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
+    PKG_VER=$(awk '
+        /^\[workspace\.package\]/ { inpkg=1; next }
+        /^\[/ { inpkg=0 }
+        inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+            sub(/[^"]*"/, ""); sub(/".*/, ""); print; exit
+        }
+    ' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null || true)
 fi
 if [ -z "$PKG_VER" ]; then
-    echo "❌ ERROR: could not determine the TapAuth version from tapauthd/Cargo.toml or Cargo.toml"
+    echo "❌ ERROR: could not determine the TapAuth version from tapauthd/Cargo.toml or [workspace.package] in Cargo.toml"
     exit 1
 fi
 
