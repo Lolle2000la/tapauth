@@ -17,6 +17,18 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
+# If Bumble is already running (e.g. started on host), don't restart Bumble,
+# but verify that bluetoothd is active and the virtual adapter is powered on.
+if [ -f /tmp/bumble-bridge.pid ]; then
+    echo "    bumble-hci-bridge is already running (PID $(cat /tmp/bumble-bridge.pid 2>/dev/null || echo unknown))."
+    if ! pgrep -x bluetoothd > /dev/null; then
+        $SUDO systemctl start bluetooth 2>/dev/null \
+            || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+    fi
+    $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+    exit 0
+fi
+
 # Ensure the vhci module is loaded and /dev/vhci is writable by us.
 if [ ! -w /dev/vhci ]; then
     if [ -f "$SCRIPT_DIR/build-kernel-vhci.sh" ]; then
@@ -33,9 +45,15 @@ fi
 # BlueZ userspace (hciconfig/btmgmt) — installed here only when missing, so a
 # local first run works without re-running apt on every CI invocation.
 if ! command -v hciconfig >/dev/null 2>&1 || ! command -v btmgmt >/dev/null 2>&1; then
-    echo "    Installing BlueZ tools (bluez, bluez-tools)..."
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -qq bluez bluez-tools
+    echo "    Installing BlueZ tools..."
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq bluez bluez-tools
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y bluez bluez-deprecated 2>/dev/null || true
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm bluez bluez-utils 2>/dev/null || true
+    fi
 fi
 
 if ! pgrep -x bluetoothd > /dev/null; then

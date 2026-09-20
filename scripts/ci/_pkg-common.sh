@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared scaffolding for scripts/ci/build-{arch,debian,fedora}-packages.sh:
 # workspace detection, argument parsing, and the production dev-feature guard.
 # Sourcing this file must be the first statement after the shebang/copyright

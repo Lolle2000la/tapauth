@@ -158,9 +158,20 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %if 0%{?fedora} || 0%{?rhel}
 if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
     current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "vendor/tapauth" ] || [ "$current_profile" = "vendor/tapauth-sssd" ]; then
-        target_profile="local"
-        [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
+    # authselect reports the bare profile ID on some versions (e.g. "tapauth")
+    # and a vendor/-prefixed ID on others, so accept both spellings.
+    case "$current_profile" in
+        vendor/tapauth|custom/tapauth|tapauth)
+            target_profile="local"
+            ;;
+        vendor/tapauth-sssd|custom/tapauth-sssd|tapauth-sssd)
+            target_profile="sssd"
+            ;;
+        *)
+            target_profile=""
+            ;;
+    esac
+    if [ -n "$target_profile" ]; then
         features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
         authselect select "$target_profile" $features --force || true
     fi
