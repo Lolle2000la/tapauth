@@ -551,6 +551,9 @@ EOF
         systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
         mkdir -p /etc/tapauth
         chown tapauthd:tapauthd /etc/tapauth
+        # 0755 mirrors the distro packaging (packaging/debian/rules creates
+        # /etc/tapauth root:root 0755). config.toml carries no secrets; the
+        # long-term keys/state live under /var/lib/tapauth (0700).
         chmod 755 /etc/tapauth
         if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
             CREATED_CONFIG=true

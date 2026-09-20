@@ -135,15 +135,22 @@ fi
 # and "clean" results cannot be trusted. The child runs in "dir" mode with
 # SCAN_SELF_TEST disabled, so it neither needs a package manager nor recurses.
 if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
-    plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
-    mkdir -p "$plant_dir/usr/bin"
-    printf 'placeholder with TAPAUTHD_SOCK dev override\n' > "$plant_dir/usr/bin/tapauthd"
-    if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
-        echo "❌ ERROR: scan self-test FAILED — a planted dev override was NOT detected; scan is unreliable!"
+    # Every forbidden tag must be individually detectable: plant one marker per
+    # variable so a renamed/removed literal (e.g. the dev-firewall-bypass tag,
+    # which is this feature's only detectable signature) cannot silently make
+    # the guard vacuous. The child runs in "dir" mode with SCAN_SELF_TEST
+    # disabled, so it neither needs a package manager nor recurses.
+    for var in "${DEV_VARS[@]}"; do
+        plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
+        mkdir -p "$plant_dir/usr/bin"
+        printf 'placeholder for %s dev override\n' "$var" > "$plant_dir/usr/bin/tapauthd"
+        if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
+            echo "❌ ERROR: scan self-test FAILED — planted '$var' was NOT detected; scan is unreliable!"
+            rm -rf "$plant_dir"
+            exit 1
+        fi
         rm -rf "$plant_dir"
-        exit 1
-    fi
-    rm -rf "$plant_dir"
+    done
 
     clean_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
     mkdir -p "$clean_dir/usr/bin"
@@ -155,7 +162,7 @@ if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     fi
     rm -rf "$clean_dir"
 
-    echo "✅ Scan self-test passed: planted dev override detected, clean payload accepted."
+    echo "✅ Scan self-test passed: every forbidden tag (${DEV_VARS[*]}) was detected, clean payload accepted."
 fi
 
 echo "✅ All shipped $PKG_TYPE binaries are 100% clean of dev/test overrides."

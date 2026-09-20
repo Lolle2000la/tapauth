@@ -18,6 +18,11 @@ BuildRequires:  clang
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  authselect
 Requires:       authselect
+# Base profile the TapAuth vendor profiles are derived from: RHEL 10 / Fedora 40+
+# ship "local", RHEL 9 and older ship "minimal". Resolved at build time (the
+# COPR/build host is the target distro) so %preun can roll back to the profile
+# that actually exists instead of hardcoding "local" (which fails on RHEL 9).
+%global authselect_local %(if [ -e %{_datadir}/authselect/default/local/system-auth ]; then echo local; else echo minimal; fi)
 %endif
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
@@ -80,14 +85,10 @@ install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libc
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation
 #
-# RHEL 10 / Fedora 40 and newer ship the local-only profile as "local",
-# while RHEL 9 and older call the equivalent profile "minimal". Pick
-# whichever one the build host provides so the vendor profile can be
-# generated on every supported release.
-AUTHSELECT_LOCAL="local"
-if [ ! -e %{_datadir}/authselect/default/local/system-auth ]; then
-    AUTHSELECT_LOCAL="minimal"
-fi
+# The base profile ("local" or "minimal") is resolved at build time into
+# %{authselect_local} so both the generated vendor profile and the %preun
+# rollback target agree on every supported release.
+AUTHSELECT_LOCAL="%{?authselect_local}"
 
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/$AUTHSELECT_LOCAL/*; do
@@ -162,7 +163,9 @@ if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
     # and a vendor/-prefixed ID on others, so accept both spellings.
     case "$current_profile" in
         vendor/tapauth|custom/tapauth|tapauth)
-            target_profile="local"
+            # Roll back to the base profile the vendor profile was built from
+            # ("local" on Fedora 40+/RHEL 10, "minimal" on RHEL 9 and older).
+            target_profile="%{?authselect_local}"
             ;;
         vendor/tapauth-sssd|custom/tapauth-sssd|tapauth-sssd)
             target_profile="sssd"
