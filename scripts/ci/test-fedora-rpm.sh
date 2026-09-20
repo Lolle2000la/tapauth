@@ -147,7 +147,7 @@ authselect_select_vendor() {
 # version (bare name or vendor/-prefixed).
 is_tapauth_profile_id() {
     case "$1" in
-        tapauth | tapauth-sssd | vendor/tapauth | vendor/tapauth-sssd) return 0 ;;
+        tapauth | tapauth-sssd | vendor/tapauth | vendor/tapauth-sssd | custom/tapauth | custom/tapauth-sssd) return 0 ;;
         *) return 1 ;;
     esac
 }

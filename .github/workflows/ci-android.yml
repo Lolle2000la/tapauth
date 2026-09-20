@@ -120,6 +120,17 @@ jobs:
             server-android/app/build/outputs/apk/androidTest/e2e/*.apk
           retention-days: 1
 
+      # The E2E variant auto-approves authentication requests when no biometrics
+      # are enrolled and exports a test-only denial receiver. It is bundled in
+      # `android-apks` for the E2E job, but keep a clearly-named copy here so it
+      # can never be mistaken for a distributable build.
+      - name: Upload E2E variant APK artifact (UNSAFE — auto-approves, do not install)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tapauth-e2e-apk-UNSAFE-auto-approves
+          path: server-android/app/build/outputs/apk/e2e/*.apk
+          retention-days: 7
+
       - name: Upload debug APK artifact (safe for manual testing)
         uses: actions/upload-artifact@v7
         with:

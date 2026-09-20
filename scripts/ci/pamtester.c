@@ -36,7 +36,9 @@ int main(int argc, char *argv[]) {
     pam_handle_t *pamh = NULL;
     int ret = pam_start(service, user, &conv, &pamh);
     if (ret != PAM_SUCCESS) {
-        fprintf(stderr, "pam_start failed: %s\n", pam_strerror(pamh, ret));
+        /* pamh is frequently unusable after a failed pam_start, so report the
+         * numeric PAM error rather than passing a possibly-NULL handle. */
+        fprintf(stderr, "pam_start failed (PAM error %d)\n", ret);
         return 1;
     }
 

@@ -406,11 +406,11 @@ else
     fail "dpkg -P tapauth failed"
 fi
 
-if command -v systemd-tmpfiles >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    assert_absent /var/lib/tapauth "systemd-tmpfiles --remove deleted /var/lib/tapauth on purge"
-else
-    skip "systemd-tmpfiles or /run/systemd/system unavailable; skipping /var/lib/tapauth removal assertion"
-fi
+# packaging/debian/postrm removes the tmpfiles-managed state/runtime dirs
+# directly on purge (the shipped fragment is already gone by then), so this
+# must hold regardless of whether the host runs systemd.
+assert_absent /var/lib/tapauth "/var/lib/tapauth removed on purge"
+assert_absent /var/log/tapauth "/var/log/tapauth removed on purge"
 assert_dir "$ETC_TAPAUTH" "$ETC_TAPAUTH survives package purge"
 assert_file "$ETC_SENTINEL" "user data under $ETC_TAPAUTH survives package purge"
 

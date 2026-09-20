@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 
-export PATH := $(HOME)/.cargo/bin:$(PATH)
+export PATH := $(if $(HOME),$(HOME)/.cargo/bin:)$(PATH)
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
 RUSTC := $(shell which rustc-1.91 2>/dev/null || which rustc)

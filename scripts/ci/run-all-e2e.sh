@@ -17,8 +17,16 @@ echo "==> Starting Virtual BLE Bridge on host..."
 echo "=================================================="
 echo " [0/3] Running JNI Crypto Instrumentation Tests"
 echo "=================================================="
-adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
-adb install -r -t server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk || true
+E2E_APK="server-android/app/build/outputs/apk/e2e/app-e2e.apk"
+TEST_APK="server-android/app/build/outputs/apk/androidTest/e2e/app-e2e-androidTest.apk"
+for apk in "$E2E_APK" "$TEST_APK"; do
+    if [ ! -f "$apk" ]; then
+        echo "❌ ERROR: expected APK not found: $apk"
+        exit 1
+    fi
+done
+adb install -r -t "$E2E_APK"
+adb install -r -t "$TEST_APK"
 RUNNER=$(adb shell pm list instrumentation | grep dev.rourunisen.tapauth | head -n1 | cut -d: -f2 | cut -d' ' -f1)
 if [ -z "$RUNNER" ]; then
     RUNNER="dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner"

@@ -1,13 +1,15 @@
 #!/bin/bash
-# Scans built distribution package binaries (.deb, .rpm, .pkg.tar.zst)
-# to guarantee no dev/test environment overrides are compiled into shipped artifacts.
+# Scans built distribution package binaries (.deb, .rpm, .pkg.tar.zst) to
+# guarantee no dev/test environment overrides are compiled into shipped
+# artifacts. Also accepts an already-extracted payload ("dir") for the
+# positive control below.
 set -euo pipefail
 
 PKG_TYPE="${1:-}"
 PKG_DIR="${2:-}"
 
 if [[ -z "$PKG_TYPE" || -z "$PKG_DIR" ]]; then
-    echo "Usage: $0 <deb|rpm|arch> <package-dir>"
+    echo "Usage: $0 <deb|rpm|arch|dir> <package-dir>"
     exit 1
 fi
 
@@ -19,13 +21,22 @@ fi
 
 DEV_VARS=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
 
-WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
+# Only ever delete an extraction dir we created ourselves; never the caller's
+# input directory (the "dir" mode scans it in place).
+WORK_DIR=""
+CLEAN_WORK=0
+cleanup_work() {
+    if [ "$CLEAN_WORK" = 1 ] && [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+trap cleanup_work EXIT
 
 case "$PKG_TYPE" in
     deb)
+        WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
+        CLEAN_WORK=1
+        echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
         for deb in "$PKG_DIR"/tapauth_*.deb "$PKG_DIR"/tapauth-*.deb; do
             [ -f "$deb" ] || continue
             dpkg-deb -x "$deb" "$WORK_DIR" || {
@@ -35,6 +46,9 @@ case "$PKG_TYPE" in
         done
         ;;
     rpm)
+        WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
+        CLEAN_WORK=1
+        echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
         for rpm in "$PKG_DIR"/tapauth-[0-9]*.rpm "$PKG_DIR"/tapauth-*.rpm; do
             [ -f "$rpm" ] || continue
             if ! (cd "$WORK_DIR" && rpm2cpio "$rpm" | cpio -idm >/dev/null 2>&1); then
@@ -44,6 +58,9 @@ case "$PKG_TYPE" in
         done
         ;;
     arch)
+        WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
+        CLEAN_WORK=1
+        echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
         for pkg in "$PKG_DIR"/tapauth-[0-9]*.pkg.tar.zst "$PKG_DIR"/tapauth-*.pkg.tar.zst; do
             [ -f "$pkg" ] || continue
             tar --zstd -xf "$pkg" -C "$WORK_DIR" || {
@@ -51,6 +68,12 @@ case "$PKG_TYPE" in
                 exit 1
             }
         done
+        ;;
+    dir)
+        # Already-extracted payload (used by the self-test positive control so
+        # it does not depend on dpkg/rpm/tar being present).
+        WORK_DIR="$PKG_DIR"
+        echo "==> Scanning already-extracted payload in $PKG_DIR..."
         ;;
     *)
         echo "Unknown package type: $PKG_TYPE"
@@ -106,20 +129,33 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-# Positive control: verify the scan itself can detect a planted dev
-# override. If this ever fails, the scan is broken (e.g. strings/grep
-# unavailable) and "clean" results cannot be trusted.
+# Positive control: prove the scan can actually detect a planted dev override
+# AND still accepts a clean payload. If this ever fails, the scan is broken
+# (e.g. strings/grep unavailable or accidentally failing closed on everything)
+# and "clean" results cannot be trusted. The child runs in "dir" mode with
+# SCAN_SELF_TEST disabled, so it neither needs a package manager nor recurses.
 if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
     mkdir -p "$plant_dir/usr/bin"
     printf 'placeholder with TAPAUTHD_SOCK dev override\n' > "$plant_dir/usr/bin/tapauthd"
-    if bash "$0" deb "$plant_dir" >/dev/null 2>&1; then
+    if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
         echo "❌ ERROR: scan self-test FAILED — a planted dev override was NOT detected; scan is unreliable!"
         rm -rf "$plant_dir"
         exit 1
     fi
     rm -rf "$plant_dir"
-    echo "✅ Scan self-test passed: planted dev override was correctly detected."
+
+    clean_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
+    mkdir -p "$clean_dir/usr/bin"
+    printf 'clean placeholder binary with no dev overrides\n' > "$clean_dir/usr/bin/tapauthd"
+    if ! SCAN_SELF_TEST=0 bash "$0" dir "$clean_dir" >/dev/null 2>&1; then
+        echo "❌ ERROR: scan self-test FAILED — a clean payload was incorrectly rejected!"
+        rm -rf "$clean_dir"
+        exit 1
+    fi
+    rm -rf "$clean_dir"
+
+    echo "✅ Scan self-test passed: planted dev override detected, clean payload accepted."
 fi
 
 echo "✅ All shipped $PKG_TYPE binaries are 100% clean of dev/test overrides."

@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # Shared scaffolding for scripts/ci/build-{arch,debian,fedora}-packages.sh:
 # workspace detection, argument parsing, and the production dev-feature guard.
 # Sourcing this file must be the first statement after the shebang/copyright
@@ -6,7 +6,6 @@
 # OUTPUT_DIR, ALLOW_TEST_FEATURES) is set up here.
 #
 # Contract with the caller:
-# - set PKG_COMMON_DISTRO before sourcing (used in the guard error message);
 # - may define pkg_extra_option() for distro-specific flags (receives the
 #   unknown option name, returns 0 when it consumed the argument);
 # - must call pkg_common_parse_args "$@" after sourcing;
@@ -19,7 +18,17 @@
 _PKG_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$_PKG_COMMON_DIR/../.." && pwd)"
 
-PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2)
+# Version comes from the crate manifest; fall back to the workspace manifest for
+# the (future) `version.workspace = true` layout.
+PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
+if [ -z "$PKG_VER" ]; then
+    PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
+fi
+if [ -z "$PKG_VER" ]; then
+    echo "❌ ERROR: could not determine the TapAuth version from tapauthd/Cargo.toml or Cargo.toml"
+    exit 1
+fi
+
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 ALLOW_TEST_FEATURES=false
@@ -28,10 +37,18 @@ pkg_common_parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --features)
+                if [ $# -lt 2 ]; then
+                    echo "❌ ERROR: --features requires a value"
+                    exit 1
+                fi
                 CARGO_FEATURES="$2"
                 shift 2
                 ;;
             --output-dir)
+                if [ $# -lt 2 ]; then
+                    echo "❌ ERROR: --output-dir requires a value"
+                    exit 1
+                fi
                 OUTPUT_DIR="$2"
                 shift 2
                 ;;

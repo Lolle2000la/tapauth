@@ -1254,14 +1254,18 @@ echo "╚═══════════════════════�
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2d).
 settle_for_dedup "Phase 2d"
 
-# Check if system D-Bus and BlueZ are accessible (e.g., host environment with BlueZ).
-# In container environments, host D-Bus rejects cross-container Unix socket connections
-# (REJECTED EXTERNAL), making BlueZ inaccessible; BLE is strictly verified on the host.
+# BLE is verified end-to-end on the host. Container environments cannot reach
+# the host BlueZ/D-Bus (cross-container Unix socket connections are rejected),
+# so the BLE phases are skipped there. On a non-container host the virtual HCI
+# adapter has already been set up by setup-emulator-ble-bridge.sh, so an
+# unreachable BlueZ is a real failure, not something to skip silently.
 BLE_AVAILABLE=true
 if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
     BLE_AVAILABLE=false
 elif ! dbus-send --system --dest=org.bluez / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
-    BLE_AVAILABLE=false
+    echo "❌ ERROR: System D-Bus / BlueZ is not reachable on this non-container host."
+    echo "   BLE is the only end-to-end verification of that transport; refusing to skip."
+    exit 1
 fi
 
 BLE_OK=0

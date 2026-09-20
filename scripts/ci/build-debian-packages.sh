@@ -1,9 +1,10 @@
 #!/bin/bash
-# Builds TapAuth Debian packages (.deb) into /tmp/deb-build/
+# Builds TapAuth Debian packages (.deb) into the output directory (default
+# /tmp/deb-build). The build happens inside $OUTPUT_DIR so a test build with a
+# different --output-dir can never overwrite the production packages.
 set -euo pipefail
 
 # Shared workspace detection, argument parsing and dev-feature guard
-PKG_COMMON_DISTRO="Debian"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_pkg-common.sh"
 
 pkg_common_parse_args "$@"
@@ -12,7 +13,8 @@ enforce_prod_feature_guard "Debian"
 
 export CARGO_FEATURES
 
-BUILD_DIR="/tmp/deb-build/tapauth-${PKG_VER}"
+mkdir -p "$OUTPUT_DIR"
+BUILD_DIR="${OUTPUT_DIR}/tapauth-${PKG_VER}"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
@@ -40,12 +42,5 @@ EOF
 echo "==> Building Debian packages with dpkg-buildpackage..."
 DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-nocheck}" dpkg-buildpackage -us -uc -b -d
 
-echo "==> Built Debian packages in /tmp/deb-build/:"
-ls -la /tmp/deb-build/*.deb
-
-if [ "$OUTPUT_DIR" != "/tmp/deb-build" ]; then
-    mkdir -p "$OUTPUT_DIR"
-    cp /tmp/deb-build/*.deb "$OUTPUT_DIR/"
-    echo "==> Copied packages to $OUTPUT_DIR:"
-    ls -la "$OUTPUT_DIR"/*.deb
-fi
+echo "==> Built Debian packages in ${OUTPUT_DIR}:"
+ls -la "$OUTPUT_DIR"/*.deb

@@ -3,7 +3,6 @@
 set -euo pipefail
 
 # Shared workspace detection, argument parsing and dev-feature guard
-PKG_COMMON_DISTRO="Arch"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_pkg-common.sh"
 
 pkg_common_parse_args "$@"
