@@ -44,6 +44,9 @@ case "$DISTRO" in
         echo "==> Installing Arch Linux runtime requirements..."
         pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
 
+        # Arch ships no `pamtester` package (AUR-only), so compile the minimal
+        # stand-in from scripts/ci/pamtester.c. The Ubuntu host and Fedora
+        # container install the genuine tool from their distro repos.
         echo "==> Building standalone pamtester..."
         gcc -o /usr/bin/pamtester "$WORKSPACE_DIR/scripts/ci/pamtester.c" -lpam -lpam_misc
 

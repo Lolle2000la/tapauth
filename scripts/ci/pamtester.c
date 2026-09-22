@@ -1,3 +1,28 @@
+/*
+ * pamtester.c — minimal stand-in for the upstream `pamtester` utility.
+ *
+ * WHY THIS EXISTS
+ *   The E2E suite drives the real Linux-PAM C ABI (pam_sm_authenticate ->
+ *   pam_tapauth.so) through `pamtester`. Ubuntu and Fedora ship the genuine
+ *   tool, but Arch Linux has no `pamtester` in its official repositories (it is
+ *   AUR-only, and pulling AUR packages into CI is not acceptable), so the Arch
+ *   E2E container compiles this file instead:
+ *
+ *       gcc -o /usr/bin/pamtester scripts/ci/pamtester.c -lpam -lpam_misc
+ *
+ * SCOPE / CONTRACT
+ *   This is NOT a general-purpose pamtester replacement and is never installed
+ *   on a real system — only inside the disposable Arch CI container. It mirrors
+ *   only the surface test-e2e.sh relies on:
+ *     - CLI:    pamtester [-v] <service> <user> <operation> (-v accepted, ignored)
+ *     - ops:    authenticate | open_session | close_session
+ *     - conv:   misc_conv, matching upstream
+ *     - exit:   0 on PAM_SUCCESS, non-zero otherwise (the suite asserts on exit
+ *               codes only, so it is drop-in compatible with the real tool)
+ *   If the suite ever needs another operation or option, extend it here rather
+ *   than assuming upstream parity.
+ */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
