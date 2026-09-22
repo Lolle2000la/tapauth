@@ -1,17 +1,27 @@
 #!/bin/bash
-# Runs complete E2E test suite across real Android emulator for Ubuntu, Fedora, and Arch Linux packages
+# Runs the complete E2E suite on a real Android emulator against the installed
+# Ubuntu (.deb) package on the host and the Fedora (.rpm) / Arch (.pkg.tar.zst)
+# packages inside systemd-booting containers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_DIR"
 
+FEDORA_SYSTEMD_IMAGE="tapauth-e2e-fedora-systemd"
+
 export E2E_KEEP_BLE_BRIDGE=1
 trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi' EXIT
 
-# Ensure host virtual BLE bridge is up
+# Ensure host virtual BLE bridge is up (with the host bluetoothd, which the
+# Ubuntu host pass below needs).
 echo "==> Starting Virtual BLE Bridge on host..."
 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
+
+# Build the systemd-capable Fedora image once: `fedora:latest` ships no init at
+# all, unlike `archlinux:base-devel`.
+echo "==> Building Fedora systemd E2E image..."
+docker build -q -t "$FEDORA_SYSTEMD_IMAGE" -f "$SCRIPT_DIR/Dockerfile.fedora-systemd" "$SCRIPT_DIR" >/dev/null
 
 # 1. Run JNI crypto instrumentation tests directly on emulator via ADB
 echo "=================================================="
@@ -60,39 +70,26 @@ echo "=================================================="
 sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
 sudo apt-get purge -y tapauth 2>/dev/null || true
 
-# Pass emulator auth token to containers so adb emu can authenticate to the console
-AUTH_TOKEN_MOUNT=()
-if [ -f "$HOME/.emulator_auth_token" ]; then
-  AUTH_TOKEN_MOUNT=(-v "$HOME/.emulator_auth_token:/root/.emulator_auth_token:ro")
-elif [ -f "/root/.emulator_auth_token" ]; then
-  AUTH_TOKEN_MOUNT=(-v "/root/.emulator_auth_token:/root/.emulator_auth_token:ro")
-fi
+# Hand the virtual Bluetooth adapter to the container instances: only one
+# bluetoothd may own an adapter, and the Fedora/Arch containers run their own
+# (see run-systemd-container.sh). Stop the host daemon, then re-assert the
+# host-owned Bumble bridge without starting bluetoothd again.
+echo "==> Yielding the host Bluetooth daemon to the systemd containers..."
+sudo systemctl stop bluetooth 2>/dev/null || true
+sudo pkill -x bluetoothd 2>/dev/null || true
+TAPAUTH_E2E_BLE_BRIDGE_ONLY=1 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 
-# 3. Run E2E against installed Fedora (.rpm) package in container
+# 3. Run E2E against installed Fedora (.rpm) package in a systemd container
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
-"$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
-docker run --rm --privileged --net=host --pid=host \
-  -v /dev:/dev \
-  -v /tmp:/tmp \
-  -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
-  -v "$WORKSPACE_DIR":/workspace \
-  ${AUTH_TOKEN_MOUNT[@]+"${AUTH_TOKEN_MOUNT[@]}"} \
-  fedora:latest /workspace/scripts/ci/run-container-e2e.sh fedora /workspace/pkg-fedora-test
+"$SCRIPT_DIR/run-systemd-container.sh" fedora "$FEDORA_SYSTEMD_IMAGE" /workspace/pkg-fedora-test
 
-# 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in container
+# 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in a systemd container
 echo "=================================================="
 echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
-"$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
-docker run --rm --privileged --net=host --pid=host \
-  -v /dev:/dev \
-  -v /tmp:/tmp \
-  -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
-  -v "$WORKSPACE_DIR":/workspace \
-  ${AUTH_TOKEN_MOUNT[@]+"${AUTH_TOKEN_MOUNT[@]}"} \
-  archlinux:base-devel /workspace/scripts/ci/run-container-e2e.sh arch /workspace/pkg-arch-test
+"$SCRIPT_DIR/run-systemd-container.sh" arch archlinux:base-devel /workspace/pkg-arch-test
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ACROSS ALL THREE DISTROS!"

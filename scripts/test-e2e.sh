@@ -1291,51 +1291,44 @@ echo "╚═══════════════════════�
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2d).
 settle_for_dedup "Phase 2d"
 
-# BLE is verified end-to-end on the host. Container environments cannot reach
-# the host BlueZ/D-Bus (cross-container Unix socket connections are rejected),
-# so the BLE phases are skipped there. On a non-container host the virtual HCI
-# adapter has already been set up by setup-emulator-ble-bridge.sh, so an
-# unreachable BlueZ is a real failure, not something to skip silently.
-BLE_AVAILABLE=true
-if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
-    BLE_AVAILABLE=false
-elif ! command -v dbus-send >/dev/null 2>&1; then
-    echo "❌ ERROR: 'dbus-send' is not installed, so BlueZ reachability cannot be verified"
-    echo "   on this non-container host. Install dbus (which provides dbus-send) and re-run:"
-    echo "   BLE is the only end-to-end verification of that transport, so it cannot be skipped."
+# The virtual HCI adapter has already been set up by
+# setup-emulator-ble-bridge.sh: on the host directly, and inside the systemd
+# containers via its external-bridge mode (the host runs the Bumble bridge, the
+# container's own bluetoothd owns the adapter). Either way, an unreachable
+# BlueZ is a real failure, not something to skip silently.
+if ! command -v dbus-send >/dev/null 2>&1; then
+    echo "❌ ERROR: 'dbus-send' is not installed, so BlueZ reachability cannot be verified."
+    echo "   Install dbus (which provides dbus-send) and re-run: BLE is the only"
+    echo "   end-to-end verification of that transport, so it cannot be skipped."
     exit 1
 elif ! dbus-send --system --dest=org.bluez / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
-    echo "❌ ERROR: System D-Bus / BlueZ is not reachable on this non-container host."
+    echo "❌ ERROR: System D-Bus / BlueZ is not reachable."
     echo "   BLE is the only end-to-end verification of that transport; refusing to skip."
     exit 1
 fi
 
 BLE_OK=0
-if [ "$BLE_AVAILABLE" = false ]; then
-    echo "ℹ️  SKIPPED: System D-Bus / BlueZ not accessible in this environment (verified on host)."
+# Refresh the Android BLE scan before the BLE phases: the preceding UDP/PAM
+# churn can leave the offloaded scan silently dead (#133). Retry a bounded
+# number of times.
+echo "==> Refreshing Android BLE scan registration before the BLE phases..."
+restart_android_app_for_ble
+
+echo "==> Setting transport config: BLE enabled, UDP disabled..."
+"$CLI_BIN" set-transports --ble true --network false
+
+echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
+if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
+    echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
+    BLE_OK=1
 else
-    # Refresh the Android BLE scan before the BLE phases: the preceding UDP/PAM
-    # churn can leave the offloaded scan silently dead (#133). Retry a bounded
-    # number of times; only a host environment with a live BlueZ reaches this branch.
-    echo "==> Refreshing Android BLE scan registration before the BLE phases..."
-    restart_android_app_for_ble
-
-    echo "==> Setting transport config: BLE enabled, UDP disabled..."
-    "$CLI_BIN" set-transports --ble true --network false
-
-    echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-    if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
-        echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
-        BLE_OK=1
-    else
-        echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
-        if [ -f "$DAEMON_LOG" ]; then
-            echo "=== DAEMON LOG DUMP ==="
-            cat "$DAEMON_LOG"
-            echo "======================="
-        fi
-        exit 1
+    echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
+    if [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
     fi
+    exit 1
 fi
 
 # Step 8: Phase 4 - Parallel Discovery Race (Both Enabled)
@@ -1347,23 +1340,19 @@ echo "╚═══════════════════════�
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 3).
 settle_for_dedup "Phase 3"
 
-if [ "$BLE_AVAILABLE" = false ]; then
-    echo "ℹ️  SKIPPED: System D-Bus / BlueZ not accessible in this environment (verified on host)."
-else
-    echo "==> Setting transport config: Both BLE and UDP enabled..."
-    "$CLI_BIN" set-transports --ble true --network true
+echo "==> Setting transport config: Both BLE and UDP enabled..."
+"$CLI_BIN" set-transports --ble true --network true
 
-    if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
-        echo "✅ Parallel Discovery Race Authentication PASSED!"
-    else
-        echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
-        if [ -f "$DAEMON_LOG" ]; then
-            echo "=== DAEMON LOG DUMP ==="
-            cat "$DAEMON_LOG"
-            echo "======================="
-        fi
-        exit 1
+if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
+    echo "✅ Parallel Discovery Race Authentication PASSED!"
+else
+    echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
+    if [ -f "$DAEMON_LOG" ]; then
+        echo "=== DAEMON LOG DUMP ==="
+        cat "$DAEMON_LOG"
+        echo "======================="
     fi
+    exit 1
 fi
 
 # Step 9: Phase 5 - Denial Testing

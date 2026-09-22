@@ -1,0 +1,22 @@
+# Minimal systemd-capable Fedora image for the E2E containers.
+#
+# `fedora:latest` ships no init at all (verified: no /sbin/init, and the
+# `systemd`/`dbus` packages are not installed), so it cannot boot systemd as
+# PID 1. Installing just those two packages provides /sbin/init and a working
+# system bus; everything else the suite needs (bluez, polkit, pam, python,
+# pamtester, ...) is installed at runtime by scripts/ci/run-container-e2e.sh
+# once systemd is up, so the package scriptlets run against a live init.
+#
+# Arch needs no equivalent: `archlinux:base-devel` already ships systemd +
+# systemd-sysvcompat (/sbin/init) and dbus.
+FROM fedora:latest
+
+RUN dnf -y install systemd dbus \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# systemd's halt/poweroff signal (SIGRTMIN+3) lets `docker stop` shut the
+# container down cleanly instead of waiting out the 30s SIGTERM timeout.
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]

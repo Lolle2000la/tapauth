@@ -17,13 +17,60 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
+# Bridge-only mode: ensure the Bumble bridge is up but leave the Bluetooth
+# daemon alone. Used on the host before the Fedora/Arch systemd containers,
+# which run their own bluetoothd and must own the vhci adapter.
+BRIDGE_ONLY="${TAPAUTH_E2E_BLE_BRIDGE_ONLY:-0}"
+
+# External-bridge mode: the Bumble bridge runs on the host (it needs Netsim on
+# the host network and /dev/vhci); this environment's job is only to run its
+# own bluetoothd and own the resulting adapter. Used inside the systemd
+# containers, which cannot see the host Bumble PID because they do not use
+# --pid=host.
+if [ "${TAPAUTH_E2E_EXTERNAL_BLE_BRIDGE:-0}" = "1" ]; then
+    echo "==> External BLE bridge: verifying adapter + bluetoothd (bridge is host-managed)..."
+    if ! pgrep -x bluetoothd >/dev/null; then
+        $SUDO systemctl start bluetooth 2>/dev/null \
+            || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+    fi
+    if ! pgrep -x bluetoothd >/dev/null; then
+        echo "❌ ERROR: bluetoothd is not running in this container."
+        exit 1
+    fi
+
+    NEW_HCI=""
+    for _ in {1..50}; do
+        for dev in /sys/class/bluetooth/hci*; do
+            [ -e "$dev" ] || continue
+            NEW_HCI="$(basename "$dev")"
+            break
+        done
+        [ -n "$NEW_HCI" ] && break
+        sleep 0.2
+    done
+    if [ -z "$NEW_HCI" ]; then
+        echo "❌ ERROR: no virtual HCI adapter found; the host Bumble bridge must be running."
+        exit 1
+    fi
+    INDEX="${NEW_HCI#hci}"
+    for _ in {1..10}; do
+        $SUDO btmgmt --index "$INDEX" power on 2>/dev/null || $SUDO btmgmt power on 2>/dev/null || true
+        if $SUDO btmgmt info 2>/dev/null | grep -q "current settings:.*powered"; then
+            break
+        fi
+        sleep 1
+    done
+    echo "✅ External BLE bridge verified: $NEW_HCI (owned by this environment's bluetoothd)"
+    exit 0
+fi
+
 # If Bumble is already running (e.g. started on host), don't restart Bumble,
 # but verify that bluetoothd is active and the virtual adapter is powered on.
 if [ -f /tmp/bumble-bridge.pid ]; then
     EXISTING_PID=$(cat /tmp/bumble-bridge.pid 2>/dev/null || true)
     if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
         echo "    bumble-hci-bridge is already running (PID $EXISTING_PID)."
-        if ! pgrep -x bluetoothd > /dev/null; then
+        if [ "$BRIDGE_ONLY" != "1" ] && ! pgrep -x bluetoothd > /dev/null; then
             $SUDO systemctl start bluetooth 2>/dev/null \
                 || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
         fi
@@ -64,7 +111,7 @@ if ! command -v hciconfig >/dev/null 2>&1 || ! command -v btmgmt >/dev/null 2>&1
     fi
 fi
 
-if ! pgrep -x bluetoothd > /dev/null; then
+if [ "$BRIDGE_ONLY" != "1" ] && ! pgrep -x bluetoothd > /dev/null; then
     $SUDO systemctl start bluetooth 2>/dev/null \
         || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
 fi

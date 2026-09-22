@@ -270,6 +270,8 @@ jobs:
 
       # Test-only packages: enable dev-* features for the in-CI E2E. Never
       # publish or distribute these; they are not scanned as production artifacts.
+      # The systemd containers run the installed units (no fallback-socket) and
+      # lack usable iptables, hence the explicit dev-firewall-bypass.
       - name: Build TapAuth Fedora RPM Packages (Test/E2E)
         run: |
           mkdir -p ~/.cargo/registry ~/.cargo/git ~/.cache/sccache ~/.cache/fedora-cargo-target ~/.cache/dnf
@@ -283,7 +285,7 @@ jobs:
             -e RUSTC_WRAPPER=sccache \
             -e SCCACHE_DIR=/root/.cache/sccache \
             fedora:latest \
-            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && ./scripts/ci/build-fedora-packages.sh --nocheck --output-dir /workspace/pkg-fedora-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/dev-firewall-bypass'"
           sudo chown -R $(id -u):$(id -g) ~/.cargo ~/.cache
 
       - name: Upload Test Fedora RPM Packages (E2E)
@@ -360,6 +362,8 @@ jobs:
 
       # Test-only packages: enable dev-* features for the in-CI E2E. Never
       # publish or distribute these; they are not scanned as production artifacts.
+      # The systemd containers run the installed units (no fallback-socket) and
+      # lack usable iptables, hence the explicit dev-firewall-bypass.
       - name: Build TapAuth Arch Linux Packages (Test/E2E)
         run: |
           mkdir -p ~/.cache/cargo-arch ~/.cache/cargo-arch-target ~/.cache/sccache-arch ~/.cache/pacman/pkg
@@ -372,7 +376,7 @@ jobs:
             -e RUSTC_WRAPPER=sccache \
             -e SCCACHE_DIR=/cache/sccache \
             archlinux:base-devel \
-            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/fallback-socket'"
+            bash -c "cd /workspace && ./scripts/ci/build-arch-packages.sh --output-dir /workspace/pkg-arch-test --allow-test-features --features 'tapauthd/dev-udp-loopback,tapauthd/dev-polkit-bypass,tapauthd/dev-firewall-bypass'"
           sudo chown -R $(id -u):$(id -g) ~/.cache
 
       - name: Upload Test Arch Linux Packages (E2E)
