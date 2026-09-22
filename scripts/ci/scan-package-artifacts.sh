@@ -49,7 +49,10 @@ case "$PKG_TYPE" in
         WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
         CLEAN_WORK=1
         echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
-        for rpm in "$PKG_DIR"/tapauth-[0-9]*.rpm "$PKG_DIR"/tapauth-*.rpm; do
+        # A single glob: `tapauth-*.rpm` already covers the versioned main
+        # package, so the former `tapauth-[0-9]*.rpm` companion only caused the
+        # main package to be extracted twice.
+        for rpm in "$PKG_DIR"/tapauth-*.rpm; do
             [ -f "$rpm" ] || continue
             if ! (cd "$WORK_DIR" && rpm2cpio "$rpm" | cpio -idm >/dev/null 2>&1); then
                 echo "❌ ERROR: failed to extract $rpm (production-build invariant must fail closed)"
@@ -61,7 +64,9 @@ case "$PKG_TYPE" in
         WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
         CLEAN_WORK=1
         echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
-        for pkg in "$PKG_DIR"/tapauth-[0-9]*.pkg.tar.zst "$PKG_DIR"/tapauth-*.pkg.tar.zst; do
+        # Single glob; see the rpm branch comment (`tapauth-[0-9]*.pkg.tar.zst`
+        # was a redundant subset).
+        for pkg in "$PKG_DIR"/tapauth-*.pkg.tar.zst; do
             [ -f "$pkg" ] || continue
             tar --zstd -xf "$pkg" -C "$WORK_DIR" || {
                 echo "❌ ERROR: failed to extract $pkg (production-build invariant must fail closed)"

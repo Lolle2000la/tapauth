@@ -211,6 +211,9 @@ BINARY_PREEXISTED=false
 # unprivileged Phase 7 cases (runuser -u ...) can execute it.
 INSTALLED_TEST_CLI=false
 CLI_BIN_PREEXISTED=false
+# Original /etc/shadow mode, restored in cleanup() if this run relaxes it for
+# passwd(1) (Debian/Ubuntu conventionally ship 0640 root:shadow).
+SHADOW_MODE_PRE=""
 
 # Env prefix for pamtester invocations: dev mode points the PAM module (and the
 # CLI, whose TAPAUTHD_SOCK override is compiled in via fallback-socket ->
@@ -330,6 +333,10 @@ cleanup() {
     for _entry in "${IPV6_SYSCTL_RESTORE[@]}"; do
         sysctl -w "net.ipv6.conf.${_entry%%=*}.disable_ipv6=${_entry##*=}" >/dev/null 2>&1 || true
     done
+    # Restore /etc/shadow's mode if this run loosened it for passwd(1).
+    if [ -n "$SHADOW_MODE_PRE" ]; then
+        chmod "$SHADOW_MODE_PRE" /etc/shadow 2>/dev/null || true
+    fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
@@ -475,11 +482,11 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
         CREATED_CONFIG=false
 
         id tapauthd >/dev/null 2>&1 || "$PROJECT_ROOT/create-dev-users.sh"
+        # Run the shipped tmpfiles config exactly as the package postinst does:
+        # it creates /etc/tapauth (root:root 0755) and config.toml owned by the
+        # daemon. Do NOT chown the directory -- production keeps it root-owned,
+        # and the E2E must exercise the real SaveConfig permission path.
         systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf" 2>/dev/null || true
-
-        mkdir -p /etc/tapauth
-        chown tapauthd:tapauthd /etc/tapauth 2>/dev/null || true
-        chmod 755 /etc/tapauth 2>/dev/null || true
         if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
             CREATED_CONFIG=true
             cat > "$CONFIG_ASSERT_FILE" <<EOF
@@ -533,7 +540,14 @@ EOF
 
         # 2. Install binaries + units + PolKit policy as the packages would
         install -Dm0755 "$TAPAUTHD_BIN" /usr/bin/tapauthd
+        # Track the test-only CLI independently of the daemon binary: if only
+        # /usr/bin/tapauthd pre-existed, cleanup() must still remove the CLI
+        # this run staged (it never belonged on the host).
+        if [ -e /usr/local/bin/tapauth-ipc-cli ]; then
+            CLI_BIN_PREEXISTED=true
+        fi
         install -Dm0755 "$CLI_BIN" /usr/local/bin/tapauth-ipc-cli
+        INSTALLED_TEST_CLI=true
         # Use the world-executable copy everywhere so the unprivileged Phase 7
         # cases (runuser -u ...) can execute it.
         CLI_BIN="/usr/local/bin/tapauth-ipc-cli"
@@ -547,16 +561,16 @@ EOF
             INSTALLED_POLKIT=true
         fi
 
-        # 3. Runtime/state/config directories exactly as packaging does
-        systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
-        mkdir -p /etc/tapauth
-        chown tapauthd:tapauthd /etc/tapauth
-        # 0755 mirrors the distro packaging (packaging/debian/rules creates
-        # /etc/tapauth root:root 0755). config.toml carries no secrets; the
-        # long-term keys/state live under /var/lib/tapauth (0700).
-        chmod 755 /etc/tapauth
+        # 3. Runtime/state/config directories exactly as packaging does. tmpfiles
+        #    creates /etc/tapauth root:root 0755 and config.toml owned by the
+        #    daemon (it carries no secrets; keys/state live under /var/lib/tapauth
+        #    at 0700). Track a config.toml that did not pre-exist so cleanup only
+        #    removes the one we introduced.
         if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
             CREATED_CONFIG=true
+        fi
+        systemd-tmpfiles --create "$PROJECT_ROOT/packaging/tmpfiles.conf"
+        if [ ! -f "$CONFIG_ASSERT_FILE" ]; then
             cat > "$CONFIG_ASSERT_FILE" <<EOF
 # TapAuth Configuration (created by the E2E suite, mirrors install.sh)
 pam_operation_timeout_secs = 120
@@ -976,9 +990,11 @@ sleep 3
 # keep them safely outside that dedup window.
 
 # Wait out the 1s same-user dedup window left by the previous auth phase
-# ($1 = previous phase label for the call-site comment; $2 = sleep seconds,
-# default 3).
+# ($1 = previous phase label, logged for context; $2 = sleep seconds, default 3).
 settle_for_dedup() {
+    if [ -n "${1:-}" ]; then
+        echo "    (settling after $1 to clear the 1s same-user dedup window)"
+    fi
     sleep "${2:-3}"
 }
 
@@ -1441,6 +1457,11 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     echo "==> Phase 6b: Mixed-stack password fallback after un-pairing..."
     if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
         useradd -m "$PAM_FALLBACK_USER"
+    fi
+    # Remember /etc/shadow's original mode before loosening it: pam_unix/passwd
+    # need to read it during this phase, and cleanup() restores it afterwards.
+    if [ -z "$SHADOW_MODE_PRE" ]; then
+        SHADOW_MODE_PRE="$(stat -c '%a' /etc/shadow 2>/dev/null || true)"
     fi
     chmod 0600 /etc/shadow 2>/dev/null || true
     passwd -u "$PAM_FALLBACK_USER" 2>/dev/null || true

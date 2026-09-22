@@ -12,13 +12,12 @@
 # files already present in PKG_DIR are used as-is; otherwise the build
 # dependencies are installed and scripts/ci/build-debian-packages.sh is invoked.
 #
-# NOTE on /etc/tapauth persistence: main ships /etc/tapauth as an *empty*
-# package-owned directory and seeds no config.toml. dpkg deletes empty
-# package-owned directories on remove/purge, so an empty directory cannot
-# survive. To assert the guarantee that actually matters -- package removal
-# must not delete user data under /etc/tapauth -- this test seeds a sentinel
-# file there after install (mirroring the runtime config created by install.sh
-# / the daemon) before exercising remove and purge.
+# NOTE on /etc/tapauth: the package ships the directory (root:root 0755) and
+# tmpfiles creates /etc/tapauth/config.toml owned by the daemon -- the single
+# writer via SaveConfig -- so a fresh package install can persist config. This
+# test asserts that posture (including that tapauthd can actually write the
+# file) and the remove-vs-purge split: removal preserves user data, purge drops
+# the generated config but not unrelated files.
 
 set -euo pipefail
 
@@ -324,7 +323,30 @@ check_etc_tapauth() {
     else
         fail "$ETC_TAPAUTH does not exist after install"
     fi
-    assert_absent "$ETC_TAPAUTH/config.toml" "no config.toml is shipped by the package"
+    # tmpfiles creates the runtime config owned by the daemon (it is the single
+    # writer via SaveConfig). The directory stays root:root so the daemon cannot
+    # add or remove arbitrary files there.
+    local cfg="$ETC_TAPAUTH/config.toml"
+    assert_file "$cfg" "config.toml is created at install time"
+    local cfg_owner cfg_mode
+    cfg_owner="$(stat -c '%U:%G' "$cfg" 2>/dev/null || true)"
+    cfg_mode="$(stat -c '%a' "$cfg" 2>/dev/null || true)"
+    if [ "$cfg_owner" = "tapauthd:tapauthd" ]; then
+        pass "$cfg is owned tapauthd:tapauthd"
+    else
+        fail "$cfg owner is '$cfg_owner' (expected tapauthd:tapauthd)"
+    fi
+    case "$cfg_mode" in
+        644|0644) pass "$cfg mode is 0644" ;;
+        *) fail "$cfg mode is '$cfg_mode' (expected 0644)" ;;
+    esac
+    # Functional check for the regression this ownership exists for: on a
+    # pristine install tapauthd must be able to persist SaveConfig.
+    if "${SUDO[@]}" runuser -u tapauthd -- test -w "$cfg"; then
+        pass "tapauthd can write $cfg (SaveConfig works on a fresh install)"
+    else
+        fail "tapauthd cannot write $cfg (SaveConfig would fail with EACCES)"
+    fi
 }
 
 check_sysusers() {
@@ -360,9 +382,9 @@ assert_absent /usr/bin/tapauth-ipc-cli "tapauth-ipc-cli is not installed"
 
 # ── Phase 3: seed user data to assert removal never deletes it ───────────────
 section "Seeding user data under /etc/tapauth"
-note "main ships $ETC_TAPAUTH as an empty package-owned directory with no config."
-note "dpkg deletes empty package-owned directories on remove/purge, so seed a"
-note "sentinel to assert the real guarantee: removal must not delete user data."
+note "$ETC_TAPAUTH is package-owned (root:root); tmpfiles creates the daemon-owned config.toml."
+note "dpkg removes package-owned directories only when empty, so seed an unrelated"
+note "user file to assert the real guarantee: removal must not delete user data."
 if [ -d "$ETC_TAPAUTH" ]; then
     printf 'lifecycle-test sentinel\n' > "$ETC_SENTINEL"
     pass "seeded $ETC_SENTINEL"
@@ -408,6 +430,7 @@ fi
 
 assert_absent "$PAM_PROFILE" "pam-config profile removed by dpkg -r"
 assert_dir "$ETC_TAPAUTH" "$ETC_TAPAUTH survives package removal"
+assert_file "$ETC_TAPAUTH/config.toml" "generated config survives package removal"
 assert_file "$ETC_SENTINEL" "user data under $ETC_TAPAUTH survives package removal"
 # State is intentionally preserved by `dpkg -r`; only purge removes it.
 if [ -d "$STATE_DIR" ]; then
@@ -430,8 +453,9 @@ fi
 assert_absent /var/lib/tapauth "/var/lib/tapauth removed on purge"
 assert_absent /var/log/tapauth "/var/log/tapauth removed on purge"
 assert_absent "$STATE_SENTINEL" "state sentinel removed with the purge"
+assert_absent "$ETC_TAPAUTH/config.toml" "generated config removed on purge"
 assert_dir "$ETC_TAPAUTH" "$ETC_TAPAUTH survives package purge"
-assert_file "$ETC_SENTINEL" "user data under $ETC_TAPAUTH survives package purge"
+assert_file "$ETC_SENTINEL" "unrelated user data under $ETC_TAPAUTH survives package purge"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 section "Summary"

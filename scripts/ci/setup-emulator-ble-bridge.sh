@@ -20,13 +20,21 @@ fi
 # If Bumble is already running (e.g. started on host), don't restart Bumble,
 # but verify that bluetoothd is active and the virtual adapter is powered on.
 if [ -f /tmp/bumble-bridge.pid ]; then
-    echo "    bumble-hci-bridge is already running (PID $(cat /tmp/bumble-bridge.pid 2>/dev/null || echo unknown))."
-    if ! pgrep -x bluetoothd > /dev/null; then
-        $SUDO systemctl start bluetooth 2>/dev/null \
-            || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+    EXISTING_PID=$(cat /tmp/bumble-bridge.pid 2>/dev/null || true)
+    if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        echo "    bumble-hci-bridge is already running (PID $EXISTING_PID)."
+        if ! pgrep -x bluetoothd > /dev/null; then
+            $SUDO systemctl start bluetooth 2>/dev/null \
+                || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
+        fi
+        $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+        exit 0
     fi
-    $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
-    exit 0
+    # A stale pid file (interrupted run, crashed bridge) must not make us skip
+    # setup: the bridge is gone, so btmgmt would "succeed" against nothing and
+    # the run would fail later with no hint. Fall through to a fresh start.
+    echo "    Removing stale /tmp/bumble-bridge.pid (PID ${EXISTING_PID:-unknown} not running)."
+    rm -f /tmp/bumble-bridge.pid
 fi
 
 # Ensure the vhci module is loaded and /dev/vhci is writable by us.

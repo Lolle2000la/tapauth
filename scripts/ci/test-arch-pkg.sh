@@ -54,9 +54,22 @@ while [[ $# -gt 0 ]]; do
 done
 PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-arch}"
 
-PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" | cut -d '"' -f2) || true
+# Version comes from the crate manifest; fall back to a `[workspace.package]`
+# version for the `version.workspace = true` layout (same logic as
+# _pkg-common.sh) so this test still resolves the version if the manifests move
+# to workspace inheritance.
+PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
 if [ -z "$PKG_VER" ]; then
-    echo "❌ Could not determine PKG_VER from ${WORKSPACE_DIR}/tapauthd/Cargo.toml" >&2
+    PKG_VER=$(awk '
+        /^\[workspace\.package\]/ { inpkg=1; next }
+        /^\[/ { inpkg=0 }
+        inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+            sub(/[^"]*"/, ""); sub(/".*/, ""); print; exit
+        }
+    ' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null || true)
+fi
+if [ -z "$PKG_VER" ]; then
+    echo "❌ Could not determine PKG_VER from tapauthd/Cargo.toml or [workspace.package] in Cargo.toml" >&2
     exit 1
 fi
 echo "==> Testing Arch Linux packaging for TapAuth version: ${PKG_VER}"
@@ -190,10 +203,34 @@ assert_etc_tapauth() {
     else
         fail "/etc/tapauth is missing"
     fi
-    # PKGBUILD declares backup=('etc/tapauth/config.toml') but does not ship
-    # the file. Do not assert it exists, and do not treat pacman's backup
-    # handling of the missing path as a failure.
-    note "PKGBUILD lists etc/tapauth/config.toml in backup= but ships no such file (not asserted)"
+    # The package does not ship config.toml; tapauth.install's post_install runs
+    # systemd-tmpfiles, which creates it owned by the daemon (the single writer
+    # via SaveConfig). The directory stays root:root.
+    local cfg=/etc/tapauth/config.toml
+    check_file "$cfg" "config.toml is created at install time (via tmpfiles)"
+    local cfg_owner cfg_mode
+    cfg_owner="$(stat -c '%U:%G' "$cfg" 2>/dev/null || true)"
+    cfg_mode="$(stat -c '%a' "$cfg" 2>/dev/null || true)"
+    if [ "$cfg_owner" = "tapauthd:tapauthd" ]; then
+        pass "$cfg is owned tapauthd:tapauthd"
+    else
+        fail "$cfg owner is '$cfg_owner' (expected tapauthd:tapauthd)"
+    fi
+    if [ "$cfg_mode" = "644" ]; then
+        pass "$cfg mode is 0644"
+    else
+        fail "$cfg mode is '$cfg_mode' (expected 0644)"
+    fi
+    # The regression this ownership exists for: on a pristine install tapauthd
+    # must be able to persist SaveConfig.
+    if runuser -u tapauthd -- test -w "$cfg"; then
+        pass "tapauthd can write $cfg (SaveConfig works on a fresh install)"
+    else
+        fail "tapauthd cannot write $cfg (SaveConfig would fail with EACCES)"
+    fi
+    # PKGBUILD declares backup=('etc/tapauth/config.toml'); the file is created
+    # by tmpfiles rather than shipped, so pacman backs up/restores whatever is
+    # on disk at that path on upgrade.
 }
 
 assert_ipc_cli_absent() {

@@ -27,7 +27,12 @@ for apk in "$E2E_APK" "$TEST_APK"; do
 done
 adb install -r -t "$E2E_APK"
 adb install -r -t "$TEST_APK"
-RUNNER=$(adb shell pm list instrumentation | grep dev.rourunisen.tapauth | head -n1 | cut -d: -f2 | cut -d' ' -f1)
+# Capture the full output first, then select the first matching line: piping
+# through `head -n1` can SIGPIPE the producer, and under `set -o pipefail` that
+# nonzero status would abort the script before the fallback runner is used.
+INSTRUMENTATION="$(adb shell pm list instrumentation 2>/dev/null || true)"
+RUNNER="$(printf '%s\n' "$INSTRUMENTATION" | grep dev.rourunisen.tapauth | cut -d: -f2 | cut -d' ' -f1 || true)"
+RUNNER="${RUNNER%%$'\n'*}"
 if [ -z "$RUNNER" ]; then
     RUNNER="dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner"
 fi

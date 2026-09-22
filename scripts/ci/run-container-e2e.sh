@@ -64,10 +64,23 @@ grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
 echo "==> Verifying system users, permissions, and directories..."
 id tapauthd
 getent group tapauthd-clients
-mkdir -p /run/tapauthd /etc/tapauth /var/lib/tapauth
-chown -R tapauthd:tapauthd /etc/tapauth /run/tapauthd /var/lib/tapauth 2>/dev/null || true
-chmod 0755 /etc/tapauth /run/tapauthd 2>/dev/null || true
+# Do NOT chown /etc/tapauth: the package ships it root:root and tmpfiles creates
+# the daemon-owned config.toml. Asserting the real posture keeps the E2E from
+# masking a packaging permission bug that would break SaveConfig on first use.
+mkdir -p /run/tapauthd /var/lib/tapauth
+chown tapauthd:tapauthd /run/tapauthd /var/lib/tapauth 2>/dev/null || true
+chmod 0755 /run/tapauthd 2>/dev/null || true
 chmod 0700 /var/lib/tapauth 2>/dev/null || true
+[ -d /etc/tapauth ] || { echo "❌ /etc/tapauth missing after package install"; exit 1; }
+[ "$(stat -c '%U:%G' /etc/tapauth)" = "root:root" ] \
+    || { echo "❌ /etc/tapauth owner is $(stat -c '%U:%G' /etc/tapauth), expected root:root"; exit 1; }
+[ -f /etc/tapauth/config.toml ] \
+    || { echo "❌ /etc/tapauth/config.toml missing after package install (did tmpfiles run?)"; exit 1; }
+[ "$(stat -c '%U:%G' /etc/tapauth/config.toml)" = "tapauthd:tapauthd" ] \
+    || { echo "❌ config.toml owner is $(stat -c '%U:%G' /etc/tapauth/config.toml), expected tapauthd:tapauthd"; exit 1; }
+runuser -u tapauthd -- test -w /etc/tapauth/config.toml \
+    || { echo "❌ tapauthd cannot write /etc/tapauth/config.toml (SaveConfig would fail)"; exit 1; }
+echo "✅ /etc/tapauth is root:root with a daemon-writable config.toml"
 
 # Verify shipped systemd unit files syntax using distro's systemd
 if command -v systemd-analyze >/dev/null 2>&1; then
