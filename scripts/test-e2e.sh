@@ -217,6 +217,9 @@ BINARY_PREEXISTED=false
 # unprivileged Phase 7 cases (runuser -u ...) can execute it.
 INSTALLED_TEST_CLI=false
 CLI_BIN_PREEXISTED=false
+# Original /etc/shadow mode, restored in cleanup() if this run relaxes it for
+# passwd(1) (Debian/Ubuntu conventionally ship 0640 root:shadow).
+SHADOW_MODE_PRE=""
 
 # Env prefix for pamtester invocations: dev mode points the PAM module (and the
 # CLI, whose TAPAUTHD_SOCK override is compiled in via fallback-socket ->
@@ -336,6 +339,10 @@ cleanup() {
     for _entry in "${IPV6_SYSCTL_RESTORE[@]}"; do
         sysctl -w "net.ipv6.conf.${_entry%%=*}.disable_ipv6=${_entry##*=}" >/dev/null 2>&1 || true
     done
+    # Restore /etc/shadow's mode if this run loosened it for passwd(1).
+    if [ -n "$SHADOW_MODE_PRE" ]; then
+        chmod "$SHADOW_MODE_PRE" /etc/shadow 2>/dev/null || true
+    fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
@@ -1474,9 +1481,20 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
         useradd -m "$PAM_FALLBACK_USER"
     fi
-    # chpasswd runs as root and replaces the locked hash useradd wrote, which is
-    # all pamtester needs; no /etc/shadow mode change or passwd(1) unlock step.
+    # Remember /etc/shadow's original mode before loosening it: pam_unix/passwd
+    # need to read it during this phase, and cleanup() restores it afterwards.
+    # The unlock/hash steps below are load-bearing on the container distros:
+    # dropping them leaves the account unusable and pam_unix reports
+    # PAM_AUTHINFO_UNAVAIL. `passwd --stdin` only exists on Fedora/RHEL (on
+    # Debian/Ubuntu the guard makes it a no-op); chpasswd alone is not enough
+    # there, so both are kept.
+    if [ -z "$SHADOW_MODE_PRE" ]; then
+        SHADOW_MODE_PRE="$(stat -c '%a' /etc/shadow 2>/dev/null || true)"
+    fi
+    chmod 0600 /etc/shadow 2>/dev/null || true
+    passwd -u "$PAM_FALLBACK_USER" 2>/dev/null || true
     echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
+    echo "$PAM_FALLBACK_PASS" | passwd --stdin "$PAM_FALLBACK_USER" 2>/dev/null || true
 
     # Same stack shape as Phase 2e (trailing pam_permit so the
     # [success=1] jump can never overshoot the stack).
