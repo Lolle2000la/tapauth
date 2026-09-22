@@ -78,7 +78,8 @@ chmod 0700 /var/lib/tapauth 2>/dev/null || true
     || { echo "❌ /etc/tapauth/config.toml missing after package install (did tmpfiles run?)"; exit 1; }
 [ "$(stat -c '%U:%G' /etc/tapauth/config.toml)" = "tapauthd:tapauthd" ] \
     || { echo "❌ config.toml owner is $(stat -c '%U:%G' /etc/tapauth/config.toml), expected tapauthd:tapauthd"; exit 1; }
-runuser -u tapauthd -- test -w /etc/tapauth/config.toml \
+# Drop to the daemon uid with coreutils only (runuser is not in every image).
+chroot --userspec=tapauthd:tapauthd / /usr/bin/test -w /etc/tapauth/config.toml \
     || { echo "❌ tapauthd cannot write /etc/tapauth/config.toml (SaveConfig would fail)"; exit 1; }
 echo "✅ /etc/tapauth is root:root with a daemon-writable config.toml"
 

@@ -341,8 +341,10 @@ check_etc_tapauth() {
         *) fail "$cfg mode is '$cfg_mode' (expected 0644)" ;;
     esac
     # Functional check for the regression this ownership exists for: on a
-    # pristine install tapauthd must be able to persist SaveConfig.
-    if "${SUDO[@]}" runuser -u tapauthd -- test -w "$cfg"; then
+    # pristine install tapauthd must be able to persist SaveConfig. chroot
+    # --userspec drops to the daemon uid using coreutils only (runuser is not in
+    # every container image).
+    if "${SUDO[@]}" chroot --userspec=tapauthd:tapauthd / /usr/bin/test -w "$cfg"; then
         pass "tapauthd can write $cfg (SaveConfig works on a fresh install)"
     else
         fail "tapauthd cannot write $cfg (SaveConfig would fail with EACCES)"
