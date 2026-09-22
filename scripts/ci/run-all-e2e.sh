@@ -8,6 +8,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_DIR"
 
+# Common systemd-container bootstrap, run before `exec /sbin/init`:
+#  * mask systemd-resolved: it rewrites /etc/resolv.conf to 127.0.0.53, which
+#    breaks the post-boot package downloads (Docker's resolv.conf must be kept);
+#  * mask systemd-firstboot: without /etc/machine-id it prompts on the console
+#    and hangs sysinit, so the container never finishes booting;
+#  * mask systemd-networkd: unused under --net=host.
+# A machine-id is generated too, so nothing else waits on firstboot.
+SYSTEMD_BOOTSTRAP='
+mkdir -p /etc/systemd/system
+ln -sf /dev/null /etc/systemd/system/systemd-resolved.service
+ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service
+ln -sf /dev/null /etc/systemd/system/systemd-networkd.service
+ln -sf /dev/null /etc/systemd/system/systemd-networkd.socket
+[ -s /etc/machine-id ] || systemd-machine-id-setup
+exec /sbin/init
+'
+
 export E2E_KEEP_BLE_BRIDGE=1
 trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi' EXIT
 
@@ -76,21 +93,18 @@ TAPAUTH_E2E_BLE_BRIDGE_ONLY=1 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
-# fedora:latest ships no init, so bootstrap systemd+dbus then exec it as PID 1.
-# Mask systemd-resolved before boot: it would otherwise rewrite /etc/resolv.conf
-# to 127.0.0.53 and break DNS for the package installs that run after boot.
-# (/etc/systemd/system does not exist yet in the stock image, hence mkdir -p.)
+# fedora:latest ships no init, so install systemd+dbus then run the common
+# bootstrap (masks + machine-id) and exec systemd as PID 1.
 "$SCRIPT_DIR/run-systemd-container.sh" fedora fedora:latest /workspace/pkg-fedora-test \
-    sh -c 'mkdir -p /etc/systemd/system && ln -sf /dev/null /etc/systemd/system/systemd-resolved.service; dnf -y install systemd dbus && exec /sbin/init'
+    sh -c "dnf -y install systemd dbus && ${SYSTEMD_BOOTSTRAP}"
 
 # 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in a systemd container
 echo "=================================================="
 echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
-# Mask systemd-resolved for the same reason as Fedora: the container must keep
-# Docker's /etc/resolv.conf for the post-boot pacman installs.
+# Same common bootstrap; archlinux:base-devel already ships systemd.
 "$SCRIPT_DIR/run-systemd-container.sh" arch archlinux:base-devel /workspace/pkg-arch-test \
-    sh -c 'mkdir -p /etc/systemd/system && ln -sf /dev/null /etc/systemd/system/systemd-resolved.service; exec /sbin/init'
+    sh -c "${SYSTEMD_BOOTSTRAP}"
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ACROSS ALL THREE DISTROS!"
