@@ -135,7 +135,13 @@ echo "ℹ️  Test User:      $TEST_USER"
 echo "ℹ️  UDP port:       $UDP_PORT (emulator shim: 127.0.0.1:$DEV_HOST_PORT)"
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     echo "ℹ️  Isolated Socket: $TAPAUTHD_SOCK"
-    echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
+    # In installed-package dev mode the daemon uses production paths, so
+    # TAPAUTH_STATE_DIR is intentionally unset; don't print an empty value.
+    if [ -n "$TAPAUTH_STATE_DIR" ]; then
+        echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
+    else
+        echo "ℹ️  State Directory: /var/lib/tapauth (production paths)"
+    fi
 fi
 echo "ℹ️  Sandbox Dir:    $TEST_DIR"
 echo ""
@@ -442,10 +448,14 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
     echo "    Found installed pam_tapauth.so:  $PAM_LIB"
 
     # Capability probe: detect whether the installed daemon contains dev-mode shims
-    if strings "$TAPAUTHD_BIN" | grep -q 'TAPAUTH_DEV_UDP_TARGET' 2>/dev/null; then
-        echo "    Daemon Capabilities:            dev shims enabled (UDP loopback, PolKit bypass)"
+    if command -v strings >/dev/null 2>&1; then
+        if strings "$TAPAUTHD_BIN" | grep -q 'TAPAUTH_DEV_UDP_TARGET' 2>/dev/null; then
+            echo "    Daemon Capabilities:            dev shims enabled (UDP loopback, PolKit bypass)"
+        else
+            echo "    Daemon Capabilities:            production release build (no dev shims, systemd activation required)"
+        fi
     else
-        echo "    Daemon Capabilities:            production release build (no dev shims, systemd activation required)"
+        echo "    Daemon Capabilities:            unknown (binutils/strings not installed)"
     fi
 else
     echo "==> Step 1: Building Linux components (tapauthd, tapauth-ipc-cli, client-pam)..."

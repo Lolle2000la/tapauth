@@ -200,6 +200,13 @@ manually bound production socket. Container passes skip the BLE phases (host D-B
 the container boundary) and Phase 7 (PolKit, which needs the systemd-mode build); both are covered by the
 Ubuntu host run.
 
+Note that the container package is intentionally a **full sandbox build**, not the shipped feature set:
+because Cargo unifies features per package across a `--workspace` build, the test features requested for
+`tapauthd` also compile `shared/dev-state-override` into that package's `client-pam`/`tapauth-config`.
+This is inert here (the containers never set `TAPAUTH_STATE_DIR`), but the container PAM module is not
+byte-for-byte the production feature set — only the Ubuntu host pass runs the production-shaped module.
+Production artifacts are built per crate and scanned separately (`check-production-build.sh`).
+
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.

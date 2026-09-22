@@ -68,8 +68,12 @@ getent group tapauthd-clients
 # the daemon-owned config.toml. Asserting the real posture keeps the E2E from
 # masking a packaging permission bug that would break SaveConfig on first use.
 mkdir -p /run/tapauthd /var/lib/tapauth
-chown tapauthd:tapauthd /run/tapauthd /var/lib/tapauth 2>/dev/null || true
-chmod 0755 /run/tapauthd 2>/dev/null || true
+# Match the packaged tmpfiles posture so the container does not exercise a
+# looser layout than production: /run/tapauthd is 0750 tapauthd:tapauthd-clients
+# and the state dir is 0700 tapauthd:tapauthd.
+chown tapauthd:tapauthd-clients /run/tapauthd 2>/dev/null || true
+chown tapauthd:tapauthd /var/lib/tapauth 2>/dev/null || true
+chmod 0750 /run/tapauthd 2>/dev/null || true
 chmod 0700 /var/lib/tapauth 2>/dev/null || true
 [ -d /etc/tapauth ] || { echo "❌ /etc/tapauth missing after package install"; exit 1; }
 [ "$(stat -c '%U:%G' /etc/tapauth)" = "root:root" ] \

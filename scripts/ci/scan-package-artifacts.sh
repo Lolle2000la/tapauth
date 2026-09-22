@@ -111,6 +111,16 @@ if [ "$found_any" -ne 1 ]; then
     exit 1
 fi
 
+# tapauthd is the only carrier of the daemon-only dev-firewall-bypass signature
+# (its warning literal). If a packaging change moved or renamed the daemon
+# binary, the generic "might belong to a subpackage" skip below would let the
+# scan report clean without ever checking that tag. The daemon binary is always
+# in the main package, so require it explicitly.
+if [ ! -f "$WORK_DIR/usr/bin/tapauthd" ]; then
+    echo "❌ ERROR: usr/bin/tapauthd is missing from the $PKG_TYPE package payload from $PKG_DIR — the daemon-only dev-override scan would be vacuous (production-build invariant must fail closed)."
+    exit 1
+fi
+
 fail=0
 for rel_bin in "${BINARIES[@]}"; do
     bin_path="$WORK_DIR/$rel_bin"
