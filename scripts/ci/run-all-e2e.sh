@@ -77,14 +77,19 @@ echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
 # fedora:latest ships no init, so bootstrap systemd+dbus then exec it as PID 1.
+# Mask systemd-resolved before boot: it would otherwise rewrite /etc/resolv.conf
+# to 127.0.0.53 and break DNS for the package installs that run after boot.
 "$SCRIPT_DIR/run-systemd-container.sh" fedora fedora:latest /workspace/pkg-fedora-test \
-    sh -c 'dnf -y install systemd dbus && exec /sbin/init'
+    sh -c 'ln -sf /dev/null /etc/systemd/system/systemd-resolved.service; dnf -y install systemd dbus && exec /sbin/init'
 
 # 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in a systemd container
 echo "=================================================="
 echo " [3/3] Running E2E against installed Arch Linux (.pkg.tar.zst) package"
 echo "=================================================="
-"$SCRIPT_DIR/run-systemd-container.sh" arch archlinux:base-devel /workspace/pkg-arch-test
+# Mask systemd-resolved for the same reason as Fedora: the container must keep
+# Docker's /etc/resolv.conf for the post-boot pacman installs.
+"$SCRIPT_DIR/run-systemd-container.sh" arch archlinux:base-devel /workspace/pkg-arch-test \
+    sh -c 'ln -sf /dev/null /etc/systemd/system/systemd-resolved.service; exec /sbin/init'
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ACROSS ALL THREE DISTROS!"
