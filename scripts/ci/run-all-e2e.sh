@@ -8,8 +8,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_DIR"
 
-FEDORA_SYSTEMD_IMAGE="tapauth-e2e-fedora-systemd"
-
 export E2E_KEEP_BLE_BRIDGE=1
 trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi' EXIT
 
@@ -17,11 +15,6 @@ trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)
 # Ubuntu host pass below needs).
 echo "==> Starting Virtual BLE Bridge on host..."
 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
-
-# Build the systemd-capable Fedora image once: `fedora:latest` ships no init at
-# all, unlike `archlinux:base-devel`.
-echo "==> Building Fedora systemd E2E image..."
-docker build -q -t "$FEDORA_SYSTEMD_IMAGE" -f "$SCRIPT_DIR/Dockerfile.fedora-systemd" "$SCRIPT_DIR" >/dev/null
 
 # 1. Run JNI crypto instrumentation tests directly on emulator via ADB
 echo "=================================================="
@@ -83,7 +76,9 @@ TAPAUTH_E2E_BLE_BRIDGE_ONLY=1 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 echo "=================================================="
 echo " [2/3] Running E2E against installed Fedora (.rpm) package"
 echo "=================================================="
-"$SCRIPT_DIR/run-systemd-container.sh" fedora "$FEDORA_SYSTEMD_IMAGE" /workspace/pkg-fedora-test
+# fedora:latest ships no init, so bootstrap systemd+dbus then exec it as PID 1.
+"$SCRIPT_DIR/run-systemd-container.sh" fedora fedora:latest /workspace/pkg-fedora-test \
+    sh -c 'dnf -y install systemd dbus && exec /sbin/init'
 
 # 4. Run E2E against installed Arch Linux (.pkg.tar.zst) package in a systemd container
 echo "=================================================="

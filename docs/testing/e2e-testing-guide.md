@@ -195,8 +195,8 @@ denies unprivileged non-owner callers; it does not prove anything about the root
 by design in this build.
 
 The Ubuntu pass runs on the host. The Fedora and Arch passes run inside containers that boot **real
-systemd as PID 1** (`archlinux:base-devel` ships it; `fedora:latest` does not, so the derived image
-`scripts/ci/Dockerfile.fedora-systemd` installs `systemd`+`dbus`). Each container runs its **own** D-Bus,
+systemd as PID 1** (`archlinux:base-devel` ships it; `fedora:latest` does not, so that container's command
+installs `systemd`+`dbus` and execs `/sbin/init`). Each container runs its **own** D-Bus,
 polkitd and bluetoothd — the host D-Bus socket is deliberately not bind-mounted — so the installed units
 are genuinely socket-activated, Phase 7 exercises the package's real PolKit action, and BLE runs too: the
 host owns the Bumble bridge, and the container's bluetoothd claims the resulting vhci adapter (the host

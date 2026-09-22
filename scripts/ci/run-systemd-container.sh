@@ -17,9 +17,18 @@ set -euo pipefail
 DISTRO="${1:-}"
 IMAGE="${2:-}"
 PACKAGE_DIR="${3:-}"
+shift 3 2>/dev/null || true
+# Optional command to start PID 1 (defaults to systemd). Fedora's stock image
+# ships no init at all, so it is bootstrapped by installing systemd+dbus and
+# exec'ing it; a `docker run` is used instead of a `docker build` because dnf is
+# reliable in `docker run` on the GitHub runners but failed under buildkit.
+INIT_CMD=("$@")
+if [ "${#INIT_CMD[@]}" -eq 0 ]; then
+    INIT_CMD=(/sbin/init)
+fi
 
 if [[ -z "$DISTRO" || -z "$IMAGE" || -z "$PACKAGE_DIR" ]]; then
-    echo "Usage: $0 <fedora|arch> <image> <package-dir-in-container>"
+    echo "Usage: $0 <distro> <image> <package-dir-in-container> [init-command...]"
     exit 1
 fi
 
@@ -68,7 +77,7 @@ docker run -d --name "$CONTAINER_NAME" \
     -v "$WORKSPACE_DIR":/workspace \
     ${AUTH_TOKEN_MOUNT[@]+"${AUTH_TOKEN_MOUNT[@]}"} \
     --stop-signal=SIGRTMIN+3 \
-    "$IMAGE" /sbin/init >/dev/null
+    "$IMAGE" "${INIT_CMD[@]}" >/dev/null
 
 echo "==> Waiting for systemd to finish booting..."
 BOOTED=false
