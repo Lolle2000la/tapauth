@@ -300,6 +300,11 @@ async fn handle_start_pairing(
     let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
         Ok(g) => Some(g),
         Err(e) => {
+            // NOTE: the "dev-firewall-bypass" token in this message is the only
+            // signature the binary scanners can detect for this feature (there
+            // is no env var). scripts/ci/check-production-build.sh and
+            // scripts/ci/scan-package-artifacts.sh grep for it, and their
+            // positive controls fail if it disappears — keep the spelling.
             tracing::warn!(
                 "Failed to open firewall port for pairing (continuing anyway; dev-firewall-bypass): {}",
                 e

@@ -96,7 +96,7 @@ BINARIES=(
 # Find pam_tapauth.so across multiarch or standard security dirs
 PAM_SO=$(find "$WORK_DIR" -name "pam_tapauth.so" 2>/dev/null | head -1 || true)
 if [ -n "$PAM_SO" ]; then
-    BINARIES+=("${PAM_SO#$WORK_DIR/}")
+    BINARIES+=("${PAM_SO#"$WORK_DIR"/}")
 fi
 
 # The PAM module is the security-critical shipped artifact; require it in real

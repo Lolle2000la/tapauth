@@ -59,7 +59,12 @@ esac
 
 echo "==> Verifying the dummy fingerprint stack stayed untouched on $DISTRO..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+# NB: use an explicit `if`, not `! grep` — under `set -e` a negated command is
+# exempt from errexit, so `! grep ...` would make this check vacuous.
+if grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
+    echo "❌ ERROR: $DISTRO package wired pam_tapauth.so into the unrelated kde-fingerprint PAM stack"
+    exit 1
+fi
 
 echo "==> Verifying system users, permissions, and directories..."
 id tapauthd
@@ -119,7 +124,12 @@ esac
 
 echo "==> Verifying the dummy fingerprint stack is still untouched after removal on $DISTRO..."
 grep "pam_fprintd.so" /etc/pam.d/kde-fingerprint
-! grep "pam_tapauth.so" /etc/pam.d/kde-fingerprint
+# NB: use an explicit `if`, not `! grep` — under `set -e` a negated command is
+# exempt from errexit, so `! grep ...` would make this check vacuous.
+if grep -q "pam_tapauth.so" /etc/pam.d/kde-fingerprint; then
+    echo "❌ ERROR: $DISTRO package wired pam_tapauth.so into the unrelated kde-fingerprint PAM stack"
+    exit 1
+fi
 
 echo "=================================================="
 echo "🎉 ALL E2E TESTS PASSED ON DISTRO: $DISTRO"

@@ -50,7 +50,10 @@ if [ -d /cache ]; then
     sed -i '/export CARGO_PROFILE_RELEASE_STRIP=/a \  export RUSTC_WRAPPER=sccache\n  export SCCACHE_DIR="/cache/sccache"\n  export CARGO_TARGET_DIR="/cache/target"' PKGBUILD
     sed -i 's|target/release/|/cache/target/release/|g' PKGBUILD
 fi
-chown -R builder:builder "$BUILD_DIR" "$OUTPUT_DIR"
+# Only the container-local build dir needs to be builder-owned: makepkg runs as
+# builder there. $OUTPUT_DIR is a host bind mount and the final copy runs as
+# root, so chowning it would just churn host ownership for no benefit.
+chown -R builder:builder "$BUILD_DIR"
 
 echo "==> Building Arch packages with makepkg..."
 su builder -c "makepkg -s --noconfirm --nodeps"
