@@ -1,23 +1,19 @@
 #!/bin/bash
-# Runs TapAuth E2E tests inside a container (Fedora or Arch) against the host
-# Android emulator.
+# Runs the TapAuth E2E suite inside a systemd-booting container (Fedora or Arch)
+# against the host Android emulator, using the installed package's units.
 #
-# Usage: run-container-e2e.sh <fedora|arch> <package-dir> [dev|systemd]
-#   dev      - fallback-socket sandbox daemon launched manually (no init)
-#   systemd  - the installed package's units, driven by a real systemd PID 1
-#              (see scripts/ci/run-systemd-container.sh); the CI default
+# The container's PID 1 is systemd and it runs its own D-Bus/polkitd/bluetoothd
+# (see scripts/ci/run-systemd-container.sh), so this script is always driven via
+# `docker exec` against that live init.
+#
+# Usage: run-container-e2e.sh <fedora|arch> <package-dir>
 set -euo pipefail
 
 DISTRO="${1:-}"
 PACKAGE_DIR="${2:-}"
-MODE="${3:-dev}"
 
 if [[ -z "$DISTRO" || -z "$PACKAGE_DIR" ]]; then
-    echo "Usage: $0 <fedora|arch> <package-dir> [dev|systemd]"
-    exit 1
-fi
-if [[ "$MODE" != "dev" && "$MODE" != "systemd" ]]; then
-    echo "❌ ERROR: invalid mode '$MODE' (expected dev|systemd)"
+    echo "Usage: $0 <fedora|arch> <package-dir>"
     exit 1
 fi
 
@@ -45,11 +41,9 @@ case "$DISTRO" in
     fedora)
         echo "==> Installing Fedora runtime requirements..."
         dnf install -y pamtester python3 python3-cryptography python3-protobuf qrencode dbus dbus-tools procps-ng iproute android-tools systemd bluez bluez-deprecated util-linux binutils
-        if [ "$MODE" = "systemd" ]; then
-            # The container runs its own system bus, polkitd and bluetoothd (see
-            # scripts/ci/run-systemd-container.sh).
-            dnf install -y polkit
-        fi
+        # The container runs its own system bus, polkitd and bluetoothd (see
+        # scripts/ci/run-systemd-container.sh).
+        dnf install -y polkit
 
         echo "==> Installing pre-built Fedora RPM packages..."
         dnf install -y "$PACKAGE_DIR"/tapauth-[0-9]*.rpm
@@ -58,9 +52,7 @@ case "$DISTRO" in
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
         pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
-        if [ "$MODE" = "systemd" ]; then
-            pacman -Sy --noconfirm polkit
-        fi
+        pacman -Sy --noconfirm polkit
 
         # Arch ships no `pamtester` package (AUR-only), so compile the minimal
         # stand-in from scripts/ci/pamtester.c. The Ubuntu host and Fedora
@@ -104,20 +96,10 @@ assert_dir_posture() {
         || { echo "❌ $dir mode is $(stat -c '%a' "$dir"), expected $mode"; exit 1; }
 }
 
-if [ "$MODE" = "systemd" ]; then
-    # Real units: the package's tmpfiles (and the socket unit) own these paths,
-    # so assert the shipped posture instead of creating/loosening it here.
-    assert_dir_posture /run/tapauthd tapauthd tapauthd-clients 750
-    assert_dir_posture /var/lib/tapauth tapauthd tapauthd 700
-else
-    # Dev sandbox: the daemon binds the socket itself, so create the runtime
-    # dirs and match the packaged posture.
-    mkdir -p /run/tapauthd /var/lib/tapauth
-    chown tapauthd:tapauthd-clients /run/tapauthd 2>/dev/null || true
-    chown tapauthd:tapauthd /var/lib/tapauth 2>/dev/null || true
-    chmod 0750 /run/tapauthd 2>/dev/null || true
-    chmod 0700 /var/lib/tapauth 2>/dev/null || true
-fi
+# The package's tmpfiles (and the socket unit) own these paths, so assert the
+# shipped posture instead of creating/loosening it here.
+assert_dir_posture /run/tapauthd tapauthd tapauthd-clients 750
+assert_dir_posture /var/lib/tapauth tapauthd tapauthd 700
 
 [ -d /etc/tapauth ] || { echo "❌ /etc/tapauth missing after package install"; exit 1; }
 [ "$(stat -c '%U:%G' /etc/tapauth)" = "root:root" ] \
@@ -137,16 +119,14 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze verify /usr/lib/systemd/system/tapauthd.service /usr/lib/systemd/system/tapauthd.socket || true
 fi
 
-if [ "$MODE" = "systemd" ]; then
-    # The container runs its own system bus, polkitd and bluetoothd. The daemon
-    # itself is socket-activated from the package's units (test-e2e.sh enables
-    # and starts tapauthd.socket); make sure the supporting services are up.
-    echo "==> Starting container systemd services (dbus, polkit, bluetooth)..."
-    systemctl start dbus.socket 2>/dev/null || true
-    systemctl enable --now polkit 2>/dev/null || true
-    systemctl enable --now bluetooth 2>/dev/null || true
-    systemctl --no-pager --failed || true
-fi
+# The container runs its own system bus, polkitd and bluetoothd. The daemon
+# itself is socket-activated from the package's units (test-e2e.sh enables and
+# starts tapauthd.socket); make sure the supporting services are up.
+echo "==> Starting container systemd services (dbus, polkit, bluetooth)..."
+systemctl start dbus.socket 2>/dev/null || true
+systemctl enable --now polkit 2>/dev/null || true
+systemctl enable --now bluetooth 2>/dev/null || true
+systemctl --no-pager --failed || true
 
 # Check ADB connectivity to host emulator
 if command -v adb >/dev/null 2>&1; then
@@ -155,18 +135,13 @@ if command -v adb >/dev/null 2>&1; then
     adb shell pm clear dev.rourunisen.tapauth.e2e || true
 fi
 
-echo "==> Running TapAuth E2E suite against installed $DISTRO package (mode: $MODE)..."
+echo "==> Running TapAuth E2E suite against installed $DISTRO package..."
 cd "$WORKSPACE_DIR"
 export TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1
-if [ "$MODE" = "systemd" ]; then
-    export TAPAUTH_E2E_DAEMON_MODE=systemd
-    # The host owns the Bumble bridge; the container's bluetoothd owns the
-    # resulting vhci adapter, so the suite must verify it, not launch it.
-    export TAPAUTH_E2E_EXTERNAL_BLE_BRIDGE=1
-else
-    export TAPAUTH_DEV_MODE=1
-    export TAPAUTH_E2E_DAEMON_MODE=dev
-fi
+export TAPAUTH_E2E_DAEMON_MODE=systemd
+# The host owns the Bumble bridge; the container's bluetoothd owns the resulting
+# vhci adapter, so the suite must verify it, not launch it.
+export TAPAUTH_E2E_EXTERNAL_BLE_BRIDGE=1
 ./scripts/test-e2e.sh
 
 echo "==> Verifying clean package uninstallation on $DISTRO..."

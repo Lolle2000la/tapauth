@@ -66,27 +66,20 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${{ steps.version_vars.outputs.VERSION }}/" PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.calc_sha.outputs.SHA256 }}')/" PKGBUILD
 
-          cat > .SRCINFO <<EOF
-          pkgbase = tapauth
-          	pkgdesc = Local smartphone-based authentication framework engine
-          	pkgver = ${{ steps.version_vars.outputs.VERSION }}
-          	pkgrel = 1
-          	url = https://github.com/lolle2000la/tapauth
-          	arch = x86_64
-          	arch = aarch64
-          	license = AGPL-3.0
-          	install = tapauth.install
-          	makedepends = cargo
-          	makedepends = rust
-          	makedepends = protobuf
-          	makedepends = clang
-          	depends = dbus
-          	depends = pam
-          	source = tapauth-${{ steps.version_vars.outputs.VERSION }}.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v${{ steps.version_vars.outputs.VERSION }}.tar.gz
-          	sha256sums = ${{ steps.calc_sha.outputs.SHA256 }}
-
-          pkgname = tapauth
-          EOF
+          # Generate .SRCINFO from the PKGBUILD with makepkg, so the AUR metadata
+          # can never drift from the shared PKGBUILD. makepkg refuses to run as
+          # root and needs a writable build dir, so run it as a throwaway user in
+          # an Arch container and capture stdout.
+          SRCINFO="$(docker run --rm \
+            -v "$PWD/PKGBUILD:/src/PKGBUILD:ro" \
+            -v "$PWD/tapauth.install:/src/tapauth.install:ro" \
+            archlinux:base-devel bash -c '
+              useradd -m builder 2>/dev/null
+              mkdir -p /work && cp /src/PKGBUILD /src/tapauth.install /work/
+              chown -R builder /work
+              su builder -c "cd /work && makepkg --printsrcinfo"
+            ')"
+          printf "%s\n" "$SRCINFO" > .SRCINFO
 
           git add PKGBUILD .SRCINFO tapauth.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"

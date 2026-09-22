@@ -50,6 +50,18 @@ systemd system daemons, and low-level communication links.
 %setup -q -n %{name}-%{version}
 
 %build
+# Refuse to let the cargo_features define pull dev overrides into a production
+# RPM. scripts/ci/build-fedora-packages.sh sets allow_test_features=1 only for
+# the explicitly test-only E2E packages, which are never scanned or published.
+if [ -n "%{?cargo_features}" ] && [ -z "%{?allow_test_features}" ]; then
+    case "%{cargo_features}" in
+        *dev-*|*fallback-socket*)
+            echo "ERROR: refusing to build a production RPM with test features: %{cargo_features}" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # Allow CI to point cargo at a persistent cache (scripts/ci/build-fedora-packages.sh
 # passes these as rpm defines when the mounted cache dirs exist).
 export CARGO_HOME="%{?_cargo_home}%{!?_cargo_home:${CARGO_HOME:-%{_builddir}/cargo-home}}"

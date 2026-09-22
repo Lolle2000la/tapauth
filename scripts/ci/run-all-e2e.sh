@@ -26,7 +26,7 @@ exec /sbin/init
 '
 
 export E2E_KEEP_BLE_BRIDGE=1
-trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi' EXIT
+trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi; rm -f /tmp/tapauth-vhci-dev' EXIT
 
 # Ensure host virtual BLE bridge is up (with the host bluetoothd, which the
 # Ubuntu host pass below needs).

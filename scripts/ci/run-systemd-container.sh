@@ -118,7 +118,7 @@ docker exec "$CONTAINER_NAME" systemctl --no-pager --failed 2>/dev/null || true
 
 # The suite itself (install deps + package, verify posture, run test-e2e.sh).
 docker exec "$CONTAINER_NAME" \
-    /workspace/scripts/ci/run-container-e2e.sh "$DISTRO" "$PACKAGE_DIR" systemd
+    /workspace/scripts/ci/run-container-e2e.sh "$DISTRO" "$PACKAGE_DIR"
 
 echo "=================================================="
 echo "🎉 SYSTEMD E2E PASSED ON DISTRO: $DISTRO"

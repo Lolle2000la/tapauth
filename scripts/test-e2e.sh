@@ -217,9 +217,6 @@ BINARY_PREEXISTED=false
 # unprivileged Phase 7 cases (runuser -u ...) can execute it.
 INSTALLED_TEST_CLI=false
 CLI_BIN_PREEXISTED=false
-# Original /etc/shadow mode, restored in cleanup() if this run relaxes it for
-# passwd(1) (Debian/Ubuntu conventionally ship 0640 root:shadow).
-SHADOW_MODE_PRE=""
 
 # Env prefix for pamtester invocations: dev mode points the PAM module (and the
 # CLI, whose TAPAUTHD_SOCK override is compiled in via fallback-socket ->
@@ -339,10 +336,6 @@ cleanup() {
     for _entry in "${IPV6_SYSCTL_RESTORE[@]}"; do
         sysctl -w "net.ipv6.conf.${_entry%%=*}.disable_ipv6=${_entry##*=}" >/dev/null 2>&1 || true
     done
-    # Restore /etc/shadow's mode if this run loosened it for passwd(1).
-    if [ -n "$SHADOW_MODE_PRE" ]; then
-        chmod "$SHADOW_MODE_PRE" /etc/shadow 2>/dev/null || true
-    fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
@@ -598,6 +591,19 @@ EOF
             chown tapauthd:tapauthd "$CONFIG_ASSERT_FILE"
             chmod 644 "$CONFIG_ASSERT_FILE"
         fi
+    fi
+
+    # The daemon reads udp_port from config.toml. When the package's tmpfiles
+    # created an empty file, the built-in default (36692) applies. Assert the
+    # effective port matches the one this harness drives the emulator
+    # redirection and packet capture with, so overriding TAPAUTH_E2E_UDP_PORT
+    # cannot silently desync the daemon from the test.
+    CONFIGURED_UDP_PORT="$(grep -E '^[[:space:]]*udp_port[[:space:]]*=' "$CONFIG_ASSERT_FILE" 2>/dev/null | tail -n1 | sed -E 's/.*=[[:space:]]*//; s/[^0-9].*//')"
+    CONFIGURED_UDP_PORT="${CONFIGURED_UDP_PORT:-36692}"
+    if [ "$CONFIGURED_UDP_PORT" != "$UDP_PORT" ]; then
+        echo "❌ ERROR: $CONFIG_ASSERT_FILE sets udp_port=$CONFIGURED_UDP_PORT but this run uses $UDP_PORT."
+        echo "   Set TAPAUTH_E2E_UDP_PORT=$CONFIGURED_UDP_PORT to match the installed config."
+        exit 1
     fi
 
     # 4. E2E-only unit override. These are the ONLY non-production knobs: the
@@ -1307,7 +1313,6 @@ elif ! dbus-send --system --dest=org.bluez / org.freedesktop.DBus.Peer.Ping >/de
     exit 1
 fi
 
-BLE_OK=0
 # Refresh the Android BLE scan before the BLE phases: the preceding UDP/PAM
 # churn can leave the offloaded scan silently dead (#133). Retry a bounded
 # number of times.
@@ -1320,7 +1325,6 @@ echo "==> Setting transport config: BLE enabled, UDP disabled..."
 echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
 if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
     echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
-    BLE_OK=1
 else
     echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
@@ -1470,15 +1474,9 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     if ! id "$PAM_FALLBACK_USER" >/dev/null 2>&1; then
         useradd -m "$PAM_FALLBACK_USER"
     fi
-    # Remember /etc/shadow's original mode before loosening it: pam_unix/passwd
-    # need to read it during this phase, and cleanup() restores it afterwards.
-    if [ -z "$SHADOW_MODE_PRE" ]; then
-        SHADOW_MODE_PRE="$(stat -c '%a' /etc/shadow 2>/dev/null || true)"
-    fi
-    chmod 0600 /etc/shadow 2>/dev/null || true
-    passwd -u "$PAM_FALLBACK_USER" 2>/dev/null || true
+    # chpasswd runs as root and replaces the locked hash useradd wrote, which is
+    # all pamtester needs; no /etc/shadow mode change or passwd(1) unlock step.
     echo "${PAM_FALLBACK_USER}:${PAM_FALLBACK_PASS}" | chpasswd
-    echo "$PAM_FALLBACK_PASS" | passwd --stdin "$PAM_FALLBACK_USER" 2>/dev/null || true
 
     # Same stack shape as Phase 2e (trailing pam_permit so the
     # [success=1] jump can never overshoot the stack).
@@ -1596,13 +1594,10 @@ echo "║  Phase 6b: Mixed-stack PAM password fallback:    PASSED       ║"
 else
 echo "║  Phase 6b: Mixed-stack PAM password fallback:    SKIPPED      ║"
 fi
-if [ "${BLE_OK:-0}" = "1" ]; then
+# BLE has no skip path: an unreachable BlueZ or a failed BLE auth exits above,
+# so reaching the summary means both phases ran and passed.
 echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
 echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
-else
-echo "║  Phase 3: Bluetooth Low Energy (BLE):            SKIPPED      ║"
-echo "║  Phase 4: Parallel Race (UDP + BLE):             SKIPPED      ║"
-fi
 echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
 echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
 echo "║  Phase 6: Device Removal & PAM_IGNORE:           PASSED       ║"

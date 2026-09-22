@@ -50,6 +50,12 @@ fi
 if [ -n "$CARGO_FEATURES" ]; then
     RPMBUILD_ARGS+=("--define" "cargo_features --features ${CARGO_FEATURES}")
 fi
+if [ "$ALLOW_TEST_FEATURES" = true ]; then
+    # Let the spec's dev-feature guard accept the test-only feature set. Without
+    # this the spec refuses dev-*/fallback-socket outright, which is exactly the
+    # invariant we want for anything that is not an explicit test build.
+    RPMBUILD_ARGS+=("--define" "allow_test_features 1")
+fi
 
 if [ -d /root/.cargo ]; then
     RPMBUILD_ARGS+=("--define" "_cargo_home /root/.cargo")
