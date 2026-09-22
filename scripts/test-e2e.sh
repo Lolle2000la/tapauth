@@ -419,7 +419,15 @@ if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
         fi
     done
     if [ -z "$PAM_LIB" ]; then
-        PAM_LIB="pam_tapauth.so"
+        # The multiarch security dir differs across distros; fall back to a
+        # bounded search before giving up.
+        PAM_LIB="$(find /usr/lib /lib -maxdepth 4 -name pam_tapauth.so 2>/dev/null | head -1 || true)"
+    fi
+    if [ -z "$PAM_LIB" ]; then
+        echo "❌ ERROR: installed-package mode could not locate pam_tapauth.so."
+        echo "   The PAM phases (2b/2e/6b) would otherwise be skipped silently;"
+        echo "   the installed package is broken or ships the module elsewhere."
+        exit 1
     fi
 
     if [ ! -x "$TAPAUTHD_BIN" ]; then

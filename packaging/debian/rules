@@ -3,7 +3,6 @@
 export PATH := $(if $(HOME),$(HOME)/.cargo/bin:)$(PATH)
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 CARGO := $(shell which cargo-1.91 2>/dev/null || which cargo)
-RUSTC := $(shell which rustc-1.91 2>/dev/null || which rustc)
 DISTRO_SERIES := $(shell dpkg-parsechangelog -S Distribution)
 # Extra cargo features (e.g. test-only dev knobs) are passed in by
 # scripts/ci/build-debian-packages.sh --features. Production release builds

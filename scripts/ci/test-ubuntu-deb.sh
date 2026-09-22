@@ -147,6 +147,10 @@ group_exists() {
 # ── State paths ───────────────────────────────────────────────────────────────
 ETC_TAPAUTH="/etc/tapauth"
 ETC_SENTINEL="$ETC_TAPAUTH/persist-check"
+# Set only when this run seeds the sentinel, so cleanup() removes the directory
+# only if the test itself emptied it — never a real, empty /etc/tapauth on the
+# host.
+ETC_SENTINEL_SEEDED=false
 STATE_DIR="/var/lib/tapauth"
 STATE_SENTINEL="$STATE_DIR/lifecycle-sentinel"
 PAM_PROFILE="/usr/share/pam-configs/tapauth"
@@ -160,7 +164,9 @@ cleanup() {
     # Remove the sentinels this test created; leave anything a real install owns.
     rm -f "$ETC_SENTINEL" 2>/dev/null || true
     "${SUDO[@]}" rm -f "$STATE_SENTINEL" 2>/dev/null || true
-    rmdir "$ETC_TAPAUTH" 2>/dev/null || true
+    if [ "$ETC_SENTINEL_SEEDED" = true ]; then
+        rmdir "$ETC_TAPAUTH" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -389,6 +395,7 @@ note "dpkg removes package-owned directories only when empty, so seed an unrelat
 note "user file to assert the real guarantee: removal must not delete user data."
 if [ -d "$ETC_TAPAUTH" ]; then
     printf 'lifecycle-test sentinel\n' > "$ETC_SENTINEL"
+    ETC_SENTINEL_SEEDED=true
     pass "seeded $ETC_SENTINEL"
 else
     fail "cannot seed sentinel: $ETC_TAPAUTH is missing"

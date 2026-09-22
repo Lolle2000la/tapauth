@@ -44,6 +44,9 @@ if ! id builder >/dev/null 2>&1; then
     useradd -m builder
 fi
 if [ -d /cache ]; then
+    # /cache is a host bind mount. Unlike $OUTPUT_DIR it must be chowned: makepkg
+    # runs as builder and writes CARGO_HOME/SCCACHE_DIR/target there. The
+    # workflow restores host ownership afterwards.
     mkdir -p /cache/cargo /cache/sccache /cache/target
     chown -R builder:builder /cache
     sed -i 's|export CARGO_HOME=.*|export CARGO_HOME="/cache/cargo"|' PKGBUILD

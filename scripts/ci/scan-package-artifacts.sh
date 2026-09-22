@@ -99,10 +99,11 @@ if [ -n "$PAM_SO" ]; then
     BINARIES+=("${PAM_SO#"$WORK_DIR"/}")
 fi
 
-# The PAM module is the security-critical shipped artifact; require it in real
-# package payloads so a rename/relocation cannot make its scan silently vacuous.
-# (The `dir` self-test intentionally carries only a stub daemon.)
-if [ "$PKG_TYPE" != "dir" ] && [ -z "$PAM_SO" ]; then
+# The PAM module is the security-critical shipped artifact; require it in every
+# mode (including an extracted `dir` payload) so a rename/relocation cannot make
+# its scan silently vacuous. The self-test below plants a stub module so it
+# still exercises the rest of the scanner.
+if [ -z "$PAM_SO" ]; then
     echo "❌ ERROR: pam_tapauth.so not found in the $PKG_TYPE payload from $PKG_DIR — refusing to report success (production-build invariant must fail closed)."
     exit 1
 fi
@@ -165,8 +166,9 @@ if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     # disabled, so it neither needs a package manager nor recurses.
     for var in "${DEV_VARS[@]}"; do
         plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
-        mkdir -p "$plant_dir/usr/bin"
+        mkdir -p "$plant_dir/usr/bin" "$plant_dir/usr/lib/security"
         printf 'placeholder for %s dev override\n' "$var" > "$plant_dir/usr/bin/tapauthd"
+        printf 'clean pam stub\n' > "$plant_dir/usr/lib/security/pam_tapauth.so"
         if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
             echo "❌ ERROR: scan self-test FAILED — planted '$var' was NOT detected; scan is unreliable!"
             rm -rf "$plant_dir"
@@ -176,8 +178,9 @@ if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     done
 
     clean_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
-    mkdir -p "$clean_dir/usr/bin"
+    mkdir -p "$clean_dir/usr/bin" "$clean_dir/usr/lib/security"
     printf 'clean placeholder binary with no dev overrides\n' > "$clean_dir/usr/bin/tapauthd"
+    printf 'clean pam stub\n' > "$clean_dir/usr/lib/security/pam_tapauth.so"
     if ! SCAN_SELF_TEST=0 bash "$0" dir "$clean_dir" >/dev/null 2>&1; then
         echo "❌ ERROR: scan self-test FAILED — a clean payload was incorrectly rejected!"
         rm -rf "$clean_dir"
@@ -185,7 +188,19 @@ if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     fi
     rm -rf "$clean_dir"
 
-    echo "✅ Scan self-test passed: every forbidden tag (${DEV_VARS[*]}) was detected, clean payload accepted."
+    # The module requirement must fire: a payload with the daemon but no
+    # pam_tapauth.so has to be rejected rather than scanned as "clean".
+    no_pam_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
+    mkdir -p "$no_pam_dir/usr/bin"
+    printf 'clean daemon without a pam module\n' > "$no_pam_dir/usr/bin/tapauthd"
+    if SCAN_SELF_TEST=0 bash "$0" dir "$no_pam_dir" >/dev/null 2>&1; then
+        echo "❌ ERROR: scan self-test FAILED — a payload missing pam_tapauth.so was accepted!"
+        rm -rf "$no_pam_dir"
+        exit 1
+    fi
+    rm -rf "$no_pam_dir"
+
+    echo "✅ Scan self-test passed: every forbidden tag (${DEV_VARS[*]}) was detected, clean payload accepted, missing pam_tapauth.so rejected."
 fi
 
 echo "✅ All shipped $PKG_TYPE binaries are 100% clean of dev/test overrides."
