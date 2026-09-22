@@ -11,7 +11,13 @@ import kotlin.math.abs
  * 1. Nonce Check (Primary): Maintains cache of all received challenge nonces
  * 2. Timestamp Check (Secondary): Validates 60-second validity window
  */
-class ReplayMitigationCache {
+class ReplayMitigationCache(
+    // Injectable wall-clock in Unix seconds. Defaults to the system clock; the
+    // unit tests override it so the 60-second window boundary is deterministic
+    // (a real clock can tick between building a timestamp and isReplay reading
+    // "now", which made the +61s case flaky).
+    private val nowSecondsProvider: () -> Long = { System.currentTimeMillis() / 1000 }
+) {
 
     private val challengeCache = ConcurrentHashMap<String, Long>()
 
@@ -37,7 +43,7 @@ class ReplayMitigationCache {
      */
     fun isReplay(challenge: ByteArray, timestampUnixSeconds: Long): Boolean {
         val challengeHex = challenge.toHex()
-        val nowSeconds = System.currentTimeMillis() / 1000
+        val nowSeconds = nowSecondsProvider()
 
         // Defense 1: Timestamp Check (Secondary Defense)
         // Reject if timestamp is outside the 60-second validity window
@@ -76,7 +82,7 @@ class ReplayMitigationCache {
 
     /** Remove expired entries from the cache. Called periodically during isReplay() checks. */
     private fun cleanExpired() {
-        val nowSeconds = System.currentTimeMillis() / 1000
+        val nowSeconds = nowSecondsProvider()
         val sizeBefore = challengeCache.size
 
         challengeCache.entries.removeIf { (_, expiryTime) -> expiryTime < nowSeconds }
