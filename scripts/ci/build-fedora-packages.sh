@@ -38,8 +38,9 @@ tar -czf "$RPM_ROOT/SOURCES/tapauth-${PKG_VER}.tar.gz" \
     --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle \
     --transform "s,^./,tapauth-${PKG_VER}/," \
     -C "${WORKSPACE_DIR}" .
-cp "${WORKSPACE_DIR}/packaging/sysusers.conf" "$RPM_ROOT/SOURCES/tapauth-sysusers.conf"
-cp "${WORKSPACE_DIR}/packaging/tmpfiles.conf" "$RPM_ROOT/SOURCES/tapauth-tmpfiles.conf"
+
+# NOTE: sysusers.conf/tmpfiles.conf are read by the spec from the unpacked
+# source tree (%install), not from SOURCES — no copies are needed here.
 
 # Define cargo_features macro if features were passed
 RPMBUILD_ARGS=("-ba" "$RPM_ROOT/SPECS/tapauth.spec")

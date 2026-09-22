@@ -99,6 +99,14 @@ if [ -n "$PAM_SO" ]; then
     BINARIES+=("${PAM_SO#$WORK_DIR/}")
 fi
 
+# The PAM module is the security-critical shipped artifact; require it in real
+# package payloads so a rename/relocation cannot make its scan silently vacuous.
+# (The `dir` self-test intentionally carries only a stub daemon.)
+if [ "$PKG_TYPE" != "dir" ] && [ -z "$PAM_SO" ]; then
+    echo "❌ ERROR: pam_tapauth.so not found in the $PKG_TYPE payload from $PKG_DIR — refusing to report success (production-build invariant must fail closed)."
+    exit 1
+fi
+
 # Fail closed: a production package MUST contain the shipped binaries. A
 # package payload with none of them means extraction silently produced an
 # empty tree (which used to print success).

@@ -8,7 +8,6 @@ on:
       - 'tapauthd/**'
       - 'client-pam/**'
       - 'client-config-gui/**'
-      - 'server-android/**'
       - 'proto/**'
       - 'packaging/**'
       - 'systemd/**'
@@ -25,7 +24,6 @@ on:
       - 'tapauthd/**'
       - 'client-pam/**'
       - 'client-config-gui/**'
-      - 'server-android/**'
       - 'proto/**'
       - 'packaging/**'
       - 'systemd/**'
@@ -84,9 +82,37 @@ jobs:
       - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
 
+  production-guard:
+    name: Production Build Override Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libpam0g-dev \
+            protobuf-compiler \
+            libgtk-4-dev \
+            build-essential
+
+      # Builds the shipped artifacts per crate (debug + release), scans them for
+      # dev overrides and self-checks the scan with a positive control. This is
+      # release-build heavy, so it runs as its own job instead of delaying
+      # formatting/clippy feedback in `lint-and-format`.
       - name: Verify production binaries contain no dev/test overrides
         run: ./scripts/ci/check-production-build.sh
-
 
   build-and-test:
     name: Build and Test Workspace Modules

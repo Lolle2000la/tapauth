@@ -30,9 +30,18 @@ ln -sfn "${WORKSPACE_DIR}/target" "$BUILD_DIR/target"
 rm -rf debian
 cp -r "${WORKSPACE_DIR}/packaging/debian" debian
 
-# Create changelog
+# Create changelog. The distribution is informational for a `-b` build, but use
+# the host codename so a jammy/bookworm build is not mislabelled as noble
+# (debian/rules branches on it for the jammy-only pkla). Overridable via
+# DEB_CODENAME.
+DEB_CODENAME="${DEB_CODENAME:-}"
+if [ -z "$DEB_CODENAME" ] && [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    DEB_CODENAME="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+fi
+DEB_CODENAME="${DEB_CODENAME:-noble}"
 cat > debian/changelog <<EOF
-tapauth (${PKG_VER}-1) noble; urgency=medium
+tapauth (${PKG_VER}-1) ${DEB_CODENAME}; urgency=medium
 
   * Package build.
 
