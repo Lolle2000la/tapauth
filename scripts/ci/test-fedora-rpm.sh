@@ -54,20 +54,11 @@ while [[ $# -gt 0 ]]; do
 done
 PKG_DIR="${PKG_DIR:-${WORKSPACE_DIR}/pkg-fedora}"
 
-# Version comes from the crate manifest; fall back to a `[workspace.package]`
-# version for the `version.workspace = true` layout (same logic as
-# _pkg-common.sh) so this test still resolves the version if the manifests move
-# to workspace inheritance.
-PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
-if [ -z "$PKG_VER" ]; then
-    PKG_VER=$(awk '
-        /^\[workspace\.package\]/ { inpkg=1; next }
-        /^\[/ { inpkg=0 }
-        inpkg && /^[[:space:]]*version[[:space:]]*=/ {
-            sub(/[^"]*"/, ""); sub(/".*/, ""); print; exit
-        }
-    ' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null || true)
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Version resolution is shared with the build scripts.
+# shellcheck source=scripts/ci/_pkg-version.sh
+source "$SCRIPT_DIR/_pkg-version.sh"
+PKG_VER="$(resolve_tapauth_version "$WORKSPACE_DIR")"
 if [ -z "$PKG_VER" ]; then
     echo "❌ Could not determine PKG_VER from tapauthd/Cargo.toml or [workspace.package] in Cargo.toml" >&2
     exit 1
@@ -415,6 +406,15 @@ assert_removed() {
         authselect_restore_base >/dev/null 2>&1 || true
     else
         skip "authselect was not tested; skipping dangling-profile assertions"
+    fi
+
+    # The generated config and state are not package-owned, so `rpm -e` leaves
+    # them in place (AGENTS.md); only Debian's purge removes the generated config.
+    check_file /etc/tapauth/config.toml "daemon-owned config survives rpm -e"
+    if [ -d /var/lib/tapauth ]; then
+        pass "/var/lib/tapauth survives rpm -e"
+    else
+        fail "/var/lib/tapauth removed by rpm -e"
     fi
 }
 

@@ -76,7 +76,6 @@ jobs:
           	arch = aarch64
           	license = AGPL-3.0
           	install = tapauth.install
-          	backup = etc/tapauth/config.toml
           	makedepends = cargo
           	makedepends = rust
           	makedepends = protobuf

@@ -20,18 +20,12 @@
 _PKG_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$_PKG_COMMON_DIR/../.." && pwd)"
 
-# Version comes from the crate manifest; fall back to a `[workspace.package]`
-# version for the `version.workspace = true` layout.
-PKG_VER=$(grep -m1 '^version' "${WORKSPACE_DIR}/tapauthd/Cargo.toml" 2>/dev/null | cut -d '"' -f2 || true)
-if [ -z "$PKG_VER" ]; then
-    PKG_VER=$(awk '
-        /^\[workspace\.package\]/ { inpkg=1; next }
-        /^\[/ { inpkg=0 }
-        inpkg && /^[[:space:]]*version[[:space:]]*=/ {
-            sub(/[^"]*"/, ""); sub(/".*/, ""); print; exit
-        }
-    ' "${WORKSPACE_DIR}/Cargo.toml" 2>/dev/null || true)
-fi
+# Version comes from the crate manifest (section-scoped), falling back to a
+# `[workspace.package]` version for the `version.workspace = true` layout. The
+# resolver is shared with the lifecycle tests so the logic cannot drift.
+# shellcheck source=scripts/ci/_pkg-version.sh
+source "${_PKG_COMMON_DIR}/_pkg-version.sh"
+PKG_VER="$(resolve_tapauth_version "$WORKSPACE_DIR")"
 if [ -z "$PKG_VER" ]; then
     echo "❌ ERROR: could not determine the TapAuth version from tapauthd/Cargo.toml or [workspace.package] in Cargo.toml"
     exit 1

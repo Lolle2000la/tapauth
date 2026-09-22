@@ -103,10 +103,15 @@ check_artifact "${CARGO_TARGET_DIR}/release/tapauth-config" "${DEV_VARS_CLIENT[@
 echo "==> Positive control: rebuilding tapauthd with fallback-socket (dev build)"
 cargo build --quiet -p tapauthd --features fallback-socket
 control_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "TAPAUTH_STATE_DIR" || true)
-if [ "${control_hits:-0}" != "0" ]; then
-    echo "✅ dev build does contain TAPAUTH_STATE_DIR ($control_hits match(es)) — the scan can detect overrides"
+# dev-firewall-bypass has no env var; its only detectable signature is the
+# cfg'd warning literal. It is folded into fallback-socket, so this same build
+# must carry the tag or the daemon scanner's entry for it is vacuous.
+fw_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "dev-firewall-bypass" || true)
+if [ "${control_hits:-0}" != "0" ] && [ "${fw_hits:-0}" != "0" ]; then
+    echo "✅ dev build contains TAPAUTH_STATE_DIR ($control_hits) and dev-firewall-bypass ($fw_hits) — the scan can detect overrides"
 else
-    echo "❌ ERROR: the dev reference build does NOT contain TAPAUTH_STATE_DIR."
+    echo "❌ ERROR: the dev reference build is missing a scanned tag"
+    echo "   (TAPAUTH_STATE_DIR=${control_hits:-0}, dev-firewall-bypass=${fw_hits:-0})."
     echo "   The string scan is not working (check \$STRINGS_BIN); the checks above"
     echo "   are meaningless until this positive control passes."
     fail=1

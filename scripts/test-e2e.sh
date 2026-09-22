@@ -1281,6 +1281,11 @@ settle_for_dedup "Phase 2d"
 BLE_AVAILABLE=true
 if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
     BLE_AVAILABLE=false
+elif ! command -v dbus-send >/dev/null 2>&1; then
+    echo "❌ ERROR: 'dbus-send' is not installed, so BlueZ reachability cannot be verified"
+    echo "   on this non-container host. Install dbus (which provides dbus-send) and re-run:"
+    echo "   BLE is the only end-to-end verification of that transport, so it cannot be skipped."
+    exit 1
 elif ! dbus-send --system --dest=org.bluez / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
     echo "❌ ERROR: System D-Bus / BlueZ is not reachable on this non-container host."
     echo "   BLE is the only end-to-end verification of that transport; refusing to skip."

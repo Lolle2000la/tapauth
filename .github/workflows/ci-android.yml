@@ -413,14 +413,16 @@ jobs:
       - name: Download Distro Packages
         uses: actions/download-artifact@v7
         with:
+          # Only the test/e2e packages are consumed here; without a pattern this
+          # step would also pull the production packages, the native libraries
+          # and both APK artifacts (unused transfer/time).
+          pattern: pkg-*-test
           path: packages
 
       - name: Arrange Distro Packages
         run: |
-          # Both the production and the test/e2e artifacts are uploaded
-          # unconditionally by the build jobs (all four are in `needs:`, and
-          # download-artifact fails on a missing artifact), so every artifact
-          # directory exists here — no fallback branches.
+          # Only the test/e2e artifacts were downloaded (see the pattern above);
+          # the production packages are built and scanned in their own jobs.
           mkdir -p pkg-fedora-test pkg-arch-test /tmp/deb-build
           find packages -type f -path "*pkg-ubuntu-test*/*.deb" -exec cp {} /tmp/deb-build/ \;
           find packages -type f -path "*pkg-fedora-test*/*.rpm" -exec cp {} pkg-fedora-test/ \;
@@ -507,6 +509,19 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: ./scripts/ci/run-all-e2e.sh
+
+      # Preserve the instrumentation + bridge logs so a failure is debuggable
+      # after the runner is torn down (the emulator-runner step only cats them).
+      - name: Upload E2E logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          if-no-files-found: ignore
+          path: |
+            /tmp/jni-test.log
+            /tmp/bumble-bridge.log
+            /tmp/bluetoothd.log
 
       - name: Clean up E2E artifacts
         if: always()

@@ -8,7 +8,6 @@ url="https://github.com/lolle2000la/tapauth"
 license=('AGPL-3.0')
 depends=('dbus' 'pam')
 makedepends=('cargo' 'rust' 'protobuf' 'clang')
-backup=('etc/tapauth/config.toml')
 install=tapauth.install
 source=("$pkgname-$pkgver.tar.gz::https://github.com/lolle2000la/tapauth/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
