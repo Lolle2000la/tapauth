@@ -81,7 +81,8 @@ docker run -d --name "$CONTAINER_NAME" \
 
 echo "==> Waiting for systemd to finish booting..."
 BOOTED=false
-for _ in $(seq 1 60); do
+STATE=""
+for i in $(seq 1 120); do
     STATE="$(docker exec "$CONTAINER_NAME" systemctl is-system-running 2>/dev/null || true)"
     case "$STATE" in
         # `degraded` is the healthy result for a bare container (a handful of
@@ -93,6 +94,9 @@ for _ in $(seq 1 60); do
             break
             ;;
     esac
+    if [ $((i % 15)) -eq 0 ]; then
+        echo "    ... still waiting (state: ${STATE:-unknown}, ${i}s)"
+    fi
     if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -q true; then
         echo "❌ ERROR: $DISTRO container exited during boot. Last log lines:"
         docker logs "$CONTAINER_NAME" 2>&1 | tail -50 || true
@@ -101,8 +105,13 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [ "$BOOTED" != true ]; then
-    echo "❌ ERROR: $DISTRO container did not reach a running systemd state."
+    echo "❌ ERROR: $DISTRO container did not reach a running systemd state (last state: ${STATE:-unknown})."
+    echo "--- systemctl status ---"
+    docker exec "$CONTAINER_NAME" systemctl status --no-pager 2>/dev/null || true
+    echo "--- systemctl --failed ---"
     docker exec "$CONTAINER_NAME" systemctl --no-pager --failed 2>/dev/null || true
+    echo "--- container log tail ---"
+    docker logs "$CONTAINER_NAME" 2>&1 | tail -80 || true
     exit 1
 fi
 docker exec "$CONTAINER_NAME" systemctl --no-pager --failed 2>/dev/null || true
