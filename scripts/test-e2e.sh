@@ -107,22 +107,27 @@ PAM_FALLBACK_PASS="TapAuth-E2E-Fallback-$(date +%s)!"
 ADMIN_DENY_USER="tapauth-e2e-deny"
 USE_INSTALLED_PACKAGE="${TAPAUTH_E2E_USE_INSTALLED_PACKAGE:-0}"
 
+if [ "$E2E_DAEMON_MODE" = "dev" ] && [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
+    # The packaged daemon is built WITHOUT fallback-socket, so it cannot bind
+    # the socket itself: without systemd socket activation it exits with
+    # "Systemd socket activation required". The old dev+installed path launched
+    # it manually and always died at Step 4, so reject the combination up front.
+    echo "❌ ERROR: TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 requires systemd daemon mode."
+    echo "   The packaged tapauthd has no fallback-socket feature, so it cannot bind"
+    echo "   the socket without systemd socket activation (FD #3)."
+    echo "   Set TAPAUTH_E2E_DAEMON_MODE=systemd, or drop TAPAUTH_E2E_USE_INSTALLED_PACKAGE."
+    exit 1
+fi
+
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
     # Dev-mode sandbox: feature-gated daemon + env redirection.
-    if [ "$USE_INSTALLED_PACKAGE" = "1" ]; then
-        export TAPAUTHD_SOCK="/run/tapauthd/tapauthd.sock"
-        unset TAPAUTH_STATE_DIR
-        export TAPAUTH_DEV_MODE=1
-        CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
-    else
-        export TAPAUTHD_SOCK="${TEST_DIR}/tapauthd.sock"
-        export TAPAUTH_STATE_DIR="${TEST_DIR}/state"
-        export TAPAUTH_DEV_MODE=1
-        mkdir -p "$TAPAUTH_STATE_DIR"
-        chmod 700 "$TAPAUTH_STATE_DIR"
-        CONFIG_ASSERT_FILE="${TAPAUTH_STATE_DIR}/config.toml"
-        chown -R tapauthd:tapauthd "$TEST_DIR" 2>/dev/null || true
-    fi
+    export TAPAUTHD_SOCK="${TEST_DIR}/tapauthd.sock"
+    export TAPAUTH_STATE_DIR="${TEST_DIR}/state"
+    export TAPAUTH_DEV_MODE=1
+    mkdir -p "$TAPAUTH_STATE_DIR"
+    chmod 700 "$TAPAUTH_STATE_DIR"
+    CONFIG_ASSERT_FILE="${TAPAUTH_STATE_DIR}/config.toml"
+    chown -R tapauthd:tapauthd "$TEST_DIR" 2>/dev/null || true
 else
     CONFIG_ASSERT_FILE="/etc/tapauth/config.toml"
 fi

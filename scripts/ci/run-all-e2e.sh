@@ -73,11 +73,14 @@ echo "✅ JNI Crypto Instrumentation Tests Passed!"
 export CARGO_TARGET_DIR="$WORKSPACE_DIR/target"
 cargo build -p tapauthd --bin tapauth-ipc-cli
 
-# 2. Run E2E against installed Ubuntu (.deb) package on host
+# 2. Run E2E against installed Ubuntu (.deb) package on host. Pin systemd mode
+#    explicitly: the installed package can only be driven by the systemd units,
+#    so relying on auto-detection would silently fall back to the broken
+#    dev+installed path on any host where systemd is not PID 1.
 echo "=================================================="
 echo " [1/3] Running E2E against installed Ubuntu (.deb) package"
 echo "=================================================="
-sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 ./scripts/test-e2e.sh
+sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 TAPAUTH_E2E_DAEMON_MODE=systemd ./scripts/test-e2e.sh
 sudo apt-get purge -y tapauth 2>/dev/null || true
 
 # Hand the virtual Bluetooth adapter to the container instances: only one

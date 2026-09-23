@@ -738,8 +738,12 @@ create_initial_config() {
         print_info "Configuration file already exists, skipping creation"
         print_info "To enable/disable TPM, edit $config_file manually"
         # The daemon (tapauthd) is the single writer of this file (SaveConfig
-        # admin op persists hostname/port/transport toggles) — grant it ownership
+        # admin op persists hostname/port/transport toggles to it) — grant it
+        # ownership and the same 0644 posture tmpfiles asserts, so install.sh
+        # and the packages agree on owner AND mode regardless of the caller's
+        # umask.
         chown tapauthd:tapauthd "$config_file" || true
+        chmod 0644 "$config_file" 2>/dev/null || true
         return
     fi
     

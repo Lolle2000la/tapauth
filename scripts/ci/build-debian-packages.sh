@@ -22,7 +22,12 @@ echo "==> Packaging TapAuth version ${PKG_VER}..."
 tar -C "${WORKSPACE_DIR}" --exclude=./target --exclude=./.git --exclude=./server-android/app/build --exclude=./server-android/.gradle -cf - . | tar -C "$BUILD_DIR" -xf -
 cd "$BUILD_DIR"
 
-# Symlink workspace target directory so cargo writes directly into the cached location
+# Symlink workspace target directory so cargo writes directly into the cached
+# location. NOTE: the workspace target/ is shared with the production build in
+# the same job, so a test build (different CARGO_FEATURES) reuses and rebuilds
+# those artifacts with the test feature set — the cached target dir and the
+# already-produced production .deb therefore diverge. The .deb itself is not
+# overwritten (OUTPUT_DIR differs), which is what matters.
 mkdir -p "${WORKSPACE_DIR}/target"
 ln -sfn "${WORKSPACE_DIR}/target" "$BUILD_DIR/target"
 

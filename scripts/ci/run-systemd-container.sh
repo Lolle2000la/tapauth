@@ -88,10 +88,24 @@ for i in $(seq 1 120); do
         # `degraded` is the healthy result for a bare container (a handful of
         # units like getty/binfmt/sys-kernel-*.mount can never start there);
         # only `initializing`/`unknown` mean "not up yet".
-        running|degraded|maintenance)
+        running|degraded)
             echo "    systemd state: $STATE"
             BOOTED=true
             break
+            ;;
+        # `maintenance` means PID 1 dropped into rescue/emergency mode (e.g. a
+        # failed unit with OnFailure=emergency). It will not become healthy, so
+        # fail now with diagnostics instead of letting the suite run against a
+        # broken system.
+        maintenance)
+            echo "❌ ERROR: $DISTRO container booted into maintenance (rescue/emergency) mode."
+            echo "--- systemctl status ---"
+            docker exec "$CONTAINER_NAME" systemctl status --no-pager 2>/dev/null || true
+            echo "--- systemctl --failed ---"
+            docker exec "$CONTAINER_NAME" systemctl --no-pager --failed 2>/dev/null || true
+            echo "--- container log tail ---"
+            docker logs "$CONTAINER_NAME" 2>&1 | tail -80 || true
+            exit 1
             ;;
     esac
     if [ $((i % 15)) -eq 0 ]; then
