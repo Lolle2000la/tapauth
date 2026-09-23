@@ -18,6 +18,11 @@ BuildRequires:  clang
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  authselect
 Requires:       authselect
+# Base profile the TapAuth vendor profiles are derived from: RHEL 10 / Fedora 40+
+# ship "local", RHEL 9 and older ship "minimal". Resolved at build time (the
+# COPR/build host is the target distro) so %preun can roll back to the profile
+# that actually exists instead of hardcoding "local" (which fails on RHEL 9).
+%global authselect_local %(if [ -e %{_datadir}/authselect/default/local/system-auth ]; then echo local; else echo minimal; fi)
 %endif
 %if 0%{?suse_version}
 BuildRequires:  protobuf-devel
@@ -45,7 +50,31 @@ systemd system daemons, and low-level communication links.
 %setup -q -n %{name}-%{version}
 
 %build
-cargo build --workspace --release
+# Refuse to let the cargo_features define pull dev overrides into a production
+# RPM. scripts/ci/build-fedora-packages.sh sets allow_test_features=1 only for
+# the explicitly test-only E2E packages, which are never scanned or published.
+if [ -n "%{?cargo_features}" ] && [ "%{?allow_test_features}" != "1" ]; then
+    case "%{cargo_features}" in
+        *dev-*|*fallback-socket*)
+            echo "ERROR: refusing to build a production RPM with test features: %{cargo_features}" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# Allow CI to point cargo at a persistent cache (scripts/ci/build-fedora-packages.sh
+# passes these as rpm defines when the mounted cache dirs exist).
+export CARGO_HOME="%{?_cargo_home}%{!?_cargo_home:${CARGO_HOME:-%{_builddir}/cargo-home}}"
+export CARGO_PROFILE_RELEASE_STRIP=true
+export CARGO_TARGET_DIR="%{?_cargo_target_dir}%{!?_cargo_target_dir:${CARGO_TARGET_DIR:-target}}"
+if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER=sccache
+    export SCCACHE_DIR="%{?_sccache_dir}%{!?_sccache_dir:${SCCACHE_DIR:-%{_builddir}/sccache}}"
+fi
+cargo build --workspace --release --locked %{?cargo_features}
+if command -v sccache >/dev/null 2>&1; then
+    sccache --show-stats || true
+fi
 
 %install
 mkdir -p %{buildroot}%{_bindir}
@@ -61,21 +90,17 @@ mkdir -p %{buildroot}%{_datadir}/polkit-1/rules.d
 mkdir -p %{buildroot}%{_sysconfdir}/tapauth
 
 # Binaries & Shared Objects
-install -m 0755 target/release/tapauthd %{buildroot}%{_bindir}/tapauthd
-install -m 0755 target/release/tapauth-config %{buildroot}%{_bindir}/tapauth-config
-install -m 0755 target/release/libclient_pam.so %{buildroot}%{_libdir}/security/pam_tapauth.so
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauthd" %{buildroot}%{_bindir}/tapauthd
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/tapauth-config" %{buildroot}%{_bindir}/tapauth-config
+install -m 0755 "%{?_cargo_target_dir}%{!?_cargo_target_dir:target}/release/libclient_pam.so" %{buildroot}%{_libdir}/security/pam_tapauth.so
 
 %if 0%{?fedora} || 0%{?rhel}
 # Authselect Vendor Profile Generation
 #
-# RHEL 10 / Fedora 40 and newer ship the local-only profile as "local",
-# while RHEL 9 and older call the equivalent profile "minimal". Pick
-# whichever one the build host provides so the vendor profile can be
-# generated on every supported release.
-AUTHSELECT_LOCAL="local"
-if [ ! -e %{_datadir}/authselect/default/local/system-auth ]; then
-    AUTHSELECT_LOCAL="minimal"
-fi
+# The base profile ("local" or "minimal") is resolved at build time into
+# %{authselect_local} so both the generated vendor profile and the %preun
+# rollback target agree on every supported release.
+AUTHSELECT_LOCAL="%{?authselect_local}"
 
 mkdir -p %{buildroot}%{_datadir}/authselect/vendor/tapauth
 for f in %{_datadir}/authselect/default/$AUTHSELECT_LOCAL/*; do
@@ -146,9 +171,22 @@ install -m 0644 packaging/50-tapauthd.rules %{buildroot}%{_datadir}/polkit-1/rul
 %if 0%{?fedora} || 0%{?rhel}
 if [ $1 -eq 0 ] && command -v authselect &>/dev/null; then
     current_profile=$(LC_ALL=C authselect current 2>/dev/null | grep 'Profile ID:' | cut -d: -f2 | xargs)
-    if [ "$current_profile" = "vendor/tapauth" ] || [ "$current_profile" = "vendor/tapauth-sssd" ]; then
-        target_profile="local"
-        [ "$current_profile" = "vendor/tapauth-sssd" ] && target_profile="sssd"
+    # authselect reports the bare profile ID on some versions (e.g. "tapauth")
+    # and a vendor/-prefixed ID on others, so accept both spellings.
+    case "$current_profile" in
+        vendor/tapauth|custom/tapauth|tapauth)
+            # Roll back to the base profile the vendor profile was built from
+            # ("local" on Fedora 40+/RHEL 10, "minimal" on RHEL 9 and older).
+            target_profile="%{?authselect_local}"
+            ;;
+        vendor/tapauth-sssd|custom/tapauth-sssd|tapauth-sssd)
+            target_profile="sssd"
+            ;;
+        *)
+            target_profile=""
+            ;;
+    esac
+    if [ -n "$target_profile" ]; then
         features=$(LC_ALL=C authselect current 2>/dev/null | grep '^- ' | cut -c3- | tr '\n' ' ')
         authselect select "$target_profile" $features --force || true
     fi

@@ -29,21 +29,27 @@ if ! command -v "$STRINGS_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Variable names that must never appear in a shipped binary. All of these are
-# read only behind dev Cargo features (dev-state-override, dev-udp-loopback,
-# dev-socket-override, dev-polkit-bypass, fallback-socket), so a clean scan
-# proves no dev knob was compiled into the artifact. TAPAUTH_DEV_MODE matters
-# in particular because it is the ONLY runtime string of dev-polkit-bypass:
-# without it, an accidental dev-polkit-bypass build would pass the scan.
+# Variable names / feature tags that must never appear in a shipped binary. All
+# of these are read only behind dev Cargo features (dev-state-override,
+# dev-udp-loopback, dev-socket-override, dev-polkit-bypass, dev-firewall-bypass,
+# fallback-socket), so a clean scan proves no dev knob was compiled into the
+# artifact. TAPAUTH_DEV_MODE matters in particular because it is the ONLY
+# runtime string of dev-polkit-bypass: without it, an accidental
+# dev-polkit-bypass build would pass the scan. dev-firewall-bypass has no env
+# var at all, so its cfg'd warning literal carries the tag that is scanned for.
 DEV_VARS_CLIENT=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
-DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE")
+DEV_VARS_DAEMON=("TAPAUTHD_SOCK" "TAPAUTH_STATE_DIR" "TAPAUTH_DEV_UDP_TARGET" "TAPAUTH_DEV_MODE" "dev-firewall-bypass")
 
-echo "==> Building production artifacts (per crate, default features)"
+echo "==> Building production artifacts (per crate, default features, debug & release)"
 # Mirrors install.sh: each crate is built on its own so no dev feature can be
 # pulled in through workspace feature unification.
 cargo build --quiet -p tapauthd
 cargo build --quiet -p client-pam
 cargo build --quiet -p client-config-gui
+
+cargo build --quiet --release -p tapauthd
+cargo build --quiet --release -p client-pam
+cargo build --quiet --release -p client-config-gui
 
 fail=0
 
@@ -73,11 +79,20 @@ check_artifact() {
     fi
 }
 
-echo "==> Checking shipped artifacts"
+echo "==> Checking debug artifacts"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauthd" "${DEV_VARS_DAEMON[@]}"
+# tapauth-ipc-cli is a testing-only admin tool, deliberately NOT shipped by the
+# distro packages; it is built here anyway and scanned so no dev override can
+# leak into a workspace/test binary either.
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
 check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-config" "${DEV_VARS_CLIENT[@]}"
+
+echo "==> Checking release artifacts (shipping binaries + the test-only IPC CLI)"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauthd" "${DEV_VARS_DAEMON[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauth-ipc-cli" "${DEV_VARS_CLIENT[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/libclient_pam.so" "${DEV_VARS_CLIENT[@]}"
+check_artifact "${CARGO_TARGET_DIR}/release/tapauth-config" "${DEV_VARS_CLIENT[@]}"
 
 # Positive control: prove the scan above is capable of detecting a dev build.
 # Without this, a missing/garbled strings binary would report "clean" for every
@@ -88,10 +103,15 @@ check_artifact "${CARGO_TARGET_DIR}/debug/tapauth-config" "${DEV_VARS_CLIENT[@]}
 echo "==> Positive control: rebuilding tapauthd with fallback-socket (dev build)"
 cargo build --quiet -p tapauthd --features fallback-socket
 control_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "TAPAUTH_STATE_DIR" || true)
-if [ "${control_hits:-0}" != "0" ]; then
-    echo "✅ dev build does contain TAPAUTH_STATE_DIR ($control_hits match(es)) — the scan can detect overrides"
+# dev-firewall-bypass has no env var; its only detectable signature is the
+# cfg'd warning literal. It is folded into fallback-socket, so this same build
+# must carry the tag or the daemon scanner's entry for it is vacuous.
+fw_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "dev-firewall-bypass" || true)
+if [ "${control_hits:-0}" != "0" ] && [ "${fw_hits:-0}" != "0" ]; then
+    echo "✅ dev build contains TAPAUTH_STATE_DIR ($control_hits) and dev-firewall-bypass ($fw_hits) — the scan can detect overrides"
 else
-    echo "❌ ERROR: the dev reference build does NOT contain TAPAUTH_STATE_DIR."
+    echo "❌ ERROR: the dev reference build is missing a scanned tag"
+    echo "   (TAPAUTH_STATE_DIR=${control_hits:-0}, dev-firewall-bypass=${fw_hits:-0})."
     echo "   The string scan is not working (check \$STRINGS_BIN); the checks above"
     echo "   are meaningless until this positive control passes."
     fail=1
