@@ -1392,11 +1392,17 @@ DENIAL_CLI_PID=$!
 
 # Trigger denial repeatedly while the request is in flight to ensure it catches
 # the active request without racing UDP transit or background scheduling delays.
+# The first call is a full denial once the prompt has had a moment to appear
+# (finger 2 + package-scoped broadcast + a single global BACK); the retries use
+# deny-retry, which repeats only the targeted triggers, so the loop cannot
+# dismiss unrelated emulator UI.
+sleep 0.5
+"$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny "$APP_PKG"
 for _ in {1..15}; do
     if ! kill -0 "$DENIAL_CLI_PID" 2>/dev/null; then
         break
     fi
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny "$APP_PKG"
+    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" deny-retry "$APP_PKG"
     sleep 0.3
 done
 

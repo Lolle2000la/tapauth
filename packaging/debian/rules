@@ -15,7 +15,19 @@ CARGO_FEATURES ?=
 override_dh_clean:
 	dh_clean -Xvendor/
 
+# Refuse dev overrides in a production package build: only the explicit test
+# opt-in (ALLOW_TEST_FEATURES=1, set by scripts/ci/build-debian-packages.sh
+# --allow-test-features) may pass dev-*/fallback-socket. Mirrors the RPM spec's
+# %build guard, so a local `CARGO_FEATURES=dev-... dpkg-buildpackage` cannot
+# inject them either.
 override_dh_auto_build:
+	@if [ -n "$(CARGO_FEATURES)" ] && [ "$(ALLOW_TEST_FEATURES)" != "1" ]; then \
+		case "$(CARGO_FEATURES)" in \
+			*dev-*|*fallback-socket*) \
+				echo "ERROR: refusing to build a production Debian package with test features: $(CARGO_FEATURES)" >&2; \
+				exit 1 ;; \
+		esac; \
+	fi
 	$(CARGO) build --workspace --release $(if $(wildcard vendor),--offline --frozen,--locked) $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES))
 
 override_dh_auto_install:

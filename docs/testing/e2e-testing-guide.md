@@ -187,12 +187,13 @@ E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and
 CI runs in **systemd mode on all three distros**. The daemon is installed as the real
 `tapauthd.service`/`tapauthd.socket` units, is socket-activated (no `fallback-socket`), runs as the
 unprivileged `tapauthd` user, and keeps state in `/var/lib/tapauth` and config in
-`/etc/tapauth/config.toml`. The binaries enable only two dev features — `dev-udp-loopback` (the emulator
-UDP shim; a hosted runner has no LAN multicast path into the emulator) and `dev-polkit-bypass` (so the
-root harness needs no authentication agent). `dev-state-override` is **off**, so `TAPAUTH_STATE_DIR` is
-not compiled in at all and every path is the production one. Phase 7 therefore proves that PolKit still
-denies unprivileged non-owner callers; it does not prove anything about the root path, which is bypassed
-by design in this build.
+`/etc/tapauth/config.toml`. The Ubuntu host build enables `dev-udp-loopback` (the emulator UDP shim; a
+hosted runner has no LAN multicast path into the emulator) and `dev-polkit-bypass` (so the root harness
+needs no authentication agent); the Fedora/Arch container builds add `dev-firewall-bypass` because
+containers lack usable `iptables`. `dev-state-override` is **off** in every case, so `TAPAUTH_STATE_DIR`
+is not compiled in at all and every path is the production one. Phase 7 therefore proves that PolKit
+still denies unprivileged non-owner callers; it does not prove anything about the root path, which is
+bypassed by design in this build.
 
 The Ubuntu pass runs on the host. The Fedora and Arch passes run inside containers that boot **real
 systemd as PID 1** (`archlinux:base-devel` ships it; `fedora:latest` does not, so that container's command

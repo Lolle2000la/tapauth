@@ -53,7 +53,7 @@ systemd system daemons, and low-level communication links.
 # Refuse to let the cargo_features define pull dev overrides into a production
 # RPM. scripts/ci/build-fedora-packages.sh sets allow_test_features=1 only for
 # the explicitly test-only E2E packages, which are never scanned or published.
-if [ -n "%{?cargo_features}" ] && [ -z "%{?allow_test_features}" ]; then
+if [ -n "%{?cargo_features}" ] && [ "%{?allow_test_features}" != "1" ]; then
     case "%{cargo_features}" in
         *dev-*|*fallback-socket*)
             echo "ERROR: refusing to build a production RPM with test features: %{cargo_features}" >&2

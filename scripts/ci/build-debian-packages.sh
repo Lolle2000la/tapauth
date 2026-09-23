@@ -12,6 +12,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-/tmp/deb-build}"
 enforce_prod_feature_guard "Debian"
 
 export CARGO_FEATURES
+# Signal the in-tree rules guard that this is an explicit test build. Only the
+# literal "1" disables it (mirroring the RPM spec's allow_test_features opt-in);
+# a plain production invocation leaves it unset and the guard stays armed.
+if [ "$ALLOW_TEST_FEATURES" = true ]; then
+    export ALLOW_TEST_FEATURES=1
+else
+    unset ALLOW_TEST_FEATURES
+fi
 
 mkdir -p "$OUTPUT_DIR"
 BUILD_DIR="${OUTPUT_DIR}/tapauth-${PKG_VER}"

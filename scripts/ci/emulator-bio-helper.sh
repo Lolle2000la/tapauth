@@ -78,8 +78,20 @@ case "$ACTION" in
         adb emu finger touch 2 >/dev/null 2>&1 || true
         # Explicit denial broadcast (no-op unless the e2e variant is installed)
         adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_DENY >/dev/null 2>&1 || true
-        # Also simulate negative / cancel button if prompt is active
+        # Also simulate negative / cancel button if prompt is active. This is a
+        # *global* UI action (it dismisses whatever is focused), so it is sent
+        # only on this first, full denial. Retries use `deny-retry`, which repeats
+        # just the targeted triggers and cannot disturb unrelated emulator UI.
         adb shell input keyevent KEYCODE_BACK >/dev/null 2>&1 || true
+        ;;
+
+    deny-retry)
+        # Repeatable denial retry for the in-flight loop in Phase 5: only the
+        # targeted triggers (biometric HAL + package-scoped broadcast), never a
+        # global BACK.
+        PKG="${2:-dev.rourunisen.tapauth.e2e}"
+        adb emu finger touch 2 >/dev/null 2>&1 || true
+        adb shell am broadcast -p "$PKG" -a dev.rourunisen.tapauth.ACTION_DEV_DENY >/dev/null 2>&1 || true
         ;;
 
     start-auto-grant)
@@ -138,7 +150,7 @@ EOF
         ;;
 
     *)
-        echo "Usage: $0 {setup [package]|deny [package]|start-auto-grant|stop-auto-grant}"
+        echo "Usage: $0 {setup [package]|deny [package]|deny-retry [package]|start-auto-grant|stop-auto-grant}"
         exit 1
         ;;
 esac
