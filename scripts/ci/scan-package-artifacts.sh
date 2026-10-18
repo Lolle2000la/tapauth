@@ -163,17 +163,20 @@ fi
 # SCAN_SELF_TEST disabled, so it neither needs a package manager nor recurses.
 if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
     # Every forbidden tag must be individually detectable in every scanned
-    # binary: planting only in tapauthd would not catch a regression that
-    # dropped pam_tapauth.so (the security-critical module) or tapauth-config
-    # from BINARIES. The child runs in "dir" mode with SCAN_SELF_TEST disabled,
-    # so it neither needs a package manager nor recurses.
-    for rel_bin in "${BINARIES[@]}" "usr/lib/security/pam_tapauth.so"; do
+    # binary. The plant dir uses fixed canonical paths (not the parent's
+    # distro-specific BINARIES): the child re-derives BINARIES from the payload,
+    # so planting a tag in `usr/lib/security/pam_tapauth.so` makes the self-test
+    # fail if a regression drops the security-critical module from BINARIES.
+    # The child runs in "dir" mode with SCAN_SELF_TEST disabled, so it neither
+    # needs a package manager nor recurses.
+    self_test_bins=("usr/bin/tapauthd" "usr/bin/tapauth-config" "usr/lib/security/pam_tapauth.so")
+    for rel_bin in "${self_test_bins[@]}"; do
         for var in "${DEV_VARS[@]}"; do
             plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
-            mkdir -p "$plant_dir/usr/bin" "$plant_dir/usr/lib/security"
-            printf 'clean daemon placeholder\n' > "$plant_dir/usr/bin/tapauthd"
-            printf 'clean gui placeholder\n' > "$plant_dir/usr/bin/tapauth-config"
-            printf 'clean pam stub\n' > "$plant_dir/usr/lib/security/pam_tapauth.so"
+            for b in "${self_test_bins[@]}"; do
+                mkdir -p "$plant_dir/$(dirname "$b")"
+                printf 'clean placeholder binary\n' > "$plant_dir/$b"
+            done
             printf 'placeholder for %s dev override\n' "$var" > "$plant_dir/$rel_bin"
             if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
                 echo "❌ ERROR: scan self-test FAILED — planted '$var' in $rel_bin was NOT detected; scan is unreliable!"
