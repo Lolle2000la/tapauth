@@ -81,6 +81,11 @@ jobs:
             ')"
           printf "%s\n" "$SRCINFO" > .SRCINFO
 
+          # This is the only workflow that pushes to a live external repo, so
+          # fail closed on empty/garbled metadata rather than publishing it.
+          [ -s .SRCINFO ] || { echo "ERROR: generated .SRCINFO is empty"; exit 1; }
+          grep -q '^pkgbase' .SRCINFO || { echo "ERROR: generated .SRCINFO has no pkgbase header"; exit 1; }
+
           git add PKGBUILD .SRCINFO tapauth.install
           git commit -m "Automated production sync target version: v${{ steps.version_vars.outputs.VERSION }}"
           git push origin master

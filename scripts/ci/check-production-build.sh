@@ -124,7 +124,8 @@ if [ "$fail" != "0" ]; then
     echo ""
     echo "❌ Production-build check FAILED."
     echo "   Production builds must not enable dev-state-override / dev-udp-loopback /"
-    echo "   dev-polkit-bypass / fallback-socket / dev-socket-override (see AGENTS.md)."
+    echo "   dev-polkit-bypass / dev-firewall-bypass / fallback-socket / dev-socket-override"
+    echo "   (see AGENTS.md)."
     exit 1
 fi
 

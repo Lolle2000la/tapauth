@@ -162,22 +162,26 @@ fi
 # and "clean" results cannot be trusted. The child runs in "dir" mode with
 # SCAN_SELF_TEST disabled, so it neither needs a package manager nor recurses.
 if [[ "${SCAN_SELF_TEST:-0}" == "1" ]]; then
-    # Every forbidden tag must be individually detectable: plant one marker per
-    # variable so a renamed/removed literal (e.g. the dev-firewall-bypass tag,
-    # which is this feature's only detectable signature) cannot silently make
-    # the guard vacuous. The child runs in "dir" mode with SCAN_SELF_TEST
-    # disabled, so it neither needs a package manager nor recurses.
-    for var in "${DEV_VARS[@]}"; do
-        plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
-        mkdir -p "$plant_dir/usr/bin" "$plant_dir/usr/lib/security"
-        printf 'placeholder for %s dev override\n' "$var" > "$plant_dir/usr/bin/tapauthd"
-        printf 'clean pam stub\n' > "$plant_dir/usr/lib/security/pam_tapauth.so"
-        if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
-            echo "❌ ERROR: scan self-test FAILED — planted '$var' was NOT detected; scan is unreliable!"
+    # Every forbidden tag must be individually detectable in every scanned
+    # binary: planting only in tapauthd would not catch a regression that
+    # dropped pam_tapauth.so (the security-critical module) or tapauth-config
+    # from BINARIES. The child runs in "dir" mode with SCAN_SELF_TEST disabled,
+    # so it neither needs a package manager nor recurses.
+    for rel_bin in "${BINARIES[@]}" "usr/lib/security/pam_tapauth.so"; do
+        for var in "${DEV_VARS[@]}"; do
+            plant_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)
+            mkdir -p "$plant_dir/usr/bin" "$plant_dir/usr/lib/security"
+            printf 'clean daemon placeholder\n' > "$plant_dir/usr/bin/tapauthd"
+            printf 'clean gui placeholder\n' > "$plant_dir/usr/bin/tapauth-config"
+            printf 'clean pam stub\n' > "$plant_dir/usr/lib/security/pam_tapauth.so"
+            printf 'placeholder for %s dev override\n' "$var" > "$plant_dir/$rel_bin"
+            if SCAN_SELF_TEST=0 bash "$0" dir "$plant_dir" >/dev/null 2>&1; then
+                echo "❌ ERROR: scan self-test FAILED — planted '$var' in $rel_bin was NOT detected; scan is unreliable!"
+                rm -rf "$plant_dir"
+                exit 1
+            fi
             rm -rf "$plant_dir"
-            exit 1
-        fi
-        rm -rf "$plant_dir"
+        done
     done
 
     clean_dir=$(mktemp -d -t scan-pkg-selftest.XXXXXX)

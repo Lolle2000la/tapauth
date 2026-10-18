@@ -139,14 +139,10 @@ echo "ℹ️  Daemon mode:    $E2E_DAEMON_MODE"
 echo "ℹ️  Test User:      $TEST_USER"
 echo "ℹ️  UDP port:       $UDP_PORT (emulator shim: 127.0.0.1:$DEV_HOST_PORT)"
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
+    # dev + installed-package mode is rejected above, so TAPAUTH_STATE_DIR is
+    # always set here (a sandbox path).
     echo "ℹ️  Isolated Socket: $TAPAUTHD_SOCK"
-    # In installed-package dev mode the daemon uses production paths, so
-    # TAPAUTH_STATE_DIR is intentionally unset; don't print an empty value.
-    if [ -n "$TAPAUTH_STATE_DIR" ]; then
-        echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
-    else
-        echo "ℹ️  State Directory: /var/lib/tapauth (production paths)"
-    fi
+    echo "ℹ️  State Directory: $TAPAUTH_STATE_DIR"
 fi
 echo "ℹ️  Sandbox Dir:    $TEST_DIR"
 echo ""

@@ -37,14 +37,17 @@ WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONTAINER_NAME="tapauth-e2e-${DISTRO}"
 
 # Pass the emulator console auth token so `adb emu ...` works inside the
-# container (the emulator itself runs on the host; --net=host makes it
-# reachable).
+# container. With --net=host the container's adb normally talks to the host's
+# already-running adb server, which holds the token, so this is belt-and-braces
+# for a container that ever starts its own server. The file's standard name is
+# `~/.emulator_console_auth_token` (not `.emulator_auth_token`).
 AUTH_TOKEN_MOUNT=()
-if [ -f "$HOME/.emulator_auth_token" ]; then
-    AUTH_TOKEN_MOUNT=(-v "$HOME/.emulator_auth_token:/root/.emulator_auth_token:ro")
-elif [ -f "/root/.emulator_auth_token" ]; then
-    AUTH_TOKEN_MOUNT=(-v "/root/.emulator_auth_token:/root/.emulator_auth_token:ro")
-fi
+for _token in "$HOME/.emulator_console_auth_token" "/root/.emulator_console_auth_token"; do
+    if [ -f "$_token" ]; then
+        AUTH_TOKEN_MOUNT=(-v "$_token:/root/.emulator_console_auth_token:ro")
+        break
+    fi
+done
 
 cleanup() {
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
