@@ -113,6 +113,13 @@ struct ThreadContext {
 // imply `nounwind` and abort the process.
 // `pam_get_authtok` is generated with the correct ABI by bindgen's
 // `.override_abi(bindgen::Abi::CUnwind, ...)` in build.rs.
+//
+// rustc's `invalid_runtime_symbol_definitions` (deny-by-default since 1.99)
+// flags this because `std` declares the same runtime `write` symbol as
+// `extern "C"`: the two declarations agree on the call ABI and differ only in
+// unwind behaviour, which is exactly the point here, so the lint is allowed
+// with this rationale.
+#[allow(invalid_runtime_symbol_definitions)]
 extern "C-unwind" {
     #[link_name = "write"]
     fn write_unwind(
