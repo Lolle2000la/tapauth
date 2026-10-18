@@ -18,6 +18,11 @@ if [ "$1" = "purge" ]; then
 	# the directory is only removed if that leaves it empty.
 	rm -f -- /etc/tapauth/config.toml
 	rmdir --ignore-fail-on-non-empty /etc/tapauth 2>/dev/null || true
+	# The tapauthd/tapauthd-clients identities created by sysusers are
+	# deliberately NOT removed here: a system uid/gid must stay stable, and files
+	# owned by it may outlive the package (an admin's logs, anything kept under
+	# /etc/tapauth). Fedora and Arch also leave them in place; `uninstall.sh
+	# --remove-user-data` is the explicit total-removal path.
 fi
 #DEBHELPER#
 exit 0

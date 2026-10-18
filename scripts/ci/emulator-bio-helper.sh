@@ -14,6 +14,16 @@ fi
 
 ACTION="${1:-setup}"
 
+# The e2e auto-approve fallback (used when no biometrics are enrolled) only
+# works with the e2e build installed, so fail loudly here instead of letting
+# every later auth phase hang until its timeout. Reads $PKG, set per action.
+require_e2e_pkg_for_fallback() {
+    if [ -n "$PKG" ] && [ -z "$(adb shell pm path "$PKG" 2>/dev/null)" ]; then
+        echo "❌ ERROR: e2e package '$PKG' is not installed; the auto-approve fallback cannot work."
+        exit 1
+    fi
+}
+
 case "$ACTION" in
     setup)
         # Optional arg 2: package under test. When real fingerprint enrollment is
@@ -53,6 +63,10 @@ case "$ACTION" in
             else
                 echo "⚠️  WARNING: could not confirm fingerprint enrollment via 'cmd fingerprint list'."
                 echo "    If nothing is enrolled, the e2e build's auto-approve fallback still covers the suite."
+                # Enrollment may have silently failed even though the subcommand
+                # exists; the fallback then has to be usable, so apply the same
+                # prerequisite check as the unsupported branch below.
+                require_e2e_pkg_for_fallback
             fi
         else
             echo "⚠️  'cmd fingerprint enroll' is NOT supported on this image (removed in newer Android APIs)."
@@ -60,10 +74,7 @@ case "$ACTION" in
             echo "    pending requests are granted ~1s after the prompt (AuthRequestManager.autoApproveInE2e)."
             # The fallback only works with the e2e build installed. Fail loudly
             # here instead of letting every auth phase hang until its timeout.
-            if [ -n "$PKG" ] && [ -z "$(adb shell pm path "$PKG" 2>/dev/null)" ]; then
-                echo "❌ ERROR: e2e package '$PKG' is not installed; the auto-approve fallback cannot work."
-                exit 1
-            fi
+            require_e2e_pkg_for_fallback
             echo "✅ Auto-approve fallback active (no biometrics enrolled on this image)."
         fi
         ;;

@@ -37,7 +37,10 @@ case "$PKG_TYPE" in
         WORK_DIR=$(mktemp -d -t scan-pkg.XXXXXX)
         CLEAN_WORK=1
         echo "==> Extracting $PKG_TYPE packages from $PKG_DIR for strings security scan..."
-        for deb in "$PKG_DIR"/tapauth_*.deb "$PKG_DIR"/tapauth-*.deb; do
+        # Single glob: dpkg always emits tapauth_<version>_<arch>.deb, so the
+        # former `tapauth-*.deb` companion could never match (cf. the rpm/arch
+        # branches).
+        for deb in "$PKG_DIR"/tapauth_*.deb; do
             [ -f "$deb" ] || continue
             dpkg-deb -x "$deb" "$WORK_DIR" || {
                 echo "❌ ERROR: failed to extract $deb (production-build invariant must fail closed)"
