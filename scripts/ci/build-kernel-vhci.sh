@@ -22,8 +22,11 @@ fi
 
 echo "==> /dev/vhci not available. Attempting to build bluetooth + hci_vhci modules for $(uname -r)..."
 
-# Ensure build essentials, kernel headers, and patchutils are installed
-sudo apt-get update -qq
+# Ensure build essentials, kernel headers, and patchutils are installed.
+# Tolerate partial index-fetch failures (e.g. transient hash-sum mismatches
+# on third-party runner repos like dl.google.com): the packages we need come
+# from the distro mirrors, which refresh fine.
+sudo apt-get update -qq || echo "WARNING: apt-get update reported failures (possibly third-party repos); continuing with available indexes."
 sudo apt-get install -y -qq build-essential "linux-headers-$(uname -r)" patchutils wget
 
 HDRS="linux-headers-$(uname -r)"
@@ -55,9 +58,37 @@ BASE="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$SRCPKG/$SRCVER
 ORIG="${SRCPKG}_${UPSTREAM}.orig.tar.gz"
 DIFF="${SRCPKG}_${SRCVER}.diff.gz"
 
-echo "    Downloading $ORIG and $DIFF from Launchpad..."
-wget -q "$BASE/$ORIG"
-wget -q "$BASE/$DIFF"
+# Bound the download. wget's defaults are ~20 tries with a ~15 min read
+# timeout, so a stalled transfer can hang this step for many minutes
+# (observed >19 min). Cap per-connection stalls, retry a few times, and
+# resume partial files.
+#
+# Prefer the Ubuntu archive pool: it serves the exact same source tarball
+# directly, whereas Launchpad 303-redirects to launchpadlibrarian.net, which
+# is often far slower (observed ~0.3 MB/s => ~13 min for the ~237 MB orig
+# tarball). The pool dir is derived from the headers package's Filename, so
+# it matches whatever pocket the runner actually installed from. Launchpad
+# remains the fallback.
+WGET_ARGS=(--quiet --continue --connect-timeout=20 --read-timeout=60 --tries=3 --waitretry=5)
+POOL_DIR=$(apt-cache show "$HDRS" 2>/dev/null | sed -n 's/^Filename: \(pool\/[^ ]*\)\/[^/]*$/\1/p' | head -1 || true)
+ARCHIVE_BASE="https://archive.ubuntu.com/ubuntu"
+
+fetch_source() {
+    local name="$1"
+    echo "    Fetching $name..."
+    if [ -n "$POOL_DIR" ] && wget "${WGET_ARGS[@]}" "$ARCHIVE_BASE/$POOL_DIR/$name"; then
+        return 0
+    fi
+    echo "    Archive mirror unavailable; falling back to Launchpad..."
+    if wget "${WGET_ARGS[@]}" "$BASE/$name"; then
+        return 0
+    fi
+    echo "❌ ERROR: Could not download $name (archive mirror and Launchpad both failed)."
+    return 1
+}
+
+fetch_source "$ORIG"
+fetch_source "$DIFF"
 
 TOPDIR=$(tar tzf "$ORIG" 2>/dev/null | head -1 | cut -d/ -f1 || true)
 if [ -z "$TOPDIR" ]; then

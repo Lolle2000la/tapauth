@@ -105,7 +105,7 @@ fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResp
 
 pub struct PendingPairing {
     pub listener: TcpListener,
-    pub firewall_guard: Arc<FirewallGuard>,
+    pub firewall_guard: Option<Arc<FirewallGuard>>,
     pub session: ClientPairingSession,
     #[allow(dead_code)]
     pub url: String,
@@ -120,7 +120,7 @@ pub struct ActivePairing {
     pub server_device_name: String,
     pub port: u16,
     #[allow(dead_code)]
-    pub firewall_guard: Arc<FirewallGuard>,
+    pub firewall_guard: Option<Arc<FirewallGuard>>,
     pub generation: u64,
 }
 
@@ -292,8 +292,30 @@ async fn handle_start_pairing(
         }
     };
 
-    let firewall_guard = match FirewallGuard::new(port, Protocol::Tcp) {
-        Ok(g) => g,
+    // Opening the pairing firewall port is best-effort only in test builds
+    // (containers/user-namespaces without usable iptables). Production builds
+    // keep the original strict behaviour: a firewall error aborts pairing rather
+    // than leaving the ephemeral TCP listener reachable without a rule.
+    #[cfg(feature = "dev-firewall-bypass")]
+    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            // NOTE: the "dev-firewall-bypass" token in this message is the only
+            // signature the binary scanners can detect for this feature (there
+            // is no env var). scripts/ci/check-production-build.sh and
+            // scripts/ci/scan-package-artifacts.sh grep for it, and their
+            // positive controls fail if it disappears — keep the spelling.
+            tracing::warn!(
+                "Failed to open firewall port for pairing (continuing anyway; dev-firewall-bypass): {}",
+                e
+            );
+            None
+        }
+    };
+
+    #[cfg(not(feature = "dev-firewall-bypass"))]
+    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
+        Ok(g) => Some(g),
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,

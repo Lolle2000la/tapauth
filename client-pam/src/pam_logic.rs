@@ -107,21 +107,6 @@ struct ThreadContext {
     pipe_write_fd: std::os::raw::c_int,
 }
 
-// `write` is declared `extern "C-unwind"` so that glibc's forced unwind
-// exceptions (`abi::__forced_unwind`) triggered by `pthread_cancel` can
-// safely propagate through this call frame.  `extern "C"` alone would
-// imply `nounwind` and abort the process.
-// `pam_get_authtok` is generated with the correct ABI by bindgen's
-// `.override_abi(bindgen::Abi::CUnwind, ...)` in build.rs.
-extern "C-unwind" {
-    #[link_name = "write"]
-    fn write_unwind(
-        fd: std::os::raw::c_int,
-        buf: *const std::os::raw::c_void,
-        count: usize,
-    ) -> isize;
-}
-
 /// Raw background worker using the `C-unwind` ABI so that glibc's forced
 /// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
 /// can pass through this frame without aborting the process.
@@ -154,14 +139,25 @@ unsafe extern "C-unwind" fn native_password_worker(
     // regardless of whether a password was collected or the dialog was
     // cancelled.  Without this, cancel/poll-hang would force the full
     // timeout.
+    //
+    // glibc's `write` is a cancellation point, so a `pthread_cancel` delivered
+    // inside it would throw `abi::__forced_unwind` through this call frame.
+    // `pam_get_authtok` above needs the `C-unwind` ABI for that, but the
+    // runtime `write` symbol must keep its canonical `extern "C"` signature:
+    // re-declaring it with a different ABI is what rustc's
+    // `invalid_runtime_symbol_definitions` rejects, and a mismatched runtime
+    // declaration risks UB.  Use the bare `write` syscall instead — the
+    // cancellation machinery lives in glibc's `write` wrapper, so the raw
+    // syscall is not a cancellation point and cannot unwind.
     let dummy: [u8; 1] = [1];
     loop {
         let written = unsafe {
-            write_unwind(
+            libc::syscall(
+                libc::SYS_write,
                 ctx.pipe_write_fd,
                 dummy.as_ptr() as *const std::os::raw::c_void,
-                1,
-            )
+                1usize,
+            ) as isize
         };
         if written >= 0 {
             break;

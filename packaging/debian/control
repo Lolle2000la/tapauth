@@ -1,0 +1,18 @@
+Source: tapauth
+Section: admin
+Priority: optional
+Maintainer: Luca Auer <lolle2000.la+tapauth@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo-1.91 | cargo (>= 1.85), rustc-1.91 | rustc (>= 1.85), protobuf-compiler, libdbus-1-dev, libsystemd-dev, libpam0g-dev, clang, libclang-dev
+Standards-Version: 4.7.0
+
+Package: tapauth
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, polkitd
+Recommends: firewalld
+Suggests: iptables
+Description: Local smartphone-based authentication framework
+ A modern, privacy-preserving local-first authentication system
+ using Rust PAM modules, systemd system daemons, and low-level
+ communication links. Provides phone-based biometric
+ verification for Linux desktop login, sudo, and polkit
+ authentication via UDP and BLE transport layers.

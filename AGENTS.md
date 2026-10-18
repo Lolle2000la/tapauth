@@ -64,7 +64,7 @@ cd server-android && ./gradlew connectedE2eAndroidTest
 | Crate | Default | Features |
 |-------|---------|----------|
 | `shared` | `[]` | `jni`, `tpm`, `firewall`, `dev-state-override`, `dev-udp-loopback` |
-| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override` |
+| `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-firewall-bypass`, `dev-socket-override` |
 | `client-pam` | `[]` | `tpm`, `dev-socket-override` |
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
 
@@ -78,15 +78,16 @@ environment alone:
 | `dev-state-override` (`shared`, `tapauthd`) | `TAPAUTH_STATE_DIR` | Relocates the state dir (and `config.toml` inside it) |
 | `dev-udp-loopback` (`shared`, `tapauthd`) | `TAPAUTH_DEV_UDP_TARGET` | Unicasts packets to a local peer and accepts locally-sourced replies (emulator) |
 | `dev-polkit-bypass` (`tapauthd`) | `TAPAUTH_DEV_MODE` | Skips the PolKit check for same-UID/root callers so headless harnesses need no agent |
+| `dev-firewall-bypass` (`tapauthd`) | — (compile-time only) | Continues pairing when the firewall port cannot be opened (containers without usable `iptables`). Production builds abort pairing instead. Covered by the binary-string scanners via its cfg'd warning literal |
 | `dev-socket-override` (`client-pam`, `client-config-gui`, `tapauthd`) | `TAPAUTHD_SOCK` | Redirects the IPC client to another socket. On `tapauthd` the feature only affects the `tapauth-ipc-cli` admin tool; the daemon itself always uses the systemd-activated socket in production |
 
 **Gotchas:**
 - `--all-features` **may not work locally** — it pulls in `jni` which requires `libjvm`/JDK headers. If you have a JDK installed, it should compile; otherwise use per-crate feature combos from CI.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
-- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Pulls in all four daemon dev knobs above (`dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-socket-override`) — i.e. it is a full local sandbox build.
-- The **E2E suite's systemd mode** deliberately enables only `dev-udp-loopback,dev-polkit-bypass` (NOT `dev-state-override`), so state/config/socket paths stay production while the emulator transport shim works.
+- **`fallback-socket`** on `tapauthd`: production uses systemd socket activation (FD#3). For dev/testing, rebuild tapauthd with `--features fallback-socket` to bind the Unix socket manually. Pulls in all five daemon dev knobs above (`dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-firewall-bypass`, `dev-socket-override`) — i.e. it is a full local sandbox build.
+- The **E2E suite's systemd mode** runs against the installed packages: the Ubuntu pass on the host, and the Fedora/Arch passes inside containers that boot real systemd (PID 1) and run their own D-Bus, polkitd and bluetoothd. All three enable only `dev-udp-loopback,dev-polkit-bypass` (NOT `dev-state-override`), so state/config/socket paths stay production while the emulator transport shim works; the Fedora/Arch containers additionally enable `dev-firewall-bypass` (containers lack usable `iptables`). BLE runs everywhere (the host owns the Bumble bridge; each container's own bluetoothd owns the resulting vhci adapter), and Phase 7 exercises the package's installed PolKit action under the container's polkitd.
 - `tpm` propagates through all crates via `shared/tpm`. Requires `tpm2-tools` on the system.
-- **Production builds must NOT enable any `dev-*` feature** (nor `fallback-socket`/`dev-socket-override`): they would allow environment-controlled socket/state redirection. `scripts/ci/check-production-build.sh` (run in CI) enforces this by building the shipped artifacts per crate and failing if a dev env-var name survives into them. Beware that Cargo unifies features **per package across a workspace build**: `cargo build --workspace --features tapauthd/fallback-socket` compiles `shared/dev-state-override` into the GUI and PAM module too, even though neither asks for it — build shipped artifacts per crate (as `install.sh` does).
+- **Production builds must NOT enable any `dev-*` feature** (nor `fallback-socket`/`dev-socket-override`): they would allow environment-controlled socket/state redirection. `scripts/ci/check-production-build.sh` (run in CI) enforces this by building the shipped artifacts per crate and failing if a dev env-var name survives into them; `packaging/tapauth.spec` `%build` and `packaging/debian/rules` `override_dh_auto_build` both refuse `dev-*`/`fallback-socket` unless the explicit `allow_test_features=1` / `ALLOW_TEST_FEATURES=1` test opt-in is set, so a plain local `rpmbuild`/`dpkg-buildpackage` cannot inject them. Beware that Cargo unifies features **per package across a workspace build**: `cargo build --workspace --features tapauthd/fallback-socket` compiles `shared/dev-state-override` into the GUI and PAM module too, even though neither asks for it — build shipped artifacts per crate (as `install.sh` does).
 
 ## Development Quick Start
 ```bash
@@ -196,6 +197,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
 - Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
+- **`/etc/tapauth` posture** (all packages): the directory is `root:root 0755`; `config.toml` is created at install time by `packaging/tmpfiles.conf` owned `tapauthd:tapauthd 0644` (no secrets in it; keys live under `/var/lib/tapauth`, 0700). The daemon is the single writer, so a root-owned file would make the first `SaveConfig` fail with `EACCES`. `install.sh` establishes the same posture. tmpfiles `f` preserves the file's content on upgrades but re-asserts that owner/mode on every `systemd-tmpfiles --create`, so config edits survive while a manually changed mode/owner does not. Debian `purge` removes the generated `config.toml` along with the pairing state; `remove` preserves it.
 
 ## Docker Dev Environment
 ```bash
