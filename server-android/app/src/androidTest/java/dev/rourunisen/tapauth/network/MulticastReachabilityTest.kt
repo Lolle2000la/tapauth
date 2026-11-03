@@ -106,7 +106,7 @@ class MulticastReachabilityTest {
                 fail(
                     "$label: no multicast datagram received on ${iface.name} " +
                         "(${group.hostAddress}, port $port) within 5s. The socket joined the " +
-                        "group and sent to it, but loopback delivery did not arrive."
+                        "group and sent to it, but loopback delivery did not arrive.",
                 )
                 return
             }
@@ -117,7 +117,7 @@ class MulticastReachabilityTest {
                 received.data.copyOf(received.length),
             )
             println(
-                "$label OK: sent+received ${payload.size} bytes via ${group.hostAddress} on ${iface.name}"
+                "$label OK: sent+received ${payload.size} bytes via ${group.hostAddress} on ${iface.name}",
             )
         } finally {
             socket.close()

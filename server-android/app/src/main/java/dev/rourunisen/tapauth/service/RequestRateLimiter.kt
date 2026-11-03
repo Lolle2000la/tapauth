@@ -21,7 +21,7 @@ import kotlin.math.min
  * legitimate multi-transport or retransmission traffic.
  */
 class RequestRateLimiter(
-    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() },
 ) {
 
     private data class BackoffState(

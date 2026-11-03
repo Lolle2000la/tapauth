@@ -670,7 +670,7 @@ class AuthenticationService : Service() {
             val confirmation =
                 try {
                     dev.rourunisen.tapauth.protocol.ProtobufParser.parseGrantConfirmation(
-                        wrapperMessage
+                        wrapperMessage,
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse GrantConfirmation", e)
@@ -709,7 +709,7 @@ class AuthenticationService : Service() {
             val cancel =
                 try {
                     dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(
-                        wrapperMessage
+                        wrapperMessage,
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse AuthenticationCancel", e)

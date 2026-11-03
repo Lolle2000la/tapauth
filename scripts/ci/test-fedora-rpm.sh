@@ -484,7 +484,11 @@ test_authselect_functional
 # 7. Upgrade
 # ---------------------------------------------------------------------------
 step "7. Upgrade (rpm -Uvh --replacepkgs)"
-rpm -Uvh --replacepkgs "${INSTALL_RPMS[@]}"
+# The RPMs are built locally and unsigned. RPM 6 (Fedora 45+) defaults to
+# %_pkgverify_level "all", which makes rpm refuse them outright, while dnf
+# (step 1) skips OpenPGP checks for @commandline packages on its own. Skip
+# signature verification here for the same reason; digest checks still run.
+rpm -Uvh --replacepkgs --nosignature "${INSTALL_RPMS[@]}"
 assert_payload "after upgrade"
 assert_etc_tapauth
 assert_ipc_cli_absent

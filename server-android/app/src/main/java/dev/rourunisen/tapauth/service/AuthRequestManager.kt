@@ -116,9 +116,9 @@ class AuthRequestManager private constructor() {
 
         // Index by challenge for fast cancellation
         runCatching {
-                val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-                challengeIndex.getOrPut(key) { mutableSetOf() }.add(requestId)
-            }
+            val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
+            challengeIndex.getOrPut(key) { mutableSetOf() }.add(requestId)
+        }
             .onFailure { e ->
                 Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
             }

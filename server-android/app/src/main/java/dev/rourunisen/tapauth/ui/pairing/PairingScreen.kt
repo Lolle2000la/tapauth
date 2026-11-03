@@ -86,7 +86,7 @@ fun PairingScreen(
                     }
                 },
             )
-        }
+        },
     ) { padding ->
         Box(
             modifier = Modifier.fillMaxSize().padding(padding),
@@ -132,7 +132,7 @@ fun PairingScreen(
                             state.psk.fill(0)
                             pairingState =
                                 PairingState.Failed(
-                                    context.getString(R.string.pairing_user_cancelled)
+                                    context.getString(R.string.pairing_user_cancelled),
                                 )
                             onPairingFailed(context.getString(R.string.pairing_cancelled_message))
                         },
@@ -198,7 +198,7 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
             modifier = Modifier.fillMaxWidth(),
             colors =
                 CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
                 ),
         ) {
             Text(

@@ -187,7 +187,7 @@ class MainActivity : FragmentActivity() {
                     }
 
                     override fun onAuthenticationSucceeded(
-                        result: BiometricPrompt.AuthenticationResult
+                        result: BiometricPrompt.AuthenticationResult,
                     ) {
                         super.onAuthenticationSucceeded(result)
                         Log.d(TAG, "Biometric authentication succeeded")
@@ -273,7 +273,7 @@ class MainActivity : FragmentActivity() {
                 .setTitle("Authentication Request")
                 .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
                 .setDescription(
-                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}"
+                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}",
                 )
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
@@ -384,7 +384,7 @@ class MainActivity : FragmentActivity() {
                     "1. Tap 'Permissions'\n" +
                     "2. Tap 'Location'\n" +
                     "3. Select 'Allow all the time'\n\n" +
-                    "Note: TapAuth does not track your location. This permission is only required by Android for BLE scanning."
+                    "Note: TapAuth does not track your location. This permission is only required by Android for BLE scanning.",
             )
             builder.setPositiveButton("Open Settings") { dialog: DialogInterface, which: Int ->
                 try {
@@ -635,7 +635,7 @@ fun PermissionButton(label: String, description: String, isGranted: Boolean, onC
                         MaterialTheme.colorScheme.primaryContainer
                     } else {
                         MaterialTheme.colorScheme.surfaceVariant
-                    }
+                    },
             ),
     ) {
         Row(

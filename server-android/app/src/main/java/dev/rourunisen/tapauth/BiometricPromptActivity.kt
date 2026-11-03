@@ -35,7 +35,7 @@ class BiometricPromptActivity : FragmentActivity() {
             @Suppress("DEPRECATION")
             window.addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
             )
         }
 
@@ -128,7 +128,7 @@ class BiometricPromptActivity : FragmentActivity() {
                     }
 
                     override fun onAuthenticationSucceeded(
-                        result: BiometricPrompt.AuthenticationResult
+                        result: BiometricPrompt.AuthenticationResult,
                     ) {
                         super.onAuthenticationSucceeded(result)
                         Log.d(TAG, "Biometric authentication succeeded")
@@ -159,7 +159,7 @@ class BiometricPromptActivity : FragmentActivity() {
                 .setTitle("Authentication Request")
                 .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
                 .setDescription(
-                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}"
+                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}",
                 )
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)

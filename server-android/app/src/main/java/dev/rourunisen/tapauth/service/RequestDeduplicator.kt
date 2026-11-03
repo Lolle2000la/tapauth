@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap
  * Thread-safe: backed by [ConcurrentHashMap].
  */
 class RequestDeduplicator(
-    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+    private val timeProvider: () -> Long = { android.os.SystemClock.elapsedRealtime() },
 ) {
 
     private data class DeduplicationEntry(val timestamp: Long, val accepted: Boolean)
