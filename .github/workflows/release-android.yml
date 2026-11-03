@@ -155,7 +155,7 @@ jobs:
       - name: Set up Python Environment
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Initialize F-Droid Server CLI Tooling
         run: pip install "fdroidserver==2.4.4" "androguard<4.1.4"
