@@ -738,13 +738,21 @@ create_initial_config() {
         print_info "Configuration file already exists, skipping creation"
         print_info "To enable/disable TPM, edit $config_file manually"
         # The daemon (tapauthd) is the single writer of this file (SaveConfig
-        # admin op persists hostname/port/transport toggles) — grant it ownership
+        # admin op persists hostname/port/transport toggles to it). Force the
+        # same owner+mode the packages assert (tapauthd:tapauthd 0644): the
+        # packages' tmpfiles `f` re-asserts that mode on every boot, so a
+        # stricter mode an admin set by hand would not survive a packaged
+        # install either — this keeps the script and the packages identical.
         chown tapauthd:tapauthd "$config_file" || true
+        chmod 0644 "$config_file" 2>/dev/null || true
         return
     fi
     
-    # Create config directory if it doesn't exist
-    mkdir -p "$config_dir"
+    # Create the config directory with the packaged posture (root:root 0755). A
+    # bare `mkdir -p` would inherit the caller's umask (e.g. 0700 under umask
+    # 077), which would not match tmpfiles' `d /etc/tapauth 0755`; `install -d`
+    # applies the mode even when the directory already exists.
+    install -dm0755 "$config_dir"
     
     print_info "Creating configuration file at $config_file"
     

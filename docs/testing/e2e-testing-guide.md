@@ -184,18 +184,39 @@ Android emulators provide an internal Bluetooth simulation service called **Nets
 ### In CI (GitHub Actions)
 E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and push to `main`.
 
-CI runs in **systemd mode**: the daemon is installed as the real `tapauthd.service`/`tapauthd.socket`
-units, is socket-activated (no `fallback-socket`), runs as the unprivileged `tapauthd` user, and keeps
-state in `/var/lib/tapauth` and config in `/etc/tapauth/config.toml`. The binary enables only two dev
-features — `dev-udp-loopback` (the emulator UDP shim; a hosted runner has no LAN multicast path into the
-emulator) and `dev-polkit-bypass` (so the root harness needs no authentication agent). `dev-state-override`
-is **off**, so `TAPAUTH_STATE_DIR` is not compiled in at all and every path is the production one. Phase 7
-therefore proves that PolKit still denies unprivileged non-owner callers; it does not prove anything about
-the root path, which is bypassed by design in this build.
+CI runs in **systemd mode on all three distros**. The daemon is installed as the real
+`tapauthd.service`/`tapauthd.socket` units, is socket-activated (no `fallback-socket`), runs as the
+unprivileged `tapauthd` user, and keeps state in `/var/lib/tapauth` and config in
+`/etc/tapauth/config.toml`. The Ubuntu host build enables `dev-udp-loopback` (the emulator UDP shim; a
+hosted runner has no LAN multicast path into the emulator) and `dev-polkit-bypass` (so the root harness
+needs no authentication agent); the Fedora/Arch container builds add `dev-firewall-bypass` because
+containers lack usable `iptables`. `dev-state-override` is **off** in every case, so `TAPAUTH_STATE_DIR`
+is not compiled in at all and every path is the production one. Phase 7 therefore proves that PolKit
+still denies unprivileged non-owner callers; it does not prove anything about the root path, which is
+bypassed by design in this build.
+
+The Ubuntu pass runs on the host. The Fedora and Arch passes run inside containers that boot **real
+systemd as PID 1** (`archlinux:base-devel` ships it; `fedora:latest` does not, so that container's command
+installs `systemd`+`dbus` and execs `/sbin/init`). Each container runs its **own** D-Bus,
+polkitd and bluetoothd — the host D-Bus socket is deliberately not bind-mounted — so the installed units
+are genuinely socket-activated, Phase 7 exercises the package's real PolKit action, and BLE runs too: the
+host owns the Bumble bridge, and the container's bluetoothd claims the resulting vhci adapter (the host
+bluetoothd is stopped first, since only one daemon may own an adapter). The container packages add
+`dev-firewall-bypass` to the systemd-mode feature set because containers lack usable `iptables`. The
+systemd containers cannot use `--pid=host` (incompatible with systemd as PID 1); they need `--privileged
+--cgroupns=host` and a writable `/sys/fs/cgroup`.
+
+Note that the test packages are not byte-for-byte the shipped feature set: because Cargo unifies features
+per package across a `--workspace` build, the test features requested for `tapauthd` also compile into
+that package's `client-pam`/`tapauth-config` (e.g. `shared/dev-udp-loopback` in the PAM module). No distro
+E2E package is byte-for-byte the production feature set; production artifacts are built per crate and
+scanned separately (`check-production-build.sh`).
 
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.
+- `tapauth-ipc-cli` is a testing-only admin harness and is deliberately **not** shipped by the distro packages. The E2E runner builds it from the workspace and the container runs reuse that binary through the mounted workspace (`scripts/ci/run-all-e2e.sh`).
+- The CI pipeline builds real `.deb`/`.rpm`/`.pkg.tar.zst` packages and runs the suite against an installed Ubuntu package on the host plus installed Fedora/Arch packages inside systemd containers; see `.github/workflows/ci-android.yml`, `scripts/ci/run-all-e2e.sh`, `scripts/ci/run-systemd-container.sh` and `scripts/ci/run-container-e2e.sh`.
 
 **CI Artifacts**:
 - `tapauth-debug-apk`: Standard safe debug build.

@@ -48,6 +48,10 @@ yay -S tapauth
 auth      sufficient      pam_tapauth.so
 ```
 
+#### Removing the packages
+
+`apt remove`, `dnf remove` and `pacman -R` remove the binaries and units but keep your pairing keys and state under `/var/lib/tapauth`. **`apt purge` additionally deletes that state (pairing keys/CSK) and the generated `/etc/tapauth/config.toml`**, so you will need to pair your device again after a purge.
+
 ### 4. Android (via F-Droid)
 A custom, unified F-Droid repository delivers the TapAuth Android companion app and update channels without requiring any third-party app store account.
 
