@@ -75,11 +75,11 @@ fun SettingsScreen(onBack: () -> Unit) {
     // Observe live state from ServiceStatusManager
     val udpState by
         dev.rourunisen.tapauth.service.ServiceStatusManager.udpRunning.collectAsState(
-            initial = config.udpRunning
+            initial = config.udpRunning,
         )
     val bleState by
         dev.rourunisen.tapauth.service.ServiceStatusManager.bleRunning.collectAsState(
-            initial = config.bleRunning
+            initial = config.bleRunning,
         )
 
     // Handle system back button
@@ -386,7 +386,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 modifier = Modifier.fillMaxWidth(),
                                 colors =
                                     CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                        containerColor = MaterialTheme.colorScheme.errorContainer,
                                     ),
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
@@ -398,7 +398,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     )
                                     Text(
                                         stringResource(
-                                            R.string.settings_location_required_description
+                                            R.string.settings_location_required_description,
                                         ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
@@ -428,12 +428,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                                                 val intent =
                                                     Intent(
                                                             Settings
-                                                                .ACTION_APPLICATION_DETAILS_SETTINGS
+                                                                .ACTION_APPLICATION_DETAILS_SETTINGS,
                                                         )
                                                         .apply {
                                                             data =
                                                                 Uri.parse(
-                                                                    "package:${context.packageName}"
+                                                                    "package:${context.packageName}",
                                                                 )
                                                             flags = Intent.FLAG_ACTIVITY_NEW_TASK
                                                         }
@@ -483,16 +483,17 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 try {
                                     val pm =
                                         context.getSystemService(
-                                            android.content.Context.POWER_SERVICE
+                                            android.content.Context.POWER_SERVICE,
                                         ) as android.os.PowerManager
                                     val packageName = context.packageName
                                     if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                                         val intent =
                                             Intent(
-                                                Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS
+                                                Settings
+                                                    .ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS,
                                             )
                                         context.startActivity(
-                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                                         )
                                     } else {
                                         val intent =
@@ -501,11 +502,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                                                 Uri.parse("package:" + packageName),
                                             )
                                         context.startActivity(
-                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                                         )
                                     }
                                 } catch (_: Exception) {}
-                            }
+                            },
                         ) {
                             Text(stringResource(R.string.settings_open_system_settings))
                         }

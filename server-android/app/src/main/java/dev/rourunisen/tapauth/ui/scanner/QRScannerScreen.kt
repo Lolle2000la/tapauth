@@ -61,7 +61,7 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
                     }
                 },
             )
-        }
+        },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when {
@@ -76,14 +76,16 @@ fun QRScannerScreen(onQRCodeScanned: (PairingUrl) -> Unit, onBack: () -> Unit) {
                         // Status overlay
                         Column(
                             modifier =
-                                Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp)
+                                Modifier.align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
                         ) {
                             Card(
                                 colors =
                                     CardDefaults.cardColors(
                                         containerColor =
-                                            MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
-                                    )
+                                            MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+                                    ),
                             ) {
                                 Column(modifier = Modifier.padding(16.dp)) {
                                     Text(
@@ -177,7 +179,7 @@ private fun CameraPreview(
                                     ResolutionStrategy(
                                         Size(1920, 1080),
                                         ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
-                                    )
+                                    ),
                                 )
                                 .build()
 
@@ -196,7 +198,7 @@ private fun CameraPreview(
                                                 Log.d("QRScanner", "QR Code detected: $qrCode")
                                                 onCodeDetected(qrCode)
                                                 onScanStatus(
-                                                    context.getString(R.string.scanner_detected)
+                                                    context.getString(R.string.scanner_detected),
                                                 )
 
                                                 // Try to parse as pairing URL
@@ -208,8 +210,8 @@ private fun CameraPreview(
                                                     )
                                                     onScanStatus(
                                                         context.getString(
-                                                            R.string.scanner_valid_url
-                                                        )
+                                                            R.string.scanner_valid_url,
+                                                        ),
                                                     )
                                                     hasScanned = true
                                                     onQRCodeScanned(pairingUrl)
@@ -225,8 +227,8 @@ private fun CameraPreview(
                                                     Log.w("QRScanner", "Received: $qrCode")
                                                     onScanStatus(
                                                         context.getString(
-                                                            R.string.scanner_invalid_format
-                                                        )
+                                                            R.string.scanner_invalid_format,
+                                                        ),
                                                     )
                                                 }
                                             }

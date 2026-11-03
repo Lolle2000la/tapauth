@@ -127,7 +127,7 @@ class BleGattService : Service() {
                 ) {
                     val challengeBytes =
                         intent.getByteArrayExtra(
-                            dev.rourunisen.tapauth.service.AuthenticationService.EXTRA_CHALLENGE
+                            dev.rourunisen.tapauth.service.AuthenticationService.EXTRA_CHALLENGE,
                         )
                     if (challengeBytes != null) {
                         handleCancelConnection(challengeBytes)
@@ -328,7 +328,7 @@ class BleGattService : Service() {
         // Register broadcast receiver for cancellation requests
         val filter =
             android.content.IntentFilter(
-                dev.rourunisen.tapauth.service.AuthenticationService.ACTION_CANCEL_BLE_CONNECTION
+                dev.rourunisen.tapauth.service.AuthenticationService.ACTION_CANCEL_BLE_CONNECTION,
             )
         androidx.core.content.ContextCompat.registerReceiver(
             this,
@@ -797,7 +797,7 @@ class BleGattService : Service() {
             val cancel =
                 try {
                     dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(
-                        wrapperMessageBytes
+                        wrapperMessageBytes,
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse AuthenticationCancel via BLE", e)
@@ -855,7 +855,7 @@ class BleGattService : Service() {
             val authRequest =
                 try {
                     dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(
-                        wrapperMessageBytes
+                        wrapperMessageBytes,
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
@@ -1291,7 +1291,7 @@ class BleGattService : Service() {
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableArrayListExtra(
-                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT
+                    android.bluetooth.le.BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
                 )
             }
 

@@ -16,7 +16,7 @@ class ReplayMitigationCache(
     // unit tests override it so the 60-second window boundary is deterministic
     // (a real clock can tick between building a timestamp and isReplay reading
     // "now", which made the +61s case flaky).
-    private val nowSecondsProvider: () -> Long = { System.currentTimeMillis() / 1000 }
+    private val nowSecondsProvider: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
 
     private val challengeCache = ConcurrentHashMap<String, Long>()

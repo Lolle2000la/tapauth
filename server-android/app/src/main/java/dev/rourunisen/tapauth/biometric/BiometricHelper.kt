@@ -54,13 +54,13 @@ class BiometricHelper(private val context: Context) {
                         super.onAuthenticationError(errorCode, errString)
                         if (continuation.isActive) {
                             continuation.resume(
-                                BiometricResult.Error(errorCode, errString.toString())
+                                BiometricResult.Error(errorCode, errString.toString()),
                             )
                         }
                     }
 
                     override fun onAuthenticationSucceeded(
-                        result: BiometricPrompt.AuthenticationResult
+                        result: BiometricPrompt.AuthenticationResult,
                     ) {
                         super.onAuthenticationSucceeded(result)
                         if (continuation.isActive) {
@@ -79,7 +79,7 @@ class BiometricHelper(private val context: Context) {
                                     BiometricResult.Error(
                                         BiometricPrompt.ERROR_NEGATIVE_BUTTON,
                                         "Only biometric authentication is allowed",
-                                    )
+                                    ),
                                 )
                             }
                         }
@@ -99,7 +99,7 @@ class BiometricHelper(private val context: Context) {
                 .setNegativeButtonText(negativeButtonText)
                 .setAllowedAuthenticators(AUTHENTICATORS)
                 .setConfirmationRequired(
-                    false
+                    false,
                 ) // Don't require additional confirmation after biometric
                 .build()
 

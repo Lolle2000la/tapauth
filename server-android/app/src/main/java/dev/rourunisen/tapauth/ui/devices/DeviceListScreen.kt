@@ -54,7 +54,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
             title = {
                 Text(
                     if (isLastUser) stringResource(R.string.devices_remove_device_title)
-                    else stringResource(R.string.devices_remove_user_title)
+                    else stringResource(R.string.devices_remove_user_title),
                 )
             },
             text = {
@@ -72,7 +72,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             device.displayName,
                             device.allowedUsers.filter { it != username }.joinToString(", "),
                         )
-                    }
+                    },
                 )
             },
             confirmButton = {
@@ -83,7 +83,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             devices = repository.getAllPairedDevices()
                             userToRemove = null
                         }
-                    }
+                    },
                 ) {
                     Text(
                         stringResource(R.string.general_remove),
@@ -133,7 +133,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             stringResource(
                                 R.string.devices_users_label,
                                 device.allowedUsers.joinToString(", "),
-                            )
+                            ),
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
@@ -142,7 +142,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             R.string.devices_remove_confirm_message,
                             device.displayName,
                             if (multipleUsers) "All users" else "You",
-                        )
+                        ),
                     )
                 }
             },
@@ -154,7 +154,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                             devices = repository.getAllPairedDevices()
                             deviceToDelete = null
                         }
-                    }
+                    },
                 ) {
                     Text(
                         stringResource(R.string.devices_remove_all),
@@ -183,7 +183,7 @@ fun DeviceListScreen(onBack: () -> Unit) {
                     }
                 },
             )
-        }
+        },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when {
