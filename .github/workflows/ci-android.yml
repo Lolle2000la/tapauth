@@ -444,7 +444,7 @@ jobs:
             bluez bluez-tools dbus \
             libpam0g-dev pamtester \
             libdbus-1-dev pkg-config protobuf-compiler \
-            policykit-1 qrencode
+            polkitd qrencode
           python3 -m pip install --user --break-system-packages "bumble[android-netsim]" grpcio protobuf \
             || python3 -m pip install "bumble[android-netsim]" grpcio protobuf
 
