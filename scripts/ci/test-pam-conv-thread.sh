@@ -96,6 +96,16 @@
 #                exactly TWO connections.  It fails if the window ever drops the
 #                username from its key.
 #
+#   duplicate-cross-service
+#                auth sufficient <module>       (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                The other negative test: the immediate duplicate for the same
+#                user against a *different* PAM service file must not be
+#                answered from the window, so both must grant and the daemon
+#                must have accepted exactly TWO connections.  It fails if the
+#                window ever drops the service from its key — which would let a
+#                lock-screen unlock answer a `sudo`/polkit prompt silently.
+#
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
 #                unlock must be offered the phone (threaded, daemon >= 1).
@@ -395,6 +405,22 @@ account required pam_permit.so
 EOF
 run_shape "duplicate-cross-user (window is per user, daemon asked twice)" \
     "$THREADED_BIN" "$DUPLICATE_CROSS_SERVICE" success "" duplicate-cross-user
+
+# The same negative test for the service half of the key: the same user, but a
+# second service file (so a second stack) must not inherit the first one's
+# verdict — a window keyed only on the user would let a lock-screen unlock
+# answer a `sudo`/polkit prompt without ringing the phone.
+DUPLICATE_CROSS_SERVICE_1="tapauth-conv-duplicate-cross-service-1"
+DUPLICATE_CROSS_SERVICE_2="tapauth-conv-duplicate-cross-service-2"
+for svc in "$DUPLICATE_CROSS_SERVICE_1" "$DUPLICATE_CROSS_SERVICE_2"; do
+    cat > "$CONFDIR/$svc" <<EOF
+auth sufficient $MODULE_PATH
+account required pam_permit.so
+EOF
+done
+run_shape "duplicate-cross-service (window is per service, daemon asked twice)" \
+    "$THREADED_BIN" "$DUPLICATE_CROSS_SERVICE_1" success "" duplicate-cross-service \
+    CONV_TEST_SERVICE_2="$DUPLICATE_CROSS_SERVICE_2"
 
 # ------------------------------------------------------------------ gdm reauth --
 # A GDM reauthentication (unlock / admin prompt of a running session) must NOT

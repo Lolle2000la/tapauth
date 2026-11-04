@@ -52,6 +52,9 @@
  *     CONV_TEST_CONFDIR     private PAM confdir (pam_start_confdir)
  *     TAPAUTHD_SOCK         the fake daemon's socket
  *     CONV_TEST_SERVICE     service file name inside CONV_TEST_CONFDIR
+ *     CONV_TEST_SERVICE_2   second service file in the same confdir, used by
+ *                           `duplicate-cross-service` (defaults to
+ *                           CONV_TEST_SERVICE)
  *     CONV_TEST_EXPECT      `success` if pam_authenticate must return
  *                           PAM_SUCCESS, `non-success` if the stack must fail
  *                           closed
@@ -102,6 +105,16 @@
  *                                          window is keyed on the user, so a
  *                                          second user must always be asked for
  *                                          independently.
+ *                             duplicate-cross-service
+ *                                        — the same user against two different
+ *                                          services (CONV_TEST_SERVICE and
+ *                                          CONV_TEST_SERVICE_2), granting
+ *                                          daemon: both must grant and the
+ *                                          daemon must have accepted TWO
+ *                                          connections.  The second negative
+ *                                          test: the window is also keyed on
+ *                                          the PAM service, so another stack
+ *                                          must always ring the phone.
  *     CONV_TEST_PRECOLLECT  `1` makes the conversation replay the password
  *                           immediately instead of waiting for the helper
  *     CONV_TEST_BLOCK       `cancel` makes the `PAM_PROMPT_ECHO_OFF` branch park
@@ -488,6 +501,8 @@ static int start_fake_daemon(const char *sock_path) {
 /* ------------------------------------------------------------- duplicate --- */
 
 typedef struct {
+    /* PAM service (and therefore the stack) this transaction runs against. */
+    const char *service;
     const char *user;
     /* Milliseconds to sleep before starting this transaction. */
     unsigned sleep_ms;
@@ -521,9 +536,9 @@ typedef struct {
  * `block_sem`), so no password is ever delivered and a `PAM_SUCCESS` can only
  * come from the daemon.
  */
-static void run_duplicate_sequence(const char *confdir, const char *service,
-                                   const dup_step *steps, int count,
-                                   int expected_accepts, int require_entered) {
+static void run_duplicate_sequence(const char *confdir, const dup_step *steps,
+                                   int count, int expected_accepts,
+                                   int require_entered) {
     enum { DUP_MAX_STEPS = 4 };
     struct pam_conv conv = {test_conv, NULL};
     pam_handle_t *handles[DUP_MAX_STEPS] = {NULL, NULL, NULL, NULL};
@@ -544,18 +559,20 @@ static void run_duplicate_sequence(const char *confdir, const char *service,
             }
         }
 
-        int ret = pam_start_confdir(service, steps[i].user, &conv, confdir,
-                                    &handles[i]);
+        int ret = pam_start_confdir(steps[i].service, steps[i].user, &conv,
+                                    confdir, &handles[i]);
         if (ret != PAM_SUCCESS) {
-            fprintf(stderr, "pam_start_confdir (transaction %d) failed: %d\n",
-                    i + 1, ret);
+            fprintf(stderr,
+                    "pam_start_confdir (transaction %d, service %s) failed: %d\n",
+                    i + 1, steps[i].service, ret);
             fail("pam_start_confdir (duplicate)");
         }
 
         ret = pam_authenticate(handles[i], 0);
         verdicts[i] = ret;
-        printf("pam_authenticate #%d (user %s): %d (%s)\n", i + 1,
-               steps[i].user, ret, pam_strerror(handles[i], ret));
+        printf("pam_authenticate #%d (user %s, service %s): %d (%s)\n", i + 1,
+               steps[i].user, steps[i].service, ret,
+               pam_strerror(handles[i], ret));
     }
 
     /* Every handle is ended only now.  libpam `dlclose()`s the module image in
@@ -581,9 +598,11 @@ static void run_duplicate_sequence(const char *confdir, const char *service,
     for (int i = 0; i < count; i++) {
         if (verdicts[i] != steps[i].expected) {
             fprintf(stderr,
-                    "transaction %d (user %s) returned %d, expected %d: the "
-                    "shape cannot judge the reuse window on the wrong verdict\n",
-                    i + 1, steps[i].user, verdicts[i], steps[i].expected);
+                    "transaction %d (user %s, service %s) returned %d, "
+                    "expected %d: the shape cannot judge the reuse window on "
+                    "the wrong verdict\n",
+                    i + 1, steps[i].user, steps[i].service, verdicts[i],
+                    steps[i].expected);
             fail("pam_authenticate returned the wrong code");
         }
     }
@@ -619,6 +638,12 @@ int main(void) {
     if (service == NULL || *service == '\0') {
         fail("CONV_TEST_SERVICE is not set");
     }
+    /* Second service file, for the cross-service shape.  Optional elsewhere:
+     * it then simply repeats the primary service. */
+    const char *service2 = getenv("CONV_TEST_SERVICE_2");
+    if (service2 == NULL || *service2 == '\0') {
+        service2 = service;
+    }
     if (expect == NULL || *expect == '\0') {
         fail("CONV_TEST_EXPECT is not set (success|non-success)");
     }
@@ -643,11 +668,15 @@ int main(void) {
     int mode_duplicate = strcmp(assert_mode, "duplicate") == 0;
     int mode_dup_unavail = strcmp(assert_mode, "duplicate-unavailable") == 0;
     int mode_dup_cross_user = strcmp(assert_mode, "duplicate-cross-user") == 0;
-    int duplicate_mode = mode_duplicate || mode_dup_unavail || mode_dup_cross_user;
+    int mode_dup_cross_service =
+        strcmp(assert_mode, "duplicate-cross-service") == 0;
+    int duplicate_mode = mode_duplicate || mode_dup_unavail ||
+                         mode_dup_cross_user || mode_dup_cross_service;
     if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass &&
         !duplicate_mode) {
         fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect', 'bypass', "
-             "'duplicate', 'duplicate-unavailable' or 'duplicate-cross-user'");
+             "'duplicate', 'duplicate-unavailable', 'duplicate-cross-user' or "
+             "'duplicate-cross-service'");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -662,7 +691,8 @@ int main(void) {
      * first connection -- a hang-up -- and gets it from `close_immediately`
      * below; any later connection there is granted, so the regression is caught
      * on the verdict as well as the count. */
-    grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user;
+    grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user ||
+                 mode_dup_cross_service;
     close_immediately = mode_dup_unavail;
 
     const char *block_env = getenv("CONV_TEST_BLOCK");
@@ -739,48 +769,56 @@ int main(void) {
     pam_handle_t *pamh = NULL;
 
     /* The duplicate shapes own their own handles (one per transaction), so they
-     * divert before the single-handle flow below.  `duplicate-cross-user` runs
-     * the same sequence for a *different* second user: it is a negative test,
-     * and it must fail if the window ever drops the username from its key. */
+     * divert before the single-handle flow below.  The two cross-* modes are
+     * negative tests: they must fail if the window ever drops the username (or
+     * the PAM service) from its key. */
     if (duplicate_mode) {
         const char *other_user =
             strcmp(user, "nobody") == 0 ? "daemon" : "nobody";
+        const char *other_service = service2;
         const dup_step success_steps[] = {
             /* T0: concludes, and is the first daemon contact. */
-            {user, 0, PAM_SUCCESS},
+            {service, user, 0, PAM_SUCCESS},
             /* The modelled 0.37 ms duplicate: a hit under every model. */
-            {user, 0, PAM_SUCCESS},
+            {service, user, 0, PAM_SUCCESS},
             /* T0 + ~300 ms: still a hit under *both* a fixed window and a
              * sliding one that re-records on each hit, so this step alone
              * proves nothing about which the module implements. */
-            {user, 300, PAM_SUCCESS},
+            {service, user, 300, PAM_SUCCESS},
             /* T0 + ~600 ms: 600 ms after the *original* verdict, so a fixed
              * window misses and a new transaction must start (daemon contact
              * 2).  A sliding window would have re-recorded at T0 + ~300 ms and
              * would still hit here, leaving the count at 1.  `nanosleep` never
              * sleeps *less* than requested, so overshoot can only push this
              * further outside the window, never back inside it. */
-            {user, 300, PAM_SUCCESS},
+            {service, user, 300, PAM_SUCCESS},
         };
         const dup_step unavailable_steps[] = {
-            {user, 0, PAM_AUTHINFO_UNAVAIL},
-            {user, 0, PAM_AUTHINFO_UNAVAIL},
+            {service, user, 0, PAM_AUTHINFO_UNAVAIL},
+            {service, user, 0, PAM_AUTHINFO_UNAVAIL},
         };
         const dup_step cross_user_steps[] = {
-            {user, 0, PAM_SUCCESS},
-            {other_user, 0, PAM_SUCCESS},
+            {service, user, 0, PAM_SUCCESS},
+            {service, other_user, 0, PAM_SUCCESS},
+        };
+        const dup_step cross_service_steps[] = {
+            {service, user, 0, PAM_SUCCESS},
+            {other_service, user, 0, PAM_SUCCESS},
         };
 
         printf("cross-user other user: %s\n", other_user);
+        printf("cross-service other service: %s\n", other_service);
         if (mode_duplicate) {
-            run_duplicate_sequence(confdir, service, success_steps, 4,
+            run_duplicate_sequence(confdir, success_steps, 4,
                                    2 /* T0 and T0+600 ms */, 1);
         } else if (mode_dup_unavail) {
-            run_duplicate_sequence(confdir, service, unavailable_steps, 2,
-                                   1, 0);
-        } else {
-            run_duplicate_sequence(confdir, service, cross_user_steps, 2,
+            run_duplicate_sequence(confdir, unavailable_steps, 2, 1, 0);
+        } else if (mode_dup_cross_user) {
+            run_duplicate_sequence(confdir, cross_user_steps, 2,
                                    2 /* one per user */, 1);
+        } else {
+            run_duplicate_sequence(confdir, cross_service_steps, 2,
+                                   2 /* one per service */, 1);
         }
         printf("RESULT: PASS\n");
         fflush(stdout);

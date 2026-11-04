@@ -77,13 +77,19 @@ use std::time::{Duration, Instant};
 /// answered by a cached failure.
 const VERDICT_REUSE_WINDOW: Duration = Duration::from_millis(500);
 
-/// The verdict this process concluded last, with the user it belongs to.
+/// The verdict this process concluded last, with the user and service it
+/// belongs to.
 ///
 /// Process-wide because the duplicate transaction comes from the same host
-/// process; per-user because a different user's stack must always be consulted.
+/// process.  Keyed on `(username, service)` because that is exactly the
+/// transaction the host is retrying: the duplicate is the same user against the
+/// same PAM service, so a different user *or* a different service must take the
+/// normal path and ring the phone.  The scope is deliberately no wider than the
+/// one transaction being repeated.
 struct LastConclusion {
     concluded_at: Instant,
     username: String,
+    service: String,
     code: c_int,
 }
 
@@ -100,20 +106,30 @@ static LAST_CONCLUSION: Mutex<Option<LastConclusion>> = Mutex::new(None);
 /// record it.
 struct Verdict {
     username: String,
+    /// `None` when the PAM service name could not be resolved: such a call is
+    /// never cached, neither looked up nor recorded, because an empty string
+    /// would silently merge unrelated services into one key.
+    service: Option<String>,
     /// The code came from the cache, so it must not be recorded again: that
     /// would refresh the timestamp and turn the fixed window into a sliding
     /// one.
     from_cache: bool,
 }
 
-/// Whether `prev` may be replayed for `username` at `now` — any code, not just
-/// a success.
+/// Whether `prev` may be replayed for `username` against `service` at `now` —
+/// any code, not just a success.
 ///
 /// Pure so the window can be tested without touching the process-wide cache.
 /// `saturating_duration_since` keeps a clock anomaly (a recorded instant later
 /// than `now`, e.g. an NTP step) from panicking; it reads as "no time passed".
-fn reusable_conclusion(prev: &LastConclusion, username: &str, now: Instant) -> Option<c_int> {
+fn reusable_conclusion(
+    prev: &LastConclusion,
+    username: &str,
+    service: &str,
+    now: Instant,
+) -> Option<c_int> {
     if prev.username == username
+        && prev.service == service
         && now.saturating_duration_since(prev.concluded_at) < VERDICT_REUSE_WINDOW
     {
         return Some(prev.code);
@@ -121,7 +137,8 @@ fn reusable_conclusion(prev: &LastConclusion, username: &str, now: Instant) -> O
     None
 }
 
-/// The cached verdict in `lock` for `username` at `now`, if it may be replayed.
+/// The cached verdict in `lock` for `(username, service)` at `now`, if it may
+/// be replayed.
 ///
 /// The lock is a parameter so the poisoned path can be exercised by a test
 /// without poisoning the real [`LAST_CONCLUSION`].  A poisoned lock returns
@@ -130,6 +147,7 @@ fn reusable_conclusion(prev: &LastConclusion, username: &str, now: Instant) -> O
 fn cached_from(
     lock: &Mutex<Option<LastConclusion>>,
     username: &str,
+    service: &str,
     now: Instant,
 ) -> Option<c_int> {
     let Ok(guard) = lock.lock() else {
@@ -137,24 +155,26 @@ fn cached_from(
     };
     guard
         .as_ref()
-        .and_then(|prev| reusable_conclusion(prev, username, now))
+        .and_then(|prev| reusable_conclusion(prev, username, service, now))
 }
 
-/// The cached verdict for `username` at `now`, if it may be replayed.
-fn cached_conclusion_for(username: &str, now: Instant) -> Option<c_int> {
-    cached_from(&LAST_CONCLUSION, username, now)
+/// The cached verdict for `(username, service)` at `now`, if it may be
+/// replayed.
+fn cached_conclusion_for(username: &str, service: &str, now: Instant) -> Option<c_int> {
+    cached_from(&LAST_CONCLUSION, username, service, now)
 }
 
-/// Remember the verdict this process concluded for `username`.
+/// Remember the verdict this process concluded for `(username, service)`.
 ///
 /// This is the *last* conclusion, so a non-success code overwrites an earlier
 /// success: a later denial must invalidate the cached grant, never sit behind
 /// it.
-fn record_conclusion(username: &str, code: c_int, now: Instant) {
+fn record_conclusion(username: &str, service: &str, code: c_int, now: Instant) {
     if let Ok(mut guard) = LAST_CONCLUSION.lock() {
         *guard = Some(LastConclusion {
             concluded_at: now,
             username: username.to_owned(),
+            service: service.to_owned(),
             code,
         });
     }
@@ -728,8 +748,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut verdict: Option<Verdict> = None;
     let code = authenticate_inner(pamh, &mut verdict);
     if let Some(v) = verdict {
-        if !v.from_cache {
-            record_conclusion(&v.username, code, Instant::now());
+        // Only real transactions are recorded, and only when the service name
+        // is known: an unresolved service must not collapse into the "" key.
+        if let (false, Some(service)) = (v.from_cache, v.service.as_deref()) {
+            record_conclusion(&v.username, service, code, Instant::now());
         }
     }
     code
@@ -789,13 +811,17 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // This prevents the PAM module from stealing stdin strings from checking
     // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
     // to deadlock during graphical challenge-response dialogs.
-    let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
+    // Fetched once: the same value keys the verdict cache below, and `None`
+    // means the service is unknown, which disables the cache for this call
+    // rather than collapsing every such call into one key.
+    let service_item = unsafe { pam_sys::get_service_name(pamh) };
+    let service = service_item.as_deref().unwrap_or_default();
     let process = process_identity();
     // GDM reauthentication (unlock / admin prompt of a running session) must
     // not take the display-manager bypass below, and it is the only GDM case
     // whose conversation we may drive from a worker thread.
-    let reauth = is_gdm_reauth(&service);
-    let mode = conversation_mode(&service, process.as_deref(), reauth);
+    let reauth = is_gdm_reauth(service);
+    let mode = conversation_mode(service, process.as_deref(), reauth);
     tracing::debug!(
         "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?}, reauth: {reauth})",
         process,
@@ -861,15 +887,18 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // `pam_unix` on that handle.  A setup failure above this point (no
     // conversation function) produces no verdict either.  None of them may
     // clobber the last real conclusion.
-    if let Some(code) = cached_conclusion_for(&username, Instant::now()) {
-        // `from_cache` stops `authenticate` from recording this hit, so the
-        // window stays anchored to the original verdict no matter how many
-        // duplicates arrive.  It is not a sliding window.
-        *verdict = Some(Verdict {
-            username,
-            from_cache: true,
-        });
-        return code;
+    if let Some(service_name) = service_item.as_deref() {
+        if let Some(code) = cached_conclusion_for(&username, service_name, Instant::now()) {
+            // `from_cache` stops `authenticate` from recording this hit, so the
+            // window stays anchored to the original verdict no matter how many
+            // duplicates arrive.  It is not a sliding window.
+            *verdict = Some(Verdict {
+                username,
+                service: service_item.as_deref().map(str::to_owned),
+                from_cache: true,
+            });
+            return code;
+        }
     }
 
     // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
@@ -933,6 +962,7 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // asked.
     *verdict = Some(Verdict {
         username: username.clone(),
+        service: service_item.as_deref().map(str::to_owned),
         from_cache: false,
     });
     let mut ipc = match IpcClient::connect_nonblocking() {
@@ -2672,19 +2702,22 @@ mod conversation_mode_tests {
 mod verdict_reuse_tests {
     use super::*;
 
-    fn conclusion(ms_ago: u64, user: &str, code: c_int) -> LastConclusion {
+    const SERVICE: &str = "tapauth-test";
+
+    fn conclusion(ms_ago: u64, user: &str, service: &str, code: c_int) -> LastConclusion {
         LastConclusion {
             concluded_at: Instant::now() - Duration::from_millis(ms_ago),
             username: user.to_owned(),
+            service: service.to_owned(),
             code,
         }
     }
 
     #[test]
     fn a_success_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", pam_sys::PAM_SUCCESS);
+        let prev = conclusion(400, "alice", SERVICE, pam_sys::PAM_SUCCESS);
         assert_eq!(
-            reusable_conclusion(&prev, "alice", Instant::now()),
+            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
             Some(pam_sys::PAM_SUCCESS),
             "a success 400 ms old must still be replayable inside the 500 ms window"
         );
@@ -2692,9 +2725,9 @@ mod verdict_reuse_tests {
 
     #[test]
     fn a_success_after_the_window_is_not_reused() {
-        let prev = conclusion(600, "alice", pam_sys::PAM_SUCCESS);
+        let prev = conclusion(600, "alice", SERVICE, pam_sys::PAM_SUCCESS);
         assert_eq!(
-            reusable_conclusion(&prev, "alice", Instant::now()),
+            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
             None,
             "a success 600 ms old is outside the window and must start a new transaction"
         );
@@ -2702,9 +2735,9 @@ mod verdict_reuse_tests {
 
     #[test]
     fn an_unavailability_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", pam_sys::PAM_AUTHINFO_UNAVAIL);
+        let prev = conclusion(400, "alice", SERVICE, pam_sys::PAM_AUTHINFO_UNAVAIL);
         assert_eq!(
-            reusable_conclusion(&prev, "alice", Instant::now()),
+            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
             Some(pam_sys::PAM_AUTHINFO_UNAVAIL),
             "the duplicate is queued while the first transaction runs, so the \
              unavailability it just reached must be replayed instead of ringing \
@@ -2714,9 +2747,9 @@ mod verdict_reuse_tests {
 
     #[test]
     fn a_denial_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", pam_sys::PAM_PERM_DENIED);
+        let prev = conclusion(400, "alice", SERVICE, pam_sys::PAM_PERM_DENIED);
         assert_eq!(
-            reusable_conclusion(&prev, "alice", Instant::now()),
+            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
             Some(pam_sys::PAM_PERM_DENIED),
             "a concluded denial must be replayed for the duplicate, not re-asked"
         );
@@ -2724,9 +2757,9 @@ mod verdict_reuse_tests {
 
     #[test]
     fn an_unavailability_after_the_window_is_not_reused() {
-        let prev = conclusion(600, "alice", pam_sys::PAM_AUTHINFO_UNAVAIL);
+        let prev = conclusion(600, "alice", SERVICE, pam_sys::PAM_AUTHINFO_UNAVAIL);
         assert_eq!(
-            reusable_conclusion(&prev, "alice", Instant::now()),
+            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
             None,
             "outside the window a failure must be re-derived: this is what keeps a \
              human retry from being answered by a stale verdict"
@@ -2740,9 +2773,9 @@ mod verdict_reuse_tests {
             pam_sys::PAM_AUTHINFO_UNAVAIL,
             pam_sys::PAM_PERM_DENIED,
         ] {
-            let prev = conclusion(1, "alice", code);
+            let prev = conclusion(1, "alice", SERVICE, code);
             assert_eq!(
-                reusable_conclusion(&prev, "bob", Instant::now()),
+                reusable_conclusion(&prev, "bob", SERVICE, Instant::now()),
                 None,
                 "code {code} recorded for alice must never answer for bob"
             );
@@ -2750,16 +2783,34 @@ mod verdict_reuse_tests {
     }
 
     #[test]
+    fn another_services_conclusion_is_never_reused() {
+        for code in [
+            pam_sys::PAM_SUCCESS,
+            pam_sys::PAM_AUTHINFO_UNAVAIL,
+            pam_sys::PAM_PERM_DENIED,
+        ] {
+            let prev = conclusion(1, "alice", "kscreenlocker", code);
+            assert_eq!(
+                reusable_conclusion(&prev, "alice", "polkit-1", Instant::now()),
+                None,
+                "code {code} recorded for one service must never answer a \
+                 different service: only the transaction the host is retrying may \
+                 be replayed, every other stack must ring the phone"
+            );
+        }
+    }
+
+    #[test]
     fn recording_a_failure_replaces_the_cached_success() {
         let now = Instant::now();
-        record_conclusion("alice", pam_sys::PAM_SUCCESS, now);
+        record_conclusion("alice", SERVICE, pam_sys::PAM_SUCCESS, now);
         assert_eq!(
-            cached_conclusion_for("alice", now),
+            cached_conclusion_for("alice", SERVICE, now),
             Some(pam_sys::PAM_SUCCESS)
         );
-        record_conclusion("alice", pam_sys::PAM_AUTHINFO_UNAVAIL, now);
+        record_conclusion("alice", SERVICE, pam_sys::PAM_AUTHINFO_UNAVAIL, now);
         assert_eq!(
-            cached_conclusion_for("alice", now),
+            cached_conclusion_for("alice", SERVICE, now),
             Some(pam_sys::PAM_AUTHINFO_UNAVAIL),
             "the cache holds the *last* conclusion, so a later failure must \
              overwrite the earlier success"
@@ -2771,6 +2822,7 @@ mod verdict_reuse_tests {
         let local: Mutex<Option<LastConclusion>> = Mutex::new(Some(LastConclusion {
             concluded_at: Instant::now(),
             username: "alice".to_owned(),
+            service: SERVICE.to_owned(),
             code: pam_sys::PAM_SUCCESS,
         }));
 
@@ -2784,7 +2836,7 @@ mod verdict_reuse_tests {
         );
 
         assert_eq!(
-            cached_from(&local, "alice", Instant::now()),
+            cached_from(&local, "alice", SERVICE, Instant::now()),
             None,
             "a poisoned lock must read as a cache miss: a `PAM_SUCCESS` that is \
              otherwise inside the window must not be returned, and the path must \
@@ -2798,13 +2850,14 @@ mod verdict_reuse_tests {
         let prev = LastConclusion {
             concluded_at: now + Duration::from_millis(50),
             username: "alice".to_owned(),
+            service: SERVICE.to_owned(),
             code: pam_sys::PAM_AUTHINFO_UNAVAIL,
         };
         // `saturating_duration_since` reads a clock anomaly as "no time has
         // passed", so the conclusion still counts as fresh.  The point of the
         // test is that it must not panic.
         assert_eq!(
-            reusable_conclusion(&prev, "alice", now),
+            reusable_conclusion(&prev, "alice", SERVICE, now),
             Some(pam_sys::PAM_AUTHINFO_UNAVAIL)
         );
     }
@@ -2812,10 +2865,11 @@ mod verdict_reuse_tests {
     /// **Smoke test only.**  It compares source byte offsets, so it would still
     /// pass if the lookup sat behind a branch that never executes.
     ///
-    /// The authoritative coverage is the `duplicate` and
-    /// `duplicate-unavailable` shapes in `scripts/ci/test-pam-conv-thread.sh`,
-    /// which count the connections the fake daemon accepted: this ordering is
-    /// what makes that count meaningful.
+    /// The authoritative coverage is the `duplicate`, `duplicate-unavailable`,
+    /// `duplicate-cross-user` and `duplicate-cross-service` shapes in
+    /// `scripts/ci/test-pam-conv-thread.sh`, which count the connections the
+    /// fake daemon accepted: this ordering is what makes those counts
+    /// meaningful.
     #[test]
     fn cache_lookup_precedes_daemon_contact() {
         let source = include_str!("pam_logic.rs");
