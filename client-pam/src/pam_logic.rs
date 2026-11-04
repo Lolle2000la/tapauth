@@ -81,10 +81,10 @@ impl IpcResponseReader for IpcClient {
 // by `conversation_mode` — an allowlist of calling processes with a sequential
 // default:
 //
-// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`): the
-//   conversation can be driven from another thread.  Polkit's is a plain
-//   blocking socket fd fed by the *separate* agent process; kscreenlocker
-//   ≥ 6.8 makes it a peer D-Bus call answered by Qt's
+// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `swaylock`,
+//   `gtklock`, `hyprlock`): the conversation can be driven from another thread.
+//   Polkit's is a plain blocking socket fd fed by the *separate* agent process;
+//   kscreenlocker ≥ 6.8 makes it a peer D-Bus call answered by Qt's
 //   `QDBusConnectionManager` daemon thread, not by the thread that called
 //   `pam_authenticate`.  A native POSIX thread collects the password while the
 //   main thread waits for the phone, and the main loop multiplexes the IPC
@@ -160,10 +160,29 @@ fn process_identity() -> Option<String> {
 ///   `pam_authenticate`, which would deadlock; nothing in `/proc` reveals the
 ///   version, so the allowlist stays as narrow as it can and
 ///   `kscreenlocker_greet` is deliberately absent.
+/// * `swaylock` — forked child; the conversation is a blocking read on a pipe.
+///   swaylock collects the password *before* calling `pam_authenticate` and
+///   the conversation merely replays it, so this is not a live race: the phone
+///   never gets a chance to answer.
+/// * `gtklock` — forked child driven by a `GThread`; the conversation returns
+///   the stored password immediately.  Same pre-collected nuance as `swaylock`.
+/// * `hyprlock` — a worker `std::thread` with mutex/condvar, i.e. a genuine
+///   concurrent race.  Known residual risk, accepted by the operator:
+///   `resetConversation` and `checkWaiting` are not synchronised, so more than
+///   one waiter would be unsafe.
+///
+/// Extending the list is one match entry plus one row in the table test below;
+/// every host that is not named stays on the sequential path.
 fn conversation_mode(service: &str, process: Option<&str>) -> ConversationMode {
     match process {
         Some("polkit-agent-helper-1" | "polkit-agent-he")
         | Some("kscreenlocker_worker" | "kscreenlocker_w") => ConversationMode::Threaded,
+        // All three names are shorter than `TASK_COMM_LEN` (15), so the
+        // `/proc/self/comm` spelling equals the full name and there is no
+        // truncated variant to accept.  swaylock/gtklock replay a password
+        // collected before `pam_authenticate`; hyprlock answers concurrently
+        // (see the residual-risk note above).
+        Some("swaylock" | "gtklock" | "hyprlock") => ConversationMode::Threaded,
         // /proc unreadable: preserve the historic polkit behaviour rather than
         // silently changing how polkit drives its conversation.
         None if service == "polkit-1" => ConversationMode::Threaded,
@@ -1732,9 +1751,9 @@ mod conversation_mode_tests {
             ("kde", Some("kscreenlocker_g"), ConversationMode::Sequential),
             ("sudo", Some("sudo"), ConversationMode::Sequential),
             ("su", Some("su"), ConversationMode::Sequential),
-            ("hyprlock", Some("hyprlock"), ConversationMode::Sequential),
-            ("swaylock", Some("swaylock"), ConversationMode::Sequential),
-            ("gtklock", Some("gtklock"), ConversationMode::Sequential),
+            ("hyprlock", Some("hyprlock"), ConversationMode::Threaded),
+            ("swaylock", Some("swaylock"), ConversationMode::Threaded),
+            ("gtklock", Some("gtklock"), ConversationMode::Threaded),
             ("whatever", Some("whatever"), ConversationMode::Sequential),
             ("polkit-1", None, ConversationMode::Threaded),
             ("sudo", None, ConversationMode::Sequential),
