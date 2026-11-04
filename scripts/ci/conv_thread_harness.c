@@ -115,6 +115,17 @@
  *                                          test: the window is also keyed on
  *                                          the PAM service, so another stack
  *                                          must always ring the phone.
+ *                             duplicate-after-slow-module
+ *                                        — user, user, granting daemon, against
+ *                                          a stack whose second `auth` line is
+ *                                          `pam_exec.so /bin/sleep 0.8`: the
+ *                                          first call returns ~800 ms after the
+ *                                          module did, so the immediate
+ *                                          duplicate is outside the 500 ms
+ *                                          window and must reach the daemon
+ *                                          (TWO connections).  This pins the
+ *                                          window's end, the documented
+ *                                          limitation of the suppression.
  *     CONV_TEST_PRECOLLECT  `1` makes the conversation replay the password
  *                           immediately instead of waiting for the helper
  *     CONV_TEST_BLOCK       `cancel` makes the `PAM_PROMPT_ECHO_OFF` branch park
@@ -530,7 +541,15 @@ typedef struct {
  *                          reused too;
  *   duplicate-cross-user   user-a, user-b               daemon grants twice
  *                          a negative test: the window is per user, so a second
- *                          user must be asked for independently.
+ *                          user must be asked for independently;
+ *   duplicate-after-slow-module
+ *                          user, user                   daemon grants twice
+ *                          the window's *end*, pinned: a module after
+ *                          `pam_tapauth.so` blocks 800 ms, so the first
+ *                          `pam_authenticate` returns > 800 ms after the
+ *                          module did and the immediate duplicate is already
+ *                          outside the 500 ms window.  Suppression must not
+ *                          cover it: the phone is rung twice.
  *
  * The conversation is parked in a cancellation point nothing signals (see
  * `block_sem`), so no password is ever delivered and a `PAM_SUCCESS` can only
@@ -670,13 +689,16 @@ int main(void) {
     int mode_dup_cross_user = strcmp(assert_mode, "duplicate-cross-user") == 0;
     int mode_dup_cross_service =
         strcmp(assert_mode, "duplicate-cross-service") == 0;
+    int mode_dup_slow_module =
+        strcmp(assert_mode, "duplicate-after-slow-module") == 0;
     int duplicate_mode = mode_duplicate || mode_dup_unavail ||
-                         mode_dup_cross_user || mode_dup_cross_service;
+                         mode_dup_cross_user || mode_dup_cross_service ||
+                         mode_dup_slow_module;
     if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass &&
         !duplicate_mode) {
         fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect', 'bypass', "
-             "'duplicate', 'duplicate-unavailable', 'duplicate-cross-user' or "
-             "'duplicate-cross-service'");
+             "'duplicate', 'duplicate-unavailable', 'duplicate-cross-user', "
+             "'duplicate-cross-service' or 'duplicate-after-slow-module'");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -692,7 +714,7 @@ int main(void) {
      * below; any later connection there is granted, so the regression is caught
      * on the verdict as well as the count. */
     grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user ||
-                 mode_dup_cross_service;
+                 mode_dup_cross_service || mode_dup_slow_module;
     close_immediately = mode_dup_unavail;
 
     const char *block_env = getenv("CONV_TEST_BLOCK");
@@ -805,6 +827,18 @@ int main(void) {
             {service, user, 0, PAM_SUCCESS},
             {other_service, user, 0, PAM_SUCCESS},
         };
+        /* The window's end: the same user and service, and the second call
+         * issued immediately after the first returned — but the stack puts
+         * `pam_exec.so /bin/sleep 0.8` after `pam_tapauth.so`, so the first
+         * `pam_authenticate` only comes back ~800 ms after the module did.  The
+         * window is anchored at the module's return, so the duplicate is already
+         * well outside the 500 ms it covers and must ring the phone again
+         * (two accepts).  Widening the window past 800 ms, or anchoring it
+         * anywhere later than the module's return, turns this into one accept. */
+        const dup_step slow_module_steps[] = {
+            {service, user, 0, PAM_SUCCESS},
+            {service, user, 0, PAM_SUCCESS},
+        };
 
         printf("cross-user other user: %s\n", other_user);
         printf("cross-service other service: %s\n", other_service);
@@ -816,6 +850,10 @@ int main(void) {
         } else if (mode_dup_cross_user) {
             run_duplicate_sequence(confdir, cross_user_steps, 2,
                                    2 /* one per user */, 1);
+        } else if (mode_dup_slow_module) {
+            run_duplicate_sequence(confdir, slow_module_steps, 2,
+                                   2 /* the window does not cover the duplicate */,
+                                   1);
         } else {
             run_duplicate_sequence(confdir, cross_service_steps, 2,
                                    2 /* one per service */, 1);

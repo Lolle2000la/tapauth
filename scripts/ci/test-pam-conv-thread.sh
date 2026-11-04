@@ -106,6 +106,24 @@
 #                window ever drops the service from its key — which would let a
 #                lock-screen unlock answer a `sudo`/polkit prompt silently.
 #
+#   duplicate-after-slow-module
+#                auth required <module>          (harness run as
+#                auth required pam_exec.so /bin/sleep 0.8
+#                auth required pam_permit.so      `kscreenlocker_worker`)
+#                account required pam_permit.so
+#                The window's *end*, pinned.  The harness issues its two
+#                transactions immediately one after the other, but the first
+#                `pam_authenticate` only returns after the module *after*
+#                `pam_tapauth.so` has blocked for 800 ms — and the window is
+#                anchored at the module's return, not at the end of the stack.
+#                The duplicate therefore starts >= 800 ms after the module
+#                returned, outside the 500 ms the window covers, so the phone
+#                must be rung a second time: both calls grant, the conversation
+#                is entered, and the daemon accepts exactly TWO connections.
+#                This is the documented limitation, and it fails if the window
+#                is widened past 800 ms or anchored later than the module's
+#                return.
+#
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
 #                unlock must be offered the phone (threaded, daemon >= 1).
@@ -421,6 +439,29 @@ done
 run_shape "duplicate-cross-service (window is per service, daemon asked twice)" \
     "$THREADED_BIN" "$DUPLICATE_CROSS_SERVICE_1" success "" duplicate-cross-service \
     CONV_TEST_SERVICE_2="$DUPLICATE_CROSS_SERVICE_2"
+
+# ------------------------------------------------- the window's end ----------
+# The documented limitation, pinned: the 500 ms window is anchored at the
+# *module's* return, so a module listed after `pam_tapauth.so` that blocks for
+# longer pushes the host's duplicate outside it.  The harness issues its two
+# transactions immediately one after the other (sleep_ms 0), but the first
+# `pam_authenticate` only returns once `pam_exec.so` has run `/bin/sleep 0.8`
+# *after* the module, so the second call starts >= 800 ms after the module's
+# return — comfortably outside the 500 ms, and `nanosleep` never undersleeps, so
+# load can only widen the margin.  Asserted: both calls grant, the conversation
+# was entered, and the daemon accepted exactly TWO connections (the phone was
+# rung twice).  It fails if the window is widened past 800 ms or anchored
+# anywhere later than the module's return.  `auth required` on the tapauth line
+# (not `sufficient`) so processing continues into the sleeper on success.
+DUPLICATE_SLOW_SERVICE="tapauth-conv-duplicate-after-slow-module"
+cat > "$CONFDIR/$DUPLICATE_SLOW_SERVICE" <<EOF
+auth required $MODULE_PATH
+auth required pam_exec.so /bin/sleep 0.8
+auth required pam_permit.so
+account required pam_permit.so
+EOF
+run_shape "duplicate-after-slow-module (later module blocks past the window, two phone requests)" \
+    "$THREADED_BIN" "$DUPLICATE_SLOW_SERVICE" success "" duplicate-after-slow-module
 
 # ------------------------------------------------------------------ gdm reauth --
 # A GDM reauthentication (unlock / admin prompt of a running session) must NOT
