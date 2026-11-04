@@ -126,7 +126,10 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 
 ### Phase 6b: Mixed-Stack PAM Password Fallback
 1. With no paired devices, `pamtester` is invoked against the mixed stack.
-2. `pam_tapauth.so` returns `PAM_IGNORE`, allowing fallthrough to `pam_unix.so`.
+2. `pam_tapauth.so` returns `PAM_AUTHINFO_UNAVAIL`, which the stack's
+   `default=ignore` turns into a fallthrough to `pam_unix.so`. (`PAM_IGNORE`
+   cannot be used for this: Linux-PAM records no failure for it, so a later
+   `optional pam_permit.so` voting success would grant the whole stack.)
 3. Asserts that a correct password succeeds and an incorrect password fails.
 
 ### Phase 7: Admin IPC Authorization Enforcement (PolKit)
@@ -215,12 +218,75 @@ scanned separately (`check-production-build.sh`).
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.
+- `./scripts/ci/test-pam-host-cases.sh` (root, in the `build-and-test` job) pins the module's non-interactive verdicts against real `/etc/pam.d` stacks — TTY-less wait announcement, display-manager bypass, `sufficient` fallthrough and double invocation; see the section below.
 - `tapauth-ipc-cli` is a testing-only admin harness and is deliberately **not** shipped by the distro packages. The E2E runner builds it from the workspace and the container runs reuse that binary through the mounted workspace (`scripts/ci/run-all-e2e.sh`).
 - The CI pipeline builds real `.deb`/`.rpm`/`.pkg.tar.zst` packages and runs the suite against an installed Ubuntu package on the host plus installed Fedora/Arch packages inside systemd containers; see `.github/workflows/ci-android.yml`, `scripts/ci/run-all-e2e.sh`, `scripts/ci/run-systemd-container.sh` and `scripts/ci/run-container-e2e.sh`.
 
 **CI Artifacts**:
 - `tapauth-debug-apk`: Standard safe debug build.
 - `tapauth-e2e-apk-UNSAFE-auto-approves`: Test-only auto-approving APK (short 7-day retention; never distribute or install on physical devices).
+
+### PAM Host Cases (`scripts/ci/test-pam-host-cases.sh`)
+
+A focused regression suite for the module's **host-facing** verdicts, i.e. the
+behaviour a real display manager, lock screen or `sufficient` line sees. It drives
+the real Linux-PAM C ABI through `scripts/ci/pamtester.c` against stacks written to
+`/etc/pam.d`, with **no controlling terminal** (the child is detached with `setsid`
+and reads `/dev/null`) and the **production** socket path
+`/run/tapauthd/tapauthd.sock` bound by `scripts/ci/pam-stub-daemon.py` — a silent
+stand-in daemon that accepts connections, discards whatever arrives and never
+replies. With a reachable-but-silent daemon the module's own deadline decides the
+outcome, so the suite is deterministic and fast: it writes
+`/etc/tapauth/config.toml` with `pam_gui_timeout_secs = 2` and
+`pam_operation_timeout_secs = 4` (backing up and restoring any existing file), and
+each blocking case settles in about 2 s.
+
+Requirements: root (it writes `/etc/pam.d/tapauth-host-*` plus the synthetic
+display-manager service `/etc/pam.d/gdm-tapauth-host`, and replaces
+`/etc/tapauth/config.toml`), `cc` (to compile `pamtester.c`), `python3`, `setsid`
+(util-linux) and `libpam` headers. Cleanup only removes files this run actually
+wrote and only restores a file it actually backed up, so a run that aborts early
+leaves the host untouched; a pre-existing socket at
+`/run/tapauthd/tapauthd.sock` is **refused** (the script aborts with a message)
+rather than shadowed or deleted, so a real daemon is never disturbed. The real
+`/etc/pam.d/gdm-password` is never touched: the DM bypass only matches on the
+service-name prefix, and the synthetic service exercises it. As non-root it
+prints one `SKIP` line per case and exits 0. The script exports `LC_ALL=C` and
+`LANG=C`, so the module's own localized messages cannot turn a correct run into
+a failure under `sudo -E` with a non-English user locale.
+
+```bash
+sudo ./scripts/ci/test-pam-host-cases.sh
+
+# Against another build (e.g. the pre-fix module), skipping the cargo build:
+PAM_MODULE_PATH=/tmp/pam-base/target/debug/libclient_pam.so SKIP_BUILD=1 \
+  sudo -E ./scripts/ci/test-pam-host-cases.sh
+```
+
+Every case asserts the **numeric** `PAM_RESULT=` that `pamtester` prints (0 success,
+6 explicit denial, 7 internal failure, 9 consult-unavailable), not just the exit
+status, and prints the elapsed time on failure:
+
+| Case | Discriminates | What it asserts (and what it would catch) |
+| :--- | :--- | :--- |
+| `ttyless_wait_announced_before_blocking` | `c40543f` | exactly one `TEXT_INFO` delivered *before the wait ends* (at `T < 1.0 s`, while the call blocks `> 1.5 s`) and its wording names the password route. It does **not** pin the position relative to the daemon request (the announcement is logged after the request is sent and the stub only stamps connections, so the two are unordered); that the announcement is not emitted before the module can possibly wait — at module entry, before connecting — is what `fast_path_does_not_announce_the_wait` pins, via the no-daemon path. The `TEXT_INFO` the module emits when it times out is a separate, post-wait message and is not counted. |
+| `conv_error_still_verdicts` | `0868f81` | a host whose conversation returns `PAM_CONV_ERR` for every message still gets a real verdict (exactly `9`) and the process is not killed by a signal |
+| `null_conv_is_survivable` | none | `SKIP`ped on the libpam versions this suite runs against (1.7.3 on Arch, 1.5.3 on Ubuntu 24.04): `pam_start` rejects a NULL conversation (`PAM error 4`), so the state is unreachable through the public libpam API and the `7` it would assert is **not** covered behaviour. The SKIP is expected, not pending. |
+| `required_arch_gdm_stack_not_success` | `0868f81` | (a) the display-manager bypass under the synthetic service `gdm-tapauth-host` and (b) the same `required` + `optional pam_permit` + `required pam_env` stack under a non-DM service must both return exactly `9`; the pre-fix `PAM_IGNORE` let `pam_permit` grant the whole stack (`0`) |
+| `sufficient_stack_falls_through` | none — regression guard | on a `sufficient` line the skip verdict expands to `default=ignore`: the following `pam_permit` decides success and the following `pam_deny` decides failure. `PAM_IGNORE` expands identically, so this case passes on the pre-fix tree too; it only catches a module that starts returning `PAM_SUCCESS` |
+| `double_invocation_never_ignore` | `0868f81` | a second invocation of the module in the same transaction also returns exactly `9`, with both waits visible (`> 3 s`) |
+| `fast_path_does_not_announce_the_wait` | `c40543f` | with no daemon the module fails fast (exactly `9`, `< 1.5 s`) and emits **no** `TEXT_INFO`; it does emit a `PAM_ERROR_MSG` ("Cannot connect to daemon…"), which is allowed and expected — only the wait announcement is forbidden on a path that never waits |
+
+### Manual test matrix (cannot be automated)
+
+These need a real desktop session or a real distro install and stay manual:
+
+| Scenario | Do | Observe | Failure looks like |
+| :--- | :--- | :--- | :--- |
+| GDM / gnome-shell password entry | install the module, log out to GDM, start typing at the password prompt | the password field is revealed immediately (the `TEXT_INFO` arrives before the wait) and accepts typing during the wait; TapAuth does not consume that input, so it only counts once the next password module prompts — i.e. after the GUI timeout (`pam_gui_timeout_secs`) | no prompt/field until the TapAuth timeout elapses, or the session hangs with a frozen spinner |
+| KDE lock screen (`kscreenlocker_worker`) | lock the session with a paired phone present but unlocked/away | one "Waiting for your phone…" message, the unlock field is revealed during the wait (typing is not consumed by TapAuth; it is submitted once the following password module prompts), and unlocking with the password works after the GUI timeout | the lock screen freezes, never shows the field, or the worker dies (lock screen crash / X session reset) |
+| Arch GDM boot with the required stack | on a real Arch GDM install, put `auth required pam_tapauth.so`, `auth optional pam_permit.so`, `auth required pam_env.so` in `/etc/pam.d/gdm-password` | login without a phone fails (returns the password prompt / denies), never grants a session | you land on the desktop with only the password (or with no credentials) — a `PAM_IGNORE` verdict would have granted the stack |
+| Distro `sufficient` line | use the packaged `sufficient`/`[success=1 default=ignore]` line from `packaging/` | login with the phone → session starts; without the phone → password prompt; wrong password → rejected | TapAuth silently succeeds without the phone, or the password prompt never appears |
 
 ### Locally (Dev Sandbox vs. Systemd Mode)
 The test runner automatically selects **dev mode** when run unprivileged:

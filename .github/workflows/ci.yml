@@ -171,6 +171,28 @@ jobs:
       - name: Run tests for client PAM module
         run: cargo test --manifest-path client-pam/Cargo.toml --verbose
 
+      - name: Install PAM host-case test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpam0g-dev \
+            python3
+
+      # Host-facing PAM verdicts: TTY-less wait announcement, DM bypass,
+      # sufficient-stack fallthrough, double invocation. Needs root (writes
+      # /etc/pam.d and the production socket path; both are restored on exit).
+      # The module is rebuilt unprivileged here so the sudo'd script always has
+      # target/debug/libclient_pam.so and never runs cargo as root; the script
+      # compiles its own pamtester from scripts/ci/pamtester.c, so no distro
+      # pamtester package is needed.
+      - name: Run PAM host-case tests (root)
+        run: |
+          cargo build --manifest-path client-pam/Cargo.toml --verbose
+          sudo env \
+            PAM_MODULE_PATH="$PWD/target/debug/libclient_pam.so" \
+            SKIP_BUILD=1 \
+            ./scripts/ci/test-pam-host-cases.sh
+
       - name: Run tests for client config GUI
         run: cargo test --manifest-path client-config-gui/Cargo.toml --verbose
 
