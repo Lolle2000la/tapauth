@@ -1,0 +1,101 @@
+name: "Release: Arch AUR (Git)"
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: aur-git-push
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-arch-aur-git:
+    name: Arch User Repository (AUR) Git Sync
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout Source Context
+        uses: actions/checkout@v7
+        with:
+          # Full history and tags are required to derive the same version that
+          # pkgver() computes from the checked-out source.
+          fetch-depth: 0
+
+      - name: Compute VCS package version
+        id: pkgver
+        run: |
+          if DESC=$(git describe --long --tags --match 'v[0-9]*' 2>/dev/null); then
+            PKGVER=$(printf '%s\n' "$DESC" | sed -E 's/^v//;s/-([0-9]+)-g([0-9a-f]+)$/.r\1.g\2/;s/-/_/g')
+          else
+            BASE=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | head -1 | sed 's/^v//' || true)
+            PKGVER="${BASE:-0.0.0}.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+          fi
+          if ! printf '%s' "$PKGVER" | grep -Eq '^[0-9][0-9A-Za-z._]*$'; then
+            echo "ERROR: computed an invalid pkgver: '$PKGVER'" >&2
+            exit 1
+          fi
+          echo "PKGVER=${PKGVER}" >> "$GITHUB_OUTPUT"
+          echo "Computed tapauth-git pkgver: ${PKGVER}"
+
+      - name: Synchronize and Push Metadata Changes to the AUR
+        env:
+          PKGVER: ${{ steps.pkgver.outputs.PKGVER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_aur
+          chmod 600 ~/.ssh/id_aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_aur
+
+          git config --global user.name "AUR Deployment Pipeline"
+          git config --global user.email "lolle2000.la+tapauth@gmail.com"
+
+          git clone aur@aur.archlinux.org:tapauth-git.git aur-repo
+
+          # PKGBUILD and install scriptlet are checked in under
+          # packaging/arch-git/ and shared verbatim with CI. Only the version
+          # is substituted here: without a fresh pkgver on every push, AUR
+          # helpers cannot see that a new commit exists and never offer the
+          # upgrade.
+          cp packaging/arch-git/PKGBUILD aur-repo/PKGBUILD
+          cp packaging/arch-git/tapauth-git.install aur-repo/tapauth-git.install
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" aur-repo/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur-repo/PKGBUILD
+
+          # Generate .SRCINFO from the PKGBUILD with makepkg, so the AUR
+          # metadata can never drift from the shared PKGBUILD. makepkg
+          # refuses to run as root and needs a writable build dir, so run it
+          # as a throwaway user in an Arch container and capture stdout.
+          SRCINFO="$(docker run --rm \
+            -v "$PWD/aur-repo/PKGBUILD:/src/PKGBUILD:ro" \
+            -v "$PWD/aur-repo/tapauth-git.install:/src/tapauth-git.install:ro" \
+            archlinux:base-devel bash -c '
+              useradd -m builder 2>/dev/null
+              mkdir -p /work && cp /src/PKGBUILD /src/tapauth-git.install /work/
+              chown -R builder /work
+              su builder -c "cd /work && makepkg --printsrcinfo"
+            ')"
+          printf "%s\n" "$SRCINFO" > aur-repo/.SRCINFO
+
+          # Fail closed on empty/garbled metadata rather than publishing it.
+          [ -s aur-repo/.SRCINFO ] || { echo "ERROR: generated .SRCINFO is empty"; exit 1; }
+          grep -q '^pkgbase = tapauth-git$' aur-repo/.SRCINFO || { echo "ERROR: generated .SRCINFO has no tapauth-git pkgbase header"; exit 1; }
+          grep -q "^	pkgver = ${PKGVER}$" aur-repo/.SRCINFO || { echo "ERROR: generated .SRCINFO does not carry pkgver ${PKGVER}"; exit 1; }
+
+          cd aur-repo
+
+          git add PKGBUILD .SRCINFO tapauth-git.install
+
+          if git diff --cached --quiet; then
+            echo "tapauth-git metadata already current (${PKGVER}); nothing to push."
+            exit 0
+          fi
+
+          git commit -m "Automated git sync from main (${GITHUB_SHA::8}): ${PKGVER}"
+          git push origin master

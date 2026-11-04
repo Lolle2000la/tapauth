@@ -196,6 +196,19 @@ cargo build --manifest-path client-pam/Cargo.toml
 - **Replay protection**: challenge nonces + 60-second timestamp window. Do not remove these checks.
 - **Config files**: mode 600 for files, 700 for directories under `/var/lib/tapauth/`, owned by `tapauthd` user.
 
+## Distribution Packaging
+- `packaging/arch/PKGBUILD` is the **release** package (`tapauth`): `release-arch.yml`
+  substitutes the release `pkgver` and the tagged tarball checksum.
+- `packaging/arch-git/PKGBUILD` is the **VCS** package (`tapauth-git`): it sources
+  `main` and `release-arch-git.yml` rewrites `pkgver` on every push to `main` (and
+  regenerates `.SRCINFO`), so AUR helpers see each new commit.
+- **The two PKGBUILDs intentionally duplicate the package payload. Whenever you add,
+  remove, or rename an installed file, change `depends`/`optdepends`/`makedepends`,
+  or change a build flag, edit BOTH `packaging/arch/PKGBUILD` and
+  `packaging/arch-git/PKGBUILD`.** For the same reason,
+  `packaging/arch/tapauth.install` and `packaging/arch-git/tapauth-git.install` are
+  kept byte-identical and must be updated together.
+
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
 - Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).
