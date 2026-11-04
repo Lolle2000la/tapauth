@@ -12,6 +12,16 @@ if ! command -v adb &> /dev/null; then
     done
 fi
 
+# adb reads the emulator console auth token from $HOME. Under sudo on
+# Ubuntu 26.04 (sudo-rs) HOME is /root and bare -E is ignored, so fall
+# back to the invoking user's home when it holds the token.
+if [ ! -r "$HOME/.emulator_console_auth_token" ] && [ -n "${SUDO_USER:-}" ]; then
+    _sudo_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    if [ -r "$_sudo_home/.emulator_console_auth_token" ]; then
+        export HOME="$_sudo_home"
+    fi
+fi
+
 ACTION="${1:-setup}"
 
 # The e2e auto-approve fallback (used when no biometrics are enrolled) only

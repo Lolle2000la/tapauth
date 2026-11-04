@@ -26,7 +26,19 @@ exec /sbin/init
 '
 
 export E2E_KEEP_BLE_BRIDGE=1
-trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi; rm -f /tmp/tapauth-vhci-dev' EXIT
+
+# Exit path: drop the bridge, drop the recorded adapter, and lift the bluetooth
+# mask set below — a failed run must not leave the host's Bluetooth unit masked
+# for the rest of the job (or for a re-run on the same runner).
+cleanup() {
+    if [ -f /tmp/bumble-bridge.pid ]; then
+        kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
+        rm -f /tmp/bumble-bridge.pid
+    fi
+    rm -f /tmp/tapauth-vhci-dev
+    sudo systemctl unmask bluetooth 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # Ensure host virtual BLE bridge is up (with the host bluetoothd, which the
 # Ubuntu host pass below needs).
@@ -80,16 +92,50 @@ cargo build -p tapauthd --bin tapauth-ipc-cli
 echo "=================================================="
 echo " [1/3] Running E2E against installed Ubuntu (.deb) package"
 echo "=================================================="
-sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 TAPAUTH_E2E_DAEMON_MODE=systemd ./scripts/test-e2e.sh
+# Preserve PATH and HOME via the explicit list form: Ubuntu 26.04 ships sudo-rs,
+# which ignores bare -E (it sets HOME to the target user's home unconditionally).
+# adb reads the emulator console auth token from $HOME, so HOME must stay the
+# invoking user's for the Phase 2 UDP bridge to authenticate.
+sudo --preserve-env=PATH,HOME env TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 TAPAUTH_E2E_DAEMON_MODE=systemd ./scripts/test-e2e.sh
 sudo apt-get purge -y tapauth 2>/dev/null || true
 
 # Hand the virtual Bluetooth adapter to the container instances: only one
 # bluetoothd may own an adapter, and the Fedora/Arch containers run their own
-# (see run-systemd-container.sh). Stop the host daemon, then re-assert the
-# host-owned Bumble bridge without starting bluetoothd again.
+# (see run-systemd-container.sh). Stopping the host daemon is not enough: the
+# Bumble bridge (re)creates a fresh vhci adapter moments later, and BlueZ is
+# reactivated for the new controller through its systemd unit or its D-Bus
+# activation path, which takes the adapter back. The container's tapauthd then
+# logs "No Bluetooth adapter found" and falls back to UDP-only. Masking closes
+# both activation paths, and it must happen before the bridge restart below.
+# `cleanup` (EXIT trap) unmasks it again.
 echo "==> Yielding the host Bluetooth daemon to the systemd containers..."
 sudo systemctl stop bluetooth 2>/dev/null || true
-sudo pkill -x bluetoothd 2>/dev/null || true
+sudo systemctl mask --now bluetooth
+for _ in {1..10}; do
+    pgrep -x bluetoothd >/dev/null 2>&1 || break
+    sudo pkill -x bluetoothd 2>/dev/null || true
+    sleep 0.5
+done
+if pgrep -x bluetoothd >/dev/null 2>&1; then
+    echo "❌ ERROR: host bluetoothd survived stop + mask; it would claim the vhci adapter"
+    echo "   and the container BLE phase would fail with 'No Bluetooth adapter found'."
+    echo "--- pgrep -a bluetoothd ---"
+    pgrep -a bluetoothd || true
+    echo "--- systemctl status bluetooth ---"
+    sudo systemctl status bluetooth --no-pager 2>&1 | tail -30 || true
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        echo "--- bluetoothctl list (10s timeout) ---"
+        # bluetoothd is demonstrably unhealthy on this path, so bound the call:
+        # without a bound it waits for the org.bluez bus name forever.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 bluetoothctl list 2>&1 || true
+        else
+            bluetoothctl list 2>&1 || true
+        fi
+    fi
+    exit 1
+fi
+echo "    host bluetoothd stopped and masked."
 TAPAUTH_E2E_BLE_BRIDGE_ONLY=1 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 
 # 3. Run E2E against installed Fedora (.rpm) package in a systemd container
