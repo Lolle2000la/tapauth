@@ -1,5 +1,5 @@
 use nix::unistd::User;
-use zbus::Connection;
+use zbus::{Connection, Variant};
 
 const POLKIT_ACTION_ID: &str = "dev.rourunisen.tapauth.config.admin";
 
@@ -161,15 +161,9 @@ async fn check_polkit(identity: &PeerIdentity) -> Result<bool, PeerIdentityError
         .map_err(|e| PeerIdentityError::DBusUnavailable(format!("{}", e)))?;
 
     let mut details = std::collections::HashMap::new();
-    details.insert(
-        "pid".to_string(),
-        zbus::zvariant::Value::U32(identity.pid as u32),
-    );
-    details.insert(
-        "start-time".to_string(),
-        zbus::zvariant::Value::U64(identity.start_time),
-    );
-    details.insert("uid".to_string(), zbus::zvariant::Value::U32(identity.uid));
+    details.insert("pid".to_string(), Variant::U32(identity.pid as u32));
+    details.insert("start-time".to_string(), Variant::U64(identity.start_time));
+    details.insert("uid".to_string(), Variant::U32(identity.uid));
 
     let reply = connection
         .call_method(
