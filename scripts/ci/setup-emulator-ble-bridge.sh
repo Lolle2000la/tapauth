@@ -33,12 +33,28 @@ VHCI_DEV_FILE="/tmp/tapauth-vhci-dev"
 # tapauthd/src/transport/ble.rs), so ask the local bluetoothd through
 # `bluetoothctl list`: that fails exactly when tapauthd would log
 # "No Bluetooth adapter found" and silently fall back to UDP-only.
-bt_list() {
+#
+# Every `bluetoothctl` call must go through here. bluetoothctl talks to the
+# local bluetoothd over D-Bus and blocks *indefinitely* waiting for the
+# `org.bluez` bus name when none is running — which is the normal state of the
+# host while the containers own the adapter (that is the whole point of the
+# mask in run-all-e2e.sh). An unbounded call here once hung the E2E job for 60
+# minutes. Callers that poll may tighten BTCTL_TIMEOUT with a `local`.
+BTCTL_TIMEOUT="${BTCTL_TIMEOUT:-10}"
+btctl() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout 10 bluetoothctl list 2>&1 || true
+        timeout "$BTCTL_TIMEOUT" bluetoothctl "$@" 2>&1 || true
     else
-        bluetoothctl list 2>&1 || true
+        bluetoothctl "$@" 2>&1 || true
     fi
+}
+
+# BlueZ-side "power on" is only meaningful for a bluetoothd this environment
+# owns: under BRIDGE_ONLY the adapter belongs to the containers' bluetoothd and
+# the host daemon is masked, so there is no bus name to talk to.
+bluez_power_on() {
+    [ "$BRIDGE_ONLY" != "1" ] || return 0
+    btctl power on
 }
 
 show_bluetooth_diagnostics() {
@@ -61,20 +77,22 @@ show_bluetooth_diagnostics() {
         echo "(journalctl not available)"
     fi
     echo "--- bluetoothctl list ---"
-    bt_list
+    btctl list
 }
 
 # Waits briefly: bluetoothd registers a freshly created vhci controller over
-# D-Bus a moment after the kernel adapter appears.
+# D-Bus a moment after the kernel adapter appears. Worst case is bounded:
+# 12 polls x (5s helper timeout + 0.5s sleep) + one 5s diagnostic call < 75s.
 assert_bluez_adapter() {
     local label="$1"
     local out=""
+    local BTCTL_TIMEOUT=5
     if ! command -v bluetoothctl >/dev/null 2>&1; then
         echo "    ⚠️  bluetoothctl is not installed; skipping the BlueZ adapter assertion."
         return 0
     fi
-    for _ in {1..20}; do
-        out="$(bt_list)"
+    for _ in {1..12}; do
+        out="$(btctl list)"
         if printf '%s\n' "$out" | grep -q '^Controller '; then
             echo "✅ BlueZ exposes an adapter over D-Bus: $(printf '%s\n' "$out" | grep -m1 '^Controller ')"
             return 0
@@ -157,7 +175,7 @@ if [ -f /tmp/bumble-bridge.pid ]; then
             $SUDO systemctl start bluetooth 2>/dev/null \
                 || { $SUDO sh -c 'bluetoothd -n -d > /tmp/bluetoothd.log 2>&1' & sleep 2; }
         fi
-        $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+        $SUDO btmgmt power on 2>/dev/null || bluez_power_on || true
         # Record which adapter the bridge owns for the systemd containers, if the
         # initial (fresh-start) invocation has not already done so.
         if [ ! -s "$VHCI_DEV_FILE" ]; then
@@ -276,7 +294,7 @@ INDEX=$(echo "$NEW_HCI" | sed 's/hci//')
 
 # Power on adapter with retries
 for _ in {1..10}; do
-    $SUDO btmgmt --index "$INDEX" power on 2>/dev/null || $SUDO btmgmt power on 2>/dev/null || bluetoothctl power on 2>/dev/null || true
+    $SUDO btmgmt --index "$INDEX" power on 2>/dev/null || $SUDO btmgmt power on 2>/dev/null || bluez_power_on || true
     $SUDO hciconfig "$NEW_HCI" up 2>/dev/null || true
     if $SUDO btmgmt info 2>/dev/null | grep -q "current settings:.*powered"; then
         echo "✅ $NEW_HCI powered on successfully."
@@ -287,7 +305,13 @@ done
 
 echo "--- Adapter details ---"
 $SUDO btmgmt info 2>/dev/null || true
-bluetoothctl show 2>/dev/null || true
+# BRIDGE_ONLY means another environment's bluetoothd owns this adapter and no
+# local BlueZ is running, so `bluetoothctl show` would only block on a bus name
+# that is not going to appear. btmgmt above is safe: it is the kernel mgmt API,
+# which is exactly what is alive on this side.
+if [ "$BRIDGE_ONLY" != "1" ]; then
+    btctl show
+fi
 
 # Bridge-only mode deliberately leaves bluetoothd stopped (the containers own the
 # adapter), so the BlueZ assertion only applies to the full host setup that the

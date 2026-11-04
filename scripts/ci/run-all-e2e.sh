@@ -124,8 +124,14 @@ if pgrep -x bluetoothd >/dev/null 2>&1; then
     echo "--- systemctl status bluetooth ---"
     sudo systemctl status bluetooth --no-pager 2>&1 | tail -30 || true
     if command -v bluetoothctl >/dev/null 2>&1; then
-        echo "--- bluetoothctl list ---"
-        bluetoothctl list 2>&1 || true
+        echo "--- bluetoothctl list (10s timeout) ---"
+        # bluetoothd is demonstrably unhealthy on this path, so bound the call:
+        # without a bound it waits for the org.bluez bus name forever.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 bluetoothctl list 2>&1 || true
+        else
+            bluetoothctl list 2>&1 || true
+        fi
     fi
     exit 1
 fi
