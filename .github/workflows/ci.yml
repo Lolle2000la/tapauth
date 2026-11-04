@@ -189,6 +189,7 @@ jobs:
         run: |
           cargo build --manifest-path client-pam/Cargo.toml --verbose
           sudo env \
+            CI="$CI" \
             PAM_MODULE_PATH="$PWD/target/debug/libclient_pam.so" \
             SKIP_BUILD=1 \
             ./scripts/ci/test-pam-host-cases.sh

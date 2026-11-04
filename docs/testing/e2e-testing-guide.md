@@ -250,15 +250,22 @@ leaves the host untouched; a pre-existing socket at
 `/run/tapauthd/tapauthd.sock` is **refused** (the script aborts with a message)
 rather than shadowed or deleted, so a real daemon is never disturbed. The real
 `/etc/pam.d/gdm-password` is never touched: the DM bypass only matches on the
-service-name prefix, and the synthetic service exercises it. As non-root it
-prints one `SKIP` line per case and exits 0 locally, but exits 1 when `CI` is
-set, so a CI job that lost its `sudo` prefix fails instead of going green with
-zero cases run. The script exports `LC_ALL=C` and
+service-name prefix, and the synthetic service exercises it. The script is
+root-required: a non-root run prints one `SKIP` line per case and then **fails**
+(exit 1), so a CI job that lost its `sudo` prefix fails instead of going green
+with zero cases run. `ALLOW_NONROOT=1` is the local opt-out — it keeps the `SKIP`
+lines, the summary and the `Re-run as root` hint and exits 0; it is refused
+(exit 1) whenever `CI` is non-empty, so an accidental opt-out in a workflow
+cannot pass by skipping. The script exports `LC_ALL=C` and
 `LANG=C`, so the module's own localized messages cannot turn a correct run into
 a failure under `sudo env` with a non-English user locale.
 
 ```bash
 sudo ./scripts/ci/test-pam-host-cases.sh
+
+# Local run without root: prints the SKIP lines and exits 0 (never in CI, which
+# does not honour the opt-out and fails instead):
+ALLOW_NONROOT=1 ./scripts/ci/test-pam-host-cases.sh
 
 # Against another build (e.g. the pre-fix module), skipping the cargo build:
 sudo env \
