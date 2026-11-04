@@ -19,7 +19,20 @@
 //!
 //! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
 //! runtime per authentication attempt. A separate thread monitors `/dev/tty`
-//! for skip signals in terminal contexts.
+//! for skip signals in terminal contexts. TTY-less (GUI) hosts are split into
+//! a *threaded* and a *sequential* conversation mode by `conversation_mode`;
+//! only allowlisted hosts get the worker thread, everyone else keeps the
+//! conversation on the caller's thread.
+//!
+//! ## Return-code mapping
+//!
+//! | Transition | Code |
+//! | :--- | :--- |
+//! | Phone approved the request | `PAM_SUCCESS` |
+//! | Phone explicitly denied | `PAM_PERM_DENIED` |
+//! | Timeout, dialog dismissed, IPC error, no paired device, skip, DM bypass | `PAM_AUTHINFO_UNAVAIL` |
+//! | Daemon reported an internal error, or a local failure (conversation lookup, RNG, pipe/thread spawn) | `PAM_AUTH_ERR` |
+//! | Username lookup failed | `PAM_USER_UNKNOWN` |
 
 use crate::ipc_client::IpcClient;
 use crate::logging;
@@ -64,20 +77,27 @@ impl IpcResponseReader for IpcClient {
 }
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
-// socket and /dev/tty.  The GUI flow (no TTY) comes in two variants:
+// socket and /dev/tty.  The GUI flow (no TTY) comes in two variants, selected
+// by `conversation_mode` — an allowlist of calling processes with a sequential
+// default:
 //
-// * `polkit-1` (polkit-agent-helper-1): the conversation is a plain blocking
-//   socket fd fed by the *separate* agent process, so it can safely be driven
-//   from a background thread.  A native POSIX thread collects the password
-//   while the main thread waits for the phone, and the main loop multiplexes
-//   the IPC socket and a self-pipe (`run_gui_event_loop`).
+// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`): the
+//   conversation can be driven from another thread.  Polkit's is a plain
+//   blocking socket fd fed by the *separate* agent process; kscreenlocker
+//   ≥ 6.8 makes it a peer D-Bus call answered by Qt's
+//   `QDBusConnectionManager` daemon thread, not by the thread that called
+//   `pam_authenticate`.  A native POSIX thread collects the password while the
+//   main thread waits for the phone, and the main loop multiplexes the IPC
+//   socket and a self-pipe (`run_gui_event_loop`).
 //
-// * All other TTY-less hosts (notably KDE's `kscreenlocker_worker`): the
-//   conversation is a synchronous round-trip that must be dispatched by the
-//   host's own event loop on the thread that called `pam_authenticate`.
-//   Blocking that thread (or driving the conversation from a second thread)
-//   deadlocks the host, so the main thread simply waits for the daemon on its
-//   own and never *drives* the conversation (`run_sequential_event_loop`).
+// * Sequential (everything else, which includes older kscreenlocker and every
+//   host not explicitly known to be safe): the conversation is a synchronous
+//   round-trip that must be dispatched by the host's own event loop on the
+//   thread that called `pam_authenticate`.  Blocking that thread (or driving
+//   the conversation from a second thread, which older kscreenlocker cannot
+//   answer because it posts the reply to the blocked thread) deadlocks the
+//   host, so the main thread simply waits for the daemon on its own and never
+//   *drives* the conversation (`run_sequential_event_loop`).
 //   The one exception is a single non-blocking `PAM_TEXT_INFO` announcement
 //   emitted immediately before the wait begins: it is one conversation round
 //   trip that carries no input, and host event loops need it in order to
@@ -87,8 +107,69 @@ impl IpcResponseReader for IpcClient {
 //   `PamConversation::new` fails first and the module returns
 //   `PAM_AUTH_ERR` as before.
 //
-// The native password thread used by the polkit variant uses no Drop-bearing
+// The native password thread used by the threaded variant uses no Drop-bearing
 // Rust types so that pthread_cancel is safe.
+
+/// How the PAM conversation of the calling host may be driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationMode {
+    /// The conversation may run on a background thread while the calling
+    /// thread waits for the daemon.
+    Threaded,
+    /// The conversation must be left to the calling thread/host event loop.
+    Sequential,
+}
+
+/// Best-effort identity of the process that called into this module.
+///
+/// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
+/// some sandboxes; `/proc/self/comm` is the fallback and holds at most
+/// `TASK_COMM_LEN - 1` (15) bytes, which is why `conversation_mode` accepts
+/// both the full and the truncated spelling of each process name.
+fn process_identity() -> Option<String> {
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
+        if let Some(name) = exe.file_name() {
+            let name = name.to_string_lossy();
+            // The kernel suffixes " (deleted)" once the binary is unlinked.
+            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
+            if !name.is_empty() {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    std::fs::read_to_string("/proc/self/comm")
+        .ok()
+        .map(|comm| comm.trim().to_owned())
+        .filter(|comm| !comm.is_empty())
+}
+
+/// Classify the calling host's PAM conversation.
+///
+/// This is an **allowlist with a sequential default**: only hosts whose
+/// conversation is known to stay answerable while this thread is blocked are
+/// listed.  An unknown host therefore keeps the behaviour that cannot
+/// deadlock, at the cost of the existing (shorter) GUI timeout before password
+/// fallback — the failure direction is "slower", never "wedged".
+///
+/// What makes a host eligible:
+/// * `polkit-agent-helper-1` — the conversation is a blocking fd answered by
+///   the separate agent process.
+/// * `kscreenlocker_worker` (≥ 6.8) — the conversation is a peer D-Bus call
+///   answered by Qt's `QDBusConnectionManager` daemon thread.  On kscreenlocker
+///   ≤ 6.7 the answer is instead posted back to the thread that called
+///   `pam_authenticate`, which would deadlock; nothing in `/proc` reveals the
+///   version, so the allowlist stays as narrow as it can and
+///   `kscreenlocker_greet` is deliberately absent.
+fn conversation_mode(service: &str, process: Option<&str>) -> ConversationMode {
+    match process {
+        Some("polkit-agent-helper-1" | "polkit-agent-he")
+        | Some("kscreenlocker_worker" | "kscreenlocker_w") => ConversationMode::Threaded,
+        // /proc unreadable: preserve the historic polkit behaviour rather than
+        // silently changing how polkit drives its conversation.
+        None if service == "polkit-1" => ConversationMode::Threaded,
+        _ => ConversationMode::Sequential,
+    }
+}
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
 /// message from being displayed on top of an explicit IPC error message.
@@ -180,6 +261,53 @@ unsafe extern "C-unwind" fn native_password_worker(
     }
 
     std::ptr::null_mut()
+}
+
+/// Cancel (optionally) and reap the native password worker.
+///
+/// # Why the join is load-bearing
+///
+/// 1. Stack safety: `ThreadContext` lives on the caller's stack, so the worker
+///    must be gone before that frame is popped.
+/// 2. libpam ownership: `pamh` is a plain, unlocked struct and the libpam
+///    state the conversation depends on (`caller_is`) is process-global.  If
+///    the calling thread re-entered libpam — another `conv` call, a
+///    `pam_get_item`, or simply the return from `pam_authenticate` — while the
+///    worker could still be inside `pam_get_authtok`, the two would race on
+///    unsynchronised libpam state.  The join is what orders them, so it runs on
+///    every path, including the ones where the worker is expected to have
+///    exited already.
+///
+/// # Safety
+///
+/// `pthread_id` must be a live, joinable thread created by this module, and
+/// this must be its only join.
+unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
+    // NOTE: pthread_cancel carries a theoretical risk of deadlocking the parent
+    // process if the cancellation signal arrives while the worker holds an
+    // internal libc lock (e.g. inside a malloc arena entered by
+    // pam_get_authtok).  This is an accepted architectural trade-off; fully
+    // isolating the conversation pipe would require a separate helper process,
+    // as Howdy does with its Python subprocess.
+    if cancel {
+        let cancel_res = unsafe { libc::pthread_cancel(pthread_id) };
+        // ESRCH is benign: the thread already exited naturally during a race
+        // between password entry and the phone tap response.
+        if cancel_res != 0 && cancel_res != libc::ESRCH {
+            let err = std::io::Error::from_raw_os_error(cancel_res);
+            tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
+        }
+    }
+
+    // SAFETY: if pthread_join fails the worker thread may still be running with
+    // a dangling reference into the caller's stack frame.  Aborting is the only
+    // safe response.
+    let join_res = unsafe { libc::pthread_join(pthread_id, std::ptr::null_mut()) };
+    if join_res != 0 {
+        let err = std::io::Error::from_raw_os_error(join_res);
+        tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
+        std::process::abort();
+    }
 }
 
 /// Central event loop for the graphical authentication flow.
@@ -291,16 +419,16 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
 /// Event loop for GUI contexts whose conversation function must not be driven
 /// while TapAuth waits for the phone.
 ///
-/// Some graphical PAM hosts — most importantly KDE's lock screen, which runs
-/// the PAM stack inside `kscreenlocker_worker` — implement the conversation as
-/// a synchronous D-Bus round-trip that can only be answered by the event loop
-/// running on the very thread that called `pam_authenticate`.  For those
-/// hosts:
+/// This is the default for every host that `conversation_mode` does not
+/// allowlist.  Such a host typically implements the conversation as a
+/// synchronous round-trip that can only be answered by the event loop running
+/// on the very thread that called `pam_authenticate` (kscreenlocker ≤ 6.7, for
+/// instance, posts the answer back to that thread).  For those hosts:
 ///
 /// 1. collecting the password from a background thread deadlocks: the
 ///    conversation reply is queued for the blocked host event loop and can
 ///    never be dispatched, so password entry stops working entirely, and
-/// 2. `pthread_cancel`-ing that background thread (as the polkit flow does)
+/// 2. `pthread_cancel`-ing that background thread (as the threaded flow does)
 ///    would force-unwind through the host's non-Rust frames, which can
 ///    `abort()` the host process and take the lock screen down with it.
 ///
@@ -441,19 +569,22 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     let msgs = pam_messages::load_for_user(&username);
 
-    // Block terminal polling if running under the Polkit Graphical Helper.
+    // Block terminal polling if the calling host drives its own conversation.
     // This prevents the PAM module from stealing stdin strings from checking
     // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
     // to deadlock during graphical challenge-response dialogs.
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
-    let is_polkit = service == "polkit-1";
-    // Only hosts whose conversation is a plain blocking fd fed by a separate
-    // process (polkit-agent-helper-1) can safely run the conversation from a
-    // background thread while this thread waits for the daemon.  Event-loop
-    // based hosts (e.g. kscreenlocker_worker) deadlock instead — see
-    // `run_sequential_event_loop`.
-    let supports_threaded_conversation = is_polkit;
-    let tty_file = if !is_polkit {
+    let process = process_identity();
+    let mode = conversation_mode(&service, process.as_deref());
+    tracing::debug!(
+        "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?})",
+        process,
+        service
+    );
+    // A host whose conversation we drive from a worker thread must not take the
+    // terminal branch: it would start polling /dev/tty on this thread and steal
+    // the stdin the host expects for its own dialog.
+    let tty_file = if mode == ConversationMode::Sequential {
         std::fs::File::open("/dev/tty").ok()
     } else {
         None
@@ -468,7 +599,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // hosts only reveal their password entry once a PAM message arrives.
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
-    } else if supports_threaded_conversation {
+    } else if mode == ConversationMode::Threaded {
         pam_conv.try_info(msgs.waiting_for_tap());
     }
 
@@ -483,7 +614,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // and the daemon's authentication timeout, so they stay in sync.  GUI
     // contexts without a usable conversation get the shorter GUI deadline so
     // password fallback remains close at hand.
-    let effective_timeout_secs = if !has_terminal && !supports_threaded_conversation {
+    let effective_timeout_secs = if !has_terminal && mode == ConversationMode::Sequential {
         config
             .pam_gui_timeout_secs
             .min(config.pam_operation_timeout_secs)
@@ -500,8 +631,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     };
     let context = if has_terminal {
         "terminal"
-    } else if supports_threaded_conversation {
-        "gui-threaded (polkit)"
+    } else if mode == ConversationMode::Threaded {
+        "gui-threaded"
     } else {
         "gui-sequential"
     };
@@ -527,11 +658,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_AUTHINFO_UNAVAIL;
     }
 
-    // GUI contexts without a usable conversation (e.g. the KDE lock screen's
-    // kscreenlocker_worker): wait for the daemon on this thread and never
-    // drive the conversation.  Password fallback happens after this returns,
-    // when the next PAM module runs its own conversation.
-    if !has_terminal && !supports_threaded_conversation {
+    // GUI contexts whose conversation must be left to the host (the sequential
+    // mode, e.g. the KDE lock screen before kscreenlocker 6.8): wait for the
+    // daemon on this thread and never *drive* the conversation.  Password
+    // fallback happens after this returns, when the next PAM module runs its
+    // own conversation.
+    if !has_terminal && mode == ConversationMode::Sequential {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
         // Announce the wait now that the request is on the wire and the module
         // is about to block.  Event-loop hosts (GDM's auth prompt, KDE's
@@ -568,11 +700,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         };
     }
 
-    // GUI context with a threaded-conversation-capable host (polkit-1 only):
-    // offload blocking credential collection to a native background thread so
-    // the Polkit graphical helper can process window events, then multiplex
+    // GUI context with a threaded-conversation-capable host (see
+    // `conversation_mode`): offload blocking credential collection to a native
+    // background thread so the host can process window events, then multiplex
     // loop events using a secure close-on-exec self-pipe.
-    if !has_terminal && supports_threaded_conversation {
+    if !has_terminal && mode == ConversationMode::Threaded {
         // O_CLOEXEC prevents the pipe fds from leaking to child processes
         // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
@@ -643,6 +775,15 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         let pthread_id = unsafe { pthread_id.assume_init() };
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
+        // The verdict when no daemon response arrived.  Every remaining exit
+        // reason means the service could not be consulted — the user chose the
+        // password (`PasswordEntered`, which leaves the token cached by
+        // `pam_get_authtok` for the next module), dismissed the dialog
+        // (`PasswordFailed`), the daemon went quiet (`Timeout`) or the IPC layer
+        // failed (`IpcError`, announced through `pending_error` above).  It is
+        // not `PAM_IGNORE`: on a `sufficient` line `PAM_AUTHINFO_UNAVAIL` is
+        // equally `ignore`, while on a `required` line `PAM_IGNORE` would let a
+        // later `optional pam_permit` grant the whole stack.
         let mut final_outcome = pam_sys::PAM_AUTHINFO_UNAVAIL;
         let mut auth_response = None;
         let mut pending_error: Option<&str> = None;
@@ -658,36 +799,17 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             &mut pending_error,
         );
 
-        // Cancel the worker if it hasn't already exited on its own.
+        // Cancel the worker if it hasn't already exited on its own, then always
+        // reap it (see `cancel_and_join` for why the join is load-bearing).
         //
-        // NOTE: pthread_cancel carries a theoretical risk of deadlocking the
-        // parent process if the cancellation signal arrives while the worker
-        // holds an internal libc lock (e.g. inside a malloc arena entered by
-        // pam_get_authtok).  This is an accepted architectural trade-off;
-        // fully isolating the conversation pipe would require a separate
-        // helper process, as Howdy does with its Python subprocess.
-        if exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed {
-            unsafe {
-                let cancel_res = libc::pthread_cancel(pthread_id);
-                // ESRCH is benign: the thread already exited naturally during
-                // a race between password entry and the phone tap response.
-                if cancel_res != 0 && cancel_res != libc::ESRCH {
-                    let err = std::io::Error::from_raw_os_error(cancel_res);
-                    tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
-                }
-            }
-        }
-
-        // SAFETY: if pthread_join fails the worker thread may still be
-        // running with a dangling &ctx reference into our stack frame.
-        // Aborting is the only safe response.
+        // Password entry and dialog dismissal both mean the worker has left
+        // `pam_get_authtok` on its own, so those paths skip the cancel.
         unsafe {
-            let join_res = libc::pthread_join(pthread_id, std::ptr::null_mut());
-            if join_res != 0 {
-                let err = std::io::Error::from_raw_os_error(join_res);
-                tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
-                std::process::abort();
-            }
+            cancel_and_join(
+                pthread_id,
+                exit_reason != ExitReason::PasswordEntered
+                    && exit_reason != ExitReason::PasswordFailed,
+            );
             libc::close(pipe_read);
             libc::close(pipe_write);
         }
@@ -1574,5 +1696,145 @@ mod gui_loop_tests {
             "the sequential-wait announcement must stay on one line, got {:?}",
             text
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod conversation_mode_tests {
+    use super::*;
+    use std::os::raw::c_void;
+
+    #[test]
+    fn conversation_mode_is_an_allowlist_with_a_sequential_default() {
+        let cases: &[(&str, Option<&str>, ConversationMode)] = &[
+            (
+                "polkit-1",
+                Some("polkit-agent-helper-1"),
+                ConversationMode::Threaded,
+            ),
+            (
+                "polkit-1",
+                Some("polkit-agent-he"),
+                ConversationMode::Threaded,
+            ),
+            (
+                "kde",
+                Some("kscreenlocker_worker"),
+                ConversationMode::Threaded,
+            ),
+            ("kde", Some("kscreenlocker_w"), ConversationMode::Threaded),
+            (
+                "kde",
+                Some("kscreenlocker_greet"),
+                ConversationMode::Sequential,
+            ),
+            ("kde", Some("kscreenlocker_g"), ConversationMode::Sequential),
+            ("sudo", Some("sudo"), ConversationMode::Sequential),
+            ("su", Some("su"), ConversationMode::Sequential),
+            ("hyprlock", Some("hyprlock"), ConversationMode::Sequential),
+            ("swaylock", Some("swaylock"), ConversationMode::Sequential),
+            ("gtklock", Some("gtklock"), ConversationMode::Sequential),
+            ("whatever", Some("whatever"), ConversationMode::Sequential),
+            ("polkit-1", None, ConversationMode::Threaded),
+            ("sudo", None, ConversationMode::Sequential),
+            ("", None, ConversationMode::Sequential),
+        ];
+
+        for &(service, process, expected) in cases {
+            assert_eq!(
+                conversation_mode(service, process),
+                expected,
+                "service {service:?} with process {process:?}"
+            );
+        }
+    }
+
+    static JOIN_TEST_STARTED: AtomicBool = AtomicBool::new(false);
+
+    struct JoinTestCtx {
+        pipe_read: libc::c_int,
+    }
+
+    /// Blocks in `read(2)` — a cancellation point, just like
+    /// `pam_get_authtok` — so `cancel_and_join` can only return promptly by
+    /// actually cancelling the thread.  `C-unwind` lets glibc's
+    /// `abi::__forced_unwind` pass through this frame.
+    unsafe extern "C-unwind" fn join_test_worker(arg: *mut c_void) -> *mut c_void {
+        let ctx = unsafe { &*(arg as *const JoinTestCtx) };
+        JOIN_TEST_STARTED.store(true, Ordering::Release);
+        let mut buf = [0u8; 1];
+        unsafe {
+            libc::read(ctx.pipe_read, buf.as_mut_ptr() as *mut c_void, 1);
+        }
+        std::ptr::null_mut()
+    }
+
+    // `libc::pthread_create` wants an `extern "C"` fn; this binding keeps the
+    // worker's `C-unwind` ABI without transmuting function signatures.
+    extern "C" {
+        #[link_name = "pthread_create"]
+        fn pthread_create_unwind(
+            thread: *mut libc::pthread_t,
+            attr: *const libc::pthread_attr_t,
+            start_routine: unsafe extern "C-unwind" fn(*mut c_void) -> *mut c_void,
+            arg: *mut c_void,
+        ) -> libc::c_int;
+    }
+
+    #[test]
+    fn cancel_and_join_reaps_a_worker_blocked_in_a_cancellation_point() {
+        let mut fds: [libc::c_int; 2] = [-1, -1];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2 failed"
+        );
+
+        // The write end stays open: only a cancel unblocks the worker.
+        let ctx = JoinTestCtx { pipe_read: fds[0] };
+        let mut tid = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+        let rc = unsafe {
+            pthread_create_unwind(
+                tid.as_mut_ptr(),
+                std::ptr::null(),
+                join_test_worker,
+                &ctx as *const JoinTestCtx as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "pthread_create failed");
+        let tid = unsafe { tid.assume_init() };
+
+        // Watchdog: unblock the worker after 5s so a missing cancel fails this
+        // test instead of hanging it.  It owns the write end and closes it.
+        let watchdog_write = fds[1];
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let byte = [1u8];
+            unsafe {
+                libc::write(watchdog_write, byte.as_ptr() as *const c_void, 1);
+                libc::close(watchdog_write);
+            }
+        });
+
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while !JOIN_TEST_STARTED.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < start_deadline,
+                "worker thread never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        unsafe { cancel_and_join(tid, true) };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel_and_join took {elapsed:?}: the worker was not cancelled and had to be \
+             unblocked by the watchdog"
+        );
+
+        unsafe { libc::close(fds[0]) };
     }
 }
