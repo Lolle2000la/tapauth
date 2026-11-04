@@ -80,7 +80,11 @@ cargo build -p tapauthd --bin tapauth-ipc-cli
 echo "=================================================="
 echo " [1/3] Running E2E against installed Ubuntu (.deb) package"
 echo "=================================================="
-sudo -E env "PATH=$PATH" TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 TAPAUTH_E2E_DAEMON_MODE=systemd ./scripts/test-e2e.sh
+# Preserve PATH and HOME via the explicit list form: Ubuntu 26.04 ships sudo-rs,
+# which ignores bare -E (it sets HOME to the target user's home unconditionally).
+# adb reads the emulator console auth token from $HOME, so HOME must stay the
+# invoking user's for the Phase 2 UDP bridge to authenticate.
+sudo --preserve-env=PATH,HOME env TAPAUTH_E2E_USE_INSTALLED_PACKAGE=1 TAPAUTH_E2E_DAEMON_MODE=systemd ./scripts/test-e2e.sh
 sudo apt-get purge -y tapauth 2>/dev/null || true
 
 # Hand the virtual Bluetooth adapter to the container instances: only one
