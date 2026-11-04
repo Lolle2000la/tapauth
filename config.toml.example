@@ -10,9 +10,13 @@
 # Default: 120
 pam_operation_timeout_secs = 120
 
-# Timeout for graphical PAM contexts that cannot collect a password while
-# TapAuth is waiting (e.g. the KDE lock screen). In those contexts the wait
-# is capped at this duration before falling through to password entry.
+# Timeout for graphical PAM contexts whose conversation TapAuth cannot drive
+# (the sequential path, e.g. kscreenlocker <= 6.7 or an unrecognised host). In
+# those contexts the wait is capped at this duration before falling through to
+# password entry.
+# Graphical hosts whose conversation can be driven from a worker thread
+# (polkit, kscreenlocker >= 6.8, hyprlock, xsecurelock, GDM unlock) are bounded
+# by pam_operation_timeout_secs instead.
 # Clamped to pam_operation_timeout_secs.
 # Default: 30
 pam_gui_timeout_secs = 30

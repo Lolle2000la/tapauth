@@ -18,9 +18,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 /// Default PAM authentication session timeout in seconds
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
-/// Default PAM authentication timeout for GUI contexts without a usable
-/// conversation (e.g. the KDE lock screen), in seconds. Mirrors the default
-/// in the PAM module's `PamConfig` (client-pam).
+/// Default PAM authentication timeout for GUI contexts whose conversation the
+/// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7), in
+/// seconds. Mirrors the default in the PAM module's `PamConfig` (client-pam).
 const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 
 /// Default UDP port for authentication
@@ -104,13 +104,17 @@ pub struct TapAuthConfig {
     /// time to complete BLE/UDP discovery and receive the phone's response.
     pub pam_operation_timeout_secs: u64,
 
-    /// Authentication timeout for graphical PAM contexts that cannot collect a
-    /// password while TapAuth waits (e.g. the KDE lock screen).
+    /// Authentication timeout for graphical PAM contexts whose conversation the
+    /// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7 or an
+    /// unrecognised host).
     /// Default: 30 seconds
     ///
     /// In those contexts the TapAuth wait is capped at this duration before
     /// falling through to password entry. The PAM module additionally clamps
-    /// this to `pam_operation_timeout_secs`.
+    /// this to `pam_operation_timeout_secs`. Graphical hosts whose conversation
+    /// can be driven from a worker thread (polkit, kscreenlocker >= 6.8,
+    /// hyprlock, xsecurelock, GDM unlock) are bounded by
+    /// `pam_operation_timeout_secs` instead.
     ///
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a
