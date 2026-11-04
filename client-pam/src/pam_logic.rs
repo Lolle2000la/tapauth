@@ -20,9 +20,10 @@
 //! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
 //! runtime per authentication attempt. A separate thread monitors `/dev/tty`
 //! for skip signals in terminal contexts. TTY-less (GUI) hosts are split into
-//! a *threaded* and a *sequential* conversation mode by `conversation_mode`;
-//! only allowlisted hosts get the worker thread, everyone else keeps the
-//! conversation on the caller's thread.
+//! three conversation modes by `conversation_mode`; only allowlisted hosts get
+//! the worker thread, hosts that collect the password before calling into PAM
+//! get a synchronous replay and no daemon request at all, and everyone else
+//! keeps the conversation on the caller's thread.
 //!
 //! ## Return-code mapping
 //!
@@ -77,18 +78,27 @@ impl IpcResponseReader for IpcClient {
 }
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
-// socket and /dev/tty.  The GUI flow (no TTY) comes in two variants, selected
-// by `conversation_mode` — an allowlist of calling processes with a sequential
-// default:
+// socket and /dev/tty.  The GUI flow (no TTY) comes in three variants,
+// selected by `conversation_mode` — an allowlist of calling processes with a
+// sequential default:
 //
-// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `swaylock`,
-//   `gtklock`, `hyprlock`): the conversation can be driven from another thread.
-//   Polkit's is a plain blocking socket fd fed by the *separate* agent process;
-//   kscreenlocker ≥ 6.8 makes it a peer D-Bus call answered by Qt's
-//   `QDBusConnectionManager` daemon thread, not by the thread that called
-//   `pam_authenticate`.  A native POSIX thread collects the password while the
-//   main thread waits for the phone, and the main loop multiplexes the IPC
-//   socket and a self-pipe (`run_gui_event_loop`).
+// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `hyprlock`,
+//   `authproto_pam`, `xfce4-screensaver-dialog`, `mate-screensaver-dialog`,
+//   and GDM's reauthentication worker): the conversation can be driven from
+//   another thread.  Polkit's is a plain blocking socket fd fed by the
+//   *separate* agent process; kscreenlocker ≥ 6.8 makes it a peer D-Bus call
+//   answered by Qt's `QDBusConnectionManager` daemon thread, not by the thread
+//   that called `pam_authenticate`.  A native POSIX thread collects the
+//   password while the main thread waits for the phone, and the main loop
+//   multiplexes the IPC socket and a self-pipe (`run_gui_event_loop`).
+//
+// * PreCollected (`swaylock`, `gtklock`, `i3lock`): the host reads the
+//   password *before* calling `pam_authenticate` and its conversation is a
+//   synchronous replay of that already-typed password.  The module therefore
+//   collects the token on the calling thread with no daemon request at all and
+//   immediately hands over to the next PAM module (see the branch in
+//   `authenticate`).  Ringing the phone here would be misleading: the user has
+//   already chosen the password route, and the wait could only ever time out.
 //
 // * Sequential (everything else, which includes older kscreenlocker and every
 //   host not explicitly known to be safe): the conversation is a synchronous
@@ -116,6 +126,10 @@ enum ConversationMode {
     /// The conversation may run on a background thread while the calling
     /// thread waits for the daemon.
     Threaded,
+    /// The host collected the password before calling `pam_authenticate` and
+    /// its conversation only replays it.  The module collects the token on the
+    /// calling thread and hands over without contacting the daemon.
+    PreCollected,
     /// The conversation must be left to the calling thread/host event loop.
     Sequential,
 }
@@ -160,34 +174,77 @@ fn process_identity() -> Option<String> {
 ///   `pam_authenticate`, which would deadlock; nothing in `/proc` reveals the
 ///   version, so the allowlist stays as narrow as it can and
 ///   `kscreenlocker_greet` is deliberately absent.
-/// * `swaylock` — forked child; the conversation is a blocking read on a pipe.
-///   swaylock collects the password *before* calling `pam_authenticate` and
-///   the conversation merely replays it, so this is not a live race: the phone
-///   never gets a chance to answer.
-/// * `gtklock` — forked child driven by a `GThread`; the conversation returns
-///   the stored password immediately.  Same pre-collected nuance as `swaylock`.
 /// * `hyprlock` — a worker `std::thread` with mutex/condvar, i.e. a genuine
 ///   concurrent race.  Known residual risk, accepted by the operator:
 ///   `resetConversation` and `checkWaiting` are not synchronised, so more than
 ///   one waiter would be unsafe.
+/// * `authproto_pam` (xsecurelock) — the conversation is answered by the host's
+///   own thread pool, not by the thread that called `pam_authenticate`.  Quirk:
+///   `CallPAMWithRetries` (`helpers/authproto_pam.c:109-132`) re-runs
+///   `pam_authenticate` up to 3× when it returns `PAM_AUTHINFO_UNAVAIL`, so one
+///   lock-screen attempt can ring the phone up to three times.  Documented, not
+///   fixed here.
+/// * `xfce4-screensaver-dialog` — the answer is produced by the child process
+///   that owns the password entry (`/proc/self/comm` truncates it to
+///   `xfce4-screensav`).
+/// * `mate-screensaver-dialog` — same shape as xfce4-screensaver (comm
+///   truncation: `mate-screensave`).
+/// * `gdm-session-worker` on a `gdm-password` **reauthentication** — the
+///   unlock/re-auth prompt of a running GDM session, whose conversation is
+///   answered by the worker's GLib main loop on another thread.  Only a
+///   reauthentication qualifies: a GDM *login* is bypassed by
+///   `guard_display_manager_bypass` for keyring reasons, and the worker is
+///   otherwise the host whose event loop must own the conversation.
+///
+/// Pre-collected hosts (`swaylock`, `gtklock`, `i3lock`) are classified
+/// `PreCollected` instead: their conversation replays a password that was read
+/// before `pam_authenticate`, so the phone must not be consulted at all.
 ///
 /// Extending the list is one match entry plus one row in the table test below;
 /// every host that is not named stays on the sequential path.
-fn conversation_mode(service: &str, process: Option<&str>) -> ConversationMode {
+fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> ConversationMode {
     match process {
         Some("polkit-agent-helper-1" | "polkit-agent-he")
-        | Some("kscreenlocker_worker" | "kscreenlocker_w") => ConversationMode::Threaded,
+        | Some("kscreenlocker_worker" | "kscreenlocker_w")
+        | Some("hyprlock")
+        | Some("authproto_pam")
+        | Some("xfce4-screensaver-dialog" | "xfce4-screensav")
+        | Some("mate-screensaver-dialog" | "mate-screensave") => ConversationMode::Threaded,
+        // A GDM reauthentication prompt only.  `reauth` is false when
+        // `GDM_SESSION_FOR_REAUTH` is absent (a missed or renamed variable
+        // therefore degrades to the sequential default, never to a deadlock),
+        // and a non-`gdm-password` service behind `gdm-session-worker` stays
+        // sequential.
+        Some("gdm-session-worker" | "gdm-session-wor")
+            if reauth && service.eq_ignore_ascii_case("gdm-password") =>
+        {
+            ConversationMode::Threaded
+        }
         // All three names are shorter than `TASK_COMM_LEN` (15), so the
         // `/proc/self/comm` spelling equals the full name and there is no
-        // truncated variant to accept.  swaylock/gtklock replay a password
-        // collected before `pam_authenticate`; hyprlock answers concurrently
-        // (see the residual-risk note above).
-        Some("swaylock" | "gtklock" | "hyprlock") => ConversationMode::Threaded,
+        // truncated variant to accept.  These hosts read the password before
+        // `pam_authenticate` (swaylock `pam.c:51` `strdup(state->password)`,
+        // gtklock `auth.c:61` `strdup(data->pw)`, i3lock `i3lock.c:836`
+        // `strdup(password)`) and their conversation is a synchronous replay of
+        // it, so collecting the token on the calling thread is not a race.
+        Some("swaylock" | "gtklock" | "i3lock") => ConversationMode::PreCollected,
         // /proc unreadable: preserve the historic polkit behaviour rather than
         // silently changing how polkit drives its conversation.
         None if service == "polkit-1" => ConversationMode::Threaded,
         _ => ConversationMode::Sequential,
     }
+}
+
+/// Whether this invocation is a GDM reauthentication (unlock, or the admin
+/// prompt of a running GNOME session) rather than a fresh login.
+///
+/// GDM exports `GDM_SESSION_FOR_REAUTH` for the `gdm-session-worker` it spawns
+/// to reauthenticate an existing session.  The variable is the only signal
+/// available inside the module: the service name (`gdm-password`) is identical
+/// for login and reauthentication.
+fn is_gdm_reauth(service: &str) -> bool {
+    service.eq_ignore_ascii_case("gdm-password")
+        && std::env::var_os("GDM_SESSION_FOR_REAUTH").is_some()
 }
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
@@ -594,9 +651,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // to deadlock during graphical challenge-response dialogs.
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
     let process = process_identity();
-    let mode = conversation_mode(&service, process.as_deref());
+    // GDM reauthentication (unlock / admin prompt of a running session) must
+    // not take the display-manager bypass below, and it is the only GDM case
+    // whose conversation we may drive from a worker thread.
+    let reauth = is_gdm_reauth(&service);
+    let mode = conversation_mode(&service, process.as_deref(), reauth);
     tracing::debug!(
-        "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?})",
+        "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?}, reauth: {reauth})",
         process,
         service
     );
@@ -609,6 +670,42 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         None
     };
     let has_terminal = tty_file.is_some();
+
+    // Pre-collected hosts (swaylock, gtklock, i3lock) read the password before
+    // they call `pam_authenticate`; their conversation is a synchronous replay
+    // of it, so `pam_get_authtok` returns immediately and never waits for the
+    // user.  Collect the token on the calling thread — a worker thread would
+    // only reintroduce the cross-thread libpam pattern the threaded path has to
+    // join around — and let it be cached in `PAM_AUTHTOK`, which is what the
+    // next module (`pam_unix` with `try_first_pass`/`use_first_pass`) verifies.
+    //
+    // This is deliberately a skip, not a wait: the user has already typed the
+    // password, so ringing the phone would be misleading and could only ever
+    // end in a timeout.  Returning `PAM_AUTHINFO_UNAVAIL` (never `PAM_IGNORE`)
+    // makes the `sufficient` line fall through to the password module and fails
+    // a `required` line closed.  If the token cannot be read (the host's
+    // conversation refused it, or nothing was collected) the next module simply
+    // prompts as it would without this module.
+    if mode == ConversationMode::PreCollected {
+        let mut authtok: *const std::os::raw::c_char = std::ptr::null();
+        // SAFETY: `pamh` is the live handle libpam passed to this call and the
+        // conversation belongs to this thread, which is what the host expects.
+        let res = unsafe {
+            pam_sys::pam_get_authtok(pamh, pam_sys::PAM_AUTHTOK, &mut authtok, std::ptr::null())
+        };
+        if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
+            tracing::warn!(
+                "TapAuth: pre-collected host supplied no password token ({res}); \
+                 falling through to the next PAM module"
+            );
+        } else {
+            tracing::info!(
+                "TapAuth: pre-collected password cached for the next PAM module; \
+                 the phone is not consulted"
+            );
+        }
+        return pam_sys::PAM_AUTHINFO_UNAVAIL;
+    }
 
     // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
     // (one conversation round trip that carries no input and never waits for
@@ -992,33 +1089,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     pam_sys::PAM_AUTHINFO_UNAVAIL
 }
 
-/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
-/// manager.
+/// Whether the PAM service name belongs to a primary display manager.
 ///
-/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
-/// LightDM, LXDM), a successful phone confirmation authenticates the user but
-/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
-/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
-/// depend on that token to unlock the local secure keyring/wallet at login-time.
-///
-/// Bypassing DM services preserves the normal password collection flow so the
-/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
-/// secondary prompt. The module still runs for secondary services such as
-/// `sudo`, `polkit-1`, and desktop screensavers.
-///
-/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
-/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
-/// `sufficient` line the stack treats it as `ignore` and still runs the next
-/// module; on a `required` line it fails closed.
-///
-/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
-/// otherwise.
-fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
-    let service = unsafe { pam_sys::get_service_name(pamh) }?;
-    tracing::debug!("Calling PAM service name: {}", service);
-
-    let service_lower = service.to_ascii_lowercase();
-    let dm_prefixes = [
+/// Matched by exact name or by a `-`-suffixed prefix, so `gdm`, `gdm3` and
+/// `gdm-password` all qualify but an unrelated service such as `gdmfoo` does
+/// not.
+fn is_dm_service(service: &str) -> bool {
+    const DM_PREFIXES: [&str; 13] = [
         "sddm",
         "gdm",
         "gdm3",
@@ -1033,11 +1110,46 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
         "entrance",
         "plasmalogin",
     ];
-    if dm_prefixes.iter().any(|p| {
+    let service_lower = service.to_ascii_lowercase();
+    DM_PREFIXES.iter().any(|p| {
         service_lower == *p
             || (service_lower.starts_with(p)
                 && service_lower.as_bytes().get(p.len()) == Some(&b'-'))
-    }) {
+    })
+}
+
+/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
+/// manager.
+///
+/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
+/// LightDM, LXDM), a successful phone confirmation authenticates the user but
+/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
+/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
+/// depend on that token to unlock the local secure keyring/wallet at login-time.
+///
+/// Bypassing DM services preserves the normal password collection flow so the
+/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
+/// secondary prompt. The module still runs for secondary services such as
+/// `sudo`, `polkit-1`, and desktop screensavers.
+///
+/// A **GDM reauthentication** (`gdm-password` with `GDM_SESSION_FOR_REAUTH`
+/// set) is exempt: it runs no session/setcred phase
+/// (`gdm-session-worker.c:1489,1781`), so the keyring reason for keeping the
+/// login sequential does not apply, and the unlock prompt is exactly where the
+/// phone should be offered.
+///
+/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
+/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
+/// `sufficient` line the stack treats it as `ignore` and still runs the next
+/// module; on a `required` line it fails closed.
+///
+/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
+/// otherwise.
+fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
+    let service = unsafe { pam_sys::get_service_name(pamh) }?;
+    tracing::debug!("Calling PAM service name: {}", service);
+
+    if is_dm_service(&service) && !is_gdm_reauth(&service) {
         tracing::info!(
             "TapAuth: Service '{}' is a primary display manager. \
              Skipping to avoid breaking keyring auto-unlock.",
@@ -1726,45 +1838,199 @@ mod conversation_mode_tests {
 
     #[test]
     fn conversation_mode_is_an_allowlist_with_a_sequential_default() {
-        let cases: &[(&str, Option<&str>, ConversationMode)] = &[
+        // (service, process, reauth, expected)
+        let cases: &[(&str, Option<&str>, bool, ConversationMode)] = &[
+            // polkit: conversation is a fd answered by the separate agent
+            // process.  Reauth is irrelevant to it.
             (
                 "polkit-1",
                 Some("polkit-agent-helper-1"),
+                false,
                 ConversationMode::Threaded,
             ),
             (
                 "polkit-1",
                 Some("polkit-agent-he"),
+                false,
                 ConversationMode::Threaded,
             ),
+            // kscreenlocker >= 6.8 answers on Qt's D-Bus daemon thread; the
+            // greet helper does not, so it stays sequential.
             (
                 "kde",
                 Some("kscreenlocker_worker"),
+                false,
                 ConversationMode::Threaded,
             ),
-            ("kde", Some("kscreenlocker_w"), ConversationMode::Threaded),
+            (
+                "kde",
+                Some("kscreenlocker_w"),
+                false,
+                ConversationMode::Threaded,
+            ),
             (
                 "kde",
                 Some("kscreenlocker_greet"),
+                false,
                 ConversationMode::Sequential,
             ),
-            ("kde", Some("kscreenlocker_g"), ConversationMode::Sequential),
-            ("sudo", Some("sudo"), ConversationMode::Sequential),
-            ("su", Some("su"), ConversationMode::Sequential),
-            ("hyprlock", Some("hyprlock"), ConversationMode::Threaded),
-            ("swaylock", Some("swaylock"), ConversationMode::Threaded),
-            ("gtklock", Some("gtklock"), ConversationMode::Threaded),
-            ("whatever", Some("whatever"), ConversationMode::Sequential),
-            ("polkit-1", None, ConversationMode::Threaded),
-            ("sudo", None, ConversationMode::Sequential),
-            ("", None, ConversationMode::Sequential),
+            (
+                "kde",
+                Some("kscreenlocker_g"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            ("sudo", Some("sudo"), false, ConversationMode::Sequential),
+            ("su", Some("su"), false, ConversationMode::Sequential),
+            // hyprlock answers concurrently (documented residual risk).
+            (
+                "hyprlock",
+                Some("hyprlock"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // xsecurelock's helper answers on its own thread pool.
+            (
+                "xsecurelock",
+                Some("authproto_pam"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // xfce4-screensaver / mate-screensaver dialog children, full and
+            // `/proc/self/comm`-truncated spellings.
+            (
+                "xfce4-screensaver",
+                Some("xfce4-screensaver-dialog"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "xfce4-screensaver",
+                Some("xfce4-screensav"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "mate-screensaver",
+                Some("mate-screensaver-dialog"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "mate-screensaver",
+                Some("mate-screensave"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // Hosts that read the password before pam_authenticate: their
+            // conversation only replays it, so the phone is not consulted.
+            (
+                "swaylock",
+                Some("swaylock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            (
+                "gtklock",
+                Some("gtklock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            (
+                "i3lock",
+                Some("i3lock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            // GDM: only a reauthentication prompt may be driven from a worker
+            // thread, and only behind the `gdm-password` service.
+            (
+                "gdm-password",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            (
+                "gdm-password",
+                Some("gdm-session-wor"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            // The env var is absent (reauth=false): same worker, sequential.
+            (
+                "gdm-password",
+                Some("gdm-session-worker"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            // The reauth flag alone must not promote a non-DM service.
+            (
+                "sudo",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Sequential,
+            ),
+            // Case-insensitive service match.
+            (
+                "GDM-Password",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            (
+                "whatever",
+                Some("whatever"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            ("polkit-1", None, false, ConversationMode::Threaded),
+            ("sudo", None, false, ConversationMode::Sequential),
+            ("", None, false, ConversationMode::Sequential),
         ];
 
-        for &(service, process, expected) in cases {
+        for &(service, process, reauth, expected) in cases {
             assert_eq!(
-                conversation_mode(service, process),
+                conversation_mode(service, process, reauth),
                 expected,
-                "service {service:?} with process {process:?}"
+                "service {service:?} with process {process:?} and reauth {reauth}"
+            );
+        }
+    }
+
+    /// The DM bypass and the GDM reauth exemption both hang off this prefix
+    /// test: it must stay exact-or-`-`-suffixed so an unrelated service whose
+    /// name merely starts with a DM name is not skipped.
+    #[test]
+    fn display_manager_prefix_matching() {
+        for service in [
+            "gdm",
+            "gdm3",
+            "gdm-password",
+            "GDM-Password",
+            "gdm-tapauth-host",
+            "sddm",
+            "sddm-helper",
+            "lightdm",
+            "greetd",
+            "plasmalogin",
+        ] {
+            assert!(
+                is_dm_service(service),
+                "{service:?} must be treated as a display manager service"
+            );
+        }
+        for service in [
+            "gdmfoo",
+            "sddmfoo",
+            "sudo",
+            "su",
+            "polkit-1",
+            "tapauth-conv-sufficient",
+            "",
+        ] {
+            assert!(
+                !is_dm_service(service),
+                "{service:?} must not be treated as a display manager service"
             );
         }
     }
