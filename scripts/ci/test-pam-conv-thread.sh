@@ -47,6 +47,19 @@
 #                must read it on the calling thread and hand it on *without
 #                contacting the daemon*: daemon accept count must stay 0.
 #
+#   grant        auth sufficient <module>       (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                CONV_TEST_BLOCK=cancel parks the conversation in
+#                `pthread_cond_wait` — a POSIX cancellation point — and never
+#                signals it, while the fake daemon waits for the conversation to
+#                be entered and then writes a granted IpcEnvelope.  The phone
+#                therefore wins while the host is still blocked, and the module
+#                must abandon the worker (`pthread_cancel`) instead of waiting
+#                for a password that never comes.  A pass cannot be explained by
+#                password fallback: the conversation never returns, and the
+#                harness asserts `conv_returned == 0` even though the stack
+#                granted.  This is the only shape that exercises the cancel path.
+#
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
 #                unlock must be offered the phone (threaded, daemon >= 1).
@@ -265,6 +278,25 @@ run_shape "pre-collect (no phone, token handed on)" "$PRECOLLECT_BIN" \
     "$PRECOLLECT_SERVICE" success "$PRECOLLECT_MARKER" precollect \
     CONV_TEST_PRECOLLECT=1
 
+# --------------------------------------------------------------------- grant --
+# The phone grants while the host's conversation is still parked in a
+# cancellation point.  This is the one shape where the module must abandon the
+# worker: the conversation is never signalled, so if `pthread_cancel` in
+# `cancel_and_join` stops happening the harness never returns and `timeout 15`
+# below turns the regression into rc 124 instead of a hung CI job.
+#
+# A pass cannot come from password fallback: nothing ever writes a password, the
+# conversation never returns (`conv_returned == 0`), yet the stack must grant —
+# so the grant can only be the daemon's response, and the module can only have
+# reported it after reaping a *cancelled* worker.
+GRANT_SERVICE="tapauth-conv-grant"
+cat > "$CONFDIR/$GRANT_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+account required pam_permit.so
+EOF
+run_shape "grant (phone wins while the conversation is parked)" \
+    "$THREADED_BIN" "$GRANT_SERVICE" success "" grant CONV_TEST_BLOCK=cancel
+
 # ------------------------------------------------------------------ gdm reauth --
 # A GDM reauthentication (unlock / admin prompt of a running session) must NOT
 # take the display-manager bypass, and its conversation is answerable from a
@@ -316,4 +348,4 @@ if [ "$CONTROL_RC" -eq 0 ] || grep -q '^RESULT: PASS$' <<<"$CONTROL_OUT"; then
     exit 1
 fi
 
-echo "✅ PAM conversation E2E passed (sufficient, required, bypass, pre-collect, gdm reauth, gdm login, control)"
+echo "✅ PAM conversation E2E passed (sufficient, required, bypass, pre-collect, grant, gdm reauth, gdm login, control)"
