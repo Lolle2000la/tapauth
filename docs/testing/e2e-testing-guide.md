@@ -253,14 +253,16 @@ rather than shadowed or deleted, so a real daemon is never disturbed. The real
 service-name prefix, and the synthetic service exercises it. As non-root it
 prints one `SKIP` line per case and exits 0. The script exports `LC_ALL=C` and
 `LANG=C`, so the module's own localized messages cannot turn a correct run into
-a failure under `sudo -E` with a non-English user locale.
+a failure under `sudo env` with a non-English user locale.
 
 ```bash
 sudo ./scripts/ci/test-pam-host-cases.sh
 
 # Against another build (e.g. the pre-fix module), skipping the cargo build:
-PAM_MODULE_PATH=/tmp/pam-base/target/debug/libclient_pam.so SKIP_BUILD=1 \
-  sudo -E ./scripts/ci/test-pam-host-cases.sh
+sudo env \
+  PAM_MODULE_PATH=/tmp/pam-base/target/debug/libclient_pam.so \
+  SKIP_BUILD=1 \
+  ./scripts/ci/test-pam-host-cases.sh
 ```
 
 Every case asserts the **numeric** `PAM_RESULT=` that `pamtester` prints (0 success,
