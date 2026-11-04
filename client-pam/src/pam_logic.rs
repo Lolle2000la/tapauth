@@ -10,7 +10,10 @@
 //! 2. Send authentication request via BLE/UDP multicast
 //! 3. Wait for phone tap or user skip (terminal only)
 //! 4. On skip, send IPC cancel to daemon (best effort) plus network cancel
-//! 5. Return `PAM_SUCCESS` on authentication, `PAM_IGNORE` to allow fallback to password
+//! 5. Return `PAM_SUCCESS` on authentication; every other outcome returns a
+//!    real verdict (`PAM_PERM_DENIED`, `PAM_AUTHINFO_UNAVAIL` or `PAM_AUTH_ERR`),
+//!    never `PAM_IGNORE`: Linux-PAM records no failure for that code, so a later
+//!    `optional` module voting success (e.g. `pam_permit`) would grant the stack.
 //!
 //! ## Threading
 //!
@@ -21,7 +24,7 @@
 use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::pam_messages;
-use crate::pam_sys::{self, PAM_IGNORE};
+use crate::pam_sys;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::Read;
@@ -367,9 +370,19 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
 /// ## Returns
 ///
 /// - `PAM_SUCCESS`: Authentication succeeded via TapAuth
-/// - `PAM_IGNORE`: No paired devices, skipped, or timed out (allows password fallback)
-/// - `PAM_PERM_DENIED`: Not running as root
+/// - `PAM_PERM_DENIED`: The user explicitly denied the request on the phone
+/// - `PAM_AUTHINFO_UNAVAIL`: The authentication service could not be consulted —
+///   no paired devices, the user skipped, the daemon is unreachable, or the
+///   attempt timed out. On a `sufficient` line (which expands to
+///   `[success=done new_authtok_reqd=done default=ignore]`) this still falls
+///   through to the next module, so password fallback is preserved
+/// - `PAM_AUTH_ERR`: This attempt failed while being processed — a local
+///   processing failure, or the daemon reported an internal error
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
+///
+/// `PAM_IGNORE` is deliberately never returned. Linux-PAM records no failure
+/// for it, so a later `optional` module that votes success (e.g. `pam_permit`)
+/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
 
@@ -406,7 +419,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             Ok(conv) => conv,
             Err(e) => {
                 tracing::error!("Failed to get PAM conversation function: {}", e);
-                return pam_sys::PAM_IGNORE;
+                return pam_sys::PAM_AUTH_ERR;
             }
         }
     };
@@ -444,7 +457,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut rid_bytes = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut rid_bytes) {
         tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
-        return PAM_IGNORE;
+        return pam_sys::PAM_AUTH_ERR;
     }
     let request_id = hex::encode(rid_bytes);
     // Use the configured PAM operation timeout for both the local poll deadline
@@ -485,14 +498,14 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         Err(e) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
             pam_conv.try_error(msgs.cannot_connect());
-            return pam_sys::PAM_IGNORE;
+            return pam_sys::PAM_AUTHINFO_UNAVAIL;
         }
     };
     if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
     {
         tracing::error!("Failed to send authenticate request: {}", e);
         pam_conv.try_error(msgs.communication_error());
-        return pam_sys::PAM_IGNORE;
+        return pam_sys::PAM_AUTHINFO_UNAVAIL;
     }
 
     // GUI contexts without a usable conversation (e.g. the KDE lock screen's
@@ -506,13 +519,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
                 Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs),
-                None => pam_sys::PAM_IGNORE,
+                None => pam_sys::PAM_AUTHINFO_UNAVAIL,
             },
             ExitReason::Timeout => {
                 // The daemon runs on the same deadline and multicasts its own
                 // AuthenticationCancel, so no client-side cancel is needed.
                 pam_conv.try_info(msgs.timed_out());
-                pam_sys::PAM_IGNORE
+                pam_sys::PAM_AUTHINFO_UNAVAIL
             }
             _ => {
                 // IPC error: the request may still be in flight daemon-side.
@@ -522,7 +535,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                     let _ = c.send_cancel("gui-ipc-error", &request_id);
                 }
                 pam_conv.try_error(msgs.communication_error());
-                pam_sys::PAM_IGNORE
+                pam_sys::PAM_AUTHINFO_UNAVAIL
             }
         };
     }
@@ -542,7 +555,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                 let _ = c.send_cancel("gui-pipe2-fail", &request_id);
             }
-            return pam_sys::PAM_IGNORE;
+            return pam_sys::PAM_AUTH_ERR;
         }
         let pipe_read = pipe_fds[0];
         let pipe_write = pipe_fds[1];
@@ -596,13 +609,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                 libc::close(pipe_read);
                 libc::close(pipe_write);
             }
-            return pam_sys::PAM_IGNORE;
+            return pam_sys::PAM_AUTH_ERR;
         }
 
         let pthread_id = unsafe { pthread_id.assume_init() };
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
-        let mut final_outcome = pam_sys::PAM_IGNORE;
+        let mut final_outcome = pam_sys::PAM_AUTHINFO_UNAVAIL;
         let mut auth_response = None;
         let mut pending_error: Option<&str> = None;
 
@@ -680,7 +693,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // guaranteed Some. We still use let-else as a non-panicking
     // defuse instead of expect()/unwrap().
     let Some(mut tty) = tty_file else {
-        return pam_sys::PAM_IGNORE;
+        return pam_sys::PAM_AUTHINFO_UNAVAIL;
     };
 
     // Set tty nonblocking to avoid read(1) blocking unexpectedly
@@ -741,20 +754,20 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                         "Daemon closed connection before sending response"
                                     );
                                     pam_conv.try_info(msgs.connection_lost());
-                                    return pam_sys::PAM_IGNORE;
+                                    return pam_sys::PAM_AUTHINFO_UNAVAIL;
                                 }
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {}", e);
                                 pam_conv.try_info(msgs.communication_error());
-                                return pam_sys::PAM_IGNORE;
+                                return pam_sys::PAM_AUTHINFO_UNAVAIL;
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         // Hangup/error without any data available
                         tracing::error!("Daemon closed connection or error detected");
                         pam_conv.try_info(msgs.connection_lost());
-                        return pam_sys::PAM_IGNORE;
+                        return pam_sys::PAM_AUTHINFO_UNAVAIL;
                     }
                 }
                 // TTY - read one byte; skip on Enter, discard other keys
@@ -775,7 +788,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
                                             let _ = c.send_cancel("tty-skip", &request_id);
                                         }
                                         pam_conv.try_info(msgs.skipped());
-                                        return pam_sys::PAM_IGNORE;
+                                        return pam_sys::PAM_AUTHINFO_UNAVAIL;
                                     }
                                     // Non-Enter key: consume and ignore
                                 }
@@ -807,10 +820,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 
     pam_conv.try_info(msgs.timed_out());
-    pam_sys::PAM_IGNORE
+    pam_sys::PAM_AUTHINFO_UNAVAIL
 }
 
-/// Yield `PAM_IGNORE` if the calling service is a primary display manager.
+/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
+/// manager.
 ///
 /// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
 /// LightDM, LXDM), a successful phone confirmation authenticates the user but
@@ -823,7 +837,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 /// secondary prompt. The module still runs for secondary services such as
 /// `sudo`, `polkit-1`, and desktop screensavers.
 ///
-/// Returns `Some(PAM_IGNORE)` for display manager services, `None` otherwise.
+/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
+/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
+/// `sufficient` line the stack treats it as `ignore` and still runs the next
+/// module; on a `required` line it fails closed.
+///
+/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
+/// otherwise.
 fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
     let service = unsafe { pam_sys::get_service_name(pamh) }?;
     tracing::debug!("Calling PAM service name: {}", service);
@@ -854,7 +874,7 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
              Skipping to avoid breaking keyring auto-unlock.",
             service
         );
-        return Some(pam_sys::PAM_IGNORE);
+        return Some(pam_sys::PAM_AUTHINFO_UNAVAIL);
     }
 
     None
@@ -884,11 +904,11 @@ fn map_pam_outcome(
         }
         shared::ipc::pb::PamOutcome::Timeout => {
             tracing::info!("Authentication timed out for user: {}", username);
-            pam_sys::PAM_IGNORE
+            pam_sys::PAM_AUTHINFO_UNAVAIL
         }
         shared::ipc::pb::PamOutcome::Ignore => {
             tracing::info!("Daemon indicated IGNORE for user: {}", username);
-            pam_sys::PAM_IGNORE
+            pam_sys::PAM_AUTHINFO_UNAVAIL
         }
         shared::ipc::pb::PamOutcome::Error => {
             tracing::error!(
@@ -897,7 +917,7 @@ fn map_pam_outcome(
                 resp.detail
             );
             pam_conv.try_error(&msgs.error(&resp.detail));
-            pam_sys::PAM_IGNORE
+            pam_sys::PAM_AUTH_ERR
         }
     }
 }
@@ -905,12 +925,146 @@ fn map_pam_outcome(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::*;
     use crate::logging;
 
     #[test]
     fn test_logging_init() {
         logging::init_logging();
         logging::init_logging();
+    }
+
+    #[test]
+    fn test_map_pam_outcome_matrix() {
+        let conv = unsafe { pam_sys::PamConversation::dummy() };
+        let msgs = pam_messages::load_for_user("testuser");
+
+        let resp_for = |outcome: shared::ipc::pb::PamOutcome,
+                        detail: &str|
+         -> shared::ipc::pb::PamAuthenticateResponse {
+            shared::ipc::pb::PamAuthenticateResponse {
+                outcome: outcome as i32,
+                detail: detail.to_string(),
+                challenge: vec![],
+            }
+        };
+
+        // A grant is the only success.
+        assert_eq!(
+            map_pam_outcome(
+                &resp_for(shared::ipc::pb::PamOutcome::Success, "Success"),
+                "testuser",
+                &conv,
+                &msgs
+            ),
+            pam_sys::PAM_SUCCESS
+        );
+
+        // An explicit phone denial must stay a denial: it fails in both the
+        // `required` and the `[success=done default=bad]` stack shapes.
+        assert_eq!(
+            map_pam_outcome(
+                &resp_for(shared::ipc::pb::PamOutcome::Denied, "Denied"),
+                "testuser",
+                &conv,
+                &msgs
+            ),
+            pam_sys::PAM_PERM_DENIED
+        );
+
+        // No usable answer from the service (timeout, skip, no paired device):
+        // the auth service could not be consulted.
+        for outcome in [
+            shared::ipc::pb::PamOutcome::Timeout,
+            shared::ipc::pb::PamOutcome::Ignore,
+        ] {
+            assert_eq!(
+                map_pam_outcome(&resp_for(outcome, "detail"), "testuser", &conv, &msgs),
+                pam_sys::PAM_AUTHINFO_UNAVAIL,
+                "{outcome:?} must report the service as unavailable"
+            );
+        }
+
+        // The daemon answered but could not process the attempt.
+        assert_eq!(
+            map_pam_outcome(
+                &resp_for(shared::ipc::pb::PamOutcome::Error, "boom"),
+                "testuser",
+                &conv,
+                &msgs
+            ),
+            pam_sys::PAM_AUTH_ERR
+        );
+    }
+
+    /// Regression test for the `PAM_IGNORE` authentication bypass.
+    ///
+    /// Linux-PAM records no failure for `PAM_IGNORE`, so in a stack shaped like
+    /// `auth required pam_tapauth.so` + `auth optional pam_permit` +
+    /// `auth required pam_env` the `optional` module's success vote turned the
+    /// whole stack into `PAM_SUCCESS` — a grant without any phone approval.
+    /// No daemon outcome may map to `PAM_IGNORE`.
+    #[test]
+    fn test_no_pam_outcome_maps_to_pam_ignore() {
+        let conv = unsafe { pam_sys::PamConversation::dummy() };
+        let msgs = pam_messages::load_for_user("testuser");
+
+        // Every variant of the IPC enum; the `match` in `map_pam_outcome` is
+        // exhaustive, so a new variant forces this list to be extended.
+        let all_outcomes = [
+            shared::ipc::pb::PamOutcome::Success,
+            shared::ipc::pb::PamOutcome::Denied,
+            shared::ipc::pb::PamOutcome::Timeout,
+            shared::ipc::pb::PamOutcome::Ignore,
+            shared::ipc::pb::PamOutcome::Error,
+        ];
+
+        for outcome in all_outcomes {
+            let resp = shared::ipc::pb::PamAuthenticateResponse {
+                outcome: outcome as i32,
+                detail: "detail".to_string(),
+                challenge: vec![],
+            };
+            let code = map_pam_outcome(&resp, "testuser", &conv, &msgs);
+            // `PAM_IGNORE` is 25 and is deliberately absent from this list: it
+            // is not a verdict, so a later `optional pam_permit` can still make
+            // the whole stack succeed.
+            let is_real_verdict = [
+                pam_sys::PAM_SUCCESS,
+                pam_sys::PAM_PERM_DENIED,
+                pam_sys::PAM_AUTHINFO_UNAVAIL,
+                pam_sys::PAM_AUTH_ERR,
+            ]
+            .contains(&code);
+            assert!(
+                is_real_verdict,
+                "{outcome:?} mapped to {code}, which is not a real PAM verdict \
+                 (PAM_IGNORE is 25)"
+            );
+        }
+    }
+
+    /// The mapping above only covers daemon responses. Guard the remaining
+    /// return sites (conversation lookup, RNG, IPC failures, skip and timeout
+    /// paths) against reintroducing `PAM_IGNORE` in the module source.
+    ///
+    /// The needle is split across two literals so that this test's own text
+    /// does not match it.
+    #[test]
+    fn test_module_source_contains_no_pam_ignore_return() {
+        for (file, source) in [
+            ("client-pam/src/pam_logic.rs", include_str!("pam_logic.rs")),
+            ("client-pam/src/lib.rs", include_str!("lib.rs")),
+        ] {
+            for (index, line) in source.lines().enumerate() {
+                assert!(
+                    !line.contains(concat!("pam_sys::PAM", "_IGNORE")),
+                    "{file}:{} returns PAM_IGNORE: {}",
+                    index + 1,
+                    line.trim()
+                );
+            }
+        }
     }
 }
 

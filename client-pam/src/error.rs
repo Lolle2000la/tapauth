@@ -55,7 +55,12 @@ impl PamError {
     /// Mapping:
     /// - `ExplicitDenied` → `PAM_PERM_DENIED`
     /// - `UserUnknown` → `PAM_USER_UNKNOWN`
-    /// - `Timeout`, `Ipc*`, `DaemonError`, `ProtoDecode`, `Ignore` → `PAM_IGNORE`
+    /// - `Conversation` → `PAM_CONV_ERR`
+    /// - `ProtoDecode` → `PAM_AUTH_ERR` (the attempt reached the daemon but its
+    ///   answer could not be processed, i.e. a processing failure)
+    /// - `Timeout`, `Ipc*`, `DaemonError`, `Ignore` → `PAM_AUTHINFO_UNAVAIL`
+    ///   (the service could not be consulted; never `PAM_IGNORE`, which
+    ///   Linux-PAM does not record as a failure)
     /// - `ConfigError` → `PAM_SYSTEM_ERR`
     pub fn to_pam_code(&self) -> c_int {
         match self {
@@ -63,13 +68,18 @@ impl PamError {
             PamError::UserUnknown => pam_sys::PAM_USER_UNKNOWN,
             PamError::ConfigError(_) => pam_sys::PAM_SYSTEM_ERR,
             PamError::Conversation(_) => pam_sys::PAM_CONV_ERR,
-            // All transient/daemon errors map to IGNORE to allow password fallback
+            // A malformed daemon response is a processing failure, not an
+            // unavailable service: the daemon did answer.
+            PamError::ProtoDecode(_) => pam_sys::PAM_AUTH_ERR,
+            // All transient/daemon errors report the service as unavailable. They
+            // must not map to PAM_IGNORE: a `sufficient` line already treats any
+            // non-success as `ignore`, while PAM_IGNORE would let a later
+            // `optional pam_permit` grant the whole stack.
             PamError::IpcConnectTimeout
             | PamError::IpcIo(_)
-            | PamError::ProtoDecode(_)
             | PamError::DaemonError(_)
             | PamError::Timeout
-            | PamError::Ignore => pam_sys::PAM_IGNORE,
+            | PamError::Ignore => pam_sys::PAM_AUTHINFO_UNAVAIL,
         }
     }
 }

@@ -21,8 +21,14 @@
 //!
 //! ## Behavior
 //!
-//! Returns `PAM_IGNORE` (not `PAM_AUTH_ERR`) on failure to allow password fallback.
-//! Only returns `PAM_SUCCESS` when phone tap authentication succeeds.
+//! Returns `PAM_SUCCESS` only when phone tap authentication succeeds. Every
+//! other outcome returns a real verdict — `PAM_PERM_DENIED` for an explicit
+//! phone denial, `PAM_AUTHINFO_UNAVAIL` when the service could not be consulted
+//! (no paired device, skip, timeout, daemon unreachable) and `PAM_AUTH_ERR` for
+//! a processing failure. It never returns `PAM_IGNORE`: Linux-PAM records no
+//! failure for that code, so a later `optional` module that votes success (e.g.
+//! `pam_permit`) would authenticate the user. Password fallback still works on
+//! a `sufficient` line, whose default action for any non-success is `ignore`.
 //!
 //! ## Requirements
 //!
@@ -41,7 +47,7 @@ pub use ipc_client::*;
 
 use std::os::raw::c_int;
 use std::panic::catch_unwind;
-// Internal panic guard: returns PAM_IGNORE if the inner closure panics.
+// Internal panic guard: returns PAM_AUTH_ERR if the inner closure panics.
 fn guard<F>(f: F) -> c_int
 where
     F: FnOnce() -> c_int + std::panic::UnwindSafe,
@@ -51,10 +57,10 @@ where
         Err(_) => {
             let _ = catch_unwind(|| {
                 tracing::error!(
-                    "TapAuth PAM: panic caught in guarded section; returning PAM_IGNORE"
+                    "TapAuth PAM: panic caught in guarded section; returning PAM_AUTH_ERR"
                 );
             });
-            pam_sys::PAM_IGNORE
+            pam_sys::PAM_AUTH_ERR
         }
     }
 }
@@ -134,8 +140,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn guard_returns_ignore_on_panic() {
+    fn guard_returns_auth_err_on_panic() {
         let code = guard(|| panic!("boom"));
-        assert_eq!(code, crate::pam_sys::PAM_IGNORE);
+        assert_eq!(code, crate::pam_sys::PAM_AUTH_ERR);
     }
 }
