@@ -26,6 +26,68 @@ BRIDGE_ONLY="${TAPAUTH_E2E_BLE_BRIDGE_ONLY:-0}"
 # containers pick the Bumble adapter rather than an unrelated real controller.
 VHCI_DEV_FILE="/tmp/tapauth-vhci-dev"
 
+# `btmgmt` goes through the kernel mgmt API and is satisfied by *any*
+# bluetoothd (or by none at all), so it cannot tell "this environment's BlueZ
+# owns the adapter" from "another bluetoothd claimed it". The daemon under test
+# enumerates adapters over D-Bus (`session.adapter_names()` in
+# tapauthd/src/transport/ble.rs), so ask the local bluetoothd through
+# `bluetoothctl list`: that fails exactly when tapauthd would log
+# "No Bluetooth adapter found" and silently fall back to UDP-only.
+bt_list() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 bluetoothctl list 2>&1 || true
+    else
+        bluetoothctl list 2>&1 || true
+    fi
+}
+
+show_bluetooth_diagnostics() {
+    echo "--- pgrep -a bluetoothd ---"
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -a bluetoothd || echo "(no bluetoothd process)"
+    else
+        echo "(pgrep not available)"
+    fi
+    echo "--- systemctl status bluetooth (tail) ---"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl status bluetooth --no-pager 2>&1 | tail -30 || true
+    else
+        echo "(systemctl not available)"
+    fi
+    echo "--- journalctl -u bluetooth (this boot, tail) ---"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u bluetooth --no-pager -b 2>&1 | tail -40 || true
+    else
+        echo "(journalctl not available)"
+    fi
+    echo "--- bluetoothctl list ---"
+    bt_list
+}
+
+# Waits briefly: bluetoothd registers a freshly created vhci controller over
+# D-Bus a moment after the kernel adapter appears.
+assert_bluez_adapter() {
+    local label="$1"
+    local out=""
+    if ! command -v bluetoothctl >/dev/null 2>&1; then
+        echo "    ⚠️  bluetoothctl is not installed; skipping the BlueZ adapter assertion."
+        return 0
+    fi
+    for _ in {1..20}; do
+        out="$(bt_list)"
+        if printf '%s\n' "$out" | grep -q '^Controller '; then
+            echo "✅ BlueZ exposes an adapter over D-Bus: $(printf '%s\n' "$out" | grep -m1 '^Controller ')"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "❌ ERROR: BlueZ in this environment exposes no Bluetooth adapter over D-Bus."
+    echo "   The kernel adapter ($label) exists, but the daemon enumerates adapters through"
+    echo "   bluetoothd; it would run BLE-less and only report 'No Bluetooth adapter found' later."
+    show_bluetooth_diagnostics
+    exit 1
+}
+
 # External-bridge mode: the Bumble bridge runs on the host (it needs Netsim on
 # the host network and /dev/vhci); this environment's job is only to run its
 # own bluetoothd and own the resulting adapter. Used inside the systemd
@@ -80,6 +142,7 @@ if [ "${TAPAUTH_E2E_EXTERNAL_BLE_BRIDGE:-0}" = "1" ]; then
         fi
         sleep 1
     done
+    assert_bluez_adapter "$NEW_HCI"
     echo "✅ External BLE bridge verified: $NEW_HCI (owned by this environment's bluetoothd)"
     exit 0
 fi
@@ -225,5 +288,12 @@ done
 echo "--- Adapter details ---"
 $SUDO btmgmt info 2>/dev/null || true
 bluetoothctl show 2>/dev/null || true
+
+# Bridge-only mode deliberately leaves bluetoothd stopped (the containers own the
+# adapter), so the BlueZ assertion only applies to the full host setup that the
+# Ubuntu host pass needs.
+if [ "$BRIDGE_ONLY" != "1" ]; then
+    assert_bluez_adapter "$NEW_HCI"
+fi
 
 echo "✅ Virtual BLE bridge setup completed."

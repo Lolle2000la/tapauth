@@ -26,7 +26,19 @@ exec /sbin/init
 '
 
 export E2E_KEEP_BLE_BRIDGE=1
-trap 'if [ -f /tmp/bumble-bridge.pid ]; then kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true; rm -f /tmp/bumble-bridge.pid; fi; rm -f /tmp/tapauth-vhci-dev' EXIT
+
+# Exit path: drop the bridge, drop the recorded adapter, and lift the bluetooth
+# mask set below — a failed run must not leave the host's Bluetooth unit masked
+# for the rest of the job (or for a re-run on the same runner).
+cleanup() {
+    if [ -f /tmp/bumble-bridge.pid ]; then
+        kill "$(cat /tmp/bumble-bridge.pid)" 2>/dev/null || true
+        rm -f /tmp/bumble-bridge.pid
+    fi
+    rm -f /tmp/tapauth-vhci-dev
+    sudo systemctl unmask bluetooth 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # Ensure host virtual BLE bridge is up (with the host bluetoothd, which the
 # Ubuntu host pass below needs).
@@ -89,11 +101,35 @@ sudo apt-get purge -y tapauth 2>/dev/null || true
 
 # Hand the virtual Bluetooth adapter to the container instances: only one
 # bluetoothd may own an adapter, and the Fedora/Arch containers run their own
-# (see run-systemd-container.sh). Stop the host daemon, then re-assert the
-# host-owned Bumble bridge without starting bluetoothd again.
+# (see run-systemd-container.sh). Stopping the host daemon is not enough: the
+# Bumble bridge (re)creates a fresh vhci adapter moments later, and BlueZ is
+# reactivated for the new controller through its systemd unit or its D-Bus
+# activation path, which takes the adapter back. The container's tapauthd then
+# logs "No Bluetooth adapter found" and falls back to UDP-only. Masking closes
+# both activation paths, and it must happen before the bridge restart below.
+# `cleanup` (EXIT trap) unmasks it again.
 echo "==> Yielding the host Bluetooth daemon to the systemd containers..."
 sudo systemctl stop bluetooth 2>/dev/null || true
-sudo pkill -x bluetoothd 2>/dev/null || true
+sudo systemctl mask --now bluetooth
+for _ in {1..10}; do
+    pgrep -x bluetoothd >/dev/null 2>&1 || break
+    sudo pkill -x bluetoothd 2>/dev/null || true
+    sleep 0.5
+done
+if pgrep -x bluetoothd >/dev/null 2>&1; then
+    echo "❌ ERROR: host bluetoothd survived stop + mask; it would claim the vhci adapter"
+    echo "   and the container BLE phase would fail with 'No Bluetooth adapter found'."
+    echo "--- pgrep -a bluetoothd ---"
+    pgrep -a bluetoothd || true
+    echo "--- systemctl status bluetooth ---"
+    sudo systemctl status bluetooth --no-pager 2>&1 | tail -30 || true
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        echo "--- bluetoothctl list ---"
+        bluetoothctl list 2>&1 || true
+    fi
+    exit 1
+fi
+echo "    host bluetoothd stopped and masked."
 TAPAUTH_E2E_BLE_BRIDGE_ONLY=1 "$SCRIPT_DIR/setup-emulator-ble-bridge.sh"
 
 # 3. Run E2E against installed Fedora (.rpm) package in a systemd container
