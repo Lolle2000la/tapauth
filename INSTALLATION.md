@@ -43,6 +43,12 @@ paru -S tapauth
 # or alternatively
 yay -S tapauth
 ```
+To build the latest development commit instead of the latest tagged release, use
+`tapauth-git`. Its AUR version is refreshed automatically on every push to `main`,
+so AUR helpers offer updates as soon as new commits land:
+```bash
+paru -S tapauth-git
+```
 * **PAM Configuration:** Arch Linux avoids implicit post-install system alterations. To complete activation, append your rule manually to your chosen authentication stack configuration file (e.g., `/etc/pam.d/system-auth`):
 ```text
 auth      sufficient      pam_tapauth.so
