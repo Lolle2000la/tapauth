@@ -310,6 +310,10 @@ calling process, so nothing has to be configured per host:
 | `slock` | Not supported: it checks the password against crypt/shadow itself and never calls PAM |
 | `betterlockscreen` | Not supported: it is a wrapper that execs `i3lock-color`/`i3lock`, and `i3lock-color` is not a recognised process yet |
 
+On `swaylock`, `gtklock` and `i3lock` the phone is not a credential at all: TapAuth
+neither rings it nor verifies anything, so a PAM stack with no password module after
+`pam_tapauth.so` cannot unlock.
+
 Two quirks worth knowing:
 
 - **xsecurelock** retries `pam_authenticate` up to three times when the answer is
