@@ -77,7 +77,15 @@ impl IpcResponseReader for IpcClient {
 //   host's own event loop on the thread that called `pam_authenticate`.
 //   Blocking that thread (or driving the conversation from a second thread)
 //   deadlocks the host, so the main thread simply waits for the daemon on its
-//   own and never touches the conversation (`run_sequential_event_loop`).
+//   own and never *drives* the conversation (`run_sequential_event_loop`).
+//   The one exception is a single non-blocking `PAM_TEXT_INFO` announcement
+//   emitted immediately before the wait begins: it is one conversation round
+//   trip that carries no input, and host event loops need it in order to
+//   reveal the password entry.  Should the host's conversation return an
+//   error, `try_info` logs and swallows it, so the verdict is unchanged; a
+//   NULL conversation never reaches this point at all, because
+//   `PamConversation::new` fails first and the module returns
+//   `PAM_AUTH_ERR` as before.
 //
 // The native password thread used by the polkit variant uses no Drop-bearing
 // Rust types so that pthread_cancel is safe.
@@ -296,12 +304,17 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
 ///    would force-unwind through the host's non-Rust frames, which can
 ///    `abort()` the host process and take the lock screen down with it.
 ///
-/// The safe pattern is to leave the conversation completely alone: block on
-/// the daemon IPC socket on the calling thread, return the result, and let
-/// the PAM stack fall through to the password module afterwards (whose own
-/// conversation then runs on the host's terms).  The cost is that password
-/// entry is only possible *after* the (shorter) GUI timeout, which is why
-/// `pam_gui_timeout_secs` exists.
+/// The safe pattern is to never drive the conversation from this thread: no
+/// query is sent and no input is read, and the conversation is not touched at
+/// all while the module waits.  It blocks on the daemon IPC socket on the
+/// calling thread, returns the result, and lets the PAM stack fall through to
+/// the password module afterwards (whose own conversation then runs on the
+/// host's terms).  The one exception is a single non-blocking `PAM_TEXT_INFO`
+/// announcement emitted immediately before this loop starts (see the caller):
+/// it carries no input and hosts need it in order to reveal their password
+/// entry.  Because nothing is consumed here, a typed password only counts once
+/// the *following* module prompts for it, after the (shorter) GUI timeout —
+/// which is why `pam_gui_timeout_secs` exists.
 ///
 /// Returns the exit reason plus the daemon response, if one was received.
 fn run_sequential_event_loop<T: IpcResponseReader>(
@@ -447,9 +460,15 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     };
     let has_terminal = tty_file.is_some();
 
+    // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
+    // (one conversation round trip that carries no input and never waits for
+    // the user).  The terminal and polkit paths get theirs here, before the
+    // wait starts; event-loop hosts get it further down, right before the
+    // module begins blocking (see `run_sequential_event_loop`), because such
+    // hosts only reveal their password entry once a PAM message arrives.
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
-    } else {
+    } else if supports_threaded_conversation {
         pam_conv.try_info(msgs.waiting_for_tap());
     }
 
@@ -510,10 +529,19 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     // GUI contexts without a usable conversation (e.g. the KDE lock screen's
     // kscreenlocker_worker): wait for the daemon on this thread and never
-    // touch the conversation.  Password fallback happens after this returns,
+    // drive the conversation.  Password fallback happens after this returns,
     // when the next PAM module runs its own conversation.
     if !has_terminal && !supports_threaded_conversation {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+        // Announce the wait now that the request is on the wire and the module
+        // is about to block.  Event-loop hosts (GDM's auth prompt, KDE's
+        // kscreenlocker_worker) only reveal their password entry once a PAM
+        // module sends a query or a `PAM_TEXT_INFO`, so this is what gives the
+        // user a visible password route while we wait.  A single non-blocking
+        // `PAM_TEXT_INFO` — it never prompts, never reads input and never runs
+        // on another thread; a host whose conversation returns `PAM_CONV_ERR`
+        // is unaffected because `try_info` swallows the error.
+        pam_conv.try_info(msgs.waiting_for_tap_password());
         let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline);
 
         return match exit_reason {
@@ -1009,8 +1037,9 @@ mod tests {
         let conv = unsafe { pam_sys::PamConversation::dummy() };
         let msgs = pam_messages::load_for_user("testuser");
 
-        // Every variant of the IPC enum; the `match` in `map_pam_outcome` is
-        // exhaustive, so a new variant forces this list to be extended.
+        // Every variant of the IPC enum. This list is not compiler-enforced:
+        // the `match` in `map_pam_outcome` is exhaustive but this array is not,
+        // so extend this list by hand when adding a variant.
         let all_outcomes = [
             shared::ipc::pb::PamOutcome::Success,
             shared::ipc::pb::PamOutcome::Denied,
@@ -1370,5 +1399,63 @@ mod gui_loop_tests {
 
         assert_eq!(reason, ExitReason::IpcError);
         assert!(auth_response.is_none());
+    }
+
+    #[test]
+    fn test_sequential_wait_is_announced_before_it_blocks() {
+        let source = include_str!("pam_logic.rs");
+        // Only the production half of the file: the test modules below contain
+        // the same identifiers inside string literals, which would otherwise
+        // satisfy the searches no matter what the production code does.
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+
+        let announce = production
+            .find("waiting_for_tap_password()")
+            .unwrap_or_else(|| {
+                panic!("invariant broken: the sequential wait never announces a password route")
+            });
+
+        // `rfind` picks the call after the function definition; every test-only
+        // call site passes `mock_ipc` and does not match.
+        let blocking_wait = production
+            .rfind("run_sequential_event_loop(&mut ipc")
+            .unwrap_or_else(|| {
+                panic!("invariant broken: production call to the sequential wait not found")
+            });
+
+        assert!(
+            announce < blocking_wait,
+            "invariant broken: the password-route announcement (byte {}) must be emitted \
+             before the call that blocks on the sequential wait (byte {}), otherwise the \
+             host never reveals its password entry during the wait",
+            announce,
+            blocking_wait
+        );
+    }
+
+    #[test]
+    fn test_wait_announcement_is_single_line() {
+        let text = pam_messages::load_for_user("testuser")
+            .waiting_for_tap_password()
+            .to_string();
+
+        assert!(
+            !text.is_empty(),
+            "the sequential-wait announcement resolved to an empty string"
+        );
+        assert!(
+            !text.contains("pam-waiting-tap-password"),
+            "the sequential-wait announcement is the unresolved '??key??' fallback marker, \
+             so the pam-waiting-tap-password key is missing from the loaded locale: {:?}",
+            text
+        );
+        assert!(
+            !text.contains('\n') && !text.contains('\r'),
+            "the sequential-wait announcement must stay on one line, got {:?}",
+            text
+        );
     }
 }
