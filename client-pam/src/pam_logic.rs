@@ -186,9 +186,17 @@ fn process_identity() -> Option<String> {
 ///   fixed here.
 /// * `xfce4-screensaver-dialog` — the answer is produced by the child process
 ///   that owns the password entry (`/proc/self/comm` truncates it to
-///   `xfce4-screensav`).
+///   `xfce4-screensav`).  `pam_authenticate` runs on a dedicated `auththread`
+///   (`src/gs-auth-pam.c:453,467`, created at `:590`) while the caller sits in
+///   `gtk_main()` (`:598`); the conversation hands its prompt over with
+///   `g_idle_add` and parks the auth thread on a `GCond` (`:223,231`), and the
+///   lock dialog's nested `g_main_loop` (`src/gs-lock-plug.c:562`) keeps
+///   turning so the prompt can be answered.
 /// * `mate-screensaver-dialog` — same shape as xfce4-screensaver (comm
-///   truncation: `mate-screensave`).
+///   truncation: `mate-screensave`): `auththread` at `src/gs-auth-pam.c:488,505`
+///   (created `:644`), caller in `gtk_main()` at `:653`, `g_idle_add` /
+///   `g_cond_wait` at `:215,224`, nested `g_main_loop` at
+///   `src/gs-lock-plug.c:662`.
 /// * `gdm-session-worker` on a `gdm-password` **reauthentication** — the
 ///   unlock/re-auth prompt of a running GDM session, whose conversation is
 ///   answered by the worker's GLib main loop on another thread.  Only a
@@ -351,8 +359,13 @@ unsafe extern "C-unwind" fn native_password_worker(
 ///    `pam_get_item`, or simply the return from `pam_authenticate` — while the
 ///    worker could still be inside `pam_get_authtok`, the two would race on
 ///    unsynchronised libpam state.  The join is what orders them, so it runs on
-///    every path, including the ones where the worker is expected to have
-///    exited already.
+///    every non-panicking path, including the ones where the worker is expected
+///    to have exited already.
+///
+/// A panic between the `pthread_create` and this join unwinds past the frame
+/// that holds `ThreadContext` without reaping the worker.  That pre-existing
+/// gap is not addressed by this change — closing it would need a drop guard —
+/// and `guard()` (`lib.rs`) only converts the panic into `PAM_AUTH_ERR`.
 ///
 /// # Safety
 ///
@@ -597,9 +610,14 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
 ///   processing failure, or the daemon reported an internal error
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
 ///
-/// `PAM_IGNORE` is deliberately never returned. Linux-PAM records no failure
+/// `PAM_IGNORE` is deliberately never returned.  Linux-PAM records no failure
 /// for it, so a later `optional` module that votes success (e.g. `pam_permit`)
-/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.
+/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.  That is
+/// a `required`-line hazard, and it is the shape this protects: there
+/// `PAM_IGNORE` is explicitly `ignore` while `PAM_AUTHINFO_UNAVAIL` is `bad`.
+/// On a `sufficient` line both codes are `ignore` and a following
+/// `optional pam_permit` grants either way, so there the stack's own
+/// configuration, not the return code, is what prevents the grant.
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
 
@@ -1443,27 +1461,338 @@ mod tests {
         }
     }
 
-    /// The mapping above only covers daemon responses. Guard the remaining
-    /// return sites (conversation lookup, RNG, IPC failures, skip and timeout
-    /// paths) against reintroducing `PAM_IGNORE` in the module source.
+    /// Blank every comment, string literal and char literal, keeping the
+    /// newlines so that the reported line numbers still match the file on disk.
     ///
-    /// The needle is split across two literals so that this test's own text
-    /// does not match it.
-    #[test]
-    fn test_module_source_contains_no_pam_ignore_return() {
-        for (file, source) in [
-            ("client-pam/src/pam_logic.rs", include_str!("pam_logic.rs")),
-            ("client-pam/src/lib.rs", include_str!("lib.rs")),
-        ] {
-            for (index, line) in source.lines().enumerate() {
-                assert!(
-                    !line.contains(concat!("pam_sys::PAM", "_IGNORE")),
-                    "{file}:{} returns PAM_IGNORE: {}",
-                    index + 1,
-                    line.trim()
+    /// The docs in this crate deliberately name the forbidden code in prose, and
+    /// the test's own assertions quote both needles, so scanning raw source
+    /// would flag those instead of the return site it is looking for.
+    ///
+    /// Runs over bytes: every delimiter involved is ASCII, and the crate's
+    /// sources are ASCII apart from localisation strings, which are blanked
+    /// here.  A non-ASCII *char* literal would be taken for a lifetime and
+    /// copied verbatim, which can only hide a needle, never invent one.
+    #[allow(clippy::indexing_slicing)]
+    fn stripped_source(source: &str) -> String {
+        let b = source.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            // Line comment.
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment (Rust nests them).
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 1usize;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            // Raw strings: `r"…"`, `r#"…"#`, `br"…"`, `br#"…"#`.
+            let raw_at = if b[i] == b'r' {
+                Some(i + 1)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'r') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(at) = raw_at {
+                let mut hashes = 0usize;
+                while b.get(at + hashes) == Some(&b'#') {
+                    hashes += 1;
+                }
+                if b.get(at + hashes) == Some(&b'"') {
+                    let mut j = at + hashes + 1;
+                    let mut end = b.len();
+                    while j < b.len() {
+                        if b[j] == b'"' && (0..hashes).all(|k| b.get(j + 1 + k) == Some(&b'#')) {
+                            end = j + 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    out.extend(blank(b, i, end));
+                    i = end;
+                    continue;
+                }
+            }
+            // Normal and byte strings, honouring backslash escapes.
+            let quote_at = if b[i] == b'"' {
+                Some(i)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'"') {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(q) = quote_at {
+                let mut j = q + 1;
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'"' {
+                        j += 1;
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                let end = j.min(b.len());
+                out.extend(blank(b, i, end));
+                i = end;
+                continue;
+            }
+            // Char literals and byte chars.  A tick that does not open a
+            // one-character or escaped literal is a lifetime (`'a`) and is
+            // copied verbatim.
+            let tick_at = if b[i] == b'\'' {
+                Some(i)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'\'') {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(t) = tick_at {
+                let opens_literal = matches!(
+                    (b.get(t + 1), b.get(t + 2)),
+                    (Some(&b'\\'), _) | (Some(_), Some(&b'\''))
                 );
+                if !opens_literal {
+                    out.push(b[i]);
+                    i += 1;
+                    continue;
+                }
+                let mut j = t + 1;
+                if b.get(j) == Some(&b'\\') {
+                    j += 2;
+                    // `'\u{1F600}'`
+                    if b.get(j - 1) == Some(&b'u') && b.get(j) == Some(&b'{') {
+                        while j < b.len() && b[j] != b'}' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                } else {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'\'') {
+                    j += 1;
+                }
+                let end = j.min(b.len());
+                out.extend(blank(b, i, end));
+                i = end;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// `bytes[start..end]` as spaces, keeping its newlines.
+    #[allow(clippy::indexing_slicing)]
+    fn blank(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+        bytes[start..end]
+            .iter()
+            .map(|&c| if c == b'\n' { b'\n' } else { b' ' })
+            .collect()
+    }
+
+    /// The source line containing byte offset `at`, trimmed.
+    fn line_at(source: &str, at: usize) -> String {
+        let start = source[..at].rfind('\n').map_or(0, |n| n + 1);
+        let end = source[at..].find('\n').map_or(source.len(), |n| at + n);
+        source[start..end].trim().to_owned()
+    }
+
+    /// Every occurrence of `PAM_IGNORE` used as an identifier, as
+    /// `(line, source line)`.
+    #[allow(clippy::indexing_slicing)]
+    fn pam_ignore_identifiers(cleaned: &str) -> Vec<(usize, String)> {
+        const NEEDLE: &str = "PAM_IGNORE";
+        let b = cleaned.as_bytes();
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(offset) = cleaned[from..].find(NEEDLE) {
+            let start = from + offset;
+            let end = start + NEEDLE.len();
+            let is_ident_char = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+            let whole_word = !(start > 0 && is_ident_char(&b[start - 1]))
+                && !(end < b.len() && is_ident_char(&b[end]));
+            if whole_word {
+                let line = cleaned[..start].matches('\n').count() + 1;
+                hits.push((line, line_at(cleaned, start)));
+            }
+            from = end;
+        }
+        hits
+    }
+
+    /// Every numeric literal in `cleaned` whose value equals `code`, as
+    /// `(line, token)`.
+    ///
+    /// The literal is evaluated rather than substring-matched, so `0.25`
+    /// (rounded float), `0x25` (hex 37) and `1_025` (1025) are not hits while
+    /// `25u32` is.
+    #[allow(clippy::indexing_slicing)]
+    fn numeric_literals_equal_to(cleaned: &str, code: u128) -> Vec<(usize, String)> {
+        let b = cleaned.as_bytes();
+        let mut hits = Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            // Skip a digit that continues an identifier (`foo25`).
+            let begins_literal = b[i].is_ascii_digit()
+                && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'));
+            if !begins_literal {
+                i += 1;
+                continue;
+            }
+            let (value, next) = read_numeric_literal(b, i);
+            if value == Some(code) {
+                let line = cleaned[..i].matches('\n').count() + 1;
+                hits.push((line, cleaned[i..next].to_owned()));
+            }
+            i = next.max(i + 1);
+        }
+        hits
+    }
+
+    /// Read the numeric literal starting at `start` as `(value, end)`, with
+    /// `None` for floats.
+    #[allow(clippy::indexing_slicing)]
+    fn read_numeric_literal(b: &[u8], start: usize) -> (Option<u128>, usize) {
+        let mut i = start;
+        let radix = if b[i] == b'0' {
+            match b.get(i + 1).copied() {
+                Some(b'x' | b'X') => Some(16u32),
+                Some(b'o' | b'O') => Some(8u32),
+                Some(b'b' | b'B') => Some(2u32),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(radix) = radix {
+            i += 2;
+            let mut digits = String::new();
+            while let Some(&c) = b.get(i) {
+                if c == b'_' {
+                    i += 1;
+                } else if (c as char).is_digit(radix) {
+                    digits.push(c as char);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            while matches!(b.get(i), Some(c) if c.is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            return (u128::from_str_radix(&digits, radix).ok(), i);
+        }
+
+        let mut digits = String::new();
+        let mut is_float = false;
+        while let Some(&c) = b.get(i) {
+            if c == b'_' {
+                i += 1;
+            } else if c.is_ascii_digit() {
+                digits.push(c as char);
+                i += 1;
+            } else {
+                break;
             }
         }
+        if b.get(i) == Some(&b'.') && matches!(b.get(i + 1), Some(c) if c.is_ascii_digit()) {
+            is_float = true;
+            i += 1;
+            while matches!(b.get(i), Some(c) if c.is_ascii_digit() || *c == b'_') {
+                i += 1;
+            }
+        }
+        if matches!(b.get(i).copied(), Some(b'e' | b'E'))
+            && matches!(b.get(i + 1).copied(), Some(c) if c.is_ascii_digit() || c == b'+' || c == b'-')
+        {
+            is_float = true;
+            i += 2;
+            while matches!(b.get(i), Some(c) if c.is_ascii_digit() || *c == b'_') {
+                i += 1;
+            }
+        }
+        // Integer/float suffix (`25u32`, `1.5f64`).
+        while matches!(b.get(i), Some(c) if c.is_ascii_alphanumeric()) {
+            i += 1;
+        }
+        if is_float {
+            return (None, i);
+        }
+        (digits.parse::<u128>().ok(), i)
+    }
+
+    /// The mapping above only covers daemon responses.  Guard *every* file of
+    /// this crate — not just `pam_logic.rs` and `lib.rs` — against
+    /// reintroducing `PAM_IGNORE`, by identifier and by its numeric value.
+    ///
+    /// The numeric half is the one that matters for regressions: the mapping
+    /// that would bring the bypass back is `PamError::Ignore` in `error.rs`,
+    /// which is a single edit away from returning the bare code, and a
+    /// name-only scan would miss it.
+    #[test]
+    fn test_module_source_contains_no_pam_ignore_return() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
+            .map(|entry| entry.expect("readable dir entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.sort();
+        // An empty or relocated scan must not pass silently: these are the
+        // files that carry the return codes today.
+        assert!(
+            files.iter().any(|p| p.ends_with("pam_logic.rs"))
+                && files.iter().any(|p| p.ends_with("error.rs")),
+            "the scan did not cover pam_logic.rs and error.rs: {files:?}"
+        );
+
+        // Spelled arithmetically so this test's own source carries no literal
+        // for its own scan to find.
+        let ignore_code: u128 = 5 * 5;
+        let mut findings: Vec<String> = Vec::new();
+        for path in &files {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let cleaned = stripped_source(&source);
+            for (line, text) in pam_ignore_identifiers(&cleaned) {
+                findings.push(format!("{name}:{line}: PAM_IGNORE identifier in: {text}"));
+            }
+            for (line, text) in numeric_literals_equal_to(&cleaned, ignore_code) {
+                findings.push(format!(
+                    "{name}:{line}: PAM_IGNORE value {ignore_code} used in: {text}"
+                ));
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "the module must never return PAM_IGNORE:\n{}",
+            findings.join("\n")
+        );
     }
 }
 
@@ -1771,6 +2100,12 @@ mod gui_loop_tests {
         assert!(auth_response.is_none());
     }
 
+    /// **Smoke test only.**  It compares *source byte offsets* and would still
+    /// pass if the announcement sat behind a branch that never executes.
+    ///
+    /// The authoritative coverage is `scripts/ci/test-pam-host-cases.sh` case 1
+    /// (`ttyless_wait_announced_before_blocking`), which counts and times the
+    /// real `PAM_TEXT_INFO` on a live PAM stack.
     #[test]
     fn test_sequential_wait_is_announced_before_it_blocks() {
         let source = include_str!("pam_logic.rs");
