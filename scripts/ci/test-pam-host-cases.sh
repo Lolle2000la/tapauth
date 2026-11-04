@@ -41,7 +41,9 @@
 #     removed again, and only a file it actually backed up is restored. A
 #     pre-existing socket is refused (the script aborts; it never shadows or
 #     deletes a real daemon's socket). As non-root it prints one SKIP line per
-#     case and exits 0.
+#     case and exits 0 locally — but exits 1 when CI is set, so a CI job that
+#     lost its `sudo` prefix fails instead of silently going green with zero
+#     cases run.
 #   - cc (builds pamtester), python3 (stub daemon), setsid (util-linux),
 #     libpam headers.
 #   - The module is built from the tree unless SKIP_BUILD=1.
@@ -308,6 +310,15 @@ if [ "$(id -u)" -ne 0 ]; then
     done
     echo ""
     echo "Summary: 0 passed, 0 failed, ${SKIPPED} skipped (not root)"
+    # Under CI a non-root run means the `sudo` prefix was lost or changed: every
+    # case would skip and the job would go green with zero coverage. Fail loudly
+    # instead. Locally the SKIP lines above stay and the exit status stays 0.
+    if [ -n "${CI:-}" ]; then
+        echo "ERROR: CI=${CI} but this script is not root, so nothing was tested." >&2
+        echo "       Re-run it with: sudo $0" >&2
+        exit 1
+    fi
+    echo "Re-run as root to actually test: sudo $0"
     exit 0
 fi
 

@@ -919,7 +919,7 @@ fn map_pam_outcome(
     pam_conv: &pam_sys::PamConversation,
     msgs: &pam_messages::PamMessages,
 ) -> c_int {
-    match resp.outcome() {
+    match response_outcome(resp) {
         shared::ipc::pb::PamOutcome::Success => {
             tracing::info!("Authentication successful for user: {}", username);
             pam_conv.try_info(msgs.auth_successful());
@@ -948,6 +948,41 @@ fn map_pam_outcome(
             pam_sys::PAM_AUTH_ERR
         }
     }
+}
+
+/// Map the raw protobuf `outcome` field to a [`shared::ipc::pb::PamOutcome`].
+///
+/// This must not be replaced by prost's generated accessor
+/// `PamAuthenticateResponse::outcome()`: that accessor is
+/// `PamOutcome::try_from(self.outcome).unwrap_or_default()`, and
+/// `PamOutcome::default()` is the first declared variant, `SUCCESS` (0). A
+/// response carrying a value prost does not recognise — `99`, or a variant
+/// added by a newer daemon — therefore decoded as a *grant*.
+///
+/// Unknown values fail closed as `PamOutcome::Error`, which `map_pam_outcome`
+/// turns into `PAM_AUTH_ERR`.
+fn outcome_from_raw(raw: i32) -> shared::ipc::pb::PamOutcome {
+    use shared::ipc::pb::PamOutcome;
+
+    // `PamOutcome::try_from` is the authority for "known variant"; a proto variant
+    // makes this match (and `map_pam_outcome`) go non-exhaustive, forcing a
+    // decision here. Arms are spelled out, not `unwrap_or(...)`, to stay auditable.
+    match PamOutcome::try_from(raw) {
+        Ok(PamOutcome::Success) => PamOutcome::Success,
+        Ok(PamOutcome::Denied) => PamOutcome::Denied,
+        Ok(PamOutcome::Timeout) => PamOutcome::Timeout,
+        Ok(PamOutcome::Ignore) => PamOutcome::Ignore,
+        Ok(PamOutcome::Error) => PamOutcome::Error,
+        Err(_) => PamOutcome::Error,
+    }
+}
+
+/// Outcome of a daemon response, failing closed on unknown values.
+fn response_outcome(
+    resp: &shared::ipc::pb::PamAuthenticateResponse,
+) -> shared::ipc::pb::PamOutcome {
+    // Reads the raw `i32` field, not the generated `outcome()` accessor.
+    outcome_from_raw(resp.outcome)
 }
 
 #[cfg(test)]
@@ -1023,6 +1058,88 @@ mod tests {
             ),
             pam_sys::PAM_AUTH_ERR
         );
+    }
+
+    /// The `outcome` field is a raw `i32` on the wire, so a peer can put any
+    /// value in it. Unknown values must fail closed (`Error` → `PAM_AUTH_ERR`)
+    /// rather than decode to `PamOutcome::default()` = `SUCCESS`.
+    #[test]
+    fn test_unknown_outcome_raw_values_fail_closed() {
+        use shared::ipc::pb::PamOutcome;
+
+        for raw in [-1, 5, 99, 255, i32::MAX, i32::MIN] {
+            assert_eq!(
+                outcome_from_raw(raw),
+                PamOutcome::Error,
+                "raw outcome {raw} must fail closed instead of {:?}",
+                outcome_from_raw(raw)
+            );
+        }
+
+        // Known values keep exactly today's mapping.
+        for (raw, expected) in [
+            (0, PamOutcome::Success),
+            (1, PamOutcome::Denied),
+            (2, PamOutcome::Timeout),
+            (3, PamOutcome::Ignore),
+            (4, PamOutcome::Error),
+        ] {
+            assert_eq!(
+                outcome_from_raw(raw),
+                expected,
+                "raw outcome {raw} must keep its mapping"
+            );
+        }
+    }
+
+    /// Wire-level version of the test above: hand-encode a
+    /// `PamAuthenticateResponse` whose `outcome` field is an unknown value,
+    /// decode it with prost and drive the real PAM mapping.
+    ///
+    /// Layout (proto3): `outcome` is field 1, varint, so the tag byte is
+    /// `(1 << 3) | 0 == 0x08`, followed by the value's base-128 varint. `detail`
+    /// and `challenge` are empty and therefore absent from the encoding.
+    #[test]
+    fn test_undecodable_wire_outcome_never_grants() {
+        use prost::Message;
+
+        /// Base-128 varint encoding of `value`.
+        fn varint(mut value: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return out;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        let conv = unsafe { pam_sys::PamConversation::dummy() };
+        let msgs = pam_messages::load_for_user("testuser");
+
+        for raw in [99_i32, i32::MAX] {
+            let mut bytes = vec![0x08_u8];
+            bytes.extend(varint(raw as u32));
+
+            let resp = shared::ipc::pb::PamAuthenticateResponse::decode(bytes.as_slice()).unwrap();
+            // The hand-built bytes really did carry the unknown outcome.
+            assert_eq!(resp.outcome, raw, "hand-encoded bytes decode as expected");
+
+            let code = map_pam_outcome(&resp, "testuser", &conv, &msgs);
+            assert_ne!(
+                code,
+                pam_sys::PAM_SUCCESS,
+                "unknown outcome {raw} must not grant access"
+            );
+            assert_eq!(
+                code,
+                pam_sys::PAM_AUTH_ERR,
+                "unknown outcome {raw} must be a processing failure"
+            );
+        }
     }
 
     /// Regression test for the `PAM_IGNORE` authentication bypass.

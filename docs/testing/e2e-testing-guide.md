@@ -251,7 +251,9 @@ leaves the host untouched; a pre-existing socket at
 rather than shadowed or deleted, so a real daemon is never disturbed. The real
 `/etc/pam.d/gdm-password` is never touched: the DM bypass only matches on the
 service-name prefix, and the synthetic service exercises it. As non-root it
-prints one `SKIP` line per case and exits 0. The script exports `LC_ALL=C` and
+prints one `SKIP` line per case and exits 0 locally, but exits 1 when `CI` is
+set, so a CI job that lost its `sudo` prefix fails instead of going green with
+zero cases run. The script exports `LC_ALL=C` and
 `LANG=C`, so the module's own localized messages cannot turn a correct run into
 a failure under `sudo env` with a non-English user locale.
 
