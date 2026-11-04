@@ -147,9 +147,13 @@ run_shape() {
     done
 
     echo "==> ${label}: running the harness as '$(basename "$bin")' [${assert_mode}]"
+    # The caller's own environment must not decide the GDM shape: clear the
+    # reauth variable here so the login run really is a login.  `env` applies
+    # -u before the assignments, so the reauth shape's GDM_SESSION_FOR_REAUTH=1
+    # (from extra_env) still wins.
     set +e
     local out rc
-    out="$(env CONV_TEST_MODE="$assert_mode" \
+    out="$(env -u GDM_SESSION_FOR_REAUTH CONV_TEST_MODE="$assert_mode" \
         ${extra_env[@]+"${extra_env[@]}"} \
         CONV_TEST_SERVICE="$service" CONV_TEST_EXPECT="$expect" \
         timeout 15 "$bin" 2>&1)"

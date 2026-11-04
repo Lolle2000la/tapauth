@@ -302,10 +302,13 @@ calling process, so nothing has to be configured per host:
 
 | Host | Behaviour |
 | :--- | :--- |
-| sudo, polkit dialogs, `kscreenlocker` ≥ 6.8, `hyprlock`, xsecurelock, xfce4-screensaver, mate-screensaver, GNOME unlock (GDM reauthentication) | Password field **and** phone, at the same time — whichever answers first wins |
+| polkit dialogs, `kscreenlocker` ≥ 6.8, `hyprlock`, xsecurelock, xfce4-screensaver, mate-screensaver, GNOME unlock (GDM reauthentication) | Password field **and** phone, at the same time — whichever answers first wins |
 | `swaylock`, `gtklock`, `i3lock` | **Password only.** These read the password before asking PAM and then replay it, so the phone is deliberately not rung |
+| `sudo`, `su` | **Phone first, then password.** The terminal is the sequential flow: the phone is offered first and pressing Enter skips straight to the password prompt — there is no password field waiting alongside the phone |
 | `kscreenlocker` ≤ 6.7, `xscreensaver` | **Sequential:** the phone is offered first for a shorter timeout (30 s), then the password prompt. Answered on the wrong thread these hosts would freeze, so the module never drives their dialog |
-| `light-locker`, `slock`, `betterlockscreen` | Not supported: these do not use PAM |
+| `light-locker` | Not supported: it delegates to LightDM, and TapAuth bypasses display-manager services |
+| `slock` | Not supported: it checks the password against crypt/shadow itself and never calls PAM |
+| `betterlockscreen` | Not supported: it is a wrapper that execs `i3lock-color`/`i3lock`, and `i3lock-color` is not a recognised process yet |
 
 Two quirks worth knowing:
 
