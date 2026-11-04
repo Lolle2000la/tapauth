@@ -326,7 +326,8 @@ Two quirks worth knowing:
 
 - **xsecurelock** retries `pam_authenticate` up to three times for every result except
   aborts, "too many tries", expired-password and success — so an explicit denial, not
-  just a missing phone, can ring your phone up to three times.
+  just a missing phone, can ring your phone up to three times (retries that land within
+  500 ms of the previous verdict are answered from it without ringing).
 - **GNOME unlock** reuses the `gdm-password` service; TapAuth distinguishes it from a
   fresh login by the `GDM_SESSION_FOR_REAUTH` variable. If that variable is missing,
   unlock falls back to password only rather than freezing.

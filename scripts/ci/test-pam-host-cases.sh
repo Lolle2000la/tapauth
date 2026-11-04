@@ -629,20 +629,58 @@ EOF
 }
 
 # ===========================================================================
-# Case 6: a second invocation in the same transaction also gets a real code.
-# (Main has no dedupe branch; this pins that the second call is not PAM_IGNORE.)
+# Case 6: a second invocation in the same transaction is answered from the
+# per-process verdict cache and still returns a real code, never PAM_IGNORE.
+#
+# Two `pam_tapauth.so` lines are one stack run twice inside one transaction:
+# the in-process duplicate kscreenlocker >= 6.8 issues (the second call is
+# dispatched the moment the first returns), reachable here without a lock
+# screen.  The daemon never answers, so the first call concludes
+# PAM_AUTHINFO_UNAVAIL after the ${GUI_TIMEOUT_SECS}s GUI timeout and records
+# that verdict; the second call arrives milliseconds later and is answered from
+# that record without contacting the daemon and without waiting again.
+#
+# The stack is shaped so line 2's own code decides:
+#   line 1 `sufficient`  9 -> ignore, the stack continues
+#   line 2 `required`    9 -> bad (result 9);  PAM_IGNORE -> ignore, continues
+#   line 3 `required pam_permit`  grants, so a result of 0 here means line 2
+#                                 returned PAM_IGNORE
+# That is why the result assertion discriminates: with two `required` module
+# lines instead, line 1's 9 would mask line 2 and a cache hit that wrongly
+# returned PAM_IGNORE would still show 9.
+#
+# The other two assertions pin the reuse itself: exactly one stub connection (a
+# second one means the phone would be rung twice for one unlock) and exactly one
+# wait.  The wall-time bounds sit far from both one and two waits, so a loaded
+# runner cannot flip them.  The stub-liveness check keeps "no second accept"
+# from passing because the stub died.
 # ===========================================================================
 case_6() {
     write_service "$SERVICE_DOUBLE" <<EOF
+auth    sufficient      ${PAM_MODULE_PATH}
 auth    required        ${PAM_MODULE_PATH}
-auth    required        ${PAM_MODULE_PATH}
+auth    required        pam_permit.so
 EOF
     start_stub || return
     run_pamtester "$PAMTESTER_BIN" "$SERVICE_DOUBLE" root authenticate
+    # 9 = line 2 returned PAM_AUTHINFO_UNAVAIL; 0 = it returned PAM_IGNORE and
+    # pam_permit granted the whole stack.
     assert_eq "PAM result" "9" "$RUN_RESULT"
+
+    # Without a live stub, "one accept" proves nothing (the module would fail to
+    # connect and still report 9).
+    if ! kill -0 "$stub_pid" 2>/dev/null; then
+        add_error "case 6 stub daemon is not running, so the accept count proves nothing: $(cat "${CASE_DIR}/stub.log" 2>/dev/null)"
+    fi
+    local accepts
+    accepts="$(grep -c 'pam-stub-daemon: accept' "${CASE_DIR}/stub.log" 2>/dev/null || true)"
+    assert_eq "daemon connections" "1" "${accepts:-?}"
+
+    local half_ms=$((GUI_TIMEOUT_SECS * 1000 / 2))
+    local one_and_a_half_ms=$((GUI_TIMEOUT_SECS * 1000 * 3 / 2))
     assert_ok "wall time" \
-        "$([ "${RUN_MS:-0}" -gt 3000 ] && echo 0 || echo 1)" \
-        "expected two sequential ${GUI_TIMEOUT_SECS}s waits (>3000 ms), took ${RUN_MS:-?} ms"
+        "$([ "${RUN_MS:-0}" -gt "$half_ms" ] && [ "${RUN_MS:-0}" -lt "$one_and_a_half_ms" ] && echo 0 || echo 1)" \
+        "expected exactly one ${GUI_TIMEOUT_SECS}s wait (more than ${half_ms} ms, less than ${one_and_a_half_ms} ms; two waits would be about $((GUI_TIMEOUT_SECS * 2000)) ms), took ${RUN_MS:-?} ms"
 }
 
 # ===========================================================================

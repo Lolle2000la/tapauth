@@ -65,6 +65,43 @@
  *                             precollect — conversation entered, returned, ON
  *                                          the calling thread, daemon == 0
  *                             bypass     — conversation not entered, daemon == 0
+ *                             every `duplicate*` mode runs several complete
+ *                             transactions on separate handles in one process,
+ *                             kept open until the end because `pam_end`
+ *                             unloads the module (and with it the window):
+ *                             duplicate  — user, user, (300 ms) user,
+ *                                          (300 ms) user: all four must grant
+ *                                          and the fake daemon must have
+ *                                          accepted exactly TWO connections.
+ *                                          The immediate second transaction is
+ *                                          the duplicate a lock screen issues;
+ *                                          it and the T0+300 ms call are
+ *                                          answered from the window under any
+ *                                          model, while the T0+600 ms call is
+ *                                          outside the fixed 500 ms window and
+ *                                          must start a real one again (a
+ *                                          sliding window, which re-records on
+ *                                          each hit, fails on the count).
+ *                             duplicate-unavailable
+ *                                        — user, user, but the fake daemon
+ *                                          hangs up on the first connection, so
+ *                                          both transactions conclude
+ *                                          `PAM_AUTHINFO_UNAVAIL` with exactly
+ *                                          ONE accepted connection: the
+ *                                          concluded failure, not just a
+ *                                          success, is what gets reused.  A
+ *                                          second connection (which only a
+ *                                          broken window produces) is granted,
+ *                                          so the regression shows up in the
+ *                                          verdict too.
+ *                             duplicate-cross-user
+ *                                        — user-a, user-b against a granting
+ *                                          daemon: both must grant and the
+ *                                          daemon must have accepted TWO
+ *                                          connections.  A negative test: the
+ *                                          window is keyed on the user, so a
+ *                                          second user must always be asked for
+ *                                          independently.
  *     CONV_TEST_PRECOLLECT  `1` makes the conversation replay the password
  *                           immediately instead of waiting for the helper
  *     CONV_TEST_BLOCK       `cancel` makes the `PAM_PROMPT_ECHO_OFF` branch park
@@ -72,7 +109,12 @@
  *                           instead of reading the pipe.  Nothing ever signals
  *                           it, so the conversation returns only if the module
  *                           cancels the worker — which is exactly what the
- *                           `grant` assertion set measures.
+ *                           `grant` assertion set measures.  Every `duplicate*`
+ *                           mode implies its own park of the same kind, in
+ *                           `sem_wait` (a cancellation point that holds no
+ *                           mutex), because a condition-variable waiter that is
+ *                           cancelled can leave its mutex held for the next
+ *                           transaction.
  *
  *   Prints `RESULT: PASS` on success and exits 0.  Any other outcome prints a
  *   diagnostic, `RESULT: FAIL ...`, and exits non-zero.  Never install this.
@@ -84,6 +126,7 @@
 #include <pthread.h>
 #include <pwd.h>
 #include <security/pam_appl.h>
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -102,7 +145,16 @@ static int precollect;
 /* `grant` mode: the fake daemon answers with a granted envelope, and the
  * conversation parks in a cancellation point until the module abandons it. */
 static int grant_mode;
+/* `duplicate-unavailable` mode: the fake daemon accepts and closes at once, so
+ * the module concludes `PAM_AUTHINFO_UNAVAIL` through its IPC-error path in
+ * milliseconds instead of waiting out a timeout. */
+static int close_immediately;
 static int block_cancel;
+/* `duplicate` mode: the conversation parks in a `sem_wait` instead of the
+ * condition variable.  `sem_wait` is a cancellation point and holds no mutex,
+ * so a cancelled waiter cannot leave a lock behind for the next transaction. */
+static int block_sem;
+static sem_t conv_park_sem;
 static pthread_mutex_t conv_block_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t conv_block_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t main_thread;
@@ -175,6 +227,21 @@ static int test_conv(int num_msg, const struct pam_message **msg,
                 }
             }
 
+            if (block_sem) {
+                /* THE POINT OF THE `duplicate` SHAPE: the same "never signalled,
+                 * only a cancel can end it" park, but in `sem_wait`, which is a
+                 * POSIX cancellation point that holds no mutex.  The
+                 * condition-variable park above cannot be used here: POSIX
+                 * reacquires the mutex before the cancellation cleanup handlers
+                 * run, so the cancelled waiter of the first transaction can
+                 * leave `conv_block_mu` held, and the second transaction's
+                 * worker would block in a non-cancellable `pthread_mutex_lock`
+                 * — hanging the run instead of reporting the accept count.
+                 * `conv_returned` stays 0: no password is ever delivered. */
+                while (sem_wait(&conv_park_sem) != 0 && errno == EINTR) {
+                }
+            }
+
             char buf[64];
             ssize_t n;
             do {
@@ -241,6 +308,9 @@ static void *password_helper(void *arg) {
 
 typedef struct {
     int fd;
+    /* 1-based accept order: the duplicate modes need "the first connection
+     * hangs up, any later one grants". */
+    int index;
 } conn_arg;
 
 /*
@@ -298,9 +368,23 @@ static void wait_for_conversation(void) {
  */
 static void *conn_reader(void *arg) {
     int fd = ((conn_arg *)arg)->fd;
+    int index = ((conn_arg *)arg)->index;
     free(arg);
 
-    if (grant_mode) {
+    if (close_immediately && index == 1) {
+        /* `duplicate-unavailable`: the first connection is accepted and closed
+         * with no response, so the module sees POLLHUP and concludes
+         * `PAM_AUTHINFO_UNAVAIL` at once (`test_gui_loop_daemon_hangup` covers
+         * that path).  Any *later* connection is granted instead: with the
+         * reuse window neutered the duplicate transaction really does reach the
+         * daemon, and then it must be caught on the verdict too (the second
+         * call would succeed instead of repeating the failure), not only on the
+         * accept count. */
+        close(fd);
+        return NULL;
+    }
+
+    if (grant_mode || close_immediately) {
         wait_for_conversation();
 
         size_t off = 0;
@@ -345,13 +429,14 @@ static void *daemon_accept_loop(void *arg) {
             }
             break;
         }
-        atomic_fetch_add(&daemon_accepted, 1);
+        int index = atomic_fetch_add(&daemon_accepted, 1) + 1;
 
         conn_arg *ca = calloc(1, sizeof(*ca));
         if (ca == NULL) {
             fail("calloc for connection thread");
         }
         ca->fd = fd;
+        ca->index = index;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, conn_reader, ca) != 0) {
@@ -400,6 +485,122 @@ static int start_fake_daemon(const char *sock_path) {
     return fd;
 }
 
+/* ------------------------------------------------------------- duplicate --- */
+
+typedef struct {
+    const char *user;
+    /* Milliseconds to sleep before starting this transaction. */
+    unsigned sleep_ms;
+    int expected;
+} dup_step;
+
+/*
+ * The shape of a lock screen that re-enters `pam_authenticate` right after the
+ * previous transaction concluded (kscreenlocker >= 6.8 queues the duplicate
+ * while the first one is still running): several complete PAM transactions on
+ * separate handles in one process.  Only the transactions the reuse window does
+ * not cover may reach the daemon, so the fake daemon's accept count is the
+ * discriminator for every variant:
+ *
+ *   duplicate              user, user, (300 ms) user, (300 ms) user
+ *                          daemon grants twice.  The immediate duplicate and
+ *                          the T0+300 ms call are hits under any model; the
+ *                          T0+600 ms call is outside the fixed 500 ms window
+ *                          and must start a real transaction again, while a
+ *                          sliding window (which re-records on each hit) would
+ *                          still answer it and leave the count at 1;
+ *   duplicate-unavailable  user, user                   daemon hangs up once
+ *                          both transactions conclude `PAM_AUTHINFO_UNAVAIL`
+ *                          from a single connection, so a concluded failure is
+ *                          reused too;
+ *   duplicate-cross-user   user-a, user-b               daemon grants twice
+ *                          a negative test: the window is per user, so a second
+ *                          user must be asked for independently.
+ *
+ * The conversation is parked in a cancellation point nothing signals (see
+ * `block_sem`), so no password is ever delivered and a `PAM_SUCCESS` can only
+ * come from the daemon.
+ */
+static void run_duplicate_sequence(const char *confdir, const char *service,
+                                   const dup_step *steps, int count,
+                                   int expected_accepts, int require_entered) {
+    enum { DUP_MAX_STEPS = 4 };
+    struct pam_conv conv = {test_conv, NULL};
+    pam_handle_t *handles[DUP_MAX_STEPS] = {NULL, NULL, NULL, NULL};
+    int verdicts[DUP_MAX_STEPS] = {PAM_SERVICE_ERR, PAM_SERVICE_ERR,
+                                   PAM_SERVICE_ERR, PAM_SERVICE_ERR};
+
+    if (count < 1 || count > DUP_MAX_STEPS) {
+        fail("the duplicate sequence has an unsupported number of steps");
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (steps[i].sleep_ms > 0) {
+            struct timespec delay = {
+                .tv_sec = (time_t)(steps[i].sleep_ms / 1000),
+                .tv_nsec = (long)(steps[i].sleep_ms % 1000) * 1000000L,
+            };
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+            }
+        }
+
+        int ret = pam_start_confdir(service, steps[i].user, &conv, confdir,
+                                    &handles[i]);
+        if (ret != PAM_SUCCESS) {
+            fprintf(stderr, "pam_start_confdir (transaction %d) failed: %d\n",
+                    i + 1, ret);
+            fail("pam_start_confdir (duplicate)");
+        }
+
+        ret = pam_authenticate(handles[i], 0);
+        verdicts[i] = ret;
+        printf("pam_authenticate #%d (user %s): %d (%s)\n", i + 1,
+               steps[i].user, ret, pam_strerror(handles[i], ret));
+    }
+
+    /* Every handle is ended only now.  libpam `dlclose()`s the module image in
+     * `pam_end`, so an end sitting between two transactions would unmap the
+     * module and the next `pam_authenticate` would map a *fresh* copy with an
+     * empty reuse window (measured: the module disappears from
+     * /proc/self/maps at pam_end).  The shape would then measure glibc's
+     * unload, not the fix.  Keeping the transactions open is also what the real
+     * host does: kscreenlocker re-enters `pam_authenticate` inside one open
+     * transaction. */
+    for (int i = count - 1; i >= 0; i--) {
+        int end_status = pam_end(handles[i], verdicts[i]);
+        if (end_status != PAM_SUCCESS) {
+            fail("pam_end failed (duplicate)");
+        }
+    }
+
+    int entered = atomic_load(&conv_entered);
+    int accepted = atomic_load(&daemon_accepted);
+    printf("conv_entered: %d\n", entered);
+    printf("daemon_accepted: %d\n", accepted);
+
+    for (int i = 0; i < count; i++) {
+        if (verdicts[i] != steps[i].expected) {
+            fprintf(stderr,
+                    "transaction %d (user %s) returned %d, expected %d: the "
+                    "shape cannot judge the reuse window on the wrong verdict\n",
+                    i + 1, steps[i].user, verdicts[i], steps[i].expected);
+            fail("pam_authenticate returned the wrong code");
+        }
+    }
+    if (require_entered && !entered) {
+        fail("the conversation was never entered (threaded mode not selected?)");
+    }
+    if (accepted != expected_accepts) {
+        fprintf(stderr,
+                "the fake daemon accepted %d connection(s), expected exactly "
+                "%d: every transaction the reuse window does not cover must "
+                "reach the daemon, and every one it covers must not\n",
+                accepted, expected_accepts);
+        fail("the duplicate transaction reached the daemon the wrong number of "
+             "times");
+    }
+}
+
 /* ----------------------------------------------------------------- main --- */
 
 int main(void) {
@@ -439,8 +640,14 @@ int main(void) {
     int mode_grant = strcmp(assert_mode, "grant") == 0;
     int mode_precollect = strcmp(assert_mode, "precollect") == 0;
     int mode_bypass = strcmp(assert_mode, "bypass") == 0;
-    if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass) {
-        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect' or 'bypass'");
+    int mode_duplicate = strcmp(assert_mode, "duplicate") == 0;
+    int mode_dup_unavail = strcmp(assert_mode, "duplicate-unavailable") == 0;
+    int mode_dup_cross_user = strcmp(assert_mode, "duplicate-cross-user") == 0;
+    int duplicate_mode = mode_duplicate || mode_dup_unavail || mode_dup_cross_user;
+    if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass &&
+        !duplicate_mode) {
+        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect', 'bypass', "
+             "'duplicate', 'duplicate-unavailable' or 'duplicate-cross-user'");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -448,7 +655,15 @@ int main(void) {
     precollect = (precollect_env != NULL && strcmp(precollect_env, "1") == 0) ||
                  mode_precollect;
 
-    grant_mode = mode_grant;
+    /* The granting variants also need the daemon to grant a second connection:
+     * with the reuse window neutered the duplicate transaction really does
+     * reach the daemon, and only then is the accepted count what makes the
+     * regression visible.  `duplicate-unavailable` needs the opposite on the
+     * first connection -- a hang-up -- and gets it from `close_immediately`
+     * below; any later connection there is granted, so the regression is caught
+     * on the verdict as well as the count. */
+    grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user;
+    close_immediately = mode_dup_unavail;
 
     const char *block_env = getenv("CONV_TEST_BLOCK");
     if (block_env != NULL && *block_env != '\0') {
@@ -460,6 +675,19 @@ int main(void) {
     }
     if (block_cancel && precollect) {
         fail("CONV_TEST_BLOCK=cancel contradicts CONV_TEST_PRECOLLECT=1");
+        return 1; /* unreachable: fail() exits */
+    }
+    /* Every duplicate mode parks the conversation in its own cancellation
+     * point (a semaphore), so they must not also take the condition-variable
+     * park and they need no CONV_TEST_BLOCK.  Either way no password is ever
+     * delivered, so a `PAM_SUCCESS` can only come from the daemon. */
+    block_sem = duplicate_mode;
+    if (block_sem && block_cancel) {
+        fail("the duplicate modes must not be combined with CONV_TEST_BLOCK=cancel");
+        return 1; /* unreachable: fail() exits */
+    }
+    if (block_sem && sem_init(&conv_park_sem, 0, 0) != 0) {
+        fail("sem_init for the duplicate park");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -483,7 +711,9 @@ int main(void) {
     printf("expect     : %s\n", expect);
     printf("mode       : %s\n", assert_mode);
     printf("precollect : %d\n", precollect);
-    printf("block      : %s\n", block_cancel ? "cancel" : "none");
+    printf("block      : %s\n",
+           block_cancel ? "cancel"
+                        : (block_sem ? "sem (duplicate)" : "none"));
     printf("user       : %s\n", user);
     printf("confdir    : %s\n", confdir);
     printf("socket     : %s\n", sock_path);
@@ -507,6 +737,55 @@ int main(void) {
 
     struct pam_conv conv = {test_conv, NULL};
     pam_handle_t *pamh = NULL;
+
+    /* The duplicate shapes own their own handles (one per transaction), so they
+     * divert before the single-handle flow below.  `duplicate-cross-user` runs
+     * the same sequence for a *different* second user: it is a negative test,
+     * and it must fail if the window ever drops the username from its key. */
+    if (duplicate_mode) {
+        const char *other_user =
+            strcmp(user, "nobody") == 0 ? "daemon" : "nobody";
+        const dup_step success_steps[] = {
+            /* T0: concludes, and is the first daemon contact. */
+            {user, 0, PAM_SUCCESS},
+            /* The modelled 0.37 ms duplicate: a hit under every model. */
+            {user, 0, PAM_SUCCESS},
+            /* T0 + ~300 ms: still a hit under *both* a fixed window and a
+             * sliding one that re-records on each hit, so this step alone
+             * proves nothing about which the module implements. */
+            {user, 300, PAM_SUCCESS},
+            /* T0 + ~600 ms: 600 ms after the *original* verdict, so a fixed
+             * window misses and a new transaction must start (daemon contact
+             * 2).  A sliding window would have re-recorded at T0 + ~300 ms and
+             * would still hit here, leaving the count at 1.  `nanosleep` never
+             * sleeps *less* than requested, so overshoot can only push this
+             * further outside the window, never back inside it. */
+            {user, 300, PAM_SUCCESS},
+        };
+        const dup_step unavailable_steps[] = {
+            {user, 0, PAM_AUTHINFO_UNAVAIL},
+            {user, 0, PAM_AUTHINFO_UNAVAIL},
+        };
+        const dup_step cross_user_steps[] = {
+            {user, 0, PAM_SUCCESS},
+            {other_user, 0, PAM_SUCCESS},
+        };
+
+        printf("cross-user other user: %s\n", other_user);
+        if (mode_duplicate) {
+            run_duplicate_sequence(confdir, service, success_steps, 4,
+                                   2 /* T0 and T0+600 ms */, 1);
+        } else if (mode_dup_unavail) {
+            run_duplicate_sequence(confdir, service, unavailable_steps, 2,
+                                   1, 0);
+        } else {
+            run_duplicate_sequence(confdir, service, cross_user_steps, 2,
+                                   2 /* one per user */, 1);
+        }
+        printf("RESULT: PASS\n");
+        fflush(stdout);
+        return 0;
+    }
 
     int ret = pam_start_confdir(service, user, &conv, confdir, &pamh);
     if (ret != PAM_SUCCESS) {
