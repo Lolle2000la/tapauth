@@ -58,7 +58,70 @@
 #                for a password that never comes.  A pass cannot be explained by
 #                password fallback: the conversation never returns, and the
 #                harness asserts `conv_returned == 0` even though the stack
-#                granted.  This is the only shape that exercises the cancel path.
+#                granted.  Together with the `duplicate` shape below, this
+#                exercises the cancel path.
+#
+#   duplicate    auth sufficient <module>       (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                Four transactions in one process (pam_start/pam_authenticate
+#                pairs, all handles kept open): user at T0, user immediately
+#                (the modelled 0.37 ms duplicate), user at T0+300 ms and user
+#                at T0+600 ms.  All four must grant and the fake daemon must
+#                have accepted exactly TWO connections: T0 and T0+600 ms.  The
+#                T0+300 ms call is a hit under a fixed *and* a sliding window,
+#                so only the T0+600 ms call can tell them apart — under the
+#                fixed 500 ms window it has been 600 ms since T0 and must start
+#                a real transaction, while a window that re-records on each hit
+#                would answer it and leave the count at one.  `pam_end` unloads
+#                the module and its window, hence the open handles — see
+#                run_duplicate_sequence in conv_thread_harness.c.
+#
+#   duplicate-unavailable
+#                auth required <module>          (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                The same immediate duplicate, but the fake daemon hangs up on
+#                the first connection, so both conclude PAM_AUTHINFO_UNAVAIL
+#                within milliseconds (no full timeout) with exactly one
+#                connection: a concluded failure is reused just like a success,
+#                because the duplicate was queued while the first transaction
+#                was still running and re-asking would only cost another ring
+#                and another wait.
+#
+#   duplicate-cross-user
+#                auth sufficient <module>       (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                A negative test: the immediate duplicate for a *different*
+#                user (this user, then `nobody`) must not be answered from the
+#                window, so both must grant and the daemon must have accepted
+#                exactly TWO connections.  It fails if the window ever drops the
+#                username from its key.
+#
+#   duplicate-cross-service
+#                auth sufficient <module>       (harness run as
+#                account required pam_permit.so   `kscreenlocker_worker`)
+#                The other negative test: the immediate duplicate for the same
+#                user against a *different* PAM service file must not be
+#                answered from the window, so both must grant and the daemon
+#                must have accepted exactly TWO connections.  It fails if the
+#                window ever drops the service from its key — which would let a
+#                lock-screen unlock answer a `sudo`/polkit prompt silently.
+#
+#   duplicate-after-slow-module
+#                auth required <module>          (harness run as
+#                auth required pam_exec.so /bin/sleep 0.8
+#                auth required pam_permit.so      `kscreenlocker_worker`)
+#                account required pam_permit.so
+#                The window's *end*, pinned.  The harness issues its two
+#                transactions immediately one after the other, but the first
+#                `pam_authenticate` only returns after the module *after*
+#                `pam_tapauth.so` has blocked for 800 ms — and the window is
+#                anchored at the module's return, not at the end of the stack.
+#                The duplicate therefore starts >= 800 ms after the module
+#                returned, outside the 500 ms the window covers, so the phone
+#                must be rung a second time: both calls grant, the conversation
+#                is entered, and the daemon accepts exactly TWO connections.
+#                This is the documented limitation, and it fails if the window
+#                is widened past 800 ms.
 #
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
@@ -306,6 +369,98 @@ account required pam_permit.so
 EOF
 run_shape "grant (phone wins while the conversation is parked)" \
     "$THREADED_BIN" "$GRANT_SERVICE" success "" grant CONV_TEST_BLOCK=cancel
+
+# ----------------------------------------------------------------- duplicate --
+# A lock screen that re-enters `pam_authenticate` right after a transaction
+# concludes (kscreenlocker >= 6.8 does so 0.37 ms later) must not produce a
+# second transaction: no new request id, no new daemon challenge, no second ring
+# of the phone.  The harness runs four transactions in one process (T0, an
+# immediate duplicate, T0+300 ms, T0+600 ms; every handle stays open) and
+# requires all four to grant.
+#
+# The discriminator is the fake daemon's accept count: exactly TWO connections,
+# one at T0 and one at T0+600 ms.  The immediate duplicate and the T0+300 ms
+# call are answered from the module's verdict-reuse window under any model; the
+# T0+600 ms call is 600 ms after the *original* verdict, so a fixed 500 ms
+# window misses and a new transaction starts, while a window that re-records on
+# each hit would still answer it and leave the count at one.  `nanosleep` never
+# sleeps less than requested, so overshoot cannot turn the T0+600 ms miss into a
+# hit.  The conversation is parked in a cancellation point (`sem_wait`, which
+# the mode sets up itself) so a grant cannot come from password fallback.
+DUPLICATE_SERVICE="tapauth-conv-duplicate"
+cat > "$CONFDIR/$DUPLICATE_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+account required pam_permit.so
+EOF
+run_shape "duplicate (previous success reused, two phone requests)" \
+    "$THREADED_BIN" "$DUPLICATE_SERVICE" success "" duplicate
+
+# The duplicate is dispatched whatever the first transaction concluded, so a
+# concluded *failure* has to be reused too: the fake daemon hangs up on the
+# first connection and both transactions must return PAM_AUTHINFO_UNAVAIL with
+# exactly one accepted connection.  Without the reuse window the second call
+# starts a fresh transaction, which the daemon grants — so the regression fails
+# on the verdict as well as on the count, and the phone would have been rung and
+# waited on a second time.  A `required` line makes the nine fail the stack, so
+# the verdict is unambiguous.
+DUPLICATE_FAIL_SERVICE="tapauth-conv-duplicate-unavailable"
+cat > "$CONFDIR/$DUPLICATE_FAIL_SERVICE" <<EOF
+auth required $MODULE_PATH
+account required pam_permit.so
+EOF
+run_shape "duplicate-unavailable (concluded failure reused, one phone request)" \
+    "$THREADED_BIN" "$DUPLICATE_FAIL_SERVICE" non-success "" duplicate-unavailable
+
+# Negative test for the per-user key: the same immediate duplicate for a
+# *different* user must not be answered from the window, so the daemon is asked
+# twice and both grant.  A window that ignored the username would answer the
+# second call from the first user's verdict and accept only one connection.
+DUPLICATE_CROSS_SERVICE="tapauth-conv-duplicate-cross-user"
+cat > "$CONFDIR/$DUPLICATE_CROSS_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+account required pam_permit.so
+EOF
+run_shape "duplicate-cross-user (window is per user, daemon asked twice)" \
+    "$THREADED_BIN" "$DUPLICATE_CROSS_SERVICE" success "" duplicate-cross-user
+
+# The same negative test for the service half of the key: the same user, but a
+# second service file (so a second stack) must not inherit the first one's
+# verdict — a window keyed only on the user would let a lock-screen unlock
+# answer a `sudo`/polkit prompt without ringing the phone.
+DUPLICATE_CROSS_SERVICE_1="tapauth-conv-duplicate-cross-service-1"
+DUPLICATE_CROSS_SERVICE_2="tapauth-conv-duplicate-cross-service-2"
+for svc in "$DUPLICATE_CROSS_SERVICE_1" "$DUPLICATE_CROSS_SERVICE_2"; do
+    cat > "$CONFDIR/$svc" <<EOF
+auth sufficient $MODULE_PATH
+account required pam_permit.so
+EOF
+done
+run_shape "duplicate-cross-service (window is per service, daemon asked twice)" \
+    "$THREADED_BIN" "$DUPLICATE_CROSS_SERVICE_1" success "" duplicate-cross-service \
+    CONV_TEST_SERVICE_2="$DUPLICATE_CROSS_SERVICE_2"
+
+# ------------------------------------------------- the window's end ----------
+# The documented limitation, pinned: the 500 ms window is anchored at the
+# *module's* return, so a module listed after `pam_tapauth.so` that blocks for
+# longer pushes the host's duplicate outside it.  The harness issues its two
+# transactions immediately one after the other (sleep_ms 0), but the first
+# `pam_authenticate` only returns once `pam_exec.so` has run `/bin/sleep 0.8`
+# *after* the module, so the second call starts >= 800 ms after the module's
+# return — comfortably outside the 500 ms, and `nanosleep` never undersleeps, so
+# load can only widen the margin.  Asserted: both calls grant, the conversation
+# was entered, and the daemon accepted exactly TWO connections (the phone was
+# rung twice).  It fails if the window is widened past 800 ms.  `auth required`
+# on the tapauth line (not `sufficient`) so processing continues into the
+# sleeper on success.
+DUPLICATE_SLOW_SERVICE="tapauth-conv-duplicate-after-slow-module"
+cat > "$CONFDIR/$DUPLICATE_SLOW_SERVICE" <<EOF
+auth required $MODULE_PATH
+auth required pam_exec.so /bin/sleep 0.8
+auth required pam_permit.so
+account required pam_permit.so
+EOF
+run_shape "duplicate-after-slow-module (later module blocks past the window, two phone requests)" \
+    "$THREADED_BIN" "$DUPLICATE_SLOW_SERVICE" success "" duplicate-after-slow-module
 
 # ------------------------------------------------------------------ gdm reauth --
 # A GDM reauthentication (unlock / admin prompt of a running session) must NOT
