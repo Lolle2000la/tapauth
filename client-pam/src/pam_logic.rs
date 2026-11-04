@@ -184,14 +184,13 @@ fn process_identity() -> Option<String> {
 ///   `pam_authenticate` up to 3× when it returns `PAM_AUTHINFO_UNAVAIL`, so one
 ///   lock-screen attempt can ring the phone up to three times.  Documented, not
 ///   fixed here.
-/// * `xfce4-screensaver-dialog` — the answer is produced by the child process
-///   that owns the password entry (`/proc/self/comm` truncates it to
-///   `xfce4-screensav`).  `pam_authenticate` runs on a dedicated `auththread`
-///   (`src/gs-auth-pam.c:453,467`, created at `:590`) while the caller sits in
-///   `gtk_main()` (`:598`); the conversation hands its prompt over with
-///   `g_idle_add` and parks the auth thread on a `GCond` (`:223,231`), and the
-///   lock dialog's nested `g_main_loop` (`src/gs-lock-plug.c:562`) keeps
-///   turning so the prompt can be answered.
+/// * `xfce4-screensaver-dialog` (comm truncated to `xfce4-screensav`) — the
+///   prompt is marshalled onto the dialog's GTK main loop with `g_idle_add`
+///   while `pam_authenticate` runs on a dedicated `auththread`
+///   (`src/gs-auth-pam.c:453,467`, created at `:590`) and the caller sits in
+///   `gtk_main()` (`:598`); the auth thread parks on a `GCond` (`:223,231`),
+///   and the lock dialog's nested `g_main_loop` (`src/gs-lock-plug.c:562`)
+///   keeps turning so the prompt can be answered.
 /// * `mate-screensaver-dialog` — same shape as xfce4-screensaver (comm
 ///   truncation: `mate-screensave`): `auththread` at `src/gs-auth-pam.c:488,505`
 ///   (created `:644`), caller in `gtk_main()` at `:653`, `g_idle_add` /
