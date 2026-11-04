@@ -812,20 +812,30 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let mut verdict: Option<Verdict> = None;
     let code = authenticate_inner(pamh, &mut verdict);
-    if let Some(v) = verdict {
-        // Only real transactions are recorded, and only when the service name
-        // is known: an unresolved service must not collapse into the "" key.
-        //
-        // This runs after `authenticate_inner` returned, so it is also the
-        // anchor of the reuse window: the 500 ms is measured from this module's
-        // *return*, not from the moment the transaction concluded.  A module
-        // after `pam_tapauth.so` that blocks longer than that pushes the host's
-        // duplicate outside the window, and it rings the phone again.
-        if let (false, Some(service)) = (v.from_cache, v.service.as_deref()) {
-            record_conclusion(&v.username, service, code, Instant::now());
-        }
-    }
+    // This runs after `authenticate_inner` returned, so it is also the anchor of
+    // the reuse window: the 500 ms is measured from this module's *return*, not
+    // from the moment the transaction concluded.  A module after
+    // `pam_tapauth.so` that blocks longer than that pushes the host's duplicate
+    // outside the window, and it rings the phone again.
+    record_verdict(&verdict, code, Instant::now());
     code
+}
+
+/// Record what `authenticate` is about to return, when the attempt armed a
+/// real transaction with a known service.
+///
+/// Split out of `authenticate` so the failed-connect test can run the exact
+/// post-processing `authenticate` runs, on the state a failed attempt leaves
+/// behind.
+fn record_verdict(verdict: &Option<Verdict>, code: c_int, now: Instant) {
+    let Some(v) = verdict else {
+        return;
+    };
+    // Only real transactions are recorded, and only when the service name is
+    // known: an unresolved service must not collapse into the "" key.
+    if let (false, Some(service)) = (v.from_cache, v.service.as_deref()) {
+        record_conclusion(&v.username, service, code, now);
+    }
 }
 
 fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdict>) -> c_int {
@@ -2897,37 +2907,42 @@ mod verdict_reuse_tests {
         );
     }
 
-    /// A connect failure says nothing about the phone, so it must leave the
-    /// record unarmed — and a retry must therefore dial the socket again
-    /// instead of being answered from a verdict that never existed.
+    /// A connect failure says nothing about the phone, so it must leave both the
+    /// local flag *and* the process-wide cache unarmed — and a retry must
+    /// therefore be able to start a real transaction instead of replaying a
+    /// verdict that never existed.
+    ///
+    /// The key is unique to this test: `LAST_CONCLUSION` is process-wide and
+    /// other tests in this module write to it in parallel.
+    ///
+    /// Not covered here: a *caller* that arms the record before calling
+    /// `start_authentication` — this test drives the helper, so it can only see
+    /// arming inside it.  `the_verdict_record_is_armed_only_inside_the_helper`
+    /// covers that shape at the source level.
     #[test]
     fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
+        const USER: &str = "failed-connect-user";
+        const UNIQUE_SERVICE: &str = "failed-connect-service";
+
         struct FakeClient;
-        let connects = std::cell::Cell::new(0u32);
-        let sends = std::cell::Cell::new(0u32);
         let mut verdict: Option<Verdict> = None;
 
         let first = start_authentication::<FakeClient, _, _>(
             &mut verdict,
-            "alice",
-            Some(SERVICE),
+            USER,
+            Some(UNIQUE_SERVICE),
             || {
-                connects.set(connects.get() + 1);
                 Err(crate::ipc_client::IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "no daemon socket",
                 )))
             },
-            |_: &mut FakeClient| {
-                sends.set(sends.get() + 1);
-                Ok(())
-            },
+            |_: &mut FakeClient| Ok(()),
         );
         assert!(
             matches!(first, Err(StartError::Connect(_))),
             "a refused connect must surface as a connect failure"
         );
-        assert_eq!(sends.get(), 0, "nothing may be sent without a connection");
         assert!(
             verdict.is_none(),
             "a local IPC failure is not a verdict about the phone: arming the \
@@ -2935,39 +2950,153 @@ mod verdict_reuse_tests {
              without the phone ever being asked"
         );
 
+        // Run the exact post-processing `authenticate` runs on whatever the
+        // failed attempt left behind: an armed record would be written to the
+        // cache here, and the duplicate would then be answered from it.
+        record_verdict(&verdict, pam_sys::PAM_AUTHINFO_UNAVAIL, Instant::now());
+        assert!(
+            cached_conclusion_for(USER, UNIQUE_SERVICE, Instant::now()).is_none(),
+            "the failed connect must leave the process-wide cache empty: \
+             `authenticate` records whatever the attempt armed, so an armed \
+             record would answer the duplicate with a local IPC failure as if \
+             the phone had been asked"
+        );
+
+        // The retry: with nothing recorded it must go through the connect/send
+        // path and arm a real transaction.
         let second = start_authentication::<FakeClient, _, _>(
             &mut verdict,
-            "alice",
-            Some(SERVICE),
-            || {
-                connects.set(connects.get() + 1);
-                Ok(FakeClient)
-            },
-            |_: &mut FakeClient| {
-                sends.set(sends.get() + 1);
-                Ok(())
-            },
+            USER,
+            Some(UNIQUE_SERVICE),
+            || Ok(FakeClient),
+            |_: &mut FakeClient| Ok(()),
         );
         assert!(
             second.is_ok(),
             "the retry must be able to connect after the failed attempt"
         );
-        assert_eq!(
-            connects.get(),
-            2,
-            "the immediate retry must attempt the socket again rather than be \
-             short-circuited by a record armed from the failure"
-        );
-        assert_eq!(sends.get(), 1);
         let armed = verdict
             .as_ref()
             .expect("a request on the wire must arm the record");
-        assert_eq!(armed.username, "alice");
-        assert_eq!(armed.service.as_deref(), Some(SERVICE));
+        assert_eq!(armed.username, USER);
+        assert_eq!(armed.service.as_deref(), Some(UNIQUE_SERVICE));
         assert!(
             !armed.from_cache,
             "the armed record is a real transaction, so `authenticate` must be \
              allowed to record its code"
+        );
+    }
+
+    /// A verdict replayed from the cache must not be recorded again: that would
+    /// refresh the timestamp and turn the fixed 500 ms window into a sliding one.
+    #[test]
+    fn a_from_cache_verdict_is_not_recorded() {
+        const USER: &str = "from-cache-user";
+        const UNIQUE_SERVICE: &str = "from-cache-service";
+
+        let now = Instant::now();
+        record_conclusion(USER, UNIQUE_SERVICE, pam_sys::PAM_PERM_DENIED, now);
+        let verdict = Some(Verdict {
+            username: USER.to_owned(),
+            service: Some(UNIQUE_SERVICE.to_owned()),
+            from_cache: true,
+        });
+        record_verdict(&verdict, pam_sys::PAM_SUCCESS, now);
+        assert_eq!(
+            cached_conclusion_for(USER, UNIQUE_SERVICE, now),
+            Some((pam_sys::PAM_PERM_DENIED, Duration::ZERO)),
+            "a cache hit must not be re-recorded: it would overwrite the original \
+             code and refresh the timestamp, making the window sliding"
+        );
+    }
+
+    /// An unresolved service is never cached: the empty string would collapse
+    /// every such call into one key.
+    #[test]
+    fn an_unresolved_service_is_not_recorded() {
+        const USER: &str = "unresolved-service-user";
+
+        let now = Instant::now();
+        let verdict = Some(Verdict {
+            username: USER.to_owned(),
+            service: None,
+            from_cache: false,
+        });
+        record_verdict(&verdict, pam_sys::PAM_AUTHINFO_UNAVAIL, now);
+        assert!(
+            cached_conclusion_for(USER, "", now).is_none(),
+            "a call without a service name must record nothing: an empty string \
+             would merge unrelated services into one key"
+        );
+    }
+
+    /// **Smoke test only.**  It reads source byte offsets, so it proves where
+    /// the arming statement is *written*, not that the compiled code runs it
+    /// there; the behavioural test above covers the ordering inside the helper.
+    ///
+    /// What it adds is the shape that test cannot reach: the bug this branch
+    /// removed armed the record in the *caller*, one statement before the
+    /// connect, which leaves every behavioural test green.
+    #[test]
+    fn the_verdict_record_is_armed_only_inside_the_helper() {
+        // No trailing comma: a caller-level arming written on one line
+        // (`*verdict = Some(Verdict { username: …, from_cache: false });`) has
+        // none inside the literal, and this guard must not depend on `cargo fmt`
+        // having split it.
+        const ARMING: &str = "from_cache: false";
+
+        let source = include_str!("pam_logic.rs");
+        // Only the production half of the file, for the same reason as
+        // `cache_lookup_precedes_daemon_contact`: the test modules contain the
+        // same identifiers inside string literals.
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+
+        let helper_start = production
+            .find("fn start_authentication<T, C, S>(")
+            .unwrap_or_else(|| panic!("invariant broken: `start_authentication` is gone"));
+        let helper_end = helper_start
+            + production
+                .get(helper_start..)
+                .and_then(|rest| rest.find("\n}\n"))
+                .unwrap_or_else(|| {
+                    panic!("invariant broken: `start_authentication` has no body end")
+                })
+            + "\n}\n".len();
+
+        let sites: Vec<usize> = production
+            .match_indices(ARMING)
+            // A comment that quotes the literal verbatim is not an arming site.
+            .filter(|(offset, _)| {
+                let line_start = production
+                    .get(..*offset)
+                    .and_then(|before| before.rfind('\n'))
+                    .map_or(0, |i| i + 1);
+                production
+                    .get(line_start..*offset)
+                    .is_some_and(|prefix| !prefix.trim_start().starts_with("//"))
+            })
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly one place may arm a real transaction; found {} at {sites:?} — \
+             a second one in a caller (e.g. before `start_authentication`) would \
+             record a local IPC failure as if the phone had been asked",
+            sites.len()
+        );
+        let Some(site) = sites.first().copied() else {
+            panic!("invariant broken: no arming site found");
+        };
+        assert!(
+            site >= helper_start && site < helper_end,
+            "the arming statement (byte {site}) must sit inside \
+             `start_authentication` (bytes {helper_start}..{helper_end}), after the \
+             connect and the send succeeded; arming in the caller records a verdict \
+             before the request reached the daemon"
         );
     }
 

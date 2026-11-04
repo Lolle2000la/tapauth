@@ -121,8 +121,7 @@
 #                must be rung a second time: both calls grant, the conversation
 #                is entered, and the daemon accepts exactly TWO connections.
 #                This is the documented limitation, and it fails if the window
-#                is widened past 800 ms or anchored later than the module's
-#                return.
+#                is widened past 800 ms.
 #
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
@@ -450,9 +449,9 @@ run_shape "duplicate-cross-service (window is per service, daemon asked twice)" 
 # return — comfortably outside the 500 ms, and `nanosleep` never undersleeps, so
 # load can only widen the margin.  Asserted: both calls grant, the conversation
 # was entered, and the daemon accepted exactly TWO connections (the phone was
-# rung twice).  It fails if the window is widened past 800 ms or anchored
-# anywhere later than the module's return.  `auth required` on the tapauth line
-# (not `sufficient`) so processing continues into the sleeper on success.
+# rung twice).  It fails if the window is widened past 800 ms.  `auth required`
+# on the tapauth line (not `sufficient`) so processing continues into the
+# sleeper on success.
 DUPLICATE_SLOW_SERVICE="tapauth-conv-duplicate-after-slow-module"
 cat > "$CONFDIR/$DUPLICATE_SLOW_SERVICE" <<EOF
 auth required $MODULE_PATH

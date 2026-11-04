@@ -833,8 +833,8 @@ int main(void) {
          * `pam_authenticate` only comes back ~800 ms after the module did.  The
          * window is anchored at the module's return, so the duplicate is already
          * well outside the 500 ms it covers and must ring the phone again
-         * (two accepts).  Widening the window past 800 ms, or anchoring it
-         * anywhere later than the module's return, turns this into one accept. */
+         * (two accepts).  Widening the window past 800 ms turns this into one
+         * accept. */
         const dup_step slow_module_steps[] = {
             {service, user, 0, PAM_SUCCESS},
             {service, user, 0, PAM_SUCCESS},
