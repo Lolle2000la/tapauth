@@ -3,16 +3,18 @@
  * prove the threaded-conversation path end to end.
  *
  * WHY THIS EXISTS
- *   `client-pam` picks between two GUI strategies at runtime:
+ *   `client-pam` picks between three GUI strategies at runtime:
  *
  *     - Threaded: a native worker thread calls `pam_get_authtok` (and therefore
  *       the host's conversation) while the calling thread waits for the phone.
+ *     - PreCollected: the host already holds the password, so the module
+ *       collects it on the calling thread and never contacts the daemon.
  *     - Sequential: the conversation is never touched; the module only waits
  *       for the daemon.
  *
  *   The choice is an allowlist keyed on the calling process (see
- *   `conversation_mode` in client-pam/src/pam_logic.rs).  Neither half of that
- *   is reachable from a Rust unit test: it needs a real libpam stack, a real
+ *   `conversation_mode` in client-pam/src/pam_logic.rs).  None of it is
+ *   reachable from a Rust unit test: it needs a real libpam stack, a real
  *   dynamically loaded module, and a process whose `/proc/self/exe` has the
  *   allowlisted name.
  *
@@ -26,27 +28,34 @@
  *     not fixed here.
  *   - A fake daemon listens on $TAPAUTHD_SOCK, accepts the module's connection
  *     and never answers, never closes: the module must reach the password path
- *     on its own rather than from a daemon response.
+ *     on its own rather than from a daemon response.  Its accept count is what
+ *     makes "did the module contact the daemon at all?" observable.
  *   - The conversation blocks in `PAM_PROMPT_ECHO_OFF` until a helper thread
  *     writes a password after ~200 ms, and records on which thread it ran and
  *     whether it had returned by the time `pam_authenticate` came back.
- *   - The script copies this binary to `$tmp/kscreenlocker_worker` and runs the
+ *     With $CONV_TEST_PRECOLLECT=1 it instead replays the stored password
+ *     immediately, which is what swaylock/gtklock/i3lock do.
+ *   - The script copies this binary to the allowlisted process name under test
+ *     (`kscreenlocker_worker`, `swaylock`, `gdm-session-worker`) and runs the
  *     copy, so `/proc/self/exe`'s basename is on the allowlist.  A symlink
  *     would not work: the kernel resolves it.
  *
  * CONTRACT
  *   Environment:
- *     CONV_TEST_CONFDIR  private PAM confdir (pam_start_confdir)
- *     TAPAUTHD_SOCK      the fake daemon's socket
- *     CONV_TEST_SERVICE  service file name inside CONV_TEST_CONFDIR
- *     CONV_TEST_EXPECT   `success` if pam_authenticate must return PAM_SUCCESS,
- *                        `non-success` if the stack must fail closed
- *
- *   The conversation assertions are the same for every shape: the harness is
- *   only ever run under an allowlisted process name, so it requires the
- *   conversation to have been entered, to have returned before
- *   `pam_authenticate` did (i.e. the worker was joined), and to have run off
- *   the calling thread.
+ *     CONV_TEST_CONFDIR     private PAM confdir (pam_start_confdir)
+ *     TAPAUTHD_SOCK         the fake daemon's socket
+ *     CONV_TEST_SERVICE     service file name inside CONV_TEST_CONFDIR
+ *     CONV_TEST_EXPECT      `success` if pam_authenticate must return
+ *                           PAM_SUCCESS, `non-success` if the stack must fail
+ *                           closed
+ *     CONV_TEST_MODE        which assertion set applies:
+ *                             threaded   — conversation entered, returned, off
+ *                                          the calling thread, daemon >= 1
+ *                             precollect — conversation entered, returned, ON
+ *                                          the calling thread, daemon == 0
+ *                             bypass     — conversation not entered, daemon == 0
+ *     CONV_TEST_PRECOLLECT  `1` makes the conversation replay the password
+ *                           immediately instead of waiting for the helper
  *
  *   Prints `RESULT: PASS` on success and exits 0.  Any other outcome prints a
  *   diagnostic, `RESULT: FAIL ...`, and exits non-zero.  Never install this.
@@ -72,6 +81,7 @@
 #define PASSWORD_DELAY_MS 200
 
 static int conv_pipe[2] = {-1, -1};
+static int precollect;
 static pthread_t main_thread;
 static atomic_int conv_entered;
 static atomic_int conv_returned;
@@ -109,6 +119,21 @@ static int test_conv(int num_msg, const struct pam_message **msg,
             atomic_store(&conv_ran_on_main_thread,
                          pthread_equal(pthread_self(), main_thread) ? 1 : 0);
             atomic_store(&conv_entered, 1);
+
+            if (precollect) {
+                /* swaylock/gtklock/i3lock shape: the host already holds the
+                 * password and the conversation is a synchronous replay.  No
+                 * pipe read, so the answer is in place before the caller can
+                 * do anything else. */
+                atomic_store(&conv_returned, 1);
+                out[i].resp = strdup(PASSWORD);
+                out[i].resp_retcode = 0;
+                if (out[i].resp == NULL) {
+                    free(out);
+                    return PAM_BUF_ERR;
+                }
+                break;
+            }
 
             char buf[64];
             ssize_t n;
@@ -277,6 +302,7 @@ int main(void) {
     const char *sock_path = getenv("TAPAUTHD_SOCK");
     const char *service = getenv("CONV_TEST_SERVICE");
     const char *expect = getenv("CONV_TEST_EXPECT");
+    const char *assert_mode = getenv("CONV_TEST_MODE");
 
     if (confdir == NULL || *confdir == '\0') {
         fail("CONV_TEST_CONFDIR is not set");
@@ -290,6 +316,9 @@ int main(void) {
     if (expect == NULL || *expect == '\0') {
         fail("CONV_TEST_EXPECT is not set (success|non-success)");
     }
+    if (assert_mode == NULL || *assert_mode == '\0') {
+        assert_mode = "threaded";
+    }
 
     int expect_success;
     if (strcmp(expect, "success") == 0) {
@@ -300,6 +329,18 @@ int main(void) {
         fail("CONV_TEST_EXPECT must be 'success' or 'non-success'");
         return 1; /* unreachable: fail() exits */
     }
+
+    int mode_threaded = strcmp(assert_mode, "threaded") == 0;
+    int mode_precollect = strcmp(assert_mode, "precollect") == 0;
+    int mode_bypass = strcmp(assert_mode, "bypass") == 0;
+    if (!mode_threaded && !mode_precollect && !mode_bypass) {
+        fail("CONV_TEST_MODE must be 'threaded', 'precollect' or 'bypass'");
+        return 1; /* unreachable: fail() exits */
+    }
+
+    const char *precollect_env = getenv("CONV_TEST_PRECOLLECT");
+    precollect = (precollect_env != NULL && strcmp(precollect_env, "1") == 0) ||
+                 mode_precollect;
 
     char exe[4096];
     ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof exe - 1);
@@ -319,6 +360,8 @@ int main(void) {
     printf("harness exe: %s\n", exe);
     printf("service    : %s\n", service);
     printf("expect     : %s\n", expect);
+    printf("mode       : %s\n", assert_mode);
+    printf("precollect : %d\n", precollect);
     printf("user       : %s\n", user);
     printf("confdir    : %s\n", confdir);
     printf("socket     : %s\n", sock_path);
@@ -331,9 +374,13 @@ int main(void) {
 
     start_fake_daemon(sock_path);
 
-    pthread_t helper;
-    if (pthread_create(&helper, NULL, password_helper, NULL) != 0) {
-        fail("pthread_create for the password helper");
+    /* Only the blocking conversation reads the pipe; the pre-collected replay
+     * answers immediately and must not depend on a helper thread. */
+    if (!precollect) {
+        pthread_t helper;
+        if (pthread_create(&helper, NULL, password_helper, NULL) != 0) {
+            fail("pthread_create for the password helper");
+        }
     }
 
     struct pam_conv conv = {test_conv, NULL};
@@ -379,18 +426,47 @@ int main(void) {
                 "expected pam_authenticate to fail closed, got PAM_SUCCESS\n");
         fail("pam_authenticate granted a stack that must fail closed");
     }
-    if (!entered) {
-        fail("the conversation was never entered (threaded mode not selected?)");
-    }
-    if (!returned) {
-        fail("the conversation had not returned when pam_authenticate returned "
-             "(worker not joined before returning)");
-    }
-    if (on_main) {
-        fail("the conversation ran on the pam_authenticate thread, not the worker");
-    }
-    if (accepted < 1) {
-        fail("the fake daemon accepted no connection");
+
+    /* The per-mode assertion set.  Each one pins a *different* strategy, so a
+     * regression that silently switches strategy fails on the count/thread
+     * assertions even when the stack verdict still matches. */
+    if (mode_threaded) {
+        if (!entered) {
+            fail("the conversation was never entered (threaded mode not selected?)");
+        }
+        if (!returned) {
+            fail("the conversation had not returned when pam_authenticate "
+                 "returned (worker not joined before returning)");
+        }
+        if (on_main) {
+            fail("the conversation ran on the pam_authenticate thread, not the worker");
+        }
+        if (accepted < 1) {
+            fail("the fake daemon accepted no connection");
+        }
+    } else if (mode_precollect) {
+        if (!entered) {
+            fail("the conversation was never entered (pre-collected replay not selected?)");
+        }
+        if (!returned) {
+            fail("the conversation had not returned when pam_authenticate returned");
+        }
+        if (!on_main) {
+            fail("the pre-collected replay ran off the pam_authenticate thread; a "
+                 "pre-collected host must be served synchronously on it");
+        }
+        if (accepted != 0) {
+            fail("a pre-collected host contacted the daemon: the password was "
+                 "already typed, so the phone must not be consulted");
+        }
+    } else {
+        if (entered) {
+            fail("the conversation was entered: a bypassed service must not "
+                 "touch the conversation");
+        }
+        if (accepted != 0) {
+            fail("a bypassed service contacted the daemon");
+        }
     }
     if (end_status != PAM_SUCCESS) {
         fail("pam_end failed");

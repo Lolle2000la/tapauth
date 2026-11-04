@@ -1,17 +1,19 @@
 #!/bin/bash
-# E2E: the threaded PAM conversation path of the PAM module, across the stack
+# E2E: the PAM conversation strategies of the PAM module, across the stack
 # shapes the module is installed on.
 #
 # `client-pam` chooses at runtime between driving the host's PAM conversation
 # from a worker thread (safe for hosts whose conversation stays answerable while
-# the calling thread is blocked) and leaving the conversation alone.  The choice
-# is an allowlist keyed on the calling process (`conversation_mode` in
-# client-pam/src/pam_logic.rs), so neither branch is reachable from a Rust unit
-# test: it needs a real libpam stack, a dynamically loaded `pam_tapauth.so`, and
-# a process whose `/proc/self/exe` basename is on the allowlist.
+# the calling thread is blocked), collecting a password the host already holds
+# without contacting the daemon (pre-collected hosts), and leaving the
+# conversation alone.  The choice is an allowlist keyed on the calling process
+# (`conversation_mode` in client-pam/src/pam_logic.rs), so none of the branches
+# is reachable from a Rust unit test: it needs a real libpam stack, a
+# dynamically loaded `pam_tapauth.so`, and a process whose `/proc/self/exe`
+# basename is on the allowlist.
 #
 # The thread strategy and the return-code policy have to hold *together*, so the
-# conversation half is exercised against three real stacks:
+# conversation half is exercised against these real stacks:
 #
 #   sufficient   auth sufficient <module>
 #                auth required <token-check> expected=<pw> marker=<tmp>/token-seen
@@ -38,6 +40,21 @@
 #                optional pam_permit success vote would grant the stack.  The
 #                module must not grant here.
 #
+#   pre-collect  auth sufficient <module>       (harness run as `swaylock`)
+#                auth required <token-check> expected=<pw> marker=…
+#                CONV_TEST_PRECOLLECT=1 makes the conversation replay the
+#                password immediately, like swaylock/gtklock/i3lock.  The module
+#                must read it on the calling thread and hand it on *without
+#                contacting the daemon*: daemon accept count must stay 0.
+#
+#   gdm reauth   the service file is `gdm-password` and the harness runs as
+#                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
+#                unlock must be offered the phone (threaded, daemon >= 1).
+#
+#   gdm login    the same service and binary without the reauth variable: the
+#                display-manager bypass must still skip it (conversation not
+#                entered, daemon 0, and the next module sees no token).
+#
 # This script therefore:
 #   1. builds `libclient_pam.so` release with `dev-socket-override` so the
 #      module talks to a socket under our control instead of /run/tapauthd;
@@ -45,10 +62,11 @@
 #      scripts/ci/conv_thread_token_check.c (the token-check module) into $TMP;
 #   3. for each shape, writes a private confdir service file that loads the
 #      module and the token check by absolute path, copies the harness (not a
-#      symlink — the kernel resolves /proc/self/exe) to `kscreenlocker_worker`,
-#      the allowlisted name, runs it, and asserts `RESULT: PASS`, the stack
-#      verdict, the conversation having run on a worker thread, and — where the
-#      stack has one — that the token check saw the cached password;
+#      symlink — the kernel resolves /proc/self/exe) to the allowlisted name
+#      under test, runs it with the matching CONV_TEST_MODE assertion set, and
+#      asserts `RESULT: PASS`, the stack verdict, the strategy actually taken,
+#      and — where the stack has one — that the token check saw the cached
+#      password;
 #   4. runs the same binary under a name that is NOT allowlisted and asserts it
 #      does not pass, so step 3 cannot succeed vacuously.
 #
@@ -113,19 +131,28 @@ THREADED_BIN="$TMP_DIR/kscreenlocker_worker"
 cp "$HARNESS_BIN" "$THREADED_BIN"
 chmod +x "$THREADED_BIN"
 
-# run_shape <label> <service> <expect> <marker-path-or-empty>
+# run_shape <label> <binary> <service> <expect> <marker-path-or-empty> <assert-mode> [VAR=VAL...]
 #
-# Runs the allowlisted copy against an already written service file and asserts
-# the harness reported PASS, and — when the stack contains the token check —
-# that the token check ran *and* saw the cached password.
+# Runs the harness copy named <binary> against an already written service file
+# and asserts it reported PASS, that the strategy under test actually ran (the
+# harness enforces the per-mode conversation assertions), and — when the stack
+# contains the token check — that the token check saw the expected password.
 run_shape() {
-    local label="$1" service="$2" expect="$3" marker="$4"
+    local label="$1" bin="$2" service="$3" expect="$4" marker="$5" assert_mode="$6"
+    shift 6
+    local -a extra_env=()
+    local kv
+    for kv in "$@"; do
+        extra_env+=("$kv")
+    done
 
-    echo "==> ${label}: running the harness as 'kscreenlocker_worker'"
+    echo "==> ${label}: running the harness as '$(basename "$bin")' [${assert_mode}]"
     set +e
     local out rc
-    out="$(CONV_TEST_SERVICE="$service" CONV_TEST_EXPECT="$expect" \
-        timeout 15 "$THREADED_BIN" 2>&1)"
+    out="$(env CONV_TEST_MODE="$assert_mode" \
+        ${extra_env[@]+"${extra_env[@]}"} \
+        CONV_TEST_SERVICE="$service" CONV_TEST_EXPECT="$expect" \
+        timeout 15 "$bin" 2>&1)"
     rc=$?
     set -e
     echo "$out"
@@ -159,6 +186,24 @@ run_shape() {
     fi
 }
 
+# assert_marker <label> <marker> <expected-verdict>
+#
+# For stacks where the token check must NOT see a token (a bypassed service):
+# its marker still proves the module ran, and its verdict proves the previous
+# module neither collected nor cached anything.
+assert_marker() {
+    local label="$1" marker="$2" expected="$3"
+    if [ ! -f "$marker" ]; then
+        echo "❌ ERROR: ${label}: the token-check module never ran (no $marker)."
+        exit 1
+    fi
+    if ! grep -qx "$expected" "$marker"; then
+        echo "❌ ERROR: ${label}: the token-check module reported '$(cat "$marker")',"
+        echo "   expected '$expected'."
+        exit 1
+    fi
+}
+
 # ---------------------------------------------------------------- sufficient --
 SUFFICIENT_SERVICE="tapauth-conv-sufficient"
 SUFFICIENT_MARKER="$TMP_DIR/token-seen-sufficient"
@@ -167,7 +212,8 @@ auth sufficient $MODULE_PATH
 auth required $TOKEN_CHECK_SO expected=$PASSWORD marker=$SUFFICIENT_MARKER
 account required pam_permit.so
 EOF
-run_shape "sufficient (password fallback)" "$SUFFICIENT_SERVICE" success "$SUFFICIENT_MARKER"
+run_shape "sufficient (password fallback)" "$THREADED_BIN" "$SUFFICIENT_SERVICE" \
+    success "$SUFFICIENT_MARKER" threaded
 
 # ------------------------------------------------------------------ required --
 REQUIRED_SERVICE="tapauth-conv-required"
@@ -179,7 +225,8 @@ account required pam_permit.so
 EOF
 # Fail-closed: the stack must not grant, but the token still reaches the next
 # module (which is why the marker is asserted inside run_shape).
-run_shape "required (fail closed)" "$REQUIRED_SERVICE" non-success "$REQUIRED_MARKER"
+run_shape "required (fail closed)" "$THREADED_BIN" "$REQUIRED_SERVICE" \
+    non-success "$REQUIRED_MARKER" threaded
 
 # -------------------------------------------------------------------- bypass --
 BYPASS_SERVICE="tapauth-conv-bypass"
@@ -190,7 +237,61 @@ account required pam_permit.so
 EOF
 # No token check in this stack, so no marker: the assertions are the verdict and
 # the conversation having run.
-run_shape "bypass (no grant)" "$BYPASS_SERVICE" non-success ""
+run_shape "bypass (no grant)" "$THREADED_BIN" "$BYPASS_SERVICE" non-success "" threaded
+
+# --------------------------------------------------------------- pre-collect --
+# swaylock/gtklock/i3lock read the password *before* pam_authenticate and their
+# conversation replays it.  The module must collect that token on the calling
+# thread and hand it to the next module without ever contacting the daemon: the
+# user already chose the password, so ringing the phone could only time out.
+# The assertion that discriminates this from a threaded regression is the
+# daemon-accept count being zero (the harness's `precollect` set).
+PRECOLLECT_BIN="$TMP_DIR/swaylock"
+cp "$HARNESS_BIN" "$PRECOLLECT_BIN"
+chmod +x "$PRECOLLECT_BIN"
+
+PRECOLLECT_SERVICE="tapauth-conv-precollect"
+PRECOLLECT_MARKER="$TMP_DIR/token-seen-precollect"
+cat > "$CONFDIR/$PRECOLLECT_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+auth required $TOKEN_CHECK_SO expected=$PASSWORD marker=$PRECOLLECT_MARKER
+account required pam_permit.so
+EOF
+run_shape "pre-collect (no phone, token handed on)" "$PRECOLLECT_BIN" \
+    "$PRECOLLECT_SERVICE" success "$PRECOLLECT_MARKER" precollect \
+    CONV_TEST_PRECOLLECT=1
+
+# ------------------------------------------------------------------ gdm reauth --
+# A GDM reauthentication (unlock / admin prompt of a running session) must NOT
+# take the display-manager bypass, and its conversation is answerable from a
+# worker thread: the unlock prompt is where the phone has to be offered.
+GDM_BIN="$TMP_DIR/gdm-session-worker"
+cp "$HARNESS_BIN" "$GDM_BIN"
+chmod +x "$GDM_BIN"
+
+GDM_SERVICE="gdm-password"
+GDM_REAUTH_MARKER="$TMP_DIR/token-seen-gdm-reauth"
+cat > "$CONFDIR/$GDM_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+auth required $TOKEN_CHECK_SO expected=$PASSWORD marker=$GDM_REAUTH_MARKER
+account required pam_permit.so
+EOF
+run_shape "gdm-password reauth (phone offered)" "$GDM_BIN" "$GDM_SERVICE" \
+    success "$GDM_REAUTH_MARKER" threaded GDM_SESSION_FOR_REAUTH=1
+
+# ------------------------------------------------------------- gdm login ------
+# The same service without the reauth variable is a *login*: the module must
+# keep skipping it so the session can populate PAM_AUTHTOK and unlock the
+# keyring.  A regression that widened the reauth exemption would connect here.
+GDM_LOGIN_MARKER="$TMP_DIR/token-seen-gdm-login"
+cat > "$CONFDIR/$GDM_SERVICE" <<EOF
+auth sufficient $MODULE_PATH
+auth required $TOKEN_CHECK_SO expected=$PASSWORD marker=$GDM_LOGIN_MARKER
+account required pam_permit.so
+EOF
+run_shape "gdm-password login (guard bypass)" "$GDM_BIN" "$GDM_SERVICE" \
+    non-success "" bypass
+assert_marker "gdm-password login (guard bypass)" "$GDM_LOGIN_MARKER" no-token
 
 # Positive control: an unknown process name must NOT reach the threaded path.
 # The module then waits out the GUI timeout, so a short timeout is enough.
@@ -200,8 +301,8 @@ chmod +x "$CONTROL_BIN"
 
 echo "==> Control: the same harness as 'not_allowlisted_host' must not pass"
 set +e
-CONTROL_OUT="$(CONV_TEST_SERVICE="$SUFFICIENT_SERVICE" CONV_TEST_EXPECT=success \
-    timeout 3 "$CONTROL_BIN" 2>&1)"
+CONTROL_OUT="$(CONV_TEST_MODE=threaded CONV_TEST_SERVICE="$SUFFICIENT_SERVICE" \
+    CONV_TEST_EXPECT=success timeout 3 "$CONTROL_BIN" 2>&1)"
 CONTROL_RC=$?
 set -e
 echo "$CONTROL_OUT"
@@ -211,4 +312,4 @@ if [ "$CONTROL_RC" -eq 0 ] || grep -q '^RESULT: PASS$' <<<"$CONTROL_OUT"; then
     exit 1
 fi
 
-echo "✅ PAM conversation threading E2E passed (sufficient, required, bypass, control)"
+echo "✅ PAM conversation E2E passed (sufficient, required, bypass, pre-collect, gdm reauth, gdm login, control)"
