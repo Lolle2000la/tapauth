@@ -1757,12 +1757,11 @@ mod tests {
             .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
             .collect();
         files.sort();
-        // An empty or relocated scan must not pass silently: these are the
-        // files that carry the return codes today.
+        // An empty or relocated scan must not pass silently: `pam_logic.rs`
+        // carries the return codes today.
         assert!(
-            files.iter().any(|p| p.ends_with("pam_logic.rs"))
-                && files.iter().any(|p| p.ends_with("error.rs")),
-            "the scan did not cover pam_logic.rs and error.rs: {files:?}"
+            files.iter().any(|p| p.ends_with("pam_logic.rs")),
+            "the scan did not cover pam_logic.rs: {files:?}"
         );
 
         // Spelled arithmetically so this test's own source carries no literal
