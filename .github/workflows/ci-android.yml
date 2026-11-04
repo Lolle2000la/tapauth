@@ -43,7 +43,7 @@ jobs:
   # ── 1. Android Mobile Build & APK Generation ─────────────────────────────────
   build-android:
     name: Build Android Native Libraries and APKs
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
@@ -153,7 +153,7 @@ jobs:
   # ── 2. Ubuntu Debian Package Build (Parallel) ────────────────────────────────
   build-pkg-ubuntu:
     name: Build Ubuntu Debian Package (.deb)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
@@ -208,7 +208,7 @@ jobs:
   # ── 3. Fedora RPM Package Build (Parallel, with --nocheck & cache) ────────────
   build-pkg-fedora:
     name: Build Fedora RPM Package (.rpm)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
@@ -298,7 +298,7 @@ jobs:
   # ── 4. Arch Linux Package Build (Parallel) ───────────────────────────────────
   build-pkg-arch:
     name: Build Arch Linux Package (.pkg.tar.zst)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
@@ -390,7 +390,7 @@ jobs:
   e2e:
     name: Real-Android E2E Tests (Ubuntu, Fedora, Arch)
     needs: [build-android, build-pkg-ubuntu, build-pkg-fedora, build-pkg-arch]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
