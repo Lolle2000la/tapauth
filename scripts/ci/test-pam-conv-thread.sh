@@ -115,6 +115,11 @@ fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tapauth-conv-thread.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# Every shape that actually passed, as "<short name>=pass".  The final summary
+# is derived from this array so a shape that is no longer run (or that stopped
+# being reached) cannot stay listed in a hand-maintained trailer.
+SHAPES=()
+
 echo "==> Building libclient_pam.so (release, --features dev-socket-override)"
 cargo build --quiet --release -p client-pam --features dev-socket-override
 
@@ -201,6 +206,11 @@ run_shape() {
             exit 1
         fi
     fi
+
+    # Past every assertion: this shape is a genuine pass.  The short name is the
+    # label up to the parenthesised detail, e.g. "sufficient (password
+    # fallback)" -> "sufficient".
+    SHAPES+=("${label%% (*}=pass")
 }
 
 # assert_marker <label> <marker> <expected-verdict>
@@ -347,5 +357,14 @@ if [ "$CONTROL_RC" -eq 0 ] || grep -q '^RESULT: PASS$' <<<"$CONTROL_OUT"; then
     echo "❌ ERROR: a non-allowlisted process reached the threaded conversation path"
     exit 1
 fi
+echo "✅ control (not_allowlisted_host): did not reach the threaded conversation path"
+SHAPES+=("control=pass")
 
-echo "✅ PAM conversation E2E passed (sufficient, required, bypass, pre-collect, grant, gdm reauth, gdm login, control)"
+SHAPE_LIST=""
+for shape in "${SHAPES[@]}"; do
+    if [ -n "$SHAPE_LIST" ]; then
+        SHAPE_LIST+=", "
+    fi
+    SHAPE_LIST+="$shape"
+done
+echo "✅ PAM conversation E2E passed (${#SHAPES[@]} shapes: $SHAPE_LIST)"
