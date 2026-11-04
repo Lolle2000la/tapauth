@@ -698,9 +698,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     //
     // This is deliberately a skip, not a wait: the user has already typed the
     // password, so ringing the phone would be misleading and could only ever
-    // end in a timeout.  Returning `PAM_AUTHINFO_UNAVAIL` (never `PAM_IGNORE`)
-    // makes the `sufficient` line fall through to the password module and fails
-    // a `required` line closed.  If the token cannot be read (the host's
+    // end in a timeout.  The skip returns `PAM_AUTHINFO_UNAVAIL` (never
+    // `PAM_IGNORE`): a `sufficient` line treats that as `ignore`, exactly as
+    // `PAM_IGNORE` would, so the next module still runs; a `required` line
+    // fails closed.  If the token cannot be read (the host's
     // conversation refused it, or nothing was collected) the next module simply
     // prompts as it would without this module.
     if mode == ConversationMode::PreCollected {
@@ -1748,10 +1749,11 @@ mod tests {
     /// this crate — not just `pam_logic.rs` and `lib.rs` — against
     /// reintroducing `PAM_IGNORE`, by identifier and by its numeric value.
     ///
-    /// The numeric half is the one that matters for regressions: the mapping
-    /// that would bring the bypass back is `PamError::Ignore` in `error.rs`,
-    /// which is a single edit away from returning the bare code, and a
-    /// name-only scan would miss it.
+    /// The numeric half is the one that matters for regressions: the vectors
+    /// that remain are a `pam_sys::PAM_IGNORE` re-export reaching a `return`, or
+    /// a bare literal equal to PAM_IGNORE's value, in any `client-pam/src/*.rs`
+    /// — either is a single edit away from the bypass this guards, and a
+    /// name-only scan would miss the numeric form.
     #[test]
     fn test_module_source_contains_no_pam_ignore_return() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
@@ -1791,6 +1793,52 @@ mod tests {
             findings.is_empty(),
             "the module must never return PAM_IGNORE:\n{}",
             findings.join("\n")
+        );
+    }
+
+    /// The whole-crate scan above returns empty for two independent reasons —
+    /// every `PAM_IGNORE` in this crate is prose inside a comment, and no bare
+    /// literal holds its value — so it would stay green even if the stripper or
+    /// either detector were broken.  Prove both detectors fire on a synthetic
+    /// snippet, and that a comment or a string naming the code does not count.
+    #[test]
+    fn test_pam_ignore_scan_detects_a_real_return() {
+        // Spelled arithmetically so this test's own source carries no literal
+        // for its own scan to find (as in the whole-crate scan above).
+        let ignore_code: u128 = 5 * 5;
+
+        let source = format!(
+            "// PAM_IGNORE in a comment is prose, not a return.\n\
+             /* PAM_IGNORE and {ignore_code} in a block comment, too. */\n\
+             let prose = \"return pam_sys::PAM_IGNORE; return {ignore_code};\";\n\
+             let code = {{ let x = pam_sys::PAM_IGNORE; x }};\n\
+             return {ignore_code}u32;\n"
+        );
+        let cleaned = stripped_source(&source);
+
+        assert_eq!(
+            pam_ignore_identifiers(&cleaned),
+            vec![(
+                4,
+                "let code = { let x = pam_sys::PAM_IGNORE; x };".to_owned()
+            )],
+            "the identifier scan must report the real return and neither the \
+             comment nor the string"
+        );
+
+        assert_eq!(
+            numeric_literals_equal_to(&cleaned, ignore_code),
+            vec![(5, format!("{ignore_code}u32"))],
+            "the numeric scan must report the bare value and neither the \
+             comment nor the string"
+        );
+
+        // The negative half: prose alone must never be reported, which is what
+        // makes the whole-crate assertion meaningful today.
+        assert_eq!(
+            pam_ignore_identifiers(&stripped_source("// PAM_IGNORE\n")),
+            Vec::new(),
+            "a comment naming PAM_IGNORE is not a return"
         );
     }
 }

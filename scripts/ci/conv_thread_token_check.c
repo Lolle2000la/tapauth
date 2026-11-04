@@ -21,13 +21,15 @@
  *   - Writes the verdict to the path given by the `marker=` option, on every
  *     path, so the script can prove the module ran at all:
  *       match     — the cached token was readable and equal to `expected=`
- *       mismatch  — the cached token was readable but different
+ *       mismatch  — the cached token was readable but different (or the stack
+ *                   line carried no `expected=`, which can never match)
  *       no-token  — no cached token was visible to this module
  *   - Returns PAM_SUCCESS only on a match.
  *
- *   `expected=` is compared byte for byte against the token.  The token itself
- *   is never written out; the marker only records the verdict, so a failing
- *   run does not leave the password on disk.
+ *   `expected=` is compared byte for byte against the token, and a line that
+ *   omits it can never produce a `match`.  The token itself is never written
+ *   out; the marker only records the verdict, so a failing run does not leave
+ *   the password on disk.
  *
  * Never install this.  It is compiled into a temporary directory as a shared
  * object and referenced by absolute path from a private PAM confdir.
@@ -73,7 +75,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
     const char *verdict;
     if (ret != PAM_SUCCESS || item == NULL) {
         verdict = "no-token";
-    } else if (expected == NULL || strcmp((const char *)item, expected) == 0) {
+    } else if (expected != NULL && strcmp((const char *)item, expected) == 0) {
         verdict = "match";
     } else {
         verdict = "mismatch";
