@@ -131,7 +131,7 @@ cargo build --manifest-path client-pam/Cargo.toml
 
 ### PAM Module (`client-pam`)
 - Built as `libclient_pam.so`, installed to distro-specific PAM dir as `pam_tapauth.so`
-- Returns `PAM_IGNORE` on failure (not `PAM_AUTH_ERR`) to allow password fallback
+- Never returns `PAM_IGNORE`: Linux-PAM records no failure for it, so on a stack like `auth required pam_tapauth.so` + `auth optional pam_permit.so` + `auth required pam_env.so` the whole stack would succeed. Failures map to `PAM_AUTHINFO_UNAVAIL` (no paired device, skip, timeout, daemon unreachable), `PAM_AUTH_ERR` (processing failure), `PAM_PERM_DENIED` (explicit denial on the phone) or `PAM_USER_UNKNOWN` (username lookup failed), which still fall through on a `sufficient` line (`default=ignore`) but fail closed on a `required` one
 - Wraps all IPC messages in `IpcEnvelope`, unwraps `PamResponse` from envelope
 - Custom PAM FFI bindings in `pam_sys.rs` (not `pam-bindings` crate — known issues with pamtester)
 - **GUI (no-TTY) contexts use one of two flows**:

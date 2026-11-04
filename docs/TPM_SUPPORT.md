@@ -393,7 +393,8 @@ The SRK is created using the TPM's endorsement hierarchy and is unique to each T
 **PAM Module Behavior:**
 - Receives error response from daemon
 - Displays: "TapAuth: Error - Failed to load keypair: [details]. Please run tapauth-config to regenerate keys."
-- Returns `PAM_IGNORE` to allow password fallback
+- Returns `PAM_AUTH_ERR` (never `PAM_IGNORE`) so the attempt fails closed; on a
+  `sufficient` line the stack still falls through to password
 
 ## Troubleshooting
 

@@ -15,9 +15,9 @@ mod ffi {
 }
 
 pub use ffi::{
-    pam_get_authtok, PAM_AUTHTOK, PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_IGNORE,
-    PAM_PERM_DENIED, PAM_SERVICE, PAM_SUCCESS, PAM_SYSTEM_ERR, PAM_TEXT_INFO, PAM_USER,
-    PAM_USER_UNKNOWN,
+    pam_get_authtok, PAM_AUTHINFO_UNAVAIL, PAM_AUTHTOK, PAM_AUTH_ERR, PAM_BUF_ERR, PAM_CONV_ERR,
+    PAM_ERROR_MSG, PAM_PERM_DENIED, PAM_SERVICE, PAM_SUCCESS, PAM_SYSTEM_ERR, PAM_TEXT_INFO,
+    PAM_USER, PAM_USER_UNKNOWN,
 };
 
 pub type PamHandle = ffi::pam_handle_t;
@@ -260,6 +260,20 @@ impl<'a> PamConversation<'a> {
             pamh,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Build a conversation wrapper without a PAM handle, for unit tests.
+    ///
+    /// `send_message`/`prompt_user` call `get_conv`, which already rejects a
+    /// null handle with `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are
+    /// clean no-ops here. Only the return-code logic that takes a
+    /// `&PamConversation` can be exercised this way.
+    #[cfg(test)]
+    pub unsafe fn dummy() -> Self {
+        Self {
+            pamh: std::ptr::null_mut(),
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     /// Send an informational message to the user.

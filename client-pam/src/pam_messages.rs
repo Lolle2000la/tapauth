@@ -20,6 +20,7 @@ mod locales_codegen {
 pub struct PamMessages {
     waiting_for_tap_skip: String,
     waiting_for_tap: String,
+    waiting_for_tap_password: String,
     cannot_connect: String,
     communication_error: String,
     connection_lost: String,
@@ -94,6 +95,7 @@ impl PamMessages {
         Self {
             waiting_for_tap_skip: tr_val("pam-waiting-tap-skip"),
             waiting_for_tap: tr_val("pam-waiting-tap"),
+            waiting_for_tap_password: tr_val("pam-waiting-tap-password"),
             cannot_connect: tr_val("pam-cannot-connect"),
             communication_error: tr_val("pam-communication-error"),
             connection_lost: tr_val("pam-connection-lost"),
@@ -110,6 +112,9 @@ impl PamMessages {
     }
     pub fn waiting_for_tap(&self) -> &str {
         &self.waiting_for_tap
+    }
+    pub fn waiting_for_tap_password(&self) -> &str {
+        &self.waiting_for_tap_password
     }
     pub fn cannot_connect(&self) -> &str {
         &self.cannot_connect

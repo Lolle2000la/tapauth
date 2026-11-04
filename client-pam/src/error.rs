@@ -1,9 +1,6 @@
-//! PAM-specific error types and mapping to PAM return codes.
+//! PAM-specific error types.
 
-use std::os::raw::c_int;
 use thiserror::Error;
-
-use crate::pam_sys;
 
 /// Errors that can occur during PAM authentication.
 #[derive(Error, Debug)]
@@ -47,29 +44,4 @@ pub enum PamError {
     /// Configuration error (file missing, invalid perms, parse error)
     #[error("config error: {0}")]
     ConfigError(String),
-}
-
-impl PamError {
-    /// Convert PAM error to a PAM return code.
-    ///
-    /// Mapping:
-    /// - `ExplicitDenied` → `PAM_PERM_DENIED`
-    /// - `UserUnknown` → `PAM_USER_UNKNOWN`
-    /// - `Timeout`, `Ipc*`, `DaemonError`, `ProtoDecode`, `Ignore` → `PAM_IGNORE`
-    /// - `ConfigError` → `PAM_SYSTEM_ERR`
-    pub fn to_pam_code(&self) -> c_int {
-        match self {
-            PamError::ExplicitDenied => pam_sys::PAM_PERM_DENIED,
-            PamError::UserUnknown => pam_sys::PAM_USER_UNKNOWN,
-            PamError::ConfigError(_) => pam_sys::PAM_SYSTEM_ERR,
-            PamError::Conversation(_) => pam_sys::PAM_CONV_ERR,
-            // All transient/daemon errors map to IGNORE to allow password fallback
-            PamError::IpcConnectTimeout
-            | PamError::IpcIo(_)
-            | PamError::ProtoDecode(_)
-            | PamError::DaemonError(_)
-            | PamError::Timeout
-            | PamError::Ignore => pam_sys::PAM_IGNORE,
-        }
-    }
 }

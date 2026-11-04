@@ -1060,7 +1060,9 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     fi
 
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
-    # PAM_IGNORE must fall through to pam_unix, and a grant must skip it.
+    # PAM_AUTHINFO_UNAVAIL is expanded to `ignore` by the [success=1
+    # default=ignore] flag below, so it falls through to pam_unix, and a grant
+    # must skip it.
     #
     # NOTE 1: the module deliberately yields as soon as an authtok is available
     # ("password submission takes absolute precedence over any concurrent
@@ -1069,7 +1071,7 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     # a jump that overshoots the end of the stack makes Linux-PAM return
     # PAM_PERM_DENIED even though the module succeeded.
     echo ""
-    echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, IGNORE falls back)..."
+    echo "==> Phase 2e: Mixed-stack PAM semantics (grant skips password, skip verdict falls back)..."
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2b).
     settle_for_dedup "Phase 2b"
     printf 'auth [success=1 default=ignore] %s\nauth required pam_unix.so nullok\nauth required pam_permit.so\naccount required pam_permit.so\n' "$PAM_LIB" > "$PAM_MIXED_CONFIG_PATH"
@@ -1466,7 +1468,7 @@ fi
 
 # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 5b).
 settle_for_dedup "Phase 5b"
-echo "==> Verifying authentication returns PAM_IGNORE when no devices are configured..."
+echo "==> Verifying the daemon reports OUTCOME=IGNORE when no devices are configured..."
 UNPAIRED_AUTH_LOG="${TEST_DIR}/unpaired-cli.log"
 "$CLI_BIN" pam-auth "$TEST_USER" 5 > "$UNPAIRED_AUTH_LOG" 2>&1 || true
 cat "$UNPAIRED_AUTH_LOG"
@@ -1480,7 +1482,8 @@ else
 fi
 
 # Mixed-stack password fallback with the real PAM module: with no paired
-# devices TapAuth yields PAM_IGNORE, so the stack must fall through to
+# devices TapAuth yields PAM_AUTHINFO_UNAVAIL, which the [success=1
+# default=ignore] flag below expands to `ignore`, so the stack falls through to
 # pam_unix and the LOCAL PASSWORD decides.
 if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     echo ""
@@ -1515,14 +1518,14 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
     set -e
 
     if [ "$FALLBACK_OK_EXIT" -eq 0 ]; then
-        echo "✅ PAM_IGNORE fell through to pam_unix; correct password authenticated."
+        echo "✅ TapAuth's skip verdict fell through to pam_unix; correct password authenticated."
         PAM_FALLBACK_OK=1
     else
-        echo "❌ ERROR: password fallback did not work after TapAuth IGNORE (rc=$FALLBACK_OK_EXIT)."
+        echo "❌ ERROR: password fallback did not work after the TapAuth skip verdict (rc=$FALLBACK_OK_EXIT)."
         exit 1
     fi
     if [ "$FALLBACK_BAD_EXIT" -ne 0 ]; then
-        echo "✅ Wrong password correctly rejected after TapAuth IGNORE."
+        echo "✅ Wrong password correctly rejected after TapAuth's skip verdict (PAM_AUTHINFO_UNAVAIL)."
     else
         echo "❌ ERROR: wrong password was accepted — password module did not enforce!"
         exit 1
@@ -1625,7 +1628,7 @@ echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
 echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
 echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
 echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
-echo "║  Phase 6: Device Removal & PAM_IGNORE:           PASSED       ║"
+echo "║  Phase 6: Device Removal & Ignore Outcome:       PASSED       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"
