@@ -75,17 +75,30 @@ use std::time::{Duration, Instant};
 /// as the same user takes seconds — no human-initiated retry can fall inside
 /// the window, which is what keeps a genuine second attempt from being
 /// answered by a cached failure.
+///
+/// Where the window starts: at this module's **return**.  `authenticate` records
+/// the code only after `authenticate_inner` has handed it back, so the 500 ms
+/// runs from the end of the `pam_authenticate` call, not from the moment the
+/// transaction concluded.  That is what matches the host behaviour it exists
+/// for (the duplicate is dispatched the instant the first call returns), but it
+/// also bounds the suppression: a module *after* `pam_tapauth.so` in the same
+/// stack that blocks for longer than 500 ms pushes the host's duplicate outside
+/// the window, and that duplicate rings the phone again.  Suppression is a
+/// heuristic for a host that re-enters immediately, not a guarantee that a
+/// second `pam_authenticate` in the same process is always answered locally.
 const VERDICT_REUSE_WINDOW: Duration = Duration::from_millis(500);
 
 /// The verdict this process concluded last, with the user and service it
 /// belongs to.
 ///
 /// Process-wide because the duplicate transaction comes from the same host
-/// process.  Keyed on `(username, service)` because that is exactly the
-/// transaction the host is retrying: the duplicate is the same user against the
-/// same PAM service, so a different user *or* a different service must take the
-/// normal path and ring the phone.  The scope is deliberately no wider than the
-/// one transaction being repeated.
+/// process.  Keyed on `(username, service)` because the duplicate is the same
+/// user against the same PAM service, so a different user *or* a different
+/// service takes the normal path and rings the phone.  The remaining assumption
+/// is that no legitimate host performs an *independent* authentication for the
+/// same user and service within 500 ms of a concluded one: the key cannot tell
+/// such a request apart from a duplicate.  A new process always misses, because
+/// `pam_end` unloads the module and the cache dies with it.
 struct LastConclusion {
     concluded_at: Instant,
     username: String,
@@ -120,8 +133,10 @@ struct Verdict {
 /// any code, not just a success.
 ///
 /// Pure so the window can be tested without touching the process-wide cache.
-/// `saturating_duration_since` keeps a clock anomaly (a recorded instant later
-/// than `now`, e.g. an NTP step) from panicking; it reads as "no time passed".
+/// `Instant` is `CLOCK_MONOTONIC` and never steps backwards, so the subtraction
+/// can only be unavailable when the recorded instant came from another clock
+/// origin (or is a later `Instant` constructed in a test); saturating reads
+/// that as "no time passed" instead of panicking.
 fn reusable_conclusion(
     prev: &LastConclusion,
     username: &str,
@@ -149,18 +164,23 @@ fn cached_from(
     username: &str,
     service: &str,
     now: Instant,
-) -> Option<c_int> {
+) -> Option<(c_int, Duration)> {
     let Ok(guard) = lock.lock() else {
         return None;
     };
-    guard
-        .as_ref()
-        .and_then(|prev| reusable_conclusion(prev, username, service, now))
+    guard.as_ref().and_then(|prev| {
+        reusable_conclusion(prev, username, service, now)
+            .map(|code| (code, now.saturating_duration_since(prev.concluded_at)))
+    })
 }
 
-/// The cached verdict for `(username, service)` at `now`, if it may be
-/// replayed.
-fn cached_conclusion_for(username: &str, service: &str, now: Instant) -> Option<c_int> {
+/// The cached verdict for `(username, service)` at `now`, together with how long
+/// ago it was recorded, if it may be replayed.
+///
+/// The age is the distance from the recorded instant to `now` — i.e. measured
+/// from this module's return, which is where `authenticate` records it — so it
+/// is what the hit is logged with.
+fn cached_conclusion_for(username: &str, service: &str, now: Instant) -> Option<(c_int, Duration)> {
     cached_from(&LAST_CONCLUSION, username, service, now)
 }
 
@@ -169,6 +189,9 @@ fn cached_conclusion_for(username: &str, service: &str, now: Instant) -> Option<
 /// This is the *last* conclusion, so a non-success code overwrites an earlier
 /// success: a later denial must invalidate the cached grant, never sit behind
 /// it.
+///
+/// `now` is the moment the module returned to the host, which is the anchor of
+/// [`VERDICT_REUSE_WINDOW`] — not the moment the transaction concluded.
 fn record_conclusion(username: &str, service: &str, code: c_int, now: Instant) {
     if let Ok(mut guard) = LAST_CONCLUSION.lock() {
         *guard = Some(LastConclusion {
@@ -178,6 +201,48 @@ fn record_conclusion(username: &str, service: &str, code: c_int, now: Instant) {
             code,
         });
     }
+}
+
+/// Why a transaction never reached the daemon.
+enum StartError {
+    Connect(crate::ipc_client::IpcError),
+    Send(crate::ipc_client::IpcError),
+}
+
+/// Connect, put the authenticate request on the wire, and only then arm
+/// `verdict`.
+///
+/// The ordering is the point: the record exists so a duplicate
+/// `pam_authenticate` can replay a conclusion *the daemon* reached, so it must
+/// not be armed by a local IPC failure.  A missing socket or a failed write
+/// says nothing about the phone — arming there would let a later duplicate
+/// inherit that `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry
+/// must dial the socket again instead of being answered from the record.
+///
+/// `connect` and `send` are parameters so both failure paths are testable
+/// without a daemon (`verdict_reuse_tests`); production passes
+/// `IpcClient::connect_nonblocking` and `IpcClient::send_authenticate_start`.
+fn start_authentication<T, C, S>(
+    verdict: &mut Option<Verdict>,
+    username: &str,
+    service: Option<&str>,
+    connect: C,
+    send: S,
+) -> Result<T, StartError>
+where
+    C: FnOnce() -> Result<T, crate::ipc_client::IpcError>,
+    S: FnOnce(&mut T) -> Result<(), crate::ipc_client::IpcError>,
+{
+    let mut client = connect().map_err(StartError::Connect)?;
+    send(&mut client).map_err(StartError::Send)?;
+    // The request is on the wire, so a daemon conclusion is now possible and
+    // the record may be armed.  Nothing above this line can produce one.
+    *verdict = Some(Verdict {
+        username: username.to_owned(),
+        service: service.map(str::to_owned),
+        from_cache: false,
+    });
+    Ok(client)
 }
 
 /// Minimal abstraction over the IPC transport so `run_gui_event_loop` can be
@@ -750,6 +815,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     if let Some(v) = verdict {
         // Only real transactions are recorded, and only when the service name
         // is known: an unresolved service must not collapse into the "" key.
+        //
+        // This runs after `authenticate_inner` returned, so it is also the
+        // anchor of the reuse window: the 500 ms is measured from this module's
+        // *return*, not from the moment the transaction concluded.  A module
+        // after `pam_tapauth.so` that blocks longer than that pushes the host's
+        // duplicate outside the window, and it rings the phone again.
         if let (false, Some(service)) = (v.from_cache, v.service.as_deref()) {
             record_conclusion(&v.username, service, code, Instant::now());
         }
@@ -888,10 +959,17 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // conversation function) produces no verdict either.  None of them may
     // clobber the last real conclusion.
     if let Some(service_name) = service_item.as_deref() {
-        if let Some(code) = cached_conclusion_for(&username, service_name, Instant::now()) {
+        if let Some((code, age)) = cached_conclusion_for(&username, service_name, Instant::now()) {
             // `from_cache` stops `authenticate` from recording this hit, so the
             // window stays anchored to the original verdict no matter how many
             // duplicates arrive.  It is not a sliding window.
+            tracing::debug!(
+                username = %username,
+                service = %service_name,
+                code,
+                age_ms = age.as_millis(),
+                "Replaying the concluded verdict for a duplicate transaction"
+            );
             *verdict = Some(Verdict {
                 username,
                 service: service_item.as_deref().map(str::to_owned),
@@ -954,31 +1032,33 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
 
     // Establish nonblocking IPC connection and send authenticate request.
     //
-    // This is the first line that can produce a daemon conclusion, so it is
-    // also where the process arms the record: everything above it (the
-    // display-manager bypass, the pre-collected skip, a missing conversation,
-    // a failed RNG) is not a verdict about a transaction attempt, and a
-    // duplicate must not inherit one of those codes as if the phone had been
-    // asked.
-    *verdict = Some(Verdict {
-        username: username.clone(),
-        service: service_item.as_deref().map(str::to_owned),
-        from_cache: false,
-    });
-    let mut ipc = match IpcClient::connect_nonblocking() {
-        Ok(c) => c,
-        Err(e) => {
+    // Arming the record happens inside `start_authentication`, and only once
+    // the request is actually on the wire — i.e. after both the connect and the
+    // send succeeded.  A local IPC failure is not a verdict about the phone:
+    // recording one would let a later duplicate inherit that
+    // `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry must dial
+    // the socket again.  Everything above this point (the display-manager
+    // bypass, the pre-collected skip, a missing conversation, a failed RNG) is
+    // not a verdict about a transaction attempt either, so it records nothing.
+    let mut ipc = match start_authentication(
+        &mut *verdict,
+        &username,
+        service_item.as_deref(),
+        IpcClient::connect_nonblocking,
+        |ipc| ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id),
+    ) {
+        Ok(ipc) => ipc,
+        Err(StartError::Connect(e)) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
             pam_conv.try_error(msgs.cannot_connect());
             return pam_sys::PAM_AUTHINFO_UNAVAIL;
         }
+        Err(StartError::Send(e)) => {
+            tracing::error!("Failed to send authenticate request: {}", e);
+            pam_conv.try_error(msgs.communication_error());
+            return pam_sys::PAM_AUTHINFO_UNAVAIL;
+        }
     };
-    if let Err(e) = ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id)
-    {
-        tracing::error!("Failed to send authenticate request: {}", e);
-        pam_conv.try_error(msgs.communication_error());
-        return pam_sys::PAM_AUTHINFO_UNAVAIL;
-    }
 
     // GUI contexts whose conversation must be left to the host (the sequential
     // mode, e.g. the KDE lock screen before kscreenlocker 6.8): wait for the
@@ -2806,14 +2886,88 @@ mod verdict_reuse_tests {
         record_conclusion("alice", SERVICE, pam_sys::PAM_SUCCESS, now);
         assert_eq!(
             cached_conclusion_for("alice", SERVICE, now),
-            Some(pam_sys::PAM_SUCCESS)
+            Some((pam_sys::PAM_SUCCESS, Duration::ZERO))
         );
         record_conclusion("alice", SERVICE, pam_sys::PAM_AUTHINFO_UNAVAIL, now);
         assert_eq!(
             cached_conclusion_for("alice", SERVICE, now),
-            Some(pam_sys::PAM_AUTHINFO_UNAVAIL),
+            Some((pam_sys::PAM_AUTHINFO_UNAVAIL, Duration::ZERO)),
             "the cache holds the *last* conclusion, so a later failure must \
              overwrite the earlier success"
+        );
+    }
+
+    /// A connect failure says nothing about the phone, so it must leave the
+    /// record unarmed — and a retry must therefore dial the socket again
+    /// instead of being answered from a verdict that never existed.
+    #[test]
+    fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
+        struct FakeClient;
+        let connects = std::cell::Cell::new(0u32);
+        let sends = std::cell::Cell::new(0u32);
+        let mut verdict: Option<Verdict> = None;
+
+        let first = start_authentication::<FakeClient, _, _>(
+            &mut verdict,
+            "alice",
+            Some(SERVICE),
+            || {
+                connects.set(connects.get() + 1);
+                Err(crate::ipc_client::IpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "no daemon socket",
+                )))
+            },
+            |_: &mut FakeClient| {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(first, Err(StartError::Connect(_))),
+            "a refused connect must surface as a connect failure"
+        );
+        assert_eq!(sends.get(), 0, "nothing may be sent without a connection");
+        assert!(
+            verdict.is_none(),
+            "a local IPC failure is not a verdict about the phone: arming the \
+             record here would let the duplicate inherit PAM_AUTHINFO_UNAVAIL \
+             without the phone ever being asked"
+        );
+
+        let second = start_authentication::<FakeClient, _, _>(
+            &mut verdict,
+            "alice",
+            Some(SERVICE),
+            || {
+                connects.set(connects.get() + 1);
+                Ok(FakeClient)
+            },
+            |_: &mut FakeClient| {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            second.is_ok(),
+            "the retry must be able to connect after the failed attempt"
+        );
+        assert_eq!(
+            connects.get(),
+            2,
+            "the immediate retry must attempt the socket again rather than be \
+             short-circuited by a record armed from the failure"
+        );
+        assert_eq!(sends.get(), 1);
+        let armed = verdict
+            .as_ref()
+            .expect("a request on the wire must arm the record");
+        assert_eq!(armed.username, "alice");
+        assert_eq!(armed.service.as_deref(), Some(SERVICE));
+        assert!(
+            !armed.from_cache,
+            "the armed record is a real transaction, so `authenticate` must be \
+             allowed to record its code"
         );
     }
 
@@ -2882,13 +3036,13 @@ mod verdict_reuse_tests {
             .unwrap_or(source);
 
         let lookup = production
-            .find("if let Some(code) = cached_conclusion_for(")
+            .find("if let Some((code, age)) = cached_conclusion_for(")
             .unwrap_or_else(|| {
                 panic!("invariant broken: the reuse lookup is gone from `authenticate_inner`")
             });
 
         let daemon_contact = production
-            .find("IpcClient::connect_nonblocking()")
+            .find("IpcClient::connect_nonblocking,")
             .unwrap_or_else(|| {
                 panic!("invariant broken: production call to the IPC connect not found")
             });
