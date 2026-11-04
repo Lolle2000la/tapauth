@@ -48,8 +48,10 @@
 #
 # USAGE
 #   sudo ./scripts/ci/test-pam-host-cases.sh
-#   PAM_MODULE_PATH=/tmp/opencode/pam-base/target/debug/libclient_pam.so \
-#     SKIP_BUILD=1 sudo -E ./scripts/ci/test-pam-host-cases.sh
+#   sudo env \
+#     PAM_MODULE_PATH=/tmp/opencode/pam-base/target/debug/libclient_pam.so \
+#     SKIP_BUILD=1 \
+#     ./scripts/ci/test-pam-host-cases.sh
 #
 # ENVIRONMENT
 #   PAM_MODULE_PATH   module under test (default: target/debug/libclient_pam.so)
@@ -58,7 +60,7 @@
 #   PAM_CASE_FILTER   space-separated case numbers/names to run (default: all)
 #
 # LC_ALL/LANG are forced to `C` below, so the module's own (localized) message
-# text is locale-independent even under `sudo -E` with a non-English user
+# text is locale-independent even under `sudo env` with a non-English user
 # locale; the script never relies on the text alone anyway (case 1 asserts the
 # announcement's count and timing, and treats the wording as an extra check).
 #
@@ -67,9 +69,10 @@
 set -u -o pipefail
 
 # A correct run must not FAIL just because the caller has a German (or any
-# non-English) locale: the module localizes its messages, and `sudo -E` (the
-# documented invocation) forwards LANG/LC_ALL to root. Pin C for this script and
-# every pamtester child.
+# non-English) locale: the module localizes its messages, and `sudo env`
+# (the documented invocation) passes the named VAR=… assignments — including
+# LANG/LC_ALL when given — to root. Pin C for this script and every pamtester
+# child.
 export LC_ALL=C
 export LANG=C
 
@@ -512,9 +515,21 @@ EOF
 # ===========================================================================
 # Case 4: a `required` Arch/GDM-style stack must never be granted.
 #
-# Discriminates 0868f81: on the pre-fix tree the module returned PAM_IGNORE,
-# which Linux-PAM does not record, so `optional pam_permit` granted the stack
-# (PAM_RESULT=0).
+# 4a pins the display-manager bypass *path*, not just its return code: with a
+# silent stub daemon bound at the production socket, a `gdm-`-prefixed service
+# must return PAM_AUTHINFO_UNAVAIL without the module ever connecting. The
+# return code alone does not discriminate — a failed IPC connect also yields
+# PAM_AUTHINFO_UNAVAIL — so the daemon-visible connection is the signal: the
+# stub logs every accept, and 4a asserts that log stays free of one. Delete the
+# bypass and the module proceeds to IpcClient::connect_nonblocking(), the stub
+# accepts, and 4a fails even though the code is still 9.
+#
+# 4b is the same stack under a non-DM service: there the module *does* connect
+# and wait (the sequential path), which is why it needs the stub.
+#
+# Both also discriminate 0868f81: on the pre-fix tree the module returned
+# PAM_IGNORE, which Linux-PAM does not record, so `optional pam_permit` granted
+# the stack (PAM_RESULT=0).
 # ===========================================================================
 gdm_stack() {
     cat <<EOF
@@ -534,8 +549,25 @@ case_4() {
     write_service "$SERVICE_DM" <<EOF
 $(gdm_stack)
 EOF
+    # A reachable-but-silent daemon is what makes "did the module connect?"
+    # observable: without one, a module that skipped the bypass would fail to
+    # connect and still report 9, which is exactly the ambiguity this case has
+    # to remove.
+    start_stub || return
     run_pamtester "$PAMTESTER_BIN" "$SERVICE_DM" root authenticate
     assert_eq "4a ${SERVICE_DM} PAM result" "9" "${RUN_RESULT:-<none>}"
+    # Discriminator: the bypass must return before the module connects. A
+    # failed assertion here means the bypass did not run (or no longer returns
+    # early), so the "9" above came from a dead IPC connect instead.
+    if ! kill -0 "$stub_pid" 2>/dev/null; then
+        add_error "4a ${SERVICE_DM} stub daemon is not running, so 'no accept' proves nothing: $(cat "${CASE_DIR}/stub.log" 2>/dev/null)"
+    fi
+    local accept_line
+    accept_line="$(grep -m 1 'pam-stub-daemon: accept' "${CASE_DIR}/stub.log" 2>/dev/null)"
+    if [ -n "$accept_line" ]; then
+        add_error "4a ${SERVICE_DM} connected to the daemon (${accept_line}): the display-manager bypass must return before the module connects; an accepted connection means the bypass did not run"
+    fi
+    stop_stub
 
     # 4b: identical stack under a non-DM service with a silent daemon, i.e. the
     # sequential wait path instead of the bypass.

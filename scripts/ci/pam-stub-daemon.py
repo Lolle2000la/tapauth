@@ -14,7 +14,9 @@ Scope
 -----
 * ``pam-stub-daemon.py <socket-path>`` creates the Unix socket, accepts
   connections in a loop, reads (and discards) whatever arrives, never replies
-  and keeps the connection open.
+  and keeps the connection open. It logs one line per accepted connection
+  (``pam-stub-daemon: accept``) so a caller can tell "the module never
+  connected" apart from "the module connected and got no answer".
 * Exits cleanly on SIGTERM/SIGINT (within ~0.2 s) and unlinks the socket it
   created on the way out.
 * The socket path must not exist yet: an ``EADDRINUSE`` bind is reported and the
@@ -83,6 +85,7 @@ def main(argv):
                 continue
             conn.settimeout(POLL)
             conns.append(conn)
+            print("pam-stub-daemon: accept", flush=True)
             # Read and discard; the client sees an open, silent peer.
             while not stopping:
                 try:
