@@ -294,6 +294,28 @@ This is a **safe, non-disruptive** configuration. Your system remains accessible
 
 **For detailed information about PAM integration, security, and troubleshooting, see [PAM_INTEGRATION.md](PAM_INTEGRATION.md).**
 
+### Lock Screen and Desktop Integration
+
+TapAuth offers the phone wherever a host asks PAM for a password and can survive a
+second of waiting. The module picks one of three strategies automatically from the
+calling process, so nothing has to be configured per host:
+
+| Host | Behaviour |
+| :--- | :--- |
+| sudo, polkit dialogs, `kscreenlocker` ≥ 6.8, `hyprlock`, xsecurelock, xfce4-screensaver, mate-screensaver, GNOME unlock (GDM reauthentication) | Password field **and** phone, at the same time — whichever answers first wins |
+| `swaylock`, `gtklock`, `i3lock` | **Password only.** These read the password before asking PAM and then replay it, so the phone is deliberately not rung |
+| `kscreenlocker` ≤ 6.7, `xscreensaver` | **Sequential:** the phone is offered first for a shorter timeout (30 s), then the password prompt. Answered on the wrong thread these hosts would freeze, so the module never drives their dialog |
+| `light-locker`, `slock`, `betterlockscreen` | Not supported: these do not use PAM |
+
+Two quirks worth knowing:
+
+- **xsecurelock** retries `pam_authenticate` up to three times when the answer is
+  "phone unavailable", so a single unlock attempt can ring your phone up to three
+  times.
+- **GNOME unlock** reuses the `gdm-password` service; TapAuth distinguishes it from a
+  fresh login by the `GDM_SESSION_FOR_REAUTH` variable. If that variable is missing,
+  unlock falls back to password only rather than freezing.
+
 ### When Do Changes Take Effect?
 
 PAM modules are loaded dynamically - **no system restart is required**:
