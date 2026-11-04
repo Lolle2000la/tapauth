@@ -83,10 +83,9 @@ impl IpcResponseReader for IpcClient {
 // sequential default:
 //
 // * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `hyprlock`,
-//   `authproto_pam`, `xfce4-screensaver-dialog`, `mate-screensaver-dialog`,
-//   and GDM's reauthentication worker): the conversation can be driven from
-//   another thread.  Polkit's is a plain blocking socket fd fed by the
-//   *separate* agent process; kscreenlocker ≥ 6.8 makes it a peer D-Bus call
+//   `authproto_pam`, and GDM's reauthentication worker): the conversation can
+//   be driven from another thread.  Polkit's is a plain blocking socket fd fed
+//   by the *separate* agent process; kscreenlocker ≥ 6.8 makes it a peer D-Bus
 //   answered by Qt's `QDBusConnectionManager` daemon thread, not by the thread
 //   that called `pam_authenticate`.  A native POSIX thread collects the
 //   password while the main thread waits for the phone, and the main loop
@@ -100,8 +99,9 @@ impl IpcResponseReader for IpcClient {
 //   `authenticate`).  Ringing the phone here would be misleading: the user has
 //   already chosen the password route, and the wait could only ever time out.
 //
-// * Sequential (everything else, which includes older kscreenlocker and every
-//   host not explicitly known to be safe): the conversation is a synchronous
+// * Sequential (everything else, which includes older kscreenlocker,
+//   `xfce4-screensaver-dialog` and `mate-screensaver-dialog`, and every host
+//   not explicitly known to be safe): the conversation is a synchronous
 //   round-trip that must be dispatched by the host's own event loop on the
 //   thread that called `pam_authenticate`.  Blocking that thread (or driving
 //   the conversation from a second thread, which older kscreenlocker cannot
@@ -163,7 +163,9 @@ fn process_identity() -> Option<String> {
 /// conversation is known to stay answerable while this thread is blocked are
 /// listed.  An unknown host therefore keeps the behaviour that cannot
 /// deadlock, at the cost of the existing (shorter) GUI timeout before password
-/// fallback — the failure direction is "slower", never "wedged".
+/// fallback — the failure direction is "slower", never "wedged".  Only hosts
+/// whose conversation blocks in a cancellation point may be threaded; a host
+/// that parks in a bare futex must stay sequential.
 ///
 /// What makes a host eligible:
 /// * `polkit-agent-helper-1` — the conversation is a blocking fd answered by
@@ -181,27 +183,21 @@ fn process_identity() -> Option<String> {
 /// * `authproto_pam` (xsecurelock) — the conversation is answered by the host's
 ///   own thread pool, not by the thread that called `pam_authenticate`.  Quirk:
 ///   `CallPAMWithRetries` (`helpers/authproto_pam.c:109-132`) re-runs
-///   `pam_authenticate` up to 3× when it returns `PAM_AUTHINFO_UNAVAIL`, so one
-///   lock-screen attempt can ring the phone up to three times.  Documented, not
-///   fixed here.
-/// * `xfce4-screensaver-dialog` (comm truncated to `xfce4-screensav`) — the
-///   prompt is marshalled onto the dialog's GTK main loop with `g_idle_add`
-///   while `pam_authenticate` runs on a dedicated `auththread`
-///   (`src/gs-auth-pam.c:453,467`, created at `:590`) and the caller sits in
-///   `gtk_main()` (`:598`); the auth thread parks on a `GCond` (`:223,231`),
-///   and the lock dialog's nested `g_main_loop` (`src/gs-lock-plug.c:562`)
-///   keeps turning so the prompt can be answered.
-/// * `mate-screensaver-dialog` — same shape as xfce4-screensaver (comm
-///   truncation: `mate-screensave`): `auththread` at `src/gs-auth-pam.c:488,505`
-///   (created `:644`), caller in `gtk_main()` at `:653`, `g_idle_add` /
-///   `g_cond_wait` at `:215,224`, nested `g_main_loop` at
-///   `src/gs-lock-plug.c:662`.
+///   `pam_authenticate` for every status except `ABORT`, `MAXTRIES`,
+///   `NEW_AUTHTOK_REQD` and `SUCCESS`, so an explicit denial can ring the phone
+///   up to three times too.  Documented, not fixed here.
 /// * `gdm-session-worker` on a `gdm-password` **reauthentication** — the
 ///   unlock/re-auth prompt of a running GDM session, whose conversation is
 ///   answered by the worker's GLib main loop on another thread.  Only a
 ///   reauthentication qualifies: a GDM *login* is bypassed by
 ///   `guard_display_manager_bypass` for keyring reasons, and the worker is
 ///   otherwise the host whose event loop must own the conversation.
+///
+/// The screen-saver dialogs are deliberately absent: `xfce4-screensaver-dialog`
+/// and `mate-screensaver-dialog` park their PAM conversation in GLib's
+/// `g_cond_wait`, a bare `futex(FUTEX_WAIT_PRIVATE)` with no cancellation
+/// handshake, so a phone grant cannot abandon the conversation.  Sequential
+/// keeps the phone race and only gives up in-call password fallback.
 ///
 /// Pre-collected hosts (`swaylock`, `gtklock`, `i3lock`) are classified
 /// `PreCollected` instead: their conversation replays a password that was read
@@ -214,9 +210,7 @@ fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> Conv
         Some("polkit-agent-helper-1" | "polkit-agent-he")
         | Some("kscreenlocker_worker" | "kscreenlocker_w")
         | Some("hyprlock")
-        | Some("authproto_pam")
-        | Some("xfce4-screensaver-dialog" | "xfce4-screensav")
-        | Some("mate-screensaver-dialog" | "mate-screensave") => ConversationMode::Threaded,
+        | Some("authproto_pam") => ConversationMode::Threaded,
         // A GDM reauthentication prompt only.  `reauth` is false when
         // `GDM_SESSION_FOR_REAUTH` is absent (a missed or renamed variable
         // therefore degrades to the sequential default, never to a deadlock),
@@ -2279,30 +2273,32 @@ mod conversation_mode_tests {
                 ConversationMode::Threaded,
             ),
             // xfce4-screensaver / mate-screensaver dialog children, full and
-            // `/proc/self/comm`-truncated spellings.
+            // `/proc/self/comm`-truncated spellings.  Their conversation parks
+            // in `g_cond_wait`, which is not a cancellation point, so they stay
+            // sequential.
             (
                 "xfce4-screensaver",
                 Some("xfce4-screensaver-dialog"),
                 false,
-                ConversationMode::Threaded,
+                ConversationMode::Sequential,
             ),
             (
                 "xfce4-screensaver",
                 Some("xfce4-screensav"),
                 false,
-                ConversationMode::Threaded,
+                ConversationMode::Sequential,
             ),
             (
                 "mate-screensaver",
                 Some("mate-screensaver-dialog"),
                 false,
-                ConversationMode::Threaded,
+                ConversationMode::Sequential,
             ),
             (
                 "mate-screensaver",
                 Some("mate-screensave"),
                 false,
-                ConversationMode::Threaded,
+                ConversationMode::Sequential,
             ),
             // Hosts that read the password before pam_authenticate: their
             // conversation only replays it, so the phone is not consulted.
