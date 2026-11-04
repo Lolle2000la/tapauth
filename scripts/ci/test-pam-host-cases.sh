@@ -40,10 +40,11 @@
 #     /run/tapauthd/tapauthd.sock. Only files this run actually wrote are
 #     removed again, and only a file it actually backed up is restored. A
 #     pre-existing socket is refused (the script aborts; it never shadows or
-#     deletes a real daemon's socket). As non-root it prints one SKIP line per
-#     case and exits 0 locally — but exits 1 when CI is set, so a CI job that
-#     lost its `sudo` prefix fails instead of silently going green with zero
-#     cases run.
+#     deletes a real daemon's socket). It is root-required: a non-root run
+#     prints one SKIP line per case and then fails (exit 1) instead of going
+#     green with zero cases run. `ALLOW_NONROOT=1` is the local opt-out: it keeps
+#     the SKIP lines and exits 0, and is refused whenever `CI` is non-empty, so a
+#     CI job that lost its `sudo` prefix can never pass by skipping.
 #   - cc (builds pamtester), python3 (stub daemon), setsid (util-linux),
 #     libpam headers.
 #   - The module is built from the tree unless SKIP_BUILD=1.
@@ -60,6 +61,8 @@
 #   SKIP_BUILD=1      do not run cargo build
 #   PAMTESTER_BIN     use an existing pamtester binary instead of compiling
 #   PAM_CASE_FILTER   space-separated case numbers/names to run (default: all)
+#   ALLOW_NONROOT=1   local only: a non-root run skips every case and exits 0
+#                     (ignored — the run still fails — when CI is non-empty)
 #
 # LC_ALL/LANG are forced to `C` below, so the module's own (localized) message
 # text is locale-independent even under `sudo env` with a non-English user
@@ -310,16 +313,24 @@ if [ "$(id -u)" -ne 0 ]; then
     done
     echo ""
     echo "Summary: 0 passed, 0 failed, ${SKIPPED} skipped (not root)"
-    # Under CI a non-root run means the `sudo` prefix was lost or changed: every
-    # case would skip and the job would go green with zero coverage. Fail loudly
-    # instead. Locally the SKIP lines above stay and the exit status stays 0.
-    if [ -n "${CI:-}" ]; then
-        echo "ERROR: CI=${CI} but this script is not root, so nothing was tested." >&2
-        echo "       Re-run it with: sudo $0" >&2
+    # Fail closed. A non-root run tests nothing, and a green step with zero
+    # coverage is exactly what this guard must make impossible — so by default
+    # this is an error, whether or not `CI` happens to be set (it is dropped by
+    # `sudo`'s env_reset and not set by every runner). Only an explicit local
+    # opt-out may skip everything and exit 0, and CI never honours it.
+    if [ -n "${CI:-}" ] && [ "${ALLOW_NONROOT:-}" = "1" ]; then
+        echo "ERROR: CI=${CI} must actually test, so ALLOW_NONROOT=1 is not honoured here." >&2
+        echo "       The opt-out is for local runs only. Re-run with: sudo $0" >&2
         exit 1
     fi
-    echo "Re-run as root to actually test: sudo $0"
-    exit 0
+    if [ "${ALLOW_NONROOT:-}" = "1" ]; then
+        echo "Re-run as root to actually test: sudo $0"
+        exit 0
+    fi
+    echo "ERROR: this script must run as root; it is not, so nothing was tested." >&2
+    echo "       Re-run it with: sudo $0" >&2
+    echo "       Local runs that only want the SKIP lines: ALLOW_NONROOT=1 $0" >&2
+    exit 1
 fi
 
 # The stub occupies the *production* socket path. If something is already there

@@ -294,6 +294,37 @@ This is a **safe, non-disruptive** configuration. Your system remains accessible
 
 **For detailed information about PAM integration, security, and troubleshooting, see [PAM_INTEGRATION.md](PAM_INTEGRATION.md).**
 
+### Lock Screen and Desktop Integration
+
+TapAuth offers the phone wherever the module can safely drive or await the host's PAM
+conversation. On hosts that collect the password before calling PAM (`swaylock`,
+`gtklock`, `i3lock`) the typed password is handed straight on and the phone is not
+rung. The module picks one of three strategies automatically from the calling
+process, so nothing has to be configured per host:
+
+| Host | Behaviour |
+| :--- | :--- |
+| polkit dialogs, `kscreenlocker` ≥ 6.8, `hyprlock`, xsecurelock, GNOME unlock (GDM reauthentication) | Password field **and** phone, at the same time — whichever answers first wins |
+| `swaylock`, `gtklock`, `i3lock` | **Password only.** These read the password before asking PAM and then replay it, so the phone is deliberately not rung |
+| `sudo`, `su` | **Phone first, then password.** The terminal is the sequential flow: the phone is offered first and pressing Enter skips straight to the password prompt — there is no password field waiting alongside the phone |
+| `kscreenlocker` ≤ 6.7, `xscreensaver`, xfce4-screensaver, mate-screensaver | **Sequential:** the phone is offered first for a shorter timeout (30 s), then the password prompt. Answered on the wrong thread these hosts would freeze, so the module never drives their dialog — in the screen savers' case the conversation waits in a GLib condition variable that a cancelled thread could never leave |
+| `light-locker` | Not supported: it delegates to LightDM, and TapAuth bypasses display-manager services |
+| `slock` | Not supported: it checks the password against crypt/shadow itself and never calls PAM |
+| `betterlockscreen` | **Password only.** The wrapper is not itself allowlisted, but it execs `i3lock`, which is: the typed password is collected synchronously and handed to the next PAM module, so the phone is not offered there. What you lose is the phone, not the password. (Its default `i3lock-color` binary is not a recognised process and falls back to the sequential strategy instead) |
+
+On `swaylock`, `gtklock` and `i3lock` the phone is not a credential at all: TapAuth
+neither rings it nor verifies anything, so a PAM stack with no password module after
+`pam_tapauth.so` cannot unlock.
+
+Two quirks worth knowing:
+
+- **xsecurelock** retries `pam_authenticate` up to three times for every result except
+  aborts, "too many tries", expired-password and success — so an explicit denial, not
+  just a missing phone, can ring your phone up to three times.
+- **GNOME unlock** reuses the `gdm-password` service; TapAuth distinguishes it from a
+  fresh login by the `GDM_SESSION_FOR_REAUTH` variable. If that variable is missing,
+  unlock falls back to password only rather than freezing.
+
 ### When Do Changes Take Effect?
 
 PAM modules are loaded dynamically - **no system restart is required**:

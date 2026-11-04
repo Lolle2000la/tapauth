@@ -25,10 +25,12 @@
 //! other outcome returns a real verdict — `PAM_PERM_DENIED` for an explicit
 //! phone denial, `PAM_AUTHINFO_UNAVAIL` when the service could not be consulted
 //! (no paired device, skip, timeout, daemon unreachable) and `PAM_AUTH_ERR` for
-//! a processing failure. It never returns `PAM_IGNORE`: Linux-PAM records no
-//! failure for that code, so a later `optional` module that votes success (e.g.
-//! `pam_permit`) would authenticate the user. Password fallback still works on
-//! a `sufficient` line, whose default action for any non-success is `ignore`.
+//! a processing failure. It never returns `PAM_IGNORE`, which protects the
+//! `required` stack shape: there `PAM_IGNORE` is explicitly `ignore` while
+//! `PAM_AUTHINFO_UNAVAIL` is `bad`. On a `sufficient` line both codes are
+//! `ignore`, so a following `optional pam_permit` grants either way and only
+//! the stack's configuration prevents it. Password fallback still works on that
+//! `sufficient` line, whose default action for any non-success is `ignore`.
 //!
 //! ## Requirements
 //!

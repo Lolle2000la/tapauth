@@ -250,15 +250,22 @@ leaves the host untouched; a pre-existing socket at
 `/run/tapauthd/tapauthd.sock` is **refused** (the script aborts with a message)
 rather than shadowed or deleted, so a real daemon is never disturbed. The real
 `/etc/pam.d/gdm-password` is never touched: the DM bypass only matches on the
-service-name prefix, and the synthetic service exercises it. As non-root it
-prints one `SKIP` line per case and exits 0 locally, but exits 1 when `CI` is
-set, so a CI job that lost its `sudo` prefix fails instead of going green with
-zero cases run. The script exports `LC_ALL=C` and
+service-name prefix, and the synthetic service exercises it. The script is
+root-required: a non-root run prints one `SKIP` line per case and then **fails**
+(exit 1), so a CI job that lost its `sudo` prefix fails instead of going green
+with zero cases run. `ALLOW_NONROOT=1` is the local opt-out — it keeps the `SKIP`
+lines, the summary and the `Re-run as root` hint and exits 0; it is refused
+(exit 1) whenever `CI` is non-empty, so an accidental opt-out in a workflow
+cannot pass by skipping. The script exports `LC_ALL=C` and
 `LANG=C`, so the module's own localized messages cannot turn a correct run into
 a failure under `sudo env` with a non-English user locale.
 
 ```bash
 sudo ./scripts/ci/test-pam-host-cases.sh
+
+# Local run without root: prints the SKIP lines and exits 0 (never in CI, which
+# does not honour the opt-out and fails instead):
+ALLOW_NONROOT=1 ./scripts/ci/test-pam-host-cases.sh
 
 # Against another build (e.g. the pre-fix module), skipping the cargo build:
 sudo env \
@@ -288,7 +295,7 @@ These need a real desktop session or a real distro install and stay manual:
 | Scenario | Do | Observe | Failure looks like |
 | :--- | :--- | :--- | :--- |
 | GDM / gnome-shell password entry | install the module, log out to GDM, start typing at the password prompt | the password field is revealed immediately (the `TEXT_INFO` arrives before the wait) and accepts typing during the wait; TapAuth does not consume that input, so it only counts once the next password module prompts — i.e. after the GUI timeout (`pam_gui_timeout_secs`) | no prompt/field until the TapAuth timeout elapses, or the session hangs with a frozen spinner |
-| KDE lock screen (`kscreenlocker_worker`) | lock the session with a paired phone present but unlocked/away | one "Waiting for your phone…" message, the unlock field is revealed during the wait (typing is not consumed by TapAuth; it is submitted once the following password module prompts), and unlocking with the password works after the GUI timeout | the lock screen freezes, never shows the field, or the worker dies (lock screen crash / X session reset) |
+| KDE lock screen (`kscreenlocker_worker`) | lock the session with a paired phone present but unlocked/away | one "Waiting for your phone…" message, the unlock field is revealed during the wait (the threaded conversation collects the password with `pam_get_authtok` and leaves it in `PAM_AUTHTOK`, so it is not consumed by TapAuth and the next password module uses it), and unlocking with the password works immediately — TapAuth stops waiting as soon as it is entered, while the phone wait runs to `pam_operation_timeout_secs`, not the 30 s GUI timeout | the lock screen freezes, never shows the field, or the worker dies (lock screen crash / X session reset) |
 | Arch GDM boot with the required stack | on a real Arch GDM install, put `auth required pam_tapauth.so`, `auth optional pam_permit.so`, `auth required pam_env.so` in `/etc/pam.d/gdm-password` | login without a phone fails (returns the password prompt / denies), never grants a session | you land on the desktop with only the password (or with no credentials) — a `PAM_IGNORE` verdict would have granted the stack |
 | Distro `sufficient` line | use the packaged `sufficient`/`[success=1 default=ignore]` line from `packaging/` | login with the phone → session starts; without the phone → password prompt; wrong password → rejected | TapAuth silently succeeds without the phone, or the password prompt never appears |
 

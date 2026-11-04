@@ -19,7 +19,21 @@
 //!
 //! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
 //! runtime per authentication attempt. A separate thread monitors `/dev/tty`
-//! for skip signals in terminal contexts.
+//! for skip signals in terminal contexts. TTY-less (GUI) hosts are split into
+//! three conversation modes by `conversation_mode`; only allowlisted hosts get
+//! the worker thread, hosts that collect the password before calling into PAM
+//! get a synchronous replay and no daemon request at all, and everyone else
+//! keeps the conversation on the caller's thread.
+//!
+//! ## Return-code mapping
+//!
+//! | Transition | Code |
+//! | :--- | :--- |
+//! | Phone approved the request | `PAM_SUCCESS` |
+//! | Phone explicitly denied | `PAM_PERM_DENIED` |
+//! | Timeout, dialog dismissed, IPC error, no paired device, skip, DM bypass | `PAM_AUTHINFO_UNAVAIL` |
+//! | Daemon reported an internal error, or a local failure (conversation lookup, RNG, pipe/thread spawn) | `PAM_AUTH_ERR` |
+//! | Username lookup failed | `PAM_USER_UNKNOWN` |
 
 use crate::ipc_client::IpcClient;
 use crate::logging;
@@ -64,20 +78,36 @@ impl IpcResponseReader for IpcClient {
 }
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
-// socket and /dev/tty.  The GUI flow (no TTY) comes in two variants:
+// socket and /dev/tty.  The GUI flow (no TTY) comes in three variants,
+// selected by `conversation_mode` — an allowlist of calling processes with a
+// sequential default:
 //
-// * `polkit-1` (polkit-agent-helper-1): the conversation is a plain blocking
-//   socket fd fed by the *separate* agent process, so it can safely be driven
-//   from a background thread.  A native POSIX thread collects the password
-//   while the main thread waits for the phone, and the main loop multiplexes
-//   the IPC socket and a self-pipe (`run_gui_event_loop`).
+// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `hyprlock`,
+//   `authproto_pam`, and GDM's reauthentication worker): the conversation can
+//   be driven from another thread.  Polkit's is a plain blocking socket fd fed
+//   by the *separate* agent process; kscreenlocker ≥ 6.8 makes it a peer D-Bus
+//   answered by Qt's `QDBusConnectionManager` daemon thread, not by the thread
+//   that called `pam_authenticate`.  A native POSIX thread collects the
+//   password while the main thread waits for the phone, and the main loop
+//   multiplexes the IPC socket and a self-pipe (`run_gui_event_loop`).
 //
-// * All other TTY-less hosts (notably KDE's `kscreenlocker_worker`): the
-//   conversation is a synchronous round-trip that must be dispatched by the
-//   host's own event loop on the thread that called `pam_authenticate`.
-//   Blocking that thread (or driving the conversation from a second thread)
-//   deadlocks the host, so the main thread simply waits for the daemon on its
-//   own and never *drives* the conversation (`run_sequential_event_loop`).
+// * PreCollected (`swaylock`, `gtklock`, `i3lock`): the host reads the
+//   password *before* calling `pam_authenticate` and its conversation is a
+//   synchronous replay of that already-typed password.  The module therefore
+//   collects the token on the calling thread with no daemon request at all and
+//   immediately hands over to the next PAM module (see the branch in
+//   `authenticate`).  Ringing the phone here would be misleading: the user has
+//   already chosen the password route, and the wait could only ever time out.
+//
+// * Sequential (everything else, which includes older kscreenlocker,
+//   `xfce4-screensaver-dialog` and `mate-screensaver-dialog`, and every host
+//   not explicitly known to be safe): the conversation is a synchronous
+//   round-trip that must be dispatched by the host's own event loop on the
+//   thread that called `pam_authenticate`.  Blocking that thread (or driving
+//   the conversation from a second thread, which older kscreenlocker cannot
+//   answer because it posts the reply to the blocked thread) deadlocks the
+//   host, so the main thread simply waits for the daemon on its own and never
+//   *drives* the conversation (`run_sequential_event_loop`).
 //   The one exception is a single non-blocking `PAM_TEXT_INFO` announcement
 //   emitted immediately before the wait begins: it is one conversation round
 //   trip that carries no input, and host event loops need it in order to
@@ -87,8 +117,136 @@ impl IpcResponseReader for IpcClient {
 //   `PamConversation::new` fails first and the module returns
 //   `PAM_AUTH_ERR` as before.
 //
-// The native password thread used by the polkit variant uses no Drop-bearing
+// The native password thread used by the threaded variant uses no Drop-bearing
 // Rust types so that pthread_cancel is safe.
+
+/// How the PAM conversation of the calling host may be driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationMode {
+    /// The conversation may run on a background thread while the calling
+    /// thread waits for the daemon.
+    Threaded,
+    /// The host collected the password before calling `pam_authenticate` and
+    /// its conversation only replays it.  The module collects the token on the
+    /// calling thread and hands over without contacting the daemon.
+    PreCollected,
+    /// The conversation must be left to the calling thread/host event loop.
+    Sequential,
+}
+
+/// Best-effort identity of the process that called into this module.
+///
+/// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
+/// some sandboxes; `/proc/self/comm` is the fallback and holds at most
+/// `TASK_COMM_LEN - 1` (15) bytes, which is why `conversation_mode` accepts
+/// both the full and the truncated spelling of each process name.
+fn process_identity() -> Option<String> {
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
+        if let Some(name) = exe.file_name() {
+            let name = name.to_string_lossy();
+            // The kernel suffixes " (deleted)" once the binary is unlinked.
+            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
+            if !name.is_empty() {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    std::fs::read_to_string("/proc/self/comm")
+        .ok()
+        .map(|comm| comm.trim().to_owned())
+        .filter(|comm| !comm.is_empty())
+}
+
+/// Classify the calling host's PAM conversation.
+///
+/// This is an **allowlist with a sequential default**: only hosts whose
+/// conversation is known to stay answerable while this thread is blocked are
+/// listed.  An unknown host therefore keeps the behaviour that cannot
+/// deadlock, at the cost of the existing (shorter) GUI timeout before password
+/// fallback — the failure direction is "slower", never "wedged".  Only hosts
+/// whose conversation blocks in a cancellation point may be threaded; a host
+/// that parks in a bare futex must stay sequential.
+///
+/// What makes a host eligible:
+/// * `polkit-agent-helper-1` — the conversation is a blocking fd answered by
+///   the separate agent process.
+/// * `kscreenlocker_worker` (≥ 6.8) — the conversation is a peer D-Bus call
+///   answered by Qt's `QDBusConnectionManager` daemon thread.  On kscreenlocker
+///   ≤ 6.7 the answer is instead posted back to the thread that called
+///   `pam_authenticate`, which would deadlock; nothing in `/proc` reveals the
+///   version, so the allowlist stays as narrow as it can and
+///   `kscreenlocker_greet` is deliberately absent.
+/// * `hyprlock` — a worker `std::thread` with mutex/condvar, i.e. a genuine
+///   concurrent race.  Known residual risk, accepted by the operator:
+///   `resetConversation` and `checkWaiting` are not synchronised, so more than
+///   one waiter would be unsafe.
+/// * `authproto_pam` (xsecurelock) — the conversation is answered by the host's
+///   own thread pool, not by the thread that called `pam_authenticate`.  Quirk:
+///   `CallPAMWithRetries` (`helpers/authproto_pam.c:109-132`) re-runs
+///   `pam_authenticate` for every status except `ABORT`, `MAXTRIES`,
+///   `NEW_AUTHTOK_REQD` and `SUCCESS`, so an explicit denial can ring the phone
+///   up to three times too.  Documented, not fixed here.
+/// * `gdm-session-worker` on a `gdm-password` **reauthentication** — the
+///   unlock/re-auth prompt of a running GDM session, whose conversation is
+///   answered by the worker's GLib main loop on another thread.  Only a
+///   reauthentication qualifies: a GDM *login* is bypassed by
+///   `guard_display_manager_bypass` for keyring reasons, and the worker is
+///   otherwise the host whose event loop must own the conversation.
+///
+/// The screen-saver dialogs are deliberately absent: `xfce4-screensaver-dialog`
+/// and `mate-screensaver-dialog` park their PAM conversation in GLib's
+/// `g_cond_wait`, a bare `futex(FUTEX_WAIT_PRIVATE)` with no cancellation
+/// handshake, so a phone grant cannot abandon the conversation.  Sequential
+/// keeps the phone race and only gives up in-call password fallback.
+///
+/// Pre-collected hosts (`swaylock`, `gtklock`, `i3lock`) are classified
+/// `PreCollected` instead: their conversation replays a password that was read
+/// before `pam_authenticate`, so the phone must not be consulted at all.
+///
+/// Extending the list is one match entry plus one row in the table test below;
+/// every host that is not named stays on the sequential path.
+fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> ConversationMode {
+    match process {
+        Some("polkit-agent-helper-1" | "polkit-agent-he")
+        | Some("kscreenlocker_worker" | "kscreenlocker_w")
+        | Some("hyprlock")
+        | Some("authproto_pam") => ConversationMode::Threaded,
+        // A GDM reauthentication prompt only.  `reauth` is false when
+        // `GDM_SESSION_FOR_REAUTH` is absent (a missed or renamed variable
+        // therefore degrades to the sequential default, never to a deadlock),
+        // and a non-`gdm-password` service behind `gdm-session-worker` stays
+        // sequential.
+        Some("gdm-session-worker" | "gdm-session-wor")
+            if reauth && service.eq_ignore_ascii_case("gdm-password") =>
+        {
+            ConversationMode::Threaded
+        }
+        // All three names are shorter than `TASK_COMM_LEN` (15), so the
+        // `/proc/self/comm` spelling equals the full name and there is no
+        // truncated variant to accept.  These hosts read the password before
+        // `pam_authenticate` (swaylock `pam.c:51` `strdup(state->password)`,
+        // gtklock `auth.c:61` `strdup(data->pw)`, i3lock `i3lock.c:836`
+        // `strdup(password)`) and their conversation is a synchronous replay of
+        // it, so collecting the token on the calling thread is not a race.
+        Some("swaylock" | "gtklock" | "i3lock") => ConversationMode::PreCollected,
+        // /proc unreadable: preserve the historic polkit behaviour rather than
+        // silently changing how polkit drives its conversation.
+        None if service == "polkit-1" => ConversationMode::Threaded,
+        _ => ConversationMode::Sequential,
+    }
+}
+
+/// Whether this invocation is a GDM reauthentication (unlock, or the admin
+/// prompt of a running GNOME session) rather than a fresh login.
+///
+/// GDM exports `GDM_SESSION_FOR_REAUTH` for the `gdm-session-worker` it spawns
+/// to reauthenticate an existing session.  The variable is the only signal
+/// available inside the module: the service name (`gdm-password`) is identical
+/// for login and reauthentication.
+fn is_gdm_reauth(service: &str) -> bool {
+    service.eq_ignore_ascii_case("gdm-password")
+        && std::env::var_os("GDM_SESSION_FOR_REAUTH").is_some()
+}
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
 /// message from being displayed on top of an explicit IPC error message.
@@ -180,6 +338,58 @@ unsafe extern "C-unwind" fn native_password_worker(
     }
 
     std::ptr::null_mut()
+}
+
+/// Cancel (optionally) and reap the native password worker.
+///
+/// # Why the join is load-bearing
+///
+/// 1. Stack safety: `ThreadContext` lives on the caller's stack, so the worker
+///    must be gone before that frame is popped.
+/// 2. libpam ownership: `pamh` is a plain, unlocked struct and the libpam
+///    state the conversation depends on (`caller_is`) is process-global.  If
+///    the calling thread re-entered libpam — another `conv` call, a
+///    `pam_get_item`, or simply the return from `pam_authenticate` — while the
+///    worker could still be inside `pam_get_authtok`, the two would race on
+///    unsynchronised libpam state.  The join is what orders them, so it runs on
+///    every non-panicking path, including the ones where the worker is expected
+///    to have exited already.
+///
+/// A panic between the `pthread_create` and this join unwinds past the frame
+/// that holds `ThreadContext` without reaping the worker.  That pre-existing
+/// gap is not addressed by this change — closing it would need a drop guard —
+/// and `guard()` (`lib.rs`) only converts the panic into `PAM_AUTH_ERR`.
+///
+/// # Safety
+///
+/// `pthread_id` must be a live, joinable thread created by this module, and
+/// this must be its only join.
+unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
+    // NOTE: pthread_cancel carries a theoretical risk of deadlocking the parent
+    // process if the cancellation signal arrives while the worker holds an
+    // internal libc lock (e.g. inside a malloc arena entered by
+    // pam_get_authtok).  This is an accepted architectural trade-off; fully
+    // isolating the conversation pipe would require a separate helper process,
+    // as Howdy does with its Python subprocess.
+    if cancel {
+        let cancel_res = unsafe { libc::pthread_cancel(pthread_id) };
+        // ESRCH is benign: the thread already exited naturally during a race
+        // between password entry and the phone tap response.
+        if cancel_res != 0 && cancel_res != libc::ESRCH {
+            let err = std::io::Error::from_raw_os_error(cancel_res);
+            tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
+        }
+    }
+
+    // SAFETY: if pthread_join fails the worker thread may still be running with
+    // a dangling reference into the caller's stack frame.  Aborting is the only
+    // safe response.
+    let join_res = unsafe { libc::pthread_join(pthread_id, std::ptr::null_mut()) };
+    if join_res != 0 {
+        let err = std::io::Error::from_raw_os_error(join_res);
+        tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
+        std::process::abort();
+    }
 }
 
 /// Central event loop for the graphical authentication flow.
@@ -291,16 +501,16 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
 /// Event loop for GUI contexts whose conversation function must not be driven
 /// while TapAuth waits for the phone.
 ///
-/// Some graphical PAM hosts — most importantly KDE's lock screen, which runs
-/// the PAM stack inside `kscreenlocker_worker` — implement the conversation as
-/// a synchronous D-Bus round-trip that can only be answered by the event loop
-/// running on the very thread that called `pam_authenticate`.  For those
-/// hosts:
+/// This is the default for every host that `conversation_mode` does not
+/// allowlist.  Such a host typically implements the conversation as a
+/// synchronous round-trip that can only be answered by the event loop running
+/// on the very thread that called `pam_authenticate` (kscreenlocker ≤ 6.7, for
+/// instance, posts the answer back to that thread).  For those hosts:
 ///
 /// 1. collecting the password from a background thread deadlocks: the
 ///    conversation reply is queued for the blocked host event loop and can
 ///    never be dispatched, so password entry stops working entirely, and
-/// 2. `pthread_cancel`-ing that background thread (as the polkit flow does)
+/// 2. `pthread_cancel`-ing that background thread (as the threaded flow does)
 ///    would force-unwind through the host's non-Rust frames, which can
 ///    `abort()` the host process and take the lock screen down with it.
 ///
@@ -393,9 +603,14 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
 ///   processing failure, or the daemon reported an internal error
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
 ///
-/// `PAM_IGNORE` is deliberately never returned. Linux-PAM records no failure
+/// `PAM_IGNORE` is deliberately never returned.  Linux-PAM records no failure
 /// for it, so a later `optional` module that votes success (e.g. `pam_permit`)
-/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.
+/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.  That is
+/// a `required`-line hazard, and it is the shape this protects: there
+/// `PAM_IGNORE` is explicitly `ignore` while `PAM_AUTHINFO_UNAVAIL` is `bad`.
+/// On a `sufficient` line both codes are `ignore` and a following
+/// `optional pam_permit` grants either way, so there the stack's own
+/// configuration, not the return code, is what prevents the grant.
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
 
@@ -441,24 +656,68 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
 
     let msgs = pam_messages::load_for_user(&username);
 
-    // Block terminal polling if running under the Polkit Graphical Helper.
+    // Block terminal polling if the calling host drives its own conversation.
     // This prevents the PAM module from stealing stdin strings from checking
     // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
     // to deadlock during graphical challenge-response dialogs.
     let service = unsafe { pam_sys::get_service_name(pamh) }.unwrap_or_default();
-    let is_polkit = service == "polkit-1";
-    // Only hosts whose conversation is a plain blocking fd fed by a separate
-    // process (polkit-agent-helper-1) can safely run the conversation from a
-    // background thread while this thread waits for the daemon.  Event-loop
-    // based hosts (e.g. kscreenlocker_worker) deadlock instead — see
-    // `run_sequential_event_loop`.
-    let supports_threaded_conversation = is_polkit;
-    let tty_file = if !is_polkit {
+    let process = process_identity();
+    // GDM reauthentication (unlock / admin prompt of a running session) must
+    // not take the display-manager bypass below, and it is the only GDM case
+    // whose conversation we may drive from a worker thread.
+    let reauth = is_gdm_reauth(&service);
+    let mode = conversation_mode(&service, process.as_deref(), reauth);
+    tracing::debug!(
+        "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?}, reauth: {reauth})",
+        process,
+        service
+    );
+    // A host whose conversation we drive from a worker thread must not take the
+    // terminal branch: it would start polling /dev/tty on this thread and steal
+    // the stdin the host expects for its own dialog.
+    let tty_file = if mode == ConversationMode::Sequential {
         std::fs::File::open("/dev/tty").ok()
     } else {
         None
     };
     let has_terminal = tty_file.is_some();
+
+    // Pre-collected hosts (swaylock, gtklock, i3lock) read the password before
+    // they call `pam_authenticate`; their conversation is a synchronous replay
+    // of it, so `pam_get_authtok` returns immediately and never waits for the
+    // user.  Collect the token on the calling thread — a worker thread would
+    // only reintroduce the cross-thread libpam pattern the threaded path has to
+    // join around — and let it be cached in `PAM_AUTHTOK`, which is what the
+    // next module (`pam_unix` with `try_first_pass`/`use_first_pass`) verifies.
+    //
+    // This is deliberately a skip, not a wait: the user has already typed the
+    // password, so ringing the phone would be misleading and could only ever
+    // end in a timeout.  The skip returns `PAM_AUTHINFO_UNAVAIL` (never
+    // `PAM_IGNORE`): a `sufficient` line treats that as `ignore`, exactly as
+    // `PAM_IGNORE` would, so the next module still runs; a `required` line
+    // fails closed.  If the token cannot be read (the host's
+    // conversation refused it, or nothing was collected) the next module simply
+    // prompts as it would without this module.
+    if mode == ConversationMode::PreCollected {
+        let mut authtok: *const std::os::raw::c_char = std::ptr::null();
+        // SAFETY: `pamh` is the live handle libpam passed to this call and the
+        // conversation belongs to this thread, which is what the host expects.
+        let res = unsafe {
+            pam_sys::pam_get_authtok(pamh, pam_sys::PAM_AUTHTOK, &mut authtok, std::ptr::null())
+        };
+        if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
+            tracing::warn!(
+                "TapAuth: pre-collected host supplied no password token ({res}); \
+                 falling through to the next PAM module"
+            );
+        } else {
+            tracing::info!(
+                "TapAuth: pre-collected password cached for the next PAM module; \
+                 the phone is not consulted"
+            );
+        }
+        return pam_sys::PAM_AUTHINFO_UNAVAIL;
+    }
 
     // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
     // (one conversation round trip that carries no input and never waits for
@@ -468,7 +727,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // hosts only reveal their password entry once a PAM message arrives.
     if has_terminal {
         pam_conv.try_info(msgs.waiting_for_tap_skip());
-    } else if supports_threaded_conversation {
+    } else if mode == ConversationMode::Threaded {
         pam_conv.try_info(msgs.waiting_for_tap());
     }
 
@@ -483,7 +742,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // and the daemon's authentication timeout, so they stay in sync.  GUI
     // contexts without a usable conversation get the shorter GUI deadline so
     // password fallback remains close at hand.
-    let effective_timeout_secs = if !has_terminal && !supports_threaded_conversation {
+    let effective_timeout_secs = if !has_terminal && mode == ConversationMode::Sequential {
         config
             .pam_gui_timeout_secs
             .min(config.pam_operation_timeout_secs)
@@ -500,8 +759,8 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     };
     let context = if has_terminal {
         "terminal"
-    } else if supports_threaded_conversation {
-        "gui-threaded (polkit)"
+    } else if mode == ConversationMode::Threaded {
+        "gui-threaded"
     } else {
         "gui-sequential"
     };
@@ -527,11 +786,12 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         return pam_sys::PAM_AUTHINFO_UNAVAIL;
     }
 
-    // GUI contexts without a usable conversation (e.g. the KDE lock screen's
-    // kscreenlocker_worker): wait for the daemon on this thread and never
-    // drive the conversation.  Password fallback happens after this returns,
-    // when the next PAM module runs its own conversation.
-    if !has_terminal && !supports_threaded_conversation {
+    // GUI contexts whose conversation must be left to the host (the sequential
+    // mode, e.g. the KDE lock screen before kscreenlocker 6.8): wait for the
+    // daemon on this thread and never *drive* the conversation.  Password
+    // fallback happens after this returns, when the next PAM module runs its
+    // own conversation.
+    if !has_terminal && mode == ConversationMode::Sequential {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
         // Announce the wait now that the request is on the wire and the module
         // is about to block.  Event-loop hosts (GDM's auth prompt, KDE's
@@ -568,11 +828,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         };
     }
 
-    // GUI context with a threaded-conversation-capable host (polkit-1 only):
-    // offload blocking credential collection to a native background thread so
-    // the Polkit graphical helper can process window events, then multiplex
+    // GUI context with a threaded-conversation-capable host (see
+    // `conversation_mode`): offload blocking credential collection to a native
+    // background thread so the host can process window events, then multiplex
     // loop events using a secure close-on-exec self-pipe.
-    if !has_terminal && supports_threaded_conversation {
+    if !has_terminal && mode == ConversationMode::Threaded {
         // O_CLOEXEC prevents the pipe fds from leaking to child processes
         // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
@@ -643,6 +903,15 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         let pthread_id = unsafe { pthread_id.assume_init() };
         let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
+        // The verdict when no daemon response arrived.  Every remaining exit
+        // reason means the service could not be consulted — the user chose the
+        // password (`PasswordEntered`, which leaves the token cached by
+        // `pam_get_authtok` for the next module), dismissed the dialog
+        // (`PasswordFailed`), the daemon went quiet (`Timeout`) or the IPC layer
+        // failed (`IpcError`, announced through `pending_error` above).  It is
+        // not `PAM_IGNORE`: on a `sufficient` line `PAM_AUTHINFO_UNAVAIL` is
+        // equally `ignore`, while on a `required` line `PAM_IGNORE` would let a
+        // later `optional pam_permit` grant the whole stack.
         let mut final_outcome = pam_sys::PAM_AUTHINFO_UNAVAIL;
         let mut auth_response = None;
         let mut pending_error: Option<&str> = None;
@@ -658,36 +927,17 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
             &mut pending_error,
         );
 
-        // Cancel the worker if it hasn't already exited on its own.
+        // Cancel the worker if it hasn't already exited on its own, then always
+        // reap it (see `cancel_and_join` for why the join is load-bearing).
         //
-        // NOTE: pthread_cancel carries a theoretical risk of deadlocking the
-        // parent process if the cancellation signal arrives while the worker
-        // holds an internal libc lock (e.g. inside a malloc arena entered by
-        // pam_get_authtok).  This is an accepted architectural trade-off;
-        // fully isolating the conversation pipe would require a separate
-        // helper process, as Howdy does with its Python subprocess.
-        if exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed {
-            unsafe {
-                let cancel_res = libc::pthread_cancel(pthread_id);
-                // ESRCH is benign: the thread already exited naturally during
-                // a race between password entry and the phone tap response.
-                if cancel_res != 0 && cancel_res != libc::ESRCH {
-                    let err = std::io::Error::from_raw_os_error(cancel_res);
-                    tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
-                }
-            }
-        }
-
-        // SAFETY: if pthread_join fails the worker thread may still be
-        // running with a dangling &ctx reference into our stack frame.
-        // Aborting is the only safe response.
+        // Password entry and dialog dismissal both mean the worker has left
+        // `pam_get_authtok` on its own, so those paths skip the cancel.
         unsafe {
-            let join_res = libc::pthread_join(pthread_id, std::ptr::null_mut());
-            if join_res != 0 {
-                let err = std::io::Error::from_raw_os_error(join_res);
-                tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
-                std::process::abort();
-            }
+            cancel_and_join(
+                pthread_id,
+                exit_reason != ExitReason::PasswordEntered
+                    && exit_reason != ExitReason::PasswordFailed,
+            );
             libc::close(pipe_read);
             libc::close(pipe_write);
         }
@@ -851,33 +1101,13 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     pam_sys::PAM_AUTHINFO_UNAVAIL
 }
 
-/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
-/// manager.
+/// Whether the PAM service name belongs to a primary display manager.
 ///
-/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
-/// LightDM, LXDM), a successful phone confirmation authenticates the user but
-/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
-/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
-/// depend on that token to unlock the local secure keyring/wallet at login-time.
-///
-/// Bypassing DM services preserves the normal password collection flow so the
-/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
-/// secondary prompt. The module still runs for secondary services such as
-/// `sudo`, `polkit-1`, and desktop screensavers.
-///
-/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
-/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
-/// `sufficient` line the stack treats it as `ignore` and still runs the next
-/// module; on a `required` line it fails closed.
-///
-/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
-/// otherwise.
-fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
-    let service = unsafe { pam_sys::get_service_name(pamh) }?;
-    tracing::debug!("Calling PAM service name: {}", service);
-
-    let service_lower = service.to_ascii_lowercase();
-    let dm_prefixes = [
+/// Matched by exact name or by a `-`-suffixed prefix, so `gdm`, `gdm3` and
+/// `gdm-password` all qualify but an unrelated service such as `gdmfoo` does
+/// not.
+fn is_dm_service(service: &str) -> bool {
+    const DM_PREFIXES: [&str; 13] = [
         "sddm",
         "gdm",
         "gdm3",
@@ -892,11 +1122,46 @@ fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> 
         "entrance",
         "plasmalogin",
     ];
-    if dm_prefixes.iter().any(|p| {
+    let service_lower = service.to_ascii_lowercase();
+    DM_PREFIXES.iter().any(|p| {
         service_lower == *p
             || (service_lower.starts_with(p)
                 && service_lower.as_bytes().get(p.len()) == Some(&b'-'))
-    }) {
+    })
+}
+
+/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
+/// manager.
+///
+/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
+/// LightDM, LXDM), a successful phone confirmation authenticates the user but
+/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
+/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
+/// depend on that token to unlock the local secure keyring/wallet at login-time.
+///
+/// Bypassing DM services preserves the normal password collection flow so the
+/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
+/// secondary prompt. The module still runs for secondary services such as
+/// `sudo`, `polkit-1`, and desktop screensavers.
+///
+/// A **GDM reauthentication** (`gdm-password` with `GDM_SESSION_FOR_REAUTH`
+/// set) is exempt: it runs no session/setcred phase
+/// (`gdm-session-worker.c:1489,1781`), so the keyring reason for keeping the
+/// login sequential does not apply, and the unlock prompt is exactly where the
+/// phone should be offered.
+///
+/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
+/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
+/// `sufficient` line the stack treats it as `ignore` and still runs the next
+/// module; on a `required` line it fails closed.
+///
+/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
+/// otherwise.
+fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
+    let service = unsafe { pam_sys::get_service_name(pamh) }?;
+    tracing::debug!("Calling PAM service name: {}", service);
+
+    if is_dm_service(&service) && !is_gdm_reauth(&service) {
         tracing::info!(
             "TapAuth: Service '{}' is a primary display manager. \
              Skipping to avoid breaking keyring auto-unlock.",
@@ -1190,27 +1455,385 @@ mod tests {
         }
     }
 
-    /// The mapping above only covers daemon responses. Guard the remaining
-    /// return sites (conversation lookup, RNG, IPC failures, skip and timeout
-    /// paths) against reintroducing `PAM_IGNORE` in the module source.
+    /// Blank every comment, string literal and char literal, keeping the
+    /// newlines so that the reported line numbers still match the file on disk.
     ///
-    /// The needle is split across two literals so that this test's own text
-    /// does not match it.
-    #[test]
-    fn test_module_source_contains_no_pam_ignore_return() {
-        for (file, source) in [
-            ("client-pam/src/pam_logic.rs", include_str!("pam_logic.rs")),
-            ("client-pam/src/lib.rs", include_str!("lib.rs")),
-        ] {
-            for (index, line) in source.lines().enumerate() {
-                assert!(
-                    !line.contains(concat!("pam_sys::PAM", "_IGNORE")),
-                    "{file}:{} returns PAM_IGNORE: {}",
-                    index + 1,
-                    line.trim()
+    /// The docs in this crate deliberately name the forbidden code in prose, and
+    /// the test's own assertions quote both needles, so scanning raw source
+    /// would flag those instead of the return site it is looking for.
+    ///
+    /// Runs over bytes: every delimiter involved is ASCII, and the crate's
+    /// sources are ASCII apart from localisation strings, which are blanked
+    /// here.  A non-ASCII *char* literal would be taken for a lifetime and
+    /// copied verbatim, which can only hide a needle, never invent one.
+    #[allow(clippy::indexing_slicing)]
+    fn stripped_source(source: &str) -> String {
+        let b = source.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            // Line comment.
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment (Rust nests them).
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 1usize;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            // Raw strings: `r"…"`, `r#"…"#`, `br"…"`, `br#"…"#`.
+            let raw_at = if b[i] == b'r' {
+                Some(i + 1)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'r') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(at) = raw_at {
+                let mut hashes = 0usize;
+                while b.get(at + hashes) == Some(&b'#') {
+                    hashes += 1;
+                }
+                if b.get(at + hashes) == Some(&b'"') {
+                    let mut j = at + hashes + 1;
+                    let mut end = b.len();
+                    while j < b.len() {
+                        if b[j] == b'"' && (0..hashes).all(|k| b.get(j + 1 + k) == Some(&b'#')) {
+                            end = j + 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    out.extend(blank(b, i, end));
+                    i = end;
+                    continue;
+                }
+            }
+            // Normal and byte strings, honouring backslash escapes.
+            let quote_at = if b[i] == b'"' {
+                Some(i)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'"') {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(q) = quote_at {
+                let mut j = q + 1;
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'"' {
+                        j += 1;
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                let end = j.min(b.len());
+                out.extend(blank(b, i, end));
+                i = end;
+                continue;
+            }
+            // Char literals and byte chars.  A tick that does not open a
+            // one-character or escaped literal is a lifetime (`'a`) and is
+            // copied verbatim.
+            let tick_at = if b[i] == b'\'' {
+                Some(i)
+            } else if b[i] == b'b' && b.get(i + 1) == Some(&b'\'') {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(t) = tick_at {
+                let opens_literal = matches!(
+                    (b.get(t + 1), b.get(t + 2)),
+                    (Some(&b'\\'), _) | (Some(_), Some(&b'\''))
                 );
+                if !opens_literal {
+                    out.push(b[i]);
+                    i += 1;
+                    continue;
+                }
+                let mut j = t + 1;
+                if b.get(j) == Some(&b'\\') {
+                    j += 2;
+                    // `'\u{1F600}'`
+                    if b.get(j - 1) == Some(&b'u') && b.get(j) == Some(&b'{') {
+                        while j < b.len() && b[j] != b'}' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                } else {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'\'') {
+                    j += 1;
+                }
+                let end = j.min(b.len());
+                out.extend(blank(b, i, end));
+                i = end;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// `bytes[start..end]` as spaces, keeping its newlines.
+    #[allow(clippy::indexing_slicing)]
+    fn blank(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+        bytes[start..end]
+            .iter()
+            .map(|&c| if c == b'\n' { b'\n' } else { b' ' })
+            .collect()
+    }
+
+    /// The source line containing byte offset `at`, trimmed.
+    fn line_at(source: &str, at: usize) -> String {
+        let start = source[..at].rfind('\n').map_or(0, |n| n + 1);
+        let end = source[at..].find('\n').map_or(source.len(), |n| at + n);
+        source[start..end].trim().to_owned()
+    }
+
+    /// Every occurrence of `PAM_IGNORE` used as an identifier, as
+    /// `(line, source line)`.
+    #[allow(clippy::indexing_slicing)]
+    fn pam_ignore_identifiers(cleaned: &str) -> Vec<(usize, String)> {
+        const NEEDLE: &str = "PAM_IGNORE";
+        let b = cleaned.as_bytes();
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(offset) = cleaned[from..].find(NEEDLE) {
+            let start = from + offset;
+            let end = start + NEEDLE.len();
+            let is_ident_char = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+            let whole_word = !(start > 0 && is_ident_char(&b[start - 1]))
+                && !(end < b.len() && is_ident_char(&b[end]));
+            if whole_word {
+                let line = cleaned[..start].matches('\n').count() + 1;
+                hits.push((line, line_at(cleaned, start)));
+            }
+            from = end;
+        }
+        hits
+    }
+
+    /// Every numeric literal in `cleaned` whose value equals `code`, as
+    /// `(line, token)`.
+    ///
+    /// The literal is evaluated rather than substring-matched, so `0.25`
+    /// (rounded float), `0x25` (hex 37) and `1_025` (1025) are not hits while
+    /// `25u32` is.
+    #[allow(clippy::indexing_slicing)]
+    fn numeric_literals_equal_to(cleaned: &str, code: u128) -> Vec<(usize, String)> {
+        let b = cleaned.as_bytes();
+        let mut hits = Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            // Skip a digit that continues an identifier (`foo25`).
+            let begins_literal = b[i].is_ascii_digit()
+                && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'));
+            if !begins_literal {
+                i += 1;
+                continue;
+            }
+            let (value, next) = read_numeric_literal(b, i);
+            if value == Some(code) {
+                let line = cleaned[..i].matches('\n').count() + 1;
+                hits.push((line, cleaned[i..next].to_owned()));
+            }
+            i = next.max(i + 1);
+        }
+        hits
+    }
+
+    /// Read the numeric literal starting at `start` as `(value, end)`, with
+    /// `None` for floats.
+    #[allow(clippy::indexing_slicing)]
+    fn read_numeric_literal(b: &[u8], start: usize) -> (Option<u128>, usize) {
+        let mut i = start;
+        let radix = if b[i] == b'0' {
+            match b.get(i + 1).copied() {
+                Some(b'x' | b'X') => Some(16u32),
+                Some(b'o' | b'O') => Some(8u32),
+                Some(b'b' | b'B') => Some(2u32),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(radix) = radix {
+            i += 2;
+            let mut digits = String::new();
+            while let Some(&c) = b.get(i) {
+                if c == b'_' {
+                    i += 1;
+                } else if (c as char).is_digit(radix) {
+                    digits.push(c as char);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            while matches!(b.get(i), Some(c) if c.is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            return (u128::from_str_radix(&digits, radix).ok(), i);
+        }
+
+        let mut digits = String::new();
+        let mut is_float = false;
+        while let Some(&c) = b.get(i) {
+            if c == b'_' {
+                i += 1;
+            } else if c.is_ascii_digit() {
+                digits.push(c as char);
+                i += 1;
+            } else {
+                break;
             }
         }
+        if b.get(i) == Some(&b'.') && matches!(b.get(i + 1), Some(c) if c.is_ascii_digit()) {
+            is_float = true;
+            i += 1;
+            while matches!(b.get(i), Some(c) if c.is_ascii_digit() || *c == b'_') {
+                i += 1;
+            }
+        }
+        if matches!(b.get(i).copied(), Some(b'e' | b'E'))
+            && matches!(b.get(i + 1).copied(), Some(c) if c.is_ascii_digit() || c == b'+' || c == b'-')
+        {
+            is_float = true;
+            i += 2;
+            while matches!(b.get(i), Some(c) if c.is_ascii_digit() || *c == b'_') {
+                i += 1;
+            }
+        }
+        // Integer/float suffix (`25u32`, `1.5f64`).
+        while matches!(b.get(i), Some(c) if c.is_ascii_alphanumeric()) {
+            i += 1;
+        }
+        if is_float {
+            return (None, i);
+        }
+        (digits.parse::<u128>().ok(), i)
+    }
+
+    /// The mapping above only covers daemon responses.  Guard *every* file of
+    /// this crate — not just `pam_logic.rs` and `lib.rs` — against
+    /// reintroducing `PAM_IGNORE`, by identifier and by its numeric value.
+    ///
+    /// The numeric half is the one that matters for regressions: the vectors
+    /// that remain are a `pam_sys::PAM_IGNORE` re-export reaching a `return`, or
+    /// a bare literal equal to PAM_IGNORE's value, in any `client-pam/src/*.rs`
+    /// — either is a single edit away from the bypass this guards, and a
+    /// name-only scan would miss the numeric form.
+    #[test]
+    fn test_module_source_contains_no_pam_ignore_return() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
+            .map(|entry| entry.expect("readable dir entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.sort();
+        // An empty or relocated scan must not pass silently: these are the
+        // files that carry the return codes today.
+        assert!(
+            files.iter().any(|p| p.ends_with("pam_logic.rs"))
+                && files.iter().any(|p| p.ends_with("error.rs")),
+            "the scan did not cover pam_logic.rs and error.rs: {files:?}"
+        );
+
+        // Spelled arithmetically so this test's own source carries no literal
+        // for its own scan to find.
+        let ignore_code: u128 = 5 * 5;
+        let mut findings: Vec<String> = Vec::new();
+        for path in &files {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let cleaned = stripped_source(&source);
+            for (line, text) in pam_ignore_identifiers(&cleaned) {
+                findings.push(format!("{name}:{line}: PAM_IGNORE identifier in: {text}"));
+            }
+            for (line, text) in numeric_literals_equal_to(&cleaned, ignore_code) {
+                findings.push(format!(
+                    "{name}:{line}: PAM_IGNORE value {ignore_code} used in: {text}"
+                ));
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "the module must never return PAM_IGNORE:\n{}",
+            findings.join("\n")
+        );
+    }
+
+    /// The whole-crate scan above returns empty for two independent reasons —
+    /// every `PAM_IGNORE` in this crate is prose inside a comment, and no bare
+    /// literal holds its value — so it would stay green even if the stripper or
+    /// either detector were broken.  Prove both detectors fire on a synthetic
+    /// snippet, and that a comment or a string naming the code does not count.
+    #[test]
+    fn test_pam_ignore_scan_detects_a_real_return() {
+        // Spelled arithmetically so this test's own source carries no literal
+        // for its own scan to find (as in the whole-crate scan above).
+        let ignore_code: u128 = 5 * 5;
+
+        let source = format!(
+            "// PAM_IGNORE in a comment is prose, not a return.\n\
+             /* PAM_IGNORE and {ignore_code} in a block comment, too. */\n\
+             let prose = \"return pam_sys::PAM_IGNORE; return {ignore_code};\";\n\
+             let code = {{ let x = pam_sys::PAM_IGNORE; x }};\n\
+             return {ignore_code}u32;\n"
+        );
+        let cleaned = stripped_source(&source);
+
+        assert_eq!(
+            pam_ignore_identifiers(&cleaned),
+            vec![(
+                4,
+                "let code = { let x = pam_sys::PAM_IGNORE; x };".to_owned()
+            )],
+            "the identifier scan must report the real return and neither the \
+             comment nor the string"
+        );
+
+        assert_eq!(
+            numeric_literals_equal_to(&cleaned, ignore_code),
+            vec![(5, format!("{ignore_code}u32"))],
+            "the numeric scan must report the bare value and neither the \
+             comment nor the string"
+        );
+
+        // The negative half: prose alone must never be reported, which is what
+        // makes the whole-crate assertion meaningful today.
+        assert_eq!(
+            pam_ignore_identifiers(&stripped_source("// PAM_IGNORE\n")),
+            Vec::new(),
+            "a comment naming PAM_IGNORE is not a return"
+        );
     }
 }
 
@@ -1518,6 +2141,12 @@ mod gui_loop_tests {
         assert!(auth_response.is_none());
     }
 
+    /// **Smoke test only.**  It compares *source byte offsets* and would still
+    /// pass if the announcement sat behind a branch that never executes.
+    ///
+    /// The authoritative coverage is `scripts/ci/test-pam-host-cases.sh` case 1
+    /// (`ttyless_wait_announced_before_blocking`), which counts and times the
+    /// real `PAM_TEXT_INFO` on a live PAM stack.
     #[test]
     fn test_sequential_wait_is_announced_before_it_blocks() {
         let source = include_str!("pam_logic.rs");
@@ -1574,5 +2203,301 @@ mod gui_loop_tests {
             "the sequential-wait announcement must stay on one line, got {:?}",
             text
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod conversation_mode_tests {
+    use super::*;
+    use std::os::raw::c_void;
+
+    #[test]
+    fn conversation_mode_is_an_allowlist_with_a_sequential_default() {
+        // (service, process, reauth, expected)
+        let cases: &[(&str, Option<&str>, bool, ConversationMode)] = &[
+            // polkit: conversation is a fd answered by the separate agent
+            // process.  Reauth is irrelevant to it.
+            (
+                "polkit-1",
+                Some("polkit-agent-helper-1"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "polkit-1",
+                Some("polkit-agent-he"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // kscreenlocker >= 6.8 answers on Qt's D-Bus daemon thread; the
+            // greet helper does not, so it stays sequential.
+            (
+                "kde",
+                Some("kscreenlocker_worker"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "kde",
+                Some("kscreenlocker_w"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            (
+                "kde",
+                Some("kscreenlocker_greet"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            (
+                "kde",
+                Some("kscreenlocker_g"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            ("sudo", Some("sudo"), false, ConversationMode::Sequential),
+            ("su", Some("su"), false, ConversationMode::Sequential),
+            // hyprlock answers concurrently (documented residual risk).
+            (
+                "hyprlock",
+                Some("hyprlock"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // xsecurelock's helper answers on its own thread pool.
+            (
+                "xsecurelock",
+                Some("authproto_pam"),
+                false,
+                ConversationMode::Threaded,
+            ),
+            // xfce4-screensaver / mate-screensaver dialog children, full and
+            // `/proc/self/comm`-truncated spellings.  Their conversation parks
+            // in `g_cond_wait`, which is not a cancellation point, so they stay
+            // sequential.
+            (
+                "xfce4-screensaver",
+                Some("xfce4-screensaver-dialog"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            (
+                "xfce4-screensaver",
+                Some("xfce4-screensav"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            (
+                "mate-screensaver",
+                Some("mate-screensaver-dialog"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            (
+                "mate-screensaver",
+                Some("mate-screensave"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            // Hosts that read the password before pam_authenticate: their
+            // conversation only replays it, so the phone is not consulted.
+            (
+                "swaylock",
+                Some("swaylock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            (
+                "gtklock",
+                Some("gtklock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            (
+                "i3lock",
+                Some("i3lock"),
+                false,
+                ConversationMode::PreCollected,
+            ),
+            // GDM: only a reauthentication prompt may be driven from a worker
+            // thread, and only behind the `gdm-password` service.
+            (
+                "gdm-password",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            (
+                "gdm-password",
+                Some("gdm-session-wor"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            // The env var is absent (reauth=false): same worker, sequential.
+            (
+                "gdm-password",
+                Some("gdm-session-worker"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            // The reauth flag alone must not promote a non-DM service.
+            (
+                "sudo",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Sequential,
+            ),
+            // Case-insensitive service match.
+            (
+                "GDM-Password",
+                Some("gdm-session-worker"),
+                true,
+                ConversationMode::Threaded,
+            ),
+            (
+                "whatever",
+                Some("whatever"),
+                false,
+                ConversationMode::Sequential,
+            ),
+            ("polkit-1", None, false, ConversationMode::Threaded),
+            ("sudo", None, false, ConversationMode::Sequential),
+            ("", None, false, ConversationMode::Sequential),
+        ];
+
+        for &(service, process, reauth, expected) in cases {
+            assert_eq!(
+                conversation_mode(service, process, reauth),
+                expected,
+                "service {service:?} with process {process:?} and reauth {reauth}"
+            );
+        }
+    }
+
+    /// The DM bypass and the GDM reauth exemption both hang off this prefix
+    /// test: it must stay exact-or-`-`-suffixed so an unrelated service whose
+    /// name merely starts with a DM name is not skipped.
+    #[test]
+    fn display_manager_prefix_matching() {
+        for service in [
+            "gdm",
+            "gdm3",
+            "gdm-password",
+            "GDM-Password",
+            "gdm-tapauth-host",
+            "sddm",
+            "sddm-helper",
+            "lightdm",
+            "greetd",
+            "plasmalogin",
+        ] {
+            assert!(
+                is_dm_service(service),
+                "{service:?} must be treated as a display manager service"
+            );
+        }
+        for service in [
+            "gdmfoo",
+            "sddmfoo",
+            "sudo",
+            "su",
+            "polkit-1",
+            "tapauth-conv-sufficient",
+            "",
+        ] {
+            assert!(
+                !is_dm_service(service),
+                "{service:?} must not be treated as a display manager service"
+            );
+        }
+    }
+
+    static JOIN_TEST_STARTED: AtomicBool = AtomicBool::new(false);
+
+    struct JoinTestCtx {
+        pipe_read: libc::c_int,
+    }
+
+    /// Blocks in `read(2)` — a cancellation point, just like
+    /// `pam_get_authtok` — so `cancel_and_join` can only return promptly by
+    /// actually cancelling the thread.  `C-unwind` lets glibc's
+    /// `abi::__forced_unwind` pass through this frame.
+    unsafe extern "C-unwind" fn join_test_worker(arg: *mut c_void) -> *mut c_void {
+        let ctx = unsafe { &*(arg as *const JoinTestCtx) };
+        JOIN_TEST_STARTED.store(true, Ordering::Release);
+        let mut buf = [0u8; 1];
+        unsafe {
+            libc::read(ctx.pipe_read, buf.as_mut_ptr() as *mut c_void, 1);
+        }
+        std::ptr::null_mut()
+    }
+
+    // `libc::pthread_create` wants an `extern "C"` fn; this binding keeps the
+    // worker's `C-unwind` ABI without transmuting function signatures.
+    extern "C" {
+        #[link_name = "pthread_create"]
+        fn pthread_create_unwind(
+            thread: *mut libc::pthread_t,
+            attr: *const libc::pthread_attr_t,
+            start_routine: unsafe extern "C-unwind" fn(*mut c_void) -> *mut c_void,
+            arg: *mut c_void,
+        ) -> libc::c_int;
+    }
+
+    #[test]
+    fn cancel_and_join_reaps_a_worker_blocked_in_a_cancellation_point() {
+        let mut fds: [libc::c_int; 2] = [-1, -1];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2 failed"
+        );
+
+        // The write end stays open: only a cancel unblocks the worker.
+        let ctx = JoinTestCtx { pipe_read: fds[0] };
+        let mut tid = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+        let rc = unsafe {
+            pthread_create_unwind(
+                tid.as_mut_ptr(),
+                std::ptr::null(),
+                join_test_worker,
+                &ctx as *const JoinTestCtx as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "pthread_create failed");
+        let tid = unsafe { tid.assume_init() };
+
+        // Watchdog: unblock the worker after 5s so a missing cancel fails this
+        // test instead of hanging it.  It owns the write end and closes it.
+        let watchdog_write = fds[1];
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let byte = [1u8];
+            unsafe {
+                libc::write(watchdog_write, byte.as_ptr() as *const c_void, 1);
+                libc::close(watchdog_write);
+            }
+        });
+
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while !JOIN_TEST_STARTED.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < start_deadline,
+                "worker thread never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        unsafe { cancel_and_join(tid, true) };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel_and_join took {elapsed:?}: the worker was not cancelled and had to be \
+             unblocked by the watchdog"
+        );
+
+        unsafe { libc::close(fds[0]) };
     }
 }
