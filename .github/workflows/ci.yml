@@ -193,6 +193,15 @@ jobs:
             SKIP_BUILD=1 \
             ./scripts/ci/test-pam-host-cases.sh
 
+      # Threaded PAM conversation path: the allowlist keyed on the calling
+      # process, the sufficient/required/bypass stack shapes and the
+      # non-allowlisted control. Runs unprivileged — it builds the module itself
+      # (release, --features dev-socket-override), compiles its C harness against
+      # the libpam0g-dev headers installed above, and uses pam_start_confdir so
+      # it never writes /etc/pam.d. No sudo.
+      - name: Run PAM conversation-thread harness
+        run: ./scripts/ci/test-pam-conv-thread.sh
+
       - name: Run tests for client config GUI
         run: cargo test --manifest-path client-config-gui/Cargo.toml --verbose
 
