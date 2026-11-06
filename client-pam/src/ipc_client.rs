@@ -283,6 +283,40 @@ impl IpcClient {
     }
 }
 
+/// Minimal abstraction over the IPC transport so the poll loops can be tested
+/// with a mock backed by real OS file descriptors.
+///
+/// It lives beside the client it abstracts — not in the orchestration — so
+/// `transaction::Armed`, which is generic over it, depends on the transport
+/// rather than on `pam_logic`.
+pub trait IpcResponseReader {
+    fn fd(&self) -> RawFd;
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<ipc::PamAuthenticateResponse>, std::io::Error>;
+    /// Best-effort cancellation of an in-flight authentication request.
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error>;
+}
+
+impl IpcResponseReader for IpcClient {
+    fn fd(&self) -> RawFd {
+        IpcClient::fd(self)
+    }
+
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<ipc::PamAuthenticateResponse>, std::io::Error> {
+        IpcClient::try_read_response_nonblocking(self)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error> {
+        IpcClient::send_cancel(self, reason, request_id)
+            .map(|_| ())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

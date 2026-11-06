@@ -37,255 +37,21 @@
 
 use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
-use crate::ipc_client::{IpcClient, IpcError};
+use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
 use crate::logging;
 use crate::outcome::{ErrorReason, Outcome, UnavailableReason};
 use crate::pam_messages;
 use crate::pam_sys;
 use crate::plan::{Announcement, Plannable, TtyUse};
 use crate::policy;
-use crate::transaction::{Concluded, Finished, Via};
+use crate::transaction::{Armed, Finished, StartError};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-/// Window during which the verdict this process just concluded may be
-/// replayed instead of starting a second authentication transaction.
-///
-/// What it guards: a duplicate transaction some lock screens issue right after
-/// a transaction concludes.  kscreenlocker ≥ 6.8 queues the duplicate
-/// `Authenticate()` about a second into the first transaction — while it is
-/// still running — and dispatches it the moment the first call returns,
-/// whatever its outcome, because its `PamAuthenticator::promptInternal()`
-/// clears the busy guard before the heartbeat's request can be observed and
-/// dropped.  The real fix is the upstream busy-guard change; until then the
-/// duplicate is answered here.  Without it the second call is a full
-/// transaction: a new request id, a new daemon challenge, and a second ring of
-/// the phone (or a second full timeout) for a single unlock.
-///
-/// Why replay *any* concluded code, not just `Success`: the duplicate was
-/// queued while the first transaction was still running, so no user could have
-/// initiated it.  Re-asking the phone about a request the user never made is
-/// wrong in both directions — a success would ring twice, and a failure
-/// (`PAM_AUTHINFO_UNAVAIL` for a phone timeout or an unpaired device, or
-/// `PAM_PERM_DENIED`) would ring again and wait out another full timeout for a
-/// question that was just answered.
-///
-/// Why 500 ms: the observed duplicate gap is 0.37 ms, so 500 ms absorbs
-/// scheduling jitter on a loaded host, while a human re-lock or a second login
-/// as the same user takes seconds — no human-initiated retry can fall inside
-/// the window, which is what keeps a genuine second attempt from being
-/// answered by a cached failure.
-///
-/// Where the window starts: at this module's **return**.  `authenticate` records
-/// the code only after `authenticate_inner` has handed it back, so the 500 ms
-/// runs from the end of the `pam_authenticate` call, not from the moment the
-/// transaction concluded.  That is what matches the host behaviour it exists
-/// for (the duplicate is dispatched the instant the first call returns), but it
-/// also bounds the suppression: a module *after* `pam_tapauth.so` in the same
-/// stack that blocks for longer than 500 ms pushes the host's duplicate outside
-/// the window, and that duplicate rings the phone again.  Suppression is a
-/// heuristic for a host that re-enters immediately, not a guarantee that a
-/// second `pam_authenticate` in the same process is always answered locally.
-const VERDICT_REUSE_WINDOW: Duration = Duration::from_millis(500);
-
-/// The verdict this process concluded last, with the user and service it
-/// belongs to.
-///
-/// Process-wide because the duplicate transaction comes from the same host
-/// process.  Keyed on `(username, service)` because the duplicate is the same
-/// user against the same PAM service, so a different user *or* a different
-/// service takes the normal path and rings the phone.  The remaining assumption
-/// is that no legitimate host performs an *independent* authentication for the
-/// same user and service within 500 ms of a concluded one: the key cannot tell
-/// such a request apart from a duplicate.  A new process always misses, because
-/// `pam_end` unloads the module and the cache dies with it.
-struct LastConclusion {
-    concluded_at: Instant,
-    username: String,
-    service: String,
-    outcome: Outcome,
-}
-
-/// The last conclusion of this process, replayed for
-/// [`VERDICT_REUSE_WINDOW`] only.
-///
-/// `std::sync::Mutex` is const-constructible on stable, so no lazy initializer
-/// (and no `once_cell`) is needed.  The lock is an optimisation, never a
-/// credential: a poisoned lock is ignored rather than fatal, so losing the
-/// cache only costs one duplicate request.
-static LAST_CONCLUSION: Mutex<Option<LastConclusion>> = Mutex::new(None);
-
-/// What the verdict being returned was about, so the public entry point can
-/// record it.
-struct Verdict {
-    username: String,
-    /// `None` when the PAM service name could not be resolved: such a call is
-    /// never cached, neither looked up nor recorded, because an empty string
-    /// would silently merge unrelated services into one key.
-    service: Option<String>,
-    /// The code came from the cache, so it must not be recorded again: that
-    /// would refresh the timestamp and turn the fixed window into a sliding
-    /// one.
-    from_cache: bool,
-}
-
-/// Whether `prev` may be replayed for `username` against `service` at `now` —
-/// any code, not just a success.
-///
-/// Pure so the window can be tested without touching the process-wide cache.
-/// `Instant` is `CLOCK_MONOTONIC` and never steps backwards, so the subtraction
-/// can only be unavailable when the recorded instant came from another clock
-/// origin (or is a later `Instant` constructed in a test); saturating reads
-/// that as "no time passed" instead of panicking.
-fn reusable_conclusion(
-    prev: &LastConclusion,
-    username: &str,
-    service: &str,
-    now: Instant,
-) -> Option<Outcome> {
-    if prev.username == username
-        && prev.service == service
-        && now.saturating_duration_since(prev.concluded_at) < VERDICT_REUSE_WINDOW
-    {
-        return Some(prev.outcome.clone());
-    }
-    None
-}
-
-/// The cached verdict in `lock` for `(username, service)` at `now`, if it may
-/// be replayed.
-///
-/// The lock is a parameter so the poisoned path can be exercised by a test
-/// without poisoning the real [`LAST_CONCLUSION`].  A poisoned lock returns
-/// `None`: the cache is an optimisation, so ignoring it is always a correct
-/// answer.
-fn cached_from(
-    lock: &Mutex<Option<LastConclusion>>,
-    username: &str,
-    service: &str,
-    now: Instant,
-) -> Option<(Outcome, Duration)> {
-    let Ok(guard) = lock.lock() else {
-        return None;
-    };
-    guard.as_ref().and_then(|prev| {
-        reusable_conclusion(prev, username, service, now)
-            .map(|outcome| (outcome, now.saturating_duration_since(prev.concluded_at)))
-    })
-}
-
-/// The cached verdict for `(username, service)` at `now`, together with how long
-/// ago it was recorded, if it may be replayed.
-///
-/// The age is the distance from the recorded instant to `now` — i.e. measured
-/// from this module's return, which is where `authenticate` records it — so it
-/// is what the hit is logged with.
-fn cached_conclusion_for(
-    username: &str,
-    service: &str,
-    now: Instant,
-) -> Option<(Outcome, Duration)> {
-    cached_from(&LAST_CONCLUSION, username, service, now)
-}
-
-/// Remember the verdict this process concluded for `(username, service)`.
-///
-/// This is the *last* conclusion, so a non-success verdict overwrites an earlier
-/// success: a later denial must invalidate the cached grant, never sit behind
-/// it. The record holds the `Outcome`, not a code, so a replay cannot re-enter
-/// the code path — and step 5's `record` refuses a `Via::Replay` conclusion
-/// outright.
-///
-/// `now` is the moment the module returned to the host, which is the anchor of
-/// [`VERDICT_REUSE_WINDOW`] — not the moment the transaction concluded.
-fn record_conclusion(username: &str, service: &str, outcome: Outcome, now: Instant) {
-    if let Ok(mut guard) = LAST_CONCLUSION.lock() {
-        *guard = Some(LastConclusion {
-            concluded_at: now,
-            username: username.to_owned(),
-            service: service.to_owned(),
-            outcome,
-        });
-    }
-}
-
-/// Why a transaction never reached the daemon.
-enum StartError {
-    Connect(crate::ipc_client::IpcError),
-    Send(crate::ipc_client::IpcError),
-}
-
-/// Connect, put the authenticate request on the wire, and only then arm
-/// `verdict`.
-///
-/// The ordering is the point: the record exists so a duplicate
-/// `pam_authenticate` can replay a conclusion *the daemon* reached, so it must
-/// not be armed by a local IPC failure.  A missing socket or a failed write
-/// says nothing about the phone — arming there would let a later duplicate
-/// inherit that `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry
-/// must dial the socket again instead of being answered from the record.
-///
-/// `connect` and `send` are parameters so both failure paths are testable
-/// without a daemon (`verdict_reuse_tests`); production passes
-/// `IpcClient::connect_nonblocking` and `IpcClient::send_authenticate_start`.
-fn start_authentication<T, C, S>(
-    verdict: &mut Option<Verdict>,
-    username: &str,
-    service: Option<&str>,
-    connect: C,
-    send: S,
-) -> Result<T, StartError>
-where
-    C: FnOnce() -> Result<T, crate::ipc_client::IpcError>,
-    S: FnOnce(&mut T) -> Result<(), crate::ipc_client::IpcError>,
-{
-    let mut client = connect().map_err(StartError::Connect)?;
-    send(&mut client).map_err(StartError::Send)?;
-    // The request is on the wire, so a daemon conclusion is now possible and
-    // the record may be armed.  Nothing above this line can produce one.
-    *verdict = Some(Verdict {
-        username: username.to_owned(),
-        service: service.map(str::to_owned),
-        from_cache: false,
-    });
-    Ok(client)
-}
-
-/// Minimal abstraction over the IPC transport so `run_gui_event_loop` can be
-/// tested with a mock backed by real OS file descriptors.
-pub trait IpcResponseReader {
-    fn fd(&self) -> RawFd;
-    fn try_read_response_nonblocking(
-        &mut self,
-    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>;
-    /// Best-effort cancellation of an in-flight authentication request.
-    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error>;
-}
-
-impl IpcResponseReader for IpcClient {
-    fn fd(&self) -> RawFd {
-        IpcClient::fd(self)
-    }
-
-    fn try_read_response_nonblocking(
-        &mut self,
-    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
-        self.try_read_response_nonblocking()
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error> {
-        self.send_cancel(reason, request_id)
-            .map(|_| ())
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
-}
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
 // socket and /dev/tty.  The GUI flow (no TTY) comes in three variants,
@@ -871,7 +637,11 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     let ctx = unsafe { CallerContext::capture(pamh) };
     // The orchestration returns the verdict, never a code. This is the one
     // place a `PAM_*` value is produced from it: `to_pam` is exhaustive, so an
-    // arm cannot be forgotten and a code cannot travel beside the verdict.
+    // arm cannot be forgotten and a code cannot travel beside the verdict. A
+    // conclusion is recorded here — after the body returned, which is what
+    // anchors the 500 ms reuse window to *this module's return* — and `record`
+    // hands the verdict back so it becomes a code exactly once. Neither arm
+    // emits: `run` already emitted its outcome's one notice.
     match orchestrate(
         pamh,
         &ctx,
@@ -879,7 +649,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         IpcClient::connect_nonblocking,
         send_authenticate_request,
     ) {
-        Finished::Concluded(concluded) => concluded.outcome.to_pam(),
+        Finished::Concluded(concluded) => {
+            crate::transaction::record(concluded, Instant::now()).to_pam()
+        }
         Finished::Unrecorded(outcome) => outcome.to_pam(),
     }
 }
@@ -914,24 +686,24 @@ impl OrchestrationIo {
 /// The module's single `/dev/tty` open.
 ///
 /// Injected into `authenticate_inner` as a closure, the same seam
-/// `start_authentication`'s `connect`/`send` have, so tests can count the probe
+/// `Armed::open`'s `connect`/`send` have, so tests can count the probe
 /// without a terminal.
 fn probe_tty() -> Option<std::fs::File> {
     std::fs::File::open("/dev/tty").ok()
 }
 
-/// Run one authentication, then record its conclusion.
+/// Run one authentication: classify, resolve, plan, arm, drive a mechanism and
+/// conclude.
 ///
-/// The body decides and acts; this wrapper records the verdict afterwards so
-/// the 500 ms reuse window stays anchored to *this module's return* (`record` is
-/// called after the whole body returned, exactly as before).
+/// The body decides and acts; recording is the caller's (`authenticate`), so the
+/// 500 ms reuse window stays anchored to *this module's return* rather than to
+/// the moment the transaction concluded.
 ///
 /// `connect` and `send` are the transaction's two injected effects, the same
-/// seam `start_authentication` has: production passes
-/// `IpcClient::connect_nonblocking` and [`send_authenticate_request`], and a
-/// test passes counting closures or failures, so "the skip never reaches the
-/// daemon" and "a connect failure records nothing" are assertions rather than
-/// promises.
+/// seam `Armed::open` has: production passes `IpcClient::connect_nonblocking`
+/// and [`send_authenticate_request`], and a test passes counting closures or
+/// failures, so "the skip never reaches the daemon" and "a connect failure
+/// records nothing" are assertions rather than promises.
 fn orchestrate<T, C, S>(
     pamh: *mut pam_sys::PamHandle,
     ctx: &CallerContext,
@@ -944,15 +716,7 @@ where
     C: FnOnce() -> Result<T, IpcError>,
     S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
 {
-    let mut verdict: Option<Verdict> = None;
-    let finished = run(pamh, ctx, io, &mut verdict, probe_tty, connect, send);
-    // This runs after the body returned, so it is also the anchor of the reuse
-    // window: the 500 ms is measured from this module's *return*, not from the
-    // moment the transaction concluded.  A module after `pam_tapauth.so` that
-    // blocks longer than that pushes the host's duplicate outside the window,
-    // and it rings the phone again.
-    record_verdict(&verdict, finished.outcome(), Instant::now());
-    finished
+    run(pamh, ctx, io, probe_tty, connect, send)
 }
 
 /// What the transaction puts on the wire.
@@ -979,23 +743,6 @@ fn send_authenticate_request(
     )
 }
 
-/// Record what `authenticate` is about to return, when the attempt armed a
-/// real transaction with a known service.
-///
-/// Split out of `authenticate` so the failed-connect test can run the exact
-/// post-processing `authenticate` runs, on the state a failed attempt leaves
-/// behind.
-fn record_verdict(verdict: &Option<Verdict>, outcome: &Outcome, now: Instant) {
-    let Some(v) = verdict else {
-        return;
-    };
-    // Only real transactions are recorded, and only when the service name is
-    // known: an unresolved service must not collapse into the "" key.
-    if let (false, Some(service)) = (v.from_cache, v.service.as_deref()) {
-        record_conclusion(&v.username, service, outcome.clone(), now);
-    }
-}
-
 /// One authentication transaction.
 ///
 /// Everything that happens *before* a request is on the wire returns
@@ -1004,7 +751,7 @@ fn record_verdict(verdict: &Option<Verdict>, outcome: &Outcome, now: Instant) {
 /// Recording one of those would answer a later duplicate with a verdict the
 /// daemon never reached.
 ///
-/// Everything after `start_authentication` returns `Finished::Concluded`, with
+/// Everything after `Armed::open` returns `Finished::Concluded`, with
 /// `Via::Daemon` for this call's own request and `Via::Replay` for a duplicate
 /// answered from the reuse record. The conclusion carries the verdict and its
 /// subject; `Outcome::to_pam` is called once, by `authenticate`.
@@ -1013,12 +760,10 @@ fn record_verdict(verdict: &Option<Verdict>, outcome: &Outcome, now: Instant) {
 /// returning, so a message can be neither lost by an early return nor doubled;
 /// the paths that return before a conversation exists carry outcomes whose
 /// notice is `None` by construction (`outcomes_that_precede_the_conversation_are_silent`).
-#[allow(clippy::too_many_arguments)]
 fn run<T, C, S>(
     pamh: *mut pam_sys::PamHandle,
     ctx: &CallerContext,
     io: &OrchestrationIo,
-    verdict: &mut Option<Verdict>,
     probe_tty: impl FnOnce() -> Option<std::fs::File>,
     connect: C,
     send: S,
@@ -1037,9 +782,9 @@ where
     let classification = policy::classify(ctx);
 
     // The display-manager bypass returns before the username is resolved, so it
-    // never sets `verdict` and never touches the recorded conclusion.  That is
-    // deliberate: it is a static policy decision about the service, not a
-    // conclusion about credentials.  Only a daemon-path conclusion is ever
+    // never reaches `Armed::open` and never touches the recorded conclusion.
+    // That is deliberate: it is a static policy decision about the service, not
+    // a conclusion about credentials.  Only a daemon-path conclusion is ever
     // recorded, and a pre-IPC path must not clobber the last real one.
     if let Some(outcome) = guard_display_manager_bypass(ctx, &classification) {
         return Finished::Unrecorded(outcome);
@@ -1162,33 +907,16 @@ where
     // unknown, which disables the cache for this call rather than collapsing
     // every such call into one key.
     if let Some(service_name) = ctx.service() {
-        let service_name = service_name.original();
-        if let Some((recorded, age)) =
-            cached_conclusion_for(&username, service_name, Instant::now())
+        // A hit is a conclusion — an earlier call's — so it is `Concluded`,
+        // with `Via::Replay` saying it must not be recorded again: that would
+        // refresh the timestamp, so the window stays anchored to the original
+        // verdict no matter how many duplicates arrive. It is not a sliding
+        // window. The hit's own log line (with its age) belongs to the cache,
+        // which is the only place that knows it.
+        if let Some(concluded) =
+            crate::transaction::replay_for(&username, service_name.original(), Instant::now())
         {
-            // `from_cache` stops the recording from refreshing the timestamp, so
-            // the window stays anchored to the original verdict no matter how
-            // many duplicates arrive.  It is not a sliding window.
-            tracing::debug!(
-                username = %username,
-                service = %service_name,
-                outcome = ?recorded,
-                age_ms = age.as_millis(),
-                "Replaying the concluded verdict for a duplicate transaction"
-            );
-            *verdict = Some(Verdict {
-                username: username.clone(),
-                service: Some(service_name.to_owned()),
-                from_cache: true,
-            });
-            // A hit is a conclusion — an earlier call's — so it is `Concluded`,
-            // with `Via::Replay` saying it must not be recorded again.
-            return Finished::Concluded(Concluded {
-                outcome: Outcome::replayed(&recorded),
-                username,
-                service: ctx.service().cloned(),
-                via: Via::Replay,
-            });
+            return Finished::Concluded(concluded);
         }
     }
 
@@ -1247,10 +975,10 @@ where
 
     // Establish nonblocking IPC connection and send authenticate request.
     //
-    // Arming the record happens inside `start_authentication`, and only once
-    // the request is actually on the wire — i.e. after both the connect and the
-    // send succeeded.  A local IPC failure is not a verdict about the phone:
-    // recording one would let a later duplicate inherit that
+    // `Armed::open` produces the `Armed` only when the request is actually on
+    // the wire — i.e. after both the connect and the send succeeded — and it is
+    // the only way to reach a conclusion, so a local IPC failure cannot record
+    // one.  Recording a failure would let a later duplicate inherit that
     // `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry must dial
     // the socket again.  Everything above this point (the display-manager
     // bypass, the pre-collected skip, a missing conversation, a failed RNG) is
@@ -1261,14 +989,14 @@ where
         timeout_secs,
         request_id: &request_id,
     };
-    let mut ipc = match start_authentication(
-        &mut *verdict,
-        &username,
-        ctx.service().map(ServiceName::original),
+    // The id is cloned into the `Armed` because `SendParams` borrows it and the
+    // closure that consumes it runs inside `open`, after the `Armed` exists.
+    let mut armed = match Armed::open(
         connect,
         |ipc| send(ipc, &request),
+        request_id.clone().into_boxed_str(),
     ) {
-        Ok(ipc) => ipc,
+        Ok(armed) => armed,
         // The two pre-arm IPC failures: no request reached the daemon, so the
         // verdict is unrecorded, and each names its own message
         // (`cannot_connect` vs `communication_error`).
@@ -1307,84 +1035,71 @@ where
         if plan.announcement == Announcement::WaitThenPassword {
             pam_conv.try_info(msgs.waiting_for_tap_password());
         }
-        let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline_at);
+        let outcome = {
+            let (ipc, request_id) = armed.parts();
+            let (exit_reason, auth_response) = run_sequential_event_loop(ipc, deadline_at);
 
-        // The verdict comes from the loop's exit, never from the loop itself,
-        // so the text and the style of a failure are decided once by
-        // `Outcome::notice`. `IpcResponseReceived` without a payload cannot
-        // happen (the loop returns it only with `Some`), so it fails closed
-        // without a message rather than inventing one.
-        let outcome = match exit_reason {
-            ExitReason::IpcResponseReceived => match auth_response {
-                Some(resp) => Outcome::from_daemon(resp),
-                None => Outcome::Unavailable(UnavailableReason::ProtocolError),
-            },
-            ExitReason::Timeout => {
-                // The daemon runs on the same deadline and multicasts its own
-                // AuthenticationCancel, so no client-side cancel is needed.
-                Outcome::Unavailable(UnavailableReason::TimedOut)
-            }
-            _ => {
-                // IPC error: the request may still be in flight daemon-side.
-                // Best-effort cancel uses a new blocking connection with a
-                // short timeout so the phone doesn't keep buzzing.
-                if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                    let _ = c.send_cancel("gui-ipc-error", &request_id);
+            // The verdict comes from the loop's exit, never from the loop
+            // itself, so the text and the style of a failure are decided once
+            // by `Outcome::notice`. `IpcResponseReceived` without a payload
+            // cannot happen (the loop returns it only with `Some`), so it fails
+            // closed without a message rather than inventing one.
+            match exit_reason {
+                ExitReason::IpcResponseReceived => match auth_response {
+                    Some(resp) => Outcome::from_daemon(resp),
+                    None => Outcome::Unavailable(UnavailableReason::ProtocolError),
+                },
+                ExitReason::Timeout => {
+                    // The daemon runs on the same deadline and multicasts its
+                    // own AuthenticationCancel, so no client-side cancel is
+                    // needed.
+                    Outcome::Unavailable(UnavailableReason::TimedOut)
                 }
-                // This is the one path that shows its IPC text as an error,
-                // so it maps to `IpcError` rather than to the hangup/loop
-                // reasons the other two mechanisms use.
-                Outcome::Unavailable(UnavailableReason::IpcError)
+                _ => {
+                    // IPC error: the request may still be in flight
+                    // daemon-side. Best-effort cancel uses a new blocking
+                    // connection with a short timeout so the phone doesn't keep
+                    // buzzing.
+                    if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+                        let _ = c.send_cancel("gui-ipc-error", request_id);
+                    }
+                    // This is the one path that shows its IPC text as an error,
+                    // so it maps to `IpcError` rather than to the hangup/loop
+                    // reasons the other two mechanisms use.
+                    Outcome::Unavailable(UnavailableReason::IpcError)
+                }
             }
         };
-        return Finished::Concluded(concluded(
-            emit_notice(&pam_conv, &msgs, outcome),
-            ctx,
-            &username,
-        ));
+        let outcome = emit_notice(&pam_conv, &msgs, outcome);
+        return Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()));
     }
 
     // GUI context with a threaded-conversation-capable host (see `policy`):
     // the branch body is `run_threaded`, and its verdict is mapped here — the
     // one place this call site produces a code.
     if !has_tty && mode == ConversationMode::Threaded {
-        return Finished::Concluded(concluded(
+        let outcome = {
+            let (ipc, request_id) = armed.parts();
             emit_notice(
                 &pam_conv,
                 &msgs,
-                run_threaded(pamh, &mut ipc, deadline_at, &request_id),
-            ),
-            ctx,
-            &username,
-        ));
+                run_threaded(pamh, ipc, deadline_at, request_id),
+            )
+        };
+        return Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()));
     }
 
     // Terminal: the branch body is `run_terminal`, and its verdict is concluded
     // here like the other two mechanisms'.
-    Finished::Concluded(concluded(
+    let outcome = {
+        let (ipc, request_id) = armed.parts();
         emit_notice(
             &pam_conv,
             &msgs,
-            run_terminal(&mut ipc, tty_file, deadline_at, &request_id),
-        ),
-        ctx,
-        &username,
-    ))
-}
-
-/// Wrap a verdict reached after the request went on the wire as a conclusion
-/// this call may record.
-///
-/// `Via::Daemon` because the request this function's call sent is what the
-/// daemon answered — including the local-resource failures, which happen after
-/// arming and are recorded today too.
-fn concluded(outcome: Outcome, ctx: &CallerContext, username: &str) -> Concluded {
-    Concluded {
-        outcome,
-        username: username.to_owned(),
-        service: ctx.service().cloned(),
-        via: Via::Daemon,
-    }
+            run_terminal(ipc, tty_file, deadline_at, request_id),
+        )
+    };
+    Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()))
 }
 
 /// The terminal flow: poll the daemon socket and `/dev/tty` together, and let
@@ -1630,18 +1345,6 @@ mod tests {
     use crate::logging;
     use std::sync::atomic::AtomicUsize;
 
-    /// Serialises the tests that drive the process-wide reuse slot from a
-    /// `record_conclusion` to a lookup.
-    ///
-    /// The record is one slot for the whole process, so two tests that each
-    /// record and then look up would otherwise overwrite each other between the
-    /// two steps and read a miss. Only the tests that go through
-    /// `LAST_CONCLUSION` take it; the pure ones (`reusable_conclusion`,
-    /// `cached_from` with a local lock) need it not at all. It lives here rather
-    /// than at file scope because the source scans read "the production half",
-    /// i.e. everything before the first `#[cfg(test)]`.
-    pub(crate) static CACHE_SLOT_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn test_logging_init() {
         logging::init_logging();
@@ -1736,13 +1439,11 @@ mod tests {
     /// that file, `None` reports "no terminal".
     fn tty_probes(ctx: &CallerContext, tty: Option<&str>) -> (c_int, usize) {
         let io = inert_io();
-        let mut verdict = None;
         let mut probes = 0usize;
         let finished = run(
             std::ptr::null_mut(),
             ctx,
             &io,
-            &mut verdict,
             || {
                 probes += 1;
                 tty.and_then(|path| std::fs::File::open(path).ok())
@@ -1755,7 +1456,7 @@ mod tests {
 
     /// A connect that fails the way a missing socket does, for the paths whose
     /// call counts are the assertion.
-    fn no_daemon() -> IpcError {
+    pub(crate) fn no_daemon() -> IpcError {
         IpcError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "no daemon socket",
@@ -1808,7 +1509,7 @@ mod tests {
     /// once a hit actually happened, which the returned code proves.
     #[test]
     fn cache_hit_does_not_open_tty() {
-        let _slot = CACHE_SLOT_LOCK
+        let _slot = crate::transaction::CACHE_SLOT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -1844,7 +1545,7 @@ mod tests {
 
     /// An IPC client that never carries anything: enough to satisfy the
     /// transport bound for a path that fails before either end is used.
-    struct NullIpc;
+    pub(crate) struct NullIpc;
 
     impl IpcResponseReader for NullIpc {
         fn fd(&self) -> std::os::fd::RawFd {
@@ -1863,29 +1564,34 @@ mod tests {
     }
 
     /// Drive `run` with a context, a tty probe and the two injected IPC
-    /// effects, and report the `Finished` it returned with the record state.
+    /// effects, and report the `Finished` it returned.
     fn run_finished<T: IpcResponseReader, C, S>(
         ctx: &CallerContext,
         tty: Option<&str>,
         connect: C,
         send: S,
-    ) -> (Finished, Option<Verdict>)
+    ) -> Finished
     where
         C: FnOnce() -> Result<T, IpcError>,
         S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
     {
         let io = inert_io();
-        let mut verdict = None;
-        let finished = run(
+        run(
             std::ptr::null_mut(),
             ctx,
             &io,
-            &mut verdict,
             || tty.and_then(|path| std::fs::File::open(path).ok()),
             connect,
             send,
-        );
-        (finished, verdict)
+        )
+    }
+
+    /// Record `outcome` for `(username, service)` at `at`, through the same
+    /// `Armed`-conclude-record path `authenticate` uses.
+    fn record_conclusion(username: &str, service: &str, outcome: Outcome, at: Instant) {
+        let concluded = crate::transaction::armed_for_test(NullIpc, "pam-logic-test-request")
+            .conclude(outcome, username, Some(ServiceName::new(service)));
+        let _ = crate::transaction::record(concluded, at);
     }
 
     /// R1 refuses a remote call before anything reaches the daemon.
@@ -1903,7 +1609,7 @@ mod tests {
             let sends = AtomicUsize::new(0);
             let ctx = context(Some(service), Some("sshd"));
 
-            let (finished, verdict) = run_finished(
+            let finished = run_finished(
                 &ctx,
                 None,
                 || {
@@ -1940,10 +1646,6 @@ mod tests {
                 pam_sys::PAM_AUTHINFO_UNAVAIL,
                 "service {service}: R1 must report the service as unavailable"
             );
-            assert!(
-                verdict.is_none(),
-                "service {service}: a skip arms nothing, so nothing can be recorded"
-            );
         }
     }
 
@@ -1962,7 +1664,7 @@ mod tests {
         let msgs = pam_messages::load_for_user("unrecorded-test-user");
         let ctx = context(Some("unrecorded-paths"), Some("totally-unknown"));
 
-        let (connect_failed, verdict) = run_finished(
+        let connect_failed = run_finished(
             &ctx,
             None,
             || Err::<NullIpc, _>(no_daemon()),
@@ -1988,9 +1690,8 @@ mod tests {
             )),
             "the connect failure must still show cannot_connect, as an error"
         );
-        assert!(verdict.is_none(), "a connect failure records nothing");
 
-        let (send_failed, verdict) = run_finished(
+        let send_failed = run_finished(
             &ctx,
             None,
             || Ok(NullIpc),
@@ -2016,7 +1717,6 @@ mod tests {
             )),
             "the send failure must still show communication_error, as an error"
         );
-        assert!(verdict.is_none(), "a send failure records nothing");
     }
 
     /// Every verdict `run` can return before a conversation exists is silent.
@@ -2051,7 +1751,7 @@ mod tests {
     /// showed.
     #[test]
     fn a_cache_hit_is_a_replay_conclusion() {
-        let _slot = CACHE_SLOT_LOCK
+        let _slot = crate::transaction::CACHE_SLOT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -2066,32 +1766,45 @@ mod tests {
                 recorded.clone(),
                 Instant::now(),
             );
-            let (finished, verdict) = run_finished(
+            let finished = run_finished(
                 &ctx,
                 Some("/dev/null"),
                 || Err::<NullIpc, _>(no_daemon()),
                 |_, _| Ok(()),
             );
 
-            let Finished::Concluded(concluded) = &finished else {
+            let Finished::Concluded(concluded) = finished else {
                 // A concurrent test replaced the single record before the
                 // lookup; nothing was proved about the provenance.
                 continue;
             };
             assert_eq!(
-                concluded.via,
-                Via::Replay,
+                concluded.via(),
+                crate::transaction::Via::Replay,
                 "a cache hit must be marked as a replay"
             );
             assert_eq!(
-                concluded.outcome,
-                Outcome::replayed(&recorded),
+                concluded.outcome(),
+                &Outcome::replayed(&recorded),
                 "a replay must carry the recorded verdict, marked as replayed"
             );
-            let armed = verdict.expect("a cache hit arms the record");
-            assert!(
-                armed.from_cache,
+            // The replay marker is what refuses the re-record (today's
+            // `from_cache`): recording the conclusion hands its verdict back
+            // and must leave the slot exactly as the first call recorded it.
+            assert_eq!(
+                crate::transaction::record(concluded, Instant::now()),
+                Outcome::replayed(&recorded),
                 "a cache hit must not be recorded again: it would slide the window"
+            );
+            assert_eq!(
+                crate::transaction::replay_for(
+                    "tty-probe-test-user",
+                    service,
+                    Instant::now()
+                )
+                .map(|c| c.outcome().clone()),
+                Some(Outcome::replayed(&recorded)),
+                "the slot must still hold the verdict the first call recorded, not                  the replay that tried to overwrite it"
             );
             return;
         }
@@ -2512,7 +2225,7 @@ mod tests {
     /// here.  A non-ASCII *char* literal would be taken for a lifetime and
     /// copied verbatim, which can only hide a needle, never invent one.
     #[allow(clippy::indexing_slicing)]
-    fn stripped_source(source: &str) -> String {
+    pub(crate) fn stripped_source(source: &str) -> String {
         let b = source.as_bytes();
         let mut out: Vec<u8> = Vec::with_capacity(b.len());
         let mut i = 0usize;
@@ -2800,7 +2513,7 @@ mod tests {
     /// Recursive: `src/mechanism/` is a directory with no `rs` extension, so a
     /// single-level `read_dir` would silently stop covering the mechanisms once
     /// step 6 creates them.
-    fn source_files() -> Vec<std::path::PathBuf> {
+    pub(crate) fn source_files() -> Vec<std::path::PathBuf> {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -2827,7 +2540,7 @@ mod tests {
     /// A source file's path relative to `src`, e.g. `outcome.rs` or
     /// `mechanism/threaded.rs`. Every exemption below is written against this,
     /// never against a bare file name.
-    fn relative_to_src(path: &std::path::Path) -> String {
+    pub(crate) fn relative_to_src(path: &std::path::Path) -> String {
         let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
         path.strip_prefix(src)
             .unwrap_or(path)
@@ -2840,7 +2553,7 @@ mod tests {
     ///
     /// The tests below quote every forbidden token, so scanning the whole file
     /// would flag the assertions instead of the code.
-    fn production_source(path: &std::path::Path) -> String {
+    pub(crate) fn production_source(path: &std::path::Path) -> String {
         let source = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let production = source
@@ -3236,7 +2949,7 @@ mod tests {
 mod gui_loop_tests {
     use super::*;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     struct MockIpcReader {
@@ -3545,7 +3258,7 @@ mod gui_loop_tests {
         // `rfind` picks the call after the function definition; every test-only
         // call site passes `mock_ipc` and does not match.
         let blocking_wait = production
-            .rfind("run_sequential_event_loop(&mut ipc")
+            .rfind("run_sequential_event_loop(ipc")
             .unwrap_or_else(|| {
                 panic!("invariant broken: production call to the sequential wait not found")
             });
@@ -3880,20 +3593,33 @@ mod conversation_mode_tests {
     }
 }
 
-/// The verdict-reuse window, tested through the pure `reusable_conclusion` so
-/// the cases cannot disturb (or be disturbed by) the process-wide cache.
+/// The verdict-reuse record: the 500 ms window, its `(username, service)` key,
+/// and the two gates that decide what may be recorded.
+///
+/// Every case drives the real `transaction::record` / `transaction::replay_for`
+/// pair, so the assertions are about the record `authenticate` writes and reads
+/// and not about a parallel copy of its logic; each case holds
+/// `transaction::CACHE_SLOT_LOCK` for its whole body, because the record is one
+/// slot for the process.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod verdict_reuse_tests {
+    use super::tests::{no_daemon, NullIpc};
     use super::*;
     use crate::outcome::{DenyVia, UnavailableReason};
+    use crate::transaction::{record, replay_for, Concluded, Via};
 
     const SERVICE: &str = "tapauth-test";
 
     /// The three verdicts these tests replay: a grant, an unavailable service
     /// and an explicit denial. They are the three the daemon can reach, and the
-    /// cache stores the verdict itself now, so a replay cannot re-enter the code
-    /// path.
+    /// record stores the verdict itself now, so a replay cannot re-enter the
+    /// code path.
     fn granted() -> Outcome {
         Outcome::granted_from_daemon()
     }
@@ -3906,30 +3632,52 @@ mod verdict_reuse_tests {
         Outcome::Denied(DenyVia::PhoneDenial)
     }
 
-    fn conclusion(ms_ago: u64, user: &str, service: &str, outcome: Outcome) -> LastConclusion {
-        LastConclusion {
-            concluded_at: Instant::now() - Duration::from_millis(ms_ago),
-            username: user.to_owned(),
-            service: service.to_owned(),
+    /// The single process-wide slot, held for the whole case.
+    fn slot() -> std::sync::MutexGuard<'static, ()> {
+        crate::transaction::CACHE_SLOT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record `outcome` for `(user, service)` as if it had concluded `ms_ago`,
+    /// through the same `Armed` — conclude — record path `authenticate` uses,
+    /// and hand back the instant the lookup should use.
+    fn record_ago(ms_ago: u64, user: &str, service: Option<&str>, outcome: Outcome) -> Instant {
+        let now = Instant::now();
+        let concluded = crate::transaction::armed_for_test(NullIpc, "reuse-test-request").conclude(
             outcome,
-        }
+            user,
+            service.map(ServiceName::new),
+        );
+        let _ = record(concluded, now - Duration::from_millis(ms_ago));
+        now
+    }
+
+    /// The verdict a lookup returns for `(user, service)` at `now`.
+    ///
+    /// A hit is `Outcome::replayed(..)` of what was recorded: the marker is the
+    /// provenance this step adds, and `record` is what refuses it.
+    fn replayable(user: &str, service: &str, now: Instant) -> Option<Outcome> {
+        replay_for(user, service, now).map(|concluded| concluded.outcome().clone())
     }
 
     #[test]
     fn a_success_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", SERVICE, granted());
+        let _slot = slot();
+        let now = record_ago(400, "alice", Some(SERVICE), granted());
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
-            Some(granted()),
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&granted())),
             "a success 400 ms old must still be replayable inside the 500 ms window"
         );
     }
 
     #[test]
     fn a_success_after_the_window_is_not_reused() {
-        let prev = conclusion(600, "alice", SERVICE, granted());
+        let _slot = slot();
+        let now = record_ago(600, "alice", Some(SERVICE), granted());
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
+            replayable("alice", SERVICE, now),
             None,
             "a success 600 ms old is outside the window and must start a new transaction"
         );
@@ -3937,10 +3685,11 @@ mod verdict_reuse_tests {
 
     #[test]
     fn an_unavailability_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", SERVICE, unavailable());
+        let _slot = slot();
+        let now = record_ago(400, "alice", Some(SERVICE), unavailable());
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
-            Some(unavailable()),
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&unavailable())),
             "the duplicate is queued while the first transaction runs, so the \
              unavailability it just reached must be replayed instead of ringing \
              the phone for a second full timeout"
@@ -3949,19 +3698,21 @@ mod verdict_reuse_tests {
 
     #[test]
     fn a_denial_inside_the_window_is_reused() {
-        let prev = conclusion(400, "alice", SERVICE, denied());
+        let _slot = slot();
+        let now = record_ago(400, "alice", Some(SERVICE), denied());
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
-            Some(denied()),
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&denied())),
             "a concluded denial must be replayed for the duplicate, not re-asked"
         );
     }
 
     #[test]
     fn an_unavailability_after_the_window_is_not_reused() {
-        let prev = conclusion(600, "alice", SERVICE, unavailable());
+        let _slot = slot();
+        let now = record_ago(600, "alice", Some(SERVICE), unavailable());
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, Instant::now()),
+            replayable("alice", SERVICE, now),
             None,
             "outside the window a failure must be re-derived: this is what keeps a \
              human retry from being answered by a stale verdict"
@@ -3970,11 +3721,12 @@ mod verdict_reuse_tests {
 
     #[test]
     fn another_users_conclusion_is_never_reused() {
+        let _slot = slot();
         for outcome in [granted(), unavailable(), denied()] {
             let code = outcome.clone().to_pam();
-            let prev = conclusion(1, "alice", SERVICE, outcome);
+            let now = record_ago(1, "alice", Some(SERVICE), outcome);
             assert_eq!(
-                reusable_conclusion(&prev, "bob", SERVICE, Instant::now()),
+                replayable("bob", SERVICE, now),
                 None,
                 "code {code} recorded for alice must never answer for bob"
             );
@@ -3983,11 +3735,12 @@ mod verdict_reuse_tests {
 
     #[test]
     fn another_services_conclusion_is_never_reused() {
+        let _slot = slot();
         for outcome in [granted(), unavailable(), denied()] {
             let code = outcome.clone().to_pam();
-            let prev = conclusion(1, "alice", "kscreenlocker", outcome);
+            let now = record_ago(1, "alice", Some("kscreenlocker"), outcome);
             assert_eq!(
-                reusable_conclusion(&prev, "alice", "polkit-1", Instant::now()),
+                replayable("alice", "polkit-1", now),
                 None,
                 "code {code} recorded for one service must never answer a \
                  different service: only the transaction the host is retrying may \
@@ -3998,131 +3751,112 @@ mod verdict_reuse_tests {
 
     #[test]
     fn recording_a_failure_replaces_the_cached_success() {
-        let _slot = super::tests::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+        let _slot = slot();
         let now = Instant::now();
-        record_conclusion("alice", SERVICE, granted(), now);
+
+        let recorded = crate::transaction::armed_for_test(NullIpc, "replace-success-request")
+            .conclude(granted(), "alice", Some(ServiceName::new(SERVICE)));
+        record(recorded, now);
         assert_eq!(
-            cached_conclusion_for("alice", SERVICE, now),
-            Some((granted(), Duration::ZERO))
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&granted()))
         );
-        record_conclusion("alice", SERVICE, unavailable(), now);
+
+        let recorded = crate::transaction::armed_for_test(NullIpc, "replace-failure-request")
+            .conclude(unavailable(), "alice", Some(ServiceName::new(SERVICE)));
+        record(recorded, now);
         assert_eq!(
-            cached_conclusion_for("alice", SERVICE, now),
-            Some((unavailable(), Duration::ZERO)),
-            "the cache holds the *last* conclusion, so a later failure must \
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&unavailable())),
+            "the record holds the *last* conclusion, so a later failure must \
              overwrite the earlier success"
         );
     }
 
-    /// A connect failure says nothing about the phone, so it must leave both the
-    /// local flag *and* the process-wide cache unarmed — and a retry must
-    /// therefore be able to start a real transaction instead of replaying a
-    /// verdict that never existed.
+    /// A connect failure says nothing about the phone, so it must leave the
+    /// process-wide record unarmed — and a retry must therefore be able to start
+    /// a real transaction instead of replaying a verdict that never existed.
     ///
-    /// The key is unique to this test: `LAST_CONCLUSION` is process-wide and
-    /// other tests in this module write to it in parallel.
+    /// The key is unique to this test: the record is process-wide and other
+    /// tests in this module write to it in parallel.
     ///
-    /// Not covered here: a *caller* that arms the record before calling
-    /// `start_authentication` — this test drives the helper, so it can only see
-    /// arming inside it.  `the_verdict_record_is_armed_only_inside_the_helper`
-    /// covers that shape at the source level.
+    /// Not covered here: a *caller* that records before opening a request —
+    /// `record` takes a `Concluded` by value and `Armed::conclude` is its only
+    /// fresh producer, so that shape is a move error rather than something a
+    /// test has to look for. `armed_requires_both_connect_and_send` covers the
+    /// arming itself.
     #[test]
     fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
-        let _slot = super::tests::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _slot = slot();
 
         const USER: &str = "failed-connect-user";
         const UNIQUE_SERVICE: &str = "failed-connect-service";
+        let now = Instant::now();
 
-        struct FakeClient;
-        let mut verdict: Option<Verdict> = None;
-
-        let first = start_authentication::<FakeClient, _, _>(
-            &mut verdict,
-            USER,
-            Some(UNIQUE_SERVICE),
-            || {
-                Err(crate::ipc_client::IpcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "no daemon socket",
-                )))
-            },
-            |_: &mut FakeClient| Ok(()),
+        let first = Armed::<NullIpc>::open(
+            || Err(no_daemon()),
+            |_: &mut NullIpc| Ok(()),
+            "failed-connect-request".into(),
         );
         assert!(
             matches!(first, Err(StartError::Connect(_))),
             "a refused connect must surface as a connect failure"
         );
         assert!(
-            verdict.is_none(),
-            "a local IPC failure is not a verdict about the phone: arming the \
-             record here would let the duplicate inherit PAM_AUTHINFO_UNAVAIL \
-             without the phone ever being asked"
+            replayable(USER, UNIQUE_SERVICE, now).is_none(),
+            "a local IPC failure is not a verdict about the phone: recording one \
+             would let the duplicate inherit PAM_AUTHINFO_UNAVAIL without the \
+             phone ever being asked"
         );
 
-        // Run the exact post-processing `authenticate` runs on whatever the
-        // failed attempt left behind: an armed record would be written to the
-        // cache here, and the duplicate would then be answered from it.
-        record_verdict(&verdict, &unavailable(), Instant::now());
-        assert!(
-            cached_conclusion_for(USER, UNIQUE_SERVICE, Instant::now()).is_none(),
-            "the failed connect must leave the process-wide cache empty: \
-             `authenticate` records whatever the attempt armed, so an armed \
-             record would answer the duplicate with a local IPC failure as if \
-             the phone had been asked"
+        // The retry: with nothing recorded it must dial again and arm a real
+        // transaction, whose conclusion *is* recorded.
+        let Ok(armed) = Armed::<NullIpc>::open(
+            || Ok(NullIpc),
+            |_: &mut NullIpc| Ok(()),
+            "retry-request".into(),
+        ) else {
+            panic!("the retry must be able to connect after the failed attempt");
+        };
+        let concluded = armed.conclude(unavailable(), USER, Some(ServiceName::new(UNIQUE_SERVICE)));
+        assert_eq!(
+            concluded.via(),
+            Via::Daemon,
+            "the armed request is this call's own, so `record` must accept its conclusion"
         );
-
-        // The retry: with nothing recorded it must go through the connect/send
-        // path and arm a real transaction.
-        let second = start_authentication::<FakeClient, _, _>(
-            &mut verdict,
-            USER,
-            Some(UNIQUE_SERVICE),
-            || Ok(FakeClient),
-            |_: &mut FakeClient| Ok(()),
-        );
-        assert!(
-            second.is_ok(),
-            "the retry must be able to connect after the failed attempt"
-        );
-        let armed = verdict
-            .as_ref()
-            .expect("a request on the wire must arm the record");
-        assert_eq!(armed.username, USER);
-        assert_eq!(armed.service.as_deref(), Some(UNIQUE_SERVICE));
-        assert!(
-            !armed.from_cache,
-            "the armed record is a real transaction, so `authenticate` must be \
-             allowed to record its code"
+        assert_eq!(record(concluded, now), unavailable());
+        assert_eq!(
+            replayable(USER, UNIQUE_SERVICE, now),
+            Some(Outcome::replayed(&unavailable())),
+            "the retry's conclusion must be recorded, unlike the failed connect"
         );
     }
 
-    /// A verdict replayed from the cache must not be recorded again: that would
+    /// A verdict replayed from the record must not be recorded again: that would
     /// refresh the timestamp and turn the fixed 500 ms window into a sliding one.
     #[test]
     fn a_from_cache_verdict_is_not_recorded() {
-        let _slot = super::tests::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _slot = slot();
 
         const USER: &str = "from-cache-user";
         const UNIQUE_SERVICE: &str = "from-cache-service";
-
         let now = Instant::now();
-        record_conclusion(USER, UNIQUE_SERVICE, denied(), now);
-        let verdict = Some(Verdict {
-            username: USER.to_owned(),
-            service: Some(UNIQUE_SERVICE.to_owned()),
-            from_cache: true,
-        });
-        record_verdict(&verdict, &granted(), now);
+
+        let recorded = crate::transaction::armed_for_test(NullIpc, "original-request").conclude(
+            denied(),
+            USER,
+            Some(ServiceName::new(UNIQUE_SERVICE)),
+        );
+        record(recorded, now);
+
+        // A replay carrying a *different* verdict, recorded again on purpose: if
+        // `record` accepted it, the slot would hold the grant instead of the
+        // denial and the assertion below would see it.
+        let replay = Concluded::replay(granted(), USER.into(), ServiceName::new(UNIQUE_SERVICE));
+        assert_eq!(record(replay, now), Outcome::replayed(&granted()));
         assert_eq!(
-            cached_conclusion_for(USER, UNIQUE_SERVICE, now),
-            Some((denied(), Duration::ZERO)),
+            replayable(USER, UNIQUE_SERVICE, now),
+            Some(Outcome::replayed(&denied())),
             "a cache hit must not be re-recorded: it would overwrite the original \
              code and refresh the timestamp, making the window sliding"
         );
@@ -4132,138 +3866,36 @@ mod verdict_reuse_tests {
     /// every such call into one key.
     #[test]
     fn an_unresolved_service_is_not_recorded() {
-        let _slot = super::tests::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _slot = slot();
 
         const USER: &str = "unresolved-service-user";
-
         let now = Instant::now();
-        let verdict = Some(Verdict {
-            username: USER.to_owned(),
-            service: None,
-            from_cache: false,
-        });
-        record_verdict(&verdict, &unavailable(), now);
+
+        let recorded = crate::transaction::armed_for_test(NullIpc, "unresolved-service-request")
+            .conclude(unavailable(), USER, None);
+        assert_eq!(record(recorded, now), unavailable());
         assert!(
-            cached_conclusion_for(USER, "", now).is_none(),
+            replayable(USER, "", now).is_none(),
             "a call without a service name must record nothing: an empty string \
              would merge unrelated services into one key"
         );
     }
 
-    /// **Smoke test only.**  It reads source byte offsets, so it proves where
-    /// the arming statement is *written*, not that the compiled code runs it
-    /// there; the behavioural test above covers the ordering inside the helper.
-    ///
-    /// What it adds is the shape that test cannot reach: the bug this branch
-    /// removed armed the record in the *caller*, one statement before the
-    /// connect, which leaves every behavioural test green.
-    #[test]
-    fn the_verdict_record_is_armed_only_inside_the_helper() {
-        // No trailing comma: a caller-level arming written on one line
-        // (`*verdict = Some(Verdict { username: …, from_cache: false });`) has
-        // none inside the literal, and this guard must not depend on `cargo fmt`
-        // having split it.
-        const ARMING: &str = "from_cache: false";
-
-        let source = include_str!("pam_logic.rs");
-        // Only the production half of the file, for the same reason as
-        // `cache_lookup_precedes_daemon_contact`: the test modules contain the
-        // same identifiers inside string literals.
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(source);
-
-        let helper_start = production
-            .find("fn start_authentication<T, C, S>(")
-            .unwrap_or_else(|| panic!("invariant broken: `start_authentication` is gone"));
-        let helper_end = helper_start
-            + production
-                .get(helper_start..)
-                .and_then(|rest| rest.find("\n}\n"))
-                .unwrap_or_else(|| {
-                    panic!("invariant broken: `start_authentication` has no body end")
-                })
-            + "\n}\n".len();
-
-        let sites: Vec<usize> = production
-            .match_indices(ARMING)
-            // A comment that quotes the literal verbatim is not an arming site.
-            .filter(|(offset, _)| {
-                let line_start = production
-                    .get(..*offset)
-                    .and_then(|before| before.rfind('\n'))
-                    .map_or(0, |i| i + 1);
-                production
-                    .get(line_start..*offset)
-                    .is_some_and(|prefix| !prefix.trim_start().starts_with("//"))
-            })
-            .map(|(offset, _)| offset)
-            .collect();
-        assert_eq!(
-            sites.len(),
-            1,
-            "exactly one place may arm a real transaction; found {} at {sites:?} — \
-             a second one in a caller (e.g. before `start_authentication`) would \
-             record a local IPC failure as if the phone had been asked",
-            sites.len()
-        );
-        let Some(site) = sites.first().copied() else {
-            panic!("invariant broken: no arming site found");
-        };
-        assert!(
-            site >= helper_start && site < helper_end,
-            "the arming statement (byte {site}) must sit inside \
-             `start_authentication` (bytes {helper_start}..{helper_end}), after the \
-             connect and the send succeeded; arming in the caller records a verdict \
-             before the request reached the daemon"
-        );
-    }
-
-    #[test]
-    fn a_poisoned_lock_reads_as_a_cache_miss() {
-        let local: Mutex<Option<LastConclusion>> = Mutex::new(Some(LastConclusion {
-            concluded_at: Instant::now(),
-            username: "alice".to_owned(),
-            service: SERVICE.to_owned(),
-            outcome: granted(),
-        }));
-
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = local.lock().expect("a fresh mutex is not poisoned");
-            panic!("poison the local lock while holding it");
-        }));
-        assert!(
-            poisoned.is_err(),
-            "the helper closure was supposed to panic"
-        );
-
-        assert_eq!(
-            cached_from(&local, "alice", SERVICE, Instant::now()),
-            None,
-            "a poisoned lock must read as a cache miss: a `PAM_SUCCESS` that is \
-             otherwise inside the window must not be returned, and the path must \
-             not unwrap or panic"
-        );
-    }
-
     #[test]
     fn a_future_timestamp_does_not_panic() {
+        let _slot = slot();
         let now = Instant::now();
-        let prev = LastConclusion {
-            concluded_at: now + Duration::from_millis(50),
-            username: "alice".to_owned(),
-            service: SERVICE.to_owned(),
-            outcome: unavailable(),
-        };
+
+        let recorded = crate::transaction::armed_for_test(NullIpc, "future-timestamp-request")
+            .conclude(unavailable(), "alice", Some(ServiceName::new(SERVICE)));
+        record(recorded, now + Duration::from_millis(50));
         // `saturating_duration_since` reads a clock anomaly as "no time has
         // passed", so the conclusion still counts as fresh.  The point of the
         // test is that it must not panic.
         assert_eq!(
-            reusable_conclusion(&prev, "alice", SERVICE, now),
-            Some(unavailable())
+            replayable("alice", SERVICE, now),
+            Some(Outcome::replayed(&unavailable())),
+            "a record stamped in the future must read as fresh, not panic"
         );
     }
 
@@ -4289,7 +3921,7 @@ mod verdict_reuse_tests {
         // The call, not the `if let` that contains it: rustfmt is free to break
         // the pattern across lines.
         let lookup = production
-            .find("cached_conclusion_for(&username, service_name, Instant::now())")
+            .find("replay_for(&username, service_name.original(), Instant::now())")
             .unwrap_or_else(|| panic!("invariant broken: the reuse lookup is gone from `run`"));
 
         let daemon_contact = production
@@ -4306,6 +3938,208 @@ mod verdict_reuse_tests {
             lookup,
             daemon_contact
         );
+    }
+
+    /// The reuse suite is the fifteen named cases, and exactly one test in the
+    /// crate is ignored: the fork experiment.
+    ///
+    /// The defect this catches: a rewritten suite that silently drops a case —
+    /// presence is asserted by name, so a deleted test fails here rather than
+    /// passing as "all green with fewer tests". The ignore rule is the other
+    /// half: if `#[ignore]` could be used to silence a broken case, the fork
+    /// test's own ignore would hide it, so the crate must contain exactly one
+    /// and it must be that one.
+    #[test]
+    fn reuse_suite_is_intact() {
+        let files = super::tests::source_files();
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| super::tests::relative_to_src(path))
+            .collect();
+        for required in ["pam_logic.rs", "transaction.rs"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
+        // Comment- and string-stripped, so a doc comment that quotes a name or
+        // an attribute is not a finding, and this test's own literals cannot
+        // satisfy its searches.
+        let sources: String = files
+            .iter()
+            .map(|path| {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                super::tests::stripped_source(&source)
+            })
+            .collect();
+
+        // The fifteen: the fourteen cases that survived the retargeting, plus
+        // `armed_requires_both_connect_and_send`, which replaces
+        // `the_verdict_record_is_armed_only_inside_the_helper` — that one is
+        // deleted below because the by-value `Concluded` makes its source scan
+        // redundant, and a replacement asserting "the type is constructed here"
+        // would be strictly weaker than the type.
+        const REUSE_CASES: [&str; 15] = [
+            "a_success_inside_the_window_is_reused",
+            "a_success_after_the_window_is_not_reused",
+            "an_unavailability_inside_the_window_is_reused",
+            "a_denial_inside_the_window_is_reused",
+            "an_unavailability_after_the_window_is_not_reused",
+            "another_users_conclusion_is_never_reused",
+            "another_services_conclusion_is_never_reused",
+            "recording_a_failure_replaces_the_cached_success",
+            "a_failed_connect_records_nothing_and_the_retry_dials_again",
+            "a_from_cache_verdict_is_not_recorded",
+            "an_unresolved_service_is_not_recorded",
+            "a_poisoned_lock_reads_as_a_cache_miss",
+            "a_future_timestamp_does_not_panic",
+            "cache_lookup_precedes_daemon_contact",
+            "armed_requires_both_connect_and_send",
+        ];
+        for name in REUSE_CASES {
+            assert!(
+                sources.contains(&format!("fn {name}(")),
+                "the reuse case `{name}` is missing: the suite may not be \
+                 rewritten by dropping a case"
+            );
+        }
+        assert!(
+            !sources.contains(concat!(
+                "fn the_verdict_record_is_armed_only_inside_the",
+                "_helper("
+            )),
+            "the arming source scan is deleted, not renamed: the by-value \
+             `Concluded` replaces it, and a weaker copy must not return"
+        );
+
+        // The new cases this step adds, so a dropped one fails like any other.
+        for name in [
+            "reuse_key_is_case_sensitive",
+            "replay_notice_is_silent",
+            "cache_owner_is_local",
+            "conclusion_cache_survives_fork",
+        ] {
+            assert!(
+                sources.contains(&format!("fn {name}(")),
+                "the new reuse case `{name}` is missing"
+            );
+        }
+
+        // Exactly one ignored test in the crate, and it is the fork experiment.
+        let ignored: Vec<&str> = sources
+            .match_indices("#[ignore")
+            .map(|(at, _)| at)
+            .map(|at| &sources[at..])
+            .collect();
+        assert_eq!(
+            ignored.len(),
+            1,
+            "exactly one test may be ignored (the fork experiment); found {}",
+            ignored.len()
+        );
+        let Some(after) = ignored.first().copied() else {
+            panic!("invariant broken: no `#[ignore]` found");
+        };
+        assert!(
+            after.contains("fn conclusion_cache_survives_fork("),
+            "the one ignored test must be `conclusion_cache_survives_fork`: the \
+             attribute may not be reused to silence a dropped case"
+        );
+    }
+
+    /// No other module may name the reuse record's lock or its static.
+    ///
+    /// The defect this catches: a second file reaching `LAST_CONCLUSION` (or
+    /// any `.lock()` on it), or this module handing the guard out through a
+    /// non-test `pub(crate)` getter — either defeats the ownership that keeps a
+    /// fork fix (an `atfork` reinit, an atomic cell, or dropping the cache)
+    /// inside one file. The scan is over the comment- and string-stripped
+    /// production half of every `src/**/*.rs`, so `#[cfg(test)]` code is exempt
+    /// by construction and a doc comment that quotes the token is not a
+    /// finding. The positive control runs the detector over an in-memory
+    /// string, never a planted file under `src/`, which would race the parallel
+    /// recursive walk.
+    #[test]
+    fn cache_owner_is_local() {
+        let files = super::tests::source_files();
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| super::tests::relative_to_src(path))
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "transaction.rs"),
+            "the scan did not cover the cache's own module: {names:?}"
+        );
+
+        let mut findings: Vec<String> = Vec::new();
+        for path in &files {
+            let rel = super::tests::relative_to_src(path);
+            let production = super::tests::production_source(path);
+            if rel == "transaction.rs" {
+                // The owner may lock the static; it may not hand the lock, the
+                // guard or the record out.
+                for (line, text) in production.lines().enumerate() {
+                    let leaks_guard = text.contains("MutexGuard");
+                    let exposes_record =
+                        text.contains("pub(crate) fn") && text.contains("LastConclusion");
+                    if leaks_guard || exposes_record {
+                        findings.push(format!("{rel}:{}: {}", line + 1, text.trim()));
+                    }
+                }
+                continue;
+            }
+            for hit in lock_references(&production) {
+                findings.push(format!("{rel}: {hit}"));
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "only `transaction.rs` may name the reuse record's lock:\n{}",
+            findings.join("\n")
+        );
+
+        // Positive control: the detector fires on a planted reach.
+        let planted = super::tests::stripped_source(
+            "fn steal() -> Option<Outcome> {\n    let guard = LAST_CONCLUSION.lock().ok()?;\n    None\n}\n",
+        );
+        assert!(
+            !lock_references(&planted).is_empty(),
+            "the detector must report a planted `LAST_CONCLUSION.lock()`"
+        );
+        let getter = lock_references(&super::tests::stripped_source(
+            "pub(crate) fn guard() -> MutexGuard<'static, ()> { CACHE_SLOT_LOCK.lock().unwrap() }\n",
+        ));
+        assert!(
+            !getter.is_empty(),
+            "the detector must report a getter that hands the guard out"
+        );
+        // Negative control: prose and strings are not reaches.
+        let prose = super::tests::stripped_source(
+            "// LAST_CONCLUSION.lock() is what this module forbids elsewhere\n\
+             let doc = \"LAST_CONCLUSION\";\n",
+        );
+        assert!(
+            lock_references(&prose).is_empty(),
+            "comments and string literals are not lock references"
+        );
+    }
+
+    /// Every line of `source` that reaches the cache's lock or its static.
+    fn lock_references(source: &str) -> Vec<String> {
+        const TOKENS: [&str; 5] = [
+            ".lock()",
+            ".try_lock()",
+            ".try_lock_for",
+            "LAST_CONCLUSION",
+            "MutexGuard",
+        ];
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| TOKENS.iter().any(|token| line.contains(token)))
+            .map(|(line, text)| format!("line {}: {}", line + 1, text.trim()))
+            .collect()
     }
 }
 
