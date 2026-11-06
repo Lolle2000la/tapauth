@@ -19,8 +19,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
 /// Default PAM authentication timeout for GUI contexts whose conversation the
-/// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7), in
-/// seconds. Mirrors the default in the PAM module's `PamConfig` (client-pam).
+/// module cannot drive (the sequential path — a host the rule table in
+/// `client-pam/src/policy.rs` does not classify as threaded), in seconds.
+/// Mirrors the default in the PAM module's `PamConfig` (client-pam).
 const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 
 /// Default UDP port for authentication
@@ -105,16 +106,17 @@ pub struct TapAuthConfig {
     pub pam_operation_timeout_secs: u64,
 
     /// Authentication timeout for graphical PAM contexts whose conversation the
-    /// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7 or an
+    /// module cannot drive (the sequential path: a host the rule table in
+    /// `client-pam/src/policy.rs` does not classify as threaded, or an
     /// unrecognised host).
     /// Default: 30 seconds
     ///
     /// In those contexts the TapAuth wait is capped at this duration before
     /// falling through to password entry. The PAM module additionally clamps
-    /// this to `pam_operation_timeout_secs`. Graphical hosts whose conversation
-    /// can be driven from a worker thread (polkit, kscreenlocker >= 6.8,
-    /// hyprlock, xsecurelock, GDM unlock) are bounded by
-    /// `pam_operation_timeout_secs` instead.
+    /// this to `pam_operation_timeout_secs`, and only for a sequential host
+    /// **without** a terminal. Graphical hosts whose conversation can be driven
+    /// from a worker thread are bounded by `pam_operation_timeout_secs`
+    /// instead.
     ///
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a

@@ -12,8 +12,8 @@
  *     - Sequential: the conversation is never touched; the module only waits
  *       for the daemon.
  *
- *   The choice is an allowlist keyed on the calling process (see
- *   `conversation_mode` in client-pam/src/pam_logic.rs).  None of it is
+ *   The choice is a rule table keyed on the caller's PAM service name and
+ *   process name (see `RULES` in client-pam/src/policy.rs).  None of it is
  *   reachable from a Rust unit test: it needs a real libpam stack, a real
  *   dynamically loaded module, and a process whose `/proc/self/exe` has the
  *   allowlisted name.
@@ -42,6 +42,11 @@
  *     immediately, which is what swaylock/gtklock/i3lock do.  With
  *     $CONV_TEST_BLOCK=cancel it instead parks in `pthread_cond_wait` and is
  *     never signalled: the conversation can only end by being cancelled.
+ *     Every `PAM_TEXT_INFO`/`PAM_ERROR_MSG` it is handed is counted
+ *     (`conv_text_info`), so "a skipped call showed the user nothing" is an
+ *     assertion the script can make rather than a claim: the skip paths and the
+ *     pre-collected handoff emit no notice, while a participation announces its
+ *     wait (`Wait`/`WaitSkipHint`/`WaitThenPassword`).
  *   - The script copies this binary to the allowlisted process name under test
  *     (`kscreenlocker_worker`, `swaylock`, `gdm-session-worker`) and runs the
  *     copy, so `/proc/self/exe`'s basename is on the allowlist.  A symlink
@@ -186,6 +191,10 @@ static atomic_int conv_entered;
 static atomic_int conv_returned;
 static atomic_int conv_ran_on_main_thread;
 static atomic_int daemon_accepted;
+/* Every `PAM_TEXT_INFO`/`PAM_ERROR_MSG` the module sent through the
+ * conversation.  The skip paths (R1, R2) and the pre-collected handoff (R8)
+ * emit no notice; a participation announces its wait. */
+static atomic_int conv_text_info;
 
 static void fail(const char *what) {
     fprintf(stderr, "RESULT: FAIL %s\n", what);
@@ -300,7 +309,10 @@ static int test_conv(int num_msg, const struct pam_message **msg,
             break;
         case PAM_TEXT_INFO:
         case PAM_ERROR_MSG:
-            /* Informational only: return immediately. */
+            /* Informational only: return immediately, but count it.  A skipped
+             * call must send none at all, and a participating one sends its
+             * single announcement, which is what makes the count an assertion. */
+            atomic_fetch_add(&conv_text_info, 1);
             break;
         default:
             free(out);
@@ -613,6 +625,7 @@ static void run_duplicate_sequence(const char *confdir, const dup_step *steps,
     int accepted = atomic_load(&daemon_accepted);
     printf("conv_entered: %d\n", entered);
     printf("daemon_accepted: %d\n", accepted);
+    printf("conv_text_info: %d\n", atomic_load(&conv_text_info));
 
     for (int i = 0; i < count; i++) {
         if (verdicts[i] != steps[i].expected) {
@@ -885,6 +898,7 @@ int main(void) {
     printf("conv_returned: %d\n", returned);
     printf("conv_ran_on_main_thread: %d\n", on_main);
     printf("daemon_accepted: %d\n", accepted);
+    printf("conv_text_info: %d\n", atomic_load(&conv_text_info));
 
     int end_status = pam_end(pamh, auth_ret);
 
