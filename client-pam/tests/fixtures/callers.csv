@@ -49,3 +49,9 @@ threaded_xsecurelock,xsecurelock,authproto_pam,-,-,0,R7,threaded,the helper answ
 precollected_swaylock,swaylock,swaylock,-,-,0,R8,precollected,the password predates pam_authenticate,0
 precollected_gtklock,gtklock,gtklock,-,-,0,R8,precollected,the password predates pam_authenticate,0
 precollected_i3lock,i3lock,i3lock,-,-,0,R8,precollected,the password predates pam_authenticate,0
+svc_sshd,sshd,sshd,-,-,0,R1,skip_remote,the sshd service name is never authenticated by this module,0
+svc_sshd_session,sshd-session,sshd-session,-,-,0,R1,skip_remote,the sshd-session service is refused on the same service half,0
+svc_sshd_upper,SSHD,sshd,-,-,0,R1,skip_remote,the service comparison is ASCII case-insensitive,0
+svc_sshd_near_miss,my-sshd,sshd,-,-,0,R10,sequential,a renamed PAMServiceName is a documented false negative,0
+svc_sshd_under_swaylock,sshd,swaylock,-,-,0,R1,skip_remote,R1 precedes the process rules so the remote skip wins,0
+svc_unknown_not_sshd,-,sh,-,-,0,R10,sequential,an unresolved service never matches the remote rule,0

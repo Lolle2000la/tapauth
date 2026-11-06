@@ -1355,25 +1355,39 @@ fn authenticate_inner(
 /// `sufficient` line the stack treats it as `ignore` and still runs the next
 /// module; on a `required` line it fails closed.
 ///
-/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
-/// otherwise.
+/// R1's remote refusal is the other skip policy, and it takes the same code for
+/// the same reason: the module has no business answering that call, so it says
+/// "not me" with the code a `required` line reads as a failure.
+///
+/// The rule name is kept for the display-manager half it was written for; the
+/// decision itself is `policy::classify`'s.
+///
+/// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for any skip, `None` otherwise.
 fn guard_display_manager_bypass(
     ctx: &CallerContext,
     classification: &policy::Classification,
 ) -> Option<c_int> {
-    match classification {
-        // R2 is the only skip rule in this tree, so a skip is the display
-        // manager bypass.  (R1 adds the second skip policy.)
-        policy::Classification::Skip(policy::SkipPolicy::KeyringNeedsAuthtok) => {
+    let policy::Classification::Skip(skip) = classification else {
+        return None;
+    };
+    let service = ctx.service().map(ServiceName::original).unwrap_or_default();
+    match skip {
+        policy::SkipPolicy::KeyringNeedsAuthtok => {
             tracing::info!(
                 "TapAuth: Service '{}' is a primary display manager. \
                  Skipping to avoid breaking keyring auto-unlock.",
-                ctx.service().map(ServiceName::original).unwrap_or_default()
+                service
             );
-            Some(pam_sys::PAM_AUTHINFO_UNAVAIL)
         }
-        _ => None,
+        policy::SkipPolicy::RemoteAuthentication => {
+            tracing::info!(
+                "TapAuth: Service '{}' authenticates a remote caller. \
+                 Skipping: this module does not take part in remote authentication.",
+                service
+            );
+        }
     }
+    Some(pam_sys::PAM_AUTHINFO_UNAVAIL)
 }
 
 /// Spawn a thread to monitor `/dev/tty` for skip signals.
@@ -1563,6 +1577,13 @@ mod tests {
     /// null user would come back as `PAM_USER_UNKNOWN` instead.
     #[test]
     fn classify_before_side_effects() {
+        // R1: a remote service name is refused before anything is read.
+        assert_eq!(
+            side_effects_of(&context(Some("sshd"), Some("sshd"))),
+            [0, 0, 0, 0],
+            "a remote skip must not load config, user, conversation or messages"
+        );
+
         // R2: the display-manager bypass.
         assert_eq!(
             side_effects_of(&context(Some("sddm"), Some("sh"))),
