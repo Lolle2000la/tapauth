@@ -99,6 +99,7 @@ impl CallerContext {
 /// `to_ascii_lowercase` — never `str::to_lowercase`, which would map U+212A
 /// KELVIN SIGN to `k` and make a non-display-manager service (`\u{212a}dm`)
 /// match the `kdm` prefix.
+#[derive(Clone)]
 pub(crate) struct ServiceName {
     original: Box<str>,
     ascii_lower: Box<str>,

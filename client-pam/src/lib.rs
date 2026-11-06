@@ -46,6 +46,7 @@ mod pam_messages;
 mod pam_sys;
 mod plan;
 mod policy;
+mod transaction;
 
 pub use ipc_client::*;
 
