@@ -207,15 +207,24 @@ impl Outcome {
     pub(crate) fn from_daemon(resp: shared::ipc::pb::PamAuthenticateResponse) -> Outcome {
         let detail = resp.detail;
         match outcome_from_raw(resp.outcome) {
-            shared::ipc::pb::PamOutcome::Success => Outcome::granted_from_daemon(),
-            shared::ipc::pb::PamOutcome::Denied => Outcome::Denied(DenyVia::PhoneDenial),
+            shared::ipc::pb::PamOutcome::Success => {
+                tracing::info!("Authentication successful");
+                Outcome::granted_from_daemon()
+            }
+            shared::ipc::pb::PamOutcome::Denied => {
+                tracing::info!("Authentication explicitly denied");
+                Outcome::Denied(DenyVia::PhoneDenial)
+            }
             shared::ipc::pb::PamOutcome::Timeout => {
+                tracing::info!("Authentication timed out");
                 Outcome::Unavailable(UnavailableReason::DaemonTimedOut)
             }
             shared::ipc::pb::PamOutcome::Ignore => {
+                tracing::info!("Daemon indicated IGNORE");
                 Outcome::Unavailable(UnavailableReason::DaemonIgnored)
             }
             shared::ipc::pb::PamOutcome::Error => {
+                tracing::error!("Daemon reported error: {}", detail);
                 Outcome::Error(ErrorReason::Daemon(detail.into_boxed_str()))
             }
         }

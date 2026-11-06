@@ -39,6 +39,7 @@ use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::IpcClient;
 use crate::logging;
+use crate::outcome::Outcome;
 use crate::pam_messages;
 use crate::pam_sys;
 use crate::plan::{Announcement, Plannable, TtyUse};
@@ -1049,7 +1050,7 @@ fn authenticate_inner(
 
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
-                Some(resp) => map_pam_outcome(&resp, &username, &pam_conv, &msgs),
+                Some(resp) => finish(Outcome::from_daemon(resp), &pam_conv, &msgs),
                 None => pam_sys::PAM_AUTHINFO_UNAVAIL,
             },
             ExitReason::Timeout => {
@@ -1186,18 +1187,12 @@ fn authenticate_inner(
 
         // The worker is fully reaped.  It is now safe to touch the PAM
         // conversation function without racing the background thread.
-        //
-        // &username is a stack-allocated Rust String reference passed to
-        // map_pam_outcome.  This is sound because map_pam_outcome only uses
-        // it for tracing log messages and immediately returns a PAM status
-        // code; it never stores the reference or passes it to C via
-        // pam_set_item.  No CString allocation is needed here.
         if let Some(err_msg) = pending_error {
             pam_conv.try_info(err_msg);
         }
 
         if let Some(resp) = auth_response {
-            final_outcome = map_pam_outcome(&resp, &username, &pam_conv, &msgs);
+            final_outcome = finish(Outcome::from_daemon(resp), &pam_conv, &msgs);
         }
 
         if exit_reason == ExitReason::Timeout {
@@ -1262,7 +1257,7 @@ fn authenticate_inner(
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
-                                return map_pam_outcome(&resp, &username, &pam_conv, &msgs)
+                                return finish(Outcome::from_daemon(resp), &pam_conv, &msgs)
                             }
                             Ok(None) => {
                                 // No complete frame yet, check for errors
@@ -1402,81 +1397,26 @@ fn guard_display_manager_bypass(
     Some(pam_sys::PAM_AUTHINFO_UNAVAIL)
 }
 
-/// Spawn a thread to monitor `/dev/tty` for skip signals.
+/// Emit an outcome's one message, then hand back its `PAM_*` code.
 ///
-/// Reads from the controlling terminal and signals via `skip_tx` when any key
-/// is pressed. Uses `/dev/tty` instead of stdin to work correctly in PAM contexts
-/// where stdin may not be connected to the terminal.
-fn map_pam_outcome(
-    resp: &shared::ipc::pb::PamAuthenticateResponse,
-    username: &str,
+/// The daemon-response sites go through this, so the message and the code are
+/// decided by the outcome and not by the site that produced it: `to_pam` is the
+/// only place a code is made, and `Outcome::notice` the only place a message is
+/// chosen. The emission itself is the two calls the module has always made —
+/// `try_info` for information, `try_error` for an error — and both swallow a
+/// failing conversation.
+fn finish(
+    outcome: crate::outcome::Outcome,
     pam_conv: &pam_sys::PamConversation,
     msgs: &pam_messages::PamMessages,
 ) -> c_int {
-    match response_outcome(resp) {
-        shared::ipc::pb::PamOutcome::Success => {
-            tracing::info!("Authentication successful for user: {}", username);
-            pam_conv.try_info(msgs.auth_successful());
-            pam_sys::PAM_SUCCESS
-        }
-        shared::ipc::pb::PamOutcome::Denied => {
-            tracing::info!("Authentication explicitly denied for user: {}", username);
-            pam_conv.try_info(msgs.auth_denied());
-            pam_sys::PAM_PERM_DENIED
-        }
-        shared::ipc::pb::PamOutcome::Timeout => {
-            tracing::info!("Authentication timed out for user: {}", username);
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        }
-        shared::ipc::pb::PamOutcome::Ignore => {
-            tracing::info!("Daemon indicated IGNORE for user: {}", username);
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        }
-        shared::ipc::pb::PamOutcome::Error => {
-            tracing::error!(
-                "Daemon reported error for user {}: {}",
-                username,
-                resp.detail
-            );
-            pam_conv.try_error(&msgs.error(&resp.detail));
-            pam_sys::PAM_AUTH_ERR
+    if let Some(notice) = outcome.notice(msgs) {
+        match notice.style {
+            crate::outcome::NoticeStyle::Info => pam_conv.try_info(&notice.text),
+            crate::outcome::NoticeStyle::Error => pam_conv.try_error(&notice.text),
         }
     }
-}
-
-/// Map the raw protobuf `outcome` field to a [`shared::ipc::pb::PamOutcome`].
-///
-/// This must not be replaced by prost's generated accessor
-/// `PamAuthenticateResponse::outcome()`: that accessor is
-/// `PamOutcome::try_from(self.outcome).unwrap_or_default()`, and
-/// `PamOutcome::default()` is the first declared variant, `SUCCESS` (0). A
-/// response carrying a value prost does not recognise — `99`, or a variant
-/// added by a newer daemon — therefore decoded as a *grant*.
-///
-/// Unknown values fail closed as `PamOutcome::Error`, which `map_pam_outcome`
-/// turns into `PAM_AUTH_ERR`.
-fn outcome_from_raw(raw: i32) -> shared::ipc::pb::PamOutcome {
-    use shared::ipc::pb::PamOutcome;
-
-    // `PamOutcome::try_from` is the authority for "known variant"; a proto variant
-    // makes this match (and `map_pam_outcome`) go non-exhaustive, forcing a
-    // decision here. Arms are spelled out, not `unwrap_or(...)`, to stay auditable.
-    match PamOutcome::try_from(raw) {
-        Ok(PamOutcome::Success) => PamOutcome::Success,
-        Ok(PamOutcome::Denied) => PamOutcome::Denied,
-        Ok(PamOutcome::Timeout) => PamOutcome::Timeout,
-        Ok(PamOutcome::Ignore) => PamOutcome::Ignore,
-        Ok(PamOutcome::Error) => PamOutcome::Error,
-        Err(_) => PamOutcome::Error,
-    }
-}
-
-/// Outcome of a daemon response, failing closed on unknown values.
-fn response_outcome(
-    resp: &shared::ipc::pb::PamAuthenticateResponse,
-) -> shared::ipc::pb::PamOutcome {
-    // Reads the raw `i32` field, not the generated `outcome()` accessor.
-    outcome_from_raw(resp.outcome)
+    outcome.to_pam()
 }
 
 #[cfg(test)]
@@ -1866,6 +1806,11 @@ mod tests {
     fn test_map_pam_outcome_matrix() {
         let conv = unsafe { pam_sys::PamConversation::dummy() };
         let msgs = pam_messages::load_for_user("testuser");
+        // The daemon-answer path as the call sites run it: the verdict, its one
+        // message and its code, from the response alone.
+        let map = |resp: shared::ipc::pb::PamAuthenticateResponse| {
+            finish(Outcome::from_daemon(resp), &conv, &msgs)
+        };
 
         let resp_for = |outcome: shared::ipc::pb::PamOutcome,
                         detail: &str|
@@ -1879,24 +1824,14 @@ mod tests {
 
         // A grant is the only success.
         assert_eq!(
-            map_pam_outcome(
-                &resp_for(shared::ipc::pb::PamOutcome::Success, "Success"),
-                "testuser",
-                &conv,
-                &msgs
-            ),
+            map(resp_for(shared::ipc::pb::PamOutcome::Success, "Success")),
             pam_sys::PAM_SUCCESS
         );
 
         // An explicit phone denial must stay a denial: it fails in both the
         // `required` and the `[success=done default=bad]` stack shapes.
         assert_eq!(
-            map_pam_outcome(
-                &resp_for(shared::ipc::pb::PamOutcome::Denied, "Denied"),
-                "testuser",
-                &conv,
-                &msgs
-            ),
+            map(resp_for(shared::ipc::pb::PamOutcome::Denied, "Denied")),
             pam_sys::PAM_PERM_DENIED
         );
 
@@ -1907,7 +1842,7 @@ mod tests {
             shared::ipc::pb::PamOutcome::Ignore,
         ] {
             assert_eq!(
-                map_pam_outcome(&resp_for(outcome, "detail"), "testuser", &conv, &msgs),
+                map(resp_for(outcome, "detail")),
                 pam_sys::PAM_AUTHINFO_UNAVAIL,
                 "{outcome:?} must report the service as unavailable"
             );
@@ -1915,12 +1850,7 @@ mod tests {
 
         // The daemon answered but could not process the attempt.
         assert_eq!(
-            map_pam_outcome(
-                &resp_for(shared::ipc::pb::PamOutcome::Error, "boom"),
-                "testuser",
-                &conv,
-                &msgs
-            ),
+            map(resp_for(shared::ipc::pb::PamOutcome::Error, "boom")),
             pam_sys::PAM_AUTH_ERR
         );
     }
@@ -1930,27 +1860,39 @@ mod tests {
     /// rather than decode to `PamOutcome::default()` = `SUCCESS`.
     #[test]
     fn test_unknown_outcome_raw_values_fail_closed() {
-        use shared::ipc::pb::PamOutcome;
+        use crate::outcome::DenyVia;
+        use crate::outcome::ErrorReason;
+        use crate::outcome::GrantVia;
+        use crate::outcome::Outcome;
+        use crate::outcome::UnavailableReason;
+
+        let from_raw = |raw: i32| {
+            Outcome::from_daemon(shared::ipc::pb::PamAuthenticateResponse {
+                outcome: raw,
+                detail: "detail".to_owned(),
+                challenge: vec![],
+            })
+        };
 
         for raw in [-1, 5, 99, 255, i32::MAX, i32::MIN] {
+            let outcome = from_raw(raw);
             assert_eq!(
-                outcome_from_raw(raw),
-                PamOutcome::Error,
-                "raw outcome {raw} must fail closed instead of {:?}",
-                outcome_from_raw(raw)
+                outcome,
+                Outcome::Error(ErrorReason::Daemon("detail".into())),
+                "raw outcome {raw} must fail closed instead of {outcome:?}"
             );
         }
 
         // Known values keep exactly today's mapping.
         for (raw, expected) in [
-            (0, PamOutcome::Success),
-            (1, PamOutcome::Denied),
-            (2, PamOutcome::Timeout),
-            (3, PamOutcome::Ignore),
-            (4, PamOutcome::Error),
+            (0, Outcome::Granted(GrantVia::PhoneTap)),
+            (1, Outcome::Denied(DenyVia::PhoneDenial)),
+            (2, Outcome::Unavailable(UnavailableReason::DaemonTimedOut)),
+            (3, Outcome::Unavailable(UnavailableReason::DaemonIgnored)),
+            (4, Outcome::Error(ErrorReason::Daemon("detail".into()))),
         ] {
             assert_eq!(
-                outcome_from_raw(raw),
+                from_raw(raw),
                 expected,
                 "raw outcome {raw} must keep its mapping"
             );
@@ -1993,7 +1935,7 @@ mod tests {
             // The hand-built bytes really did carry the unknown outcome.
             assert_eq!(resp.outcome, raw, "hand-encoded bytes decode as expected");
 
-            let code = map_pam_outcome(&resp, "testuser", &conv, &msgs);
+            let code = finish(Outcome::from_daemon(resp), &conv, &msgs);
             assert_ne!(
                 code,
                 pam_sys::PAM_SUCCESS,
@@ -2020,8 +1962,8 @@ mod tests {
         let msgs = pam_messages::load_for_user("testuser");
 
         // Every variant of the IPC enum. This list is not compiler-enforced:
-        // the `match` in `map_pam_outcome` is exhaustive but this array is not,
-        // so extend this list by hand when adding a variant.
+        // the `match` in `Outcome::from_daemon` is exhaustive but this array is
+        // not, so extend this list by hand when adding a variant.
         let all_outcomes = [
             shared::ipc::pb::PamOutcome::Success,
             shared::ipc::pb::PamOutcome::Denied,
@@ -2036,7 +1978,7 @@ mod tests {
                 detail: "detail".to_string(),
                 challenge: vec![],
             };
-            let code = map_pam_outcome(&resp, "testuser", &conv, &msgs);
+            let code = finish(Outcome::from_daemon(resp), &conv, &msgs);
             // `PAM_IGNORE` is 25 and is deliberately absent from this list: it
             // is not a verdict, so a later `optional pam_permit` can still make
             // the whole stack succeed.
