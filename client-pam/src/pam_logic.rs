@@ -1192,16 +1192,20 @@ fn authenticate_inner(
         }
         let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline_at);
 
-        return match exit_reason {
+        // The verdict comes from the loop's exit, never from the loop itself,
+        // so the text and the style of a failure are decided once by
+        // `Outcome::notice`. `IpcResponseReceived` without a payload cannot
+        // happen (the loop returns it only with `Some`), so it fails closed
+        // without a message rather than inventing one.
+        let outcome = match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
-                Some(resp) => finish(Outcome::from_daemon(resp), &pam_conv, &msgs),
-                None => pam_sys::PAM_AUTHINFO_UNAVAIL,
+                Some(resp) => Outcome::from_daemon(resp),
+                None => Outcome::Unavailable(UnavailableReason::ProtocolError),
             },
             ExitReason::Timeout => {
                 // The daemon runs on the same deadline and multicasts its own
                 // AuthenticationCancel, so no client-side cancel is needed.
-                pam_conv.try_info(msgs.timed_out());
-                pam_sys::PAM_AUTHINFO_UNAVAIL
+                Outcome::Unavailable(UnavailableReason::TimedOut)
             }
             _ => {
                 // IPC error: the request may still be in flight daemon-side.
@@ -1210,10 +1214,13 @@ fn authenticate_inner(
                 if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
                     let _ = c.send_cancel("gui-ipc-error", &request_id);
                 }
-                pam_conv.try_error(msgs.communication_error());
-                pam_sys::PAM_AUTHINFO_UNAVAIL
+                // This is the one path that shows its IPC text as an error,
+                // so it maps to `IpcError` rather than to the hangup/loop
+                // reasons the other two mechanisms use.
+                Outcome::Unavailable(UnavailableReason::IpcError)
             }
         };
+        return finish(outcome, &pam_conv, &msgs);
     }
 
     // GUI context with a threaded-conversation-capable host (see `policy`):
