@@ -40,6 +40,7 @@ mod config;
 mod context;
 mod ipc_client;
 mod logging;
+mod outcome;
 mod pam_logic;
 mod pam_messages;
 mod pam_sys;
