@@ -43,6 +43,7 @@ mod logging;
 mod pam_logic;
 mod pam_messages;
 mod pam_sys;
+mod plan;
 mod policy;
 
 pub use ipc_client::*;

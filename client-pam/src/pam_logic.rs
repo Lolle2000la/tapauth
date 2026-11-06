@@ -41,6 +41,7 @@ use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::pam_messages;
 use crate::pam_sys;
+use crate::plan::{Announcement, Plannable, TtyUse};
 use crate::policy;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -736,6 +737,15 @@ impl OrchestrationIo {
     }
 }
 
+/// The module's single `/dev/tty` open.
+///
+/// Injected into `authenticate_inner` as a closure, the same seam
+/// `start_authentication`'s `connect`/`send` have, so tests can count the probe
+/// without a terminal.
+fn probe_tty() -> Option<std::fs::File> {
+    std::fs::File::open("/dev/tty").ok()
+}
+
 /// Run one authentication, then record its conclusion.
 ///
 /// The body decides and acts; this wrapper records the verdict afterwards so
@@ -748,7 +758,7 @@ impl OrchestrationIo {
 /// wrapper disappear with it.
 fn orchestrate(pamh: *mut pam_sys::PamHandle, ctx: &CallerContext, io: &OrchestrationIo) -> c_int {
     let mut verdict: Option<Verdict> = None;
-    let code = authenticate_inner(pamh, ctx, io, &mut verdict);
+    let code = authenticate_inner(pamh, ctx, io, &mut verdict, probe_tty);
     // This runs after the body returned, so it is also the anchor of the reuse
     // window: the 500 ms is measured from this module's *return*, not from the
     // moment the transaction concluded.  A module after `pam_tapauth.so` that
@@ -780,6 +790,7 @@ fn authenticate_inner(
     ctx: &CallerContext,
     io: &OrchestrationIo,
     verdict: &mut Option<Verdict>,
+    probe_tty: impl FnOnce() -> Option<std::fs::File>,
 ) -> c_int {
     // The conversation policy is decided from the caller facts `capture` read,
     // and it is decided *first*: a `Skip` returns before the config read, the
@@ -840,61 +851,61 @@ fn authenticate_inner(
 
     let msgs = (io.load_messages)(&username);
 
-    // Block terminal polling if the calling host drives its own conversation.
-    // This prevents the PAM module from stealing stdin strings from checking
-    // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
-    // to deadlock during graphical challenge-response dialogs.
+    // The conversation mode names the branch this call takes; the `Plannable`
+    // carrier and the plan that follows it are what the four timed decisions
+    // are made from.
     let mode = match participation.conversation {
         policy::Conversation::Threaded => ConversationMode::Threaded,
         policy::Conversation::Sequential => ConversationMode::Sequential,
         policy::Conversation::PreCollected => ConversationMode::PreCollected,
     };
-    // A host whose conversation we drive from a worker thread must not take the
-    // terminal branch: it would start polling /dev/tty on this thread and steal
-    // the stdin the host expects for its own dialog.
-    let tty_file = if mode == ConversationMode::Sequential {
-        std::fs::File::open("/dev/tty").ok()
-    } else {
-        None
-    };
-    let has_terminal = tty_file.is_some();
 
-    // Pre-collected hosts (swaylock, gtklock, i3lock) read the password before
-    // they call `pam_authenticate`; their conversation is a synchronous replay
-    // of it, so `pam_get_authtok` returns immediately and never waits for the
-    // user.  Collect the token on the calling thread — a worker thread would
-    // only reintroduce the cross-thread libpam pattern the threaded path has to
-    // join around — and let it be cached in `PAM_AUTHTOK`, which is what the
-    // next module (`pam_unix` with `try_first_pass`/`use_first_pass`) verifies.
-    //
-    // This is deliberately a skip, not a wait: the user has already typed the
-    // password, so ringing the phone would be misleading and could only ever
-    // end in a timeout.  The skip returns `PAM_AUTHINFO_UNAVAIL` (never
-    // `PAM_IGNORE`): a `sufficient` line treats that as `ignore`, exactly as
-    // `PAM_IGNORE` would, so the next module still runs; a `required` line
-    // fails closed.  If the token cannot be read (the host's
-    // conversation refused it, or nothing was collected) the next module simply
-    // prompts as it would without this module.
-    if mode == ConversationMode::PreCollected {
-        let mut authtok: *const std::os::raw::c_char = std::ptr::null();
-        // SAFETY: `pamh` is the live handle libpam passed to this call and the
-        // conversation belongs to this thread, which is what the host expects.
-        let res = unsafe {
-            pam_sys::pam_get_authtok(pamh, pam_sys::PAM_AUTHTOK, &mut authtok, std::ptr::null())
-        };
-        if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
-            tracing::warn!(
-                "TapAuth: pre-collected host supplied no password token ({res}); \
-                 falling through to the next PAM module"
-            );
-        } else {
-            tracing::info!(
-                "TapAuth: pre-collected password cached for the next PAM module; \
-                 the phone is not consulted"
-            );
+    // `PreCollected` has no plan at all: its handoff is the last thing that
+    // happens before the transaction machinery, and it returns before a probe,
+    // a `Plan` or a cache lookup exists — which is why `plan::Plannable` has no
+    // `PreCollected` variant to excuse.
+    let plannable = match participation.conversation {
+        policy::Conversation::Threaded => Plannable::Threaded,
+        policy::Conversation::Sequential => Plannable::Sequential,
+        // Pre-collected hosts (swaylock, gtklock, i3lock) read the password
+        // before they call `pam_authenticate`; their conversation is a
+        // synchronous replay of it, so `pam_get_authtok` returns immediately and
+        // never waits for the user.  Collect the token on the calling thread — a
+        // worker thread would only reintroduce the cross-thread libpam pattern
+        // the threaded path has to join around — and let it be cached in
+        // `PAM_AUTHTOK`, which is what the next module (`pam_unix` with
+        // `try_first_pass`/`use_first_pass`) verifies.
+        //
+        // This is deliberately a skip, not a wait: the user has already typed
+        // the password, so ringing the phone would be misleading and could only
+        // ever end in a timeout.  The skip returns `PAM_AUTHINFO_UNAVAIL` (never
+        // `PAM_IGNORE`): a `sufficient` line treats that as `ignore`, exactly as
+        // `PAM_IGNORE` would, so the next module still runs; a `required` line
+        // fails closed.  If the token cannot be read (the host's conversation
+        // refused it, or nothing was collected) the next module simply prompts
+        // as it would without this module.
+        policy::Conversation::PreCollected => {
+            let mut authtok: *const std::os::raw::c_char = std::ptr::null();
+            // SAFETY: `pamh` is the live handle libpam passed to this call and
+            // the conversation belongs to this thread, which is what the host
+            // expects.
+            let res = unsafe {
+                pam_sys::pam_get_authtok(pamh, pam_sys::PAM_AUTHTOK, &mut authtok, std::ptr::null())
+            };
+            if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
+                tracing::warn!(
+                    "TapAuth: pre-collected host supplied no password token ({res}); \
+                     falling through to the next PAM module"
+                );
+            } else {
+                tracing::info!(
+                    "TapAuth: pre-collected password cached for the next PAM module; \
+                     the phone is not consulted"
+                );
+            }
+            return pam_sys::PAM_AUTHINFO_UNAVAIL;
         }
-        return pam_sys::PAM_AUTHINFO_UNAVAIL;
-    }
+    };
 
     // First, answer a duplicate: the lock-screen duplicate is queued while the
     // first transaction is still running, so replaying the code this process
@@ -934,16 +945,33 @@ fn authenticate_inner(
         }
     }
 
+    // The `/dev/tty` probe, gated by `Plannable::tty_use` — a function of the
+    // carrier alone — so `conversation == Sequential` is not tested a second
+    // time here. It runs *after* the reuse lookup: a duplicate answered from the
+    // record must not open the terminal at all.
+    //
+    // A host whose conversation we drive from a worker thread must not take the
+    // terminal branch either: it would start polling `/dev/tty` on this thread
+    // and steal the stdin the host expects for its own dialog.
+    let tty_file = if plannable.tty_use() == TtyUse::PollForKey {
+        probe_tty()
+    } else {
+        None
+    };
+    let has_tty = tty_file.is_some();
+    let plan = plannable.plan(has_tty);
+
     // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
     // (one conversation round trip that carries no input and never waits for
-    // the user).  The terminal and polkit paths get theirs here, before the
-    // wait starts; event-loop hosts get it further down, right before the
-    // module begins blocking (see `run_sequential_event_loop`), because such
-    // hosts only reveal their password entry once a PAM message arrives.
-    if has_terminal {
-        pam_conv.try_info(msgs.waiting_for_tap_skip());
-    } else if mode == ConversationMode::Threaded {
-        pam_conv.try_info(msgs.waiting_for_tap());
+    // the user).  The terminal and threaded paths get theirs here, before the
+    // wait starts; a no-terminal sequential host gets `WaitThenPassword`
+    // further down, right before the module begins blocking, because such hosts
+    // only reveal their password entry once a PAM message arrives.
+    match plan.announcement {
+        Announcement::WaitSkipHint => pam_conv.try_info(msgs.waiting_for_tap_skip()),
+        Announcement::Wait => pam_conv.try_info(msgs.waiting_for_tap()),
+        // Emitted after the request is on the wire, just below.
+        Announcement::WaitThenPassword => {}
     }
 
     // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
@@ -953,31 +981,16 @@ fn authenticate_inner(
         return pam_sys::PAM_AUTH_ERR;
     }
     let request_id = hex::encode(rid_bytes);
-    // Use the configured PAM operation timeout for both the local poll deadline
-    // and the daemon's authentication timeout, so they stay in sync.  GUI
-    // contexts without a usable conversation get the shorter GUI deadline so
-    // password fallback remains close at hand.
-    let effective_timeout_secs = if !has_terminal && mode == ConversationMode::Sequential {
-        config
-            .pam_gui_timeout_secs
-            .min(config.pam_operation_timeout_secs)
-    } else {
-        config.pam_operation_timeout_secs
-    };
-    let timeout_secs = {
-        let secs = effective_timeout_secs;
-        if secs > u64::from(u32::MAX) {
-            u32::MAX
-        } else {
-            secs as u32
-        }
-    };
-    let context = if has_terminal {
-        "terminal"
-    } else if mode == ConversationMode::Threaded {
-        "gui-threaded"
-    } else {
-        "gui-sequential"
+    // The deadline, resolved once from the plan and anchored *before* the
+    // request is on the wire, so a stalled connect or write consumes budget
+    // instead of running past it. The daemon gets the same number of seconds,
+    // so the two deadlines stay in sync.
+    let timeout_secs = plan.deadline.resolve(&config);
+    let deadline_at = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+    let context = match (plannable, plan.tty_use) {
+        (Plannable::Threaded, _) => "gui-threaded",
+        (Plannable::Sequential, TtyUse::PollForKey) => "terminal",
+        (Plannable::Sequential, TtyUse::DoNotOpen) => "gui-sequential",
     };
     tracing::debug!(
         "Authentication deadline: {}s (context: {})",
@@ -1000,7 +1013,7 @@ fn authenticate_inner(
         &username,
         ctx.service().map(ServiceName::original),
         IpcClient::connect_nonblocking,
-        |ipc| ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id),
+        |ipc| ipc.send_authenticate_start(&username, has_tty, timeout_secs, &request_id),
     ) {
         Ok(ipc) => ipc,
         Err(StartError::Connect(e)) => {
@@ -1020,8 +1033,7 @@ fn authenticate_inner(
     // daemon on this thread and never *drive* the conversation.  Password
     // fallback happens after this returns, when the next PAM module runs its
     // own conversation.
-    if !has_terminal && mode == ConversationMode::Sequential {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+    if !has_tty && mode == ConversationMode::Sequential {
         // Announce the wait now that the request is on the wire and the module
         // is about to block.  Event-loop hosts (GDM's auth prompt, KDE's
         // kscreenlocker_worker) only reveal their password entry once a PAM
@@ -1030,8 +1042,10 @@ fn authenticate_inner(
         // `PAM_TEXT_INFO` — it never prompts, never reads input and never runs
         // on another thread; a host whose conversation returns `PAM_CONV_ERR`
         // is unaffected because `try_info` swallows the error.
-        pam_conv.try_info(msgs.waiting_for_tap_password());
-        let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline);
+        if plan.announcement == Announcement::WaitThenPassword {
+            pam_conv.try_info(msgs.waiting_for_tap_password());
+        }
+        let (exit_reason, auth_response) = run_sequential_event_loop(&mut ipc, deadline_at);
 
         return match exit_reason {
             ExitReason::IpcResponseReceived => match auth_response {
@@ -1061,7 +1075,7 @@ fn authenticate_inner(
     // `conversation_mode`): offload blocking credential collection to a native
     // background thread so the host can process window events, then multiplex
     // loop events using a secure close-on-exec self-pipe.
-    if !has_terminal && mode == ConversationMode::Threaded {
+    if !has_tty && mode == ConversationMode::Threaded {
         // O_CLOEXEC prevents the pipe fds from leaking to child processes
         // started by the long-running privileged host (sudo, gdm, polkitd).
         let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
@@ -1130,7 +1144,6 @@ fn authenticate_inner(
         }
 
         let pthread_id = unsafe { pthread_id.assume_init() };
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
 
         // The verdict when no daemon response arrived.  Every remaining exit
         // reason means the service could not be consulted — the user chose the
@@ -1148,7 +1161,7 @@ fn authenticate_inner(
         let exit_reason = run_gui_event_loop(
             &mut ipc,
             pipe_read,
-            deadline,
+            deadline_at,
             &ctx,
             &request_id,
             &msgs,
@@ -1196,7 +1209,7 @@ fn authenticate_inner(
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
     //
-    // Safety: at this point has_terminal is true, so tty_file is
+    // Safety: at this point `has_tty` is true, so tty_file is
     // guaranteed Some. We still use let-else as a non-panicking
     // defuse instead of expect()/unwrap().
     let Some(mut tty) = tty_file else {
@@ -1213,14 +1226,13 @@ fn authenticate_inner(
     }
 
     let mut poll_tty = true;
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
     let mut kb = [0u8; 4];
     loop {
         let now = Instant::now();
-        if now >= deadline {
+        if now >= deadline_at {
             break;
         }
-        let remain = deadline
+        let remain = deadline_at
             .checked_duration_since(now)
             .unwrap_or(Duration::ZERO);
         let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
@@ -1547,6 +1559,109 @@ mod tests {
             None => crate::context::ProcessIdentity::Unknown,
         };
         CallerContext::from_parts(service, process, crate::context::GdmReauth::Absent)
+    }
+
+    /// An `OrchestrationIo` that counts nothing and needs no PAM handle, for the
+    /// tests about the tty probe rather than about call order.
+    fn inert_io() -> OrchestrationIo {
+        unsafe fn user(_pamh: *mut pam_sys::PamHandle) -> Result<String, c_int> {
+            Ok("tty-probe-test-user".to_owned())
+        }
+        unsafe fn conversation(
+            _pamh: *mut pam_sys::PamHandle,
+        ) -> Result<pam_sys::PamConversation<'static>, c_int> {
+            Ok(unsafe { pam_sys::PamConversation::dummy() })
+        }
+        OrchestrationIo {
+            load_config: zero_timeouts,
+            get_user: user,
+            new_conversation: conversation,
+            load_messages: |_username| pam_messages::load_for_user("tty-probe-test-user"),
+        }
+    }
+
+    /// Run `authenticate_inner` with an injected tty probe, and report how many
+    /// times the probe ran. `tty` is what the probe returns: `Some(path)` opens
+    /// that file, `None` reports "no terminal".
+    fn tty_probes(ctx: &CallerContext, tty: Option<&str>) -> (c_int, usize) {
+        let io = inert_io();
+        let mut verdict = None;
+        let mut probes = 0usize;
+        let code = authenticate_inner(std::ptr::null_mut(), ctx, &io, &mut verdict, || {
+            probes += 1;
+            tty.and_then(|path| std::fs::File::open(path).ok())
+        });
+        (code, probes)
+    }
+
+    /// `/dev/tty` is opened once, and only for the conversation that polls it.
+    ///
+    /// The defect this catches: the probe moved to the top of the function (or
+    /// gated on `conversation == Sequential` a second time, next to the plan),
+    /// so a threaded host polls the terminal and steals the stdin its own dialog
+    /// needs — or a plan maker and the probe disagree about whether a terminal
+    /// exists.
+    #[test]
+    fn tty_probe_only_for_sequential() {
+        let threaded = context(Some("probe-threaded"), Some("hyprlock"));
+        assert_eq!(
+            tty_probes(&threaded, Some("/dev/null")),
+            (pam_sys::PAM_AUTHINFO_UNAVAIL, 0),
+            "a threaded conversation must not open /dev/tty"
+        );
+
+        let sequential_tty = context(Some("probe-tty"), Some("xfce4-screensaver-dialog"));
+        assert_eq!(
+            tty_probes(&sequential_tty, Some("/dev/null")),
+            (pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
+            "a sequential conversation probes /dev/tty exactly once"
+        );
+
+        let sequential_no_tty = context(Some("probe-no-tty"), Some("xfce4-screensaver-dialog"));
+        assert_eq!(
+            tty_probes(&sequential_no_tty, None),
+            (pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
+            "a sequential conversation probes once even when there is no terminal"
+        );
+    }
+
+    /// A duplicate answered from the reuse record does not open `/dev/tty`.
+    ///
+    /// The defect this catches: the probe left *before* the reuse lookup, where
+    /// it used to be, so every hit opened the terminal for a transaction it
+    /// never starts. The recorded conclusion is a success, so the returned code
+    /// also proves the hit was taken rather than the probe merely being skipped
+    /// on an early return.
+    ///
+    /// The reuse record is one process-wide slot that other tests in this binary
+    /// also write, and the module's lookup happens after the injected
+    /// `load_messages`, so the record is re-taken whenever a concurrent test
+    /// replaced it. The assertion itself is never relaxed: it is only evaluated
+    /// once a hit actually happened, which the returned code proves.
+    #[test]
+    fn cache_hit_does_not_open_tty() {
+        let service = "cache-hit-service";
+        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
+        let conclusion = pam_sys::PAM_SUCCESS;
+
+        for _ in 0..64 {
+            record_conclusion("tty-probe-test-user", service, conclusion, Instant::now());
+            let (code, probes) = tty_probes(&ctx, Some("/dev/null"));
+            if code != conclusion {
+                // A concurrent test replaced the single record before the
+                // lookup; nothing was proved about the ordering, so re-take it.
+                continue;
+            }
+            assert_eq!(
+                probes, 0,
+                "a cache hit must replay the conclusion and never open /dev/tty"
+            );
+            return;
+        }
+        panic!(
+            "the reuse record was replaced by a concurrent test before every one of 64 \
+             attempts, so the cache-hit path was never observed"
+        );
     }
 
     /// Run `orchestrate` for `ctx` and return the four call counters in the
