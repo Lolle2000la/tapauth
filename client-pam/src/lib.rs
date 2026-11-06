@@ -37,11 +37,13 @@
 //! Must run as root to access `/etc/tapauth` configuration files.
 
 mod config;
+mod context;
 mod ipc_client;
 mod logging;
 mod pam_logic;
 mod pam_messages;
 mod pam_sys;
+mod policy;
 
 pub use ipc_client::*;
 

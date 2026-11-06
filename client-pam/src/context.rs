@@ -1,0 +1,247 @@
+//! The caller facts the conversation policy is decided on, read once per call.
+//!
+//! Everything here is a *local* fact about this PAM call: the service name, the
+//! process identity and the GDM reauthentication flag. None of it leaves the
+//! module (the IPC request stays four fields), and none of it is re-read by the
+//! policy: `capture` reads, `policy::classify` decides.
+
+use crate::pam_sys;
+use std::ffi::OsStr;
+use std::path::Path;
+
+/// The caller facts, captured before any other work in `authenticate`.
+///
+/// Read once, at `capture`; every consumer reads the captured values. (The
+/// remote-presence fact joins this type with rule R1, which does not exist
+/// yet.)
+pub(crate) struct CallerContext {
+    service: Option<ServiceName>,
+    process: ProcessIdentity,
+    gdm_reauth: GdmReauth,
+}
+
+impl CallerContext {
+    /// The single site that reads `PAM_SERVICE`, `/proc` and the environment.
+    ///
+    /// # Safety
+    ///
+    /// `pamh` must be the live handle libpam passed to this module's
+    /// `pam_sm_authenticate`; every read below is a handle read or a `/proc`
+    /// read of this process.
+    pub(crate) unsafe fn capture(pamh: *mut pam_sys::PamHandle) -> CallerContext {
+        let service = unsafe { pam_sys::get_service_name(pamh) };
+        if let Some(service) = service.as_deref() {
+            tracing::debug!("Calling PAM service name: {}", service);
+        }
+        CallerContext {
+            // `get_service_name` already rejects a non-UTF-8 item (its `to_str`
+            // fails), so the name is never converted lossily: a lossy string
+            // would become a real prefix candidate and a real cache key.
+            service: service.as_deref().map(ServiceName::new),
+            process: identity_from_proc(),
+            gdm_reauth: GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref()),
+        }
+    }
+
+    /// Build a context from already-resolved facts.
+    ///
+    /// Test-only, so no production caller can fabricate an identity: the only
+    /// way in is `capture`.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        service: Option<&str>,
+        process: ProcessIdentity,
+        gdm_reauth: GdmReauth,
+    ) -> CallerContext {
+        CallerContext {
+            service: service.map(ServiceName::new),
+            process,
+            gdm_reauth,
+        }
+    }
+
+    pub(crate) fn service(&self) -> Option<&ServiceName> {
+        self.service.as_ref()
+    }
+
+    pub(crate) fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    /// A GDM reauthentication: `GDM_SESSION_FOR_REAUTH` is present **and** the
+    /// service is `gdm-password`. Both conditions live here so every consumer
+    /// reads the same answer from one capture.
+    pub(crate) fn is_gdm_reauth(&self) -> bool {
+        self.gdm_reauth == GdmReauth::Present
+            && self
+                .service
+                .as_ref()
+                .is_some_and(|service| service.eq_ignore_ascii_case("gdm-password"))
+    }
+}
+
+/// A PAM service name, in the two forms the policy compares.
+///
+/// `original` is the bytes libpam returned and is the form the verdict cache
+/// keys on, so `sudo` and `SUDO` stay distinct keys. `ascii_lower` is used only
+/// by the case-insensitive comparisons, and it is folded with
+/// `to_ascii_lowercase` — never `str::to_lowercase`, which would map U+212A
+/// KELVIN SIGN to `k` and make a non-display-manager service (`\u{212a}dm`)
+/// match the `kdm` prefix.
+pub(crate) struct ServiceName {
+    original: Box<str>,
+    ascii_lower: Box<str>,
+}
+
+impl ServiceName {
+    pub(crate) fn new(service: &str) -> ServiceName {
+        ServiceName {
+            original: service.into(),
+            ascii_lower: service.to_ascii_lowercase().into(),
+        }
+    }
+
+    /// The bytes libpam returned, and the verdict cache's key.
+    pub(crate) fn original(&self) -> &str {
+        &self.original
+    }
+
+    /// Exact-bytes comparison, for the rules whose literal is deliberately
+    /// case-sensitive (`polkit-1`, `sshd`).
+    pub(crate) fn is(&self, literal: &str) -> bool {
+        self.original.as_ref() == literal
+    }
+
+    /// ASCII case-insensitive comparison (`gdm-password`). ASCII-only by
+    /// construction, so no Unicode folding is involved.
+    pub(crate) fn eq_ignore_ascii_case(&self, literal: &str) -> bool {
+        self.ascii_lower.eq_ignore_ascii_case(literal)
+    }
+
+    /// Whether the name is `prefix` exactly, or `prefix` followed by a `-`
+    /// boundary. `ly` therefore matches `ly` and `ly-*` but not `lyfoo`.
+    pub(crate) fn dm_prefixed(&self, prefix: &str) -> bool {
+        let name = self.ascii_lower.as_ref();
+        name == prefix
+            || (name.starts_with(prefix) && name.as_bytes().get(prefix.len()) == Some(&b'-'))
+    }
+}
+
+/// Which source the process name came from, once resolved.
+///
+/// `Exe`/`Comm` is **provenance only**: every rule matches on the name for both
+/// variants, so a real binary literally named `kscreenlocker_w` still matches
+/// the worker rule. The distinction exists so a test can assert the
+/// `(deleted)` strip and the `comm` fallback independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessIdentity {
+    Exe(Box<str>),
+    Comm(Box<str>),
+    Unknown,
+}
+
+impl ProcessIdentity {
+    /// The resolved name, or `None` when neither source produced one.
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            ProcessIdentity::Exe(name) | ProcessIdentity::Comm(name) => Some(name),
+            ProcessIdentity::Unknown => None,
+        }
+    }
+}
+
+/// Resolve this process's identity from `/proc`.
+///
+/// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
+/// some sandboxes; `/proc/self/comm` is the fallback and holds at most
+/// `TASK_COMM_LEN - 1` (15) bytes, which is why the policy accepts both the
+/// full and the truncated spelling of each process name. The `comm` read only
+/// happens when `exe` produced nothing, exactly as before.
+pub(crate) fn identity_from_proc() -> ProcessIdentity {
+    let exe = std::fs::read_link("/proc/self/exe").ok();
+    let from_exe = classify_identity(exe.as_deref(), None);
+    if matches!(from_exe, ProcessIdentity::Exe(_)) {
+        return from_exe;
+    }
+    let comm = std::fs::read_to_string("/proc/self/comm").ok();
+    classify_identity(None, comm.as_deref())
+}
+
+/// Resolve a process identity from the two `/proc` sources.
+///
+/// Pure, so the `(deleted)` strip, the empty-name rejection and the
+/// `exe`-before-`comm` precedence are unit-testable: its caller does the reads
+/// and this function does the interpretation.
+pub(crate) fn classify_identity(exe: Option<&Path>, comm: Option<&str>) -> ProcessIdentity {
+    if let Some(exe) = exe {
+        if let Some(name) = exe.file_name() {
+            let name = name.to_string_lossy();
+            // The kernel suffixes " (deleted)" once the binary is unlinked.
+            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
+            if !name.is_empty() {
+                return ProcessIdentity::Exe(name.into());
+            }
+        }
+    }
+    if let Some(comm) = comm {
+        let comm = comm.trim();
+        if !comm.is_empty() {
+            return ProcessIdentity::Comm(comm.into());
+        }
+    }
+    ProcessIdentity::Unknown
+}
+
+/// Whether the calling process carries `GDM_SESSION_FOR_REAUTH`.
+///
+/// Presence only: `var_os(..).is_some()`, so a set variable holding `0` is as
+/// present as one holding `1`, and there is no value parse to get wrong.
+/// `from_env` is pure, so the interpretation is testable without `set_var`
+/// (which would race every other test in this binary that reads the
+/// environment); `capture` is its only caller and does the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdmReauth {
+    Present,
+    Absent,
+}
+
+impl GdmReauth {
+    pub(crate) fn from_env(value: Option<&OsStr>) -> GdmReauth {
+        if value.is_some() {
+            GdmReauth::Present
+        } else {
+            GdmReauth::Absent
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// `GDM_SESSION_FOR_REAUTH` is read for its *presence* only, so a set
+    /// variable holding `0` or `""` is as present as one holding `1`.
+    ///
+    /// The value is passed in, so this pins the interpretation without
+    /// `set_var` and without racing the rest of the binary; the read itself is
+    /// covered end to end by the `gdm-password login`/`reauth` e2e shapes, the
+    /// two shapes that differ only in that variable.
+    #[test]
+    fn gdm_reauth_env_parsing() {
+        let cases: &[(Option<&OsStr>, GdmReauth)] = &[
+            (None, GdmReauth::Absent),
+            (Some(OsStr::new("")), GdmReauth::Present),
+            (Some(OsStr::new("0")), GdmReauth::Present),
+            (Some(OsStr::new("1")), GdmReauth::Present),
+        ];
+        for &(value, expected) in cases {
+            assert_eq!(GdmReauth::from_env(value), expected, "value {value:?}");
+        }
+    }
+}

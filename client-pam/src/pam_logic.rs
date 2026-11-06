@@ -20,7 +20,7 @@
 //! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
 //! runtime per authentication attempt. A separate thread monitors `/dev/tty`
 //! for skip signals in terminal contexts. TTY-less (GUI) hosts are split into
-//! three conversation modes by `conversation_mode`; only allowlisted hosts get
+//! three conversation modes by the policy table in `policy`; only allowlisted hosts get
 //! the worker thread, hosts that collect the password before calling into PAM
 //! get a synchronous replay and no daemon request at all, and everyone else
 //! keeps the conversation on the caller's thread.
@@ -35,17 +35,17 @@
 //! | Daemon reported an internal error, or a local failure (conversation lookup, RNG, pipe/thread spawn) | `PAM_AUTH_ERR` |
 //! | Username lookup failed | `PAM_USER_UNKNOWN` |
 
+use crate::context::{self, CallerContext, GdmReauth, ServiceName};
 use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::pam_messages;
 use crate::pam_sys;
+use crate::policy;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use std::ffi::OsStr;
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -279,8 +279,8 @@ impl IpcResponseReader for IpcClient {
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
 // socket and /dev/tty.  The GUI flow (no TTY) comes in three variants,
-// selected by `conversation_mode` — an allowlist of calling processes with a
-// sequential default:
+// selected by the policy table (`policy::classify`) — an allowlist of calling
+// processes with a sequential default:
 //
 // * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `hyprlock`,
 //   `authproto_pam`, and GDM's reauthentication worker): the conversation can
@@ -334,148 +334,14 @@ enum ConversationMode {
     Sequential,
 }
 
-/// Which source the process name came from, once resolved.
-///
-/// `Exe`/`Comm` is **provenance only**: every rule matches on the name for both
-/// variants, so a real binary literally named `kscreenlocker_w` still matches
-/// the worker rule.  The distinction exists so a test can assert the
-/// `(deleted)` strip and the `comm` fallback independently.
-#[derive(Debug, PartialEq, Eq)]
-enum ProcessIdentity {
-    Exe(Box<str>),
-    Comm(Box<str>),
-    Unknown,
-}
-
-impl ProcessIdentity {
-    /// The resolved name, or `None` when neither source produced one.
-    fn name(&self) -> Option<&str> {
-        match self {
-            ProcessIdentity::Exe(name) | ProcessIdentity::Comm(name) => Some(name),
-            ProcessIdentity::Unknown => None,
-        }
-    }
-}
-
-/// Resolve a process identity from the two `/proc` sources.
-///
-/// Pure, so the `(deleted)` strip, the empty-name rejection and the
-/// `exe`-before-`comm` precedence are unit-testable: its caller does the reads
-/// and this function does the interpretation.
-fn classify_identity(exe: Option<&Path>, comm: Option<&str>) -> ProcessIdentity {
-    if let Some(exe) = exe {
-        if let Some(name) = exe.file_name() {
-            let name = name.to_string_lossy();
-            // The kernel suffixes " (deleted)" once the binary is unlinked.
-            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
-            if !name.is_empty() {
-                return ProcessIdentity::Exe(name.into());
-            }
-        }
-    }
-    if let Some(comm) = comm {
-        let comm = comm.trim();
-        if !comm.is_empty() {
-            return ProcessIdentity::Comm(comm.into());
-        }
-    }
-    ProcessIdentity::Unknown
-}
-
 /// Best-effort identity of the process that called into this module.
 ///
 /// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
 /// some sandboxes; `/proc/self/comm` is the fallback and holds at most
-/// `TASK_COMM_LEN - 1` (15) bytes, which is why `conversation_mode` accepts
-/// both the full and the truncated spelling of each process name.
+/// `TASK_COMM_LEN - 1` (15) bytes, which is why the policy accepts both the
+/// full and the truncated spelling of each process name.
 fn process_identity() -> Option<String> {
-    let exe = std::fs::read_link("/proc/self/exe").ok();
-    if let ProcessIdentity::Exe(name) = classify_identity(exe.as_deref(), None) {
-        return Some(String::from(name));
-    }
-    let comm = std::fs::read_to_string("/proc/self/comm").ok();
-    classify_identity(None, comm.as_deref())
-        .name()
-        .map(str::to_owned)
-}
-
-/// Classify the calling host's PAM conversation.
-///
-/// This is an **allowlist with a sequential default**: only hosts whose
-/// conversation is known to stay answerable while this thread is blocked are
-/// listed.  An unknown host therefore keeps the behaviour that cannot
-/// deadlock, at the cost of the existing (shorter) GUI timeout before password
-/// fallback — the failure direction is "slower", never "wedged".  Only hosts
-/// whose conversation blocks in a cancellation point may be threaded; a host
-/// that parks in a bare futex must stay sequential.
-///
-/// What makes a host eligible:
-/// * `polkit-agent-helper-1` — the conversation is a blocking fd answered by
-///   the separate agent process.
-/// * `kscreenlocker_worker` (≥ 6.8) — the conversation is a peer D-Bus call
-///   answered by Qt's `QDBusConnectionManager` daemon thread.  On kscreenlocker
-///   ≤ 6.7 the answer is instead posted back to the thread that called
-///   `pam_authenticate`, which would deadlock; nothing in `/proc` reveals the
-///   version, so the allowlist stays as narrow as it can and
-///   `kscreenlocker_greet` is deliberately absent.
-/// * `hyprlock` — a worker `std::thread` with mutex/condvar, i.e. a genuine
-///   concurrent race.  Known residual risk, accepted by the operator:
-///   `resetConversation` and `checkWaiting` are not synchronised, so more than
-///   one waiter would be unsafe.
-/// * `authproto_pam` (xsecurelock) — the conversation is answered by the host's
-///   own thread pool, not by the thread that called `pam_authenticate`.  Quirk:
-///   `CallPAMWithRetries` (`helpers/authproto_pam.c:109-132`) re-runs
-///   `pam_authenticate` for every status except `ABORT`, `MAXTRIES`,
-///   `NEW_AUTHTOK_REQD` and `SUCCESS`, so an explicit denial can ring the phone
-///   up to three times too.  Documented, not fixed here.
-/// * `gdm-session-worker` on a `gdm-password` **reauthentication** — the
-///   unlock/re-auth prompt of a running GDM session, whose conversation is
-///   answered by the worker's GLib main loop on another thread.  Only a
-///   reauthentication qualifies: a GDM *login* is bypassed by
-///   `guard_display_manager_bypass` for keyring reasons, and the worker is
-///   otherwise the host whose event loop must own the conversation.
-///
-/// The screen-saver dialogs are deliberately absent: `xfce4-screensaver-dialog`
-/// and `mate-screensaver-dialog` park their PAM conversation in GLib's
-/// `g_cond_wait`, a bare `futex(FUTEX_WAIT_PRIVATE)` with no cancellation
-/// handshake, so a phone grant cannot abandon the conversation.  Sequential
-/// keeps the phone race and only gives up in-call password fallback.
-///
-/// Pre-collected hosts (`swaylock`, `gtklock`, `i3lock`) are classified
-/// `PreCollected` instead: their conversation replays a password that was read
-/// before `pam_authenticate`, so the phone must not be consulted at all.
-///
-/// Extending the list is one match entry plus one row in the table test below;
-/// every host that is not named stays on the sequential path.
-fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> ConversationMode {
-    match process {
-        Some("polkit-agent-helper-1" | "polkit-agent-he")
-        | Some("kscreenlocker_worker" | "kscreenlocker_w")
-        | Some("hyprlock")
-        | Some("authproto_pam") => ConversationMode::Threaded,
-        // A GDM reauthentication prompt only.  `reauth` is false when
-        // `GDM_SESSION_FOR_REAUTH` is absent (a missed or renamed variable
-        // therefore degrades to the sequential default, never to a deadlock),
-        // and a non-`gdm-password` service behind `gdm-session-worker` stays
-        // sequential.
-        Some("gdm-session-worker" | "gdm-session-wor")
-            if reauth && service.eq_ignore_ascii_case("gdm-password") =>
-        {
-            ConversationMode::Threaded
-        }
-        // All three names are shorter than `TASK_COMM_LEN` (15), so the
-        // `/proc/self/comm` spelling equals the full name and there is no
-        // truncated variant to accept.  These hosts read the password before
-        // `pam_authenticate` (swaylock `pam.c:51` `strdup(state->password)`,
-        // gtklock `auth.c:61` `strdup(data->pw)`, i3lock `i3lock.c:836`
-        // `strdup(password)`) and their conversation is a synchronous replay of
-        // it, so collecting the token on the calling thread is not a race.
-        Some("swaylock" | "gtklock" | "i3lock") => ConversationMode::PreCollected,
-        // /proc unreadable: preserve the historic polkit behaviour rather than
-        // silently changing how polkit drives its conversation.
-        None if service == "polkit-1" => ConversationMode::Threaded,
-        _ => ConversationMode::Sequential,
-    }
+    context::identity_from_proc().name().map(str::to_owned)
 }
 
 /// Whether this invocation is a GDM reauthentication (unlock, or the admin
@@ -485,33 +351,14 @@ fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> Conv
 /// to reauthenticate an existing session.  The variable is the only signal
 /// available inside the module: the service name (`gdm-password`) is identical
 /// for login and reauthentication.
-fn is_gdm_reauth(service: &str) -> bool {
-    service.eq_ignore_ascii_case("gdm-password")
-        && GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref())
-            == GdmReauth::Present
-}
-
-/// Whether the calling process carries `GDM_SESSION_FOR_REAUTH`.
 ///
-/// Presence only: `var_os(..).is_some()`, so a set variable holding `0` is as
-/// present as one holding `1`, and there is no value parse to get wrong.
-/// `from_env` is pure, so the interpretation is testable without `set_var`
-/// (which would race every other test in this binary that reads the
-/// environment); [`is_gdm_reauth`] keeps the read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GdmReauth {
-    Present,
-    Absent,
-}
-
-impl GdmReauth {
-    fn from_env(value: Option<&OsStr>) -> GdmReauth {
-        if value.is_some() {
-            GdmReauth::Present
-        } else {
-            GdmReauth::Absent
-        }
-    }
+/// The environment read stays here; the comparison and the presence-only
+/// interpretation live in `context` (`GdmReauth::from_env`), and
+/// `CallerContext::is_gdm_reauth` is the same predicate over a captured
+/// context.
+fn is_gdm_reauth(service: &str) -> bool {
+    GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref()) == GdmReauth::Present
+        && ServiceName::new(service).eq_ignore_ascii_case("gdm-password")
 }
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
@@ -911,14 +758,27 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
 
     tracing::info!("TapAuth PAM module called (custom bindings)");
 
+    // The caller facts are read once, here, and the conversation policy is
+    // decided from them before anything that costs work: a `Skip` returns
+    // before the config read, the username lookup, the conversation and the
+    // messages, which is the order the display-manager bypass has always had.
+    let ctx = unsafe { CallerContext::capture(pamh) };
+    let classification = policy::classify(&ctx);
+
     // The display-manager bypass returns before the username is resolved, so it
     // never sets `verdict` and never touches the recorded conclusion.  That is
     // deliberate: it is a static policy decision about the service, not a
     // conclusion about credentials.  Only a daemon-path conclusion is ever
     // recorded, and a pre-IPC path must not clobber the last real one.
-    if let Some(pam_status) = guard_display_manager_bypass(pamh) {
+    if let Some(pam_status) = guard_display_manager_bypass(&ctx, &classification) {
         return pam_status;
     }
+    let participation = match classification {
+        policy::Classification::Participate(participation) => participation,
+        // Every `Skip` returned above.  Repeated here so the match is total
+        // without a panic path (`clippy::panic` is denied crate-wide).
+        policy::Classification::Skip(_) => return pam_sys::PAM_AUTHINFO_UNAVAIL,
+    };
 
     // Load configuration for timeouts
     let config = crate::config::PamConfig::load();
@@ -970,7 +830,14 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // not take the display-manager bypass below, and it is the only GDM case
     // whose conversation we may drive from a worker thread.
     let reauth = is_gdm_reauth(service);
-    let mode = conversation_mode(service, process.as_deref(), reauth);
+    // The participation `classify` resolved from the same captured facts: a skip
+    // returned above, so this is the conversation `conversation_mode` picks for
+    // these inputs.
+    let mode = match participation.conversation {
+        policy::Conversation::Threaded => ConversationMode::Threaded,
+        policy::Conversation::Sequential => ConversationMode::Sequential,
+        policy::Conversation::PreCollected => ConversationMode::PreCollected,
+    };
     tracing::debug!(
         "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?}, reauth: {reauth})",
         process,
@@ -1453,35 +1320,6 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     pam_sys::PAM_AUTHINFO_UNAVAIL
 }
 
-/// Whether the PAM service name belongs to a primary display manager.
-///
-/// Matched by exact name or by a `-`-suffixed prefix, so `gdm`, `gdm3` and
-/// `gdm-password` all qualify but an unrelated service such as `gdmfoo` does
-/// not.
-fn is_dm_service(service: &str) -> bool {
-    const DM_PREFIXES: [&str; 13] = [
-        "sddm",
-        "gdm",
-        "gdm3",
-        "lightdm",
-        "lxdm",
-        "slim",
-        "xdm",
-        "kdm",
-        "greetd",
-        "ly",
-        "nodm",
-        "entrance",
-        "plasmalogin",
-    ];
-    let service_lower = service.to_ascii_lowercase();
-    DM_PREFIXES.iter().any(|p| {
-        service_lower == *p
-            || (service_lower.starts_with(p)
-                && service_lower.as_bytes().get(p.len()) == Some(&b'-'))
-    })
-}
-
 /// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
 /// manager.
 ///
@@ -1509,20 +1347,23 @@ fn is_dm_service(service: &str) -> bool {
 ///
 /// Returns `Some(PAM_AUTHINFO_UNAVAIL)` for display manager services, `None`
 /// otherwise.
-fn guard_display_manager_bypass(pamh: *mut pam_sys::PamHandle) -> Option<c_int> {
-    let service = unsafe { pam_sys::get_service_name(pamh) }?;
-    tracing::debug!("Calling PAM service name: {}", service);
-
-    if is_dm_service(&service) && !is_gdm_reauth(&service) {
-        tracing::info!(
-            "TapAuth: Service '{}' is a primary display manager. \
-             Skipping to avoid breaking keyring auto-unlock.",
-            service
-        );
-        return Some(pam_sys::PAM_AUTHINFO_UNAVAIL);
+fn guard_display_manager_bypass(
+    ctx: &CallerContext,
+    classification: &policy::Classification,
+) -> Option<c_int> {
+    match classification {
+        // R2 is the only skip rule in this tree, so a skip is the display
+        // manager bypass.  (R1 adds the second skip policy.)
+        policy::Classification::Skip(policy::SkipPolicy::KeyringNeedsAuthtok) => {
+            tracing::info!(
+                "TapAuth: Service '{}' is a primary display manager. \
+                 Skipping to avoid breaking keyring auto-unlock.",
+                ctx.service().map(ServiceName::original).unwrap_or_default()
+            );
+            Some(pam_sys::PAM_AUTHINFO_UNAVAIL)
+        }
+        _ => None,
     }
-
-    None
 }
 
 /// Spawn a thread to monitor `/dev/tty` for skip signals.
@@ -2744,7 +2585,7 @@ mod conversation_mode_tests {
             "plasmalogin",
         ] {
             assert!(
-                is_dm_service(service),
+                policy::is_dm_service(service),
                 "{service:?} must be treated as a display manager service"
             );
         }
@@ -2758,7 +2599,7 @@ mod conversation_mode_tests {
             "",
         ] {
             assert!(
-                !is_dm_service(service),
+                !policy::is_dm_service(service),
                 "{service:?} must not be treated as a display manager service"
             );
         }
@@ -3255,270 +3096,37 @@ mod verdict_reuse_tests {
     }
 }
 
-/// Characterisation corpus for the conversation decision table.
+/// Test-only compatibility wrapper: the pre-refactor entry point expressed in
+/// terms of the policy table.
 ///
-/// `client-pam/tests/fixtures/callers.csv` was written by reading today's code
-/// and its comments, so every later step of the refactor is checked against an
-/// oracle that was *not* generated from the refactored implementation.
+/// The policy itself — which host is threaded, which keeps the conversation on
+/// the caller's thread, and which collected its password first — is
+/// `policy::RULES`, in order, with each row's justification and evidence. The
+/// process rules are order-insensitive among themselves; R2 is deliberately
+/// excluded here because `conversation_mode` never ran for a display-manager
+/// service (the bypass preceded it).
 ///
-/// What the corpus pins, and what it does not: it feeds the decision function
-/// *literal* inputs — the service string, `classify_identity(exe, comm)` from
-/// the two identity columns and `GdmReauth::from_env` from the `env` column. It
-/// does not pin the reads that produce those inputs (`/proc/self/exe`,
-/// `/proc/self/comm`, `GDM_SESSION_FOR_REAUTH`): no unit test can characterise a
-/// `/proc` read portably, and a test that called `set_var` would race every
-/// other test in this binary that reads the environment. The end-to-end shapes
-/// in `scripts/ci/test-pam-conv-thread.sh` stay the proof for the reads.
+/// It exists so the 24-row decision table test keeps exercising the same
+/// inputs, and it is deleted with that test once the table is the only
+/// representation. It lives at the end of this file on purpose: the three
+/// source-scan tests here read "the production half", i.e. everything before the
+/// first `#[cfg(test)]`, so a test-only item among the production code would
+/// silently truncate what they scan.
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-mod caller_corpus_tests {
-    use super::*;
-
-    const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/callers.csv");
-
-    /// The schema this parser demands, in column order.
-    const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
-
-    /// What the module decides to do with a call.  `SkipRemote` belongs to R1,
-    /// which does not exist yet: the variant is parsed so a later step can add
-    /// its rows without touching the parser.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Policy {
-        SkipRemote,
-        SkipKeyring,
-        Threaded,
-        Sequential,
-        PreCollected,
-    }
-
-    /// Where the resolved process name came from.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Provenance {
-        Exe,
-        Comm,
-        Unknown,
-    }
-
-    struct Row {
-        id: String,
-        service: Option<String>,
-        exe: Option<String>,
-        comm: Option<String>,
-        env: Option<String>,
-        tty: bool,
-        /// Which rule must fire.  Parsed and carried from this commit, but only
-        /// asserted once `policy::classify` exists (step 1): today's code has no
-        /// rule ids, so there is nothing to compare it against yet.
-        expected_rule: String,
-        expected_policy: Policy,
-        why: String,
-        e2e: bool,
-    }
-
-    fn parse_bool(field: &str) -> bool {
-        match field {
-            "0" => false,
-            "1" => true,
-            other => panic!("{other:?} is not a 0/1 column value"),
-        }
-    }
-
-    /// `-` is "unreadable"/"unset"; `~` is the literal empty string, which is a
-    /// different input from a missing one.
-    fn name_field(field: &str) -> Option<String> {
-        match field {
-            "-" => None,
-            "~" => Some(String::new()),
-            other => Some(other.to_owned()),
-        }
-    }
-
-    fn optional_field(field: &str) -> Option<String> {
-        match field {
-            "-" => None,
-            other => Some(other.to_owned()),
-        }
-    }
-
-    fn parse_policy(field: &str) -> Policy {
-        match field {
-            "skip_remote" => Policy::SkipRemote,
-            "skip_keyring" => Policy::SkipKeyring,
-            "threaded" => Policy::Threaded,
-            "sequential" => Policy::Sequential,
-            "precollected" => Policy::PreCollected,
-            other => panic!("{other:?} is not a known expected_policy"),
-        }
-    }
-
-    fn parse_row(line: &str) -> Row {
-        let fields: Vec<&str> = line.split(',').collect();
-        // A `why` containing a comma is a parse error, not a quoted field.
-        assert_eq!(
-            fields.len(),
-            10,
-            "row {line}: a field contains a comma (10 columns expected)"
-        );
-        Row {
-            id: fields[0].to_owned(),
-            service: optional_field(fields[1]),
-            exe: name_field(fields[2]),
-            comm: name_field(fields[3]),
-            env: optional_field(fields[4]),
-            tty: parse_bool(fields[5]),
-            expected_rule: fields[6].to_owned(),
-            expected_policy: parse_policy(fields[7]),
-            why: fields[8].to_owned(),
-            e2e: parse_bool(fields[9]),
-        }
-    }
-
-    fn rows() -> Vec<Row> {
-        let text =
-            std::fs::read_to_string(CORPUS_PATH).expect("the fixture corpus must be readable");
-        let header = text
-            .lines()
-            .next()
-            .expect("the fixture corpus has a header");
-        assert_eq!(header, HEADER, "the fixture corpus changed its schema");
-        let mut rows: Vec<Row> = text
-            .lines()
-            .skip(1)
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(parse_row)
-            .collect();
-        assert!(!rows.is_empty(), "the fixture corpus has no rows");
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-        rows
-    }
-
-    fn provenance(identity: &ProcessIdentity) -> Provenance {
-        match identity {
-            ProcessIdentity::Exe(_) => Provenance::Exe,
-            ProcessIdentity::Comm(_) => Provenance::Comm,
-            ProcessIdentity::Unknown => Provenance::Unknown,
-        }
-    }
-
-    /// The provenance the two identity columns imply: a non-empty `exe` wins,
-    /// otherwise a non-blank `comm`, otherwise nothing.
-    fn expected_provenance(row: &Row) -> Provenance {
-        if row.exe.as_deref().is_some_and(|exe| !exe.is_empty()) {
-            Provenance::Exe
-        } else if row
-            .comm
-            .as_deref()
-            .is_some_and(|comm| !comm.trim().is_empty())
-        {
-            Provenance::Comm
-        } else {
-            Provenance::Unknown
-        }
-    }
-
-    /// Today's decision path, in today's order: the display-manager bypass
-    /// first (`is_dm_service` and not a GDM reauthentication), then
-    /// `conversation_mode`.
-    ///
-    /// `is_gdm_reauth`'s environment read is replaced by the row's `env`
-    /// column — `GdmReauth::from_env` is that read's interpretation — because a
-    /// corpus reader cannot set a process-wide variable without racing the rest
-    /// of the test binary.
-    fn today_decision(row: &Row, process: Option<&str>, reauth: GdmReauth) -> Policy {
-        let service = row.service.as_deref();
-        let gdm_reauth = reauth == GdmReauth::Present
-            && service.is_some_and(|service| service.eq_ignore_ascii_case("gdm-password"));
-        if service.is_some_and(is_dm_service) && !gdm_reauth {
-            return Policy::SkipKeyring;
-        }
-        match conversation_mode(service.unwrap_or_default(), process, gdm_reauth) {
-            ConversationMode::Threaded => Policy::Threaded,
-            ConversationMode::Sequential => Policy::Sequential,
-            ConversationMode::PreCollected => Policy::PreCollected,
-        }
-    }
-
-    #[test]
-    fn corpus_characterises_the_decision_table() {
-        let rows = rows();
-
-        for row in &rows {
-            assert!(!row.why.is_empty(), "row {} has no justification", row.id);
-            assert!(
-                row.expected_rule.strip_prefix('R').is_some_and(|number| {
-                    number.parse::<u8>().is_ok_and(|n| (1..=10).contains(&n))
-                }),
-                "row {}: expected_rule {:?} is not R1..R10",
-                row.id,
-                row.expected_rule
-            );
-            // `/dev/tty` is only probed for a sequential conversation, so a
-            // host that never reaches that branch cannot carry a terminal.
-            assert!(
-                !row.tty || matches!(row.expected_policy, Policy::Sequential | Policy::Threaded),
-                "row {}: a pre-collected or skipped host has no terminal branch",
-                row.id
-            );
-            // A shape the shell harness must run needs a binary name to copy
-            // the harness to.
-            assert!(
-                !row.e2e || row.exe.is_some(),
-                "row {}: an e2e row must set its exe column",
-                row.id
-            );
-
-            let identity =
-                classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
-            assert_eq!(
-                provenance(&identity),
-                expected_provenance(row),
-                "row {}: exe {:?} / comm {:?} resolved to the wrong source",
-                row.id,
-                row.exe,
-                row.comm
-            );
-
-            let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
-            assert_eq!(
-                reauth == GdmReauth::Present,
-                row.env.is_some(),
-                "row {}: GDM_SESSION_FOR_REAUTH is presence-only, so {} is present",
-                row.id,
-                row.env.as_deref().unwrap_or("-")
-            );
-
-            assert_eq!(
-                today_decision(row, identity.name(), reauth),
-                row.expected_policy,
-                "row {} ({}): today's decision does not reproduce the corpus",
-                row.id,
-                row.why
-            );
-        }
-    }
-
-    /// `GDM_SESSION_FOR_REAUTH` is read for its *presence* only, so a set
-    /// variable holding `0` or `""` is as present as one holding `1`.
-    ///
-    /// The value is passed in, so this pins the interpretation without
-    /// `set_var` and without racing the rest of the binary; the read itself is
-    /// covered end to end by the `gdm-password login`/`reauth` e2e shapes.
-    #[test]
-    fn gdm_reauth_env_parsing() {
-        let cases: &[(Option<&OsStr>, GdmReauth)] = &[
-            (None, GdmReauth::Absent),
-            (Some(OsStr::new("")), GdmReauth::Present),
-            (Some(OsStr::new("0")), GdmReauth::Present),
-            (Some(OsStr::new("1")), GdmReauth::Present),
-        ];
-        for &(value, expected) in cases {
-            assert_eq!(GdmReauth::from_env(value), expected, "value {value:?}");
-        }
+fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> ConversationMode {
+    let process = match process {
+        Some(name) => crate::context::ProcessIdentity::Exe(name.into()),
+        None => crate::context::ProcessIdentity::Unknown,
+    };
+    let gdm_reauth = if reauth {
+        GdmReauth::Present
+    } else {
+        GdmReauth::Absent
+    };
+    let ctx = CallerContext::from_parts(Some(service), process, gdm_reauth);
+    match policy::conversation_mode_of(&ctx) {
+        policy::Conversation::Threaded => ConversationMode::Threaded,
+        policy::Conversation::Sequential => ConversationMode::Sequential,
+        policy::Conversation::PreCollected => ConversationMode::PreCollected,
     }
 }
