@@ -21,11 +21,33 @@
 //!
 //! ## Behavior
 //!
-//! Returns `PAM_SUCCESS` only when phone tap authentication succeeds. Every
-//! other outcome returns a real verdict — `PAM_PERM_DENIED` for an explicit
-//! phone denial, `PAM_AUTHINFO_UNAVAIL` when the service could not be consulted
-//! (no paired device, skip, timeout, daemon unreachable) and `PAM_AUTH_ERR` for
-//! a processing failure. It never returns `PAM_IGNORE`, which protects the
+//! Every path produces one `outcome::Outcome`, and `Outcome::to_pam` is the only
+//! conversion from a verdict to a code — `authenticate` maps the two arms of the
+//! transaction's result (`Finished::Concluded` and `Finished::Unrecorded`), and
+//! nothing else in the crate produces a `PAM_*` value except the six constant
+//! ABI sites named below:
+//!
+//! - `PAM_SUCCESS` — this call's daemon response was a phone tap, or a duplicate
+//!   answered from this process's 500 ms reuse record (a replay, which emits no
+//!   message)
+//! - `PAM_PERM_DENIED` — the phone explicitly denied the request
+//! - `PAM_AUTHINFO_UNAVAIL` — the service could not be consulted: no paired
+//!   device, the user skipped, the daemon timed out or was unreachable, the
+//!   conversation could not be driven, a display-manager login or a remote
+//!   caller was skipped, or a pre-collected host's own token was handed on
+//! - `PAM_AUTH_ERR` — a processing failure: the daemon reported an internal
+//!   error, the conversation lookup failed, the request id could not be
+//!   generated, or a local resource (pipe, thread) could not be created
+//! - `PAM_USER_UNKNOWN` — the username lookup failed
+//!
+//! The ABI surface is the exception, and it is exempt by name: `pam_sm_setcred`,
+//! `pam_sm_acct_mgmt`, `pam_sm_open_session`, `pam_sm_close_session` and
+//! `pam_sm_chauthtok` answer a non-authentication entry point with
+//! `PAM_SUCCESS`, and `guard`'s panic arm answers `PAM_AUTH_ERR`; none of them
+//! converts a verdict or sees an `Outcome`.
+//! (`only_outcome_rs_returns_pam_constants` asserts both halves.)
+//!
+//! It never returns `PAM_IGNORE`, which protects the
 //! `required` stack shape: there `PAM_IGNORE` is explicitly `ignore` while
 //! `PAM_AUTHINFO_UNAVAIL` is `bad`. On a `sufficient` line both codes are
 //! `ignore`, so a following `optional pam_permit` grants either way and only

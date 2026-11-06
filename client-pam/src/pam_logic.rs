@@ -832,15 +832,25 @@ fn run_threaded<T: IpcResponseReader>(
 ///
 /// ## Returns
 ///
-/// - `PAM_SUCCESS`: Authentication succeeded via TapAuth
+/// The orchestration returns a [`Finished`], whose two arms both carry an
+/// [`Outcome`]; `Outcome::to_pam` is the only conversion, and the `match` below
+/// is its only caller. Which reasons reach which code is the table in
+/// `Outcome::to_pam` / `Outcome::notice`, not a per-call decision here:
+///
+/// - `PAM_SUCCESS`: this call's daemon response was a phone tap, or a duplicate
+///   answered from this process's 500 ms reuse record (a replay, which records
+///   nothing and shows nothing)
 /// - `PAM_PERM_DENIED`: The user explicitly denied the request on the phone
 /// - `PAM_AUTHINFO_UNAVAIL`: The authentication service could not be consulted —
-///   no paired devices, the user skipped, the daemon is unreachable, or the
-///   attempt timed out. On a `sufficient` line (which expands to
+///   no paired devices, the user skipped, the daemon is unreachable, the
+///   attempt timed out, a display-manager login or a remote caller was skipped,
+///   or a pre-collected host's token was handed on. On a `sufficient` line
+///   (which expands to
 ///   `[success=done new_authtok_reqd=done default=ignore]`) this still falls
 ///   through to the next module, so password fallback is preserved
-/// - `PAM_AUTH_ERR`: This attempt failed while being processed — a local
-///   processing failure, or the daemon reported an internal error
+/// - `PAM_AUTH_ERR`: This attempt failed while being processed — the daemon
+///   reported an internal error, the conversation lookup failed, the request id
+///   could not be generated, or a local resource could not be created
 /// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
 ///
 /// `PAM_IGNORE` is deliberately never returned.  Linux-PAM records no failure
@@ -1162,7 +1172,7 @@ where
             tracing::debug!(
                 username = %username,
                 service = %service_name,
-                code = recorded.clone().to_pam(),
+                outcome = ?recorded,
                 age_ms = age.as_millis(),
                 "Replaying the concluded verdict for a duplicate transaction"
             );
@@ -2777,6 +2787,345 @@ mod tests {
             return (None, i);
         }
         (digits.parse::<u128>().ok(), i)
+    }
+
+    // ------------------------------------------------------------------
+    // The two scans step 4d turns on: no PAM code outside `outcome.rs`, and
+    // no grant outside the two constructors.
+    // ------------------------------------------------------------------
+
+    /// Every `client-pam/src/**/*.rs`, sorted, so a new module cannot be added
+    /// and stay outside the scans.
+    ///
+    /// Recursive: `src/mechanism/` is a directory with no `rs` extension, so a
+    /// single-level `read_dir` would silently stop covering the mechanisms once
+    /// step 6 creates them.
+    fn source_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut paths: Vec<std::path::PathBuf> = entries
+                .map(|entry| entry.expect("readable dir entry").path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        walk(src, &mut files);
+        files.sort();
+        files
+    }
+
+    /// A source file's path relative to `src`, e.g. `outcome.rs` or
+    /// `mechanism/threaded.rs`. Every exemption below is written against this,
+    /// never against a bare file name.
+    fn relative_to_src(path: &std::path::Path) -> String {
+        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        path.strip_prefix(src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The production half of a source file: everything before the first
+    /// `#[cfg(test)]`.
+    ///
+    /// The tests below quote every forbidden token, so scanning the whole file
+    /// would flag the assertions instead of the code.
+    fn production_source(path: &std::path::Path) -> String {
+        let source = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source.as_str());
+        stripped_source(production)
+    }
+
+    /// `pam_sys` constants that are not return codes: they name an item type, so
+    /// a line holding one is an argument (`pam_get_authtok(.., PAM_AUTHTOK, ..)`,
+    /// which rustfmt may put on its own line), never a verdict.
+    const NON_CODE_PAM_CONSTANTS: [&str; 1] = ["pam_sys::PAM_AUTHTOK"];
+
+    /// The `pam_sys::PAM_*` values this crate returns, as `(byte offset, line)`.
+    ///
+    /// A site is a line of the *stripped* source that either returns one
+    /// (`return pam_sys::PAM_X`) or is a bare code in tail position
+    /// (`pam_sys::PAM_X` / `pam_sys::PAM_X,` — a match arm or a function tail).
+    /// Comparisons and arguments (`res != pam_sys::PAM_SUCCESS`,
+    /// `pam_get_authtok(.., pam_sys::PAM_AUTHTOK, ..)`) are not sites: they
+    /// consume a code, they do not produce one.
+    fn pam_code_sites(cleaned: &str) -> Vec<(usize, String)> {
+        let mut hits = Vec::new();
+        let mut offset = 0usize;
+        for line in cleaned.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("pam_sys::PAM_") {
+                let bare_token = trimmed.trim_end_matches([',', ';']).trim();
+                let bare = !NON_CODE_PAM_CONSTANTS.contains(&bare_token)
+                    && bare_token
+                        .strip_prefix("pam_sys::PAM_")
+                        .is_some_and(|rest| {
+                            !rest.is_empty()
+                                && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        });
+                if trimmed.contains("return ") || bare {
+                    hits.push((offset, trimmed.to_owned()));
+                }
+            }
+            offset += line.len() + 1;
+        }
+        hits
+    }
+
+    /// The name of the function whose body contains `at`, as written.
+    ///
+    /// Used only for the `lib.rs` exemption, which names the six ABI functions
+    /// (`guard`'s panic arm and the five constant stubs) — never a line number,
+    /// so an edit above them cannot silently move the exemption.
+    fn enclosing_fn(cleaned: &str, at: usize) -> Option<String> {
+        let before = cleaned.get(..at)?;
+        let start = before.rfind("fn ")? + "fn ".len();
+        let name: String = before[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The `lib.rs` functions allowed to answer with a constant: the five
+    /// constant ABI stubs and `guard`'s panic arm.
+    ///
+    /// These are the whole ABI surface: they convert no verdict, never see an
+    /// `Outcome`, and are not part of any authentication decision.
+    const LIB_PAM_EXEMPTIONS: [&str; 6] = [
+        "guard",
+        "pam_sm_setcred",
+        "pam_sm_acct_mgmt",
+        "pam_sm_open_session",
+        "pam_sm_close_session",
+        "pam_sm_chauthtok",
+    ];
+
+    /// No `pam_sys::PAM_*` value is produced outside `outcome.rs`, except the
+    /// six `lib.rs` ABI sites named above.
+    ///
+    /// The defect this catches: a return code minted at the site that observed
+    /// the failure instead of through `Outcome::to_pam` — the 24 `pam_logic.rs`
+    /// sites this step removes. Such a site can return `PAM_SUCCESS`, can return
+    /// a code the verdict does not imply, and adds a path no outcome test
+    /// covers. The exemption is by *function name* and the scan asserts it
+    /// covered `outcome.rs` (by path) and `lib.rs`, so a moved or emptied scan
+    /// cannot pass vacuously.
+    #[test]
+    fn only_outcome_rs_returns_pam_constants() {
+        let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        for required in ["outcome.rs", "lib.rs", "pam_logic.rs", "transaction.rs"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
+
+        let mut findings: Vec<String> = Vec::new();
+        let mut exempted = 0usize;
+        for path in &files {
+            let rel = relative_to_src(path);
+            // Exempt by path, not by file name: a future `mechanism/outcome.rs`
+            // must not inherit this file's exemption.
+            if rel == "outcome.rs" {
+                continue;
+            }
+            let cleaned = production_source(path);
+            for (offset, text) in pam_code_sites(&cleaned) {
+                if rel == "lib.rs" {
+                    let enclosing = enclosing_fn(&cleaned, offset).unwrap_or_default();
+                    if LIB_PAM_EXEMPTIONS.contains(&enclosing.as_str()) {
+                        exempted += 1;
+                        continue;
+                    }
+                }
+                findings.push(format!("{rel}: {text}"));
+            }
+        }
+
+        assert!(
+            findings.is_empty(),
+            "every PAM code must come from `Outcome::to_pam`, found:\n{}",
+            findings.join("\n")
+        );
+        assert_eq!(
+            exempted, 6,
+            "the six `lib.rs` ABI sites (guard's panic arm and the five constant \
+             stubs) are the only exemption; found {exempted}"
+        );
+    }
+
+    /// The grant constructors, and any hand-built `Outcome::Granted`, as
+    /// findings for the file `rel`.
+    ///
+    /// `outcome.rs` is where both constructors are defined, and the
+    /// orchestration (`pam_logic.rs` now, `transaction.rs` once the cache moves
+    /// there) is the only code allowed to call them. A mechanism, a rule, a
+    /// plan or a test helper calling either — or building `Outcome::Granted`
+    /// by hand — is a second way to mint a grant.
+    fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
+        let mut findings = Vec::new();
+        for (line, text) in identifier_hits(cleaned, "granted_from_daemon")
+            .into_iter()
+            .chain(identifier_hits(cleaned, "replayed"))
+            .chain(identifier_hits(cleaned, "Granted"))
+        {
+            let call = text.contains("granted_from_daemon")
+                || text.contains("Outcome::replayed")
+                || text.contains("fn replayed");
+            let allowed = match rel {
+                "outcome.rs" => true,
+                "pam_logic.rs" | "transaction.rs" => call,
+                _ => false,
+            };
+            if !allowed {
+                findings.push(format!("{rel}:{line}: {text}"));
+            }
+        }
+        findings
+    }
+
+    /// A `Granted` is minted only by `Outcome::granted_from_daemon` or
+    /// `Outcome::replayed`, from the orchestration, and nowhere else.
+    ///
+    /// The defect this catches: a mechanism (or anything else outside the
+    /// orchestration) building `Outcome::Granted(..)` directly, or calling one
+    /// of the two constructors, which would be a second grant path beside the
+    /// daemon's `Success` and the replay. The retired check — "the token
+    /// `Outcome::Granted` appears only in `outcome.rs`" — is not used: it
+    /// passes for the very code that defines the constructors, so it cannot
+    /// catch a grant minted inside that module or reached from a mechanism.
+    #[test]
+    fn granted_only_from_daemon() {
+        let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        for required in ["outcome.rs", "pam_logic.rs", "transaction.rs"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
+
+        let mut findings: Vec<String> = Vec::new();
+        let mut definitions = 0usize;
+        for path in &files {
+            let rel = relative_to_src(path);
+            let cleaned = production_source(path);
+            if rel == "outcome.rs" {
+                definitions += cleaned.matches("fn granted_from_daemon").count();
+                definitions += cleaned.matches("fn replayed").count();
+                continue;
+            }
+            findings.extend(grant_findings(&rel, &cleaned));
+        }
+
+        assert!(
+            findings.is_empty(),
+            "only the orchestration may reach a grant constructor, and only \
+             `outcome.rs` may build a `Granted`:\n{}",
+            findings.join("\n")
+        );
+        assert_eq!(
+            definitions, 2,
+            "the two grant constructors — granted_from_daemon and replayed — are \
+             defined once, in outcome.rs"
+        );
+    }
+
+    /// The `PAM_*` return-site detector fires on a planted return and on a
+    /// planted bare arm, and not on a comparison or on prose.
+    ///
+    /// Without this, a detector that stopped matching would make
+    /// `only_outcome_rs_returns_pam_constants` pass for every tree.
+    #[test]
+    fn pam_return_scan_detects_a_planted_return() {
+        let planted = stripped_source(
+            "fn returns_one() -> c_int {\n    return pam_sys::PAM_AUTH_ERR;\n}\n\
+             fn tail_position() -> c_int {\n    pam_sys::PAM_SUCCESS\n}\n\
+             fn compares_one(res: c_int) -> c_int {\n    if res != pam_sys::PAM_SUCCESS {}\n    0\n}\n",
+        );
+        let sites = pam_code_sites(&planted);
+        assert_eq!(
+            sites.len(),
+            2,
+            "the detector must report the return and the tail expression, and \
+             not the comparison: {sites:?}"
+        );
+        assert_eq!(
+            enclosing_fn(&planted, sites[0].0).as_deref(),
+            Some("returns_one"),
+            "the exemption is by enclosing function name"
+        );
+        assert_eq!(
+            enclosing_fn(&planted, sites[1].0).as_deref(),
+            Some("tail_position")
+        );
+
+        // Prose is not a site, which is what makes the whole-crate assertion
+        // meaningful: this file's docs name the forbidden codes.
+        let prose = stripped_source(
+            "// return pam_sys::PAM_AUTH_ERR;\nlet s = \"return pam_sys::PAM_SUCCESS;\";\n",
+        );
+        assert!(pam_code_sites(&prose).is_empty());
+
+        // An item type is not a verdict, even alone on its line: the whole-crate
+        // scan would otherwise report `pam_get_authtok`'s argument.
+        let item = stripped_source(
+            "pam_get_authtok(\n    pamh,\n    pam_sys::PAM_AUTHTOK,\n    &mut tok,\n);\n",
+        );
+        assert!(
+            pam_code_sites(&item).is_empty(),
+            "an item-type constant is not a return code"
+        );
+    }
+
+    /// The grant detector reports a hand-built `Granted` and a constructor call
+    /// from a mechanism, and accepts `outcome.rs` and the orchestration.
+    ///
+    /// Without this, `granted_only_from_daemon` would pass for a tree in which
+    /// the detector had stopped matching.
+    #[test]
+    fn granted_scan_detects_a_planted_construction() {
+        let planted = stripped_source(
+            "fn drive() -> Outcome {\n    Outcome::Granted(GrantVia::PhoneTap)\n}\n\
+             fn other() -> Outcome {\n    Outcome::granted_from_daemon()\n}\n",
+        );
+
+        let mechanism = grant_findings("mechanism/threaded.rs", &planted);
+        assert_eq!(
+            mechanism.len(),
+            2,
+            "a mechanism must not build a grant or call a grant constructor: {mechanism:?}"
+        );
+
+        let orchestration = grant_findings("pam_logic.rs", &planted);
+        assert_eq!(
+            orchestration.len(),
+            1,
+            "the orchestration may call the constructor but may not build a \
+             `Granted` by hand: {orchestration:?}"
+        );
+        assert!(orchestration[0].contains("Outcome::Granted"));
+
+        assert!(
+            grant_findings("outcome.rs", &planted).is_empty(),
+            "outcome.rs defines both constructors, so it is exempt by path"
+        );
     }
 
     /// The mapping above only covers daemon responses.  Guard *every* file of
