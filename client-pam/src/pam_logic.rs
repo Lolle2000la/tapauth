@@ -660,6 +660,103 @@ mod tests {
         );
     }
 
+    /// The conversation lookups a skip must not perform, counted separately from
+    /// `counting_io` so the two tests cannot race on one static.
+    static SKIP_CONVERSATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn skip_conversation(
+        _pamh: *mut pam_sys::PamHandle,
+    ) -> Result<pam_sys::PamConversation<'static>, c_int> {
+        SKIP_CONVERSATION_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(unsafe { pam_sys::PamConversation::dummy() })
+    }
+
+    fn skip_io() -> OrchestrationIo {
+        unsafe fn user(_pamh: *mut pam_sys::PamHandle) -> Result<String, c_int> {
+            Ok("skip-test-user".to_owned())
+        }
+        OrchestrationIo {
+            load_config: zero_timeouts,
+            get_user: user,
+            new_conversation: skip_conversation,
+            load_messages: |_username| pam_messages::load_for_user("skip-test-user"),
+        }
+    }
+
+    /// A skip never reaches the handoff.
+    ///
+    /// The two no-daemon paths are not one category: R1 and R2 skip the handle
+    /// entirely (no plan, no deadline, no conversation), while R8's pre-collected
+    /// handoff *must* touch it — it calls `pam_get_authtok` on the calling thread
+    /// and leaves `PAM_AUTHTOK` for the next module. The defect this catches: a
+    /// skip routed through the participation path, so a display-manager login or
+    /// a remote call reads the token (and answers `PasswordHandoff` instead of
+    /// its own reason).
+    ///
+    /// What is asserted, and why it is enough: the conversation is never looked
+    /// up, so `HostIo` is never built, so `transaction::run` is never entered, so
+    /// `mechanism::handoff::perform` — whose only caller is `run`'s
+    /// pre-collected arm — cannot have run. A `pam_get_authtok` call counter
+    /// would need an injection seam the handoff does not have; the structural
+    /// argument is what stands in for it, and the returned reason (never
+    /// `PasswordHandoff`) is the observable half.
+    #[test]
+    fn skip_never_hands_off() {
+        for (service, process, expected) in [
+            (
+                "sddm",
+                "sh",
+                crate::outcome::UnavailableReason::KeyringBypass,
+            ),
+            (
+                "sshd",
+                "sshd",
+                crate::outcome::UnavailableReason::RemoteAuthentication,
+            ),
+        ] {
+            SKIP_CONVERSATION_CALLS.store(0, Ordering::SeqCst);
+            let connects = AtomicUsize::new(0);
+            let sends = AtomicUsize::new(0);
+
+            let finished = orchestrate(
+                std::ptr::null_mut(),
+                &context(Some(service), Some(process)),
+                &skip_io(),
+                || {
+                    connects.fetch_add(1, Ordering::SeqCst);
+                    Err::<NullIpc, _>(no_daemon())
+                },
+                |_: &mut NullIpc, _: &SendParams<'_>| {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_, _| {},
+            );
+
+            assert_eq!(
+                SKIP_CONVERSATION_CALLS.load(Ordering::SeqCst),
+                0,
+                "service {service}: a skip must not look up a conversation, which is \
+                 what keeps `pam_get_authtok` out of its reach"
+            );
+            assert_eq!(
+                connects.load(Ordering::SeqCst),
+                0,
+                "service {service}: a skip must not dial the daemon"
+            );
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                0,
+                "service {service}: a skip must put no request on the wire"
+            );
+            assert_eq!(
+                finished.outcome(),
+                &Outcome::Unavailable(expected),
+                "service {service}: a skip keeps its own reason and never hands off"
+            );
+        }
+    }
+
     /// `PAM_SERVICE` is read at exactly one call site, in `CallerContext::capture`.
     ///
     /// The defect this catches: a second `pam_sys::get_service_name(pamh)` call

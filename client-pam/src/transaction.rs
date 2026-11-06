@@ -208,6 +208,7 @@ impl<I: IpcResponseReader> Armed<I> {
 /// `pthread_create`), which must keep returning `PAM_AUTH_ERR` and must keep
 /// being recorded. The response is owned, because a mechanism cannot return a
 /// borrow of its own local.
+#[derive(Debug)]
 pub(crate) enum MechanismEnd {
     Response(shared::ipc::pb::PamAuthenticateResponse),
     Reason(UnavailableReason),
@@ -1511,6 +1512,159 @@ pub(crate) mod tests {
         panic!(
             "the reuse record was replaced by a concurrent test before every one of 64 \
              attempts, so the cache-hit path was never observed"
+        );
+    }
+    // ------------------------------------------------------------------
+    // The transaction's own ordering guarantees: the announcements and the
+    // pre-collected arm.
+    // ------------------------------------------------------------------
+
+    /// What `run` showed, in order, with the point the request went on the wire
+    /// marked.
+    ///
+    /// The recording host is the only way an announcement can be observed
+    /// without a real PAM handle; `send` runs inside `Armed::open`, so its mark
+    /// is the request's position in the same log.
+    fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<String> {
+        const OPEN: &str = "Armed::open";
+        let msgs = PamMessages::new("en");
+        let log: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log);
+        let participation = participation_for(ctx);
+        let _finished = run(
+            ctx,
+            "announcement-order-user",
+            &participation,
+            &mut host,
+            &zero_timeouts(),
+            || tty.and_then(|path| std::fs::File::open(path).ok()),
+            || Ok(NullIpc),
+            |_: &mut NullIpc, _: &SendParams<'_>| {
+                log.borrow_mut().push(OPEN.to_owned());
+                Ok(())
+            },
+            |_, _| {},
+        );
+        log.into_inner()
+    }
+
+    /// The position of `needle` in `log`, which must appear exactly once.
+    fn once(log: &[String], needle: &str) -> usize {
+        let hits: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.as_str() == needle)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{needle:?} must be shown exactly once: {log:?}"
+        );
+        hits.first().copied().unwrap_or_default()
+    }
+
+    /// The three announcements keep the ordering they have today.
+    ///
+    /// The defect this catches: `Wait`/`WaitSkipHint` emitted *after* the
+    /// request — so a host whose conversation has to reveal the password entry
+    /// before it can answer never sees the message in time — or
+    /// `WaitThenPassword` emitted *before* it, which is the opposite failure on
+    /// the one host shape that needs it after: an event-loop host must already
+    /// be blocked when the message arrives, which is why today's code emits it
+    /// between the send and the blocking wait. This replaces `S4`
+    /// (`test_sequential_wait_is_announced_before_it_blocks`), which could only
+    /// compare two source byte offsets and had to name a call that no longer
+    /// exists.
+    #[test]
+    fn announcement_order_matches_today() {
+        const OPEN: &str = "Armed::open";
+        let msgs = PamMessages::new("en");
+
+        // Threaded: `waiting_for_tap` before the request.
+        let log = shown_order(&context(Some("order-threaded"), Some("hyprlock")), None);
+        assert!(
+            once(&log, msgs.waiting_for_tap()) < once(&log, OPEN),
+            "the threaded wait is announced before the request: {log:?}"
+        );
+
+        // Terminal: `waiting_for_tap_skip` before the request.
+        let log = shown_order(
+            &context(Some("order-terminal"), Some("xfce4-screensaver-dialog")),
+            Some("/dev/null"),
+        );
+        assert!(
+            once(&log, msgs.waiting_for_tap_skip()) < once(&log, OPEN),
+            "the terminal wait is announced before the request: {log:?}"
+        );
+
+        // No-terminal sequential: `waiting_for_tap_password` *after* it.
+        let log = shown_order(
+            &context(
+                Some("order-gui-sequential"),
+                Some("xfce4-screensaver-dialog"),
+            ),
+            None,
+        );
+        assert!(
+            once(&log, msgs.waiting_for_tap_password()) > once(&log, OPEN),
+            "the password-route announcement follows the request, once the \
+             module is about to block: {log:?}"
+        );
+    }
+
+    /// A pre-collected participation neither probes nor plans.
+    ///
+    /// The defect this catches: the handoff placed after the probe, the cache
+    /// lookup or the request — which would open `/dev/tty` for a host that never
+    /// uses it, consult the reuse record for a transaction that never happened,
+    /// or, worst, ring the phone for a user who already chose the password
+    /// route. The probe would return a terminal here, so a probe count of zero
+    /// is a real assertion rather than a check that the file was missing.
+    #[test]
+    fn precollected_never_plans() {
+        let ctx = context(Some("swaylock"), Some("swaylock"));
+        let participation = participation_for(&ctx);
+        assert_eq!(
+            participation.conversation,
+            Conversation::PreCollected,
+            "swaylock is the pre-collected rule's host"
+        );
+
+        let msgs = PamMessages::new("en");
+        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs);
+        let mut probes = 0usize;
+        let connects = std::cell::Cell::new(0usize);
+        let finished = run(
+            &ctx,
+            "precollected-user",
+            &participation,
+            &mut host,
+            &zero_timeouts(),
+            || {
+                probes += 1;
+                std::fs::File::open("/dev/null").ok()
+            },
+            || {
+                connects.set(connects.get() + 1);
+                Err::<NullIpc, _>(no_daemon())
+            },
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            |_, _| {},
+        );
+
+        assert_eq!(probes, 0, "a pre-collected host must not open /dev/tty");
+        assert_eq!(connects.get(), 0, "a pre-collected host must not dial");
+        assert!(
+            matches!(
+                &finished,
+                Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::PasswordHandoff))
+            ),
+            "the handoff is an unrecorded PasswordHandoff verdict"
+        );
+        assert_eq!(
+            finished.outcome().clone().to_pam(),
+            crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
     }
 }
