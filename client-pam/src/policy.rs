@@ -191,7 +191,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "a grant without PAM_AUTHTOK breaks pam_kwallet6/pam_gnome_keyring auto-unlock",
         evidence: &[
             "client-pam/src/policy.rs:369",
-            "client-pam/src/pam_logic.rs:1350",
+            "client-pam/src/pam_logic.rs:436",
         ],
         predicate: dm_login_bypass,
         decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
@@ -216,7 +216,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "the conversation is a plain fd fed by the separate agent process",
         evidence: &[
             "client-pam/src/policy.rs:393",
-            "client-pam/src/pam_logic.rs:287",
+            "client-pam/src/mechanism/threaded.rs:190",
         ],
         predicate: polkit_agent,
         decision: Decision::Participate(Conversation::Threaded),
@@ -229,7 +229,7 @@ pub(crate) static RULES: [Rule; 10] = [
               and kscreenlocker_greet stays sequential",
         evidence: &[
             "client-pam/src/policy.rs:401",
-            "client-pam/src/pam_logic.rs:288",
+            "client-pam/src/mechanism/threaded.rs:191",
         ],
         predicate: kscreenlocker_worker,
         decision: Decision::Participate(Conversation::Threaded),
@@ -242,7 +242,7 @@ pub(crate) static RULES: [Rule; 10] = [
               accepted with an unsynchronised resetConversation/checkWaiting",
         evidence: &[
             "client-pam/src/policy.rs:409",
-            "client-pam/src/pam_logic.rs:285",
+            "client-pam/src/mechanism/threaded.rs:188",
         ],
         predicate: hyprlock,
         decision: Decision::Participate(Conversation::Threaded),
@@ -255,7 +255,7 @@ pub(crate) static RULES: [Rule; 10] = [
               re-run the module up to three times",
         evidence: &[
             "client-pam/src/policy.rs:414",
-            "client-pam/src/pam_logic.rs:286",
+            "client-pam/src/mechanism/threaded.rs:189",
         ],
         predicate: xsecurelock,
         decision: Decision::Participate(Conversation::Threaded),
@@ -268,7 +268,7 @@ pub(crate) static RULES: [Rule; 10] = [
               auth.c:61, i3lock.c:836), so the phone must not be rung",
         evidence: &[
             "client-pam/src/policy.rs:419",
-            "client-pam/src/pam_logic.rs:294",
+            "client-pam/src/mechanism/threaded.rs:197",
         ],
         predicate: precollected_locks,
         decision: Decision::Participate(Conversation::PreCollected),
@@ -294,7 +294,7 @@ pub(crate) static RULES: [Rule; 10] = [
               deadlock, at the cost of the shorter GUI timeout",
         evidence: &[
             "client-pam/src/policy.rs:437",
-            "client-pam/src/pam_logic.rs:302",
+            "client-pam/src/mechanism/threaded.rs:205",
         ],
         predicate: default_sequential,
         decision: Decision::Participate(Conversation::Sequential),

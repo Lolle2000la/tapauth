@@ -62,6 +62,7 @@ mod config;
 mod context;
 mod ipc_client;
 mod logging;
+mod mechanism;
 mod outcome;
 mod pam_logic;
 mod pam_messages;

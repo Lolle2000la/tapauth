@@ -39,18 +39,12 @@ use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
 use crate::logging;
-use crate::outcome::{ErrorReason, Outcome, UnavailableReason};
+use crate::outcome::Outcome;
 use crate::pam_messages;
 use crate::pam_sys;
-use crate::plan::{Announcement, Plannable, TtyUse};
 use crate::policy;
-use crate::transaction::{Armed, Finished, StartError};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use crate::transaction::{Finished, HostIo, SendParams};
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // The terminal flow below uses a single-threaded poll loop over the IPC
@@ -65,7 +59,7 @@ use std::time::{Duration, Instant};
 //   answered by Qt's `QDBusConnectionManager` daemon thread, not by the thread
 //   that called `pam_authenticate`.  A native POSIX thread collects the
 //   password while the main thread waits for the phone, and the main loop
-//   multiplexes the IPC socket and a self-pipe (`run_gui_event_loop`).
+//   multiplexes the IPC socket and a self-pipe (`mechanism::threaded`).
 //
 // * PreCollected (`swaylock`, `gtklock`, `i3lock`): the host reads the
 //   password *before* calling `pam_authenticate` and its conversation is a
@@ -83,7 +77,7 @@ use std::time::{Duration, Instant};
 //   the conversation from a second thread, which older kscreenlocker cannot
 //   answer because it posts the reply to the blocked thread) deadlocks the
 //   host, so the main thread simply waits for the daemon on its own and never
-//   *drives* the conversation (`run_sequential_event_loop`).
+//   *drives* the conversation (`mechanism::sequential`).
 //   The one exception is a single non-blocking `PAM_TEXT_INFO` announcement
 //   emitted immediately before the wait begins: it is one conversation round
 //   trip that carries no input, and host event loops need it in order to
@@ -95,504 +89,10 @@ use std::time::{Duration, Instant};
 //
 // The native password thread used by the threaded variant uses no Drop-bearing
 // Rust types so that pthread_cancel is safe.
-
-/// How the PAM conversation of the calling host may be driven.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConversationMode {
-    /// The conversation may run on a background thread while the calling
-    /// thread waits for the daemon.
-    Threaded,
-    /// The host collected the password before calling `pam_authenticate` and
-    /// its conversation only replays it.  The module collects the token on the
-    /// calling thread and hands over without contacting the daemon.
-    PreCollected,
-    /// The conversation must be left to the calling thread/host event loop.
-    Sequential,
-}
-
-/// Reason the GUI authentication loop exited.  Prevents the "timed out"
-/// message from being displayed on top of an explicit IPC error message.
-#[derive(Debug, PartialEq, Eq)]
-enum ExitReason {
-    Timeout,
-    IpcResponseReceived,
-    IpcError,
-    PasswordEntered,
-    PasswordFailed,
-}
-
-/// Context passed to the raw POSIX worker thread.
-///
-/// # Safety
-///
-/// This lives on the main thread's stack.  The main thread strictly blocks on
-/// `pthread_join` before the context goes out of scope, so the worker thread's
-/// reference to it is valid for the entire worker lifetime.  No `Drop`-bearing
-/// types are placed on the worker's stack frame, making `pthread_cancel` safe.
-struct ThreadContext {
-    pamh: *mut pam_sys::PamHandle,
-    password_entered: AtomicBool,
-    /// Write end of the self-pipe.  The worker writes a single byte here on
-    /// any exit path (success, failure, or dialog dismissal) to instantly
-    /// unblock the main loop's poll set.
-    pipe_write_fd: std::os::raw::c_int,
-}
-
-/// Raw background worker using the `C-unwind` ABI so that glibc's forced
-/// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
-/// can pass through this frame without aborting the process.
-///
-/// Always writes to the self-pipe on natural completion.  When the thread
-/// is cancelled via `pthread_cancel`, the forced unwind intercepts
-/// execution inside `pam_get_authtok` and the write is cleanly bypassed.
-unsafe extern "C-unwind" fn native_password_worker(
-    arg: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-    let ctx = unsafe { &*(arg as *const ThreadContext) };
-    let mut authtok: *const std::os::raw::c_char = std::ptr::null();
-
-    // SAFETY: ctx is valid because the main thread guarantees it outlives
-    // this worker via pthread_join.
-    let res = unsafe {
-        pam_sys::pam_get_authtok(
-            ctx.pamh,
-            pam_sys::PAM_AUTHTOK,
-            &mut authtok,
-            std::ptr::null(),
-        )
-    };
-
-    if res == pam_sys::PAM_SUCCESS && !authtok.is_null() {
-        ctx.password_entered.store(true, Ordering::Release);
-    }
-
-    // Unconditional write: notifies the main thread that the worker exited
-    // regardless of whether a password was collected or the dialog was
-    // cancelled.  Without this, cancel/poll-hang would force the full
-    // timeout.
-    //
-    // glibc's `write` is a cancellation point, so a `pthread_cancel` delivered
-    // inside it would throw `abi::__forced_unwind` through this call frame.
-    // `pam_get_authtok` above needs the `C-unwind` ABI for that, but the
-    // runtime `write` symbol must keep its canonical `extern "C"` signature:
-    // re-declaring it with a different ABI is what rustc's
-    // `invalid_runtime_symbol_definitions` rejects, and a mismatched runtime
-    // declaration risks UB.  Use the bare `write` syscall instead — the
-    // cancellation machinery lives in glibc's `write` wrapper, so the raw
-    // syscall is not a cancellation point and cannot unwind.
-    let dummy: [u8; 1] = [1];
-    loop {
-        let written = unsafe {
-            libc::syscall(
-                libc::SYS_write,
-                ctx.pipe_write_fd,
-                dummy.as_ptr() as *const std::os::raw::c_void,
-                1usize,
-            ) as isize
-        };
-        if written >= 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error().raw_os_error();
-        if err != Some(libc::EINTR) {
-            break;
-        }
-    }
-
-    std::ptr::null_mut()
-}
-
-/// Cancel (optionally) and reap the native password worker.
-///
-/// # Why the join is load-bearing
-///
-/// 1. Stack safety: `ThreadContext` lives on the caller's stack, so the worker
-///    must be gone before that frame is popped.
-/// 2. libpam ownership: `pamh` is a plain, unlocked struct and the libpam
-///    state the conversation depends on (`caller_is`) is process-global.  If
-///    the calling thread re-entered libpam — another `conv` call, a
-///    `pam_get_item`, or simply the return from `pam_authenticate` — while the
-///    worker could still be inside `pam_get_authtok`, the two would race on
-///    unsynchronised libpam state.  The join is what orders them, so it runs on
-///    every non-panicking path, including the ones where the worker is expected
-///    to have exited already.
-///
-/// A panic between the `pthread_create` and this join unwinds past the frame
-/// that holds `ThreadContext` without reaping the worker.  That pre-existing
-/// gap is not addressed by this change — closing it would need a drop guard —
-/// and `guard()` (`lib.rs`) only converts the panic into `PAM_AUTH_ERR`.
-///
-/// # Safety
-///
-/// `pthread_id` must be a live, joinable thread created by this module, and
-/// this must be its only join.
-unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
-    // NOTE: pthread_cancel carries a theoretical risk of deadlocking the parent
-    // process if the cancellation signal arrives while the worker holds an
-    // internal libc lock (e.g. inside a malloc arena entered by
-    // pam_get_authtok).  This is an accepted architectural trade-off; fully
-    // isolating the conversation pipe would require a separate helper process,
-    // as Howdy does with its Python subprocess.
-    if cancel {
-        let cancel_res = unsafe { libc::pthread_cancel(pthread_id) };
-        // ESRCH is benign: the thread already exited naturally during a race
-        // between password entry and the phone tap response.
-        if cancel_res != 0 && cancel_res != libc::ESRCH {
-            let err = std::io::Error::from_raw_os_error(cancel_res);
-            tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
-        }
-    }
-
-    // SAFETY: if pthread_join fails the worker thread may still be running with
-    // a dangling reference into the caller's stack frame.  Aborting is the only
-    // safe response.
-    let join_res = unsafe { libc::pthread_join(pthread_id, std::ptr::null_mut()) };
-    if join_res != 0 {
-        let err = std::io::Error::from_raw_os_error(join_res);
-        tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
-        std::process::abort();
-    }
-}
-
-/// Central event loop for the graphical authentication flow.
-///
-/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns an
-/// `ExitReason` plus whichever side-channel data was collected (the daemon
-/// response, or the reason the IPC side failed).  Extracted from the main
-/// authentication body so the multiplexing logic can be unit-tested
-/// independently.
-///
-/// The out-parameter is a *reason*, not a message: which text and which style
-/// the failure shows is decided once, by `Outcome::notice`, so the loop cannot
-/// pick a different string from the terminal loop for the same failure.
-#[allow(clippy::too_many_arguments)]
-fn run_gui_event_loop<T: IpcResponseReader>(
-    ipc: &mut T,
-    pipe_read: libc::c_int,
-    deadline: Instant,
-    ctx: &ThreadContext,
-    request_id: &str,
-    auth_response: &mut Option<shared::ipc::pb::PamAuthenticateResponse>,
-    pending: &mut Option<UnavailableReason>,
-) -> ExitReason {
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return ExitReason::Timeout;
-        }
-
-        let remain = deadline
-            .checked_duration_since(now)
-            .unwrap_or(Duration::ZERO);
-        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
-        let mut fds = [
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                PollFlags::POLLIN,
-            ),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(pipe_read) },
-                PollFlags::POLLIN,
-            ),
-        ];
-
-        match poll(&mut fds, timeout) {
-            Ok(0) => continue,
-            Ok(_) => {
-                // Priority: user password submission takes absolute
-                // precedence over any concurrent daemon response, so the
-                // user is never locked out of the password fallback.
-                if ctx.password_entered.load(Ordering::Acquire) {
-                    tracing::info!(
-                        "Password entered via Polkit agent. Cancelling TapAuth transaction."
-                    );
-                    let _ = ipc.send_cancel("gui-password-skip", request_id);
-                    return ExitReason::PasswordEntered;
-                }
-
-                // Daemon IPC connection
-                if let Some(rev) = fds[0].revents() {
-                    if rev.contains(PollFlags::POLLIN) {
-                        match ipc.try_read_response_nonblocking() {
-                            Ok(Some(resp)) => {
-                                *auth_response = Some(resp);
-                                return ExitReason::IpcResponseReceived;
-                            }
-                            Ok(None) => {
-                                if rev.contains(PollFlags::POLLHUP)
-                                    || rev.contains(PollFlags::POLLERR)
-                                {
-                                    tracing::error!(
-                                        "Daemon closed connection before sending response"
-                                    );
-                                    *pending = Some(UnavailableReason::IpcConnectionLost);
-                                    return ExitReason::IpcError;
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::error!("IPC read failed: {e}");
-                                *pending = Some(UnavailableReason::IpcLoopError);
-                                return ExitReason::IpcError;
-                            }
-                        }
-                    } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
-                        tracing::error!("Daemon closed connection or error detected");
-                        *pending = Some(UnavailableReason::IpcConnectionLost);
-                        return ExitReason::IpcError;
-                    }
-                }
-
-                // Self-pipe: since password_entered was already checked,
-                // readability here means the dialog was dismissed.
-                if let Some(rev) = fds[1].revents() {
-                    if rev.contains(PollFlags::POLLIN) {
-                        tracing::info!("Password dialog dismissed. Releasing transaction.");
-                        let _ = ipc.send_cancel("gui-password-failed", request_id);
-                        return ExitReason::PasswordFailed;
-                    }
-                }
-            }
-            Err(e) => {
-                if e != nix::errno::Errno::EINTR {
-                    tracing::warn!("poll error: {e}");
-                    *pending = Some(UnavailableReason::IpcLoopError);
-                    return ExitReason::IpcError;
-                }
-            }
-        }
-    }
-}
-
-/// Event loop for GUI contexts whose conversation function must not be driven
-/// while TapAuth waits for the phone.
-///
-/// This is the default for every host that `conversation_mode` does not
-/// allowlist.  Such a host typically implements the conversation as a
-/// synchronous round-trip that can only be answered by the event loop running
-/// on the very thread that called `pam_authenticate` (kscreenlocker ≤ 6.7, for
-/// instance, posts the answer back to that thread).  For those hosts:
-///
-/// 1. collecting the password from a background thread deadlocks: the
-///    conversation reply is queued for the blocked host event loop and can
-///    never be dispatched, so password entry stops working entirely, and
-/// 2. `pthread_cancel`-ing that background thread (as the threaded flow does)
-///    would force-unwind through the host's non-Rust frames, which can
-///    `abort()` the host process and take the lock screen down with it.
-///
-/// The safe pattern is to never drive the conversation from this thread: no
-/// query is sent and no input is read, and the conversation is not touched at
-/// all while the module waits.  It blocks on the daemon IPC socket on the
-/// calling thread, returns the result, and lets the PAM stack fall through to
-/// the password module afterwards (whose own conversation then runs on the
-/// host's terms).  The one exception is a single non-blocking `PAM_TEXT_INFO`
-/// announcement emitted immediately before this loop starts (see the caller):
-/// it carries no input and hosts need it in order to reveal their password
-/// entry.  Because nothing is consumed here, a typed password only counts once
-/// the *following* module prompts for it, after the (shorter) GUI timeout —
-/// which is why `pam_gui_timeout_secs` exists.
-///
-/// Returns the exit reason plus the daemon response, if one was received.
-fn run_sequential_event_loop<T: IpcResponseReader>(
-    ipc: &mut T,
-    deadline: Instant,
-) -> (ExitReason, Option<shared::ipc::pb::PamAuthenticateResponse>) {
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return (ExitReason::Timeout, None);
-        }
-
-        let remain = deadline
-            .checked_duration_since(now)
-            .unwrap_or(Duration::ZERO);
-        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
-        let mut fds = [PollFd::new(
-            unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-            PollFlags::POLLIN,
-        )];
-
-        match poll(&mut fds, timeout) {
-            Ok(0) => continue,
-            Ok(_) => {
-                let Some(rev) = fds[0].revents() else {
-                    continue;
-                };
-
-                // Read data first: POLLIN can arrive together with POLLHUP.
-                if rev.contains(PollFlags::POLLIN) {
-                    match ipc.try_read_response_nonblocking() {
-                        Ok(Some(resp)) => {
-                            return (ExitReason::IpcResponseReceived, Some(resp));
-                        }
-                        Ok(None) => {
-                            // No complete frame yet; check for hangup.
-                            if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR)
-                            {
-                                tracing::error!("Daemon closed connection before sending response");
-                                return (ExitReason::IpcError, None);
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::error!("IPC read failed: {e}");
-                            return (ExitReason::IpcError, None);
-                        }
-                    }
-                } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
-                    tracing::error!("Daemon closed connection or error detected");
-                    return (ExitReason::IpcError, None);
-                }
-            }
-            Err(e) => {
-                if e != nix::errno::Errno::EINTR {
-                    tracing::warn!("poll error: {e}");
-                    return (ExitReason::IpcError, None);
-                }
-            }
-        }
-    }
-}
-
-/// The threaded GUI flow: a worker thread collects the password while the main
-/// thread multiplexes the daemon socket and a self-pipe.
-///
-/// For the hosts whose conversation stays answerable while the calling thread
-/// is blocked (see `policy`), blocking credential collection is offloaded to a
-/// native background thread so the host can process window events, and the
-/// main loop watches both the IPC socket and the self-pipe.
-///
-/// Returns the verdict, never a code: the caller maps it with `to_pam`
-/// (`finish`), so this function cannot produce a `PAM_*` value of its own. The
-/// two local-resource failures (`pipe2`, `pthread_create`) are the only errors
-/// it can report, and both cancel the in-flight request first.
-fn run_threaded<T: IpcResponseReader>(
-    pamh: *mut pam_sys::PamHandle,
-    ipc: &mut T,
-    deadline_at: Instant,
-    request_id: &str,
-) -> Outcome {
-    // O_CLOEXEC prevents the pipe fds from leaking to child processes
-    // started by the long-running privileged host (sudo, gdm, polkitd).
-    let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::error!("Failed to create secure self-pipe: {err}");
-        // Best-effort cancel so the phone doesn't keep buzzing.
-        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-            let _ = c.send_cancel("gui-pipe2-fail", request_id);
-        }
-        return Outcome::Error(ErrorReason::LocalResource);
-    }
-    let pipe_read = pipe_fds[0];
-    let pipe_write = pipe_fds[1];
-
-    let ctx = ThreadContext {
-        pamh,
-        password_entered: AtomicBool::new(false),
-        pipe_write_fd: pipe_write,
-    };
-
-    // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
-    // paths below unconditionally call pthread_join, which blocks until
-    // the worker has been fully reaped by the kernel.  Therefore the
-    // reference passed to the worker remains valid for its entire
-    // execution, regardless of whether the worker completes normally or
-    // is cancelled via pthread_cancel.
-    let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
-
-    // Custom FFI binding for pthread_create that accepts the correct
-    // `extern "C-unwind"` function signature.  This avoids the undefined
-    // behaviour of transmuting between C-unwind and C ABIs.
-    extern "C" {
-        #[link_name = "pthread_create"]
-        fn pthread_create_unwind(
-            thread: *mut libc::pthread_t,
-            attr: *const libc::pthread_attr_t,
-            start_routine: unsafe extern "C-unwind" fn(
-                *mut std::os::raw::c_void,
-            ) -> *mut std::os::raw::c_void,
-            arg: *mut std::os::raw::c_void,
-        ) -> std::os::raw::c_int;
-    }
-
-    let spawn_res = unsafe {
-        pthread_create_unwind(
-            pthread_id.as_mut_ptr(),
-            std::ptr::null(),
-            native_password_worker,
-            &ctx as *const ThreadContext as *mut std::os::raw::c_void,
-        )
-    };
-
-    if spawn_res != 0 {
-        let err = std::io::Error::from_raw_os_error(spawn_res);
-        tracing::error!("Failed to create native password thread: {err}");
-        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-            let _ = c.send_cancel("gui-thread-spawn-fail", request_id);
-        }
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-        return Outcome::Error(ErrorReason::LocalResource);
-    }
-
-    let pthread_id = unsafe { pthread_id.assume_init() };
-
-    let mut auth_response = None;
-    let mut pending: Option<UnavailableReason> = None;
-
-    let exit_reason = run_gui_event_loop(
-        ipc,
-        pipe_read,
-        deadline_at,
-        &ctx,
-        request_id,
-        &mut auth_response,
-        &mut pending,
-    );
-
-    // Cancel the worker if it hasn't already exited on its own, then always
-    // reap it (see `cancel_and_join` for why the join is load-bearing).
-    //
-    // Password entry and dialog dismissal both mean the worker has left
-    // `pam_get_authtok` on its own, so those paths skip the cancel.
-    unsafe {
-        cancel_and_join(
-            pthread_id,
-            exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed,
-        );
-        libc::close(pipe_read);
-        libc::close(pipe_write);
-    }
-
-    // The daemon answered: that is the verdict, whatever the loop exit was.
-    if let Some(resp) = auth_response {
-        return Outcome::from_daemon(resp);
-    }
-
-    // No response, so the service could not be consulted. The reason comes
-    // from the exit: the user chose the password (`PasswordEntered`, which
-    // leaves the token cached by `pam_get_authtok` for the next module),
-    // dismissed the dialog (`PasswordFailed`), the daemon went quiet
-    // (`Timeout`) or the IPC layer failed (`IpcError`, with the reason the
-    // loop recorded). Every one of them is `PAM_AUTHINFO_UNAVAIL`: on a
-    // `sufficient` line that is `ignore`, and on a `required` line a real
-    // failure — never `PAM_IGNORE`, which records no failure at all.
-    match exit_reason {
-        ExitReason::PasswordEntered => Outcome::Unavailable(UnavailableReason::PasswordChosen),
-        ExitReason::PasswordFailed => Outcome::Unavailable(UnavailableReason::PasswordDismissed),
-        ExitReason::Timeout => Outcome::Unavailable(UnavailableReason::TimedOut),
-        _ => match pending {
-            Some(reason) => Outcome::Unavailable(reason),
-            // An `IpcError` always records its reason, so this arm is
-            // unreachable; it is not a panic path because a shipped
-            // `cdylib` compiles panics out.
-            None => Outcome::Unavailable(UnavailableReason::ProtocolError),
-        },
-    }
-}
+//
+// The three mechanisms live in `mechanism/`; this file is the orchestration
+// (identity, policy, config, username, conversation and messages) plus the one
+// call into `transaction::run`.
 
 /// Main PAM authentication entry point.
 ///
@@ -648,6 +148,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         &OrchestrationIo::production(),
         IpcClient::connect_nonblocking,
         send_authenticate_request,
+        cancel_on_fresh_connection,
     ) {
         Finished::Concluded(concluded) => {
             crate::transaction::record(concluded, Instant::now()).to_pam()
@@ -692,81 +193,34 @@ fn probe_tty() -> Option<std::fs::File> {
     std::fs::File::open("/dev/tty").ok()
 }
 
-/// Run one authentication: classify, resolve, plan, arm, drive a mechanism and
-/// conclude.
+/// Run one authentication: capture the caller facts, classify, resolve the
+/// inputs a participation needs, and hand the transaction to
+/// [`crate::transaction::run`].
 ///
 /// The body decides and acts; recording is the caller's (`authenticate`), so the
 /// 500 ms reuse window stays anchored to *this module's return* rather than to
 /// the moment the transaction concluded.
 ///
-/// `connect` and `send` are the transaction's two injected effects, the same
-/// seam `Armed::open` has: production passes `IpcClient::connect_nonblocking`
-/// and [`send_authenticate_request`], and a test passes counting closures or
-/// failures, so "the skip never reaches the daemon" and "a connect failure
-/// records nothing" are assertions rather than promises.
+/// The order is load-bearing and is asserted by `classify_before_side_effects`:
+/// `classify` runs **before** `PamConfig::load`, `get_user`,
+/// `PamConversation::new` and `PamMessages::load_for_user`, so a `Skip` (a
+/// display-manager login, a remote caller) pays none of them. `HostIo` is built
+/// after those four calls and borrows what they produced, so it cannot exist on
+/// a skip path.
+///
+/// `connect`, `send` and `cancel` are the transaction's injected effects, the
+/// same seam `Armed::open` has: production passes
+/// `IpcClient::connect_nonblocking`, [`send_authenticate_request`] and
+/// [`cancel_on_fresh_connection`], and a test passes counting closures or
+/// failures, so "the skip never reaches the daemon", "a connect failure records
+/// nothing" and "a timeout cancels nothing" are assertions rather than promises.
 fn orchestrate<T, C, S>(
     pamh: *mut pam_sys::PamHandle,
     ctx: &CallerContext,
     io: &OrchestrationIo,
     connect: C,
     send: S,
-) -> Finished
-where
-    T: IpcResponseReader,
-    C: FnOnce() -> Result<T, IpcError>,
-    S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-{
-    run(pamh, ctx, io, probe_tty, connect, send)
-}
-
-/// What the transaction puts on the wire.
-///
-/// Handed to the injected `send` closure so that closure sees exactly the four
-/// request facts and nothing else — no plan, no cache, no caller context.
-pub(crate) struct SendParams<'a> {
-    pub(crate) username: &'a str,
-    pub(crate) has_tty: bool,
-    pub(crate) timeout_secs: u32,
-    pub(crate) request_id: &'a str,
-}
-
-/// The production `send`: the authenticate request, on the connected client.
-fn send_authenticate_request(
-    ipc: &mut IpcClient,
-    request: &SendParams<'_>,
-) -> Result<(), IpcError> {
-    ipc.send_authenticate_start(
-        request.username,
-        request.has_tty,
-        request.timeout_secs,
-        request.request_id,
-    )
-}
-
-/// One authentication transaction.
-///
-/// Everything that happens *before* a request is on the wire returns
-/// `Finished::Unrecorded`: a skip, a missing username, a missing conversation,
-/// the pre-collected handoff, a failed request id, a failed connect or send.
-/// Recording one of those would answer a later duplicate with a verdict the
-/// daemon never reached.
-///
-/// Everything after `Armed::open` returns `Finished::Concluded`, with
-/// `Via::Daemon` for this call's own request and `Via::Replay` for a duplicate
-/// answered from the reuse record. The conclusion carries the verdict and its
-/// subject; `Outcome::to_pam` is called once, by `authenticate`.
-///
-/// Every return emits its verdict's one message through [`emit_notice`] before
-/// returning, so a message can be neither lost by an early return nor doubled;
-/// the paths that return before a conversation exists carry outcomes whose
-/// notice is `None` by construction (`outcomes_that_precede_the_conversation_are_silent`).
-fn run<T, C, S>(
-    pamh: *mut pam_sys::PamHandle,
-    ctx: &CallerContext,
-    io: &OrchestrationIo,
-    probe_tty: impl FnOnce() -> Option<std::fs::File>,
-    connect: C,
-    send: S,
+    cancel: fn(&str, &str),
 ) -> Finished
 where
     T: IpcResponseReader,
@@ -825,7 +279,9 @@ where
             Ok(conv) => conv,
             Err(e) => {
                 tracing::error!("Failed to get PAM conversation function: {}", e);
-                return Finished::Unrecorded(Outcome::Error(ErrorReason::ConversationLookup));
+                return Finished::Unrecorded(Outcome::Error(
+                    crate::outcome::ErrorReason::ConversationLookup,
+                ));
             }
         }
     };
@@ -834,419 +290,45 @@ where
 
     let msgs = (io.load_messages)(&username);
 
-    // The conversation mode names the branch this call takes; the `Plannable`
-    // carrier and the plan that follows it are what the four timed decisions
-    // are made from.
-    let mode = match participation.conversation {
-        policy::Conversation::Threaded => ConversationMode::Threaded,
-        policy::Conversation::Sequential => ConversationMode::Sequential,
-        policy::Conversation::PreCollected => ConversationMode::PreCollected,
-    };
-
-    // `PreCollected` has no plan at all: its handoff is the last thing that
-    // happens before the transaction machinery, and it returns before a probe,
-    // a `Plan` or a cache lookup exists — which is why `plan::Plannable` has no
-    // `PreCollected` variant to excuse.
-    let plannable = match participation.conversation {
-        policy::Conversation::Threaded => Plannable::Threaded,
-        policy::Conversation::Sequential => Plannable::Sequential,
-        // Pre-collected hosts (swaylock, gtklock, i3lock) read the password
-        // before they call `pam_authenticate`; their conversation is a
-        // synchronous replay of it, so `pam_get_authtok` returns immediately and
-        // never waits for the user.  Collect the token on the calling thread — a
-        // worker thread would only reintroduce the cross-thread libpam pattern
-        // the threaded path has to join around — and let it be cached in
-        // `PAM_AUTHTOK`, which is what the next module (`pam_unix` with
-        // `try_first_pass`/`use_first_pass`) verifies.
-        //
-        // This is deliberately a skip, not a wait: the user has already typed
-        // the password, so ringing the phone would be misleading and could only
-        // ever end in a timeout.  The skip returns `PAM_AUTHINFO_UNAVAIL` (never
-        // `PAM_IGNORE`): a `sufficient` line treats that as `ignore`, exactly as
-        // `PAM_IGNORE` would, so the next module still runs; a `required` line
-        // fails closed.  If the token cannot be read (the host's conversation
-        // refused it, or nothing was collected) the next module simply prompts
-        // as it would without this module.
-        policy::Conversation::PreCollected => {
-            let mut authtok: *const std::os::raw::c_char = std::ptr::null();
-            // SAFETY: `pamh` is the live handle libpam passed to this call and
-            // the conversation belongs to this thread, which is what the host
-            // expects.
-            let res = unsafe {
-                pam_sys::pam_get_authtok(pamh, pam_sys::PAM_AUTHTOK, &mut authtok, std::ptr::null())
-            };
-            if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
-                tracing::warn!(
-                    "TapAuth: pre-collected host supplied no password token ({res}); \
-                     falling through to the next PAM module"
-                );
-            } else {
-                tracing::info!(
-                    "TapAuth: pre-collected password cached for the next PAM module; \
-                     the phone is not consulted"
-                );
-            }
-            return Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::PasswordHandoff));
-        }
-    };
-
-    // First, answer a duplicate: the lock-screen duplicate is queued while the
-    // first transaction is still running, so replaying the code this process
-    // just concluded is the correct answer to a retry no user could have
-    // initiated.
-    //
-    // The paths above deliberately record nothing.  The display-manager bypass
-    // is a static policy decision, not a conclusion about credentials, and the
-    // pre-collected skip never contacts the daemon, so there is no transaction
-    // to suppress: storing its `PAM_AUTHINFO_UNAVAIL` would only let a
-    // duplicate skip `pam_get_authtok`, leaving `PAM_AUTHTOK` unset for
-    // `pam_unix` on that handle.  A setup failure above this point (no
-    // conversation function) produces no verdict either.  None of them may
-    // clobber the last real conclusion.
-    // The captured service name keys the cache: `None` means the service is
-    // unknown, which disables the cache for this call rather than collapsing
-    // every such call into one key.
-    if let Some(service_name) = ctx.service() {
-        // A hit is a conclusion — an earlier call's — so it is `Concluded`,
-        // with `Via::Replay` saying it must not be recorded again: that would
-        // refresh the timestamp, so the window stays anchored to the original
-        // verdict no matter how many duplicates arrive. It is not a sliding
-        // window. The hit's own log line (with its age) belongs to the cache,
-        // which is the only place that knows it.
-        if let Some(concluded) =
-            crate::transaction::replay_for(&username, service_name.original(), Instant::now())
-        {
-            return Finished::Concluded(concluded);
-        }
-    }
-
-    // The `/dev/tty` probe, gated by `Plannable::tty_use` — a function of the
-    // carrier alone — so `conversation == Sequential` is not tested a second
-    // time here. It runs *after* the reuse lookup: a duplicate answered from the
-    // record must not open the terminal at all.
-    //
-    // A host whose conversation we drive from a worker thread must not take the
-    // terminal branch either: it would start polling `/dev/tty` on this thread
-    // and steal the stdin the host expects for its own dialog.
-    let tty_file = if plannable.tty_use() == TtyUse::PollForKey {
-        probe_tty()
-    } else {
-        None
-    };
-    let has_tty = tty_file.is_some();
-    let plan = plannable.plan(has_tty);
-
-    // Announce the wait.  Each call is a single non-blocking `PAM_TEXT_INFO`
-    // (one conversation round trip that carries no input and never waits for
-    // the user).  The terminal and threaded paths get theirs here, before the
-    // wait starts; a no-terminal sequential host gets `WaitThenPassword`
-    // further down, right before the module begins blocking, because such hosts
-    // only reveal their password entry once a PAM message arrives.
-    match plan.announcement {
-        Announcement::WaitSkipHint => pam_conv.try_info(msgs.waiting_for_tap_skip()),
-        Announcement::Wait => pam_conv.try_info(msgs.waiting_for_tap()),
-        // Emitted after the request is on the wire, just below.
-        Announcement::WaitThenPassword => {}
-    }
-
-    // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
-    let mut rid_bytes = [0u8; 16];
-    if let Err(e) = getrandom::fill(&mut rid_bytes) {
-        tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
-        return Finished::Unrecorded(Outcome::Error(ErrorReason::RequestId));
-    }
-    let request_id = hex::encode(rid_bytes);
-    // The deadline, resolved once from the plan and anchored *before* the
-    // request is on the wire, so a stalled connect or write consumes budget
-    // instead of running past it. The daemon gets the same number of seconds,
-    // so the two deadlines stay in sync.
-    let timeout_secs = plan.deadline.resolve(&config);
-    let deadline_at = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
-    let context = match (plannable, plan.tty_use) {
-        (Plannable::Threaded, _) => "gui-threaded",
-        (Plannable::Sequential, TtyUse::PollForKey) => "terminal",
-        (Plannable::Sequential, TtyUse::DoNotOpen) => "gui-sequential",
-    };
-    tracing::debug!(
-        "Authentication deadline: {}s (context: {})",
-        timeout_secs,
-        context
-    );
-
-    // Establish nonblocking IPC connection and send authenticate request.
-    //
-    // `Armed::open` produces the `Armed` only when the request is actually on
-    // the wire — i.e. after both the connect and the send succeeded — and it is
-    // the only way to reach a conclusion, so a local IPC failure cannot record
-    // one.  Recording a failure would let a later duplicate inherit that
-    // `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry must dial
-    // the socket again.  Everything above this point (the display-manager
-    // bypass, the pre-collected skip, a missing conversation, a failed RNG) is
-    // not a verdict about a transaction attempt either, so it records nothing.
-    let request = SendParams {
-        username: &username,
-        has_tty,
-        timeout_secs,
-        request_id: &request_id,
-    };
-    // The id is cloned into the `Armed` because `SendParams` borrows it and the
-    // closure that consumes it runs inside `open`, after the `Armed` exists.
-    let mut armed = match Armed::open(
+    let mut host = HostIo::new(pamh, &pam_conv, &msgs);
+    crate::transaction::run(
+        ctx,
+        &username,
+        &participation,
+        &mut host,
+        &config,
+        probe_tty,
         connect,
-        |ipc| send(ipc, &request),
-        request_id.clone().into_boxed_str(),
-    ) {
-        Ok(armed) => armed,
-        // The two pre-arm IPC failures: no request reached the daemon, so the
-        // verdict is unrecorded, and each names its own message
-        // (`cannot_connect` vs `communication_error`).
-        Err(StartError::Connect(e)) => {
-            tracing::error!("Failed to connect to tapauthd: {}", e);
-            return Finished::Unrecorded(emit_notice(
-                &pam_conv,
-                &msgs,
-                Outcome::Unavailable(UnavailableReason::DaemonUnreachable),
-            ));
-        }
-        Err(StartError::Send(e)) => {
-            tracing::error!("Failed to send authenticate request: {}", e);
-            return Finished::Unrecorded(emit_notice(
-                &pam_conv,
-                &msgs,
-                Outcome::Unavailable(UnavailableReason::DaemonSendFailed),
-            ));
-        }
-    };
-
-    // GUI contexts whose conversation must be left to the host (the sequential
-    // mode, e.g. the KDE lock screen before kscreenlocker 6.8): wait for the
-    // daemon on this thread and never *drive* the conversation.  Password
-    // fallback happens after this returns, when the next PAM module runs its
-    // own conversation.
-    if !has_tty && mode == ConversationMode::Sequential {
-        // Announce the wait now that the request is on the wire and the module
-        // is about to block.  Event-loop hosts (GDM's auth prompt, KDE's
-        // kscreenlocker_worker) only reveal their password entry once a PAM
-        // module sends a query or a `PAM_TEXT_INFO`, so this is what gives the
-        // user a visible password route while we wait.  A single non-blocking
-        // `PAM_TEXT_INFO` — it never prompts, never reads input and never runs
-        // on another thread; a host whose conversation returns `PAM_CONV_ERR`
-        // is unaffected because `try_info` swallows the error.
-        if plan.announcement == Announcement::WaitThenPassword {
-            pam_conv.try_info(msgs.waiting_for_tap_password());
-        }
-        let outcome = {
-            let (ipc, request_id) = armed.parts();
-            let (exit_reason, auth_response) = run_sequential_event_loop(ipc, deadline_at);
-
-            // The verdict comes from the loop's exit, never from the loop
-            // itself, so the text and the style of a failure are decided once
-            // by `Outcome::notice`. `IpcResponseReceived` without a payload
-            // cannot happen (the loop returns it only with `Some`), so it fails
-            // closed without a message rather than inventing one.
-            match exit_reason {
-                ExitReason::IpcResponseReceived => match auth_response {
-                    Some(resp) => Outcome::from_daemon(resp),
-                    None => Outcome::Unavailable(UnavailableReason::ProtocolError),
-                },
-                ExitReason::Timeout => {
-                    // The daemon runs on the same deadline and multicasts its
-                    // own AuthenticationCancel, so no client-side cancel is
-                    // needed.
-                    Outcome::Unavailable(UnavailableReason::TimedOut)
-                }
-                _ => {
-                    // IPC error: the request may still be in flight
-                    // daemon-side. Best-effort cancel uses a new blocking
-                    // connection with a short timeout so the phone doesn't keep
-                    // buzzing.
-                    if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                        let _ = c.send_cancel("gui-ipc-error", request_id);
-                    }
-                    // This is the one path that shows its IPC text as an error,
-                    // so it maps to `IpcError` rather than to the hangup/loop
-                    // reasons the other two mechanisms use.
-                    Outcome::Unavailable(UnavailableReason::IpcError)
-                }
-            }
-        };
-        let outcome = emit_notice(&pam_conv, &msgs, outcome);
-        return Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()));
-    }
-
-    // GUI context with a threaded-conversation-capable host (see `policy`):
-    // the branch body is `run_threaded`, and its verdict is mapped here — the
-    // one place this call site produces a code.
-    if !has_tty && mode == ConversationMode::Threaded {
-        let outcome = {
-            let (ipc, request_id) = armed.parts();
-            emit_notice(
-                &pam_conv,
-                &msgs,
-                run_threaded(pamh, ipc, deadline_at, request_id),
-            )
-        };
-        return Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()));
-    }
-
-    // Terminal: the branch body is `run_terminal`, and its verdict is concluded
-    // here like the other two mechanisms'.
-    let outcome = {
-        let (ipc, request_id) = armed.parts();
-        emit_notice(
-            &pam_conv,
-            &msgs,
-            run_terminal(ipc, tty_file, deadline_at, request_id),
-        )
-    };
-    Finished::Concluded(armed.conclude(outcome, &username, ctx.service().cloned()))
+        send,
+        cancel,
+    )
 }
 
-/// The terminal flow: poll the daemon socket and `/dev/tty` together, and let
-/// Enter skip.
+/// The production `send`: the authenticate request, on the connected client.
+fn send_authenticate_request(
+    ipc: &mut IpcClient,
+    request: &SendParams<'_>,
+) -> Result<(), IpcError> {
+    ipc.send_authenticate_start(
+        request.username,
+        request.has_tty,
+        request.timeout_secs,
+        request.request_id,
+    )
+}
+
+/// The production `cancel`: a *fresh* short-timeout connection, never the live
+/// one.
 ///
-/// The only mechanism with a terminal to read: a `\n`/`\r` cancels the request
-/// on a fresh short connection and ends the wait, any other key is consumed and
-/// discarded, and a tty that reaches EOF, errors or hangs up simply stops being
-/// polled while the daemon socket keeps waiting.
-///
-/// Returns the verdict, never a code: the caller maps it with `to_pam`
-/// (`finish`), so every exit here — response, hangup, read error, skip,
-/// deadline — is a reason, and `Outcome::notice` decides the one message it
-/// shows.
-fn run_terminal<T: IpcResponseReader>(
-    ipc: &mut T,
-    tty: Option<std::fs::File>,
-    deadline_at: Instant,
-    request_id: &str,
-) -> Outcome {
-    // `run` probes /dev/tty only when the plan says `PollForKey`, so `tty` is
-    // `Some` here. A missing file is still handled without panicking: the host
-    // cannot be asked to skip, so the call ends as an unavailability with no
-    // message — the code this arm has always returned.
-    let Some(mut tty) = tty else {
-        return Outcome::Unavailable(UnavailableReason::ProtocolError);
-    };
-
-    // Set tty nonblocking to avoid read(1) blocking unexpectedly
-    {
-        if let Ok(cur) = fcntl(&tty, FcntlArg::F_GETFL) {
-            let mut flags = OFlag::from_bits_truncate(cur);
-            flags.insert(OFlag::O_NONBLOCK);
-            let _ = fcntl(&tty, FcntlArg::F_SETFL(flags));
-        }
+/// The two exits that cancel — the terminal Enter skip and the no-terminal IPC
+/// error — either no longer need the request or just watched the socket fail, so
+/// a write on `Armed.ipc` would be a guaranteed no-op and the phone would keep
+/// buzzing until the daemon's own deadline. It is best effort: a daemon that
+/// cannot be reached takes the same path as one that never got the cancel.
+fn cancel_on_fresh_connection(reason: &str, request_id: &str) {
+    if let Ok(mut client) = IpcClient::connect(Duration::from_millis(100)) {
+        let _ = client.send_cancel(reason, request_id);
     }
-
-    let mut poll_tty = true;
-    let mut kb = [0u8; 4];
-    loop {
-        let now = Instant::now();
-        if now >= deadline_at {
-            break;
-        }
-        let remain = deadline_at
-            .checked_duration_since(now)
-            .unwrap_or(Duration::ZERO);
-        let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
-        let mut fds = [
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
-                PollFlags::POLLIN,
-            ),
-            PollFd::new(
-                unsafe { BorrowedFd::borrow_raw(tty.as_raw_fd()) },
-                PollFlags::POLLIN,
-            ),
-        ];
-
-        let fds_slice = if poll_tty {
-            &mut fds[..2]
-        } else {
-            &mut fds[..1]
-        };
-
-        match poll(fds_slice, timeout) {
-            Ok(0) => {}
-            Ok(_) => {
-                // IPC
-                if let Some(rev) = fds[0].revents() {
-                    // Read data first if available (POLLIN can be set with POLLHUP)
-                    if rev.contains(PollFlags::POLLIN) {
-                        match ipc.try_read_response_nonblocking() {
-                            Ok(Some(resp)) => return Outcome::from_daemon(resp),
-                            Ok(None) => {
-                                // No complete frame yet, check for errors
-                                if rev.contains(PollFlags::POLLHUP)
-                                    || rev.contains(PollFlags::POLLERR)
-                                {
-                                    tracing::error!(
-                                        "Daemon closed connection before sending response"
-                                    );
-                                    return Outcome::Unavailable(
-                                        UnavailableReason::IpcConnectionLost,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("IPC read failed: {}", e);
-                                return Outcome::Unavailable(UnavailableReason::IpcLoopError);
-                            }
-                        }
-                    } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
-                        // Hangup/error without any data available
-                        tracing::error!("Daemon closed connection or error detected");
-                        return Outcome::Unavailable(UnavailableReason::IpcConnectionLost);
-                    }
-                }
-                // TTY - read one byte; skip on Enter, discard other keys
-                if poll_tty {
-                    if let Some(rev) = fds[1].revents() {
-                        if rev.contains(PollFlags::POLLIN) {
-                            match tty.read(&mut kb[..1]) {
-                                Ok(1) => {
-                                    let b = kb[0];
-                                    if b == b'\n' || b == b'\r' {
-                                        tracing::info!("User pressed Enter to skip");
-                                        // Best-effort cancel uses a new blocking connection
-                                        // with a short timeout so the skip is not blocked
-                                        // by an unresponsive daemon.
-                                        if let Ok(mut c) =
-                                            IpcClient::connect(Duration::from_millis(100))
-                                        {
-                                            let _ = c.send_cancel("tty-skip", request_id);
-                                        }
-                                        return Outcome::Unavailable(UnavailableReason::Skipped);
-                                    }
-                                    // Non-Enter key: consume and ignore
-                                }
-                                Ok(0) => {
-                                    // EOF reached, stop polling TTY to avoid busy loop
-                                    poll_tty = false;
-                                }
-                                Ok(_) => unreachable!("read into 1-byte buffer cannot exceed 1"),
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                Err(_) => {
-                                    // Other error, stop polling TTY
-                                    poll_tty = false;
-                                }
-                            }
-                        } else if rev.contains(PollFlags::POLLHUP)
-                            || rev.contains(PollFlags::POLLERR)
-                        {
-                            poll_tty = false;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if e != nix::errno::Errno::EINTR {
-                    tracing::warn!("poll error: {}", e);
-                }
-            }
-        }
-    }
-
-    Outcome::Unavailable(UnavailableReason::TimedOut)
 }
 
 /// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
@@ -1313,6 +395,11 @@ fn guard_display_manager_bypass(
 
 /// Emit an outcome's one message, then hand the outcome back.
 ///
+/// Test-only since `HostIo::emit` became the production site: the tests below
+/// drive an outcome through a real (dummy) conversation to pin the code pairs,
+/// which is what `emit_notice` still expresses most directly.
+#[cfg(test)]
+///
 /// Every return of `run` emits through this, so the message is decided by the
 /// verdict and not by the site that produced it, and `to_pam` is called exactly
 /// once — by `authenticate`. The emission itself is the two calls the module has
@@ -1343,7 +430,8 @@ fn emit_notice(
 mod tests {
     use super::*;
     use crate::logging;
-    use std::sync::atomic::AtomicUsize;
+    use crate::transaction::tests::{no_daemon, NullIpc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_logging_init() {
@@ -1434,166 +522,6 @@ mod tests {
         }
     }
 
-    /// Run `authenticate_inner` with an injected tty probe, and report how many
-    /// times the probe ran. `tty` is what the probe returns: `Some(path)` opens
-    /// that file, `None` reports "no terminal".
-    fn tty_probes(ctx: &CallerContext, tty: Option<&str>) -> (c_int, usize) {
-        let io = inert_io();
-        let mut probes = 0usize;
-        let finished = run(
-            std::ptr::null_mut(),
-            ctx,
-            &io,
-            || {
-                probes += 1;
-                tty.and_then(|path| std::fs::File::open(path).ok())
-            },
-            || Err(no_daemon()),
-            |_: &mut IpcClient, _: &SendParams<'_>| Ok(()),
-        );
-        (finished.outcome().clone().to_pam(), probes)
-    }
-
-    /// A connect that fails the way a missing socket does, for the paths whose
-    /// call counts are the assertion.
-    pub(crate) fn no_daemon() -> IpcError {
-        IpcError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "no daemon socket",
-        ))
-    }
-
-    /// `/dev/tty` is opened once, and only for the conversation that polls it.
-    ///
-    /// The defect this catches: the probe moved to the top of the function (or
-    /// gated on `conversation == Sequential` a second time, next to the plan),
-    /// so a threaded host polls the terminal and steals the stdin its own dialog
-    /// needs — or a plan maker and the probe disagree about whether a terminal
-    /// exists.
-    #[test]
-    fn tty_probe_only_for_sequential() {
-        let threaded = context(Some("probe-threaded"), Some("hyprlock"));
-        assert_eq!(
-            tty_probes(&threaded, Some("/dev/null")),
-            (pam_sys::PAM_AUTHINFO_UNAVAIL, 0),
-            "a threaded conversation must not open /dev/tty"
-        );
-
-        let sequential_tty = context(Some("probe-tty"), Some("xfce4-screensaver-dialog"));
-        assert_eq!(
-            tty_probes(&sequential_tty, Some("/dev/null")),
-            (pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
-            "a sequential conversation probes /dev/tty exactly once"
-        );
-
-        let sequential_no_tty = context(Some("probe-no-tty"), Some("xfce4-screensaver-dialog"));
-        assert_eq!(
-            tty_probes(&sequential_no_tty, None),
-            (pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
-            "a sequential conversation probes once even when there is no terminal"
-        );
-    }
-
-    /// A duplicate answered from the reuse record does not open `/dev/tty`.
-    ///
-    /// The defect this catches: the probe left *before* the reuse lookup, where
-    /// it used to be, so every hit opened the terminal for a transaction it
-    /// never starts. The recorded conclusion is a success, so the returned code
-    /// also proves the hit was taken rather than the probe merely being skipped
-    /// on an early return.
-    ///
-    /// The reuse record is one process-wide slot that other tests in this binary
-    /// also write, and the module's lookup happens after the injected
-    /// `load_messages`, so the record is re-taken whenever a concurrent test
-    /// replaced it. The assertion itself is never relaxed: it is only evaluated
-    /// once a hit actually happened, which the returned code proves.
-    #[test]
-    fn cache_hit_does_not_open_tty() {
-        let _slot = crate::transaction::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let service = "cache-hit-service";
-        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
-        let conclusion = crate::outcome::Outcome::granted_from_daemon();
-        let conclusion_code = conclusion.clone().to_pam();
-
-        for _ in 0..64 {
-            record_conclusion(
-                "tty-probe-test-user",
-                service,
-                conclusion.clone(),
-                Instant::now(),
-            );
-            let (code, probes) = tty_probes(&ctx, Some("/dev/null"));
-            if code != conclusion_code {
-                // A concurrent test replaced the single record before the
-                // lookup; nothing was proved about the ordering, so re-take it.
-                continue;
-            }
-            assert_eq!(
-                probes, 0,
-                "a cache hit must replay the conclusion and never open /dev/tty"
-            );
-            return;
-        }
-        panic!(
-            "the reuse record was replaced by a concurrent test before every one of 64 \
-             attempts, so the cache-hit path was never observed"
-        );
-    }
-
-    /// An IPC client that never carries anything: enough to satisfy the
-    /// transport bound for a path that fails before either end is used.
-    pub(crate) struct NullIpc;
-
-    impl IpcResponseReader for NullIpc {
-        fn fd(&self) -> std::os::fd::RawFd {
-            -1
-        }
-
-        fn try_read_response_nonblocking(
-            &mut self,
-        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
-            Ok(None)
-        }
-
-        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
-            Ok(())
-        }
-    }
-
-    /// Drive `run` with a context, a tty probe and the two injected IPC
-    /// effects, and report the `Finished` it returned.
-    fn run_finished<T: IpcResponseReader, C, S>(
-        ctx: &CallerContext,
-        tty: Option<&str>,
-        connect: C,
-        send: S,
-    ) -> Finished
-    where
-        C: FnOnce() -> Result<T, IpcError>,
-        S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-    {
-        let io = inert_io();
-        run(
-            std::ptr::null_mut(),
-            ctx,
-            &io,
-            || tty.and_then(|path| std::fs::File::open(path).ok()),
-            connect,
-            send,
-        )
-    }
-
-    /// Record `outcome` for `(username, service)` at `at`, through the same
-    /// `Armed`-conclude-record path `authenticate` uses.
-    fn record_conclusion(username: &str, service: &str, outcome: Outcome, at: Instant) {
-        let concluded = crate::transaction::armed_for_test(NullIpc, "pam-logic-test-request")
-            .conclude(outcome, username, Some(ServiceName::new(service)));
-        let _ = crate::transaction::record(concluded, at);
-    }
-
     /// R1 refuses a remote call before anything reaches the daemon.
     ///
     /// The defect this catches: a skip decided late enough to dial the socket,
@@ -1609,9 +537,10 @@ mod tests {
             let sends = AtomicUsize::new(0);
             let ctx = context(Some(service), Some("sshd"));
 
-            let finished = run_finished(
+            let finished = orchestrate(
+                std::ptr::null_mut(),
                 &ctx,
-                None,
+                &inert_io(),
                 || {
                     connects.fetch_add(1, Ordering::SeqCst);
                     Err::<NullIpc, _>(no_daemon())
@@ -1620,6 +549,7 @@ mod tests {
                     sends.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
+                |_, _| {},
             );
 
             assert_eq!(
@@ -1636,7 +566,7 @@ mod tests {
                 matches!(
                     &finished,
                     Finished::Unrecorded(Outcome::Unavailable(
-                        UnavailableReason::RemoteAuthentication
+                        crate::outcome::UnavailableReason::RemoteAuthentication
                     ))
                 ),
                 "service {service}: R1 is an unrecorded RemoteAuthentication verdict"
@@ -1647,76 +577,6 @@ mod tests {
                 "service {service}: R1 must report the service as unavailable"
             );
         }
-    }
-
-    /// The two pre-arm IPC failures keep their own messages, and neither is
-    /// recorded.
-    ///
-    /// The defect this catches: a connect failure mapped onto
-    /// `DaemonSendFailed` (so the user sees `communication_error` where
-    /// `cannot_connect` belongs, see `Outcome::notice`), and either failure
-    /// treated as a conclusion — arming the record would let a duplicate replay
-    /// a verdict the daemon never reached. The emission itself is not
-    /// observable through a dummy conversation, so what is pinned here is the
-    /// reason each path returns, which is where the text comes from.
-    #[test]
-    fn unrecorded_paths_name_their_notice() {
-        let msgs = pam_messages::load_for_user("unrecorded-test-user");
-        let ctx = context(Some("unrecorded-paths"), Some("totally-unknown"));
-
-        let connect_failed = run_finished(
-            &ctx,
-            None,
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
-        );
-        assert!(
-            matches!(
-                &connect_failed,
-                Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::DaemonUnreachable))
-            ),
-            "a refused connect is an unrecorded DaemonUnreachable"
-        );
-        assert_eq!(
-            connect_failed.outcome().clone().to_pam(),
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        );
-        let notice = connect_failed.outcome().notice(&msgs);
-        assert_eq!(
-            notice.map(|n| (n.style, n.text.into_owned())),
-            Some((
-                crate::outcome::NoticeStyle::Error,
-                msgs.cannot_connect().to_owned()
-            )),
-            "the connect failure must still show cannot_connect, as an error"
-        );
-
-        let send_failed = run_finished(
-            &ctx,
-            None,
-            || Ok(NullIpc),
-            |_: &mut NullIpc, _: &SendParams<'_>| Err(no_daemon()),
-        );
-        assert!(
-            matches!(
-                &send_failed,
-                Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::DaemonSendFailed))
-            ),
-            "a failed write is an unrecorded DaemonSendFailed"
-        );
-        assert_eq!(
-            send_failed.outcome().clone().to_pam(),
-            pam_sys::PAM_AUTHINFO_UNAVAIL
-        );
-        let notice = send_failed.outcome().notice(&msgs);
-        assert_eq!(
-            notice.map(|n| (n.style, n.text.into_owned())),
-            Some((
-                crate::outcome::NoticeStyle::Error,
-                msgs.communication_error().to_owned()
-            )),
-            "the send failure must still show communication_error, as an error"
-        );
     }
 
     /// Every verdict `run` can return before a conversation exists is silent.
@@ -1733,85 +593,13 @@ mod tests {
             Outcome::from_skip(crate::policy::SkipPolicy::RemoteAuthentication),
             Outcome::from_skip(crate::policy::SkipPolicy::KeyringNeedsAuthtok),
             Outcome::UserUnknown,
-            Outcome::Error(ErrorReason::ConversationLookup),
+            Outcome::Error(crate::outcome::ErrorReason::ConversationLookup),
         ] {
             assert!(
                 outcome.notice(&msgs).is_none(),
                 "{outcome:?} is returned before a conversation exists, so it must show nothing"
             );
         }
-    }
-
-    /// A duplicate answered from the record is a `Via::Replay` conclusion.
-    ///
-    /// The defect this catches: a cache hit reported as `Via::Daemon`, which
-    /// `record` accepts — so the duplicate would re-record the verdict and turn
-    /// the fixed 500 ms window into a sliding one — and a replay that keeps the
-    /// original provenance, which re-emits the message the first call already
-    /// showed.
-    #[test]
-    fn a_cache_hit_is_a_replay_conclusion() {
-        let _slot = crate::transaction::CACHE_SLOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let service = "replay-provenance-service";
-        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
-        let recorded = Outcome::granted_from_daemon();
-
-        for _ in 0..64 {
-            record_conclusion(
-                "tty-probe-test-user",
-                service,
-                recorded.clone(),
-                Instant::now(),
-            );
-            let finished = run_finished(
-                &ctx,
-                Some("/dev/null"),
-                || Err::<NullIpc, _>(no_daemon()),
-                |_, _| Ok(()),
-            );
-
-            let Finished::Concluded(concluded) = finished else {
-                // A concurrent test replaced the single record before the
-                // lookup; nothing was proved about the provenance.
-                continue;
-            };
-            assert_eq!(
-                concluded.via(),
-                crate::transaction::Via::Replay,
-                "a cache hit must be marked as a replay"
-            );
-            assert_eq!(
-                concluded.outcome(),
-                &Outcome::replayed(&recorded),
-                "a replay must carry the recorded verdict, marked as replayed"
-            );
-            // The replay marker is what refuses the re-record (today's
-            // `from_cache`): recording the conclusion hands its verdict back
-            // and must leave the slot exactly as the first call recorded it.
-            assert_eq!(
-                crate::transaction::record(concluded, Instant::now()),
-                Outcome::replayed(&recorded),
-                "a cache hit must not be recorded again: it would slide the window"
-            );
-            assert_eq!(
-                crate::transaction::replay_for(
-                    "tty-probe-test-user",
-                    service,
-                    Instant::now()
-                )
-                .map(|c| c.outcome().clone()),
-                Some(Outcome::replayed(&recorded)),
-                "the slot must still hold the verdict the first call recorded, not                  the replay that tried to overwrite it"
-            );
-            return;
-        }
-        panic!(
-            "the reuse record was replaced by a concurrent test before every one of 64 \
-             attempts, so the cache-hit path was never observed"
-        );
     }
 
     /// Run `orchestrate` for `ctx` and return the four call counters in the
@@ -1827,6 +615,7 @@ mod tests {
             &counting_io(),
             || Err::<IpcClient, _>(no_daemon()),
             |_: &mut IpcClient, _: &SendParams<'_>| Ok(()),
+            |_, _| {},
         );
         [
             CONFIG_CALLS.load(Ordering::SeqCst),
@@ -2636,13 +1425,23 @@ mod tests {
     /// sites this step removes. Such a site can return `PAM_SUCCESS`, can return
     /// a code the verdict does not imply, and adds a path no outcome test
     /// covers. The exemption is by *function name* and the scan asserts it
-    /// covered `outcome.rs` (by path) and `lib.rs`, so a moved or emptied scan
-    /// cannot pass vacuously.
+    /// covered `outcome.rs` (by path), `lib.rs`, the orchestration, the
+    /// transaction and every mechanism module, so a moved or emptied scan cannot
+    /// pass vacuously.
     #[test]
     fn only_outcome_rs_returns_pam_constants() {
         let files = source_files();
         let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
-        for required in ["outcome.rs", "lib.rs", "pam_logic.rs", "transaction.rs"] {
+        for required in [
+            "outcome.rs",
+            "lib.rs",
+            "pam_logic.rs",
+            "transaction.rs",
+            "mechanism/mod.rs",
+            "mechanism/threaded.rs",
+            "mechanism/sequential.rs",
+            "mechanism/handoff.rs",
+        ] {
             assert!(
                 names.iter().any(|name| name == required),
                 "the scan did not cover {required}: {names:?}"
@@ -2727,7 +1526,15 @@ mod tests {
     fn granted_only_from_daemon() {
         let files = source_files();
         let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
-        for required in ["outcome.rs", "pam_logic.rs", "transaction.rs"] {
+        for required in [
+            "outcome.rs",
+            "pam_logic.rs",
+            "transaction.rs",
+            "mechanism/mod.rs",
+            "mechanism/threaded.rs",
+            "mechanism/sequential.rs",
+            "mechanism/handoff.rs",
+        ] {
             assert!(
                 names.iter().any(|name| name == required),
                 "the scan did not cover {required}: {names:?}"
@@ -2847,24 +1654,33 @@ mod tests {
     ///
     /// The numeric half is the one that matters for regressions: the vectors
     /// that remain are a `pam_sys::PAM_IGNORE` re-export reaching a `return`, or
-    /// a bare literal equal to PAM_IGNORE's value, in any `client-pam/src/*.rs`
+    /// a bare literal equal to PAM_IGNORE's value, in any `client-pam/src/**`
     /// — either is a single edit away from the bypass this guards, and a
     /// name-only scan would miss the numeric form.
+    ///
+    /// The walk is `source_files`, i.e. recursive: `src/mechanism/` is a
+    /// directory with no `rs` extension, so a single-level `read_dir` would
+    /// silently stop covering the modules that read daemon responses and the one
+    /// that decides `PreCollected` — and the scan would stay green while the
+    /// coverage it claims evaporated.
     #[test]
     fn test_module_source_contains_no_pam_ignore_return() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
-            .map(|entry| entry.expect("readable dir entry").path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
-            .collect();
-        files.sort();
-        // An empty or relocated scan must not pass silently: `pam_logic.rs`
-        // carries the return codes today.
-        assert!(
-            files.iter().any(|p| p.ends_with("pam_logic.rs")),
-            "the scan did not cover pam_logic.rs: {files:?}"
-        );
+        let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        // An empty or relocated scan must not pass silently: these files carry
+        // the mechanism exits, the verdict mapping and the orchestration.
+        for required in [
+            "pam_logic.rs",
+            "outcome.rs",
+            "mechanism/sequential.rs",
+            "mechanism/threaded.rs",
+            "mechanism/handoff.rs",
+        ] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
 
         // Spelled arithmetically so this test's own source carries no literal
         // for its own scan to find.
@@ -2873,7 +1689,7 @@ mod tests {
         for path in &files {
             let source = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let name = relative_to_src(path);
             let cleaned = stripped_source(&source);
             for (line, text) in pam_ignore_identifiers(&cleaned) {
                 findings.push(format!("{name}:{line}: PAM_IGNORE identifier in: {text}"));
@@ -2907,23 +1723,27 @@ mod tests {
              /* PAM_IGNORE and {ignore_code} in a block comment, too. */\n\
              let prose = \"return pam_sys::PAM_IGNORE; return {ignore_code};\";\n\
              let code = {{ let x = pam_sys::PAM_IGNORE; x }};\n\
+             return pam_sys::PAM_IGNORE;\n\
              return {ignore_code}u32;\n"
         );
         let cleaned = stripped_source(&source);
 
         assert_eq!(
             pam_ignore_identifiers(&cleaned),
-            vec![(
-                4,
-                "let code = { let x = pam_sys::PAM_IGNORE; x };".to_owned()
-            )],
-            "the identifier scan must report the real return and neither the \
-             comment nor the string"
+            vec![
+                (
+                    4,
+                    "let code = { let x = pam_sys::PAM_IGNORE; x };".to_owned()
+                ),
+                (5, "return pam_sys::PAM_IGNORE;".to_owned()),
+            ],
+            "the identifier scan must report the bare identifier and the real \
+             return, and neither the comment nor the string"
         );
 
         assert_eq!(
             numeric_literals_equal_to(&cleaned, ignore_code),
-            vec![(5, format!("{ignore_code}u32"))],
+            vec![(6, format!("{ignore_code}u32"))],
             "the numeric scan must report the bare value and neither the \
              comment nor the string"
         );
@@ -2938,370 +1758,30 @@ mod tests {
     }
 }
 
+/// How the PAM conversation of the calling host may be driven.
+///
+/// Test-only: the production dispatch is `plan::Plannable`, which the policy
+/// produces directly. The enum survives so the 24-row decision table test keeps
+/// exercising the same inputs; it is deleted with that wrapper once the table is
+/// the only representation.
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::too_many_arguments,
-    clippy::indexing_slicing
-)]
-mod gui_loop_tests {
-    use super::*;
-    use std::io::Write;
-    use std::os::fd::{AsRawFd, RawFd};
-    use std::os::unix::net::UnixStream;
-
-    struct MockIpcReader {
-        stream: UnixStream,
-        next_response:
-            Option<Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>>,
-    }
-
-    impl IpcResponseReader for MockIpcReader {
-        fn fd(&self) -> RawFd {
-            AsRawFd::as_raw_fd(&self.stream)
-        }
-
-        fn try_read_response_nonblocking(
-            &mut self,
-        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
-            self.next_response.take().unwrap_or(Ok(None))
-        }
-
-        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
-            Ok(())
-        }
-    }
-
-    fn setup_test_pipe_and_ctx() -> (libc::c_int, libc::c_int, ThreadContext) {
-        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-        unsafe {
-            let res = libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC);
-            assert_eq!(res, 0);
-        }
-        let ctx = ThreadContext {
-            pamh: std::ptr::null_mut(),
-            password_entered: AtomicBool::new(false),
-            pipe_write_fd: pipe_fds[1],
-        };
-        (pipe_fds[0], pipe_fds[1], ctx)
-    }
-
-    #[test]
-    fn test_gui_loop_immediate_timeout() {
-        let (_server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: None,
-        };
-        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-
-        let deadline = Instant::now() - Duration::from_secs(1);
-        let mut auth_response = None;
-        let mut pending: Option<UnavailableReason> = None;
-
-        let reason = run_gui_event_loop(
-            &mut mock_ipc,
-            pipe_read,
-            deadline,
-            &ctx,
-            "req-123",
-            &mut auth_response,
-            &mut pending,
-        );
-
-        assert_eq!(reason, ExitReason::Timeout);
-        assert!(auth_response.is_none());
-        assert!(pending.is_none());
-
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-    }
-
-    #[test]
-    fn test_gui_loop_password_entered_breakout() {
-        let (_server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: None,
-        };
-        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-
-        ctx.password_entered.store(true, Ordering::Release);
-        let dummy = [1u8];
-        unsafe {
-            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut auth_response = None;
-        let mut pending: Option<UnavailableReason> = None;
-
-        let reason = run_gui_event_loop(
-            &mut mock_ipc,
-            pipe_read,
-            deadline,
-            &ctx,
-            "req-123",
-            &mut auth_response,
-            &mut pending,
-        );
-
-        assert_eq!(reason, ExitReason::PasswordEntered);
-        assert!(auth_response.is_none());
-        assert!(pending.is_none());
-
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-    }
-
-    #[test]
-    fn test_gui_loop_password_dialog_failed_breakout() {
-        let (_server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: None,
-        };
-        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-
-        ctx.password_entered.store(false, Ordering::Release);
-        let dummy = [1u8];
-        unsafe {
-            libc::write(pipe_write, dummy.as_ptr() as *const _, 1);
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut auth_response = None;
-        let mut pending: Option<UnavailableReason> = None;
-
-        let reason = run_gui_event_loop(
-            &mut mock_ipc,
-            pipe_read,
-            deadline,
-            &ctx,
-            "req-123",
-            &mut auth_response,
-            &mut pending,
-        );
-
-        assert_eq!(reason, ExitReason::PasswordFailed);
-        assert!(auth_response.is_none());
-        assert!(pending.is_none());
-
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-    }
-
-    #[test]
-    fn test_gui_loop_successful_phone_tap() {
-        let (mut server, client) = UnixStream::pair().unwrap();
-
-        let mut expected_resp = shared::ipc::pb::PamAuthenticateResponse::default();
-        expected_resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
-
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: Some(Ok(Some(expected_resp))),
-        };
-
-        server.write_all(&[1]).unwrap();
-
-        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut auth_response = None;
-        let mut pending: Option<UnavailableReason> = None;
-
-        let reason = run_gui_event_loop(
-            &mut mock_ipc,
-            pipe_read,
-            deadline,
-            &ctx,
-            "req-123",
-            &mut auth_response,
-            &mut pending,
-        );
-
-        assert_eq!(reason, ExitReason::IpcResponseReceived);
-        assert_eq!(
-            auth_response.unwrap().outcome(),
-            shared::ipc::pb::PamOutcome::Success
-        );
-        assert!(pending.is_none());
-
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-    }
-
-    #[test]
-    fn test_gui_loop_daemon_hangup() {
-        let (server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: Some(Ok(None)),
-        };
-
-        std::mem::drop(server);
-
-        let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut auth_response = None;
-        let mut pending: Option<UnavailableReason> = None;
-
-        let reason = run_gui_event_loop(
-            &mut mock_ipc,
-            pipe_read,
-            deadline,
-            &ctx,
-            "req-123",
-            &mut auth_response,
-            &mut pending,
-        );
-
-        assert_eq!(reason, ExitReason::IpcError);
-        assert!(auth_response.is_none());
-        assert_eq!(pending, Some(UnavailableReason::IpcConnectionLost));
-
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-    }
-
-    #[test]
-    fn test_sequential_loop_immediate_timeout() {
-        let (_server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: None,
-        };
-
-        let deadline = Instant::now() - Duration::from_secs(1);
-        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
-
-        assert_eq!(reason, ExitReason::Timeout);
-        assert!(auth_response.is_none());
-    }
-
-    #[test]
-    fn test_sequential_loop_receives_response() {
-        let (mut server, client) = UnixStream::pair().unwrap();
-
-        let mut expected_resp = shared::ipc::pb::PamAuthenticateResponse::default();
-        expected_resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
-
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: Some(Ok(Some(expected_resp))),
-        };
-
-        server.write_all(&[1]).unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
-
-        assert_eq!(reason, ExitReason::IpcResponseReceived);
-        assert_eq!(
-            auth_response.map(|r| r.outcome()),
-            Some(shared::ipc::pb::PamOutcome::Success)
-        );
-    }
-
-    #[test]
-    fn test_sequential_loop_daemon_hangup() {
-        let (server, client) = UnixStream::pair().unwrap();
-        let mut mock_ipc = MockIpcReader {
-            stream: client,
-            next_response: Some(Ok(None)),
-        };
-
-        std::mem::drop(server);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (reason, auth_response) = run_sequential_event_loop(&mut mock_ipc, deadline);
-
-        assert_eq!(reason, ExitReason::IpcError);
-        assert!(auth_response.is_none());
-    }
-
-    /// **Smoke test only.**  It compares *source byte offsets* and would still
-    /// pass if the announcement sat behind a branch that never executes.
-    ///
-    /// The authoritative coverage is `scripts/ci/test-pam-host-cases.sh` case 1
-    /// (`ttyless_wait_announced_before_blocking`), which counts and times the
-    /// real `PAM_TEXT_INFO` on a live PAM stack.
-    #[test]
-    fn test_sequential_wait_is_announced_before_it_blocks() {
-        let source = include_str!("pam_logic.rs");
-        // Only the production half of the file: the test modules below contain
-        // the same identifiers inside string literals, which would otherwise
-        // satisfy the searches no matter what the production code does.
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(source);
-
-        let announce = production
-            .find("waiting_for_tap_password()")
-            .unwrap_or_else(|| {
-                panic!("invariant broken: the sequential wait never announces a password route")
-            });
-
-        // `rfind` picks the call after the function definition; every test-only
-        // call site passes `mock_ipc` and does not match.
-        let blocking_wait = production
-            .rfind("run_sequential_event_loop(ipc")
-            .unwrap_or_else(|| {
-                panic!("invariant broken: production call to the sequential wait not found")
-            });
-
-        assert!(
-            announce < blocking_wait,
-            "invariant broken: the password-route announcement (byte {}) must be emitted \
-             before the call that blocks on the sequential wait (byte {}), otherwise the \
-             host never reveals its password entry during the wait",
-            announce,
-            blocking_wait
-        );
-    }
-
-    #[test]
-    fn test_wait_announcement_is_single_line() {
-        let text = pam_messages::load_for_user("testuser")
-            .waiting_for_tap_password()
-            .to_string();
-
-        assert!(
-            !text.is_empty(),
-            "the sequential-wait announcement resolved to an empty string"
-        );
-        assert!(
-            !text.contains("pam-waiting-tap-password"),
-            "the sequential-wait announcement is the unresolved '??key??' fallback marker, \
-             so the pam-waiting-tap-password key is missing from the loaded locale: {:?}",
-            text
-        );
-        assert!(
-            !text.contains('\n') && !text.contains('\r'),
-            "the sequential-wait announcement must stay on one line, got {:?}",
-            text
-        );
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationMode {
+    /// The conversation may run on a background thread while the calling
+    /// thread waits for the daemon.
+    Threaded,
+    /// The host collected the password before calling `pam_authenticate` and
+    /// its conversation only replays it.  The module collects the token on the
+    /// calling thread and hands over without contacting the daemon.
+    PreCollected,
+    /// The conversation must be left to the calling thread/host event loop.
+    Sequential,
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod conversation_mode_tests {
     use super::*;
-    use std::os::raw::c_void;
 
     #[test]
     fn conversation_mode_is_an_allowlist_with_a_sequential_default() {
@@ -3503,94 +1983,6 @@ mod conversation_mode_tests {
             );
         }
     }
-
-    static JOIN_TEST_STARTED: AtomicBool = AtomicBool::new(false);
-
-    struct JoinTestCtx {
-        pipe_read: libc::c_int,
-    }
-
-    /// Blocks in `read(2)` — a cancellation point, just like
-    /// `pam_get_authtok` — so `cancel_and_join` can only return promptly by
-    /// actually cancelling the thread.  `C-unwind` lets glibc's
-    /// `abi::__forced_unwind` pass through this frame.
-    unsafe extern "C-unwind" fn join_test_worker(arg: *mut c_void) -> *mut c_void {
-        let ctx = unsafe { &*(arg as *const JoinTestCtx) };
-        JOIN_TEST_STARTED.store(true, Ordering::Release);
-        let mut buf = [0u8; 1];
-        unsafe {
-            libc::read(ctx.pipe_read, buf.as_mut_ptr() as *mut c_void, 1);
-        }
-        std::ptr::null_mut()
-    }
-
-    // `libc::pthread_create` wants an `extern "C"` fn; this binding keeps the
-    // worker's `C-unwind` ABI without transmuting function signatures.
-    extern "C" {
-        #[link_name = "pthread_create"]
-        fn pthread_create_unwind(
-            thread: *mut libc::pthread_t,
-            attr: *const libc::pthread_attr_t,
-            start_routine: unsafe extern "C-unwind" fn(*mut c_void) -> *mut c_void,
-            arg: *mut c_void,
-        ) -> libc::c_int;
-    }
-
-    #[test]
-    fn cancel_and_join_reaps_a_worker_blocked_in_a_cancellation_point() {
-        let mut fds: [libc::c_int; 2] = [-1, -1];
-        assert_eq!(
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "pipe2 failed"
-        );
-
-        // The write end stays open: only a cancel unblocks the worker.
-        let ctx = JoinTestCtx { pipe_read: fds[0] };
-        let mut tid = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
-        let rc = unsafe {
-            pthread_create_unwind(
-                tid.as_mut_ptr(),
-                std::ptr::null(),
-                join_test_worker,
-                &ctx as *const JoinTestCtx as *mut c_void,
-            )
-        };
-        assert_eq!(rc, 0, "pthread_create failed");
-        let tid = unsafe { tid.assume_init() };
-
-        // Watchdog: unblock the worker after 5s so a missing cancel fails this
-        // test instead of hanging it.  It owns the write end and closes it.
-        let watchdog_write = fds[1];
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
-            let byte = [1u8];
-            unsafe {
-                libc::write(watchdog_write, byte.as_ptr() as *const c_void, 1);
-                libc::close(watchdog_write);
-            }
-        });
-
-        let start_deadline = Instant::now() + Duration::from_secs(2);
-        while !JOIN_TEST_STARTED.load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < start_deadline,
-                "worker thread never started"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        let started = Instant::now();
-        unsafe { cancel_and_join(tid, true) };
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "cancel_and_join took {elapsed:?}: the worker was not cancelled and had to be \
-             unblocked by the watchdog"
-        );
-
-        unsafe { libc::close(fds[0]) };
-    }
 }
 
 /// The verdict-reuse record: the 500 ms window, its `(username, service)` key,
@@ -3609,10 +2001,10 @@ mod conversation_mode_tests {
     clippy::indexing_slicing
 )]
 mod verdict_reuse_tests {
-    use super::tests::{no_daemon, NullIpc};
     use super::*;
     use crate::outcome::{DenyVia, UnavailableReason};
-    use crate::transaction::{record, replay_for, Concluded, Via};
+    use crate::transaction::tests::{no_daemon, NullIpc};
+    use crate::transaction::{record, replay_for, Armed, Concluded, StartError, Via};
 
     const SERVICE: &str = "tapauth-test";
 
@@ -3632,6 +2024,31 @@ mod verdict_reuse_tests {
         Outcome::Denied(DenyVia::PhoneDenial)
     }
 
+    /// The mechanism exit a recorded verdict arrives as.
+    ///
+    /// `Armed::conclude` takes a `MechanismEnd` now — a mechanism never mints an
+    /// `Outcome` — so a test that records one of the three verdicts the daemon
+    /// can reach has to name the exit that produces it.
+    fn end_of(outcome: &Outcome) -> crate::transaction::MechanismEnd {
+        use crate::transaction::MechanismEnd;
+        match outcome {
+            Outcome::Granted(_) => {
+                let mut resp = shared::ipc::pb::PamAuthenticateResponse::default();
+                resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
+                MechanismEnd::Response(resp)
+            }
+            Outcome::Denied(_) => {
+                let mut resp = shared::ipc::pb::PamAuthenticateResponse::default();
+                resp.set_outcome(shared::ipc::pb::PamOutcome::Denied);
+                MechanismEnd::Response(resp)
+            }
+            Outcome::Unavailable(reason) => MechanismEnd::Reason(*reason),
+            other => unreachable!(
+                "the daemon reaches a grant, a denial or an unavailability, not {other:?}"
+            ),
+        }
+    }
+
     /// The single process-wide slot, held for the whole case.
     fn slot() -> std::sync::MutexGuard<'static, ()> {
         crate::transaction::CACHE_SLOT_LOCK
@@ -3645,7 +2062,7 @@ mod verdict_reuse_tests {
     fn record_ago(ms_ago: u64, user: &str, service: Option<&str>, outcome: Outcome) -> Instant {
         let now = Instant::now();
         let concluded = crate::transaction::armed_for_test(NullIpc, "reuse-test-request").conclude(
-            outcome,
+            end_of(&outcome),
             user,
             service.map(ServiceName::new),
         );
@@ -3755,7 +2172,7 @@ mod verdict_reuse_tests {
         let now = Instant::now();
 
         let recorded = crate::transaction::armed_for_test(NullIpc, "replace-success-request")
-            .conclude(granted(), "alice", Some(ServiceName::new(SERVICE)));
+            .conclude(end_of(&granted()), "alice", Some(ServiceName::new(SERVICE)));
         record(recorded, now);
         assert_eq!(
             replayable("alice", SERVICE, now),
@@ -3763,7 +2180,11 @@ mod verdict_reuse_tests {
         );
 
         let recorded = crate::transaction::armed_for_test(NullIpc, "replace-failure-request")
-            .conclude(unavailable(), "alice", Some(ServiceName::new(SERVICE)));
+            .conclude(
+                end_of(&unavailable()),
+                "alice",
+                Some(ServiceName::new(SERVICE)),
+            );
         record(recorded, now);
         assert_eq!(
             replayable("alice", SERVICE, now),
@@ -3818,7 +2239,11 @@ mod verdict_reuse_tests {
         ) else {
             panic!("the retry must be able to connect after the failed attempt");
         };
-        let concluded = armed.conclude(unavailable(), USER, Some(ServiceName::new(UNIQUE_SERVICE)));
+        let concluded = armed.conclude(
+            end_of(&unavailable()),
+            USER,
+            Some(ServiceName::new(UNIQUE_SERVICE)),
+        );
         assert_eq!(
             concluded.via(),
             Via::Daemon,
@@ -3843,7 +2268,7 @@ mod verdict_reuse_tests {
         let now = Instant::now();
 
         let recorded = crate::transaction::armed_for_test(NullIpc, "original-request").conclude(
-            denied(),
+            end_of(&denied()),
             USER,
             Some(ServiceName::new(UNIQUE_SERVICE)),
         );
@@ -3872,7 +2297,7 @@ mod verdict_reuse_tests {
         let now = Instant::now();
 
         let recorded = crate::transaction::armed_for_test(NullIpc, "unresolved-service-request")
-            .conclude(unavailable(), USER, None);
+            .conclude(end_of(&unavailable()), USER, None);
         assert_eq!(record(recorded, now), unavailable());
         assert!(
             replayable(USER, "", now).is_none(),
@@ -3887,7 +2312,11 @@ mod verdict_reuse_tests {
         let now = Instant::now();
 
         let recorded = crate::transaction::armed_for_test(NullIpc, "future-timestamp-request")
-            .conclude(unavailable(), "alice", Some(ServiceName::new(SERVICE)));
+            .conclude(
+                end_of(&unavailable()),
+                "alice",
+                Some(ServiceName::new(SERVICE)),
+            );
         record(recorded, now + Duration::from_millis(50));
         // `saturating_duration_since` reads a clock anomaly as "no time has
         // passed", so the conclusion still counts as fresh.  The point of the
@@ -3909,19 +2338,22 @@ mod verdict_reuse_tests {
     /// meaningful.
     #[test]
     fn cache_lookup_precedes_daemon_contact() {
-        let source = include_str!("pam_logic.rs");
-        // Only the production half of the file: the test modules contain the
-        // same identifiers inside string literals, which would otherwise
-        // satisfy the searches no matter what the production code does.
+        let source = include_str!("transaction.rs");
+        // Only the production half of the file: the test module contains the
+        // same identifiers, which would otherwise satisfy the searches no matter
+        // what the production code does. The split is on the test *module*
+        // declaration — `transaction.rs` also carries individual `#[cfg(test)]`
+        // items above `run` (`HostIo::for_test`, the two test accessors), which a
+        // bare `split_once("#[cfg(test)]")` would stop at.
         let production = source
-            .split_once("#[cfg(test)]")
+            .split_once("\n#[cfg(test)]\n#[allow(")
             .map(|(before, _)| before)
             .unwrap_or(source);
 
         // The call, not the `if let` that contains it: rustfmt is free to break
         // the pattern across lines.
         let lookup = production
-            .find("replay_for(&username, service_name.original(), Instant::now())")
+            .find("replay_for(username, service_name.original(), Instant::now())")
             .unwrap_or_else(|| panic!("invariant broken: the reuse lookup is gone from `run`"));
 
         let daemon_contact = production

@@ -19,10 +19,24 @@
 //! [`Concluded::outcome`] is the only way the orchestration's caller reads a
 //! verdict out of this type in a test build, and `Outcome::to_pam` the only way
 //! it becomes a `PAM_*` code, so a code cannot travel beside the verdict.
+//!
+//! [`run`] is the transaction itself: it takes the classification the policy
+//! produced, dispatches the pre-collected handoff, answers a duplicate, plans
+//! the wait, puts the request on the wire, and hands the wait to one of the
+//! three mechanisms. It is the only place that emits a user-visible message, and
+//! the only place that resolves the configured deadline.
 
-use crate::context::ServiceName;
+use crate::config::PamConfig;
+use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
-use crate::outcome::Outcome;
+use crate::mechanism::{handoff, sequential, threaded};
+use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReason};
+use crate::pam_messages::PamMessages;
+use crate::pam_sys::{PamConversation, PamHandle};
+use crate::plan::{Announcement, Plannable, TtyUse};
+use crate::policy::{Conversation, Participation};
+use std::borrow::Cow;
+use std::fs::File;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -158,19 +172,18 @@ impl<I: IpcResponseReader> Armed<I> {
     /// The conclusion this request reached.
     ///
     /// Consumes the `Armed`, so a conclusion cannot outlive the fact that a
-    /// request was on the wire. At this step the mechanisms still return an
-    /// [`Outcome`] (`MechanismEnd` arrives in step 6); step 6 narrows the
-    /// parameter to `MechanismEnd` and moves the `from_daemon` call inside this
-    /// function, so the daemon's answer is mapped where the conclusion is
-    /// minted.
+    /// request was on the wire, and consumes the mechanism's [`MechanismEnd`],
+    /// so the daemon's answer is mapped to a verdict here and nowhere else: a
+    /// mechanism cannot mint a `Granted` or a `Denied` of its own (§3.5.2
+    /// layer 4).
     pub(crate) fn conclude(
         self,
-        outcome: Outcome,
+        end: MechanismEnd,
         username: &str,
         service: Option<ServiceName>,
     ) -> Concluded {
         Concluded {
-            outcome,
+            outcome: end.into_outcome(),
             username: username.to_owned(),
             service,
             via: Via::Daemon,
@@ -183,6 +196,144 @@ impl<I: IpcResponseReader> Armed<I> {
     /// mutable borrow and the id's shared borrow separately.
     pub(crate) fn parts(&mut self) -> (&mut I, &str) {
         (&mut self.ipc, &self.request_id)
+    }
+}
+
+/// A mechanism's exit.
+///
+/// It carries the daemon's response, an unavailability reason, or a local error
+/// reason — never an [`Outcome`]: only [`Armed::conclude`] may turn one into a
+/// conclusion, so a mechanism cannot mint one of its own. `Error` exists for the
+/// two local-resource failures the threaded mechanism owns (`pipe2`,
+/// `pthread_create`), which must keep returning `PAM_AUTH_ERR` and must keep
+/// being recorded. The response is owned, because a mechanism cannot return a
+/// borrow of its own local.
+pub(crate) enum MechanismEnd {
+    Response(shared::ipc::pb::PamAuthenticateResponse),
+    Reason(UnavailableReason),
+    Error(ErrorReason),
+}
+
+impl MechanismEnd {
+    /// The verdict this exit names.
+    ///
+    /// The one mapping from an exit to an outcome, used by [`Armed::conclude`]
+    /// for a transaction that reached the daemon and by [`run`]'s handoff arm,
+    /// which has no request to conclude.
+    fn into_outcome(self) -> Outcome {
+        match self {
+            MechanismEnd::Response(resp) => Outcome::from_daemon(resp),
+            MechanismEnd::Reason(reason) => Outcome::Unavailable(reason),
+            MechanismEnd::Error(reason) => Outcome::Error(reason),
+        }
+    }
+}
+
+/// What the transaction puts on the wire.
+///
+/// Handed to the injected `send` closure so that closure sees exactly the four
+/// request facts and nothing else — no plan, no cache, no caller context.
+pub(crate) struct SendParams<'a> {
+    pub(crate) username: &'a str,
+    pub(crate) has_tty: bool,
+    pub(crate) timeout_secs: u32,
+    pub(crate) request_id: &'a str,
+}
+
+/// The PAM handle and the messages the orchestration built, plus — in
+/// production only — the conversation they belong to.
+///
+/// `new` is the only production constructor and always passes `Some`; `for_test`
+/// is its `#[cfg(test)]` counterpart and passes `None`, which makes [`emit`] a
+/// no-op, so a test never opens a real PAM handle. A test that needs to *see*
+/// the emission order uses `for_test_recording`, which records the text instead.
+///
+/// The type deliberately owns no terminal: the `/dev/tty` file is `run`'s local
+/// and is consumed by the sequential mechanism.
+pub(crate) struct HostIo<'a> {
+    pamh: *mut PamHandle,
+    conv: Option<&'a PamConversation<'a>>,
+    msgs: &'a PamMessages,
+    /// Test-only record of what [`emit`] was asked to show.
+    #[cfg(test)]
+    emitted: Option<&'a std::cell::RefCell<Vec<String>>>,
+}
+
+impl<'a> HostIo<'a> {
+    pub(crate) fn new(
+        pamh: *mut PamHandle,
+        conv: &'a PamConversation<'a>,
+        msgs: &'a PamMessages,
+    ) -> Self {
+        HostIo {
+            pamh,
+            conv: Some(conv),
+            msgs,
+            #[cfg(test)]
+            emitted: None,
+        }
+    }
+
+    /// The handle a mechanism needs for its one conversation call, if any.
+    pub(crate) fn pamh(&self) -> *mut PamHandle {
+        self.pamh
+    }
+
+    /// Show one notice, if there is one.
+    ///
+    /// The one emission site in the crate: `try_info`/`try_error` swallow a
+    /// failing conversation, so a broken host conversation cannot change the
+    /// verdict, and the style comes from the notice's reason rather than from
+    /// the site that observed the failure.
+    pub(crate) fn emit(&self, notice: Option<Notice<'_>>) {
+        let Some(notice) = notice else {
+            return;
+        };
+        #[cfg(test)]
+        if let Some(log) = self.emitted {
+            log.borrow_mut().push(notice.text.to_string());
+        }
+        let Some(conv) = self.conv else {
+            return;
+        };
+        match notice.style {
+            NoticeStyle::Info => conv.try_info(&notice.text),
+            NoticeStyle::Error => conv.try_error(&notice.text),
+        }
+    }
+
+    /// A host with no conversation: every emission is a no-op.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pamh: *mut PamHandle,
+        conv: Option<&'a PamConversation<'a>>,
+        msgs: &'a PamMessages,
+    ) -> Self {
+        HostIo {
+            pamh,
+            conv,
+            msgs,
+            emitted: None,
+        }
+    }
+
+    /// A host that records what it was asked to show, in order.
+    ///
+    /// The only way an ordering assertion can see an announcement without a real
+    /// PAM handle, which is what `announcement_order_matches_today` needs.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn for_test_recording(
+        pamh: *mut PamHandle,
+        msgs: &'a PamMessages,
+        emitted: &'a std::cell::RefCell<Vec<String>>,
+    ) -> Self {
+        HostIo {
+            pamh,
+            conv: None,
+            msgs,
+            emitted: Some(emitted),
+        }
     }
 }
 
@@ -411,6 +562,219 @@ pub(crate) fn replay_for(username: &str, service: &str, now: Instant) -> Option<
     CACHE.replay_for(username, service, now)
 }
 
+/// One authentication transaction, from the classification to the conclusion.
+///
+/// Everything that happens *before* a request is on the wire returns
+/// `Finished::Unrecorded`: the pre-collected handoff, a failed request id, a
+/// failed connect or send. Recording one of those would answer a later
+/// duplicate with a verdict the daemon never reached.
+///
+/// Everything after [`Armed::open`] returns `Finished::Concluded`, with
+/// `Via::Daemon` for this call's own request and `Via::Replay` for a duplicate
+/// answered from the reuse record.
+///
+/// Every return emits its verdict's one message through `host` before returning,
+/// so a message can be neither lost by an early return nor doubled; the paths
+/// that return before a conversation exists carry outcomes whose notice is
+/// `None` by construction (`outcomes_that_precede_the_conversation_are_silent`).
+/// The mechanisms themselves emit nothing.
+///
+/// `probe_tty`, `connect`, `send` and `cancel` are the transaction's four
+/// injected effects: production passes the real `/dev/tty` open,
+/// `IpcClient::connect_nonblocking`, the `send_authenticate_start` closure and
+/// the fresh-connection cancel, and a test passes counters, failures or a
+/// recording cancel, so "the skip never reaches the daemon", "a connect failure
+/// records nothing" and "a timeout cancels nothing" are assertions rather than
+/// promises.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run<T, C, S, X>(
+    ctx: &CallerContext,
+    username: &str,
+    participation: &Participation,
+    host: &mut HostIo<'_>,
+    cfg: &PamConfig,
+    probe_tty: impl FnOnce() -> Option<File>,
+    connect: C,
+    send: S,
+    cancel: X,
+) -> Finished
+where
+    T: IpcResponseReader,
+    C: FnOnce() -> Result<T, IpcError>,
+    S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
+    X: Fn(&str, &str),
+{
+    // `PreCollected` has no plan at all: its handoff is the last thing that
+    // happens before the transaction machinery, and it returns before a probe,
+    // a `Plan` or a cache lookup exists — which is why `plan::Plannable` has no
+    // `PreCollected` variant to excuse.
+    //
+    // The same match produces the carrier for the probe, the plan and the
+    // mechanism, so a `PreCollected` participation cannot reach any of them.
+    let plannable = match participation.conversation {
+        Conversation::Threaded => Plannable::Threaded,
+        Conversation::Sequential => Plannable::Sequential,
+        Conversation::PreCollected => {
+            let outcome = handoff::perform(host).into_outcome();
+            host.emit(outcome.notice(host.msgs));
+            return Finished::Unrecorded(outcome);
+        }
+    };
+
+    // First, answer a duplicate: the lock-screen duplicate is queued while the
+    // first transaction is still running, so replaying the code this process
+    // just concluded is the correct answer to a retry no user could have
+    // initiated.
+    //
+    // The paths above deliberately record nothing. The pre-collected handoff
+    // never contacts the daemon, so there is no transaction to suppress: storing
+    // its `PAM_AUTHINFO_UNAVAIL` would only let a duplicate skip
+    // `pam_get_authtok`, leaving `PAM_AUTHTOK` unset for `pam_unix` on that
+    // handle. None of them may clobber the last real conclusion.
+    // The captured service name keys the cache: `None` means the service is
+    // unknown, which disables the cache for this call rather than collapsing
+    // every such call into one key.
+    if let Some(service_name) = ctx.service() {
+        // A hit is a conclusion — an earlier call's — so it is `Concluded`,
+        // with `Via::Replay` saying it must not be recorded again: that would
+        // refresh the timestamp, so the window stays anchored to the original
+        // verdict no matter how many duplicates arrive. It is not a sliding
+        // window. The hit's own log line (with its age) belongs to the cache,
+        // which is the only place that knows it.
+        if let Some(concluded) = replay_for(username, service_name.original(), Instant::now()) {
+            return Finished::Concluded(concluded);
+        }
+    }
+
+    // The `/dev/tty` probe, gated by `Plannable::tty_use` — a function of the
+    // carrier alone — so `conversation == Sequential` is not tested a second
+    // time here. It runs *after* the reuse lookup: a duplicate answered from the
+    // record must not open the terminal at all.
+    //
+    // A host whose conversation we drive from a worker thread must not take the
+    // terminal branch either: it would start polling `/dev/tty` on this thread
+    // and steal the stdin the host expects for its own dialog.
+    let tty_file = if plannable.tty_use() == TtyUse::PollForKey {
+        probe_tty()
+    } else {
+        None
+    };
+    let has_tty = tty_file.is_some();
+    let plan = plannable.plan(has_tty);
+
+    // Announce the wait. Each call is a single non-blocking `PAM_TEXT_INFO`
+    // (one conversation round trip that carries no input and never waits for
+    // the user). The terminal and threaded paths get theirs here, before the
+    // wait starts; a no-terminal sequential host gets `WaitThenPassword`
+    // further down, right before the module begins blocking, because such hosts
+    // only reveal their password entry once a PAM message arrives.
+    match plan.announcement {
+        Announcement::WaitSkipHint => host.emit(Some(Notice {
+            style: NoticeStyle::Info,
+            text: Cow::Borrowed(host.msgs.waiting_for_tap_skip()),
+        })),
+        Announcement::Wait => host.emit(Some(Notice {
+            style: NoticeStyle::Info,
+            text: Cow::Borrowed(host.msgs.waiting_for_tap()),
+        })),
+        // Emitted after the request is on the wire, just below.
+        Announcement::WaitThenPassword => {}
+    }
+
+    // Generate a per-request id to correlate cancellation (shared by auth and skip branches)
+    let mut rid_bytes = [0u8; 16];
+    if let Err(e) = getrandom::fill(&mut rid_bytes) {
+        tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
+        return Finished::Unrecorded(Outcome::Error(ErrorReason::RequestId));
+    }
+    let request_id = hex::encode(rid_bytes);
+    // The deadline, resolved once from the plan and anchored *before* the
+    // request is on the wire, so a stalled connect or write consumes budget
+    // instead of running past it. The daemon gets the same number of seconds,
+    // so the two deadlines stay in sync. This is the only site the clamp has.
+    let timeout_secs = plan.deadline.resolve(cfg);
+    let deadline_at = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+    let context = match (plannable, plan.tty_use) {
+        (Plannable::Threaded, _) => "gui-threaded",
+        (Plannable::Sequential, TtyUse::PollForKey) => "terminal",
+        (Plannable::Sequential, TtyUse::DoNotOpen) => "gui-sequential",
+    };
+    tracing::debug!(
+        "Authentication deadline: {}s (context: {})",
+        timeout_secs,
+        context
+    );
+
+    // Establish nonblocking IPC connection and send authenticate request.
+    //
+    // `Armed::open` produces the `Armed` only when the request is actually on
+    // the wire — i.e. after both the connect and the send succeeded — and it is
+    // the only way to reach a conclusion, so a local IPC failure cannot record
+    // one. Recording a failure would let a later duplicate inherit that
+    // `PAM_AUTHINFO_UNAVAIL` without ever asking, and a genuine retry must dial
+    // the socket again.
+    let request = SendParams {
+        username,
+        has_tty,
+        timeout_secs,
+        request_id: &request_id,
+    };
+    // The id is cloned into the `Armed` because `SendParams` borrows it and the
+    // closure that consumes it runs inside `open`, after the `Armed` exists.
+    let mut armed = match Armed::open(
+        connect,
+        |ipc| send(ipc, &request),
+        request_id.clone().into_boxed_str(),
+    ) {
+        Ok(armed) => armed,
+        // The two pre-arm IPC failures: no request reached the daemon, so the
+        // verdict is unrecorded, and each names its own message
+        // (`cannot_connect` vs `communication_error`).
+        Err(StartError::Connect(e)) => {
+            tracing::error!("Failed to connect to tapauthd: {}", e);
+            let outcome = Outcome::Unavailable(UnavailableReason::DaemonUnreachable);
+            host.emit(outcome.notice(host.msgs));
+            return Finished::Unrecorded(outcome);
+        }
+        Err(StartError::Send(e)) => {
+            tracing::error!("Failed to send authenticate request: {}", e);
+            let outcome = Outcome::Unavailable(UnavailableReason::DaemonSendFailed);
+            host.emit(outcome.notice(host.msgs));
+            return Finished::Unrecorded(outcome);
+        }
+    };
+
+    // GUI contexts whose conversation must be left to the host wait for the
+    // daemon on this thread and never *drive* the conversation. Password
+    // fallback happens after this returns, when the next PAM module runs its
+    // own conversation.
+    //
+    // Announce the wait now that the request is on the wire and the module is
+    // about to block. Event-loop hosts (GDM's auth prompt, KDE's
+    // kscreenlocker_worker) only reveal their password entry once a PAM module
+    // sends a query or a `PAM_TEXT_INFO`, so this is what gives the user a
+    // visible password route while we wait.
+    if plan.announcement == Announcement::WaitThenPassword {
+        host.emit(Some(Notice {
+            style: NoticeStyle::Info,
+            text: Cow::Borrowed(host.msgs.waiting_for_tap_password()),
+        }));
+    }
+
+    // The mechanism owns the wait; it returns an exit, never a verdict, so the
+    // daemon's answer becomes an `Outcome` exactly once, in `conclude`.
+    let end = match plannable {
+        Plannable::Threaded => threaded::drive(&mut armed, &plan, deadline_at, host.pamh()),
+        Plannable::Sequential => {
+            sequential::drive(&mut armed, &plan, deadline_at, tty_file, cancel)
+        }
+    };
+
+    let concluded = armed.conclude(end, username, ctx.service().cloned());
+    host.emit(concluded.outcome.notice(host.msgs));
+    Finished::Concluded(concluded)
+}
+
 /// The test carrier over a fake reader; no test opens a real daemon socket.
 #[cfg(test)]
 pub(crate) fn armed_for_test<I: IpcResponseReader>(ipc: I, request_id: &str) -> Armed<I> {
@@ -438,7 +802,7 @@ pub(crate) static CACHE_SLOT_LOCK: Mutex<()> = Mutex::new(());
     clippy::panic,
     clippy::indexing_slicing
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::outcome::{GrantVia, UnavailableReason};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -482,6 +846,130 @@ mod tests {
             service: Some(ServiceName::new("sudo")),
             via,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Driving `run`: the transport doubles and the harness the moved tests
+    // share. No test opens a daemon socket.
+    // ------------------------------------------------------------------
+
+    /// An `IpcResponseReader` that carries nothing: enough to satisfy the
+    /// transport bound for a path that fails before either end is used.
+    pub(crate) struct NullIpc;
+
+    impl IpcResponseReader for NullIpc {
+        fn fd(&self) -> std::os::fd::RawFd {
+            -1
+        }
+
+        fn try_read_response_nonblocking(
+            &mut self,
+        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+            Ok(None)
+        }
+
+        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    /// A connect that fails the way a missing socket does, for the paths whose
+    /// call counts are the assertion.
+    pub(crate) fn no_daemon() -> IpcError {
+        IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "no daemon socket",
+        ))
+    }
+
+    /// The exit every daemon grant arrives as: a `Success` response.
+    fn success_end() -> MechanismEnd {
+        let mut resp = shared::ipc::pb::PamAuthenticateResponse::default();
+        resp.set_outcome(shared::ipc::pb::PamOutcome::Success);
+        MechanismEnd::Response(resp)
+    }
+
+    /// Timeouts of zero, so a path that gets as far as the mechanism returns
+    /// without waiting: these tests assert call counts and orderings, not
+    /// waiting.
+    fn zero_timeouts() -> PamConfig {
+        PamConfig {
+            pam_operation_timeout_secs: 0,
+            pam_gui_timeout_secs: 0,
+        }
+    }
+
+    /// A caller context from already-resolved facts.
+    fn context(service: Option<&str>, process: Option<&str>) -> CallerContext {
+        let process = match process {
+            Some(name) => crate::context::ProcessIdentity::Exe(name.into()),
+            None => crate::context::ProcessIdentity::Unknown,
+        };
+        CallerContext::from_parts(service, process, crate::context::GdmReauth::Absent)
+    }
+
+    /// The participation `classify` produces for `ctx`.
+    ///
+    /// `run` is downstream of the policy — it receives a participation and never
+    /// re-branches on identity — so a test that drives `run` directly has to
+    /// name the one the context classifies to.
+    fn participation_for(ctx: &CallerContext) -> Participation {
+        match crate::policy::classify(ctx) {
+            crate::policy::Classification::Participate(participation) => participation,
+            crate::policy::Classification::Skip(skip) => {
+                panic!("expected a participation, got the skip {skip:?}")
+            }
+        }
+    }
+
+    /// Drive `run` with a context, a tty probe and the two injected IPC effects,
+    /// and report its result plus how many times the probe ran.
+    fn run_with_probe<T, C, S>(
+        ctx: &CallerContext,
+        tty: Option<&str>,
+        connect: C,
+        send: S,
+    ) -> (Finished, usize)
+    where
+        T: IpcResponseReader,
+        C: FnOnce() -> Result<T, IpcError>,
+        S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
+    {
+        let msgs = PamMessages::new("en");
+        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs);
+        let participation = participation_for(ctx);
+        let mut probes = 0usize;
+        let finished = run(
+            ctx,
+            "tty-probe-test-user",
+            &participation,
+            &mut host,
+            &zero_timeouts(),
+            || {
+                probes += 1;
+                tty.and_then(|path| std::fs::File::open(path).ok())
+            },
+            connect,
+            send,
+            |_, _| {},
+        );
+        (finished, probes)
+    }
+
+    /// Record `outcome` for `(username, service)` at `at`, through the same
+    /// `Armed`-conclude-record path `authenticate` uses.
+    fn record_conclusion(username: &str, service: &str, outcome: Outcome, at: Instant) {
+        let end = match outcome {
+            Outcome::Granted(_) => success_end(),
+            Outcome::Unavailable(reason) => MechanismEnd::Reason(reason),
+            other => unreachable!("these tests record a grant or an unavailability, not {other:?}"),
+        };
+        let concluded = armed_for_test(NullIpc, "pam-logic-test-request").conclude(
+            end,
+            username,
+            Some(ServiceName::new(service)),
+        );
+        let _ = record(concluded, at);
     }
 
     /// Both arms report the verdict they carry, and a `Concluded` keeps its
@@ -569,7 +1057,7 @@ mod tests {
             panic!("both effects succeeded, so the request is on the wire");
         };
         let concluded = armed.conclude(
-            Outcome::Unavailable(UnavailableReason::TimedOut),
+            MechanismEnd::Reason(UnavailableReason::TimedOut),
             "alice",
             Some(ServiceName::new("sudo")),
         );
@@ -593,11 +1081,7 @@ mod tests {
         let user = "case-key-user";
         let now = Instant::now();
 
-        let recorded = armed().conclude(
-            Outcome::granted_from_daemon(),
-            user,
-            Some(ServiceName::new("sudo")),
-        );
+        let recorded = armed().conclude(success_end(), user, Some(ServiceName::new("sudo")));
         record(recorded, now);
 
         assert!(
@@ -611,11 +1095,8 @@ mod tests {
         );
 
         // And the other direction, so neither spelling is privileged.
-        let recorded = armed().conclude(
-            Outcome::granted_from_daemon(),
-            user,
-            Some(ServiceName::new("KScreenLocker")),
-        );
+        let recorded =
+            armed().conclude(success_end(), user, Some(ServiceName::new("KScreenLocker")));
         record(recorded, now);
         assert!(replay_for(user, "KScreenLocker", now).is_some());
         assert!(
@@ -785,6 +1266,251 @@ mod tests {
             "the child could not take the cache lock after the parent forked \
              while another thread held it (wait status {status}): a blocked \
              child is killed by its own alarm, so this is the D4 defect"
+        );
+    }
+    // ------------------------------------------------------------------
+    // The transaction's own behaviour, moved with `run` when the mechanisms
+    // became modules. Assertions unchanged.
+    // ------------------------------------------------------------------
+
+    /// `/dev/tty` is opened once, and only for the conversation that polls it.
+    ///
+    /// The defect this catches: the probe moved to the top of `run` (or gated on
+    /// `conversation == Sequential` a second time, next to the plan), so a
+    /// threaded host polls the terminal and steals the stdin its own dialog
+    /// needs — or a plan maker and the probe disagree about whether a terminal
+    /// exists.
+    #[test]
+    fn tty_probe_only_for_sequential() {
+        let threaded = context(Some("probe-threaded"), Some("hyprlock"));
+        let (finished, probes) = run_with_probe(
+            &threaded,
+            Some("/dev/null"),
+            || Err::<NullIpc, _>(no_daemon()),
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+        );
+        assert_eq!(
+            (finished.outcome().clone().to_pam(), probes),
+            (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 0),
+            "a threaded conversation must not open /dev/tty"
+        );
+
+        let sequential_tty = context(Some("probe-tty"), Some("xfce4-screensaver-dialog"));
+        let (finished, probes) = run_with_probe(
+            &sequential_tty,
+            Some("/dev/null"),
+            || Err::<NullIpc, _>(no_daemon()),
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+        );
+        assert_eq!(
+            (finished.outcome().clone().to_pam(), probes),
+            (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
+            "a sequential conversation probes /dev/tty exactly once"
+        );
+
+        let sequential_no_tty = context(Some("probe-no-tty"), Some("xfce4-screensaver-dialog"));
+        let (finished, probes) = run_with_probe(
+            &sequential_no_tty,
+            None,
+            || Err::<NullIpc, _>(no_daemon()),
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+        );
+        assert_eq!(
+            (finished.outcome().clone().to_pam(), probes),
+            (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
+            "a sequential conversation probes once even when there is no terminal"
+        );
+    }
+
+    /// A duplicate answered from the reuse record does not open `/dev/tty`.
+    ///
+    /// The defect this catches: the probe left *before* the reuse lookup, where
+    /// it used to be, so every hit opened the terminal for a transaction it
+    /// never starts. The recorded conclusion is a success, so the returned code
+    /// also proves the hit was taken rather than the probe merely being skipped
+    /// on an early return.
+    ///
+    /// The reuse record is one process-wide slot that other tests in this binary
+    /// also write, and the module's lookup happens after the injected
+    /// `load_messages`, so the record is re-taken whenever a concurrent test
+    /// replaced it. The assertion itself is never relaxed: it is only evaluated
+    /// once a hit actually happened, which the returned code proves.
+    #[test]
+    fn cache_hit_does_not_open_tty() {
+        let _slot = take_slot();
+
+        let service = "cache-hit-service";
+        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
+        let conclusion = crate::outcome::Outcome::granted_from_daemon();
+        let conclusion_code = conclusion.clone().to_pam();
+
+        for _ in 0..64 {
+            record_conclusion(
+                "tty-probe-test-user",
+                service,
+                conclusion.clone(),
+                Instant::now(),
+            );
+            let (finished, probes) = run_with_probe(
+                &ctx,
+                Some("/dev/null"),
+                || Err::<NullIpc, _>(no_daemon()),
+                |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            );
+            if finished.outcome().clone().to_pam() != conclusion_code {
+                // A concurrent test replaced the single record before the
+                // lookup; nothing was proved about the ordering, so re-take it.
+                continue;
+            }
+            assert_eq!(
+                probes, 0,
+                "a cache hit must replay the conclusion and never open /dev/tty"
+            );
+            return;
+        }
+        panic!(
+            "the reuse record was replaced by a concurrent test before every one of 64 \
+             attempts, so the cache-hit path was never observed"
+        );
+    }
+
+    /// The two pre-arm IPC failures keep their own messages, and neither is
+    /// recorded.
+    ///
+    /// The defect this catches: a connect failure mapped onto
+    /// `DaemonSendFailed` (so the user sees `communication_error` where
+    /// `cannot_connect` belongs, see `Outcome::notice`), and either failure
+    /// treated as a conclusion — arming the record would let a duplicate replay
+    /// a verdict the daemon never reached. The emission itself is not
+    /// observable through a dummy conversation, so what is pinned here is the
+    /// reason each path returns, which is where the text comes from.
+    #[test]
+    fn unrecorded_paths_name_their_notice() {
+        let msgs = crate::pam_messages::load_for_user("unrecorded-test-user");
+        let ctx = context(Some("unrecorded-paths"), Some("totally-unknown"));
+
+        let (connect_failed, _) = run_with_probe(
+            &ctx,
+            None,
+            || Err::<NullIpc, _>(no_daemon()),
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+        );
+        assert!(
+            matches!(
+                &connect_failed,
+                Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::DaemonUnreachable))
+            ),
+            "a refused connect is an unrecorded DaemonUnreachable"
+        );
+        assert_eq!(
+            connect_failed.outcome().clone().to_pam(),
+            crate::pam_sys::PAM_AUTHINFO_UNAVAIL
+        );
+        let notice = connect_failed.outcome().notice(&msgs);
+        assert_eq!(
+            notice.map(|n| (n.style, n.text.into_owned())),
+            Some((
+                crate::outcome::NoticeStyle::Error,
+                msgs.cannot_connect().to_owned()
+            )),
+            "the connect failure must still show cannot_connect, as an error"
+        );
+
+        let (send_failed, _) = run_with_probe(
+            &ctx,
+            None,
+            || Ok(NullIpc),
+            |_: &mut NullIpc, _: &SendParams<'_>| Err(no_daemon()),
+        );
+        assert!(
+            matches!(
+                &send_failed,
+                Finished::Unrecorded(Outcome::Unavailable(UnavailableReason::DaemonSendFailed))
+            ),
+            "a failed write is an unrecorded DaemonSendFailed"
+        );
+        assert_eq!(
+            send_failed.outcome().clone().to_pam(),
+            crate::pam_sys::PAM_AUTHINFO_UNAVAIL
+        );
+        let notice = send_failed.outcome().notice(&msgs);
+        assert_eq!(
+            notice.map(|n| (n.style, n.text.into_owned())),
+            Some((
+                crate::outcome::NoticeStyle::Error,
+                msgs.communication_error().to_owned()
+            )),
+            "the send failure must still show communication_error, as an error"
+        );
+    }
+
+    /// A duplicate answered from the record is a `Via::Replay` conclusion.
+    ///
+    /// The defect this catches: a cache hit reported as `Via::Daemon`, which
+    /// `record` accepts — so the duplicate would re-record the verdict and turn
+    /// the fixed 500 ms window into a sliding one — and a replay that keeps the
+    /// original provenance, which re-emits the message the first call already
+    /// showed.
+    #[test]
+    fn a_cache_hit_is_a_replay_conclusion() {
+        let _slot = take_slot();
+
+        let service = "replay-provenance-service";
+        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
+        let recorded = Outcome::granted_from_daemon();
+
+        for _ in 0..64 {
+            record_conclusion(
+                "tty-probe-test-user",
+                service,
+                recorded.clone(),
+                Instant::now(),
+            );
+            let (finished, _) = run_with_probe(
+                &ctx,
+                Some("/dev/null"),
+                || Err::<NullIpc, _>(no_daemon()),
+                |_, _| Ok(()),
+            );
+
+            let Finished::Concluded(concluded) = finished else {
+                // A concurrent test replaced the single record before the
+                // lookup; nothing was proved about the provenance.
+                continue;
+            };
+            assert_eq!(
+                concluded.via(),
+                crate::transaction::Via::Replay,
+                "a cache hit must be marked as a replay"
+            );
+            assert_eq!(
+                concluded.outcome(),
+                &Outcome::replayed(&recorded),
+                "a replay must carry the recorded verdict, marked as replayed"
+            );
+            // The replay marker is what refuses the re-record (today's
+            // `from_cache`): recording the conclusion hands its verdict back
+            // and must leave the slot exactly as the first call recorded it.
+            assert_eq!(
+                crate::transaction::record(concluded, Instant::now()),
+                Outcome::replayed(&recorded),
+                "a cache hit must not be recorded again: it would slide the window"
+            );
+            assert_eq!(
+                crate::transaction::replay_for(
+                    "tty-probe-test-user",
+                    service,
+                    Instant::now()
+                )
+                .map(|c| c.outcome().clone()),
+                Some(Outcome::replayed(&recorded)),
+                "the slot must still hold the verdict the first call recorded, not                  the replay that tried to overwrite it"
+            );
+            return;
+        }
+        panic!(
+            "the reuse record was replaced by a concurrent test before every one of 64 \
+             attempts, so the cache-hit path was never observed"
         );
     }
 }
