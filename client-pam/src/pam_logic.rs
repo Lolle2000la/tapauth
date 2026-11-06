@@ -39,7 +39,7 @@ use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::IpcClient;
 use crate::logging;
-use crate::outcome::Outcome;
+use crate::outcome::{ErrorReason, Outcome, UnavailableReason};
 use crate::pam_messages;
 use crate::pam_sys;
 use crate::plan::{Announcement, Plannable, TtyUse};
@@ -484,19 +484,23 @@ unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
 /// Central event loop for the graphical authentication flow.
 ///
 /// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns an
-/// `ExitReason` plus whichever side-channel data was collected (auth response
-/// or error message).  Extracted from the main authentication body so the
-/// multiplexing logic can be unit-tested independently.
+/// `ExitReason` plus whichever side-channel data was collected (the daemon
+/// response, or the reason the IPC side failed).  Extracted from the main
+/// authentication body so the multiplexing logic can be unit-tested
+/// independently.
+///
+/// The out-parameter is a *reason*, not a message: which text and which style
+/// the failure shows is decided once, by `Outcome::notice`, so the loop cannot
+/// pick a different string from the terminal loop for the same failure.
 #[allow(clippy::too_many_arguments)]
-fn run_gui_event_loop<'a, T: IpcResponseReader>(
+fn run_gui_event_loop<T: IpcResponseReader>(
     ipc: &mut T,
     pipe_read: libc::c_int,
     deadline: Instant,
     ctx: &ThreadContext,
     request_id: &str,
-    msgs: &'a pam_messages::PamMessages,
     auth_response: &mut Option<shared::ipc::pb::PamAuthenticateResponse>,
-    pending_error: &mut Option<&'a str>,
+    pending: &mut Option<UnavailableReason>,
 ) -> ExitReason {
     loop {
         let now = Instant::now();
@@ -548,20 +552,20 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
                                     tracing::error!(
                                         "Daemon closed connection before sending response"
                                     );
-                                    *pending_error = Some(msgs.connection_lost());
+                                    *pending = Some(UnavailableReason::IpcConnectionLost);
                                     return ExitReason::IpcError;
                                 }
                                 continue;
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {e}");
-                                *pending_error = Some(msgs.communication_error());
+                                *pending = Some(UnavailableReason::IpcLoopError);
                                 return ExitReason::IpcError;
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         tracing::error!("Daemon closed connection or error detected");
-                        *pending_error = Some(msgs.connection_lost());
+                        *pending = Some(UnavailableReason::IpcConnectionLost);
                         return ExitReason::IpcError;
                     }
                 }
@@ -579,7 +583,7 @@ fn run_gui_event_loop<'a, T: IpcResponseReader>(
             Err(e) => {
                 if e != nix::errno::Errno::EINTR {
                     tracing::warn!("poll error: {e}");
-                    *pending_error = Some(msgs.communication_error());
+                    *pending = Some(UnavailableReason::IpcLoopError);
                     return ExitReason::IpcError;
                 }
             }
@@ -674,6 +678,146 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
                 }
             }
         }
+    }
+}
+
+/// The threaded GUI flow: a worker thread collects the password while the main
+/// thread multiplexes the daemon socket and a self-pipe.
+///
+/// For the hosts whose conversation stays answerable while the calling thread
+/// is blocked (see `policy`), blocking credential collection is offloaded to a
+/// native background thread so the host can process window events, and the
+/// main loop watches both the IPC socket and the self-pipe.
+///
+/// Returns the verdict, never a code: the caller maps it with `to_pam`
+/// (`finish`), so this function cannot produce a `PAM_*` value of its own. The
+/// two local-resource failures (`pipe2`, `pthread_create`) are the only errors
+/// it can report, and both cancel the in-flight request first.
+fn run_threaded<T: IpcResponseReader>(
+    pamh: *mut pam_sys::PamHandle,
+    ipc: &mut T,
+    deadline_at: Instant,
+    request_id: &str,
+) -> Outcome {
+    // O_CLOEXEC prevents the pipe fds from leaking to child processes
+    // started by the long-running privileged host (sudo, gdm, polkitd).
+    let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::error!("Failed to create secure self-pipe: {err}");
+        // Best-effort cancel so the phone doesn't keep buzzing.
+        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+            let _ = c.send_cancel("gui-pipe2-fail", request_id);
+        }
+        return Outcome::Error(ErrorReason::LocalResource);
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    let ctx = ThreadContext {
+        pamh,
+        password_entered: AtomicBool::new(false),
+        pipe_write_fd: pipe_write,
+    };
+
+    // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
+    // paths below unconditionally call pthread_join, which blocks until
+    // the worker has been fully reaped by the kernel.  Therefore the
+    // reference passed to the worker remains valid for its entire
+    // execution, regardless of whether the worker completes normally or
+    // is cancelled via pthread_cancel.
+    let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+
+    // Custom FFI binding for pthread_create that accepts the correct
+    // `extern "C-unwind"` function signature.  This avoids the undefined
+    // behaviour of transmuting between C-unwind and C ABIs.
+    extern "C" {
+        #[link_name = "pthread_create"]
+        fn pthread_create_unwind(
+            thread: *mut libc::pthread_t,
+            attr: *const libc::pthread_attr_t,
+            start_routine: unsafe extern "C-unwind" fn(
+                *mut std::os::raw::c_void,
+            ) -> *mut std::os::raw::c_void,
+            arg: *mut std::os::raw::c_void,
+        ) -> std::os::raw::c_int;
+    }
+
+    let spawn_res = unsafe {
+        pthread_create_unwind(
+            pthread_id.as_mut_ptr(),
+            std::ptr::null(),
+            native_password_worker,
+            &ctx as *const ThreadContext as *mut std::os::raw::c_void,
+        )
+    };
+
+    if spawn_res != 0 {
+        let err = std::io::Error::from_raw_os_error(spawn_res);
+        tracing::error!("Failed to create native password thread: {err}");
+        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
+            let _ = c.send_cancel("gui-thread-spawn-fail", request_id);
+        }
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+        return Outcome::Error(ErrorReason::LocalResource);
+    }
+
+    let pthread_id = unsafe { pthread_id.assume_init() };
+
+    let mut auth_response = None;
+    let mut pending: Option<UnavailableReason> = None;
+
+    let exit_reason = run_gui_event_loop(
+        ipc,
+        pipe_read,
+        deadline_at,
+        &ctx,
+        request_id,
+        &mut auth_response,
+        &mut pending,
+    );
+
+    // Cancel the worker if it hasn't already exited on its own, then always
+    // reap it (see `cancel_and_join` for why the join is load-bearing).
+    //
+    // Password entry and dialog dismissal both mean the worker has left
+    // `pam_get_authtok` on its own, so those paths skip the cancel.
+    unsafe {
+        cancel_and_join(
+            pthread_id,
+            exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed,
+        );
+        libc::close(pipe_read);
+        libc::close(pipe_write);
+    }
+
+    // The daemon answered: that is the verdict, whatever the loop exit was.
+    if let Some(resp) = auth_response {
+        return Outcome::from_daemon(resp);
+    }
+
+    // No response, so the service could not be consulted. The reason comes
+    // from the exit: the user chose the password (`PasswordEntered`, which
+    // leaves the token cached by `pam_get_authtok` for the next module),
+    // dismissed the dialog (`PasswordFailed`), the daemon went quiet
+    // (`Timeout`) or the IPC layer failed (`IpcError`, with the reason the
+    // loop recorded). Every one of them is `PAM_AUTHINFO_UNAVAIL`: on a
+    // `sufficient` line that is `ignore`, and on a `required` line a real
+    // failure — never `PAM_IGNORE`, which records no failure at all.
+    match exit_reason {
+        ExitReason::PasswordEntered => Outcome::Unavailable(UnavailableReason::PasswordChosen),
+        ExitReason::PasswordFailed => Outcome::Unavailable(UnavailableReason::PasswordDismissed),
+        ExitReason::Timeout => Outcome::Unavailable(UnavailableReason::TimedOut),
+        _ => match pending {
+            Some(reason) => Outcome::Unavailable(reason),
+            // An `IpcError` always records its reason, so this arm is
+            // unreachable; it is not a panic path because a shipped
+            // `cdylib` compiles panics out.
+            None => Outcome::Unavailable(UnavailableReason::ProtocolError),
+        },
     }
 }
 
@@ -1072,134 +1216,15 @@ fn authenticate_inner(
         };
     }
 
-    // GUI context with a threaded-conversation-capable host (see
-    // `conversation_mode`): offload blocking credential collection to a native
-    // background thread so the host can process window events, then multiplex
-    // loop events using a secure close-on-exec self-pipe.
+    // GUI context with a threaded-conversation-capable host (see `policy`):
+    // the branch body is `run_threaded`, and its verdict is mapped here — the
+    // one place this call site produces a code.
     if !has_tty && mode == ConversationMode::Threaded {
-        // O_CLOEXEC prevents the pipe fds from leaking to child processes
-        // started by the long-running privileged host (sudo, gdm, polkitd).
-        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::error!("Failed to create secure self-pipe: {err}");
-            // Best-effort cancel so the phone doesn't keep buzzing.
-            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                let _ = c.send_cancel("gui-pipe2-fail", &request_id);
-            }
-            return pam_sys::PAM_AUTH_ERR;
-        }
-        let pipe_read = pipe_fds[0];
-        let pipe_write = pipe_fds[1];
-
-        let ctx = ThreadContext {
-            pamh,
-            password_entered: AtomicBool::new(false),
-            pipe_write_fd: pipe_write,
-        };
-
-        // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
-        // paths below unconditionally call pthread_join, which blocks until
-        // the worker has been fully reaped by the kernel.  Therefore the
-        // reference passed to the worker remains valid for its entire
-        // execution, regardless of whether the worker completes normally or
-        // is cancelled via pthread_cancel.
-        let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
-
-        // Custom FFI binding for pthread_create that accepts the correct
-        // `extern "C-unwind"` function signature.  This avoids the undefined
-        // behaviour of transmuting between C-unwind and C ABIs.
-        extern "C" {
-            #[link_name = "pthread_create"]
-            fn pthread_create_unwind(
-                thread: *mut libc::pthread_t,
-                attr: *const libc::pthread_attr_t,
-                start_routine: unsafe extern "C-unwind" fn(
-                    *mut std::os::raw::c_void,
-                )
-                    -> *mut std::os::raw::c_void,
-                arg: *mut std::os::raw::c_void,
-            ) -> std::os::raw::c_int;
-        }
-
-        let spawn_res = unsafe {
-            pthread_create_unwind(
-                pthread_id.as_mut_ptr(),
-                std::ptr::null(),
-                native_password_worker,
-                &ctx as *const ThreadContext as *mut std::os::raw::c_void,
-            )
-        };
-
-        if spawn_res != 0 {
-            let err = std::io::Error::from_raw_os_error(spawn_res);
-            tracing::error!("Failed to create native password thread: {err}");
-            if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-                let _ = c.send_cancel("gui-thread-spawn-fail", &request_id);
-            }
-            unsafe {
-                libc::close(pipe_read);
-                libc::close(pipe_write);
-            }
-            return pam_sys::PAM_AUTH_ERR;
-        }
-
-        let pthread_id = unsafe { pthread_id.assume_init() };
-
-        // The verdict when no daemon response arrived.  Every remaining exit
-        // reason means the service could not be consulted — the user chose the
-        // password (`PasswordEntered`, which leaves the token cached by
-        // `pam_get_authtok` for the next module), dismissed the dialog
-        // (`PasswordFailed`), the daemon went quiet (`Timeout`) or the IPC layer
-        // failed (`IpcError`, announced through `pending_error` above).  It is
-        // not `PAM_IGNORE`: on a `sufficient` line `PAM_AUTHINFO_UNAVAIL` is
-        // equally `ignore`, while on a `required` line `PAM_IGNORE` would let a
-        // later `optional pam_permit` grant the whole stack.
-        let mut final_outcome = pam_sys::PAM_AUTHINFO_UNAVAIL;
-        let mut auth_response = None;
-        let mut pending_error: Option<&str> = None;
-
-        let exit_reason = run_gui_event_loop(
-            &mut ipc,
-            pipe_read,
-            deadline_at,
-            &ctx,
-            &request_id,
+        return finish(
+            run_threaded(pamh, &mut ipc, deadline_at, &request_id),
+            &pam_conv,
             &msgs,
-            &mut auth_response,
-            &mut pending_error,
         );
-
-        // Cancel the worker if it hasn't already exited on its own, then always
-        // reap it (see `cancel_and_join` for why the join is load-bearing).
-        //
-        // Password entry and dialog dismissal both mean the worker has left
-        // `pam_get_authtok` on its own, so those paths skip the cancel.
-        unsafe {
-            cancel_and_join(
-                pthread_id,
-                exit_reason != ExitReason::PasswordEntered
-                    && exit_reason != ExitReason::PasswordFailed,
-            );
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-
-        // The worker is fully reaped.  It is now safe to touch the PAM
-        // conversation function without racing the background thread.
-        if let Some(err_msg) = pending_error {
-            pam_conv.try_info(err_msg);
-        }
-
-        if let Some(resp) = auth_response {
-            final_outcome = finish(Outcome::from_daemon(resp), &pam_conv, &msgs);
-        }
-
-        if exit_reason == ExitReason::Timeout {
-            pam_conv.try_info(msgs.timed_out());
-        }
-
-        return final_outcome;
     }
 
     // Terminal: poll socket and /dev/tty; skip only on Enter
@@ -2441,11 +2466,10 @@ mod gui_loop_tests {
             next_response: None,
         };
         let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let msgs = pam_messages::load_for_user("testuser");
 
         let deadline = Instant::now() - Duration::from_secs(1);
         let mut auth_response = None;
-        let mut pending_error = None;
+        let mut pending: Option<UnavailableReason> = None;
 
         let reason = run_gui_event_loop(
             &mut mock_ipc,
@@ -2453,14 +2477,13 @@ mod gui_loop_tests {
             deadline,
             &ctx,
             "req-123",
-            &msgs,
             &mut auth_response,
-            &mut pending_error,
+            &mut pending,
         );
 
         assert_eq!(reason, ExitReason::Timeout);
         assert!(auth_response.is_none());
-        assert!(pending_error.is_none());
+        assert!(pending.is_none());
 
         unsafe {
             libc::close(pipe_read);
@@ -2476,7 +2499,6 @@ mod gui_loop_tests {
             next_response: None,
         };
         let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let msgs = pam_messages::load_for_user("testuser");
 
         ctx.password_entered.store(true, Ordering::Release);
         let dummy = [1u8];
@@ -2486,7 +2508,7 @@ mod gui_loop_tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut auth_response = None;
-        let mut pending_error = None;
+        let mut pending: Option<UnavailableReason> = None;
 
         let reason = run_gui_event_loop(
             &mut mock_ipc,
@@ -2494,14 +2516,13 @@ mod gui_loop_tests {
             deadline,
             &ctx,
             "req-123",
-            &msgs,
             &mut auth_response,
-            &mut pending_error,
+            &mut pending,
         );
 
         assert_eq!(reason, ExitReason::PasswordEntered);
         assert!(auth_response.is_none());
-        assert!(pending_error.is_none());
+        assert!(pending.is_none());
 
         unsafe {
             libc::close(pipe_read);
@@ -2517,7 +2538,6 @@ mod gui_loop_tests {
             next_response: None,
         };
         let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let msgs = pam_messages::load_for_user("testuser");
 
         ctx.password_entered.store(false, Ordering::Release);
         let dummy = [1u8];
@@ -2527,7 +2547,7 @@ mod gui_loop_tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut auth_response = None;
-        let mut pending_error = None;
+        let mut pending: Option<UnavailableReason> = None;
 
         let reason = run_gui_event_loop(
             &mut mock_ipc,
@@ -2535,14 +2555,13 @@ mod gui_loop_tests {
             deadline,
             &ctx,
             "req-123",
-            &msgs,
             &mut auth_response,
-            &mut pending_error,
+            &mut pending,
         );
 
         assert_eq!(reason, ExitReason::PasswordFailed);
         assert!(auth_response.is_none());
-        assert!(pending_error.is_none());
+        assert!(pending.is_none());
 
         unsafe {
             libc::close(pipe_read);
@@ -2565,10 +2584,9 @@ mod gui_loop_tests {
         server.write_all(&[1]).unwrap();
 
         let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let msgs = pam_messages::load_for_user("testuser");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut auth_response = None;
-        let mut pending_error = None;
+        let mut pending: Option<UnavailableReason> = None;
 
         let reason = run_gui_event_loop(
             &mut mock_ipc,
@@ -2576,9 +2594,8 @@ mod gui_loop_tests {
             deadline,
             &ctx,
             "req-123",
-            &msgs,
             &mut auth_response,
-            &mut pending_error,
+            &mut pending,
         );
 
         assert_eq!(reason, ExitReason::IpcResponseReceived);
@@ -2586,7 +2603,7 @@ mod gui_loop_tests {
             auth_response.unwrap().outcome(),
             shared::ipc::pb::PamOutcome::Success
         );
-        assert!(pending_error.is_none());
+        assert!(pending.is_none());
 
         unsafe {
             libc::close(pipe_read);
@@ -2605,10 +2622,9 @@ mod gui_loop_tests {
         std::mem::drop(server);
 
         let (pipe_read, pipe_write, ctx) = setup_test_pipe_and_ctx();
-        let msgs = pam_messages::load_for_user("testuser");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut auth_response = None;
-        let mut pending_error = None;
+        let mut pending: Option<UnavailableReason> = None;
 
         let reason = run_gui_event_loop(
             &mut mock_ipc,
@@ -2616,14 +2632,13 @@ mod gui_loop_tests {
             deadline,
             &ctx,
             "req-123",
-            &msgs,
             &mut auth_response,
-            &mut pending_error,
+            &mut pending,
         );
 
         assert_eq!(reason, ExitReason::IpcError);
         assert!(auth_response.is_none());
-        assert_eq!(pending_error, Some(msgs.connection_lost()));
+        assert_eq!(pending, Some(UnavailableReason::IpcConnectionLost));
 
         unsafe {
             libc::close(pipe_read);
