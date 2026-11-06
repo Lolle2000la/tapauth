@@ -70,7 +70,7 @@ fi
 
 echo ""
 echo "Remember to remove '$INSTALL_NAME' from any PAM configuration files"
-echo "in /etc/pam.d/ where you added it (e.g., sshd, login, gdm-password)."
+echo "in /etc/pam.d/ where you added it (e.g., login, sudo, su)."
 echo ""
 echo "✅ Uninstallation script finished."
 
