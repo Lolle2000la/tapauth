@@ -1,130 +1,66 @@
 package dev.rourunisen.tapauth.service
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.util.Log
-import dev.rourunisen.tapauth.data.TransportType
-import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Thread-safe manager to ensure only one transport channel (UDP or BLE) is used per authentication
- * session. This prevents duplicate responses when both channels are available.
+ * Owns the Wi-Fi [WifiManager.MulticastLock] required by the UDP multicast listener.
  *
- * The first transport to claim a challenge "wins" and the other is ignored.
+ * Holding this lock forces the Wi-Fi baseband to disable its hardware multicast filter (APF), so
+ * the lock must only be held while the UDP socket is actually bound — i.e. while the screen is on.
+ * See [AuthenticationService] for the screen-driven lifecycle.
+ *
+ * Deliberately does **not** use a [WifiManager.WifiLock] (`WIFI_MODE_FULL_HIGH_PERF` /
+ * `WIFI_MODE_FULL_LOW_LATENCY`): those keep the Wi-Fi chip awake for the whole screen-on period and
+ * are not needed because kernel network interrupts wake the SoC for socket traffic on their own.
  */
-class TransportLockManager private constructor() {
+class TransportLockManager(context: Context) {
 
-    private data class TransportLock(val transport: TransportType, val timestamp: Long)
+    private val wifiManager =
+        context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
-    // Map challenge (as hex string) to the transport that claimed it
-    private val challengeLocks = ConcurrentHashMap<String, TransportLock>()
+    private val multicastLock: WifiManager.MulticastLock? =
+        try {
+            wifiManager?.createMulticastLock(MULTICAST_LOCK_TAG)?.apply {
+                // Non-reference-counted so repeated acquire/release across screen and network
+                // transitions can never leak the lock.
+                setReferenceCounted(false)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to create Wi-Fi multicast lock: ${e.message}")
+            null
+        }
+
+    /** Whether the Wi-Fi multicast lock is currently held (diagnostic / test use). */
+    val isMulticastHeld: Boolean
+        get() = multicastLock?.isHeld == true
+
+    @Synchronized
+    fun acquireMulticastLock() {
+        val lock = multicastLock ?: return
+        if (!lock.isHeld) {
+            lock.acquire()
+            Log.d(TAG, "MulticastLock acquired")
+        }
+    }
+
+    @Synchronized
+    fun releaseMulticastLock() {
+        val lock = multicastLock ?: return
+        if (lock.isHeld) {
+            lock.release()
+            Log.d(TAG, "MulticastLock released")
+        }
+    }
 
     companion object {
         private const val TAG = "TransportLockManager"
 
-        // Locks expire after 2 minutes to prevent memory leaks
-        private const val LOCK_EXPIRY_MS = 120_000L
-
-        @Volatile private var instance: TransportLockManager? = null
-
-        fun getInstance(): TransportLockManager {
-            return instance
-                ?: synchronized(this) { instance ?: TransportLockManager().also { instance = it } }
-        }
+        /**
+         * Exact tag reported by `adb shell dumpsys wifi | grep tapauth:multicast_lock`. Keep in
+         * sync with documentation/tests; the acceptance check depends on this string.
+         */
+        const val MULTICAST_LOCK_TAG = "tapauth:multicast_lock"
     }
-
-    /**
-     * Try to claim this challenge for the given transport. Returns true if successful (first to
-     * claim), false if already claimed by another transport.
-     */
-    fun tryClaimTransport(challenge: ByteArray, transport: TransportType): Boolean {
-        val challengeHex = challenge.toHex()
-        val now = android.os.SystemClock.elapsedRealtime()
-
-        // Clean up expired locks
-        cleanupExpiredLocks(now)
-
-        // Try to claim the lock atomically
-        val existingLock = challengeLocks.putIfAbsent(challengeHex, TransportLock(transport, now))
-
-        if (existingLock == null) {
-            // Successfully claimed - we're first
-            Log.d(TAG, "Transport $transport claimed challenge ${challengeHex.take(16)}...")
-            return true
-        }
-
-        // Check if existing lock is expired
-        if (now - existingLock.timestamp > LOCK_EXPIRY_MS) {
-            // Expired, try to replace it
-            val replaced =
-                challengeLocks.replace(challengeHex, existingLock, TransportLock(transport, now))
-            if (replaced) {
-                Log.d(
-                    TAG,
-                    "Transport $transport claimed expired challenge ${challengeHex.take(16)}...",
-                )
-                return true
-            }
-        }
-
-        // Already claimed by another transport
-        if (existingLock.transport != transport) {
-            Log.i(
-                TAG,
-                "Transport $transport blocked - challenge ${challengeHex.take(16)}... already claimed by ${existingLock.transport}",
-            )
-            return false
-        }
-
-        // Already claimed by same transport (retransmission) - allow
-        return true
-    }
-
-    /** Check if a challenge is claimed by a specific transport */
-    fun isClaimedBy(challenge: ByteArray, transport: TransportType): Boolean {
-        val challengeHex = challenge.toHex()
-        val lock = challengeLocks[challengeHex] ?: return false
-
-        // Check expiry
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lock.timestamp > LOCK_EXPIRY_MS) {
-            challengeLocks.remove(challengeHex)
-            return false
-        }
-
-        return lock.transport == transport
-    }
-
-    /** Release the lock for a challenge (called when authentication completes) */
-    fun releaseLock(challenge: ByteArray) {
-        val challengeHex = challenge.toHex()
-        val removed = challengeLocks.remove(challengeHex)
-        if (removed != null) {
-            Log.d(
-                TAG,
-                "Released lock for challenge ${challengeHex.take(16)}... (transport: ${removed.transport})",
-            )
-        }
-    }
-
-    /** Clean up expired locks to prevent memory leaks */
-    private fun cleanupExpiredLocks(now: Long) {
-        val iterator = challengeLocks.entries.iterator()
-        var removedCount = 0
-
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (now - entry.value.timestamp > LOCK_EXPIRY_MS) {
-                iterator.remove()
-                removedCount++
-            }
-        }
-
-        if (removedCount > 0) {
-            Log.d(TAG, "Cleaned up $removedCount expired transport locks")
-        }
-    }
-
-    /** Get current number of active locks (for debugging) */
-    fun getActiveLockCount(): Int = challengeLocks.size
-
-    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }

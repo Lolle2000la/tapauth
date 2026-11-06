@@ -97,6 +97,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
     * **IPv6**: The Client sends to the link-local multicast group **`ff12::fdec:fc27`** on every IPv6-capable interface. The group is transient (not an IANA permanent assignment) and its low 32-bit group ID lies in the IANA "Reserved for Private Use" dynamic range `0xFD000000`-`0xFDFFFFFF` (RFC 10028).
     * **Response**: The Server responds via UDP unicast to the source IP of the request packet.
     * **Source port**: Request, confirmation and cancel datagrams are sent from an **ephemeral** source port — the client opens one socket per outgoing interface so it can pin the IPv4/IPv6 multicast interface. Servers **must** therefore reply to the configured UDP port (`udp_port`), never to the observed source port.
+    * **Availability (Android server)**: The server binds the UDP socket and joins the discovery groups only while the screen is on (`ACTION_SCREEN_ON`) and closes the socket on `ACTION_SCREEN_OFF`, so the Wi-Fi radio can enter power save while the panel is dark. A request sent while the server's screen is off is therefore dropped, and the client relies on its retransmission schedule for the session; listening resumes as soon as the screen turns on, **without requiring an unlock** (the prompt is shown over the lock screen). When the BLE transport is disabled by configuration, a screen-off server has no active transport at all until the screen turns on.
 
 * **Bluetooth Low Energy (BLE)**:
     * The Client acts in the **Advertiser/Peripheral** role.
@@ -112,7 +113,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 ### Step 2: Request Handling (Server)
 
-* The Server listens for discovery messages. Upon receiving an `EncryptedPacket`:
+* The Server listens for discovery messages while the screen is on. Upon receiving an `EncryptedPacket`:
     1.  It reads the `temporal_identifier`.
     2.  For each `CSK` of its paired clients, it independently calculates the expected identifier for the **current time window** and the **previous time window**. To avoid re-computation, these two valid identifiers for each client **should** be cached and only re-calculated when the time window changes.
     3.  It compares the received identifier against its cached valid identifiers.
