@@ -23,8 +23,6 @@
 //! and the style are a property of the reason and not of the caller. A replayed
 //! conclusion emits nothing, which is what keeps a cache hit silent.
 
-#![allow(dead_code)] // removed in step 4d, once every item has a caller
-
 use crate::pam_messages::PamMessages;
 use crate::pam_sys;
 use crate::policy::SkipPolicy;
@@ -268,7 +266,13 @@ impl Outcome {
                     style: NoticeStyle::Error,
                     text: Cow::Borrowed(msgs.communication_error()),
                 }),
-                UnavailableReason::DaemonTimedOut | UnavailableReason::TimedOut => Some(Notice {
+                // §3.5.3's two timeout rows, which differ in silence: the
+                // daemon's own `PamOutcome::Timeout` is `DaemonTimedOut` and
+                // shows **no** message (it only leaves a `tracing::info!` behind,
+                // in `from_daemon`), while `TimedOut` is this module's own
+                // deadline and is the one the user is told about.
+                UnavailableReason::DaemonTimedOut => None,
+                UnavailableReason::TimedOut => Some(Notice {
                     style: NoticeStyle::Info,
                     text: Cow::Borrowed(msgs.timed_out()),
                 }),
@@ -370,8 +374,10 @@ mod tests {
             ),
             (UnavailableReason::DaemonIgnored, None),
             (
+                // §3.5.3: the daemon's own `Timeout` row has no message; only
+                // the local deadline (`TimedOut`, below) is announced.
                 UnavailableReason::DaemonTimedOut,
-                Some((NoticeStyle::Info, msgs.timed_out())),
+                None,
             ),
             (
                 UnavailableReason::IpcConnectionLost,

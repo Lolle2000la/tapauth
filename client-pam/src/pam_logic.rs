@@ -674,25 +674,28 @@ mod tests {
     #[test]
     fn only_one_get_service_name_call_site() {
         const NEEDLE: &str = "get_service_name";
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
-            .map(|entry| entry.expect("readable dir entry").path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
-            .collect();
-        files.sort();
-        assert!(
-            files.iter().any(|p| p.ends_with("context.rs")),
-            "the scan did not cover context.rs, home of the single read: {files:?}"
-        );
+        let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        // The shared recursive walk, not one `read_dir` level: a second read
+        // could appear in `mechanism/`, which is a directory with no `rs`
+        // extension, and a single-level scan would stay green while missing it.
+        for required in [
+            "context.rs",
+            "pam_sys.rs",
+            "mechanism/sequential.rs",
+            "mechanism/threaded.rs",
+        ] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
 
         let mut definitions = 0usize;
         let mut call_sites: Vec<String> = Vec::new();
         for path in &files {
-            let source = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let cleaned = stripped_source(&source);
+            let cleaned = production_source(path);
+            let name = &relative_to_src(path);
             for (line, text) in identifier_hits(&cleaned, NEEDLE) {
                 if text.contains("fn get_service_name") {
                     definitions += 1;
@@ -749,30 +752,22 @@ mod tests {
         // source carries no literal for its own scan to find.
         let item_number: u128 = 2 * 2 * 2;
 
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
-            .map(|entry| entry.expect("readable dir entry").path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
-            .collect();
-        files.sort();
-        assert!(
-            files.iter().any(|p| p.ends_with("pam_sys.rs")),
-            "the scan did not cover pam_sys.rs, home of the user item: {files:?}"
-        );
+        let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        // The shared recursive walk and the same `#[cfg(test)]`-module split as
+        // the other scans, so a read in `mechanism/` is covered and this file's
+        // own test module is exempt.
+        for required in ["pam_sys.rs", "mechanism/sequential.rs"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}, home of the user item: {names:?}"
+            );
+        }
 
         let mut findings: Vec<String> = Vec::new();
         for path in &files {
-            let source = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            // The production half only: everything before the first
-            // `#[cfg(test)]`, the same split the other source scans here use.
-            let production = source
-                .split_once("#[cfg(test)]")
-                .map(|(before, _)| before)
-                .unwrap_or(source.as_str());
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let cleaned = stripped_source(production);
+            let name = relative_to_src(path);
+            let cleaned = production_source(path);
             for (line, text) in identifier_hits(&cleaned, ITEM) {
                 findings.push(format!("{name}:{line}: {ITEM} read in: {text}"));
             }
@@ -1337,18 +1332,99 @@ mod tests {
     }
 
     /// The production half of a source file: everything before the first
-    /// `#[cfg(test)]`.
+    /// `#[cfg(test)]` **module**.
     ///
     /// The tests below quote every forbidden token, so scanning the whole file
-    /// would flag the assertions instead of the code.
+    /// would flag the assertions instead of the code. Cutting at the test
+    /// *module* rather than at the first `#[cfg(test)]` item is what keeps the
+    /// production code above it in the scan: a file that carries a test-only
+    /// accessor early (`transaction.rs`'s `Finished::outcome`, `context.rs`'s
+    /// `from_parts`, `pam_sys.rs`'s `dummy`) would otherwise be scanned only up
+    /// to that item, and every assertion over the file would pass vacuously.
     pub(crate) fn production_source(path: &std::path::Path) -> String {
         let source = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(source.as_str());
-        stripped_source(production)
+        let end = test_module_start(&source).unwrap_or(source.len());
+        stripped_source(&source[..end])
+    }
+
+    /// The byte offset of the first `#[cfg(test)]` **module**, i.e. the start
+    /// of the file's test module.
+    ///
+    /// Only an attribute that decorates a `mod` item counts — not a test-only
+    /// `fn`, accessor or `impl`, which sits inside the production half and must
+    /// stay in the scanned text. The attribute block may carry further
+    /// attributes (`#[allow(..)]`, which is what every test module here uses)
+    /// and indentation, so the item is found by skipping to the first line that
+    /// is not itself an attribute, a doc comment or blank.
+    fn test_module_start(source: &str) -> Option<usize> {
+        let lines: Vec<&str> = source.split_inclusive('\n').collect();
+        let mut offsets = Vec::with_capacity(lines.len() + 1);
+        let mut offset = 0usize;
+        for line in &lines {
+            offsets.push(offset);
+            offset += line.len();
+        }
+        offsets.push(offset);
+
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let mut next = index + 1;
+            // Square-bracket depth, so a multi-line `#[allow(..)]` between the
+            // `cfg` and the `mod` does not look like the item. Comments are
+            // skipped without counting, so a doc block quoting `[` cannot push
+            // the scan past the item it is looking for.
+            let mut depth = 0i64;
+            while let Some(ahead) = lines.get(next) {
+                let trimmed = ahead.trim();
+                if trimmed.starts_with("//") {
+                    next += 1;
+                    continue;
+                }
+                if depth == 0 && (trimmed.is_empty() || !trimmed.starts_with("#[")) {
+                    break;
+                }
+                depth += trimmed.matches('[').count() as i64;
+                depth -= trimmed.matches(']').count() as i64;
+                next += 1;
+            }
+            let item = lines.get(next).map(|line| line.trim()).unwrap_or("");
+            let is_mod = item == "mod"
+                || [
+                    "mod ",
+                    "pub mod ",
+                    "pub(crate) mod ",
+                    "pub(super) mod ",
+                    "pub(in ",
+                ]
+                .iter()
+                .any(|prefix| item.starts_with(prefix));
+            if is_mod {
+                return Some(offsets[index]);
+            }
+        }
+        None
+    }
+
+    /// Assert a scan reached the code its assertion is about.
+    ///
+    /// The defect this catches: a truncated or relocated scan. Every assertion
+    /// over a production half is "no forbidden token is present", which is also
+    /// true of an empty string — so each scan names the declarations it must
+    /// have seen, and this is the one place the message lives. The needles are
+    /// substrings of the declarations as written (`run` is generic, so it reads
+    /// `fn run<T, C, S, X>(`).
+    pub(crate) fn assert_scan_reaches(rel: &str, cleaned: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                cleaned.contains(needle),
+                "the scanned text of {rel} does not contain {needle:?}: the scan \
+                 must stop at the first `#[cfg(test)]` module, not at the first \
+                 test-only item"
+            );
+        }
     }
 
     /// `pam_sys` constants that are not return codes: they name an item type, so
@@ -1457,6 +1533,12 @@ mod tests {
                 continue;
             }
             let cleaned = production_source(path);
+            if rel == "transaction.rs" {
+                // Guard against a re-truncated scan: this test's claim is that
+                // `run` and the reuse cache produce no code of their own, so the
+                // scan must actually have seen both (see `production_source`).
+                assert_scan_reaches(&rel, &cleaned, &["fn run", "impl ConclusionCache"]);
+            }
             for (offset, text) in pam_code_sites(&cleaned) {
                 if rel == "lib.rs" {
                     let enclosing = enclosing_fn(&cleaned, offset).unwrap_or_default();
@@ -1545,6 +1627,12 @@ mod tests {
         for path in &files {
             let rel = relative_to_src(path);
             let cleaned = production_source(path);
+            if rel == "transaction.rs" {
+                // Guard against a re-truncated scan: the two grant constructors
+                // are reached from `run` and refused by the cache, so the scan
+                // must have seen both halves of this file.
+                assert_scan_reaches(&rel, &cleaned, &["fn run", "impl ConclusionCache"]);
+            }
             if rel == "outcome.rs" {
                 definitions += cleaned.matches("fn granted_from_daemon").count();
                 definitions += cleaned.matches("fn replayed").count();
@@ -2281,6 +2369,14 @@ mod verdict_reuse_tests {
             let rel = super::tests::relative_to_src(path);
             let production = super::tests::production_source(path);
             if rel == "transaction.rs" {
+                // Guard against a re-truncated scan: the whole claim is about
+                // what the owner's module may do, and an empty production half
+                // satisfies "no other module names the lock" vacuously.
+                super::tests::assert_scan_reaches(
+                    &rel,
+                    &production,
+                    &["fn run", "impl ConclusionCache", "LAST_CONCLUSION"],
+                );
                 // The owner may lock the static; it may not hand the lock, the
                 // guard or the record out.
                 for (line, text) in production.lines().enumerate() {

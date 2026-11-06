@@ -256,4 +256,132 @@ mod tests {
             assert_eq!(GdmReauth::from_env(value), expected, "value {value:?}");
         }
     }
+
+    /// The kernel's `" (deleted)"` suffix is stripped from an `exe` basename.
+    ///
+    /// The defect this catches: the strip dropped, so an upgraded or swapped
+    /// binary (`swaylock (deleted)`) no longer matches R8, falls through to R10
+    /// and rings the phone for a host that already collected the password. The
+    /// suffix is only the kernel's, and only at the end of the name.
+    #[test]
+    fn strip_deleted_suffix() {
+        assert_eq!(
+            classify_identity(Some(Path::new("/usr/bin/swaylock (deleted)")), None),
+            ProcessIdentity::Exe("swaylock".into())
+        );
+        assert_eq!(
+            classify_identity(Some(Path::new("/usr/bin/swaylock")), None),
+            ProcessIdentity::Exe("swaylock".into())
+        );
+        // Only a trailing suffix is the kernel's; a directory named like one is
+        // not.
+        assert_eq!(
+            classify_identity(Some(Path::new("/opt/swaylock (deleted)/bin/x")), None),
+            ProcessIdentity::Exe("x".into())
+        );
+        // A basename that is *only* the suffix strips to empty, so `exe` yields
+        // nothing and `comm` becomes the only source.
+        assert_eq!(
+            classify_identity(Some(Path::new("/x/ (deleted)")), Some("sh")),
+            ProcessIdentity::Comm("sh".into())
+        );
+    }
+
+    /// The `comm` fallback is trimmed, and an empty-after-trim name is
+    /// `Unknown`.
+    ///
+    /// The defect this catches: `trim()` dropped, so `/proc/self/comm`'s
+    /// trailing newline becomes part of the name, no rule matches the truncated
+    /// spelling and a threaded host silently becomes Sequential; and a blank
+    /// `comm` accepted as `Comm("")`, which claims a provenance for a name no
+    /// rule can match.
+    #[test]
+    fn comm_fallback_trims_and_rejects_empty() {
+        let trimmed = classify_identity(None, Some("  kscreenlocker_w \n"));
+        assert_eq!(trimmed, ProcessIdentity::Comm("kscreenlocker_w".into()));
+        // The name the policy matches, not just the shape of the value: the
+        // trimmed spelling is what R5 sees.
+        let ctx = CallerContext::from_parts(Some("kde"), trimmed, GdmReauth::Absent);
+        assert!(
+            matches!(
+                crate::policy::classify(&ctx),
+                crate::policy::Classification::Participate(participation)
+                    if participation.rule == crate::policy::RuleId::R5
+            ),
+            "the trimmed comm spelling must reach R5"
+        );
+
+        assert_eq!(
+            classify_identity(None, Some("   \n")),
+            ProcessIdentity::Unknown,
+            "a blank comm is no name at all"
+        );
+        assert_eq!(classify_identity(None, Some("")), ProcessIdentity::Unknown);
+    }
+
+    /// `exe` wins over `comm` when both are readable.
+    ///
+    /// The defect this catches: `comm` consulted before `exe` (or `exe` treated
+    /// as a fallback), so a process whose truncated `comm` spelling is a
+    /// near-miss is classified from the wrong name while its real binary name
+    /// was available.
+    #[test]
+    fn exe_wins_over_comm() {
+        assert_eq!(
+            classify_identity(Some(Path::new("/usr/bin/kscreenlocker_worker")), Some("sh")),
+            ProcessIdentity::Exe("kscreenlocker_worker".into())
+        );
+        // Even a `(deleted)` `exe` that still has a name outranks `comm`.
+        assert_eq!(
+            classify_identity(Some(Path::new("/usr/bin/swaylock (deleted)")), Some("sh")),
+            ProcessIdentity::Exe("swaylock".into())
+        );
+        // And `comm` is the answer only when `exe` produced nothing.
+        assert_eq!(
+            classify_identity(Some(Path::new("/")), Some("sh")),
+            ProcessIdentity::Comm("sh".into())
+        );
+    }
+
+    /// A GDM reauthentication needs the service half as well as the flag.
+    ///
+    /// The defect this catches: `is_gdm_reauth` testing only
+    /// `GDM_SESSION_FOR_REAUTH`, so the variable alone exempts any display
+    /// manager from R2 — a `sddm` login with the variable set would participate
+    /// instead of populating `PAM_AUTHTOK`, and its keyring would stay locked.
+    #[test]
+    fn gdm_reauth_requires_service() {
+        let worker = || ProcessIdentity::Exe("gdm-session-worker".into());
+
+        let reauth = CallerContext::from_parts(Some("gdm-password"), worker(), GdmReauth::Present);
+        assert!(reauth.is_gdm_reauth(), "gdm-password plus the flag is R3's");
+
+        let login = CallerContext::from_parts(Some("gdm-password"), worker(), GdmReauth::Absent);
+        assert!(
+            !login.is_gdm_reauth(),
+            "the flag is a conjunct, not the whole rule"
+        );
+
+        // A display manager *other than* `gdm-password` keeps its keyring
+        // bypass even with the variable set: the flag alone must not turn a
+        // skip into a participation.
+        let sddm = CallerContext::from_parts(
+            Some("sddm"),
+            ProcessIdentity::Exe("sddm".into()),
+            GdmReauth::Present,
+        );
+        assert!(!sddm.is_gdm_reauth());
+        assert!(
+            matches!(
+                crate::policy::classify(&sddm),
+                crate::policy::Classification::Skip(crate::policy::SkipPolicy::KeyringNeedsAuthtok)
+            ),
+            "an sddm login with GDM_SESSION_FOR_REAUTH set must still be the \
+             keyring bypass, not a participation"
+        );
+
+        // An unresolved service can never be a reauthentication either.
+        let unknown = CallerContext::from_parts(None, worker(), GdmReauth::Present);
+        assert!(!unknown.is_gdm_reauth());
+    }
 }

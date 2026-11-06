@@ -100,8 +100,8 @@ pub(crate) struct Participation {
     pub(crate) rule: RuleId,
     pub(crate) conversation: Conversation,
     /// The rule's class, copied here so the failure direction is part of the
-    /// value and not only of the table (`class_agrees_with_conversation`).
-    #[allow(dead_code)]
+    /// value and not only of the table (`class_agrees_with_conversation`). Read
+    /// in production by `transaction::run`'s class/plan assertion.
     pub(crate) failure_direction: FailureDirection,
 }
 
@@ -479,6 +479,7 @@ fn classification_of(rule: &Rule) -> Classification {
 mod tests {
     use super::*;
     use crate::context::{classify_identity, GdmReauth};
+    use crate::plan::{Announcement, Deadline, Plan, Plannable, TtyUse};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -678,6 +679,20 @@ mod tests {
         }
     }
 
+    /// Every corpus row classifies to the rule and policy it names, and a
+    /// participating row's `tty` column produces the §3.4.1 plan cell.
+    ///
+    /// What the column-by-column feeding covers: the `exe`/`comm` pair is fed to
+    /// `classify_identity` before `classify`, so a precedence or `(deleted)`
+    /// regression fails at the column that caused it; `env` goes through
+    /// `GdmReauth::from_env`, so presence-only parsing is exercised rather than
+    /// assumed. The `tty` column is fed to `Plannable::plan`, which is the only
+    /// consumer of `has_tty`: a row whose terminal expectation drifts from its
+    /// policy (say `sequential_with_tty` losing its `1`) fails here, on the
+    /// plan cell, instead of only in a shell shape that may not run. `skip_*`
+    /// and `precollected` rows have no `Plan` — the skip returns before a plan
+    /// exists and the handoff returns before the probe — so they assert the
+    /// classification only.
     #[test]
     fn corpus_characterises_the_decision_table() {
         for row in rows() {
@@ -740,6 +755,50 @@ mod tests {
                 row.id,
                 row.why
             );
+
+            // The `tty` column is `plan`'s only input, so a participating row
+            // must produce the §3.4.1 cell for that conversation — which is
+            // what makes a drifting `tty` value a failure rather than an
+            // unused column.
+            match row.expected_policy {
+                Policy::Threaded => assert_eq!(
+                    Plannable::Threaded.plan(row.tty),
+                    Plan {
+                        deadline: Deadline::Operation,
+                        announcement: Announcement::Wait,
+                        tty_use: TtyUse::DoNotOpen,
+                    },
+                    "row {}: a threaded host plans Operation/Wait/DoNotOpen for \
+                     either tty value",
+                    row.id
+                ),
+                Policy::Sequential => assert_eq!(
+                    Plannable::Sequential.plan(row.tty),
+                    Plan {
+                        deadline: if row.tty {
+                            Deadline::Operation
+                        } else {
+                            Deadline::GuiBounded
+                        },
+                        announcement: if row.tty {
+                            Announcement::WaitSkipHint
+                        } else {
+                            Announcement::WaitThenPassword
+                        },
+                        tty_use: if row.tty {
+                            TtyUse::PollForKey
+                        } else {
+                            TtyUse::DoNotOpen
+                        },
+                    },
+                    "row {} ({}): the sequential plan must match the tty column",
+                    row.id,
+                    row.why
+                ),
+                // A skip returns before a plan exists and the pre-collected
+                // handoff returns before the probe, so neither has a cell.
+                Policy::SkipRemote | Policy::SkipKeyring | Policy::PreCollected => {}
+            }
         }
     }
 

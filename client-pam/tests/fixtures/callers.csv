@@ -57,3 +57,8 @@ svc_sshd_upper,SSHD,sshd,-,-,0,R1,skip_remote,the service comparison is ASCII ca
 svc_sshd_near_miss,my-sshd,sshd,-,-,0,R10,sequential,a renamed PAMServiceName is a documented false negative,0
 svc_sshd_under_swaylock,sshd,swaylock,-,-,0,R1,skip_remote,R1 precedes the process rules so the remote skip wins,0
 svc_unknown_not_sshd,-,sh,-,-,0,R10,sequential,an unresolved service never matches the remote rule,0
+kscreenlocker_g,kde,kscreenlocker_g,-,-,0,R10,sequential,the older greet helper spelling is absent from the table,0
+xfce4_screensav,xfce4-screensaver,xfce4-screensav,-,-,0,R10,sequential,the 15-character comm spelling of a screen saver stays sequential,0
+mate_screensaver_dialog,mate-screensaver,mate-screensaver-dialog,-,-,0,R10,sequential,a mate screen saver dialog parks in the library event loop,0
+mate_screensave,mate-screensaver,mate-screensave,-,-,0,R10,sequential,the 15-character comm spelling of a mate screen saver stays sequential,0
+gdm_reauth_wrong_dm_service,sddm,sddm,-,1,0,R2,skip_keyring,the reauth flag alone does not exempt a non gdm-password service,0

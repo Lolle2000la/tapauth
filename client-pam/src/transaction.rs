@@ -34,7 +34,7 @@ use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReaso
 use crate::pam_messages::PamMessages;
 use crate::pam_sys::{PamConversation, PamHandle};
 use crate::plan::{Announcement, Plannable, TtyUse};
-use crate::policy::{Conversation, Participation};
+use crate::policy::{Conversation, FailureDirection, Participation};
 use std::borrow::Cow;
 use std::fs::File;
 use std::sync::Mutex;
@@ -241,13 +241,26 @@ pub(crate) struct SendParams<'a> {
     pub(crate) request_id: &'a str,
 }
 
+/// One thing [`HostIo::emit`] was asked to show, with the style it was shown in.
+///
+/// The recording sink's entry: the text alone would let an `Error`-style
+/// message be asserted where an `Info` one belongs, which is exactly the
+/// distinction `Outcome::notice` exists to keep.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Emitted {
+    pub(crate) style: NoticeStyle,
+    pub(crate) text: String,
+}
+
 /// The PAM handle and the messages the orchestration built, plus — in
 /// production only — the conversation they belong to.
 ///
 /// `new` is the only production constructor and always passes `Some`; `for_test`
 /// is its `#[cfg(test)]` counterpart and passes `None`, which makes [`emit`] a
 /// no-op, so a test never opens a real PAM handle. A test that needs to *see*
-/// the emission order uses `for_test_recording`, which records the text instead.
+/// the emission order uses `for_test_recording`, which records text and style
+/// instead.
 ///
 /// The type deliberately owns no terminal: the `/dev/tty` file is `run`'s local
 /// and is consumed by the sequential mechanism.
@@ -257,7 +270,7 @@ pub(crate) struct HostIo<'a> {
     msgs: &'a PamMessages,
     /// Test-only record of what [`emit`] was asked to show.
     #[cfg(test)]
-    emitted: Option<&'a std::cell::RefCell<Vec<String>>>,
+    emitted: Option<&'a std::cell::RefCell<Vec<Emitted>>>,
 }
 
 impl<'a> HostIo<'a> {
@@ -292,7 +305,10 @@ impl<'a> HostIo<'a> {
         };
         #[cfg(test)]
         if let Some(log) = self.emitted {
-            log.borrow_mut().push(notice.text.to_string());
+            log.borrow_mut().push(Emitted {
+                style: notice.style,
+                text: notice.text.to_string(),
+            });
         }
         let Some(conv) = self.conv else {
             return;
@@ -318,16 +334,18 @@ impl<'a> HostIo<'a> {
         }
     }
 
-    /// A host that records what it was asked to show, in order.
+    /// A host that records what it was asked to show, in order, with styles.
     ///
-    /// The only way an ordering assertion can see an announcement without a real
-    /// PAM handle, which is what `announcement_order_matches_today` needs.
+    /// The only way an ordering or a message assertion can see what the
+    /// transaction emitted without a real PAM handle, which is what
+    /// `announcement_order_matches_today` and `unrecorded_paths_emit_their_notice`
+    /// need.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn for_test_recording(
         pamh: *mut PamHandle,
         msgs: &'a PamMessages,
-        emitted: &'a std::cell::RefCell<Vec<String>>,
+        emitted: &'a std::cell::RefCell<Vec<Emitted>>,
     ) -> Self {
         HostIo {
             pamh,
@@ -563,6 +581,27 @@ pub(crate) fn replay_for(username: &str, service: &str, now: Instant) -> Option<
     CACHE.replay_for(username, service, now)
 }
 
+/// The transaction's one emission site: show `finished`'s message through
+/// `host`, then hand it back.
+///
+/// Every return in [`run`] goes through here, so the message is decided by the
+/// verdict *and by how it was reached*, never by the site that produced it.
+/// `Concluded`'s [`Via`] is what suppresses it: a replay is a copy of a
+/// conclusion this process already announced when it first reached it, so it
+/// must say nothing — and it must say nothing because of its provenance, not
+/// because the cache-hit arm happens to return early, so a restructure that
+/// routed a replayed `Unavailable(..)` or `Error(..)` through an ordinary
+/// return still could not speak.
+fn finish(host: &HostIo<'_>, finished: Finished) -> Finished {
+    let notice = match &finished {
+        Finished::Concluded(concluded) if concluded.via == Via::Replay => None,
+        Finished::Concluded(concluded) => concluded.outcome.notice(host.msgs),
+        Finished::Unrecorded(outcome) => outcome.notice(host.msgs),
+    };
+    host.emit(notice);
+    finished
+}
+
 /// One authentication transaction, from the classification to the conclusion.
 ///
 /// Everything that happens *before* a request is on the wire returns
@@ -574,9 +613,11 @@ pub(crate) fn replay_for(username: &str, service: &str, now: Instant) -> Option<
 /// `Via::Daemon` for this call's own request and `Via::Replay` for a duplicate
 /// answered from the reuse record.
 ///
-/// Every return emits its verdict's one message through `host` before returning,
-/// so a message can be neither lost by an early return nor doubled; the paths
-/// that return before a conversation exists carry outcomes whose notice is
+/// Every return emits its verdict's one message through `host` before returning
+/// — all of them through [`finish`] — so a message can be neither lost by an
+/// early return nor doubled; a replayed conclusion is silent because [`finish`]
+/// sees its [`Via::Replay`], not because its return happens to be early. The
+/// paths that return before a conversation exists carry outcomes whose notice is
 /// `None` by construction (`outcomes_that_precede_the_conversation_are_silent`).
 /// The mechanisms themselves emit nothing.
 ///
@@ -617,8 +658,7 @@ where
         Conversation::Sequential => Plannable::Sequential,
         Conversation::PreCollected => {
             let outcome = handoff::perform(host).into_outcome();
-            host.emit(outcome.notice(host.msgs));
-            return Finished::Unrecorded(outcome);
+            return finish(host, Finished::Unrecorded(outcome));
         }
     };
 
@@ -643,7 +683,7 @@ where
         // window. The hit's own log line (with its age) belongs to the cache,
         // which is the only place that knows it.
         if let Some(concluded) = replay_for(username, service_name.original(), Instant::now()) {
-            return Finished::Concluded(concluded);
+            return finish(host, Finished::Concluded(concluded));
         }
     }
 
@@ -662,6 +702,24 @@ where
     };
     let has_tty = tty_file.is_some();
     let plan = plannable.plan(has_tty);
+
+    // This is where the class first meets the plan (§3.3.2, §3.6 step 4): the
+    // failure direction is a table cell copied onto the participation, so the
+    // one relation it makes about the conversation is checked at the point the
+    // two values meet. `NeverRing` is the pre-collected handoff, which returned
+    // above and so can never produce a `Plannable`; `AlwaysRing` means the host
+    // can answer while we wait, which is the threaded conversation. A rule whose
+    // class and conversation drift apart fails here in a debug build and in
+    // `class_agrees_with_conversation` in every build.
+    debug_assert!(
+        !matches!(
+            (participation.failure_direction, plannable),
+            (FailureDirection::NeverRing, _)
+                | (FailureDirection::AlwaysRing, Plannable::Sequential)
+        ),
+        "class {:?} cannot be planned as {plannable:?}",
+        participation.failure_direction
+    );
 
     // Announce the wait. Each call is a single non-blocking `PAM_TEXT_INFO`
     // (one conversation round trip that carries no input and never waits for
@@ -686,7 +744,10 @@ where
     let mut rid_bytes = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut rid_bytes) {
         tracing::warn!("Failed to generate random request ID: {}, skipping...", e);
-        return Finished::Unrecorded(Outcome::Error(ErrorReason::RequestId));
+        return finish(
+            host,
+            Finished::Unrecorded(Outcome::Error(ErrorReason::RequestId)),
+        );
     }
     let request_id = hex::encode(rid_bytes);
     // The deadline, resolved once from the plan and anchored *before* the
@@ -734,14 +795,12 @@ where
         Err(StartError::Connect(e)) => {
             tracing::error!("Failed to connect to tapauthd: {}", e);
             let outcome = Outcome::Unavailable(UnavailableReason::DaemonUnreachable);
-            host.emit(outcome.notice(host.msgs));
-            return Finished::Unrecorded(outcome);
+            return finish(host, Finished::Unrecorded(outcome));
         }
         Err(StartError::Send(e)) => {
             tracing::error!("Failed to send authenticate request: {}", e);
             let outcome = Outcome::Unavailable(UnavailableReason::DaemonSendFailed);
-            host.emit(outcome.notice(host.msgs));
-            return Finished::Unrecorded(outcome);
+            return finish(host, Finished::Unrecorded(outcome));
         }
     };
 
@@ -772,8 +831,7 @@ where
     };
 
     let concluded = armed.conclude(end, username, ctx.service().cloned());
-    host.emit(concluded.outcome.notice(host.msgs));
-    Finished::Concluded(concluded)
+    finish(host, Finished::Concluded(concluded))
 }
 
 /// The test carrier over a fake reader; no test opens a real daemon socket.
@@ -1375,24 +1433,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// The two pre-arm IPC failures keep their own messages, and neither is
+    /// The two pre-arm IPC failures *emit* their own message, and neither is
     /// recorded.
     ///
-    /// The defect this catches: a connect failure mapped onto
-    /// `DaemonSendFailed` (so the user sees `communication_error` where
-    /// `cannot_connect` belongs, see `Outcome::notice`), and either failure
-    /// treated as a conclusion — arming the record would let a duplicate replay
-    /// a verdict the daemon never reached. The emission itself is not
-    /// observable through a dummy conversation, so what is pinned here is the
-    /// reason each path returns, which is where the text comes from.
+    /// The defect this catches: the `host.emit` call deleted from the
+    /// connect-failure or send-failure return, so the user is told nothing on
+    /// the one path where the daemon could not be reached at all — and a
+    /// restructure that emitted only inside the `Concluded` arm, which leaves
+    /// both of these `Unrecorded` and silent. It also pins the mapping: a
+    /// connect failure reported as `DaemonSendFailed` would show
+    /// `communication_error` where `cannot_connect` belongs. The recorded
+    /// emission is the assertion, not `notice(&msgs)` re-derived in the test,
+    /// because a re-derived notice passes with every `emit` call deleted.
     #[test]
-    fn unrecorded_paths_name_their_notice() {
-        let msgs = crate::pam_messages::load_for_user("unrecorded-test-user");
+    fn unrecorded_paths_emit_their_notice() {
+        let msgs = PamMessages::new("en");
         let ctx = context(Some("unrecorded-paths"), Some("totally-unknown"));
 
-        let (connect_failed, _) = run_with_probe(
+        let (connect_failed, shown) = shown_while_running(
             &ctx,
-            None,
+            "unrecorded-emit-user",
             || Err::<NullIpc, _>(no_daemon()),
             |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
@@ -1407,19 +1467,19 @@ pub(crate) mod tests {
             connect_failed.outcome().clone().to_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
-        let notice = connect_failed.outcome().notice(&msgs);
         assert_eq!(
-            notice.map(|n| (n.style, n.text.into_owned())),
-            Some((
-                crate::outcome::NoticeStyle::Error,
-                msgs.cannot_connect().to_owned()
-            )),
-            "the connect failure must still show cannot_connect, as an error"
+            shown,
+            vec![Emitted {
+                style: NoticeStyle::Error,
+                text: msgs.cannot_connect().to_owned(),
+            }],
+            "the connect failure must have emitted cannot_connect, as an error, \
+             and nothing else"
         );
 
-        let (send_failed, _) = run_with_probe(
+        let (send_failed, shown) = shown_while_running(
             &ctx,
-            None,
+            "unrecorded-emit-user",
             || Ok(NullIpc),
             |_: &mut NullIpc, _: &SendParams<'_>| Err(no_daemon()),
         );
@@ -1434,14 +1494,14 @@ pub(crate) mod tests {
             send_failed.outcome().clone().to_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
-        let notice = send_failed.outcome().notice(&msgs);
         assert_eq!(
-            notice.map(|n| (n.style, n.text.into_owned())),
-            Some((
-                crate::outcome::NoticeStyle::Error,
-                msgs.communication_error().to_owned()
-            )),
-            "the send failure must still show communication_error, as an error"
+            shown,
+            vec![Emitted {
+                style: NoticeStyle::Error,
+                text: msgs.communication_error().to_owned(),
+            }],
+            "the send failure must have emitted communication_error, as an error, \
+             and nothing else"
         );
     }
 
@@ -1514,10 +1574,85 @@ pub(crate) mod tests {
              attempts, so the cache-hit path was never observed"
         );
     }
+
+    /// A replayed *failure* emits nothing, and its silence is a property of its
+    /// provenance.
+    ///
+    /// The defect this catches: the cache-hit return being silent only because
+    /// it returns early, so a later restructure that emitted
+    /// `outcome.notice(..)` on the way out re-shows `communication_error` for a
+    /// duplicate the user never made. The recorded verdict is an unavailability
+    /// that *does* have a message — `Outcome::replayed` keeps the reason — so
+    /// the outcome alone cannot explain the silence: `Via::Replay` must, which
+    /// is what [`finish`] keys on.
+    #[test]
+    fn a_replayed_failure_emits_nothing() {
+        let _slot = take_slot();
+
+        let service = "replay-emit-service";
+        let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
+        let recorded = Outcome::Unavailable(UnavailableReason::DaemonSendFailed);
+        let msgs = PamMessages::new("en");
+
+        for _ in 0..64 {
+            record_conclusion(
+                "replay-emit-user",
+                service,
+                recorded.clone(),
+                Instant::now(),
+            );
+            let (finished, shown) = shown_while_running(
+                &ctx,
+                "replay-emit-user",
+                || Err::<NullIpc, _>(no_daemon()),
+                |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            );
+            let Finished::Concluded(concluded) = finished else {
+                // A concurrent test replaced the single record before the
+                // lookup; nothing was proved about the emission.
+                continue;
+            };
+            assert_eq!(
+                concluded.via,
+                Via::Replay,
+                "a duplicate answered from the record is a replay"
+            );
+            assert!(
+                concluded.outcome.notice(&msgs).is_some(),
+                "control: the recorded failure has a message \
+                 (`communication_error`), so only the replay marker can make \
+                 the emission silent"
+            );
+            assert_eq!(
+                shown,
+                Vec::new(),
+                "a replay must emit nothing: the message was shown when the \
+                 conclusion was first reached"
+            );
+            return;
+        }
+        panic!(
+            "the reuse record was replaced by a concurrent test before every one of 64 \
+             attempts, so the cache-hit path was never observed"
+        );
+    }
     // ------------------------------------------------------------------
     // The transaction's own ordering guarantees: the announcements and the
     // pre-collected arm.
     // ------------------------------------------------------------------
+
+    /// The marker `shown_order` puts in the log where the request went on the
+    /// wire: one entry of the same log as the emissions, so its position is the
+    /// request's position.
+    const OPEN_MARKER: &str = "Armed::open";
+
+    /// A log entry that is not a message.
+    fn marker(text: &str) -> Emitted {
+        Emitted {
+            style: NoticeStyle::Info,
+            text: text.to_owned(),
+        }
+    }
 
     /// What `run` showed, in order, with the point the request went on the wire
     /// marked.
@@ -1525,10 +1660,9 @@ pub(crate) mod tests {
     /// The recording host is the only way an announcement can be observed
     /// without a real PAM handle; `send` runs inside `Armed::open`, so its mark
     /// is the request's position in the same log.
-    fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<String> {
-        const OPEN: &str = "Armed::open";
+    fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<Emitted> {
         let msgs = PamMessages::new("en");
-        let log: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
         let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log);
         let participation = participation_for(ctx);
         let _finished = run(
@@ -1540,7 +1674,7 @@ pub(crate) mod tests {
             || tty.and_then(|path| std::fs::File::open(path).ok()),
             || Ok(NullIpc),
             |_: &mut NullIpc, _: &SendParams<'_>| {
-                log.borrow_mut().push(OPEN.to_owned());
+                log.borrow_mut().push(marker(OPEN_MARKER));
                 Ok(())
             },
             |_, _| {},
@@ -1548,12 +1682,49 @@ pub(crate) mod tests {
         log.into_inner()
     }
 
-    /// The position of `needle` in `log`, which must appear exactly once.
-    fn once(log: &[String], needle: &str) -> usize {
+    /// Drive `run` through a recording host with no terminal and report what it
+    /// showed, in order.
+    ///
+    /// The transaction's own emissions are the assertion in the tests that use
+    /// it, so a test can never re-derive the message from the outcome. The
+    /// participation comes from `ctx`, so the path under test is the one
+    /// `classify` really picks.
+    fn shown_while_running<T, C, S>(
+        ctx: &CallerContext,
+        username: &str,
+        connect: C,
+        send: S,
+    ) -> (Finished, Vec<Emitted>)
+    where
+        T: IpcResponseReader,
+        C: FnOnce() -> Result<T, IpcError>,
+        S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
+    {
+        let msgs = PamMessages::new("en");
+        let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
+        let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log);
+        let participation = participation_for(ctx);
+        let finished = run(
+            ctx,
+            username,
+            &participation,
+            &mut host,
+            &zero_timeouts(),
+            || None::<File>,
+            connect,
+            send,
+            |_, _| {},
+        );
+        (finished, log.into_inner())
+    }
+
+    /// The position of the message `needle` in `log`, which must appear exactly
+    /// once.
+    fn once(log: &[Emitted], needle: &str) -> usize {
         let hits: Vec<usize> = log
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.as_str() == needle)
+            .filter(|(_, entry)| entry.text == needle)
             .map(|(at, _)| at)
             .collect();
         assert_eq!(
@@ -1578,13 +1749,12 @@ pub(crate) mod tests {
     /// exists.
     #[test]
     fn announcement_order_matches_today() {
-        const OPEN: &str = "Armed::open";
         let msgs = PamMessages::new("en");
 
         // Threaded: `waiting_for_tap` before the request.
         let log = shown_order(&context(Some("order-threaded"), Some("hyprlock")), None);
         assert!(
-            once(&log, msgs.waiting_for_tap()) < once(&log, OPEN),
+            once(&log, msgs.waiting_for_tap()) < once(&log, OPEN_MARKER),
             "the threaded wait is announced before the request: {log:?}"
         );
 
@@ -1594,7 +1764,7 @@ pub(crate) mod tests {
             Some("/dev/null"),
         );
         assert!(
-            once(&log, msgs.waiting_for_tap_skip()) < once(&log, OPEN),
+            once(&log, msgs.waiting_for_tap_skip()) < once(&log, OPEN_MARKER),
             "the terminal wait is announced before the request: {log:?}"
         );
 
@@ -1607,7 +1777,7 @@ pub(crate) mod tests {
             None,
         );
         assert!(
-            once(&log, msgs.waiting_for_tap_password()) > once(&log, OPEN),
+            once(&log, msgs.waiting_for_tap_password()) > once(&log, OPEN_MARKER),
             "the password-route announcement follows the request, once the \
              module is about to block: {log:?}"
         );

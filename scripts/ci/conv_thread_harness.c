@@ -12,8 +12,8 @@
  *     - Sequential: the conversation is never touched; the module only waits
  *       for the daemon.
  *
- *   The choice is an allowlist keyed on the calling process (see
- *   `conversation_mode` in client-pam/src/pam_logic.rs).  None of it is
+ *   The choice is a rule table keyed on the caller's PAM service name and
+ *   process name (see `RULES` in client-pam/src/policy.rs).  None of it is
  *   reachable from a Rust unit test: it needs a real libpam stack, a real
  *   dynamically loaded module, and a process whose `/proc/self/exe` has the
  *   allowlisted name.
