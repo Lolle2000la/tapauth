@@ -41,9 +41,11 @@ use crate::pam_messages;
 use crate::pam_sys;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use std::ffi::OsStr;
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -332,6 +334,54 @@ enum ConversationMode {
     Sequential,
 }
 
+/// Which source the process name came from, once resolved.
+///
+/// `Exe`/`Comm` is **provenance only**: every rule matches on the name for both
+/// variants, so a real binary literally named `kscreenlocker_w` still matches
+/// the worker rule.  The distinction exists so a test can assert the
+/// `(deleted)` strip and the `comm` fallback independently.
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessIdentity {
+    Exe(Box<str>),
+    Comm(Box<str>),
+    Unknown,
+}
+
+impl ProcessIdentity {
+    /// The resolved name, or `None` when neither source produced one.
+    fn name(&self) -> Option<&str> {
+        match self {
+            ProcessIdentity::Exe(name) | ProcessIdentity::Comm(name) => Some(name),
+            ProcessIdentity::Unknown => None,
+        }
+    }
+}
+
+/// Resolve a process identity from the two `/proc` sources.
+///
+/// Pure, so the `(deleted)` strip, the empty-name rejection and the
+/// `exe`-before-`comm` precedence are unit-testable: its caller does the reads
+/// and this function does the interpretation.
+fn classify_identity(exe: Option<&Path>, comm: Option<&str>) -> ProcessIdentity {
+    if let Some(exe) = exe {
+        if let Some(name) = exe.file_name() {
+            let name = name.to_string_lossy();
+            // The kernel suffixes " (deleted)" once the binary is unlinked.
+            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
+            if !name.is_empty() {
+                return ProcessIdentity::Exe(name.into());
+            }
+        }
+    }
+    if let Some(comm) = comm {
+        let comm = comm.trim();
+        if !comm.is_empty() {
+            return ProcessIdentity::Comm(comm.into());
+        }
+    }
+    ProcessIdentity::Unknown
+}
+
 /// Best-effort identity of the process that called into this module.
 ///
 /// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
@@ -339,20 +389,14 @@ enum ConversationMode {
 /// `TASK_COMM_LEN - 1` (15) bytes, which is why `conversation_mode` accepts
 /// both the full and the truncated spelling of each process name.
 fn process_identity() -> Option<String> {
-    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
-        if let Some(name) = exe.file_name() {
-            let name = name.to_string_lossy();
-            // The kernel suffixes " (deleted)" once the binary is unlinked.
-            let name = name.strip_suffix(" (deleted)").unwrap_or(name.as_ref());
-            if !name.is_empty() {
-                return Some(name.to_owned());
-            }
-        }
+    let exe = std::fs::read_link("/proc/self/exe").ok();
+    if let ProcessIdentity::Exe(name) = classify_identity(exe.as_deref(), None) {
+        return Some(String::from(name));
     }
-    std::fs::read_to_string("/proc/self/comm")
-        .ok()
-        .map(|comm| comm.trim().to_owned())
-        .filter(|comm| !comm.is_empty())
+    let comm = std::fs::read_to_string("/proc/self/comm").ok();
+    classify_identity(None, comm.as_deref())
+        .name()
+        .map(str::to_owned)
 }
 
 /// Classify the calling host's PAM conversation.
@@ -443,7 +487,31 @@ fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> Conv
 /// for login and reauthentication.
 fn is_gdm_reauth(service: &str) -> bool {
     service.eq_ignore_ascii_case("gdm-password")
-        && std::env::var_os("GDM_SESSION_FOR_REAUTH").is_some()
+        && GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref())
+            == GdmReauth::Present
+}
+
+/// Whether the calling process carries `GDM_SESSION_FOR_REAUTH`.
+///
+/// Presence only: `var_os(..).is_some()`, so a set variable holding `0` is as
+/// present as one holding `1`, and there is no value parse to get wrong.
+/// `from_env` is pure, so the interpretation is testable without `set_var`
+/// (which would race every other test in this binary that reads the
+/// environment); [`is_gdm_reauth`] keeps the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GdmReauth {
+    Present,
+    Absent,
+}
+
+impl GdmReauth {
+    fn from_env(value: Option<&OsStr>) -> GdmReauth {
+        if value.is_some() {
+            GdmReauth::Present
+        } else {
+            GdmReauth::Absent
+        }
+    }
 }
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
@@ -3184,5 +3252,273 @@ mod verdict_reuse_tests {
             lookup,
             daemon_contact
         );
+    }
+}
+
+/// Characterisation corpus for the conversation decision table.
+///
+/// `client-pam/tests/fixtures/callers.csv` was written by reading today's code
+/// and its comments, so every later step of the refactor is checked against an
+/// oracle that was *not* generated from the refactored implementation.
+///
+/// What the corpus pins, and what it does not: it feeds the decision function
+/// *literal* inputs — the service string, `classify_identity(exe, comm)` from
+/// the two identity columns and `GdmReauth::from_env` from the `env` column. It
+/// does not pin the reads that produce those inputs (`/proc/self/exe`,
+/// `/proc/self/comm`, `GDM_SESSION_FOR_REAUTH`): no unit test can characterise a
+/// `/proc` read portably, and a test that called `set_var` would race every
+/// other test in this binary that reads the environment. The end-to-end shapes
+/// in `scripts/ci/test-pam-conv-thread.sh` stay the proof for the reads.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod caller_corpus_tests {
+    use super::*;
+
+    const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/callers.csv");
+
+    /// The schema this parser demands, in column order.
+    const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
+
+    /// What the module decides to do with a call.  `SkipRemote` belongs to R1,
+    /// which does not exist yet: the variant is parsed so a later step can add
+    /// its rows without touching the parser.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Policy {
+        SkipRemote,
+        SkipKeyring,
+        Threaded,
+        Sequential,
+        PreCollected,
+    }
+
+    /// Where the resolved process name came from.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Provenance {
+        Exe,
+        Comm,
+        Unknown,
+    }
+
+    struct Row {
+        id: String,
+        service: Option<String>,
+        exe: Option<String>,
+        comm: Option<String>,
+        env: Option<String>,
+        tty: bool,
+        /// Which rule must fire.  Parsed and carried from this commit, but only
+        /// asserted once `policy::classify` exists (step 1): today's code has no
+        /// rule ids, so there is nothing to compare it against yet.
+        expected_rule: String,
+        expected_policy: Policy,
+        why: String,
+        e2e: bool,
+    }
+
+    fn parse_bool(field: &str) -> bool {
+        match field {
+            "0" => false,
+            "1" => true,
+            other => panic!("{other:?} is not a 0/1 column value"),
+        }
+    }
+
+    /// `-` is "unreadable"/"unset"; `~` is the literal empty string, which is a
+    /// different input from a missing one.
+    fn name_field(field: &str) -> Option<String> {
+        match field {
+            "-" => None,
+            "~" => Some(String::new()),
+            other => Some(other.to_owned()),
+        }
+    }
+
+    fn optional_field(field: &str) -> Option<String> {
+        match field {
+            "-" => None,
+            other => Some(other.to_owned()),
+        }
+    }
+
+    fn parse_policy(field: &str) -> Policy {
+        match field {
+            "skip_remote" => Policy::SkipRemote,
+            "skip_keyring" => Policy::SkipKeyring,
+            "threaded" => Policy::Threaded,
+            "sequential" => Policy::Sequential,
+            "precollected" => Policy::PreCollected,
+            other => panic!("{other:?} is not a known expected_policy"),
+        }
+    }
+
+    fn parse_row(line: &str) -> Row {
+        let fields: Vec<&str> = line.split(',').collect();
+        // A `why` containing a comma is a parse error, not a quoted field.
+        assert_eq!(
+            fields.len(),
+            10,
+            "row {line}: a field contains a comma (10 columns expected)"
+        );
+        Row {
+            id: fields[0].to_owned(),
+            service: optional_field(fields[1]),
+            exe: name_field(fields[2]),
+            comm: name_field(fields[3]),
+            env: optional_field(fields[4]),
+            tty: parse_bool(fields[5]),
+            expected_rule: fields[6].to_owned(),
+            expected_policy: parse_policy(fields[7]),
+            why: fields[8].to_owned(),
+            e2e: parse_bool(fields[9]),
+        }
+    }
+
+    fn rows() -> Vec<Row> {
+        let text =
+            std::fs::read_to_string(CORPUS_PATH).expect("the fixture corpus must be readable");
+        let header = text
+            .lines()
+            .next()
+            .expect("the fixture corpus has a header");
+        assert_eq!(header, HEADER, "the fixture corpus changed its schema");
+        let mut rows: Vec<Row> = text
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(parse_row)
+            .collect();
+        assert!(!rows.is_empty(), "the fixture corpus has no rows");
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
+    }
+
+    fn provenance(identity: &ProcessIdentity) -> Provenance {
+        match identity {
+            ProcessIdentity::Exe(_) => Provenance::Exe,
+            ProcessIdentity::Comm(_) => Provenance::Comm,
+            ProcessIdentity::Unknown => Provenance::Unknown,
+        }
+    }
+
+    /// The provenance the two identity columns imply: a non-empty `exe` wins,
+    /// otherwise a non-blank `comm`, otherwise nothing.
+    fn expected_provenance(row: &Row) -> Provenance {
+        if row.exe.as_deref().is_some_and(|exe| !exe.is_empty()) {
+            Provenance::Exe
+        } else if row
+            .comm
+            .as_deref()
+            .is_some_and(|comm| !comm.trim().is_empty())
+        {
+            Provenance::Comm
+        } else {
+            Provenance::Unknown
+        }
+    }
+
+    /// Today's decision path, in today's order: the display-manager bypass
+    /// first (`is_dm_service` and not a GDM reauthentication), then
+    /// `conversation_mode`.
+    ///
+    /// `is_gdm_reauth`'s environment read is replaced by the row's `env`
+    /// column — `GdmReauth::from_env` is that read's interpretation — because a
+    /// corpus reader cannot set a process-wide variable without racing the rest
+    /// of the test binary.
+    fn today_decision(row: &Row, process: Option<&str>, reauth: GdmReauth) -> Policy {
+        let service = row.service.as_deref();
+        let gdm_reauth = reauth == GdmReauth::Present
+            && service.is_some_and(|service| service.eq_ignore_ascii_case("gdm-password"));
+        if service.is_some_and(is_dm_service) && !gdm_reauth {
+            return Policy::SkipKeyring;
+        }
+        match conversation_mode(service.unwrap_or_default(), process, gdm_reauth) {
+            ConversationMode::Threaded => Policy::Threaded,
+            ConversationMode::Sequential => Policy::Sequential,
+            ConversationMode::PreCollected => Policy::PreCollected,
+        }
+    }
+
+    #[test]
+    fn corpus_characterises_the_decision_table() {
+        let rows = rows();
+
+        for row in &rows {
+            assert!(!row.why.is_empty(), "row {} has no justification", row.id);
+            assert!(
+                row.expected_rule.strip_prefix('R').is_some_and(|number| {
+                    number.parse::<u8>().is_ok_and(|n| (1..=10).contains(&n))
+                }),
+                "row {}: expected_rule {:?} is not R1..R10",
+                row.id,
+                row.expected_rule
+            );
+            // `/dev/tty` is only probed for a sequential conversation, so a
+            // host that never reaches that branch cannot carry a terminal.
+            assert!(
+                !row.tty || matches!(row.expected_policy, Policy::Sequential | Policy::Threaded),
+                "row {}: a pre-collected or skipped host has no terminal branch",
+                row.id
+            );
+            // A shape the shell harness must run needs a binary name to copy
+            // the harness to.
+            assert!(
+                !row.e2e || row.exe.is_some(),
+                "row {}: an e2e row must set its exe column",
+                row.id
+            );
+
+            let identity =
+                classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+            assert_eq!(
+                provenance(&identity),
+                expected_provenance(row),
+                "row {}: exe {:?} / comm {:?} resolved to the wrong source",
+                row.id,
+                row.exe,
+                row.comm
+            );
+
+            let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+            assert_eq!(
+                reauth == GdmReauth::Present,
+                row.env.is_some(),
+                "row {}: GDM_SESSION_FOR_REAUTH is presence-only, so {} is present",
+                row.id,
+                row.env.as_deref().unwrap_or("-")
+            );
+
+            assert_eq!(
+                today_decision(row, identity.name(), reauth),
+                row.expected_policy,
+                "row {} ({}): today's decision does not reproduce the corpus",
+                row.id,
+                row.why
+            );
+        }
+    }
+
+    /// `GDM_SESSION_FOR_REAUTH` is read for its *presence* only, so a set
+    /// variable holding `0` or `""` is as present as one holding `1`.
+    ///
+    /// The value is passed in, so this pins the interpretation without
+    /// `set_var` and without racing the rest of the binary; the read itself is
+    /// covered end to end by the `gdm-password login`/`reauth` e2e shapes.
+    #[test]
+    fn gdm_reauth_env_parsing() {
+        let cases: &[(Option<&OsStr>, GdmReauth)] = &[
+            (None, GdmReauth::Absent),
+            (Some(OsStr::new("")), GdmReauth::Present),
+            (Some(OsStr::new("0")), GdmReauth::Present),
+            (Some(OsStr::new("1")), GdmReauth::Present),
+        ];
+        for &(value, expected) in cases {
+            assert_eq!(GdmReauth::from_env(value), expected, "value {value:?}");
+        }
     }
 }

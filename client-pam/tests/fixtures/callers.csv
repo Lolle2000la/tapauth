@@ -1,0 +1,51 @@
+id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e
+dm_sddm,sddm,sh,-,-,0,R2,skip_keyring,prefix sddm must be skipped for the keyring,0
+dm_gdm,gdm,sh,-,-,0,R2,skip_keyring,prefix gdm must be skipped for the keyring,0
+dm_gdm3,gdm3,sh,-,-,0,R2,skip_keyring,prefix gdm3 must be skipped for the keyring,0
+dm_lightdm,lightdm,sh,-,-,0,R2,skip_keyring,prefix lightdm must be skipped for the keyring,0
+dm_lxdm,lxdm,sh,-,-,0,R2,skip_keyring,prefix lxdm is never exercised by the prefix unit test,0
+dm_slim,slim,sh,-,-,0,R2,skip_keyring,prefix slim is never exercised by the prefix unit test,0
+dm_xdm,xdm,sh,-,-,0,R2,skip_keyring,prefix xdm is never exercised by the prefix unit test,0
+dm_kdm,kdm,sh,-,-,0,R2,skip_keyring,prefix kdm is never exercised by the prefix unit test,0
+dm_greetd,greetd,sh,-,-,0,R2,skip_keyring,prefix greetd must be skipped for the keyring,0
+dm_ly,ly,sh,-,-,0,R2,skip_keyring,the shortest prefix matches its exact service name,0
+dm_nodm,nodm,sh,-,-,0,R2,skip_keyring,prefix nodm is never exercised by the prefix unit test,0
+dm_entrance,entrance,sh,-,-,0,R2,skip_keyring,prefix entrance is never exercised by the prefix unit test,0
+dm_plasmalogin,plasmalogin,sh,-,-,0,R2,skip_keyring,prefix plasmalogin must be skipped for the keyring,0
+dm_ly_not,lyfoo,sh,-,-,0,R10,sequential,a prefix without the dash boundary is not a display manager,0
+dm_ly_dash,ly-,sh,-,-,0,R2,skip_keyring,a bare prefix plus a dash is a match,0
+dm_kelvin,Kdm,sh,-,-,0,R10,sequential,folding is ASCII-only so the Kelvin sign does not become k,0
+gdmfoo_not_dm,gdmfoo,swaylock,-,-,0,R8,precollected,gdmfoo is not a display manager so the process rule applies,0
+sddmfoo_not_dm,sddmfoo,sh,-,-,0,R10,sequential,a prefix without the dash boundary is not a display manager,0
+unknown_binary,sudo,totally-unknown,-,-,0,R10,sequential,an unknown process keeps the sequential default,0
+renamed_binary,sudo,kscreenlocker_worker2,-,-,0,R10,sequential,a near-miss name must not match the worker rule,0
+reauth_zero_value,gdm-password,gdm-session-worker,-,0,0,R3,threaded,presence-only so a set variable holding zero is present,0
+reauth_wrong_service,sudo,gdm-session-worker,-,1,0,R10,sequential,the flag alone must not promote a non gdm-password service,0
+mixed_case_gdm,GDM-Password,gdm-session-worker,-,1,0,R3,threaded,the gdm-password comparison is ASCII case-insensitive,0
+proc_unreadable_polkit,polkit-1,-,-,-,0,R9,threaded,an unreadable proc on polkit-1 keeps the historic threaded behaviour,0
+proc_unreadable_polkit_upper,POLKIT-1,-,-,-,0,R10,sequential,the polkit-1 comparison is byte-exact,0
+proc_unreadable_other,sudo,-,-,-,0,R10,sequential,an unreadable proc on another service stays sequential,0
+empty_process_name,sudo,~,~,-,0,R10,sequential,an empty name is unknown rather than a match,0
+comm_only_fallback,kde,-,kscreenlocker_worker,-,0,R5,threaded,an unreadable exe falls back to the comm name,0
+exe_beats_comm,kde,kscreenlocker_worker,sh,-,0,R5,threaded,exe wins when both sources are readable,0
+exe_deleted_suffix,sudo,swaylock (deleted),sh,-,0,R8,precollected,the deleted suffix is stripped before the basename match,0
+swaylock_under_sddm,sddm,swaylock,-,-,0,R2,skip_keyring,the service rule outranks the process rule,0
+i3lock_under_gdm_login,gdm-password,i3lock,-,-,0,R2,skip_keyring,the login bypass applies even to a pre-collected host,0
+gdm_login_bypass,gdm-password,gdm-session-worker,-,-,0,R2,skip_keyring,a gdm login is bypassed and only a reauth is threaded,0
+kscreenlocker_truncated,kde,kscreenlocker_w,-,-,0,R5,threaded,the 15-character comm truncation of the worker name,0
+kscreenlocker_greet,kde,kscreenlocker_greet,-,-,0,R10,sequential,the greet helper is deliberately absent from the table,0
+service_unknown,-,kscreenlocker_worker,-,-,0,R5,threaded,an unresolved service does not change a process rule,0
+service_unknown_polkit,-,-,-,-,0,R10,sequential,an unresolved service and an unreadable proc are still sequential,0
+sequential_with_tty,tty,login,-,-,1,R10,sequential,the terminal cell of the sequential conversation,0
+sequential_no_tty,xfce4-screensaver,xfce4-screensaver-dialog,-,-,0,R10,sequential,the screen saver dialog parks in a bare futex,0
+threaded_no_tty,kde,kscreenlocker_worker,-,-,0,R5,threaded,the thread cell of the threaded conversation,0
+threaded_with_tty_unreachable,kde,kscreenlocker_worker,-,-,1,R5,threaded,the tty column must not change a threaded decision,0
+swaylock_with_reauth_set,gdm-password,swaylock,-,1,0,R8,precollected,the reauth exemption removes the bypass so the process rule applies,0
+service_case_sudo,sudo,sh,-,-,0,R10,sequential,the reuse cache keys on the original service bytes,0
+service_case_SUDO,SUDO,sh,-,-,0,R10,sequential,the upper-case service is a distinct cache key,0
+threaded_polkit_agent,polkit-1,polkit-agent-helper-1,-,-,0,R4,threaded,the polkit conversation is a plain fd fed by the agent process,0
+threaded_hyprlock,hyprlock,hyprlock,-,-,0,R6,threaded,hyprlock answers concurrently with an accepted race,0
+threaded_xsecurelock,xsecurelock,authproto_pam,-,-,0,R7,threaded,the helper answers on its own thread pool,0
+precollected_swaylock,swaylock,swaylock,-,-,0,R8,precollected,the password predates pam_authenticate,0
+precollected_gtklock,gtklock,gtklock,-,-,0,R8,precollected,the password predates pam_authenticate,0
+precollected_i3lock,i3lock,i3lock,-,-,0,R8,precollected,the password predates pam_authenticate,0
