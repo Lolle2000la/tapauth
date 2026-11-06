@@ -11,9 +11,9 @@ use std::path::Path;
 
 /// The caller facts, captured before any other work in `authenticate`.
 ///
-/// Read once, at `capture`; every consumer reads the captured values. (The
-/// remote-presence fact joins this type with rule R1, which does not exist
-/// yet.)
+/// Read once, at `capture`; every consumer reads the captured values. R1 is
+/// keyed on the service name alone (see `policy::remote_refuse`), so this type
+/// carries no remote-presence fact: the module never reads `PAM_RHOST`.
 pub(crate) struct CallerContext {
     service: Option<ServiceName>,
     process: ProcessIdentity,
@@ -30,16 +30,27 @@ impl CallerContext {
     /// read of this process.
     pub(crate) unsafe fn capture(pamh: *mut pam_sys::PamHandle) -> CallerContext {
         let service = unsafe { pam_sys::get_service_name(pamh) };
-        if let Some(service) = service.as_deref() {
-            tracing::debug!("Calling PAM service name: {}", service);
-        }
+        // `get_service_name` already rejects a non-UTF-8 item (its `to_str`
+        // fails), so the name is never converted lossily: a lossy string would
+        // become a real prefix candidate and a real cache key.
+        let service = service.as_deref().map(ServiceName::new);
+        let process = identity_from_proc();
+        let gdm_reauth = GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref());
+
+        // The module's one debug line, emitted before any decision so a log
+        // reader sees exactly the three facts `classify` is about to consume,
+        // and never learns a conclusion that was not acted on.
+        tracing::debug!(
+            service = service.as_ref().map(ServiceName::original).unwrap_or("-"),
+            process = process.name().unwrap_or("-"),
+            "gdm_reauth_present" = gdm_reauth == GdmReauth::Present,
+            "TapAuth caller"
+        );
+
         CallerContext {
-            // `get_service_name` already rejects a non-UTF-8 item (its `to_str`
-            // fails), so the name is never converted lossily: a lossy string
-            // would become a real prefix candidate and a real cache key.
-            service: service.as_deref().map(ServiceName::new),
-            process: identity_from_proc(),
-            gdm_reauth: GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref()),
+            service,
+            process,
+            gdm_reauth,
         }
     }
 

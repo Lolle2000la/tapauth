@@ -35,7 +35,8 @@
 //! | Daemon reported an internal error, or a local failure (conversation lookup, RNG, pipe/thread spawn) | `PAM_AUTH_ERR` |
 //! | Username lookup failed | `PAM_USER_UNKNOWN` |
 
-use crate::context::{self, CallerContext, GdmReauth, ServiceName};
+use crate::config::PamConfig;
+use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::pam_messages;
@@ -332,33 +333,6 @@ enum ConversationMode {
     PreCollected,
     /// The conversation must be left to the calling thread/host event loop.
     Sequential,
-}
-
-/// Best-effort identity of the process that called into this module.
-///
-/// `/proc/self/exe` is authoritative and untruncated, but it is unreadable in
-/// some sandboxes; `/proc/self/comm` is the fallback and holds at most
-/// `TASK_COMM_LEN - 1` (15) bytes, which is why the policy accepts both the
-/// full and the truncated spelling of each process name.
-fn process_identity() -> Option<String> {
-    context::identity_from_proc().name().map(str::to_owned)
-}
-
-/// Whether this invocation is a GDM reauthentication (unlock, or the admin
-/// prompt of a running GNOME session) rather than a fresh login.
-///
-/// GDM exports `GDM_SESSION_FOR_REAUTH` for the `gdm-session-worker` it spawns
-/// to reauthenticate an existing session.  The variable is the only signal
-/// available inside the module: the service name (`gdm-password`) is identical
-/// for login and reauthentication.
-///
-/// The environment read stays here; the comparison and the presence-only
-/// interpretation live in `context` (`GdmReauth::from_env`), and
-/// `CallerContext::is_gdm_reauth` is the same predicate over a captured
-/// context.
-fn is_gdm_reauth(service: &str) -> bool {
-    GdmReauth::from_env(std::env::var_os("GDM_SESSION_FOR_REAUTH").as_deref()) == GdmReauth::Present
-        && ServiceName::new(service).eq_ignore_ascii_case("gdm-password")
 }
 
 /// Reason the GUI authentication loop exited.  Prevents the "timed out"
@@ -725,13 +699,61 @@ fn run_sequential_event_loop<T: IpcResponseReader>(
 /// `optional pam_permit` grants either way, so there the stack's own
 /// configuration, not the return code, is what prevents the grant.
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
+    logging::init_logging();
+    tracing::info!("TapAuth PAM module called (custom bindings)");
+
+    // The caller facts are read once, here, and every consumer reads the
+    // captured values — the policy, the log line in `capture`, the verdict
+    // cache's key and the skip's decision. No second resolution exists.
+    let ctx = unsafe { CallerContext::capture(pamh) };
+    orchestrate(pamh, &ctx, &OrchestrationIo::production())
+}
+
+/// The four side-effecting calls `classify` must precede, injected so they can
+/// be counted without a PAM handle.
+///
+/// `classify_before_side_effects` drives `orchestrate` with this table replaced
+/// by counting wrappers and asserts every counter reads zero on a `Skip`. The
+/// context is passed in already captured, so the test can hand `orchestrate` a
+/// `CallerContext::from_parts` directly.
+pub(crate) struct OrchestrationIo {
+    pub load_config: fn() -> PamConfig,
+    pub get_user: unsafe fn(*mut pam_sys::PamHandle) -> Result<String, c_int>,
+    pub new_conversation:
+        unsafe fn(*mut pam_sys::PamHandle) -> Result<pam_sys::PamConversation<'static>, c_int>,
+    pub load_messages: fn(&str) -> pam_messages::PamMessages,
+}
+
+impl OrchestrationIo {
+    /// The real functions. The only constructor production uses.
+    pub(crate) fn production() -> Self {
+        OrchestrationIo {
+            load_config: PamConfig::load,
+            get_user: pam_sys::get_user,
+            new_conversation: pam_sys::PamConversation::new,
+            load_messages: pam_messages::load_for_user,
+        }
+    }
+}
+
+/// Run one authentication, then record its conclusion.
+///
+/// The body decides and acts; this wrapper records the verdict afterwards so
+/// the 500 ms reuse window stays anchored to *this module's return* (`record` is
+/// called after the whole body returned, exactly as before).
+///
+/// Step 4 replaces the `c_int` return with `Finished` and moves the recording
+/// into `authenticate` (`Finished::Concluded(c) => record(c, now).to_pam(),
+/// Finished::Unrecorded(o) => o.to_pam()`); the `verdict` out-parameter and this
+/// wrapper disappear with it.
+fn orchestrate(pamh: *mut pam_sys::PamHandle, ctx: &CallerContext, io: &OrchestrationIo) -> c_int {
     let mut verdict: Option<Verdict> = None;
-    let code = authenticate_inner(pamh, &mut verdict);
-    // This runs after `authenticate_inner` returned, so it is also the anchor of
-    // the reuse window: the 500 ms is measured from this module's *return*, not
-    // from the moment the transaction concluded.  A module after
-    // `pam_tapauth.so` that blocks longer than that pushes the host's duplicate
-    // outside the window, and it rings the phone again.
+    let code = authenticate_inner(pamh, ctx, io, &mut verdict);
+    // This runs after the body returned, so it is also the anchor of the reuse
+    // window: the 500 ms is measured from this module's *return*, not from the
+    // moment the transaction concluded.  A module after `pam_tapauth.so` that
+    // blocks longer than that pushes the host's duplicate outside the window,
+    // and it rings the phone again.
     record_verdict(&verdict, code, Instant::now());
     code
 }
@@ -753,24 +775,26 @@ fn record_verdict(verdict: &Option<Verdict>, code: c_int, now: Instant) {
     }
 }
 
-fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdict>) -> c_int {
-    logging::init_logging();
-
-    tracing::info!("TapAuth PAM module called (custom bindings)");
-
-    // The caller facts are read once, here, and the conversation policy is
-    // decided from them before anything that costs work: a `Skip` returns
-    // before the config read, the username lookup, the conversation and the
-    // messages, which is the order the display-manager bypass has always had.
-    let ctx = unsafe { CallerContext::capture(pamh) };
-    let classification = policy::classify(&ctx);
+fn authenticate_inner(
+    pamh: *mut pam_sys::PamHandle,
+    ctx: &CallerContext,
+    io: &OrchestrationIo,
+    verdict: &mut Option<Verdict>,
+) -> c_int {
+    // The conversation policy is decided from the caller facts `capture` read,
+    // and it is decided *first*: a `Skip` returns before the config read, the
+    // username lookup, the conversation and the messages, which is the order
+    // the display-manager bypass has always had. `classify_before_side_effects`
+    // counts those four calls, because nothing in the types stops a later edit
+    // from moving the decision below them.
+    let classification = policy::classify(ctx);
 
     // The display-manager bypass returns before the username is resolved, so it
     // never sets `verdict` and never touches the recorded conclusion.  That is
     // deliberate: it is a static policy decision about the service, not a
     // conclusion about credentials.  Only a daemon-path conclusion is ever
     // recorded, and a pre-IPC path must not clobber the last real one.
-    if let Some(pam_status) = guard_display_manager_bypass(&ctx, &classification) {
+    if let Some(pam_status) = guard_display_manager_bypass(ctx, &classification) {
         return pam_status;
     }
     let participation = match classification {
@@ -781,14 +805,14 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     };
 
     // Load configuration for timeouts
-    let config = crate::config::PamConfig::load();
+    let config = (io.load_config)();
     tracing::debug!(
         "PAM operation timeout: {}s",
         config.pam_operation_timeout_secs
     );
 
     let username = unsafe {
-        match pam_sys::get_user(pamh) {
+        match (io.get_user)(pamh) {
             Ok(user) => {
                 tracing::info!("Got username from PAM: {}", user);
                 user
@@ -803,7 +827,7 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     tracing::info!("TapAuth: Authenticating user: {}", username);
 
     let pam_conv = unsafe {
-        match pam_sys::PamConversation::new(pamh) {
+        match (io.new_conversation)(pamh) {
             Ok(conv) => conv,
             Err(e) => {
                 tracing::error!("Failed to get PAM conversation function: {}", e);
@@ -814,35 +838,17 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
 
     // No explicit root check here; shared config enforces file ownership/permissions.
 
-    let msgs = pam_messages::load_for_user(&username);
+    let msgs = (io.load_messages)(&username);
 
     // Block terminal polling if the calling host drives its own conversation.
     // This prevents the PAM module from stealing stdin strings from checking
     // hooks via /dev/tty inheritance, which causes polkit-agent-helper-1
     // to deadlock during graphical challenge-response dialogs.
-    // Fetched once: the same value keys the verdict cache below, and `None`
-    // means the service is unknown, which disables the cache for this call
-    // rather than collapsing every such call into one key.
-    let service_item = unsafe { pam_sys::get_service_name(pamh) };
-    let service = service_item.as_deref().unwrap_or_default();
-    let process = process_identity();
-    // GDM reauthentication (unlock / admin prompt of a running session) must
-    // not take the display-manager bypass below, and it is the only GDM case
-    // whose conversation we may drive from a worker thread.
-    let reauth = is_gdm_reauth(service);
-    // The participation `classify` resolved from the same captured facts: a skip
-    // returned above, so this is the conversation `conversation_mode` picks for
-    // these inputs.
     let mode = match participation.conversation {
         policy::Conversation::Threaded => ConversationMode::Threaded,
         policy::Conversation::Sequential => ConversationMode::Sequential,
         policy::Conversation::PreCollected => ConversationMode::PreCollected,
     };
-    tracing::debug!(
-        "TapAuth conversation mode: {mode:?} (process: {:?}, service: {:?}, reauth: {reauth})",
-        process,
-        service
-    );
     // A host whose conversation we drive from a worker thread must not take the
     // terminal branch: it would start polling /dev/tty on this thread and steal
     // the stdin the host expects for its own dialog.
@@ -903,11 +909,15 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     // `pam_unix` on that handle.  A setup failure above this point (no
     // conversation function) produces no verdict either.  None of them may
     // clobber the last real conclusion.
-    if let Some(service_name) = service_item.as_deref() {
+    // The captured service name keys the cache: `None` means the service is
+    // unknown, which disables the cache for this call rather than collapsing
+    // every such call into one key.
+    if let Some(service_name) = ctx.service() {
+        let service_name = service_name.original();
         if let Some((code, age)) = cached_conclusion_for(&username, service_name, Instant::now()) {
-            // `from_cache` stops `authenticate` from recording this hit, so the
-            // window stays anchored to the original verdict no matter how many
-            // duplicates arrive.  It is not a sliding window.
+            // `from_cache` stops the recording from refreshing the timestamp, so
+            // the window stays anchored to the original verdict no matter how
+            // many duplicates arrive.  It is not a sliding window.
             tracing::debug!(
                 username = %username,
                 service = %service_name,
@@ -917,7 +927,7 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
             );
             *verdict = Some(Verdict {
                 username,
-                service: service_item.as_deref().map(str::to_owned),
+                service: Some(service_name.to_owned()),
                 from_cache: true,
             });
             return code;
@@ -988,7 +998,7 @@ fn authenticate_inner(pamh: *mut pam_sys::PamHandle, verdict: &mut Option<Verdic
     let mut ipc = match start_authentication(
         &mut *verdict,
         &username,
-        service_item.as_deref(),
+        ctx.service().map(ServiceName::original),
         IpcClient::connect_nonblocking,
         |ipc| ipc.send_authenticate_start(&username, has_terminal, timeout_secs, &request_id),
     ) {
@@ -1444,15 +1454,201 @@ fn response_outcome(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::logging;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_logging_init() {
         logging::init_logging();
         logging::init_logging();
+    }
+
+    // ------------------------------------------------------------------
+    // The ordering and single-read guarantees of `authenticate`
+    // ------------------------------------------------------------------
+
+    /// The four calls `classify` must precede, counted.
+    ///
+    /// The context is passed to `orchestrate` already captured, so these tests
+    /// need no PAM handle and no daemon: whatever the body does after the four
+    /// calls, the counters are decided before it.
+    static CONFIG_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static USER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CONVERSATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MESSAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Timeouts of zero, so a path that gets as far as the IPC connect returns
+    /// without waiting: these tests assert call counts, not waiting.
+    fn zero_timeouts() -> PamConfig {
+        PamConfig {
+            pam_operation_timeout_secs: 0,
+            pam_gui_timeout_secs: 0,
+        }
+    }
+
+    fn counting_config() -> PamConfig {
+        CONFIG_CALLS.fetch_add(1, Ordering::SeqCst);
+        zero_timeouts()
+    }
+
+    unsafe fn counting_get_user(_pamh: *mut pam_sys::PamHandle) -> Result<String, c_int> {
+        USER_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok("classification-test-user".to_owned())
+    }
+
+    unsafe fn counting_conversation(
+        _pamh: *mut pam_sys::PamHandle,
+    ) -> Result<pam_sys::PamConversation<'static>, c_int> {
+        CONVERSATION_CALLS.fetch_add(1, Ordering::SeqCst);
+        // A conversation over no handle: every emission is a no-op, which is
+        // all this test needs.
+        Ok(unsafe { pam_sys::PamConversation::dummy() })
+    }
+
+    fn counting_messages(_username: &str) -> pam_messages::PamMessages {
+        MESSAGE_CALLS.fetch_add(1, Ordering::SeqCst);
+        pam_messages::load_for_user("classification-test-user")
+    }
+
+    fn counting_io() -> OrchestrationIo {
+        OrchestrationIo {
+            load_config: counting_config,
+            get_user: counting_get_user,
+            new_conversation: counting_conversation,
+            load_messages: counting_messages,
+        }
+    }
+
+    fn context(service: Option<&str>, process: Option<&str>) -> CallerContext {
+        let process = match process {
+            Some(name) => crate::context::ProcessIdentity::Exe(name.into()),
+            None => crate::context::ProcessIdentity::Unknown,
+        };
+        CallerContext::from_parts(service, process, crate::context::GdmReauth::Absent)
+    }
+
+    /// Run `orchestrate` for `ctx` and return the four call counters in the
+    /// order `config, user, conversation, messages`.
+    fn side_effects_of(ctx: &CallerContext) -> [usize; 4] {
+        CONFIG_CALLS.store(0, Ordering::SeqCst);
+        USER_CALLS.store(0, Ordering::SeqCst);
+        CONVERSATION_CALLS.store(0, Ordering::SeqCst);
+        MESSAGE_CALLS.store(0, Ordering::SeqCst);
+        let _code = orchestrate(std::ptr::null_mut(), ctx, &counting_io());
+        [
+            CONFIG_CALLS.load(Ordering::SeqCst),
+            USER_CALLS.load(Ordering::SeqCst),
+            CONVERSATION_CALLS.load(Ordering::SeqCst),
+            MESSAGE_CALLS.load(Ordering::SeqCst),
+        ]
+    }
+
+    /// `classify` runs before `PamConfig::load`, `get_user`,
+    /// `PamConversation::new` and `PamMessages::load_for_user`, so a skip costs
+    /// none of them.
+    ///
+    /// The defect this catches: moving `classify` below any of the four — the
+    /// natural place is "after the config read", where the timeouts are known.
+    /// Nothing else fails then: a display-manager login would still return
+    /// `PAM_AUTHINFO_UNAVAIL`, it would just pay a config read, two PAM item
+    /// lookups, an NSS lookup and a root-side home read first, and a skip on a
+    /// null user would come back as `PAM_USER_UNKNOWN` instead.
+    #[test]
+    fn classify_before_side_effects() {
+        // R2: the display-manager bypass.
+        assert_eq!(
+            side_effects_of(&context(Some("sddm"), Some("sh"))),
+            [0, 0, 0, 0],
+            "a display-manager skip must not load config, user, conversation or messages"
+        );
+
+        // The control: a `Participate` reaches all four, so the counters above
+        // are not zero merely because the harness never increments them.
+        assert_eq!(
+            side_effects_of(&context(Some("sudo"), Some("totally-unknown"))),
+            [1, 1, 1, 1],
+            "a participating call must reach every one of the four calls"
+        );
+    }
+
+    /// `PAM_SERVICE` is read at exactly one call site, in `CallerContext::capture`.
+    ///
+    /// The defect this catches: a second `pam_sys::get_service_name(pamh)` call
+    /// reappearing in `pam_logic.rs`. The pre-refactor tree resolved the service
+    /// twice — once in the display-manager bypass and once for the conversation
+    /// mode, the cache key and the request — so the bypass could decide from one
+    /// string while the cache keyed on another.
+    ///
+    /// Same technique and the same positive-control discipline as
+    /// `test_module_source_contains_no_pam_ignore_return`: the source is stripped
+    /// of comments and literals first, and the detector is proved to fire on an
+    /// in-memory snippet so an emptied or relocated scan cannot pass silently.
+    #[test]
+    fn only_one_get_service_name_call_site() {
+        const NEEDLE: &str = "get_service_name";
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
+            .map(|entry| entry.expect("readable dir entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.sort();
+        assert!(
+            files.iter().any(|p| p.ends_with("context.rs")),
+            "the scan did not cover context.rs, home of the single read: {files:?}"
+        );
+
+        let mut definitions = 0usize;
+        let mut call_sites: Vec<String> = Vec::new();
+        for path in &files {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let cleaned = stripped_source(&source);
+            for (line, text) in identifier_hits(&cleaned, NEEDLE) {
+                if text.contains("fn get_service_name") {
+                    definitions += 1;
+                } else {
+                    call_sites.push(format!("{name}:{line}: {text}"));
+                }
+            }
+        }
+
+        assert_eq!(
+            definitions, 1,
+            "expected exactly one definition of {NEEDLE}, found {definitions}"
+        );
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "PAM_SERVICE must be read at exactly one call site, found:\n{}",
+            call_sites.join("\n")
+        );
+        let only = call_sites.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            only.starts_with("context.rs:"),
+            "the single read must be `CallerContext::capture`, found {only}"
+        );
+
+        // Positive control: two planted call sites must both be reported, or a
+        // scan that stopped matching would pass the assertion above.
+        let planted = stripped_source(
+            "let a = pam_sys::get_service_name(pamh);\n\
+             let b = pam_sys::get_service_name(pamh);\n",
+        );
+        assert_eq!(
+            identifier_hits(&planted, NEEDLE).len(),
+            2,
+            "the detector must report both planted call sites"
+        );
     }
 
     #[test]
@@ -1808,17 +2004,16 @@ mod tests {
         source[start..end].trim().to_owned()
     }
 
-    /// Every occurrence of `PAM_IGNORE` used as an identifier, as
+    /// Every occurrence of `needle` used as a whole identifier, as
     /// `(line, source line)`.
     #[allow(clippy::indexing_slicing)]
-    fn pam_ignore_identifiers(cleaned: &str) -> Vec<(usize, String)> {
-        const NEEDLE: &str = "PAM_IGNORE";
+    fn identifier_hits(cleaned: &str, needle: &str) -> Vec<(usize, String)> {
         let b = cleaned.as_bytes();
         let mut hits = Vec::new();
         let mut from = 0usize;
-        while let Some(offset) = cleaned[from..].find(NEEDLE) {
+        while let Some(offset) = cleaned[from..].find(needle) {
             let start = from + offset;
-            let end = start + NEEDLE.len();
+            let end = start + needle.len();
             let is_ident_char = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
             let whole_word = !(start > 0 && is_ident_char(&b[start - 1]))
                 && !(end < b.len() && is_ident_char(&b[end]));
@@ -1829,6 +2024,12 @@ mod tests {
             from = end;
         }
         hits
+    }
+
+    /// Every occurrence of `PAM_IGNORE` used as an identifier, as
+    /// `(line, source line)`.
+    fn pam_ignore_identifiers(cleaned: &str) -> Vec<(usize, String)> {
+        identifier_hits(cleaned, "PAM_IGNORE")
     }
 
     /// Every numeric literal in `cleaned` whose value equals `code`, as
@@ -3119,9 +3320,9 @@ fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> Conv
         None => crate::context::ProcessIdentity::Unknown,
     };
     let gdm_reauth = if reauth {
-        GdmReauth::Present
+        crate::context::GdmReauth::Present
     } else {
-        GdmReauth::Absent
+        crate::context::GdmReauth::Absent
     };
     let ctx = CallerContext::from_parts(Some(service), process, gdm_reauth);
     match policy::conversation_mode_of(&ctx) {
