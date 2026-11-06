@@ -43,32 +43,41 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
 
 /// Retrieve the username from the PAM context.
 ///
-/// Falls back to `PAM_RUSER` (remote user) when `PAM_USER` is null.
+/// A null `PAM_USER` is `PAM_USER_UNKNOWN`, never a substitution: the module
+/// authenticates the account libpam set for this stack, and a name taken from
+/// another item would raise a phone prompt for an account the stack will not
+/// authenticate (and would key the verdict cache on it).
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
     if pamh.is_null() {
         return Err(PAM_SYSTEM_ERR);
     }
     let mut item: *const c_void = std::ptr::null();
-    let mut ret = ffi::pam_get_item(pamh, PAM_USER, &mut item);
+    let ret = ffi::pam_get_item(pamh, PAM_USER, &mut item);
 
     if ret != PAM_SUCCESS {
         return Err(ret);
     }
 
-    if item.is_null() {
-        ret = ffi::pam_get_item(pamh, ffi::PAM_RUSER, &mut item);
-        if ret != PAM_SUCCESS {
-            return Err(ret);
-        }
-        if item.is_null() {
-            return Err(PAM_USER_UNKNOWN);
-        }
-    }
+    // SAFETY: `pam_get_item` succeeded, so a non-null `item` is the C string
+    // libpam holds for `PAM_USER`; a null one means the item is unset.
+    let item = if item.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(item as *const c_char) })
+    };
+    user_from_item(item)
+}
 
-    let user_cstr = CStr::from_ptr(item as *const c_char);
-    user_cstr
-        .to_str()
-        .map(|s| s.to_string())
+/// The value interpretation of [`get_user`], split out so it is testable
+/// without a PAM handle: an absent item is [`PAM_USER_UNKNOWN`], and a present
+/// one must be UTF-8.
+///
+/// There is deliberately no second item to fall back to: the only input is
+/// `PAM_USER`.
+fn user_from_item(item: Option<&CStr>) -> Result<String, c_int> {
+    let item = item.ok_or(PAM_USER_UNKNOWN)?;
+    item.to_str()
+        .map(str::to_owned)
         .map_err(|_| PAM_USER_UNKNOWN)
 }
 
@@ -318,5 +327,43 @@ impl<'a> PamConversation<'a> {
         if let Err(e) = self.error(message) {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// A null `PAM_USER` is `PAM_USER_UNKNOWN`, and nothing else is consulted.
+    ///
+    /// The defect this catches: the retired fallback that read the remote-user
+    /// item and returned *that* as the username when `PAM_USER` was unset. That
+    /// string became the daemon request's `username`, the verdict cache's key and
+    /// the locale lookup's NSS name, so a stack with `PAM_USER` unset and the
+    /// remote-user item pointed at another account raised a phone prompt for an
+    /// account the stack would not authenticate. `user_from_item` has no second
+    /// item to consult, so the substitution cannot be reintroduced here without
+    /// changing this signature.
+    #[test]
+    fn null_user_does_not_fall_back_to_ruser() {
+        assert_eq!(user_from_item(None), Err(PAM_USER_UNKNOWN));
+
+        // The other direction, which the removal must not break: a set
+        // `PAM_USER` is returned as-is, whatever else the handle carries.
+        let user = CString::new("alice").unwrap();
+        assert_eq!(
+            user_from_item(Some(user.as_c_str())),
+            Ok("alice".to_owned())
+        );
+
+        // Non-UTF-8 stays a lookup failure rather than a lossy name.
+        let raw: &CStr = c"\xff";
+        assert_eq!(user_from_item(Some(raw)), Err(PAM_USER_UNKNOWN));
     }
 }

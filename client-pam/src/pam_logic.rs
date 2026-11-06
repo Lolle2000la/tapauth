@@ -1672,6 +1672,81 @@ mod tests {
         );
     }
 
+    /// The remote-user item is read nowhere in this crate's production code.
+    ///
+    /// The defect this catches: the retired `PAM_RUSER` fallback reappearing,
+    /// either by identifier or by the item's numeric value — `pam_get_item(pamh,
+    /// 8, ..)` is the same read without the name, which a name-only scan would
+    /// miss. A resolved name for the wrong account is the whole reason the
+    /// fallback is gone: it became the daemon request's username, the cache key
+    /// and the locale lookup's NSS name.
+    ///
+    /// Only the production half of each file is scanned, because the test that
+    /// pins the removal names the item in strings.
+    #[test]
+    fn no_ruser_read() {
+        const ITEM: &str = "PAM_RUSER";
+        // The item's numeric value, spelled arithmetically so this test's own
+        // source carries no literal for its own scan to find.
+        let item_number: u128 = 2 * 2 * 2;
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot list {dir}: {e}"))
+            .map(|entry| entry.expect("readable dir entry").path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.sort();
+        assert!(
+            files.iter().any(|p| p.ends_with("pam_sys.rs")),
+            "the scan did not cover pam_sys.rs, home of the user item: {files:?}"
+        );
+
+        let mut findings: Vec<String> = Vec::new();
+        for path in &files {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            // The production half only: everything before the first
+            // `#[cfg(test)]`, the same split the other source scans here use.
+            let production = source
+                .split_once("#[cfg(test)]")
+                .map(|(before, _)| before)
+                .unwrap_or(source.as_str());
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let cleaned = stripped_source(production);
+            for (line, text) in identifier_hits(&cleaned, ITEM) {
+                findings.push(format!("{name}:{line}: {ITEM} read in: {text}"));
+            }
+            for (line, text) in numeric_literals_equal_to(&cleaned, item_number) {
+                findings.push(format!(
+                    "{name}:{line}: item value {item_number} used in: {text}"
+                ));
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "a null PAM_USER must fail closed, not fall back to another item:\n{}",
+            findings.join("\n")
+        );
+
+        // Positive control: both detectors must fire on an in-memory snippet, or
+        // an emptied or broken scan passes for the wrong reason.
+        let planted = stripped_source(
+            "let a = pam_get_item(pamh, 8, &mut item);\n\
+             let b = ffi::PAM_RUSER;\n",
+        );
+        assert_eq!(
+            identifier_hits(&planted, ITEM).len(),
+            1,
+            "the identifier detector must report the planted item"
+        );
+        assert_eq!(
+            numeric_literals_equal_to(&planted, item_number),
+            vec![(1, "8".to_owned())],
+            "the numeric detector must report the planted item value"
+        );
+    }
+
     #[test]
     fn test_map_pam_outcome_matrix() {
         let conv = unsafe { pam_sys::PamConversation::dummy() };
