@@ -19,7 +19,7 @@
 //! predicates are disjoint and their relative order is unobservable; what is
 //! load-bearing is R1 before the process rules (R3–R8) and before R10.
 
-use crate::context::{CallerContext, ProcessIdentity, ServiceName};
+use crate::context::{CallerContext, ProcessIdentity};
 
 /// What the module does with the call.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,8 +190,8 @@ pub(crate) static RULES: [Rule; 10] = [
         class: FailureDirection::Keyring,
         why: "a grant without PAM_AUTHTOK breaks pam_kwallet6/pam_gnome_keyring auto-unlock",
         evidence: &[
-            "client-pam/src/policy.rs:369",
-            "client-pam/src/pam_logic.rs:436",
+            "client-pam/src/policy.rs:373",
+            "client-pam/src/outcome.rs:80",
         ],
         predicate: dm_login_bypass,
         decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
@@ -203,7 +203,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "the worker's GLib loop answers on another thread, but only for a \
               reauthentication; a login is bypassed by R2",
         evidence: &[
-            "client-pam/src/policy.rs:382",
+            "client-pam/src/policy.rs:380",
             "client-pam/src/context.rs:74",
         ],
         predicate: gdm_reauth_worker,
@@ -215,7 +215,7 @@ pub(crate) static RULES: [Rule; 10] = [
         class: FailureDirection::DeadlockAvoidance,
         why: "the conversation is a plain fd fed by the separate agent process",
         evidence: &[
-            "client-pam/src/policy.rs:393",
+            "client-pam/src/policy.rs:391",
             "client-pam/src/mechanism/threaded.rs:190",
         ],
         predicate: polkit_agent,
@@ -228,7 +228,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "the >= 6.8 helper answers on Qt's daemon thread; no version is parsed, \
               and kscreenlocker_greet stays sequential",
         evidence: &[
-            "client-pam/src/policy.rs:401",
+            "client-pam/src/policy.rs:399",
             "client-pam/src/mechanism/threaded.rs:191",
         ],
         predicate: kscreenlocker_worker,
@@ -241,7 +241,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "a worker std::thread with mutex/condvar: a genuine concurrent race, \
               accepted with an unsynchronised resetConversation/checkWaiting",
         evidence: &[
-            "client-pam/src/policy.rs:409",
+            "client-pam/src/policy.rs:407",
             "client-pam/src/mechanism/threaded.rs:188",
         ],
         predicate: hyprlock,
@@ -254,7 +254,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "answered by the helper's own thread pool; CallPAMWithRetries can \
               re-run the module up to three times",
         evidence: &[
-            "client-pam/src/policy.rs:414",
+            "client-pam/src/policy.rs:412",
             "client-pam/src/mechanism/threaded.rs:189",
         ],
         predicate: xsecurelock,
@@ -267,7 +267,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "the password predates pam_authenticate (swaylock pam.c:51, gtklock \
               auth.c:61, i3lock.c:836), so the phone must not be rung",
         evidence: &[
-            "client-pam/src/policy.rs:419",
+            "client-pam/src/policy.rs:417",
             "client-pam/src/mechanism/threaded.rs:197",
         ],
         predicate: precollected_locks,
@@ -280,7 +280,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "with /proc unreadable, keep the historic polkit behaviour instead \
               of silently changing how it drives its conversation",
         evidence: &[
-            "client-pam/src/policy.rs:431",
+            "client-pam/src/policy.rs:429",
             "client-pam/src/context.rs:160",
         ],
         predicate: polkit_service_without_proc,
@@ -293,7 +293,7 @@ pub(crate) static RULES: [Rule; 10] = [
         why: "the safe default: an unknown host keeps the behaviour that cannot \
               deadlock, at the cost of the shorter GUI timeout",
         evidence: &[
-            "client-pam/src/policy.rs:437",
+            "client-pam/src/policy.rs:435",
             "client-pam/src/mechanism/threaded.rs:205",
         ],
         predicate: default_sequential,
@@ -346,8 +346,10 @@ fn remote_refuse(ctx: &CallerContext) -> bool {
 ///
 /// A service matches when its ASCII-lowercased name is a prefix exactly, or the
 /// prefix followed by a `-` boundary: `gdm`, `gdm3` and `gdm-password` qualify,
-/// `gdmfoo` does not. Folding is `to_ascii_lowercase` only — see
-/// [`ServiceName`] — so U+212A KELVIN SIGN is *not* folded to `k`.
+/// `gdmfoo` does not. The match is `ServiceName::dm_prefixed`, and the folding
+/// is `to_ascii_lowercase` only — see
+/// [`ServiceName`](crate::context::ServiceName) — so U+212A KELVIN SIGN is
+/// *not* folded to `k`.
 const DM_PREFIXES: [&str; 13] = [
     "sddm",
     "gdm",
@@ -364,17 +366,13 @@ const DM_PREFIXES: [&str; 13] = [
     "plasmalogin",
 ];
 
-/// Whether `service` names a primary display manager; an absent service never
-/// matches.
-pub(crate) fn is_dm_service(service: &str) -> bool {
-    let service = ServiceName::new(service);
-    DM_PREFIXES.iter().any(|prefix| service.dm_prefixed(prefix))
-}
-
 /// R2 — the display-manager bypass, with the GDM reauthentication exemption.
+///
+/// The prefix match is `ServiceName::dm_prefixed`, reached only through
+/// `ctx.service()`, so an absent service never matches.
 fn dm_login_bypass(ctx: &CallerContext) -> bool {
     ctx.service()
-        .is_some_and(|service| is_dm_service(service.original()))
+        .is_some_and(|service| DM_PREFIXES.iter().any(|prefix| service.dm_prefixed(prefix)))
         && !ctx.is_gdm_reauth()
 }
 
@@ -455,25 +453,6 @@ fn classification_of(rule: &Rule) -> Classification {
             failure_direction: rule.class,
         }),
     }
-}
-
-/// The conversation the *process-keyed* rules choose, i.e. today's
-/// `conversation_mode`.
-///
-/// R2 is excluded because it never ran inside `conversation_mode`: the bypass
-/// preceded it, so the process rule applies even to a display-manager service.
-/// This is the step-1 compatibility shim for that function and goes away with
-/// it.
-#[cfg(test)]
-pub(crate) fn conversation_mode_of(ctx: &CallerContext) -> Conversation {
-    RULES
-        .iter()
-        .filter(|rule| rule.id != RuleId::R2)
-        .find_map(|rule| match rule.decision {
-            Decision::Participate(conversation) if (rule.predicate)(ctx) => Some(conversation),
-            _ => None,
-        })
-        .unwrap_or(Conversation::Sequential)
 }
 
 /// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this table's

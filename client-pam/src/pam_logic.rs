@@ -47,53 +47,6 @@ use crate::transaction::{Finished, HostIo, SendParams};
 use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
-// The terminal flow below uses a single-threaded poll loop over the IPC
-// socket and /dev/tty.  The GUI flow (no TTY) comes in three variants,
-// selected by the policy table (`policy::classify`) — an allowlist of calling
-// processes with a sequential default:
-//
-// * Threaded (`polkit-agent-helper-1`, `kscreenlocker_worker`, `hyprlock`,
-//   `authproto_pam`, and GDM's reauthentication worker): the conversation can
-//   be driven from another thread.  Polkit's is a plain blocking socket fd fed
-//   by the *separate* agent process; kscreenlocker ≥ 6.8 makes it a peer D-Bus
-//   answered by Qt's `QDBusConnectionManager` daemon thread, not by the thread
-//   that called `pam_authenticate`.  A native POSIX thread collects the
-//   password while the main thread waits for the phone, and the main loop
-//   multiplexes the IPC socket and a self-pipe (`mechanism::threaded`).
-//
-// * PreCollected (`swaylock`, `gtklock`, `i3lock`): the host reads the
-//   password *before* calling `pam_authenticate` and its conversation is a
-//   synchronous replay of that already-typed password.  The module therefore
-//   collects the token on the calling thread with no daemon request at all and
-//   immediately hands over to the next PAM module (see the branch in
-//   `authenticate`).  Ringing the phone here would be misleading: the user has
-//   already chosen the password route, and the wait could only ever time out.
-//
-// * Sequential (everything else, which includes older kscreenlocker,
-//   `xfce4-screensaver-dialog` and `mate-screensaver-dialog`, and every host
-//   not explicitly known to be safe): the conversation is a synchronous
-//   round-trip that must be dispatched by the host's own event loop on the
-//   thread that called `pam_authenticate`.  Blocking that thread (or driving
-//   the conversation from a second thread, which older kscreenlocker cannot
-//   answer because it posts the reply to the blocked thread) deadlocks the
-//   host, so the main thread simply waits for the daemon on its own and never
-//   *drives* the conversation (`mechanism::sequential`).
-//   The one exception is a single non-blocking `PAM_TEXT_INFO` announcement
-//   emitted immediately before the wait begins: it is one conversation round
-//   trip that carries no input, and host event loops need it in order to
-//   reveal the password entry.  Should the host's conversation return an
-//   error, `try_info` logs and swallows it, so the verdict is unchanged; a
-//   NULL conversation never reaches this point at all, because
-//   `PamConversation::new` fails first and the module returns
-//   `PAM_AUTH_ERR` as before.
-//
-// The native password thread used by the threaded variant uses no Drop-bearing
-// Rust types so that pthread_cancel is safe.
-//
-// The three mechanisms live in `mechanism/`; this file is the orchestration
-// (identity, policy, config, username, conversation and messages) plus the one
-// call into `transaction::run`.
-
 /// Main PAM authentication entry point.
 ///
 /// ## Returns
@@ -235,19 +188,30 @@ where
     // from moving the decision below them.
     let classification = policy::classify(ctx);
 
-    // The display-manager bypass returns before the username is resolved, so it
-    // never reaches `Armed::open` and never touches the recorded conclusion.
-    // That is deliberate: it is a static policy decision about the service, not
-    // a conclusion about credentials.  Only a daemon-path conclusion is ever
-    // recorded, and a pre-IPC path must not clobber the last real one.
-    if let Some(outcome) = guard_display_manager_bypass(ctx, &classification) {
-        return Finished::Unrecorded(outcome);
-    }
     let participation = match classification {
         policy::Classification::Participate(participation) => participation,
-        // Every `Skip` returned above.  Repeated here so the match is total
-        // without a panic path (`clippy::panic` is denied crate-wide).
+        // The two skip policies — a display-manager login (R2) and a remote
+        // caller (R1) — return here, before the username is resolved, so a skip
+        // never reaches `Armed::open` and never touches the recorded
+        // conclusion.  That is deliberate: it is a static policy decision about
+        // the caller, not a conclusion about credentials.  Only a daemon-path
+        // conclusion is ever recorded, and a pre-IPC path must not clobber the
+        // last real one.  `Outcome::from_skip` is the only mapping of a
+        // `SkipPolicy` to a verdict.
         policy::Classification::Skip(skip) => {
+            let service = ctx.service().map(ServiceName::original).unwrap_or_default();
+            match skip {
+                policy::SkipPolicy::KeyringNeedsAuthtok => tracing::info!(
+                    "TapAuth: Service '{}' is a primary display manager. \
+                     Skipping to avoid breaking keyring auto-unlock.",
+                    service
+                ),
+                policy::SkipPolicy::RemoteAuthentication => tracing::info!(
+                    "TapAuth: Service '{}' authenticates a remote caller. \
+                     Skipping: this module does not take part in remote authentication.",
+                    service
+                ),
+            }
             return Finished::Unrecorded(Outcome::from_skip(skip));
         }
     };
@@ -329,68 +293,6 @@ fn cancel_on_fresh_connection(reason: &str, request_id: &str) {
     if let Ok(mut client) = IpcClient::connect(Duration::from_millis(100)) {
         let _ = client.send_cancel(reason, request_id);
     }
-}
-
-/// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
-/// manager.
-///
-/// When this module runs as `sufficient` during a GUI desktop login (SDDM, GDM,
-/// LightDM, LXDM), a successful phone confirmation authenticates the user but
-/// never populates the cleartext password token (`PAM_AUTHTOK`) in the PAM
-/// stack. Downstream modules like `pam_kwallet6.so` and `pam_gnome_keyring.so`
-/// depend on that token to unlock the local secure keyring/wallet at login-time.
-///
-/// Bypassing DM services preserves the normal password collection flow so the
-/// login manager itself sets `PAM_AUTHTOK` and the keyring unlocks without any
-/// secondary prompt. The module still runs for secondary services such as
-/// `sudo`, `polkit-1`, and desktop screensavers.
-///
-/// A **GDM reauthentication** (`gdm-password` with `GDM_SESSION_FOR_REAUTH`
-/// set) is exempt: it runs no session/setcred phase
-/// (`gdm-session-worker.c:1489,1781`), so the keyring reason for keeping the
-/// login sequential does not apply, and the unlock prompt is exactly where the
-/// phone should be offered.
-///
-/// This is a skip, not a verdict, so it returns `PAM_AUTHINFO_UNAVAIL` (never
-/// `PAM_IGNORE`, which Linux-PAM does not record as a failure). On a
-/// `sufficient` line the stack treats it as `ignore` and still runs the next
-/// module; on a `required` line it fails closed.
-///
-/// R1's remote refusal is the other skip policy, and it takes the same code for
-/// the same reason: the module has no business answering that call, so it says
-/// "not me" with the code a `required` line reads as a failure.
-///
-/// The rule name is kept for the display-manager half it was written for; the
-/// decision itself is `policy::classify`'s.
-///
-/// Returns the skip's verdict for any skip, `None` otherwise. The mapping
-/// itself is `Outcome::from_skip`, the only place a `SkipPolicy` becomes a
-/// verdict.
-fn guard_display_manager_bypass(
-    ctx: &CallerContext,
-    classification: &policy::Classification,
-) -> Option<Outcome> {
-    let policy::Classification::Skip(skip) = classification else {
-        return None;
-    };
-    let service = ctx.service().map(ServiceName::original).unwrap_or_default();
-    match skip {
-        policy::SkipPolicy::KeyringNeedsAuthtok => {
-            tracing::info!(
-                "TapAuth: Service '{}' is a primary display manager. \
-                 Skipping to avoid breaking keyring auto-unlock.",
-                service
-            );
-        }
-        policy::SkipPolicy::RemoteAuthentication => {
-            tracing::info!(
-                "TapAuth: Service '{}' authenticates a remote caller. \
-                 Skipping: this module does not take part in remote authentication.",
-                service
-            );
-        }
-    }
-    Some(Outcome::from_skip(*skip))
 }
 
 /// Emit an outcome's one message, then hand the outcome back.
@@ -1855,233 +1757,6 @@ mod tests {
     }
 }
 
-/// How the PAM conversation of the calling host may be driven.
-///
-/// Test-only: the production dispatch is `plan::Plannable`, which the policy
-/// produces directly. The enum survives so the 24-row decision table test keeps
-/// exercising the same inputs; it is deleted with that wrapper once the table is
-/// the only representation.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConversationMode {
-    /// The conversation may run on a background thread while the calling
-    /// thread waits for the daemon.
-    Threaded,
-    /// The host collected the password before calling `pam_authenticate` and
-    /// its conversation only replays it.  The module collects the token on the
-    /// calling thread and hands over without contacting the daemon.
-    PreCollected,
-    /// The conversation must be left to the calling thread/host event loop.
-    Sequential,
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod conversation_mode_tests {
-    use super::*;
-
-    #[test]
-    fn conversation_mode_is_an_allowlist_with_a_sequential_default() {
-        // (service, process, reauth, expected)
-        let cases: &[(&str, Option<&str>, bool, ConversationMode)] = &[
-            // polkit: conversation is a fd answered by the separate agent
-            // process.  Reauth is irrelevant to it.
-            (
-                "polkit-1",
-                Some("polkit-agent-helper-1"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            (
-                "polkit-1",
-                Some("polkit-agent-he"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            // kscreenlocker >= 6.8 answers on Qt's D-Bus daemon thread; the
-            // greet helper does not, so it stays sequential.
-            (
-                "kde",
-                Some("kscreenlocker_worker"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            (
-                "kde",
-                Some("kscreenlocker_w"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            (
-                "kde",
-                Some("kscreenlocker_greet"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            (
-                "kde",
-                Some("kscreenlocker_g"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            ("sudo", Some("sudo"), false, ConversationMode::Sequential),
-            ("su", Some("su"), false, ConversationMode::Sequential),
-            // hyprlock answers concurrently (documented residual risk).
-            (
-                "hyprlock",
-                Some("hyprlock"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            // xsecurelock's helper answers on its own thread pool.
-            (
-                "xsecurelock",
-                Some("authproto_pam"),
-                false,
-                ConversationMode::Threaded,
-            ),
-            // xfce4-screensaver / mate-screensaver dialog children, full and
-            // `/proc/self/comm`-truncated spellings.  Their conversation parks
-            // in `g_cond_wait`, which is not a cancellation point, so they stay
-            // sequential.
-            (
-                "xfce4-screensaver",
-                Some("xfce4-screensaver-dialog"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            (
-                "xfce4-screensaver",
-                Some("xfce4-screensav"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            (
-                "mate-screensaver",
-                Some("mate-screensaver-dialog"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            (
-                "mate-screensaver",
-                Some("mate-screensave"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            // Hosts that read the password before pam_authenticate: their
-            // conversation only replays it, so the phone is not consulted.
-            (
-                "swaylock",
-                Some("swaylock"),
-                false,
-                ConversationMode::PreCollected,
-            ),
-            (
-                "gtklock",
-                Some("gtklock"),
-                false,
-                ConversationMode::PreCollected,
-            ),
-            (
-                "i3lock",
-                Some("i3lock"),
-                false,
-                ConversationMode::PreCollected,
-            ),
-            // GDM: only a reauthentication prompt may be driven from a worker
-            // thread, and only behind the `gdm-password` service.
-            (
-                "gdm-password",
-                Some("gdm-session-worker"),
-                true,
-                ConversationMode::Threaded,
-            ),
-            (
-                "gdm-password",
-                Some("gdm-session-wor"),
-                true,
-                ConversationMode::Threaded,
-            ),
-            // The env var is absent (reauth=false): same worker, sequential.
-            (
-                "gdm-password",
-                Some("gdm-session-worker"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            // The reauth flag alone must not promote a non-DM service.
-            (
-                "sudo",
-                Some("gdm-session-worker"),
-                true,
-                ConversationMode::Sequential,
-            ),
-            // Case-insensitive service match.
-            (
-                "GDM-Password",
-                Some("gdm-session-worker"),
-                true,
-                ConversationMode::Threaded,
-            ),
-            (
-                "whatever",
-                Some("whatever"),
-                false,
-                ConversationMode::Sequential,
-            ),
-            ("polkit-1", None, false, ConversationMode::Threaded),
-            ("sudo", None, false, ConversationMode::Sequential),
-            ("", None, false, ConversationMode::Sequential),
-        ];
-
-        for &(service, process, reauth, expected) in cases {
-            assert_eq!(
-                conversation_mode(service, process, reauth),
-                expected,
-                "service {service:?} with process {process:?} and reauth {reauth}"
-            );
-        }
-    }
-
-    /// The DM bypass and the GDM reauth exemption both hang off this prefix
-    /// test: it must stay exact-or-`-`-suffixed so an unrelated service whose
-    /// name merely starts with a DM name is not skipped.
-    #[test]
-    fn display_manager_prefix_matching() {
-        for service in [
-            "gdm",
-            "gdm3",
-            "gdm-password",
-            "GDM-Password",
-            "gdm-tapauth-host",
-            "sddm",
-            "sddm-helper",
-            "lightdm",
-            "greetd",
-            "plasmalogin",
-        ] {
-            assert!(
-                policy::is_dm_service(service),
-                "{service:?} must be treated as a display manager service"
-            );
-        }
-        for service in [
-            "gdmfoo",
-            "sddmfoo",
-            "sudo",
-            "su",
-            "polkit-1",
-            "tapauth-conv-sufficient",
-            "",
-        ] {
-            assert!(
-                !policy::is_dm_service(service),
-                "{service:?} must not be treated as a display manager service"
-            );
-        }
-    }
-}
-
 /// The verdict-reuse record: the 500 ms window, its `(username, service)` key,
 /// and the two gates that decide what may be recorded.
 ///
@@ -2669,40 +2344,5 @@ mod verdict_reuse_tests {
             .filter(|(_, line)| TOKENS.iter().any(|token| line.contains(token)))
             .map(|(line, text)| format!("line {}: {}", line + 1, text.trim()))
             .collect()
-    }
-}
-
-/// Test-only compatibility wrapper: the pre-refactor entry point expressed in
-/// terms of the policy table.
-///
-/// The policy itself — which host is threaded, which keeps the conversation on
-/// the caller's thread, and which collected its password first — is
-/// `policy::RULES`, in order, with each row's justification and evidence. The
-/// process rules are order-insensitive among themselves; R2 is deliberately
-/// excluded here because `conversation_mode` never ran for a display-manager
-/// service (the bypass preceded it).
-///
-/// It exists so the 24-row decision table test keeps exercising the same
-/// inputs, and it is deleted with that test once the table is the only
-/// representation. It lives at the end of this file on purpose: the three
-/// source-scan tests here read "the production half", i.e. everything before the
-/// first `#[cfg(test)]`, so a test-only item among the production code would
-/// silently truncate what they scan.
-#[cfg(test)]
-fn conversation_mode(service: &str, process: Option<&str>, reauth: bool) -> ConversationMode {
-    let process = match process {
-        Some(name) => crate::context::ProcessIdentity::Exe(name.into()),
-        None => crate::context::ProcessIdentity::Unknown,
-    };
-    let gdm_reauth = if reauth {
-        crate::context::GdmReauth::Present
-    } else {
-        crate::context::GdmReauth::Absent
-    };
-    let ctx = CallerContext::from_parts(Some(service), process, gdm_reauth);
-    match policy::conversation_mode_of(&ctx) {
-        policy::Conversation::Threaded => ConversationMode::Threaded,
-        policy::Conversation::Sequential => ConversationMode::Sequential,
-        policy::Conversation::PreCollected => ConversationMode::PreCollected,
     }
 }
