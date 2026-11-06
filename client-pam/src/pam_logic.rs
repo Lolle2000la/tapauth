@@ -1234,13 +1234,39 @@ fn authenticate_inner(
         );
     }
 
-    // Terminal: poll socket and /dev/tty; skip only on Enter
-    //
-    // Safety: at this point `has_tty` is true, so tty_file is
-    // guaranteed Some. We still use let-else as a non-panicking
-    // defuse instead of expect()/unwrap().
-    let Some(mut tty) = tty_file else {
-        return pam_sys::PAM_AUTHINFO_UNAVAIL;
+    // Terminal: the branch body is `run_terminal`, and its verdict is mapped
+    // here — the one place this call site produces a code.
+    finish(
+        run_terminal(&mut ipc, tty_file, deadline_at, &request_id),
+        &pam_conv,
+        &msgs,
+    )
+}
+
+/// The terminal flow: poll the daemon socket and `/dev/tty` together, and let
+/// Enter skip.
+///
+/// The only mechanism with a terminal to read: a `\n`/`\r` cancels the request
+/// on a fresh short connection and ends the wait, any other key is consumed and
+/// discarded, and a tty that reaches EOF, errors or hangs up simply stops being
+/// polled while the daemon socket keeps waiting.
+///
+/// Returns the verdict, never a code: the caller maps it with `to_pam`
+/// (`finish`), so every exit here — response, hangup, read error, skip,
+/// deadline — is a reason, and `Outcome::notice` decides the one message it
+/// shows.
+fn run_terminal<T: IpcResponseReader>(
+    ipc: &mut T,
+    tty: Option<std::fs::File>,
+    deadline_at: Instant,
+    request_id: &str,
+) -> Outcome {
+    // `run` probes /dev/tty only when the plan says `PollForKey`, so `tty` is
+    // `Some` here. A missing file is still handled without panicking: the host
+    // cannot be asked to skip, so the call ends as an unavailability with no
+    // message — the code this arm has always returned.
+    let Some(mut tty) = tty else {
+        return Outcome::Unavailable(UnavailableReason::ProtocolError);
     };
 
     // Set tty nonblocking to avoid read(1) blocking unexpectedly
@@ -1288,9 +1314,7 @@ fn authenticate_inner(
                     // Read data first if available (POLLIN can be set with POLLHUP)
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
-                            Ok(Some(resp)) => {
-                                return finish(Outcome::from_daemon(resp), &pam_conv, &msgs)
-                            }
+                            Ok(Some(resp)) => return Outcome::from_daemon(resp),
                             Ok(None) => {
                                 // No complete frame yet, check for errors
                                 if rev.contains(PollFlags::POLLHUP)
@@ -1299,21 +1323,20 @@ fn authenticate_inner(
                                     tracing::error!(
                                         "Daemon closed connection before sending response"
                                     );
-                                    pam_conv.try_info(msgs.connection_lost());
-                                    return pam_sys::PAM_AUTHINFO_UNAVAIL;
+                                    return Outcome::Unavailable(
+                                        UnavailableReason::IpcConnectionLost,
+                                    );
                                 }
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {}", e);
-                                pam_conv.try_info(msgs.communication_error());
-                                return pam_sys::PAM_AUTHINFO_UNAVAIL;
+                                return Outcome::Unavailable(UnavailableReason::IpcLoopError);
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         // Hangup/error without any data available
                         tracing::error!("Daemon closed connection or error detected");
-                        pam_conv.try_info(msgs.connection_lost());
-                        return pam_sys::PAM_AUTHINFO_UNAVAIL;
+                        return Outcome::Unavailable(UnavailableReason::IpcConnectionLost);
                     }
                 }
                 // TTY - read one byte; skip on Enter, discard other keys
@@ -1331,10 +1354,9 @@ fn authenticate_inner(
                                         if let Ok(mut c) =
                                             IpcClient::connect(Duration::from_millis(100))
                                         {
-                                            let _ = c.send_cancel("tty-skip", &request_id);
+                                            let _ = c.send_cancel("tty-skip", request_id);
                                         }
-                                        pam_conv.try_info(msgs.skipped());
-                                        return pam_sys::PAM_AUTHINFO_UNAVAIL;
+                                        return Outcome::Unavailable(UnavailableReason::Skipped);
                                     }
                                     // Non-Enter key: consume and ignore
                                 }
@@ -1365,8 +1387,7 @@ fn authenticate_inner(
         }
     }
 
-    pam_conv.try_info(msgs.timed_out());
-    pam_sys::PAM_AUTHINFO_UNAVAIL
+    Outcome::Unavailable(UnavailableReason::TimedOut)
 }
 
 /// Yield `PAM_AUTHINFO_UNAVAIL` if the calling service is a primary display
