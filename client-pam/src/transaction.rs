@@ -32,12 +32,13 @@ use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
 use crate::mechanism::{handoff, sequential, threaded};
 use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReason};
 use crate::pam_messages::PamMessages;
-use crate::pam_sys::{PamConversation, PamHandle};
+use crate::pam_sys::{PamConversation, PamHandle, ReadAuthtok};
 use crate::plan::{Announcement, Plannable, TtyUse};
 use crate::policy::{Conversation, FailureDirection, Participation};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::fs::File;
+use std::os::raw::{c_char, c_int};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -269,6 +270,10 @@ pub(crate) struct HostIo<'a> {
     pamh: *mut PamHandle,
     conv: Option<&'a PamConversation<'a>>,
     msgs: &'a PamMessages,
+    /// The handoff's one handle read, injected like the other effects so a test
+    /// can count it: production passes
+    /// [`crate::pam_sys::read_authtok_for_handoff`].
+    read_authtok: ReadAuthtok,
     /// Test-only record of what [`emit`] was asked to show.
     #[cfg(test)]
     emitted: Option<&'a std::cell::RefCell<Vec<Emitted>>>,
@@ -279,11 +284,13 @@ impl<'a> HostIo<'a> {
         pamh: *mut PamHandle,
         conv: &'a PamConversation<'a>,
         msgs: &'a PamMessages,
+        read_authtok: ReadAuthtok,
     ) -> Self {
         HostIo {
             pamh,
             conv: Some(conv),
             msgs,
+            read_authtok,
             #[cfg(test)]
             emitted: None,
         }
@@ -292,6 +299,14 @@ impl<'a> HostIo<'a> {
     /// The handle a mechanism needs for its one conversation call, if any.
     pub(crate) fn pamh(&self) -> *mut PamHandle {
         self.pamh
+    }
+
+    /// Read the host's pre-collected token, through the injected reader.
+    pub(crate) fn read_authtok(&self) -> (c_int, *const c_char) {
+        // SAFETY: the reader is the caller's `pam_get_authtok` wrapper, which
+        // takes the live handle this host carries; the conversation belongs to
+        // this thread.
+        unsafe { (self.read_authtok)(self.pamh) }
     }
 
     /// Show one notice, if there is one.
@@ -326,11 +341,13 @@ impl<'a> HostIo<'a> {
         pamh: *mut PamHandle,
         conv: Option<&'a PamConversation<'a>>,
         msgs: &'a PamMessages,
+        read_authtok: ReadAuthtok,
     ) -> Self {
         HostIo {
             pamh,
             conv,
             msgs,
+            read_authtok,
             emitted: None,
         }
     }
@@ -347,11 +364,13 @@ impl<'a> HostIo<'a> {
         pamh: *mut PamHandle,
         msgs: &'a PamMessages,
         emitted: &'a std::cell::RefCell<Vec<Emitted>>,
+        read_authtok: ReadAuthtok,
     ) -> Self {
         HostIo {
             pamh,
             conv: None,
             msgs,
+            read_authtok,
             emitted: Some(emitted),
         }
     }
@@ -1081,6 +1100,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// A handoff reader that reads nothing, for the tests whose paths never
+    /// reach the pre-collected handoff.
+    ///
+    /// `skip_never_hands_off` injects a counting reader instead, which is where
+    /// the read is the assertion.
+    pub(crate) unsafe fn unused_authtok(_pamh: *mut PamHandle) -> (c_int, *const c_char) {
+        (crate::pam_sys::PAM_SUCCESS, std::ptr::null())
+    }
+
     /// Drive `run` with a context, a tty probe and the two injected IPC effects,
     /// and report its result plus how many times the probe ran.
     fn run_with_probe<T, C, S>(
@@ -1095,7 +1123,7 @@ pub(crate) mod tests {
         S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
     {
         let msgs = PamMessages::new("en");
-        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs);
+        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
         let participation = participation_for(ctx);
         let mut probes = 0usize;
         let finished = run(
@@ -1789,7 +1817,8 @@ pub(crate) mod tests {
     fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<Emitted> {
         let msgs = PamMessages::new("en");
         let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
-        let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log);
+        let mut host =
+            HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log, unused_authtok);
         let participation = participation_for(ctx);
         let _finished = run(
             ctx,
@@ -1828,7 +1857,8 @@ pub(crate) mod tests {
     {
         let msgs = PamMessages::new("en");
         let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
-        let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log);
+        let mut host =
+            HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log, unused_authtok);
         let participation = participation_for(ctx);
         let finished = run(
             ctx,
@@ -1928,7 +1958,7 @@ pub(crate) mod tests {
         );
 
         let msgs = PamMessages::new("en");
-        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs);
+        let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
         let mut probes = 0usize;
         let connects = std::cell::Cell::new(0usize);
         let finished = run(

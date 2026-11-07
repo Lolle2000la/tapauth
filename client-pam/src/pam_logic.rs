@@ -123,6 +123,10 @@ pub(crate) struct OrchestrationIo {
     pub new_conversation:
         unsafe fn(*mut pam_sys::PamHandle) -> Result<pam_sys::PamConversation<'static>, c_int>,
     pub load_messages: fn(&str) -> pam_messages::PamMessages,
+    /// The pre-collected handoff's token read. Injected here as well as on
+    /// `HostIo` so a test that drives `orchestrate` end to end can count the
+    /// read, which is the only observable the handoff has.
+    pub read_authtok: pam_sys::ReadAuthtok,
 }
 
 impl OrchestrationIo {
@@ -133,6 +137,7 @@ impl OrchestrationIo {
             get_user: pam_sys::get_user,
             new_conversation: pam_sys::PamConversation::new,
             load_messages: pam_messages::load_for_user,
+            read_authtok: pam_sys::read_authtok_for_handoff,
         }
     }
 }
@@ -254,7 +259,7 @@ where
 
     let msgs = (io.load_messages)(&username);
 
-    let mut host = HostIo::new(pamh, &pam_conv, &msgs);
+    let mut host = HostIo::new(pamh, &pam_conv, &msgs, io.read_authtok);
     crate::transaction::run(
         ctx,
         &username,
@@ -394,6 +399,7 @@ mod tests {
             get_user: counting_get_user,
             new_conversation: counting_conversation,
             load_messages: counting_messages,
+            read_authtok: crate::transaction::tests::unused_authtok,
         }
     }
 
@@ -421,6 +427,7 @@ mod tests {
             get_user: user,
             new_conversation: conversation,
             load_messages: |_username| pam_messages::load_for_user("tty-probe-test-user"),
+            read_authtok: crate::transaction::tests::unused_authtok,
         }
     }
 
@@ -566,11 +573,27 @@ mod tests {
     /// `counting_io` so the two tests cannot race on one static.
     static SKIP_CONVERSATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    /// The handoff token reads, counted separately from the other statics so a
+    /// concurrent test cannot make the count meaningless.
+    static HANDOFF_TOKEN_READS: AtomicUsize = AtomicUsize::new(0);
+
     unsafe fn skip_conversation(
         _pamh: *mut pam_sys::PamHandle,
     ) -> Result<pam_sys::PamConversation<'static>, c_int> {
         SKIP_CONVERSATION_CALLS.fetch_add(1, Ordering::SeqCst);
         Ok(unsafe { pam_sys::PamConversation::dummy() })
+    }
+
+    /// The injected handoff reader: counts the read and supplies no token.
+    ///
+    /// A successful read with a null token is the handoff's "nothing was
+    /// collected" branch, so the only thing this reader's answer changes is the
+    /// log line — the count is what the test asserts.
+    unsafe fn counting_authtok(
+        _pamh: *mut pam_sys::PamHandle,
+    ) -> (c_int, *const std::os::raw::c_char) {
+        HANDOFF_TOKEN_READS.fetch_add(1, Ordering::SeqCst);
+        (pam_sys::PAM_SUCCESS, std::ptr::null())
     }
 
     fn skip_io() -> OrchestrationIo {
@@ -582,10 +605,12 @@ mod tests {
             get_user: user,
             new_conversation: skip_conversation,
             load_messages: |_username| pam_messages::load_for_user("skip-test-user"),
+            read_authtok: counting_authtok,
         }
     }
 
-    /// A skip never reaches the handoff.
+    /// A skip never reaches the handoff, which is asserted on the token read
+    /// itself.
     ///
     /// The two no-daemon paths are not one category: R1 and R2 skip the handle
     /// entirely (no plan, no deadline, no conversation), while R8's pre-collected
@@ -593,15 +618,10 @@ mod tests {
     /// and leaves `PAM_AUTHTOK` for the next module. The defect this catches: a
     /// skip routed through the participation path, so a display-manager login or
     /// a remote call reads the token (and answers `PasswordHandoff` instead of
-    /// its own reason).
-    ///
-    /// What is asserted, and why it is enough: the conversation is never looked
-    /// up, so `HostIo` is never built, so `transaction::run` is never entered, so
-    /// `mechanism::handoff::perform` — whose only caller is `run`'s
-    /// pre-collected arm — cannot have run. A `pam_get_authtok` call counter
-    /// would need an injection seam the handoff does not have; the structural
-    /// argument is what stands in for it, and the returned reason (never
-    /// `PasswordHandoff`) is the observable half.
+    /// its own reason). The read is counted where it happens — through the
+    /// reader `transaction::HostIo` carries — rather than inferred from the
+    /// absence of a conversation; the R8 control at the end is what proves the
+    /// counter fires at all, so the two zeros cannot be vacuous.
     #[test]
     fn skip_never_hands_off() {
         for (service, process, expected) in [
@@ -617,6 +637,7 @@ mod tests {
             ),
         ] {
             SKIP_CONVERSATION_CALLS.store(0, Ordering::SeqCst);
+            HANDOFF_TOKEN_READS.store(0, Ordering::SeqCst);
             let connects = AtomicUsize::new(0);
             let sends = AtomicUsize::new(0);
 
@@ -638,8 +659,12 @@ mod tests {
             assert_eq!(
                 SKIP_CONVERSATION_CALLS.load(Ordering::SeqCst),
                 0,
-                "service {service}: a skip must not look up a conversation, which is \
-                 what keeps `pam_get_authtok` out of its reach"
+                "service {service}: a skip must not look up a conversation"
+            );
+            assert_eq!(
+                HANDOFF_TOKEN_READS.load(Ordering::SeqCst),
+                0,
+                "service {service}: a skip must not read the handoff token"
             );
             assert_eq!(
                 connects.load(Ordering::SeqCst),
@@ -657,6 +682,30 @@ mod tests {
                 "service {service}: a skip keeps its own reason and never hands off"
             );
         }
+
+        // The positive control: R8's pre-collected host reaches the handoff, so
+        // the same reader counts exactly one read and the verdict is the
+        // handoff's. Without it the two zeros above would also pass for a reader
+        // that is never wired into the handoff at all.
+        HANDOFF_TOKEN_READS.store(0, Ordering::SeqCst);
+        let finished = orchestrate(
+            std::ptr::null_mut(),
+            &context(Some("test-service"), Some("swaylock")),
+            &skip_io(),
+            || Err::<NullIpc, _>(no_daemon()),
+            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            |_, _| {},
+        );
+        assert_eq!(
+            HANDOFF_TOKEN_READS.load(Ordering::SeqCst),
+            1,
+            "a pre-collected host must read the token exactly once"
+        );
+        assert_eq!(
+            finished.outcome(),
+            &Outcome::Unavailable(crate::outcome::UnavailableReason::PasswordHandoff),
+            "the pre-collected host's call is the handoff's verdict"
+        );
     }
 
     /// `PAM_SERVICE` is read at exactly one call site, in `CallerContext::capture`.

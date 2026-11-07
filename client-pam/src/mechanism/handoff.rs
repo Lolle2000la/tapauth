@@ -29,18 +29,10 @@ use crate::transaction::{HostIo, MechanismEnd};
 /// The only PAM handle use in this crate's mechanisms: the token must be read on
 /// this thread, which is what `HostIo` carries the handle for.
 pub(crate) fn perform(host: &mut HostIo<'_>) -> MechanismEnd {
-    let mut authtok: *const std::os::raw::c_char = std::ptr::null();
-    // SAFETY: `pamh` is the live handle libpam passed to this call and
-    // the conversation belongs to this thread, which is what the host
-    // expects.
-    let res = unsafe {
-        pam_sys::pam_get_authtok(
-            host.pamh(),
-            pam_sys::PAM_AUTHTOK,
-            &mut authtok,
-            std::ptr::null(),
-        )
-    };
+    // The read goes through the host's injected reader — production passes
+    // `pam_sys::read_authtok_for_handoff` — so this is the one PAM handle use a
+    // mechanism makes, and a test can count it rather than infer it.
+    let (res, authtok) = host.read_authtok();
     if res != pam_sys::PAM_SUCCESS || authtok.is_null() {
         tracing::warn!(
             "TapAuth: pre-collected host supplied no password token ({res}); \

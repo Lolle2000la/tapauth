@@ -117,6 +117,31 @@ pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_i
     Ok(item as *const ffi::pam_conv)
 }
 
+/// The pre-collected token read, as a value the handoff can be given.
+///
+/// The read is the one effect `mechanism::handoff` performs on the PAM handle,
+/// so it is passed in through `transaction::HostIo` like every other effect: a
+/// test can then count it instead of inferring it from the absence of a
+/// conversation.
+pub(crate) type ReadAuthtok = unsafe fn(*mut PamHandle) -> (c_int, *const c_char);
+
+/// Read `PAM_AUTHTOK` for the pre-collected handoff.
+///
+/// Exactly the call the handoff used to make inline: `pam_get_authtok` on this
+/// thread, with no prompt, and whatever token libpam produces. The code and the
+/// token are returned as-is; deciding that a null token means "nothing was
+/// collected" belongs to the handoff.
+///
+/// # Safety
+///
+/// `pamh` must be the live handle libpam passed to this thread's
+/// `pam_authenticate`, and the conversation behind it belongs to this thread.
+pub(crate) unsafe fn read_authtok_for_handoff(pamh: *mut PamHandle) -> (c_int, *const c_char) {
+    let mut authtok: *const c_char = std::ptr::null();
+    let res = pam_get_authtok(pamh, PAM_AUTHTOK, &mut authtok, std::ptr::null());
+    (res, authtok)
+}
+
 /// Send a message to the user via the PAM conversation function.
 ///
 /// Allocates a `pam_message` on the stack and calls the conversation
