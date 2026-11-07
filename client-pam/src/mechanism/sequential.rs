@@ -141,7 +141,35 @@ pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
 ) -> MechanismEnd {
     let profile = Profile::of(plan, tty);
     let (ipc, request_id) = armed.parts();
-    run_loop(ipc, request_id, deadline_at, profile, &cancel)
+    run_loop(
+        ipc,
+        request_id,
+        deadline_at,
+        profile,
+        &cancel,
+        production_poll,
+    )
+}
+
+/// The `poll` the loop calls, as a value.
+///
+/// It is a parameter rather than a direct call so the non-`EINTR` error cell —
+/// which the profiles answer differently — can be reached from a test with a
+/// mock. Production passes exactly [`nix::poll::poll`] (through
+/// [`production_poll`], which only widens its `c_int` count to `usize`); the
+/// error is forwarded unchanged, so the loop's mapping is unaffected.
+type PollFn = fn(&mut [PollFd<'_>], PollTimeout) -> Result<usize, nix::errno::Errno>;
+
+/// [`nix::poll::poll`] behind the seam's signature.
+///
+/// The only difference is the ready-count type: `poll` answers `c_int`, and on
+/// success that value is never negative, so the widening is exact. The
+/// `Err(Errno)` arm is passed through untouched — no errno is translated here.
+fn production_poll(
+    fds: &mut [PollFd<'_>],
+    timeout: PollTimeout,
+) -> Result<usize, nix::errno::Errno> {
+    poll(fds, timeout).map(|ready| usize::try_from(ready).unwrap_or(usize::MAX))
 }
 
 /// The one loop both shapes run.
@@ -151,6 +179,7 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
     deadline_at: Instant,
     mut profile: Profile,
     cancel: &X,
+    poll_fn: PollFn,
 ) -> MechanismEnd {
     // Set the tty nonblocking once, up front, so a `read` after a readable poll
     // cannot block unexpectedly.
@@ -199,9 +228,9 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
         // The no-terminal shape polls one fd, so a tty that stopped being
         // polled is not carried as an invalid descriptor.
         let ready = if poll_tty {
-            poll(&mut fds, timeout)
+            poll_fn(&mut fds, timeout)
         } else {
-            poll(&mut fds[..1], timeout)
+            poll_fn(&mut fds[..1], timeout)
         };
 
         match ready {
@@ -360,7 +389,7 @@ mod tests {
     use super::*;
     use crate::plan::Plannable;
     use crate::transaction::armed_for_test;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::net::UnixStream;
@@ -486,6 +515,60 @@ mod tests {
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Drive the one loop with a caller-supplied `poll`, so the non-`EINTR`
+    /// error cell can be reached. Production never takes this path: `drive`
+    /// always passes `production_poll` (`nix::poll::poll`).
+    fn run_loop_recording(
+        ipc: MockIpcReader,
+        tty: Option<File>,
+        deadline_at: Instant,
+        poll_fn: PollFn,
+    ) -> (MechanismEnd, Vec<String>) {
+        let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut armed = armed_for_test(ipc, RID);
+        let profile = Profile::of(&plan(tty.is_some()), tty);
+        let (ipc, request_id) = armed.parts();
+        let end = run_loop(
+            ipc,
+            request_id,
+            deadline_at,
+            profile,
+            &|reason: &str, request_id: &str| {
+                log.borrow_mut().push(format!("{reason}:{request_id}"));
+            },
+            poll_fn,
+        );
+        (end, log.into_inner())
+    }
+
+    // How many times the mock `poll` below ran on this thread. Thread-local, so
+    // the two poll-error cases share one mock without racing each other or any
+    // other test in this binary.
+    thread_local! {
+        static POLL_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn poll_calls() -> usize {
+        POLL_CALLS.with(Cell::get)
+    }
+
+    fn reset_poll_calls() {
+        POLL_CALLS.with(|calls| calls.set(0));
+    }
+
+    /// A `poll` that always fails with `EIO` — an error that is *not* `EINTR`,
+    /// so it reaches the profile decision instead of being swallowed. The 1 ms
+    /// pause keeps the continuing profile at about a hundred iterations over the
+    /// 100 ms deadline rather than a hot spin.
+    fn failing_poll(
+        _fds: &mut [PollFd<'_>],
+        _timeout: PollTimeout,
+    ) -> Result<usize, nix::errno::Errno> {
+        POLL_CALLS.with(|calls| calls.set(calls.get() + 1));
+        std::thread::sleep(Duration::from_millis(1));
+        Err(nix::errno::Errno::EIO)
     }
 
     /// Enter skips; every other key is consumed and the wait continues.
@@ -758,6 +841,64 @@ mod tests {
             cancelled,
             vec![format!("gui-ipc-error:{RID}")],
             "the no-terminal shape cancels so the phone stops buzzing"
+        );
+    }
+
+    /// A non-`EINTR` `poll` error ends the no-terminal wait at once.
+    ///
+    /// The defect this catches: the `Collapse` half of the poll-error cell
+    /// (`Profile::poll_error_stops`) ignored — a loop that logs the error and
+    /// keeps polling, so a broken IPC socket waits out the whole GUI timeout
+    /// while the phone keeps buzzing instead of being cancelled immediately. The
+    /// call count is the other half: the loop must *end*, not retry.
+    #[test]
+    fn poll_error_stops_the_no_terminal_wait() {
+        reset_poll_calls();
+        let (end, cancelled) =
+            run_loop_recording(MockIpcReader::idle(), None, later(), failing_poll);
+        assert!(
+            matches!(end, MechanismEnd::Reason(UnavailableReason::IpcError)),
+            "the collapsing profile names a poll error IpcError: {end:?}"
+        );
+        assert_eq!(
+            cancelled,
+            vec![format!("gui-ipc-error:{RID}")],
+            "the collapsing profile cancels so the phone stops buzzing"
+        );
+        assert_eq!(
+            poll_calls(),
+            1,
+            "a poll error ends the no-terminal loop: it must not be polled again"
+        );
+    }
+
+    /// The same error on the terminal profile is logged and the wait continues.
+    ///
+    /// The defect this catches: the `Distinguish` half of the cell — a merged
+    /// loop that treats a non-`EINTR` poll error as an IPC failure on the
+    /// terminal shape too, ending the call with `IpcConnectionLost` (a different
+    /// message and style) for a transient error it must simply retry. The call
+    /// count is what distinguishes "continue" from "return a reason": one
+    /// iteration would mean the loop ended on the first error.
+    #[test]
+    fn poll_error_is_logged_and_the_terminal_wait_continues() {
+        reset_poll_calls();
+        let (tty, write_end) = tty_pipe();
+        let (end, cancelled) =
+            run_loop_recording(MockIpcReader::idle(), Some(tty), shortly(), failing_poll);
+        unsafe { libc::close(write_end) };
+        assert!(
+            matches!(end, MechanismEnd::Reason(UnavailableReason::TimedOut)),
+            "the terminal profile keeps waiting until its deadline: {end:?}"
+        );
+        assert!(
+            cancelled.is_empty(),
+            "the terminal shape does not cancel on an IPC failure"
+        );
+        assert!(
+            poll_calls() > 1,
+            "a poll error must not end the terminal wait: poll ran {} time(s)",
+            poll_calls()
         );
     }
 }
