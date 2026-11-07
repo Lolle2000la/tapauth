@@ -483,6 +483,29 @@ local rustflags="-C target-cpu=native -C opt-level=3"
 local rustflags="-C target-cpu=x86-64 -C opt-level=3"
 ```
 
+### Refused PAM Services (`pam_refused_services`)
+
+TapAuth never takes part in remote authentication. OpenSSH's PAM service names — `sshd` and
+`sshd-session` — are built in and refused whether or not this setting exists. If your
+distribution or an administrator renames the service (OpenSSH's `PAMServiceName`, set in
+`sshd_config`), declare the new name in `/etc/tapauth/config.toml`:
+
+```toml
+# Default: ["sshd", "sshd-session"]
+pam_refused_services = ["sshd", "sshd-session", "my-sshd"]
+```
+
+- **Additive only.** Entries are added to the built-ins; the setting cannot remove `sshd` or
+  `sshd-session`.
+- **What counts as a name.** Each entry is trimmed and must be non-empty ASCII with no `/`,
+  no whitespace or control character, and at most 255 bytes (a `pam.d` file name must fit
+  `NAME_MAX`). Entries are deduplicated ASCII case-insensitively; an entry that fails these
+  rules is dropped with a warning.
+- **Why it exists.** Without the declaration a renamed SSH stack is treated as local: the
+  phone is rung for a remote login instead of the login being refused.
+- **Optional.** The built-ins apply with no configuration at all; add the setting only when
+  a stack is renamed.
+
 ### TPM Configuration
 
 If you enabled TPM support, ensure:
