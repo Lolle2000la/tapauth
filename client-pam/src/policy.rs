@@ -679,23 +679,119 @@ mod tests {
         }
     }
 
+    /// The terminal state each participating row models, written out by hand.
+    ///
+    /// This is the oracle the corpus's `tty` column is checked against, and it
+    /// is a literal for a reason: the §3.4.1 plan cell is a function of `tty`,
+    /// so an expected plan derived from the column under test agrees with a
+    /// wrong value by construction. Derived that way, only a row whose column
+    /// contradicted its own `expected_policy` could fail; a fixture row whose
+    /// `tty` simply misdescribed its host stayed green. The literal names the
+    /// host instead, so flipping any row's value — `sequential_with_tty`
+    /// losing its `1`, or `threaded_no_tty` gaining one — fails here.
+    ///
+    /// Every row whose `expected_policy` is `Threaded` or `Sequential` (the only
+    /// rows that reach a `Plan`) must appear exactly once; no other row may
+    /// appear. `daemon_timeout` is the e2e row proving a daemon-side timeout is
+    /// silent: R5, threaded, no terminal.
+    const EXPECTED_TTY: &[(&str, bool)] = &[
+        // Threaded.  The plan is Operation/Wait/DoNotOpen whatever the value,
+        // and the hosts are lock-screen, polkit and GDM helpers that own no
+        // terminal — except `threaded_with_tty_unreachable`, which carries a `1`
+        // precisely to show the column cannot change a threaded decision.
+        ("daemon_timeout", false),
+        ("reauth_zero_value", false),
+        ("mixed_case_gdm", false),
+        ("threaded_gdm_worker_truncated", false),
+        ("threaded_polkit_agent", false),
+        ("threaded_polkit_agent_truncated", false),
+        ("comm_only_fallback", false),
+        ("exe_beats_comm", false),
+        ("kscreenlocker_truncated", false),
+        ("service_unknown", false),
+        ("threaded_no_tty", false),
+        ("threaded_with_tty_unreachable", true),
+        ("threaded_hyprlock", false),
+        ("threaded_xsecurelock", false),
+        ("proc_unreadable_polkit", false),
+        // Sequential.  `sequential_with_tty` is the `login`/`su` shape where the
+        // Enter skip exists; every other row is a screen saver, an unknown
+        // binary or a near miss with no terminal on the calling side.
+        ("dm_ly_not", false),
+        ("dm_kelvin", false),
+        ("sddmfoo_not_dm", false),
+        ("unknown_binary", false),
+        ("renamed_binary", false),
+        ("reauth_wrong_service", false),
+        ("proc_unreadable_polkit_upper", false),
+        ("proc_unreadable_other", false),
+        ("empty_process_name", false),
+        ("kscreenlocker_greet", false),
+        ("service_unknown_polkit", false),
+        ("sequential_with_tty", true),
+        ("sequential_no_tty", false),
+        ("service_case_sudo", false),
+        ("service_case_SUDO", false),
+        ("svc_sshd_near_miss", false),
+        ("svc_unknown_not_sshd", false),
+        ("kscreenlocker_g", false),
+        ("xfce4_screensav", false),
+        ("mate_screensaver_dialog", false),
+        ("mate_screensave", false),
+    ];
+
+    /// The terminal state `EXPECTED_TTY` gives a row, or a panic naming the row.
+    ///
+    /// Callers only reach it for a participating row, after the set check in
+    /// `corpus_characterises_the_decision_table`.
+    fn expected_tty(id: &str) -> bool {
+        EXPECTED_TTY
+            .iter()
+            .find(|(name, _)| *name == id)
+            .map(|(_, tty)| *tty)
+            .unwrap_or_else(|| panic!("row {id} is missing from EXPECTED_TTY"))
+    }
+
     /// Every corpus row classifies to the rule and policy it names, and a
-    /// participating row's `tty` column produces the §3.4.1 plan cell.
+    /// participating row's `tty` column matches the host it models.
     ///
     /// What the column-by-column feeding covers: the `exe`/`comm` pair is fed to
     /// `classify_identity` before `classify`, so a precedence or `(deleted)`
     /// regression fails at the column that caused it; `env` goes through
     /// `GdmReauth::from_env`, so presence-only parsing is exercised rather than
-    /// assumed. The `tty` column is fed to `Plannable::plan`, which is the only
-    /// consumer of `has_tty`: a row whose terminal expectation drifts from its
-    /// policy (say `sequential_with_tty` losing its `1`) fails here, on the
-    /// plan cell, instead of only in a shell shape that may not run. `skip_*`
-    /// and `precollected` rows have no `Plan` — the skip returns before a plan
-    /// exists and the handoff returns before the probe — so they assert the
-    /// classification only.
+    /// assumed. The `tty` column is checked against `EXPECTED_TTY`, a literal
+    /// independent of the fixture, and only then fed to `Plannable::plan` — the
+    /// column cannot be its own oracle, because the plan is a function of it
+    /// (see `EXPECTED_TTY`). `skip_*` and `precollected` rows have no `Plan` —
+    /// the skip returns before a plan exists and the handoff returns before the
+    /// probe — so they assert the classification only.
     #[test]
     fn corpus_characterises_the_decision_table() {
-        for row in rows() {
+        let rows = rows();
+
+        // The literal table and the set of rows that carry a plan must be the
+        // same set: one entry per participating row, and no entry for a row that
+        // is missing or carries no plan.
+        let participating: Vec<&Row> = rows
+            .iter()
+            .filter(|row| matches!(row.expected_policy, Policy::Threaded | Policy::Sequential))
+            .collect();
+        for row in &participating {
+            let entries = EXPECTED_TTY.iter().filter(|(id, _)| *id == row.id).count();
+            assert_eq!(
+                entries, 1,
+                "row {}: EXPECTED_TTY must carry exactly one entry for it, found {}",
+                row.id, entries
+            );
+        }
+        for (id, _) in EXPECTED_TTY {
+            assert!(
+                participating.iter().any(|row| row.id == *id),
+                "{id}: EXPECTED_TTY names a row that is missing or has no plan"
+            );
+        }
+
+        for row in &rows {
             assert!(!row.why.is_empty(), "row {} has no justification", row.id);
             assert!(
                 row.expected_rule.strip_prefix('R').is_some_and(|number| {
@@ -724,7 +820,7 @@ mod tests {
                 classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
             assert_eq!(
                 provenance(&identity),
-                expected_provenance(&row),
+                expected_provenance(row),
                 "row {}: exe {:?} / comm {:?} resolved to the wrong source",
                 row.id,
                 row.exe,
@@ -740,7 +836,7 @@ mod tests {
                 row.env.as_deref().unwrap_or("-")
             );
 
-            let classification = classify(&row_context(&row, &identity, reauth));
+            let classification = classify(&row_context(row, &identity, reauth));
             assert_eq!(
                 rule_of(&classification).map(RuleId::as_str),
                 Some(row.expected_rule.as_str()),
@@ -756,45 +852,57 @@ mod tests {
                 row.why
             );
 
-            // The `tty` column is `plan`'s only input, so a participating row
-            // must produce the §3.4.1 cell for that conversation — which is
-            // what makes a drifting `tty` value a failure rather than an
-            // unused column.
+            // The `tty` column is `plan`'s only input, so it is first checked
+            // against the host it models (`EXPECTED_TTY`, a literal) and the
+            // §3.4.1 cell is then derived from that expectation — never from the
+            // column, which would make a drifted value agree with itself.
             match row.expected_policy {
-                Policy::Threaded => assert_eq!(
-                    Plannable::Threaded.plan(row.tty),
-                    Plan {
-                        deadline: Deadline::Operation,
-                        announcement: Announcement::Wait,
-                        tty_use: TtyUse::DoNotOpen,
-                    },
-                    "row {}: a threaded host plans Operation/Wait/DoNotOpen for \
-                     either tty value",
-                    row.id
-                ),
-                Policy::Sequential => assert_eq!(
-                    Plannable::Sequential.plan(row.tty),
-                    Plan {
-                        deadline: if row.tty {
-                            Deadline::Operation
-                        } else {
-                            Deadline::GuiBounded
-                        },
-                        announcement: if row.tty {
-                            Announcement::WaitSkipHint
-                        } else {
-                            Announcement::WaitThenPassword
-                        },
-                        tty_use: if row.tty {
-                            TtyUse::PollForKey
-                        } else {
-                            TtyUse::DoNotOpen
-                        },
-                    },
-                    "row {} ({}): the sequential plan must match the tty column",
-                    row.id,
-                    row.why
-                ),
+                Policy::Threaded | Policy::Sequential => {
+                    assert_eq!(
+                        row.tty,
+                        expected_tty(&row.id),
+                        "row {} ({}): the tty column disagrees with the host it models",
+                        row.id,
+                        row.why
+                    );
+                    let tty = expected_tty(&row.id);
+                    match row.expected_policy {
+                        Policy::Threaded => assert_eq!(
+                            Plannable::Threaded.plan(tty),
+                            Plan {
+                                deadline: Deadline::Operation,
+                                announcement: Announcement::Wait,
+                                tty_use: TtyUse::DoNotOpen,
+                            },
+                            "row {}: a threaded host plans Operation/Wait/DoNotOpen for \
+                             either tty value",
+                            row.id
+                        ),
+                        _ => assert_eq!(
+                            Plannable::Sequential.plan(tty),
+                            Plan {
+                                deadline: if tty {
+                                    Deadline::Operation
+                                } else {
+                                    Deadline::GuiBounded
+                                },
+                                announcement: if tty {
+                                    Announcement::WaitSkipHint
+                                } else {
+                                    Announcement::WaitThenPassword
+                                },
+                                tty_use: if tty {
+                                    TtyUse::PollForKey
+                                } else {
+                                    TtyUse::DoNotOpen
+                                },
+                            },
+                            "row {} ({}): the sequential plan must match the host's terminal",
+                            row.id,
+                            row.why
+                        ),
+                    }
+                }
                 // A skip returns before a plan exists and the pre-collected
                 // handoff returns before the probe, so neither has a cell.
                 Policy::SkipRemote | Policy::SkipKeyring | Policy::PreCollected => {}
