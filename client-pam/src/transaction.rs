@@ -36,8 +36,9 @@ use crate::pam_sys::{PamConversation, PamHandle};
 use crate::plan::{Announcement, Plannable, TtyUse};
 use crate::policy::{Conversation, FailureDirection, Participation};
 use std::borrow::Cow;
+use std::cell::UnsafeCell;
 use std::fs::File;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 /// The result of one authentication transaction.
@@ -414,7 +415,7 @@ struct LastConclusion {
     outcome: Outcome,
 }
 
-/// The last conclusion of this process, replayed for
+/// The lock that guards the last conclusion of this process, replayed for
 /// [`VERDICT_REUSE_WINDOW`] only.
 ///
 /// `std::sync::Mutex` is const-constructible on stable, so no lazy initializer
@@ -422,11 +423,109 @@ struct LastConclusion {
 /// credential: a poisoned lock is ignored rather than fatal, so losing the
 /// cache only costs one duplicate request.
 ///
+/// The mutex sits in an [`UnsafeCell`] because a forked child has to replace it
+/// wholesale: a `Mutex` a parent thread held at `fork(2)` time is permanently
+/// locked in the child, since its owner does not exist there. The only write is
+/// the child-side `pthread_atfork` handler, which runs when the process is
+/// single-threaded again, so no reader can race it. Every other access goes
+/// through the mutex itself.
+///
 /// The static is private to this module and is named by no other file:
 /// [`record`] and [`replay_for`] are the only way to reach the record, which is
-/// what keeps a change to its representation (an `atfork` reinit, an atomic
-/// cell, or removing it) inside this type.
-static LAST_CONCLUSION: Mutex<Option<LastConclusion>> = Mutex::new(None);
+/// what keeps this representation inside the type.
+struct CacheSlot {
+    /// The record under its lock, replaced (never mutated through the cell) only
+    /// by [`reinit_cache_in_child`].
+    slot: UnsafeCell<Mutex<Option<LastConclusion>>>,
+}
+
+// SAFETY: the `UnsafeCell` is only written by `reinit_cache_in_child`, which
+// runs in a forked child where this process has exactly one thread and so no
+// shared reference can exist. In the parent the cell is only ever read, and
+// every read either locks the `Mutex` or hands out a `&Mutex` whose own
+// synchronisation is unchanged. Neither the cell nor the record is ever sent
+// between threads.
+unsafe impl Sync for CacheSlot {}
+
+impl CacheSlot {
+    const fn new() -> Self {
+        CacheSlot {
+            slot: UnsafeCell::new(Mutex::new(None)),
+        }
+    }
+
+    /// Read the record under the lock, if the lock is not poisoned.
+    ///
+    /// A poisoned lock yields `None`: the cache is an optimisation, so ignoring
+    /// it is always a correct answer. The guard is never named here, let alone
+    /// handed out — this module may lock the slot, no one else may reach it.
+    fn with_read<R>(&self, f: impl FnOnce(&Option<LastConclusion>) -> R) -> Option<R> {
+        install_atfork_handler();
+        // SAFETY: no write can happen while a shared reference is live (see the
+        // `Sync` impl above).
+        let mutex = unsafe { &*self.slot.get() };
+        let guard = mutex.lock().ok()?;
+        Some(f(&guard))
+    }
+
+    /// Replace the record under the lock, if the lock is not poisoned.
+    fn with_write<R>(&self, f: impl FnOnce(&mut Option<LastConclusion>) -> R) -> Option<R> {
+        install_atfork_handler();
+        // SAFETY: as `with_read`.
+        let mutex = unsafe { &*self.slot.get() };
+        let mut guard = mutex.lock().ok()?;
+        Some(f(&mut guard))
+    }
+}
+
+/// The process's one slot. The static is the only state `CACHE` owns.
+static LAST_CONCLUSION: CacheSlot = CacheSlot::new();
+
+/// The child half of the `pthread_atfork` registration.
+///
+/// A fork taken while another thread holds `LAST_CONCLUSION` leaves the child
+/// owning a mutex whose holder does not exist there, so the child's first
+/// `pam_authenticate` would block until its host kills it. This overwrites the
+/// slot with a fresh, unlocked mutex. The child is single-threaded at this
+/// point (the kernel has copied only the forking thread), so there is no
+/// competing reader to synchronise with, and no lock can be taken here: the
+/// handler must stay async-signal-safe.
+///
+/// The child also starts with an **empty** record. A forked child is a new
+/// process, and the module's contract is that a new process always misses
+/// (`pam_end` unloads the module and the cache dies with it); inheriting a
+/// parent grant would answer an authentication the child never performed, and
+/// one extra ring of the phone is the cheaper error. So the record is cleared,
+/// not preserved.
+///
+/// The replaced `Option` is leaked rather than dropped: dropping it would free
+/// the record's strings on a copy of heap state the parent is still using.
+extern "C" fn reinit_cache_in_child() {
+    // SAFETY: see the comment above and the `Sync` impl on `CacheSlot`. Writing
+    // through the cell is sound because the child has one thread and no live
+    // shared reference to the slot.
+    unsafe {
+        std::ptr::write(LAST_CONCLUSION.slot.get(), Mutex::new(None));
+    }
+}
+
+/// Register [`reinit_cache_in_child`], once per process.
+///
+/// Called before every lock, so the handler is installed before this process
+/// can hold the lock across a fork. `pthread_atfork` is async-signal-safe per
+/// POSIX, so a child that somehow reaches this before its parent did still
+/// cannot deadlock. A failed registration is logged once and the cache keeps
+/// working: the fork hazard is the only thing lost.
+fn install_atfork_handler() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(|| {
+        let res = unsafe { libc::pthread_atfork(None, None, Some(reinit_cache_in_child)) };
+        if res != 0 {
+            let err = std::io::Error::from_raw_os_error(res);
+            tracing::warn!("pthread_atfork registration failed: {err}");
+        }
+    });
+}
 
 /// The 500 ms reuse record and its lock, owned by exactly one type.
 ///
@@ -488,10 +587,9 @@ impl ConclusionCache {
     /// A poisoned lock returns `None`: the cache is an optimisation, so
     /// ignoring it is always a correct answer.
     fn lookup(&self, username: &str, service: &str, now: Instant) -> Option<(Outcome, Duration)> {
-        let Ok(guard) = LAST_CONCLUSION.lock() else {
-            return None;
-        };
-        recorded_in(&guard, username, service, now)
+        LAST_CONCLUSION
+            .with_read(|slot| recorded_in(slot, username, service, now))
+            .flatten()
     }
 
     /// The cache hit for `(username, service)` as a conclusion that must not be
@@ -539,14 +637,14 @@ impl ConclusionCache {
         } = concluded;
         if via == Via::Daemon {
             if let Some(service) = service {
-                if let Ok(mut guard) = LAST_CONCLUSION.lock() {
-                    *guard = Some(LastConclusion {
+                LAST_CONCLUSION.with_write(|slot| {
+                    *slot = Some(LastConclusion {
                         concluded_at: at,
                         username,
                         service: service.original().to_owned(),
                         outcome: outcome.clone(),
                     });
-                }
+                });
             }
         }
         outcome
@@ -1253,47 +1351,59 @@ pub(crate) mod tests {
         );
     }
 
-    /// The cache survives a fork taken while another thread holds its lock.
+    /// The cache survives a fork taken while another thread holds its lock, and
+    /// the child starts with an empty record.
     ///
-    /// The defect this catches (D4): `LAST_CONCLUSION` has no `pthread_atfork`
-    /// handler, so a fork taken while another thread holds the lock leaves the
+    /// The defect this catches (D4): without a registered `pthread_atfork`
+    /// handler, a fork taken while another thread holds the lock leaves the
     /// child blocked forever on its first `pam_authenticate` — the lock's owner
-    /// does not exist in the child — and the child also inherits the recorded
-    /// conclusion itself, so a lookup there can replay a verdict this process
-    /// reached before the fork.
+    /// does not exist there — and, even with a reinitialised lock, a child that
+    /// kept the inherited record could replay a verdict this process reached
+    /// before the fork for a request the child never made. This test kills both
+    /// with distinct exit codes: `SIGALRM` (a blocked child is killed by its own
+    /// 5-second alarm), `2` (inherited record replayed), `3` (the inherited
+    /// record was visible to a bare lookup). Only an unlocked slot and an empty
+    /// record exit `0`.
     ///
-    /// This asserts the *fixed* behaviour, so it fails against the tree as it
-    /// stands and ships `#[ignore]`d. The three candidate fixes it tells apart
-    /// are (i) `pthread_atfork` to reinitialise the lock in the child, (ii)
-    /// replacing `Mutex<Option<..>>` with an atomic/seqlock cell, and (iii)
-    /// dropping the cache altogether (F1); (i) and (ii) keep the inherited
-    /// record and (iii) removes it, which is the decision the fix has to make.
-    /// Whichever lands removes the attribute and this test becomes its
-    /// acceptance test.
+    /// The cache is driven through its real API (`ConclusionCache::lookup` /
+    /// `replay_for`) in the child, under the module's own lock, so the test
+    /// exercises the atfork reinit rather than a copy of it.
     ///
-    /// The gate is glibc only today: no musl target exists in CI and the module
-    /// links libpam dynamically, so "built for both, run on both" is a
-    /// requirement rather than a present fact.
+    /// Platform assumption: glibc. `fork` runs the registered atfork handlers
+    /// and `std::sync::Mutex` is the glibc futex mutex; no musl target is built
+    /// in CI, so this gate is the whole story today.
     #[test]
-    #[ignore = "known latent defect (D4): a fork while another thread holds LAST_CONCLUSION leaves the \
-                child blocked, and the child inherits the recorded conclusion. The three candidate fixes \
-                are (i) a pthread_atfork reinit of the lock, (ii) an atomic/seqlock cell instead of the \
-                Mutex, and (iii) dropping the cache (F1). This test is the acceptance test for whichever \
-                of them lands"]
     fn conclusion_cache_survives_fork() {
         static HELD: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
 
+        // Seed a conclusion that is inside the reuse window, so an inherited
+        // record would be replayed by the child if the reinit kept it.
+        let now = Instant::now();
+        record_conclusion(
+            "alice",
+            "tapauth-fork-test",
+            Outcome::granted_from_daemon(),
+            now,
+        );
+        assert!(
+            CACHE
+                .lookup("alice", "tapauth-fork-test", Instant::now())
+                .is_some(),
+            "the seeded conclusion must be replayable in the parent before the fork"
+        );
+
         let holder = std::thread::spawn(|| {
-            let _guard = LAST_CONCLUSION
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            HELD.store(true, Ordering::SeqCst);
-            // Hold until the parent has forked: the fork must happen while a
-            // thread that will not exist in the child owns the lock.
-            while !RELEASE.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
+            // `with_read` registers the atfork handler before locking, so the
+            // child inherits the registration as well as the held lock.
+            LAST_CONCLUSION.with_read(|_| {
+                HELD.store(true, Ordering::SeqCst);
+                // Hold until the parent has forked: the fork must happen while
+                // a thread that will not exist in the child owns the lock.
+                while !RELEASE.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            });
         });
 
         while !HELD.load(Ordering::SeqCst) {
@@ -1302,15 +1412,22 @@ pub(crate) mod tests {
 
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            // Child. Only async-signal-safe work: an `alarm` so a blocked lock
-            // cannot hang the suite, the lock attempt itself, and `_exit` — not
-            // `exit`, so no atexit handler or Rust destructor runs on the
-            // forked copy of the parent's state.
+            // Child. Keep to what a post-fork child may safely do: an `alarm`
+            // so a blocked lock cannot hang the suite, the cache's real API,
+            // and `_exit` — not `exit`, so no atexit handler or Rust
+            // destructor runs on the forked copy of the parent's state.
             unsafe {
                 libc::alarm(5);
-                let _guard = LAST_CONCLUSION.lock();
-                libc::_exit(0);
             }
+            let at = Instant::now();
+            let inherited = CACHE.lookup("alice", "tapauth-fork-test", at);
+            let replayed = CACHE.replay_for("alice", "tapauth-fork-test", at);
+            let code = match (inherited.is_none(), replayed.is_none()) {
+                (true, true) => 0,
+                (false, true) => 2,
+                _ => 3,
+            };
+            unsafe { libc::_exit(code) };
         }
         assert!(pid > 0, "fork failed: {}", std::io::Error::last_os_error());
 
@@ -1321,10 +1438,17 @@ pub(crate) mod tests {
         let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
         assert_eq!(reaped, pid, "waitpid must reap the child");
         assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "the child could not take the cache lock after the parent forked \
-             while another thread held it (wait status {status}): a blocked \
-             child is killed by its own alarm, so this is the D4 defect"
+            libc::WIFEXITED(status),
+            "the child was killed by signal {} after the parent forked while \
+             another thread held the cache lock: a blocked child is killed by \
+             its own alarm, which is the D4 deadlock (wait status {status})",
+            libc::WTERMSIG(status)
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the child must see an unlocked cache and an empty record after the \
+             fork; exit 2/3 mean it inherited the parent's conclusion"
         );
     }
     // ------------------------------------------------------------------

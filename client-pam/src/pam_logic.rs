@@ -2232,15 +2232,14 @@ mod verdict_reuse_tests {
         );
     }
 
-    /// The reuse suite is the fifteen named cases, and exactly one test in the
-    /// crate is ignored: the fork experiment.
+    /// The reuse suite is the fifteen named cases, and no test in the crate is
+    /// ignored (the fork experiment is fixed and runs normally).
     ///
     /// The defect this catches: a rewritten suite that silently drops a case —
     /// presence is asserted by name, so a deleted test fails here rather than
     /// passing as "all green with fewer tests". The ignore rule is the other
-    /// half: if `#[ignore]` could be used to silence a broken case, the fork
-    /// test's own ignore would hide it, so the crate must contain exactly one
-    /// and it must be that one.
+    /// half: if `#[ignore]` could be used to silence a broken case, a defect
+    /// could ship as "green", so the crate must contain none.
     #[test]
     fn reuse_suite_is_intact() {
         let files = super::tests::source_files();
@@ -2318,25 +2317,12 @@ mod verdict_reuse_tests {
             );
         }
 
-        // Exactly one ignored test in the crate, and it is the fork experiment.
-        let ignored: Vec<&str> = sources
-            .match_indices("#[ignore")
-            .map(|(at, _)| at)
-            .map(|at| &sources[at..])
-            .collect();
+        // No ignored test in the crate: the fork experiment was the last one,
+        // and `#[ignore]` may not be reused to silence a broken case.
+        let ignored = sources.matches("#[ignore").count();
         assert_eq!(
-            ignored.len(),
-            1,
-            "exactly one test may be ignored (the fork experiment); found {}",
-            ignored.len()
-        );
-        let Some(after) = ignored.first().copied() else {
-            panic!("invariant broken: no `#[ignore]` found");
-        };
-        assert!(
-            after.contains("fn conclusion_cache_survives_fork("),
-            "the one ignored test must be `conclusion_cache_survives_fork`: the \
-             attribute may not be reused to silence a dropped case"
+            ignored, 0,
+            "no test may be ignored (the fork experiment now runs); found {ignored}"
         );
     }
 
