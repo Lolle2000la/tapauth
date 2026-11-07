@@ -39,7 +39,8 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::os::raw::{c_char, c_int};
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The result of one authentication transaction.
@@ -456,7 +457,26 @@ struct CacheSlot {
     /// The record under its lock, replaced (never mutated through the cell) only
     /// by [`reinit_cache_in_child`].
     slot: UnsafeCell<Mutex<Option<LastConclusion>>>,
+    /// Whether [`reinit_cache_in_child`] is registered for this process.
+    ///
+    /// A plain atomic, deliberately not a `std::sync::Once`: a `fork` taken
+    /// while a sibling thread sits between `pthread_atfork` returning and the
+    /// `Once` storing `COMPLETE` leaves the child's `Once` in `RUNNING` forever,
+    /// so the child's first cache access would block — reintroducing the very
+    /// deadlock the atfork handler exists to remove. Loading and storing an
+    /// atomic never blocks. Two threads that both read [`NOT_REGISTERED`] may
+    /// register the handler twice; that is harmless (the child half may run
+    /// twice and replace the slot twice).
+    registered: AtomicU8,
 }
+
+/// The registration states of [`CacheSlot::registered`].
+const NOT_REGISTERED: u8 = 0;
+const REGISTERED: u8 = 1;
+/// A failed registration: remembered so the failure is logged once per process
+/// rather than on every cache access, and so the cache keeps working (only the
+/// fork hazard is lost).
+const REGISTRATION_FAILED: u8 = 2;
 
 // SAFETY: the `UnsafeCell` is only written by `reinit_cache_in_child`, which
 // runs in a forked child where this process has exactly one thread and so no
@@ -470,6 +490,7 @@ impl CacheSlot {
     const fn new() -> Self {
         CacheSlot {
             slot: UnsafeCell::new(Mutex::new(None)),
+            registered: AtomicU8::new(NOT_REGISTERED),
         }
     }
 
@@ -479,7 +500,7 @@ impl CacheSlot {
     /// it is always a correct answer. The guard is never named here, let alone
     /// handed out — this module may lock the slot, no one else may reach it.
     fn with_read<R>(&self, f: impl FnOnce(&Option<LastConclusion>) -> R) -> Option<R> {
-        install_atfork_handler();
+        self.install_atfork_handler();
         // SAFETY: no write can happen while a shared reference is live (see the
         // `Sync` impl above).
         let mutex = unsafe { &*self.slot.get() };
@@ -489,7 +510,7 @@ impl CacheSlot {
 
     /// Replace the record under the lock, if the lock is not poisoned.
     fn with_write<R>(&self, f: impl FnOnce(&mut Option<LastConclusion>) -> R) -> Option<R> {
-        install_atfork_handler();
+        self.install_atfork_handler();
         // SAFETY: as `with_read`.
         let mutex = unsafe { &*self.slot.get() };
         let mut guard = mutex.lock().ok()?;
@@ -526,24 +547,56 @@ extern "C" fn reinit_cache_in_child() {
     unsafe {
         std::ptr::write(LAST_CONCLUSION.slot.get(), Mutex::new(None));
     }
+    // The atfork handler list is inherited by the child, so a future fork in
+    // the child re-runs this handler. Recording the registration here keeps the
+    // child from calling `pthread_atfork` again on its first cache access.
+    LAST_CONCLUSION
+        .registered
+        .store(REGISTERED, Ordering::Release);
 }
 
-/// Register [`reinit_cache_in_child`], once per process.
-///
-/// Called before every lock, so the handler is installed before this process
-/// can hold the lock across a fork. `pthread_atfork` is async-signal-safe per
-/// POSIX, so a child that somehow reaches this before its parent did still
-/// cannot deadlock. A failed registration is logged once and the cache keeps
-/// working: the fork hazard is the only thing lost.
-fn install_atfork_handler() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
+impl CacheSlot {
+    /// Register [`reinit_cache_in_child`] if this process has not done so yet.
+    ///
+    /// Called before every lock, so the handler is installed before this
+    /// process can hold the lock across a fork. It is a non-blocking load, not
+    /// a `std::sync::Once`: a `fork` taken while a sibling thread is inside
+    /// `pthread_atfork` (between the call returning and the flag being stored)
+    /// copies that `Once` in its `RUNNING` state, and the child's first cache
+    /// access would then wait forever — the defect this whole mechanism exists
+    /// to remove, in a narrower window.
+    ///
+    /// `pthread_atfork` is **not** in POSIX's async-signal-safe table, so two
+    /// residuals remain, and they are documented rather than claimed
+    /// impossible:
+    ///
+    /// * a fork taken while another thread is inside `pthread_atfork` itself
+    ///   copies the libc's internal atfork lock; the child's own registration
+    ///   attempt could then block on it;
+    /// * a child that forks before this module's first cache access ran
+    ///   (`registered` still false in the parent) registers lazily on that
+    ///   first access; on a libc whose child-side `malloc` is not fork-safe
+    ///   (musl), that allocation is itself unsafe if the parent was mid-`malloc`
+    ///   at the fork.
+    ///
+    /// A failed registration is logged once and remembered in
+    /// [`REGISTRATION_FAILED`], so the cache keeps working and later accesses
+    /// do not retry (or re-log) a call the process already knows fails. Only
+    /// the fork hazard is lost.
+    fn install_atfork_handler(&self) {
+        if self.registered.load(Ordering::Acquire) != NOT_REGISTERED {
+            return;
+        }
         let res = unsafe { libc::pthread_atfork(None, None, Some(reinit_cache_in_child)) };
-        if res != 0 {
+        if res == 0 {
+            self.registered.store(REGISTERED, Ordering::Release);
+        } else {
+            self.registered
+                .store(REGISTRATION_FAILED, Ordering::Release);
             let err = std::io::Error::from_raw_os_error(res);
             tracing::warn!("pthread_atfork registration failed: {err}");
         }
-    });
+    }
 }
 
 /// The 500 ms reuse record and its lock, owned by exactly one type.
@@ -1405,11 +1458,16 @@ pub(crate) mod tests {
     /// in CI, so this gate is the whole story today.
     #[test]
     fn conclusion_cache_survives_fork() {
+        // The cache is one process-wide slot, so serialise with every other
+        // test that drives it. The child does not touch `CACHE_SLOT_LOCK`, so
+        // holding it across the fork is safe: the child never waits on it.
+        let _slot = take_slot();
         static HELD: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
 
-        // Seed a conclusion that is inside the reuse window, so an inherited
-        // record would be replayed by the child if the reinit kept it.
+        // One fixed instant for the seed, the parent's check and the child's
+        // lookup: the 500 ms window can then never age out on a loaded runner,
+        // so a failure means the reinit did not happen, not that time passed.
         let now = Instant::now();
         record_conclusion(
             "alice",
@@ -1418,9 +1476,7 @@ pub(crate) mod tests {
             now,
         );
         assert!(
-            CACHE
-                .lookup("alice", "tapauth-fork-test", Instant::now())
-                .is_some(),
+            CACHE.lookup("alice", "tapauth-fork-test", now).is_some(),
             "the seeded conclusion must be replayable in the parent before the fork"
         );
 
@@ -1450,9 +1506,8 @@ pub(crate) mod tests {
             unsafe {
                 libc::alarm(5);
             }
-            let at = Instant::now();
-            let inherited = CACHE.lookup("alice", "tapauth-fork-test", at);
-            let replayed = CACHE.replay_for("alice", "tapauth-fork-test", at);
+            let inherited = CACHE.lookup("alice", "tapauth-fork-test", now);
+            let replayed = CACHE.replay_for("alice", "tapauth-fork-test", now);
             let code = match (inherited.is_none(), replayed.is_none()) {
                 (true, true) => 0,
                 (false, true) => 2,
