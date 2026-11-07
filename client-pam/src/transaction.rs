@@ -1445,9 +1445,9 @@ pub(crate) mod tests {
     /// kept the inherited record could replay a verdict this process reached
     /// before the fork for a request the child never made. This test kills both
     /// with distinct exit codes: `SIGALRM` (a blocked child is killed by its own
-    /// 5-second alarm), `2` (inherited record replayed), `3` (the inherited
-    /// record was visible to a bare lookup). Only an unlocked slot and an empty
-    /// record exit `0`.
+    /// 5-second alarm), and `3` for an inherited record — it is visible to
+    /// `lookup`, and to `replay_for`, which delegates to `lookup`. Only an
+    /// unlocked slot and an empty record exit `0`.
     ///
     /// The cache is driven through its real API (`ConclusionCache::lookup` /
     /// `replay_for`) in the child, under the module's own lock, so the test
@@ -1508,10 +1508,12 @@ pub(crate) mod tests {
             }
             let inherited = CACHE.lookup("alice", "tapauth-fork-test", now);
             let replayed = CACHE.replay_for("alice", "tapauth-fork-test", now);
-            let code = match (inherited.is_none(), replayed.is_none()) {
-                (true, true) => 0,
-                (false, true) => 2,
-                _ => 3,
+            // `replay_for` delegates to `lookup`, so a visible inherited record
+            // exits 3 whichever of the two saw it.
+            let code = if inherited.is_none() && replayed.is_none() {
+                0
+            } else {
+                3
             };
             unsafe { libc::_exit(code) };
         }
@@ -1534,7 +1536,7 @@ pub(crate) mod tests {
             libc::WEXITSTATUS(status),
             0,
             "the child must see an unlocked cache and an empty record after the \
-             fork; exit 2/3 mean it inherited the parent's conclusion"
+             fork; exit 3 means it inherited the parent's conclusion"
         );
     }
     // ------------------------------------------------------------------
