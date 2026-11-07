@@ -895,8 +895,45 @@ mod local_resource_tests {
     /// `polkitd`) — the open fds are invisible in a passing build because the
     /// return code is right either way — or cancelling with the wrong reason /
     /// not at all.
+    ///
+    /// The whole sequence runs in a forked child and the parent only asserts the
+    /// child's exit status. Checking `fcntl(fd, F_GETFD)` in the test process
+    /// after `drive_with` returned races every other test that opens an fd: the
+    /// same number can be reused between the close and the check (observed
+    /// 6/40 at `--test-threads=16`). The child's fd table is its own, so the
+    /// check is exact. `alarm(5)` turns a hang into `SIGALRM`; the child writes
+    /// a diagnostic with `write(2)` and `_exit`s — no panics, no stdio locks.
     #[test]
     fn spawn_failure_cancels_once_closes_both_fds_and_reports_local_resource() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::alarm(5) };
+            let code = run_spawn_failure_probe();
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status: libc::c_int = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(reaped, pid, "waitpid must reap the child");
+        assert!(
+            libc::WIFEXITED(status),
+            "the spawn-failure probe did not exit (wait status {status}); SIGALRM \
+             means the failing sequence hung"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the failing spawn sequence left an fd open or cancelled wrongly \
+             (child exit {})",
+            libc::WEXITSTATUS(status)
+        );
+    }
+
+    /// The child half of
+    /// [`spawn_failure_cancels_once_closes_both_fds_and_reports_local_resource`]:
+    /// drive the real failing sequence and return an exit code (0 = pass).
+    fn run_spawn_failure_probe() -> libc::c_int {
         let mut armed = armed_for_test(NullReader::new(), "spawn-fail-request");
         let cancels: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let seen_fds = Cell::new([-1, -1]);
@@ -916,32 +953,47 @@ mod local_resource_tests {
             |_thread, _attr, _start, _arg| libc::EAGAIN,
         );
 
-        assert!(
-            matches!(end, MechanismEnd::Error(ErrorReason::LocalResource)),
-            "a failed pthread_create must conclude as Error(LocalResource) \
-             (PAM_AUTH_ERR), not as a daemon unavailability"
-        );
-        assert_eq!(
-            cancels.borrow().as_slice(),
-            ["gui-thread-spawn-fail:spawn-fail-request"],
-            "the spawn failure must cancel exactly once, on its own request id"
-        );
-
-        let fds = seen_fds.get();
-        assert_ne!(fds, [-1, -1], "the test pipe was never created");
-        for fd in fds {
-            let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert_eq!(
-                rc, -1,
-                "fd {fd} must be closed after a failed pthread_create, but fcntl \
-                 (F_GETFD) still resolves it: the fds leak into the host"
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF),
-                "fd {fd} must be gone (EBADF), not merely not-cloexec"
+        if !matches!(end, MechanismEnd::Error(ErrorReason::LocalResource)) {
+            return child_diagnostic(b"spawn failure did not conclude Error(LocalResource)\n");
+        }
+        if cancels.borrow().as_slice() != ["gui-thread-spawn-fail:spawn-fail-request"] {
+            return child_diagnostic(
+                b"spawn failure did not cancel exactly once as \
+                  gui-thread-spawn-fail:spawn-fail-request\n",
             );
         }
+
+        let fds = seen_fds.get();
+        if fds == [-1, -1] {
+            return child_diagnostic(b"the test pipe was never created\n");
+        }
+        for fd in fds {
+            let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if rc != -1 {
+                return child_diagnostic(
+                    b"an fd survived the failed pthread_create: the fds leak into \
+                      the host\n",
+                );
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
+                return child_diagnostic(
+                    b"an fd was freed but its errno is not EBADF (it was not \
+                      ours to close)\n",
+                );
+            }
+        }
+        0
+    }
+
+    /// Write `message` to stderr and return 1: the only failure channel a
+    /// forked child may use. No `panic!` (a Rust panic in the child would run
+    /// unwinding machinery on the copied parent state) and no `eprintln!`
+    /// (which takes the stdio lock another thread may hold at fork time).
+    fn child_diagnostic(message: &[u8]) -> libc::c_int {
+        unsafe {
+            libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+        }
+        1
     }
 
     /// The join-failure abort actually aborts.

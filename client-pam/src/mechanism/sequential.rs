@@ -884,8 +884,16 @@ mod tests {
     fn poll_error_is_logged_and_the_terminal_wait_continues() {
         reset_poll_calls();
         let (tty, write_end) = tty_pipe();
-        let (end, cancelled) =
-            run_loop_recording(MockIpcReader::idle(), Some(tty), shortly(), failing_poll);
+        // A 500 ms budget, not `shortly()`'s 100 ms: under high parallelism a
+        // scheduling stall of a few tens of ms could otherwise end the wait
+        // before the loop's second poll, failing the `> 1` assertion below for a
+        // reason unrelated to the behaviour under test.
+        let (end, cancelled) = run_loop_recording(
+            MockIpcReader::idle(),
+            Some(tty),
+            Instant::now() + Duration::from_millis(500),
+            failing_poll,
+        );
         unsafe { libc::close(write_end) };
         assert!(
             matches!(end, MechanismEnd::Reason(UnavailableReason::TimedOut)),
