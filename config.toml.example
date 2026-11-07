@@ -21,6 +21,16 @@ pam_operation_timeout_secs = 120
 # Default: 30
 pam_gui_timeout_secs = 30
 
+# Refused PAM services
+# The PAM module refuses to take part in remote authentication for OpenSSH's
+# service names ("sshd" and "sshd-session"). Those built-in names are ALWAYS
+# refused; this setting only ADDS names and cannot remove a built-in.
+# A deployment that renames OpenSSH's PAMServiceName (sshd_config) must list the
+# new name here, or remote logins through that stack are treated as local: the
+# phone is rung and the login waits out the PAM timeout.
+# Default: ["sshd", "sshd-session"]
+# pam_refused_services = ["sshd", "sshd-session"]
+
 # Network Settings
 # UDP port for the authentication protocol.
 # Both the daemon and Android app must use the same port.

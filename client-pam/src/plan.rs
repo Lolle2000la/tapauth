@@ -137,6 +137,7 @@ mod tests {
         PamConfig {
             pam_operation_timeout_secs: operation,
             pam_gui_timeout_secs: gui,
+            ..PamConfig::default()
         }
     }
 

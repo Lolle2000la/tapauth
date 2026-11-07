@@ -19,7 +19,7 @@
 //! predicates are disjoint and their relative order is unobservable; what is
 //! load-bearing is R1 before the process rules (R3–R8) and before R10.
 
-use crate::context::{CallerContext, ProcessIdentity};
+use crate::context::{CallerContext, ProcessIdentity, ServiceName};
 
 /// What the module does with the call.
 #[derive(Debug, PartialEq, Eq)]
@@ -314,19 +314,19 @@ const DEFAULT_SEQUENTIAL: Classification = Classification::Participate(Participa
     failure_direction: FailureDirection::DeadlockAvoidance,
 });
 
-/// The service names R1 refuses.
+/// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`).
 ///
 /// `sshd` is OpenSSH's compiled-in `PAMServiceName` default; `sshd-session` is
 /// the name its per-connection session binary uses on current releases. Both are
 /// a *default*, not a constant of the protocol: a deployment that renames the
 /// service falls through to R10, which is the documented false negative (see
-/// `svc_sshd_near_miss` in the corpus). Widening the refusal to another remote
-/// service is one entry here.
+/// `svc_sshd_near_miss` in the corpus). A rename is declared by adding the new
+/// name to `pam_refused_services`; R1 itself keeps the built-ins.
 ///
 /// The comparison is ASCII case-insensitive, because `PAM_SERVICE` is a
 /// `pam.d` filename and case folding here cannot over-match: a service literally
 /// named `SSHD` is sshd's stack whatever its spelling.
-const REMOTE_SERVICES: &[&str] = &["sshd", "sshd-session"];
+const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
 
 /// R1 — refuse a remote authentication, keyed on the service name.
 ///
@@ -453,6 +453,27 @@ fn classification_of(rule: &Rule) -> Classification {
             failure_direction: rule.class,
         }),
     }
+}
+
+/// Whether an already-participating call's service is one of the *configured*
+/// refused names.
+///
+/// R1 runs before the config read by design, so it can only see the built-ins.
+/// This is the second half of the same refusal, for the names a deployment
+/// added to `pam_refused_services` (a renamed `PAMServiceName`): `orchestrate`
+/// calls it once the config is in hand, still before the username lookup,
+/// conversation, messages and transaction.
+///
+/// The match is ASCII case-insensitive, like R1's, and an entry that is empty
+/// matches nothing — an unresolved service never matches either. Malformed
+/// entries are already dropped by `PamConfig::effective_refused_services`; the
+/// empty-name guard keeps a raw slice from matching a `None`/empty service.
+pub(crate) fn refused_service(service: Option<&ServiceName>, configured: &[String]) -> bool {
+    service.is_some_and(|service| {
+        configured
+            .iter()
+            .any(|name| !name.is_empty() && service.eq_ignore_ascii_case(name))
+    })
 }
 
 /// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this table's
@@ -1120,6 +1141,58 @@ mod tests {
             rule_of(&classify(&context(Some("my-sshd"), Some("sshd")))),
             Some(RuleId::R10)
         );
+    }
+
+    /// The configured-refusal matcher's fixture table.
+    ///
+    /// The CSV corpus has no column for a runtime config, so this literal table
+    /// is the fixture for the configured half of R1: a renamed `PAMServiceName`
+    /// is refused only when it is declared, the match is ASCII case-insensitive,
+    /// a near miss is not a prefix/substring match, and a malformed entry left
+    /// in the slice matches nothing. The last row is the shape
+    /// `PamConfig::effective_refused_services` hands over (built-ins included),
+    /// which is what proves the built-ins still match through this function.
+    ///
+    /// The defect this catches: a matcher that returns true for any
+    /// participating call (the rename would be refused without being declared,
+    /// which is the negative control in `pam_logic`); one that compares
+    /// case-sensitively (`SSHD-RENAMED` would escape); one that prefix-matches
+    /// (`my-sshd` would be refused, silencing a local stack); and one that
+    /// lets an empty configured entry match.
+    #[test]
+    fn configured_refused_services_match_only_declared_names() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            // A renamed service is refused only when it is declared.
+            ("sshd-renamed", &["sshd-renamed"], true),
+            ("sshd-renamed", &[], false),
+            // Case variants, in both directions.
+            ("SSHD-RENAMED", &["sshd-renamed"], true),
+            ("sshd-renamed", &["SSHD-RENAMED"], true),
+            // Near misses: not a prefix, not a substring, not a sibling name.
+            ("my-sshd", &["sshd-renamed"], false),
+            ("sshd-renamed", &["sshd"], false),
+            ("sshd-renamed", &["sshd-renamed-old"], false),
+            // A malformed entry left in the slice matches nothing.
+            ("sshd-renamed", &["", "sshd/x", "ssh d"], false),
+            // The built-ins still match when they are in the slice, which is the
+            // list `effective_refused_services` always produces.
+            ("sshd", &["sshd", "sshd-session"], true),
+            ("Sshd-Session", &["sshd", "sshd-session"], true),
+        ];
+
+        for (name, configured, expected) in cases {
+            let configured: Vec<String> =
+                configured.iter().map(|entry| (*entry).to_owned()).collect();
+            let service = ServiceName::new(name);
+            assert_eq!(
+                refused_service(Some(&service), &configured),
+                *expected,
+                "service {name:?} against configured {configured:?}"
+            );
+        }
+
+        // An unresolved service never matches, whatever is configured.
+        assert!(!refused_service(None, &["sshd".to_owned()]));
     }
 
     /// Moving a rule must move exactly the rows it should, by value, and leave

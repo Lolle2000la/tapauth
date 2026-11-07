@@ -1074,6 +1074,7 @@ pub(crate) mod tests {
         PamConfig {
             pam_operation_timeout_secs: 0,
             pam_gui_timeout_secs: 0,
+            ..PamConfig::default()
         }
     }
 

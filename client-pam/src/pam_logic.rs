@@ -228,6 +228,23 @@ where
         config.pam_operation_timeout_secs
     );
 
+    // Gap 8: R1 keys on the built-in service names and runs before the config
+    // read by design, so a deployment that renames OpenSSH's `PAMServiceName`
+    // arrives here as a participating call. The configured extras are therefore
+    // checked here — before the username lookup, the conversation, the messages
+    // and the transaction — and the answer is R1's: no request, no probe, no
+    // record, no message. A built-in name never reaches this point (R1 already
+    // returned).
+    if policy::refused_service(ctx.service(), &config.effective_refused_services()) {
+        let service = ctx.service().map(ServiceName::original).unwrap_or_default();
+        tracing::info!(
+            "TapAuth: Service '{}' authenticates a remote caller. \
+             Skipping: this module does not take part in remote authentication.",
+            service
+        );
+        return Finished::Unrecorded(Outcome::from_skip(policy::SkipPolicy::RemoteAuthentication));
+    }
+
     let username = unsafe {
         match (io.get_user)(pamh) {
             Ok(user) => {
@@ -366,6 +383,7 @@ mod tests {
         PamConfig {
             pam_operation_timeout_secs: 0,
             pam_gui_timeout_secs: 0,
+            ..PamConfig::default()
         }
     }
 
@@ -566,6 +584,205 @@ mod tests {
             side_effects_of(&context(Some("sudo"), Some("totally-unknown"))),
             [1, 1, 1, 1],
             "a participating call must reach every one of the four calls"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Gap 8: a configured (renamed) remote service is refused after the
+    // config read and before every other side effect.
+    // ------------------------------------------------------------------
+
+    /// The four side effects the configured-refusal test counts, kept on their
+    /// own statics so the test cannot race `classify_before_side_effects`.
+    static RENAMED_CONFIG_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RENAMED_USER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RENAMED_CONVERSATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RENAMED_MESSAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A config that declares the renamed service, the shape a deployment with
+    /// `PAMServiceName sshd-renamed` writes.
+    fn renamed_config() -> PamConfig {
+        RENAMED_CONFIG_CALLS.fetch_add(1, Ordering::SeqCst);
+        PamConfig {
+            pam_refused_services: vec!["sshd-renamed".to_owned()],
+            ..zero_timeouts()
+        }
+    }
+
+    /// The same config without the extra name: the pre-gap-8 situation, and the
+    /// negative control's input.
+    fn no_extras_config() -> PamConfig {
+        RENAMED_CONFIG_CALLS.fetch_add(1, Ordering::SeqCst);
+        PamConfig {
+            pam_refused_services: vec![],
+            ..zero_timeouts()
+        }
+    }
+
+    unsafe fn renamed_get_user(_pamh: *mut pam_sys::PamHandle) -> Result<String, c_int> {
+        RENAMED_USER_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok("renamed-service-test-user".to_owned())
+    }
+
+    unsafe fn renamed_conversation(
+        _pamh: *mut pam_sys::PamHandle,
+    ) -> Result<pam_sys::PamConversation<'static>, c_int> {
+        RENAMED_CONVERSATION_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(unsafe { pam_sys::PamConversation::dummy() })
+    }
+
+    fn renamed_messages(_username: &str) -> pam_messages::PamMessages {
+        RENAMED_MESSAGE_CALLS.fetch_add(1, Ordering::SeqCst);
+        pam_messages::load_for_user("renamed-service-test-user")
+    }
+
+    /// One `orchestrate` call for a context, with every side effect counted.
+    struct RenamedRun {
+        config: usize,
+        user: usize,
+        conversation: usize,
+        messages: usize,
+        connects: usize,
+        sends: usize,
+        finished: Finished,
+    }
+
+    /// Serialises the two `run_renamed` tests: they share the counters above and
+    /// `cargo test` runs tests in parallel threads, so one resetting mid-run
+    /// would make the other's count meaningless. A poisoned lock is reused: a
+    /// panic in one test must not fail the other for the wrong reason.
+    static RENAMED_RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_renamed(ctx: &CallerContext, load_config: fn() -> PamConfig) -> RenamedRun {
+        let _guard = RENAMED_RUN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        RENAMED_CONFIG_CALLS.store(0, Ordering::SeqCst);
+        RENAMED_USER_CALLS.store(0, Ordering::SeqCst);
+        RENAMED_CONVERSATION_CALLS.store(0, Ordering::SeqCst);
+        RENAMED_MESSAGE_CALLS.store(0, Ordering::SeqCst);
+        let connects = AtomicUsize::new(0);
+        let sends = AtomicUsize::new(0);
+
+        let io = OrchestrationIo {
+            load_config,
+            get_user: renamed_get_user,
+            new_conversation: renamed_conversation,
+            load_messages: renamed_messages,
+            read_authtok: crate::transaction::tests::unused_authtok,
+        };
+        let finished = orchestrate(
+            std::ptr::null_mut(),
+            ctx,
+            &io,
+            || {
+                connects.fetch_add(1, Ordering::SeqCst);
+                Err::<NullIpc, _>(no_daemon())
+            },
+            |_: &mut NullIpc, _: &SendParams<'_>| {
+                sends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            |_, _| {},
+        );
+
+        RenamedRun {
+            config: RENAMED_CONFIG_CALLS.load(Ordering::SeqCst),
+            user: RENAMED_USER_CALLS.load(Ordering::SeqCst),
+            conversation: RENAMED_CONVERSATION_CALLS.load(Ordering::SeqCst),
+            messages: RENAMED_MESSAGE_CALLS.load(Ordering::SeqCst),
+            connects: connects.load(Ordering::SeqCst),
+            sends: sends.load(Ordering::SeqCst),
+            finished,
+        }
+    }
+
+    /// A service name added to `pam_refused_services` is refused exactly like a
+    /// built-in one: R1's verdict, after the config read, before every other
+    /// side effect.
+    ///
+    /// The defect this catches, in both directions: without the enforcement
+    /// point a renamed `PAMServiceName` is classified R10 and a remote login
+    /// rings the phone and waits out the GUI timeout (the counters would be
+    /// non-zero and the verdict `DaemonUnreachable`); an enforcement point that
+    /// runs before the config read cannot see the configured list at all, and
+    /// one placed after the username lookup, the conversation or the messages
+    /// would still pay them — and would emit through a live `HostIo`, which is
+    /// why the verdict's notice is asserted `None` here (the refusal returns
+    /// before a `HostIo` exists).
+    #[test]
+    fn a_configured_renamed_service_is_refused_after_the_config_read() {
+        let ctx = context(Some("sshd-renamed"), Some("sshd"));
+        let run = run_renamed(&ctx, renamed_config);
+
+        assert_eq!(
+            run.config, 1,
+            "the configured list only exists after the one config read"
+        );
+        assert_eq!(
+            run.user, 0,
+            "a configured refusal must not resolve a username"
+        );
+        assert_eq!(
+            run.conversation, 0,
+            "a configured refusal must not look up the conversation"
+        );
+        assert_eq!(
+            run.messages, 0,
+            "a configured refusal must not load the messages"
+        );
+        assert_eq!(
+            run.connects, 0,
+            "a configured refusal must not dial the daemon"
+        );
+        assert_eq!(
+            run.sends, 0,
+            "a configured refusal must put no request on the wire"
+        );
+        assert_eq!(
+            run.finished.outcome(),
+            &Outcome::Unavailable(crate::outcome::UnavailableReason::RemoteAuthentication),
+            "a configured refusal keeps R1's verdict"
+        );
+        assert_eq!(
+            run.finished.outcome().clone().to_pam(),
+            pam_sys::PAM_AUTHINFO_UNAVAIL,
+            "a configured refusal reports the service as unavailable"
+        );
+        let msgs = pam_messages::load_for_user("renamed-service-test-user");
+        assert!(
+            run.finished.outcome().notice(&msgs).is_none(),
+            "the refusal is silent: it returns before a HostIo exists"
+        );
+    }
+
+    /// The negative control: the same caller with no configured extras is a
+    /// participating call (R10) and does reach `get_user`.
+    ///
+    /// The defect this catches: a harness that counts nothing — the zeros above
+    /// would then also pass for a `get_user` that is never wired in — and an
+    /// enforcement point that refuses on the *process* name (`sshd`) rather than
+    /// the service name, which would silence a local stack that happens to be
+    /// named `sshd-renamed`.
+    #[test]
+    fn a_renamed_service_without_config_participates() {
+        let ctx = context(Some("sshd-renamed"), Some("sshd"));
+        let run = run_renamed(&ctx, no_extras_config);
+
+        assert_eq!(run.config, 1);
+        assert_eq!(
+            run.user, 1,
+            "without the configured name the call is local (R10) and resolves the username"
+        );
+        assert_eq!(
+            run.conversation, 1,
+            "a participating call builds its conversation"
+        );
+        assert_eq!(run.messages, 1, "a participating call loads its messages");
+        assert_eq!(
+            run.finished.outcome(),
+            &Outcome::Unavailable(crate::outcome::UnavailableReason::DaemonUnreachable),
+            "the control gets past the refusal and fails at the absent daemon"
         );
     }
 
