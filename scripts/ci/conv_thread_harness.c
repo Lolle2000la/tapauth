@@ -28,13 +28,15 @@
  *     grant comes from the phone rather than from a password the next module
  *     would have accepted).  $CONV_TEST_SERVICE is therefore not fixed here.
  *   - A fake daemon listens on $TAPAUTHD_SOCK and accepts the module's
- *     connection.  In every mode but `grant` it then only drains the request
- *     and never answers, never closes: the module must reach the password path
- *     on its own rather than from a daemon response.  In `grant` mode it waits
- *     until the conversation has been entered and then writes a granted
- *     `IpcEnvelope`, so the grant always lands while the conversation is still
- *     parked.  Its accept count is what makes "did the module contact the
- *     daemon at all?" observable.
+ *     connection.  In every mode but `grant` and `daemon-timeout` it then only
+ *     drains the request and never answers, never closes: the module must reach
+ *     the password path on its own rather than from a daemon response.  In
+ *     `grant` mode it waits until the conversation has been entered and then
+ *     writes a granted `IpcEnvelope`, so the grant always lands while the
+ *     conversation is still parked; in `daemon-timeout` mode it does the same
+ *     with `PamOutcome::Timeout`, so the timeout is the daemon's own verdict.
+ *     Its accept count is what makes "did the module contact the daemon at
+ *     all?" observable.
  *   - The conversation blocks in `PAM_PROMPT_ECHO_OFF` until a helper thread
  *     writes a password after ~200 ms, and records on which thread it ran and
  *     whether it had returned by the time `pam_authenticate` came back.
@@ -70,6 +72,15 @@
  *                                          conversation was parked: entered,
  *                                          off the calling thread, NEVER
  *                                          returned, daemon >= 1
+ *                             daemon-timeout
+ *                                        — the daemon answered `PamOutcome::
+ *                                          Timeout` while the conversation was
+ *                                          parked: entered, off the calling
+ *                                          thread, NEVER returned, daemon >= 1,
+ *                                          and exactly one message (the wait
+ *                                          announcement).  A daemon-side
+ *                                          timeout is silent, unlike the
+ *                                          module's own deadline.
  *                             precollect — conversation entered, returned, ON
  *                                          the calling thread, daemon == 0
  *                             bypass     — conversation not entered, daemon == 0
@@ -174,6 +185,10 @@ static int precollect;
 /* `grant` mode: the fake daemon answers with a granted envelope, and the
  * conversation parks in a cancellation point until the module abandons it. */
 static int grant_mode;
+/* `daemon-timeout` mode: the fake daemon answers with `PamOutcome::Timeout`
+ * instead, so the timeout originates daemon-side rather than from the module's
+ * own deadline. */
+static int daemon_timeout_mode;
 /* `duplicate-unavailable` mode: the fake daemon accepts and closes at once, so
  * the module concludes `PAM_AUTHINFO_UNAVAIL` through its IPC-error path in
  * milliseconds instead of waiting out a timeout. */
@@ -369,6 +384,25 @@ static const unsigned char grant_frame[] = {
     0x62, 0x00,             /* IpcEnvelope.pam_response {} */
 };
 
+/*
+ * A `PamAuthenticateResponse { outcome: TIMEOUT }` in the same framing:
+ *
+ *   00 00 00 04   body length = 4
+ *   62            field 12 (`pam_response`, wire type 2) => (12 << 3) | 2
+ *   02            the response's length = 2
+ *   08 02         field 1 (`outcome`), varint 2 = TIMEOUT
+ *
+ * `TIMEOUT` is the daemon's own verdict ("no response within session timeout"),
+ * which client-pam maps to `DaemonTimedOut` — deliberately *silent*, unlike the
+ * module's own `TimedOut` (`client-pam/src/outcome.rs`).  This frame is what
+ * lets an e2e shape assert that difference: the daemon decides, so the user has
+ * already stopped waiting and gets no message about it.
+ */
+static const unsigned char timeout_frame[] = {
+    0x00, 0x00, 0x00, 0x04, /* big-endian body length */
+    0x62, 0x02, 0x08, 0x02, /* IpcEnvelope.pam_response { outcome: TIMEOUT } */
+};
+
 #define GRANT_WAIT_TOTAL_MS 2000
 #define GRANT_WAIT_STEP_MS 10
 
@@ -396,11 +430,37 @@ static void wait_for_conversation(void) {
 }
 
 /*
+ * Write a complete frame to the module, retrying short writes and EINTR. A
+ * frame that only arrives in part would be decoded as a hang-up, so a failed
+ * write is a hard failure of the run.
+ */
+static void write_frame(int fd, const unsigned char *frame, size_t len,
+                        const char *what) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, frame + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        fprintf(stderr, "RESULT: FAIL write() of %s to the module failed\n",
+                what);
+        fflush(stdout);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
+/*
  * Consume whatever the module sends and then hold the connection open: closing
  * it would surface as POLLHUP and turn the run into an IPC error, and sending
  * a response would let the daemon win the race the test is measuring — except
  * in `grant` mode, where winning that race *after* the conversation has parked
- * is precisely the behaviour under test.
+ * is precisely the behaviour under test, and in `daemon-timeout` mode, where the
+ * response the daemon sends *is* the verdict under test.
  */
 static void *conn_reader(void *arg) {
     int fd = ((conn_arg *)arg)->fd;
@@ -420,21 +480,18 @@ static void *conn_reader(void *arg) {
         return NULL;
     }
 
-    if (grant_mode || close_immediately) {
+    if (daemon_timeout_mode) {
+        /* The daemon's own timeout: wait until the host's conversation is
+         * parked, then answer `TIMEOUT` — the response must land while the
+         * worker is still blocked, so the run measures the module's reaction to
+         * a daemon verdict rather than password fallback. */
         wait_for_conversation();
-
-        size_t off = 0;
-        while (off < sizeof grant_frame) {
-            ssize_t n = write(fd, grant_frame + off, sizeof grant_frame - off);
-            if (n > 0) {
-                off += (size_t)n;
-                continue;
-            }
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            fail("write() of the granted response to the module failed");
-        }
+        write_frame(fd, timeout_frame, sizeof timeout_frame,
+                    "the timeout response");
+    } else if (grant_mode || close_immediately) {
+        wait_for_conversation();
+        write_frame(fd, grant_frame, sizeof grant_frame,
+                    "the granted response");
     }
 
     char buf[512];
@@ -695,6 +752,7 @@ int main(void) {
 
     int mode_threaded = strcmp(assert_mode, "threaded") == 0;
     int mode_grant = strcmp(assert_mode, "grant") == 0;
+    int mode_daemon_timeout = strcmp(assert_mode, "daemon-timeout") == 0;
     int mode_precollect = strcmp(assert_mode, "precollect") == 0;
     int mode_bypass = strcmp(assert_mode, "bypass") == 0;
     int mode_duplicate = strcmp(assert_mode, "duplicate") == 0;
@@ -707,11 +765,12 @@ int main(void) {
     int duplicate_mode = mode_duplicate || mode_dup_unavail ||
                          mode_dup_cross_user || mode_dup_cross_service ||
                          mode_dup_slow_module;
-    if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass &&
-        !duplicate_mode) {
-        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect', 'bypass', "
-             "'duplicate', 'duplicate-unavailable', 'duplicate-cross-user', "
-             "'duplicate-cross-service' or 'duplicate-after-slow-module'");
+    if (!mode_threaded && !mode_grant && !mode_daemon_timeout &&
+        !mode_precollect && !mode_bypass && !duplicate_mode) {
+        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'daemon-timeout', "
+             "'precollect', 'bypass', 'duplicate', 'duplicate-unavailable', "
+             "'duplicate-cross-user', 'duplicate-cross-service' or "
+             "'duplicate-after-slow-module'");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -729,6 +788,7 @@ int main(void) {
     grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user ||
                  mode_dup_cross_service || mode_dup_slow_module;
     close_immediately = mode_dup_unavail;
+    daemon_timeout_mode = mode_daemon_timeout;
 
     const char *block_env = getenv("CONV_TEST_BLOCK");
     if (block_env != NULL && *block_env != '\0') {
@@ -955,6 +1015,41 @@ int main(void) {
         }
         if (accepted < 1) {
             fail("the fake daemon accepted no connection");
+        }
+    } else if (mode_daemon_timeout) {
+        /* The daemon answered `PamOutcome::Timeout` while the host's
+         * conversation was parked: the verdict is the daemon's own timeout, not
+         * this module's deadline.  All five facts are needed to rule out every
+         * other explanation for the failing stack:
+         *   - nothing was collected, so this is not password fallback;
+         *   - the daemon was contacted, so the verdict came off the wire;
+         *   - the worker ran off the calling thread, so the threaded strategy
+         *     handled it;
+         *   - the user saw exactly one message: the wait announcement a
+         *     participation always shows, and nothing for the timeout itself.
+         *     `DaemonTimedOut` has no notice in `Outcome::notice`, while this
+         *     module's own `TimedOut` is announced — so a second message is the
+         *     regression this shape exists to catch. */
+        if (!entered) {
+            fail("the conversation was never entered (threaded mode not selected?)");
+        }
+        if (on_main) {
+            fail("the conversation ran on the pam_authenticate thread, not the worker");
+        }
+        if (returned) {
+            fail("the conversation returned a password: a daemon-side timeout "
+                 "cannot be distinguished from password fallback (worker not "
+                 "cancelled?)");
+        }
+        if (accepted < 1) {
+            fail("the fake daemon accepted no connection");
+        }
+        if (atomic_load(&conv_text_info) != 1) {
+            fprintf(stderr,
+                    "conv_text_info: %d, expected the single wait announcement "
+                    "and no message for the daemon's own timeout\n",
+                    atomic_load(&conv_text_info));
+            fail("a daemon-side timeout must not be announced");
         }
     } else if (mode_precollect) {
         if (!entered) {

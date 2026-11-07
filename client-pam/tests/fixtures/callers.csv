@@ -62,4 +62,4 @@ xfce4_screensav,xfce4-screensaver,xfce4-screensav,-,-,0,R10,sequential,the 15-ch
 mate_screensaver_dialog,mate-screensaver,mate-screensaver-dialog,-,-,0,R10,sequential,a mate screen saver dialog parks in the library event loop,0
 mate_screensave,mate-screensaver,mate-screensave,-,-,0,R10,sequential,the 15-character comm spelling of a mate screen saver stays sequential,0
 gdm_reauth_wrong_dm_service,sddm,sddm,-,1,0,R2,skip_keyring,the reauth flag alone does not exempt a non gdm-password service,0
-daemon_timeout,daemon-timeout,kscreenlocker_worker,-,-,0,R5,threaded,daemon-side timeout is silent,0
+daemon_timeout,daemon-timeout,kscreenlocker_worker,-,-,0,R5,threaded,daemon-side timeout is silent,1

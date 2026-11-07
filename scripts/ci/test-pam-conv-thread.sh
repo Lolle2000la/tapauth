@@ -62,6 +62,21 @@
 #                granted.  Together with the `duplicate` shape below, this
 #                exercises the cancel path.
 #
+#   daemon timeout
+#                auth required <module>          (harness run as
+#                auth optional pam_permit.so      `kscreenlocker_worker`)
+#                account required pam_permit.so
+#                The same parked conversation, but the fake daemon waits for it
+#                and then answers `PamOutcome::Timeout`: the timeout is the
+#                daemon's verdict, not the module's own deadline.  That
+#                difference is the point — `DaemonTimedOut` shows the user no
+#                message, while `TimedOut` announces itself — so the shape
+#                asserts exactly one message, the wait announcement every
+#                participation shows, and a notice for the timeout itself fails
+#                it.  The `required` + optional stack is deliberate: `PAM_IGNORE`
+#                would record no failure and let the optional line grant, so the
+#                non-success verdict re-proves that invariant too.
+#
 #   duplicate    auth sufficient <module>       (harness run as
 #                account required pam_permit.so   `kscreenlocker_worker`)
 #                Four transactions in one process (pam_start/pam_authenticate
@@ -559,6 +574,42 @@ while read_fixture_row; do
         fi
         if [ "$OUT_ACCEPTED" -lt 1 ]; then
             fail_row "$ROW_ID" "the fake daemon accepted no connection"
+        fi
+        ;;
+
+    # ---- daemon-side timeout: the daemon's own verdict must be silent
+    # The fake daemon waits for the conversation to park and then answers
+    # `PamOutcome::Timeout`, so the module concludes `DaemonTimedOut` while the
+    # worker is still blocked.  `Outcome::notice` gives that reason no message,
+    # while this module's own deadline (`TimedOut`) is announced — which is the
+    # difference this shape pins end to end.  `CONV_TEST_BLOCK=cancel` is what
+    # keeps the conversation parked (nothing signal it, so only the module's
+    # `pthread_cancel` ends it), exactly as in the `grant` shape.  The stack is
+    # `required` + `optional pam_permit` for the R1 reason: `PAM_IGNORE` would
+    # record no failure and let the optional line grant, so `non-success`
+    # re-proves the invariant.  `conv_text_info` must be exactly 1 — the wait
+    # announcement every participation shows, and nothing for the timeout.
+    daemon_timeout)
+        write_stack "$CONFDIR/$ROW_SERVICE" \
+            "auth required $MODULE_PATH" \
+            "auth optional pam_permit.so" \
+            "account required pam_permit.so"
+        run_harness "daemon-side timeout (silent)" daemon-timeout non-success \
+            CONV_TEST_BLOCK=cancel
+        if [ "$OUT_ENTERED" -ne 1 ]; then
+            fail_row "$ROW_ID" "the conversation was never entered (threaded mode not selected?)"
+        fi
+        if [ "$OUT_RETURNED" -ne 0 ]; then
+            fail_row "$ROW_ID" "the conversation returned a password: a daemon-side timeout cannot be distinguished from password fallback (worker not cancelled?)"
+        fi
+        if [ "$OUT_ON_MAIN" -ne 0 ]; then
+            fail_row "$ROW_ID" "the conversation ran on the pam_authenticate thread, not the worker"
+        fi
+        if [ "$OUT_ACCEPTED" -lt 1 ]; then
+            fail_row "$ROW_ID" "the fake daemon accepted no connection"
+        fi
+        if [ "$OUT_TEXT_INFO" -ne 1 ]; then
+            fail_row "$ROW_ID" "the module showed $OUT_TEXT_INFO message(s); a daemon-side timeout must add none to the single wait announcement"
         fi
         ;;
 
