@@ -23,7 +23,7 @@ The module answers four questions about one `pam_authenticate` call: *does the p
 
 1. *One place to look* for "why does host X behave like this": a row with a class, a reason and citations, not a comment four hundred lines away. The `evidence` column is machine-checked (`policy.rs:1141-1205`).
 2. *One place for ordering.* `Skip` and `Participate` are different types (`policy.rs:26-29`), so a skip cannot acquire a plan, a deadline or a mechanism. `authenticate` returns on a `Skip` before config, username, conversation and messages (`pam_logic.rs:189-217`), and that order is pinned by a call-counter test, not by the compiler.
-3. *One place that can grant.* `Outcome::Granted` is constructible only through `granted_from_daemon` (this call's `PamOutcome::Success`, `outcome.rs:163-165`) or `replayed` (a copy of this process's own record, `outcome.rs:173-181`). A mechanism returns `MechanismEnd`, so it cannot mint a verdict (`transaction.rs:212-216`).
+3. *One place that can grant.* `Outcome::Granted` is constructible only through `granted_from_daemon` (this call's `PamOutcome::Success`, `outcome.rs:163-165`) or `replayed` (a copy of this process's own record, `outcome.rs:173-181`). A mechanism returns `MechanismEnd`, so it cannot mint a verdict (`transaction.rs:215-219`).
 4. *Testability.* Identity resolution, the GDM flag, the deadline clamp, the `has_tty` invariance, the two skip policies and the loop's per-shape mapping are pure functions or unit assertions (§6.3).
 
 **Invariants.**
@@ -46,7 +46,7 @@ The pre-refactor file is reachable at `git show 57d829a^:client-pam/src/pam_logi
 
 ### 2.2 The failure-direction taxonomy is a table cell
 
-The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy.rs:69-86`), a field of every rule (`policy.rs:150-163`), copied onto the returned `Participation` (`policy.rs:95-106`, `:450-454`), asserted against the conversation by `class_agrees_with_conversation` (`policy.rs:832-894`) and re-checked where the value first meets the plan (`transaction.rs:714-722`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
+The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy.rs:69-86`), a field of every rule (`policy.rs:150-163`), copied onto the returned `Participation` (`policy.rs:95-106`, `:450-454`), asserted against the conversation by `class_agrees_with_conversation` (`policy.rs:832-894`) and re-checked where the value first meets the plan (`transaction.rs:884-892`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
 
 ### 2.3 The return code is produced at one site
 
@@ -174,7 +174,7 @@ Notes that belong to the table:
 | `AlwaysRing` | the phone is offered concurrently | one extra ring, or the host's dialog loses its race; never a grant, never a wedge |
 | `Keyring` | a grant would be useless without `PAM_AUTHTOK` | under-match: the keyring stays locked after a successful login. Over-match: the login manager's prompt is skipped and the stack falls through |
 
-`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy.rs:64-86`). The class is copied onto the participation (`policy.rs:450-454`), asserted against the decision by `class_agrees_with_conversation` (`policy.rs:832-894`) and re-asserted at the point the class meets the plan (`transaction.rs:714-722`), so a mismatch fails a test rather than being a comment nobody reads.
+`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy.rs:64-86`). The class is copied onto the participation (`policy.rs:450-454`), asserted against the decision by `class_agrees_with_conversation` (`policy.rs:832-894`) and re-asserted at the point the class meets the plan (`transaction.rs:884-892`), so a mismatch fails a test rather than being a comment nobody reads.
 
 Every skip still returns `PAM_AUTHINFO_UNAVAIL`, never `PAM_IGNORE`: on a `required` line that is a failure, on a `sufficient` line it is `ignore` and the stack decides (`pam_logic.rs:75-82`).
 
@@ -200,7 +200,7 @@ Four cells over three rows and three distinct plans; `plan_table` asserts both f
 
 Two of the three announcements are emitted before the request and one after: `Wait` and `WaitSkipHint` immediately after planning (`transaction.rs:900-911`), `WaitThenPassword` after `Armed::open` and before the mechanism blocks (`transaction.rs:987-992`). The second position is why the announcement exists: an event-loop host reveals its password field only once a PAM message arrives, and it must already be blocked when one does (`plan.rs:67-70`).
 
-The tty probe is gated by `Plannable::tty_use`, not by a second copy of the mode test (`transaction.rs:868-872`), and it runs *after* the reuse lookup, so a cache hit does not open `/dev/tty` (`transaction.rs:848-858`, pinned by `cache_hit_does_not_open_tty` at `transaction.rs:1610`). `HostIo` owns no terminal: the `Option<File>` is `run`'s local and is consumed by the sequential mechanism (`transaction.rs:265-266`).
+The tty probe is gated by `Plannable::tty_use`, not by a second copy of the mode test (`transaction.rs:868-872`), and it runs *after* the reuse lookup, so a cache hit does not open `/dev/tty` (`transaction.rs:848-858`, pinned by `cache_hit_does_not_open_tty` at `transaction.rs:1610`). `HostIo` owns no terminal: the `Option<File>` is `run`'s local and is consumed by the sequential mechanism (`transaction.rs:268-269`).
 
 ### 3.5 `Outcome` (`outcome.rs`)
 
@@ -222,14 +222,14 @@ pub(crate) enum Outcome {
 
 * Two constructors: `granted_from_daemon` (`outcome.rs:163-165`) and `replayed` (`:173-181`). `replayed` is a structural copy, so it cannot upgrade an unavailability into a grant, which `replay_never_upgrades` asserts exhaustively.
 * `from_daemon` maps each `PamOutcome` explicitly and fails closed on an unknown raw value (`outcome.rs:205-229`, `:308-322`); the raw field is read directly because prost's accessor defaults to `SUCCESS`.
-* `Armed::conclude` is the only other producer, and it does no more than hand `MechanismEnd` to `into_outcome` (`transaction.rs:179-191`, `:224-230`).
-* `Concluded::replay` is the only producer of `Via::Replay` (`transaction.rs:111-118`), and `record` refuses it (`transaction.rs:540-551`).
+* `Armed::conclude` is the only other producer, and it does no more than hand `MechanismEnd` to `into_outcome` (`transaction.rs:182-194`, `:227-233`).
+* `Concluded::replay` is the only producer of `Via::Replay` (`transaction.rs:114-121`), and `record` refuses it (`transaction.rs:710-721`).
 
 A wrong *conversation* row is availability-only. A wrong *skip* is not: it silences the phone. R2 and R3 together decide whether the phone is consulted at all, and R3's three inputs are all caller-chosen — the binary basename, the service name and the caller's own environment — so a caller can turn its own skip into a participation. It cannot obtain a grant for another principal: the daemon must still answer `SUCCESS` in that call, and the stack belongs to the caller.
 
 #### 3.5.3 One message per transaction
 
-`Outcome::notice` is the pure half: which single message an outcome shows, and in which style (`outcome.rs:236-303`). A replayed verdict returns `None`, which is what keeps a cache hit silent (`:242-249`). Emission is a single site: `finish` decides the notice from the verdict *and its provenance*, emits, and returns the `Finished` (`transaction.rs:595-603`); every return of `run` goes through it (`transaction.rs:661`, `:686`, `:747`, `:798`, `:803`, `:834`). The mechanisms emit nothing (`mechanism/mod.rs:25-28`), so `try_info`/`try_error` are reached only through `HostIo::emit` (`transaction.rs:302-320`).
+`Outcome::notice` is the pure half: which single message an outcome shows, and in which style (`outcome.rs:236-303`). A replayed verdict returns `None`, which is what keeps a cache hit silent (`:242-249`). Emission is a single site: `finish` decides the notice from the verdict *and its provenance*, emits, and returns the `Finished` (`transaction.rs:765-773`); every return of `run` goes through it (`transaction.rs:831`, `:856`, `:917`, `:968`, `:973`, `:1006`). The mechanisms emit nothing (`mechanism/mod.rs:25-28`), so `try_info`/`try_error` are reached only through `HostIo::emit` (`transaction.rs:319-337`).
 
 The reason set carries the text distinction the old per-loop strings carried: `IpcConnectionLost` and `IpcLoopError` are informational, `IpcError` is an error; `DaemonTimedOut` is silent while this module's own `TimedOut` is announced (`outcome.rs:262-290`).
 
@@ -248,7 +248,7 @@ where T: IpcResponseReader,
       X: Fn(&str, &str);
 ```
 
-(`transaction.rs:802-818`.) `Finished` is `Concluded(Concluded)` or `Unrecorded(Outcome)` (`:44-50`): only the first carries a conclusion and only the first may be recorded. `Concluded` holds the verdict, the subject, the service and the provenance, all private to the module (`:52-63`); `Via` is `Daemon` or `Replay` (`:65-73`).
+(`transaction.rs:802-818`.) `Finished` is `Concluded(Concluded)` or `Unrecorded(Outcome)` (`:47-53`): only the first carries a conclusion and only the first may be recorded. `Concluded` holds the verdict, the subject, the service and the provenance, all private to the module (`:55-66`); `Via` is `Daemon` or `Replay` (`:68-76`).
 
 `run` does, in this order:
 
@@ -263,7 +263,7 @@ where T: IpcResponseReader,
 9. **The mechanism**, one `match` over `Plannable`, returning `MechanismEnd` (`:996-1003`).
 10. **`Armed::conclude`** and `finish` (`:1005-1006`).
 
-`Armed` is generic over the existing reader trait so tests can drive it without a socket (`transaction.rs:132-142`, `:1011-1016`).
+`Armed` is generic over the existing reader trait so tests can drive it without a socket (`transaction.rs:135-145`, `:1011-1016`).
 
 **Recording stays in `authenticate`**, so the window is anchored to the module's return: `record(concluded, Instant::now())` takes the token by value and hands the verdict back, and `to_pam` is called on that value (`pam_logic.rs:106-110`). Both gates live inside `record`: a conclusion whose service never resolved records nothing, and a replay records nothing (`transaction.rs:688-723`). The record stores an `Outcome`, not a code, so a replay cannot re-enter the code path.
 
@@ -271,7 +271,7 @@ where T: IpcResponseReader,
 
 ### 3.7 Mechanisms (`mechanism/`)
 
-`MechanismEnd` — `Response(PamAuthenticateResponse)`, `Reason(UnavailableReason)` or `Error(ErrorReason)` — is defined beside `Armed`, in `transaction.rs` (`:202-216`), because `Armed::conclude` consumes it; the mechanism modules import it (`mechanism/mod.rs:30-33`). `ExitReason` (`mechanism/mod.rs:39-54`) is the threaded loop's internal vocabulary and is not a verdict: the caller maps it to a reason.
+`MechanismEnd` — `Response(PamAuthenticateResponse)`, `Reason(UnavailableReason)` or `Error(ErrorReason)` — is defined beside `Armed`, in `transaction.rs` (`:215-219`), because `Armed::conclude` consumes it; the mechanism modules import it (`mechanism/mod.rs:30-33`). `ExitReason` (`mechanism/mod.rs:39-54`) is the threaded loop's internal vocabulary and is not a verdict: the caller maps it to a reason.
 
 **`threaded::drive`** owns the password worker and both local-resource failures: `ThreadContext` on the caller's stack (`mechanism/threaded.rs:35-42`), a hand-declared `pthread_create` with the `C-unwind` ABI, `pam_get_authtok`, the `Release` store and the unconditional raw-`SYS_write` self-pipe notification with EINTR retried (`:44-106`), and `cancel_and_join`, whose doc states why the join is load-bearing for stack safety and libpam ownership (`:108-120`).
 
@@ -576,9 +576,9 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 **(g) Folding `plan.rs` into `policy.rs`.** Rejected: the two files answer different questions and are checked by different oracles — a first-match over predicates against literal rows, versus a total function over `Plannable × bool` against arithmetic. The split also keeps `Plannable` next to `Plan`, so the absence of a `PreCollected` arm is visible where it matters (`plan.rs:82-91`).
 
-**(h) Defining `MechanismEnd` in `mechanism/mod.rs`.** Rejected during implementation: `Armed::conclude` consumes it and lives in `transaction.rs`, while the mechanisms only produce it. Defining it beside its consumer keeps the dependency `mechanism -> transaction` one-way (`transaction.rs:202-216`, `mechanism/mod.rs:30-33`).
+**(h) Defining `MechanismEnd` in `mechanism/mod.rs`.** Rejected during implementation: `Armed::conclude` consumes it and lives in `transaction.rs`, while the mechanisms only produce it. Defining it beside its consumer keeps the dependency `mechanism -> transaction` one-way (`transaction.rs:215-219`, `mechanism/mod.rs:30-33`).
 
-**(i) `record(&Verdict, Instant)` instead of taking `Concluded` by value.** Rejected: a borrowed token carries no proof that a request was on the wire, so any caller could record a fabricated verdict. By value, recording is a move error unless a conclusion exists (`transaction.rs:132-142`, `:533-539`).
+**(i) `record(&Verdict, Instant)` instead of taking `Concluded` by value.** Rejected: a borrowed token carries no proof that a request was on the wire, so any caller could record a fabricated verdict. By value, recording is a move error unless a conclusion exists (`transaction.rs:135-145`, `:688-723`).
 
 **(j) Returning the `PAM_*` code beside the verdict (an `Orchestrated { code }` wrapper, or `Outcome::pam_code`).** Rejected: it restores a second code channel. `orchestrate` returns `Finished` only, and both arms call `to_pam` once (`pam_logic.rs:91-110`); commit `9f8689b` is the change that made this literal.
 
@@ -592,7 +592,7 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 **(o) Passing `&PamConfig` or `&Participation` into a mechanism.** Rejected: config would give the clamp a second site, and the participation would let a mechanism re-branch on the classification it exists to obey (`mechanism/mod.rs:15-23`).
 
-**(p) Letting a mechanism emit its own message.** Rejected: two emitters make the text and style a property of where the code lives rather than of the reason. `finish` is the only emitter (`transaction.rs:595-603`).
+**(p) Letting a mechanism emit its own message.** Rejected: two emitters make the text and style a property of where the code lives rather than of the reason. `finish` is the only emitter (`transaction.rs:765-773`).
 
 ---
 
