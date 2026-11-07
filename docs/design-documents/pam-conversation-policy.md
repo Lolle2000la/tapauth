@@ -1,6 +1,6 @@
 # PAM conversation policy
 
-Status: specification of shipped behaviour. Scope: `client-pam`. This document ships with the change it specifies and describes the module as it stands at the end of that change — nineteen commits, `57d829a..7d4c486`. `client-pam/src/policy.rs` is the executable form of the rule table in §3.3, and where this prose and that code disagree, the code is authoritative. §4's inventory (the fixture corpus) and §6's tests are what make such a disagreement visible.
+Status: specification of shipped behaviour. Scope: `client-pam`. This document ships with the change it specifies: it describes the module as it stands at the end of that change (nineteen commits, `57d829a..7d4c486`) plus the gap-closure follow-up on `refactor/pam-gap-closure` (`8ecea4c`, `d94196e`, `ae4afd4`, `b00f647`, `5a6c122`, `753e3f9`, `9f4fb57`, `bdb39a7`). `client-pam/src/policy.rs` is the executable form of the rule table in §3.3, and where this prose and that code disagree, the code is authoritative. §4's inventory (the fixture corpus) and §6's tests are what make such a disagreement visible.
 
 ---
 
@@ -72,9 +72,9 @@ The terminal and no-terminal shapes used to hold the same IPC check order twice.
 
 On Debian/Ubuntu the package ships a `pam-auth-update` profile whose only auth line is `sufficient pam_tapauth.so` (`packaging/debian.pam-config:1-6`); `packaging/debian/rules:54` installs it as `/usr/share/pam-configs/tapauth`, and `packaging/debian/postinst:6-8` runs `pam-auth-update --package`. On the stock configuration `/etc/pam.d/sshd` includes `common-auth`, so with the profile enabled the module sat in sshd's stack. Before `1ec92bb`, a phone grant on such a host completed an SSH login without the account password: the module returned `PAM_SUCCESS` on a `sufficient` line and the stack short-circuited.
 
-The service-name rule closes it. `REMOTE_SERVICES` is `["sshd", "sshd-session"]`, compared ASCII case-insensitively (`policy.rs:317-343`); a matching call returns `PAM_AUTHINFO_UNAVAIL` before config, username, conversation or messages (`pam_logic.rs:201-216`).
+The service-name rule closes it. `REMOTE_SERVICES` is `shared::config::DEFAULT_PAM_REFUSED_SERVICES`, `["sshd", "sshd-session"]`, compared ASCII case-insensitively (`policy.rs:317-343`); a matching call returns `PAM_AUTHINFO_UNAVAIL` before config, username, conversation or messages (`pam_logic.rs:194-221`). A deployment that renames the service declares the new name in `pam_refused_services`, and the same refusal then runs immediately after the config read (`pam_logic.rs:238-246`).
 
-Two narrowings belong with that statement. `pam-auth-update --package` declines to regenerate a `common-auth` that has been edited locally, and a deselected profile stays off, so the exposure requires the profile to be enabled over a stock `common-auth`. And the repository does not pin the refusal at package level: `scripts/ci/test-ubuntu-deb.sh:305-310` only asserts that the string `pam_tapauth.so` appears in `common-auth`, not where the line sits, and nothing outside this branch's own corpus and e2e shapes asserts that an sshd stack is refused (§7).
+Two narrowings belong with that statement. `pam-auth-update --package` declines to regenerate a `common-auth` that has been edited locally, and a deselected profile stays off, so the exposure requires the profile to be enabled over a stock `common-auth`. And the repository does not pin the refusal at package level: `scripts/ci/test-ubuntu-deb.sh:305-310` only asserts that the string `pam_tapauth.so` appears in `common-auth`, not where the line sits. The refusal itself is asserted — the built-in names by the corpus and the e2e shapes, a configured name by `configured_refused_services_match_only_declared_names` and `a_configured_renamed_service_is_refused_after_the_config_read` — but nothing drives the packaged `common-auth` stack, and an undeclared rename still falls through to R10 (§7).
 
 ### 2.9 Standing constraints
 
@@ -100,7 +100,7 @@ lib.rs ──> pam_logic.rs ──> context.rs
 
 Dependency direction is one-way. `context` depends on `pam_sys` and nothing else in the crate (`context.rs:8-10`); `policy` on `context` (`policy.rs:22`); `plan` names no policy or caller type (`plan.rs:1-8`); `outcome` names `policy::SkipPolicy` and nothing else from the policy (`outcome.rs:28`); `transaction` on all of them plus the mechanisms (`transaction.rs:29-37`); each mechanism on `transaction`'s `Armed`/`HostIo`/`MechanismEnd` (`mechanism/threaded.rs:16-21`, `mechanism/sequential.rs:58-61`, `mechanism/handoff.rs:23-25`). No mechanism takes `&CallerContext` or `&PamConfig`, so it cannot re-branch on identity or recompute the deadline (`mechanism/mod.rs:15-23`).
 
-Construction order is part of the contract: `capture` runs first (`pam_logic.rs:90`), `classify` is the first thing `orchestrate` does (`pam_logic.rs:189`), and only a `Participate` reaches `PamConfig::load`, `get_user`, `PamConversation::new` and `load_for_user` (`pam_logic.rs:220-255`).
+Construction order is part of the contract: `capture` runs first (`pam_logic.rs:90`), `classify` is the first thing `orchestrate` does (`pam_logic.rs:194`), and only a `Participate` reaches `PamConfig::load` (`pam_logic.rs:225`). A built-in R1/R2 skip still returns before that read; a participating call loads the config and then, if its service is one of the configured extras in `pam_refused_services`, returns R1's verdict before `get_user`, `PamConversation::new` and `load_for_user` (`pam_logic.rs:238-246`, with the three calls at `:249`, `:264` and `:277`).
 
 ### 3.2 `CallerContext` (`context.rs`)
 
@@ -139,7 +139,7 @@ Order is load-bearing at the head and the tail: R1 before everything, R2 before 
 
 | # | name | class | predicate | decision |
 | :-- | :--- | :--- | :--- | :--- |
-| R1 | `remote_refuse` | `RefuseRemote` | service is `sshd` or `sshd-session`, ASCII case-insensitive | `Skip(RemoteAuthentication)` |
+| R1 | `remote_refuse` | `RefuseRemote` | service is a built-in refused name (`sshd`/`sshd-session`, ASCII case-insensitive); configured extras are checked after the config read | `Skip(RemoteAuthentication)` |
 | R2 | `dm_login_bypass` | `Keyring` | one of 13 display-manager prefixes, exact or `-`-suffixed, case-insensitive, **and** not a `gdm-password` reauthentication | `Skip(KeyringNeedsAuthtok)` |
 | R3 | `gdm_reauth_worker` | `DeadlockAvoidance` | process `gdm-session-worker`/`gdm-session-wor`, service `gdm-password` case-insensitively, reauth flag present | `Threaded` |
 | R4 | `polkit_agent` | `DeadlockAvoidance` | process `polkit-agent-helper-1`/`polkit-agent-he` | `Threaded` |
@@ -154,14 +154,15 @@ The rows are `policy.rs:169-302`; the predicates are `:337-343` (R1), `:373-377`
 
 Notes that belong to the table:
 
-* **R1 keys on the service name alone** (`policy.rs:331-336`). It cannot misfire on the process side, and `my-sshd`/`sshd-old` fall to R10 — a documented false negative pinned by corpus rows `svc_sshd_near_miss` and `svc_sshd_under_swaylock`. An unresolved service never matches (`policy.rs:337-343`).
-* **R1 outranks the process rules.** `svc_sshd_under_swaylock` classifies R1, not R8; moving R1 after R8 moves exactly that row and nothing else (`policy.rs:1040-1046`).
-* **R1 and R2 are disjoint**, so their relative order is unobservable; the permutation test deliberately omits that swap as vacuous (`policy.rs:1027-1030`).
-* **R2 outranks R8.** `swaylock_under_sddm` and `i3lock_under_gdm_login` are skipped by R2; moving R2 after R8 moves exactly those two rows (`policy.rs:1033-1039`).
-* **R3–R9 are order-insensitive**: their predicates are pairwise disjoint, asserted against the declared literal sets (`policy.rs:904-963`).
-* **R10 is last and unconditional.** A row after it is dead, and no other row may match the null context (`policy.rs:1106-1134`).
+* **R1 keys on the service name alone** (`policy.rs:331-343`). It cannot misfire on the process side, and `my-sshd`/`sshd-old` fall to R10. That false negative is narrowed by configuration, not by inference: a deployment that renames `PAMServiceName` declares the new name in `pam_refused_services`, and `orchestrate` checks the union after the config read (`pam_logic.rs:238-246`). Without the declaration the rename still falls to R10 — the corpus row `svc_sshd_near_miss` — and `configured_refused_services_match_only_declared_names` pins that an undeclared name is not matched by prefix or substring (`policy.rs:1163-1200`). An unresolved service never matches (`policy.rs:337-343`, `:471-477`).
+* **The refused set is additive.** `pam_refused_services` adds names to the built-ins; it cannot remove one. `PamConfig::effective_refused_services` starts from `shared::config::DEFAULT_PAM_REFUSED_SERVICES`, trims each configured entry, drops anything that is not a non-empty ASCII `pam.d` name (no `/`, no whitespace or control character, at most 255 bytes) with a warning, and deduplicates ASCII case-insensitively (`config.rs:75-110`, `:67-73`). `policy::refused_service` is the pure matcher the post-config check uses (`policy.rs:463-477`). The daemon's `TapAuthConfig` carries the same field, so the daemon's `SaveConfig` round-trip cannot delete a user's rename (`shared/src/config/toml_config.rs:136-148`, `:485`).
+* **R1 outranks the process rules.** `svc_sshd_under_swaylock` classifies R1, not R8; moving R1 after R8 moves exactly that row and nothing else (`policy.rs:1222-1228`).
+* **R1 and R2 are disjoint**, so their relative order is unobservable; the permutation test deliberately omits that swap as vacuous (`policy.rs:1202-1211`).
+* **R2 outranks R8.** `swaylock_under_sddm` and `i3lock_under_gdm_login` are skipped by R2; moving R2 after R8 moves exactly those two rows (`policy.rs:1213-1221`).
+* **R3–R9 are order-insensitive**: their predicates are pairwise disjoint, asserted against the declared literal sets (`policy.rs:1033-1111`).
+* **R10 is last and unconditional.** A row after it is dead, and no other row may match the null context (`policy.rs:1287-1320`).
 * **R5 parses no version.** The row's `why` says so: the name is the only signal in `/proc`, and `kscreenlocker_greet` is deliberately absent so the pre-6.8 helper stays sequential (`policy.rs:224-236`). Corpus rows `kscreenlocker_truncated`, `kscreenlocker_greet` and `kscreenlocker_g` pin the three spellings.
-* **The `evidence` column is checked.** Every non-`external:` entry must resolve to a non-blank line in an existing file, and the scan asserts it read `policy.rs` itself (`policy.rs:1141-1205`).
+* **The `evidence` column is checked.** Every non-`external:` entry must resolve to a non-blank line in an existing file, and the scan asserts it read `policy.rs` itself (`policy.rs:1322-1387`).
 
 #### 3.3.2 The class taxonomy
 
@@ -325,13 +326,13 @@ The module is not meant to be installed in sshd's stack. R1 makes it safe there 
 
 ### 4.1 The corpus is the inventory
 
-`client-pam/tests/fixtures/callers.csv` has **ten** columns and **63** data rows:
+`client-pam/tests/fixtures/callers.csv` has **ten** columns and **64** data rows:
 
 ```
 id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e
 ```
 
-(`callers.csv:1`; the parser asserts the header and the field count at `policy.rs:489`, `:558-578`.)
+(`callers.csv:1`; the parser asserts the header and the field count at `policy.rs:510`, `:579-601`.)
 
 | column | domain | meaning |
 | :--- | :--- | :--- |
@@ -346,7 +347,7 @@ id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e
 | `why` | free text, no commas | the row's justification; a comma is a parse error |
 | `e2e` | `0` \| `1` | whether the shell harness runs the row as a shape |
 
-The reader is an inline test module and not a file under `tests/`, because the crate is `cdylib`-only (`policy.rs:458-471`). It feeds each column to the function that consumes it: `classify_identity` for the identity pair, `GdmReauth::from_env` for the env value, `classify` for the decision, `Plannable::plan` for the tty cell (`policy.rs:697-803`). The shell consumer is `scripts/ci/test-pam-conv-thread.sh`, which executes every `e2e=1` row, applies the env column (exporting a set `0`, unsetting `-`, `:293-304`), and requires a named `case` arm per row.
+The reader is an inline test module and not a file under `tests/`, because the crate is `cdylib`-only (`policy.rs:496-506`). It feeds each column to the function that consumes it: `classify_identity` for the identity pair, `GdmReauth::from_env` for the env value, `classify` for the decision, `Plannable::plan` for the tty cell (`policy.rs:790-931`). The shell consumer is `scripts/ci/test-pam-conv-thread.sh`, which executes every `e2e=1` row, applies the env column (exporting a set `0`, unsetting `-`, `:313-321`), and requires a named `case` arm per row.
 
 ### 4.2 The corpus by rule
 
@@ -356,22 +357,22 @@ The reader is an inline test module and not a file under `tests/`, because the c
 | R2 | `Keyring` | skip | 18 | 1 |
 | R3 | `DeadlockAvoidance` | threaded | 3 | 2 |
 | R4 | `DeadlockAvoidance` | threaded | 2 | 2 |
-| R5 | `DeadlockAvoidance` | threaded | 6 | 4 |
+| R5 | `DeadlockAvoidance` | threaded | 7 | 5 |
 | R6 | `AlwaysRing` | threaded | 1 | 1 |
 | R7 | `AlwaysRing` | threaded | 1 | 1 |
 | R8 | `NeverRing` | precollected | 6 | 1 |
 | R9 | `DeadlockAvoidance` | threaded | 1 | 0 |
 | R10 | `DeadlockAvoidance` | sequential | 21 | 1 |
-| **total** | | | **63** | **15** |
+| **total** | | | **64** | **16** |
 
-By decision: 4 `skip_remote`, 18 `skip_keyring`, 14 `threaded`, 6 `precollected`, 21 `sequential`.
+By decision: 4 `skip_remote`, 18 `skip_keyring`, 15 `threaded`, 6 `precollected`, 21 `sequential`.
 
 What each group pins:
 
-* **R1 (4).** `svc_sshd`, `svc_sshd_session` (both `e2e=1`), `svc_sshd_upper`, `svc_sshd_under_swaylock`. The negatives are `svc_sshd_near_miss` (`my-sshd` → R10), `svc_unknown_not_sshd`, and `svc_sshd_under_swaylock`'s precedence claim. Together they pin the exact set, the ASCII-insensitive comparison, the absence of a substring match, the unresolved-service negative and R1's precedence over the process rules (`policy.rs:974-1015`).
+* **R1 (4).** `svc_sshd`, `svc_sshd_session` (both `e2e=1`), `svc_sshd_upper`, `svc_sshd_under_swaylock`. The negatives are `svc_sshd_near_miss` (`my-sshd` → R10), `svc_unknown_not_sshd`, and `svc_sshd_under_swaylock`'s precedence claim. Together they pin the exact set, the ASCII-insensitive comparison, the absence of a substring match, the unresolved-service negative and R1's precedence over the process rules (`policy.rs:1113-1144`).
 * **R2 (18).** One row per display-manager prefix (13: `sddm`, `gdm`, `gdm3`, `lightdm`, `lxdm`, `slim`, `xdm`, `kdm`, `greetd`, `ly`, `nodm`, `entrance`, `plasmalogin`), `dm_ly_dash`, `swaylock_under_sddm`, `i3lock_under_gdm_login`, `gdm_login_bypass` and `gdm_reauth_wrong_dm_service`.
 * **R3 (3).** `reauth_zero_value` and `mixed_case_gdm` (presence-only flag, case-insensitive service), `threaded_gdm_worker_truncated` (the 15-byte spelling).
-* **R4, R5, R6, R7 (10).** Both spellings of each allowlisted process (`polkit-agent-helper-1`/`polkit-agent-he`, `kscreenlocker_worker`/`kscreenlocker_w`, `hyprlock`, `authproto_pam`); R5's six rows also carry the identity precedence (`comm_only_fallback`, `exe_beats_comm`), the unresolved-service case (`service_unknown`) and the two tty-plan rows (`threaded_no_tty`, `threaded_with_tty_unreachable`).
+* **R4, R5, R6, R7 (11).** Both spellings of each allowlisted process (`polkit-agent-helper-1`/`polkit-agent-he`, `kscreenlocker_worker`/`kscreenlocker_w`, `hyprlock`, `authproto_pam`); R5's seven rows also carry the identity precedence (`comm_only_fallback`, `exe_beats_comm`), the unresolved-service case (`service_unknown`), the two tty-plan rows (`threaded_no_tty`, `threaded_with_tty_unreachable`) and the daemon-side timeout shape (`daemon_timeout`).
 * **R8 (6).** The three literals, `exe_deleted_suffix` (the kernel suffix), `swaylock_with_reauth_set` (the R2 exemption lets the process rule apply) and `gdmfoo_not_dm`.
 * **R9 (1).** `proc_unreadable_polkit`; `proc_unreadable_polkit_upper` is its byte-exactness negative.
 * **R10 (21).** `dm_ly_not`, `dm_kelvin`, `sddmfoo_not_dm`, `unknown_binary`, `renamed_binary`, `reauth_wrong_service`, `proc_unreadable_polkit_upper`, `proc_unreadable_other`, `empty_process_name`, `kscreenlocker_greet`, `service_unknown_polkit`, `sequential_with_tty`, `sequential_no_tty`, `service_case_sudo`, `service_case_SUDO`, `svc_sshd_near_miss`, `svc_unknown_not_sshd`, `kscreenlocker_g`, `xfce4_screensav`, `mate_screensaver_dialog`, `mate_screensave`.
@@ -392,7 +393,7 @@ Nine behaviours live in the sequential loop's per-shape mapping, described in §
 | any other key | — | consumed | — |
 | tty EOF/error/hangup | — | stop polling the tty, keep waiting on IPC | — |
 
-Total inventory: **63 corpus rows + 9 loop cells = 72 tracked behaviours.**
+Total inventory: **64 corpus rows + 9 loop cells = 73 tracked behaviours.**
 
 ### 4.4 Reconciliation with the proposal-era inventory
 
@@ -432,7 +433,9 @@ The ids are stable; a flag whose status changed keeps its number.
 
 ### F1 — the window
 
-`VERDICT_REUSE_WINDOW` is 500 ms (`transaction.rs:397`), the key is `(username, service)` with the service's original bytes (`transaction.rs:445-466`, `:533-553`), and the record is anchored at `authenticate`'s return rather than at the conclusion (`pam_logic.rs:106-110`). The type carries provenance so a replay cannot re-anchor: `record` refuses `Via::Replay` (`transaction.rs:540-551`), pinned by `a_from_cache_verdict_is_not_recorded` and `reuse_key_is_case_sensitive` (`transaction.rs:1138`). The assumption is unchanged and is quoted in place: no legitimate host performs an independent authentication for the same user and service within 500 ms (`transaction.rs:405-409`).
+`VERDICT_REUSE_WINDOW` is 500 ms (`transaction.rs:417`), the key is `(username, service)` with the service's original bytes (`transaction.rs:571-584`, `:650-670`), and the record is anchored at `authenticate`'s return rather than at the conclusion (`pam_logic.rs:106-110`). The type carries provenance so a replay cannot re-anchor: `record` stores only a `Via::Daemon` conclusion (`transaction.rs:650-670`), pinned by `a_from_cache_verdict_is_not_recorded` (`pam_logic.rs:2389`) and `reuse_key_is_case_sensitive` (`transaction.rs:1267`). The assumption is unchanged and is quoted in place: no legitimate host performs an independent authentication for the same user and service within 500 ms (`transaction.rs:420-429`).
+
+The record also has one owner and a fork story now. `LAST_CONCLUSION` is a private `CacheSlot` that wraps the mutex in an `UnsafeCell`, and every lock registers a `pthread_atfork` child handler (`transaction.rs:455-547`). The child reinitialises the slot to a fresh, unlocked mutex holding an **empty** record, and that handler is the only write to the cell (`transaction.rs:503-529`); no lock is taken in it, so it stays async-signal-safe. The decision behind it and the experiment that motivated it are in §7.
 
 ### F8 — the `PAM_RUSER` fallback is gone
 
@@ -446,27 +449,28 @@ The ids are stable; a flag whose status changed keeps its number.
 
 | layer | command | result |
 | :--- | :--- | :--- |
-| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **89 passed, 0 failed, 1 ignored** |
-| workspace, `shared` | `cargo test --workspace` | **95 passed** |
-| workspace, `client-pam` | the same run | 89 passed, 1 ignored |
+| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **103 passed, 0 failed, 0 ignored** |
+| workspace, `shared` | `cargo test --workspace` | **96 passed** |
+| workspace, `client-pam` | the same run | 103 passed, 0 ignored |
 | workspace, every other target | the same run | 0 tests |
-| end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **15 shapes**, the `e2e=1` rows |
+| end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **16 shapes**, the `e2e=1` rows |
 
-184 tests pass across the workspace and one is ignored; the ignored test is `conclusion_cache_survives_fork` (`transaction.rs:1277-1283`), and it is the D4 defect, not a skipped convenience (§7). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root (§7).
+199 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`transaction.rs:1407`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`pam_logic.rs:2586-2592`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
 
 ### 6.2 The corpus and its consumers
 
-The Rust reader asserts, per row, the identity provenance, the env interpretation, the rule id, the decision and — for participating rows — the plan cell for the row's `tty` value (`policy.rs:697-803`). Around it:
+The Rust reader asserts, per row, the identity provenance, the env interpretation, the rule id, the decision and — for participating rows — the plan cell for the row's `tty` value, with that `tty` value itself checked against a literal oracle (`policy.rs:790-931`). Around it:
 
-* `corpus_covers_every_rule` iterates `RULES`, requires a row per rule and a unique rule name (`policy.rs:810-827`).
-* `class_agrees_with_conversation` asserts the class/decision relation over the table and over every row (`policy.rs:832-894`).
-* `rules_are_process_disjoint` asserts the literal sets are pairwise disjoint and that each spelling fires its own rule (`policy.rs:904-963`).
-* `remote_rules` exercises both service names, both cases, four process shapes and three near misses (`policy.rs:974-1015`).
-* `rule_permutation_moves_named_rows` moves R2 after R8 and R1 after R8, asserting the exact changed set **and** that every other row is unmoved (`policy.rs:1032-1101`).
-* `unreachable_rule_rows` asserts R10 is last, unconditional, and that no other rule matches the null context (`policy.rs:1106-1134`).
-* `evidence_citations_resolve` resolves every in-tree citation and reports which files it read (`policy.rs:1141-1205`).
+* `corpus_covers_every_rule` iterates `RULES`, requires a row per rule and a unique rule name (`policy.rs:939-959`).
+* `class_agrees_with_conversation` asserts the class/decision relation over the table and over every row (`policy.rs:961-1031`).
+* `rules_are_process_disjoint` asserts the literal sets are pairwise disjoint and that each spelling fires its own rule (`policy.rs:1033-1111`).
+* `remote_rules` exercises both service names, both cases, four process shapes and three near misses (`policy.rs:1113-1144`).
+* `configured_refused_services_match_only_declared_names` pins the configured half of R1: an undeclared name is not matched, the comparison is ASCII-insensitive, and a malformed entry matches nothing (`policy.rs:1163-1200`).
+* `rule_permutation_moves_named_rows` moves R2 after R8 and R1 after R8, asserting the exact changed set **and** that every other row is unmoved (`policy.rs:1213-1230`).
+* `unreachable_rule_rows` asserts R10 is last, unconditional, and that no other rule matches the null context (`policy.rs:1287-1320`).
+* `evidence_citations_resolve` resolves every in-tree citation and reports which files it read (`policy.rs:1322-1387`).
 
-The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for it, and asserts that the executed count equals the number of `e2e=1` rows, with a floor of 15 (`scripts/ci/test-pam-conv-thread.sh:248-273`).
+The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for it, and asserts that the executed count equals the number of `e2e=1` rows, with a floor of 15 (`scripts/ci/test-pam-conv-thread.sh:283-286`, `:774-789`).
 
 ### 6.3 The unit layer
 
@@ -474,18 +478,19 @@ The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for
 | :--- | :--- |
 | `context.rs` | the `(deleted)` strip including a basename that strips to empty (`:267-288`); `comm` trimming and empty rejection, asserted through to R5 (`:299-320`); `exe` before `comm` (`:329-344`); presence-only env parsing without `set_var` (`:248-258`); the reauth flag needing the service half, including `sddm` with the flag set still skipping (`:353-386`) |
 | `plan.rs` | every `Plannable × has_tty` cell and exactly three distinct plans (`:153-188`); `has_tty` not reaching a threaded plan (`:196-201`); `GuiBounded` as `min` in four configurations including zero (`:210-226`); saturation at `u32::MAX` (`:233-246`) |
-| `policy.rs` | the corpus, coverage, class/decision agreement, disjointness, R1, both permutations, reachability and citation resolution (§6.2) |
+| `policy.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
 | `outcome.rs` | `outcome_table_code_and_notice` (the code and notice matrix, including that `DaemonTimedOut` is silent while `TimedOut` is announced and that a replay is silent), `from_daemon_maps_every_answer`, `replay_never_upgrades`, `skip_policy_maps_to_outcome` (`outcome.rs:324` onward) |
-| `transaction.rs` | `finished_reports_its_outcome_and_provenance` (`:1043`); `armed_requires_both_connect_and_send` (`:1081`); `reuse_key_is_case_sensitive` (`:1138`); `replay_notice_is_silent` (`:1177`); `a_poisoned_lock_reads_as_a_cache_miss` (`:1230`); `conclusion_cache_survives_fork` (`:1283`); `tty_probe_only_for_sequential` (`:1343`); `cache_hit_does_not_open_tty` (`:1398`); `announcement_order_matches_today`, `precollected_never_plans`, `unrecorded_paths_emit_their_notice`, `a_cache_hit_is_a_replay_conclusion`, `a_replayed_failure_emits_nothing` |
-| `mechanism/sequential.rs` | `enter_skips_other_keys_do_not`, `tty_eof_stops_polling_not_waiting`, `timeout_does_not_cancel`, `partial_frame_with_hangup_is_connection_lost`, `read_error_maps_to_ipc_error`, `skip_cancels_with_tty_skip`, `ipc_error_cancels_only_without_tty`, plus the three loop tests |
-| `mechanism/threaded.rs` | the three GUI loop exits (`timeout`, `password_entered` breakout, `password_dialog_failed`), the successful tap, the hangup, `test_wait_announcement_is_single_line` and `cancel_and_join_reaps_a_worker_blocked_in_a_cancellation_point` |
-| `pam_logic.rs` | `classify_before_side_effects` (`pam_logic.rs:541`), `skip_never_hands_off` (`:606`), `only_one_get_service_name_call_site` (`:675`), `no_ruser_read` (`:749`), `test_map_pam_outcome_matrix` (`:805`), the scans (`:1507`, `:1754`), `reuse_suite_is_intact` (`:2245`), `cache_owner_is_local` (`:2356`), and the other thirteen tests of the fifteen-test reuse suite |
+| `transaction.rs` | `finished_reports_its_outcome_and_provenance` (`:1172`); `armed_requires_both_connect_and_send` (`:1210`); `reuse_key_is_case_sensitive` (`:1267`); `replay_notice_is_silent` (`:1306`); `a_poisoned_lock_reads_as_a_cache_miss` (`:1359`); `conclusion_cache_survives_fork` (`:1407`, no longer `#[ignore]`d); `tty_probe_only_for_sequential` (`:1498`); `cache_hit_does_not_open_tty` (`:1553`); `announcement_order_matches_today`, `precollected_never_plans`, `unrecorded_paths_emit_their_notice`, `a_cache_hit_is_a_replay_conclusion`, `a_replayed_failure_emits_nothing` |
+| `mechanism/sequential.rs` | `enter_skips_other_keys_do_not`, `tty_eof_stops_polling_not_waiting`, `timeout_does_not_cancel`, `partial_frame_with_hangup_is_connection_lost`, `read_error_maps_to_ipc_error`, `skip_cancels_with_tty_skip`, `ipc_error_cancels_only_without_tty`, the three loop tests, and the two poll-error tests `poll_error_stops_the_no_terminal_wait` and `poll_error_is_logged_and_the_terminal_wait_continues` (`:855`, `:884`) |
+| `mechanism/threaded.rs` | the three GUI loop exits (`timeout`, `password_entered` breakout, `password_dialog_failed`), the successful tap, the hangup, `test_wait_announcement_is_single_line`, `cancel_and_join_reaps_a_worker_blocked_in_a_cancellation_point`, and — through the injected local-resource seam — `pipe2_failure_cancels_once_and_reports_local_resource` (`:857`), `spawn_failure_cancels_once_closes_both_fds_and_reports_local_resource` (`:899`) and `join_failure_aborts_the_process` (`:959`) |
+| `pam_logic.rs` | `classify_before_side_effects` (`pam_logic.rs:566`), `skip_never_hands_off` (`:843`, the token read counted through the injected reader, with the R8 positive control), `a_configured_renamed_service_is_refused_after_the_config_read` (`:714`) and its negative control `a_renamed_service_without_config_participates` (`:768`), `only_one_get_service_name_call_site` (`:941`), `no_ruser_read` (`:1015`), `test_map_pam_outcome_matrix` (`:1071`), the scans (`:1773`, `:1873`, `:2020`) and their positive controls (`:1929`, `:1976`, `:2069`), `reuse_suite_is_intact` (`:2510`), `cache_owner_is_local` (`:2608`), and the other thirteen tests of the fifteen-test reuse suite |
+| `config.rs` | `configured_refused_service_is_added_to_the_built_ins`, `built_ins_survive_an_empty_configured_list`, `refused_services_are_deduplicated_case_insensitively`, `invalid_refused_services_are_dropped_without_losing_valid_ones` and `test_parse_refused_services_from_toml` (`config.rs:182-291`); `shared`'s `test_save_preserves_pam_refused_services` (`shared/src/config/toml_config.rs:485`) |
 | `pam_sys.rs` | `null_user_does_not_fall_back_to_ruser` |
 | `lib.rs` | `guard_returns_auth_err_on_panic` |
 
 ### 6.4 The e2e layer
 
-Fifteen shapes, one per `e2e=1` row:
+Sixteen shapes, one per `e2e=1` row:
 
 | rows | what the shape proves |
 | :--- | :--- |
@@ -497,8 +502,11 @@ Fifteen shapes, one per `e2e=1` row:
 | `kscreenlocker_greet` | R10: the greet helper is not allowlisted, so the stack falls through sequentially |
 | `precollected_swaylock` | R8: the token is read on the calling thread, the daemon accepts **zero** connections and the message count is zero |
 | `svc_sshd`, `svc_sshd_session` | R1: the conversation is never entered, the daemon is not contacted, and the module shows no message |
+| `daemon_timeout` | R5: the daemon's own `PamOutcome::Timeout` concludes `DaemonTimedOut` while the conversation is still parked — no token returned, the daemon contacted, the worker off the calling thread, and exactly one message |
 
-The harness keeps the behaviours a CSV cannot express in each row's `case` arm: which stack runs, the token marker's expected verdict, the daemon accept count, the thread the conversation ran on, and whether the conversation returned at all (`scripts/ci/test-pam-conv-thread.sh:16-141`, `:225-292`). The duplicate family — the immediate duplicate, the unavailable duplicate, the two cross-key negatives and the after-slow-module case — is driven by `run_duplicate_sequence` inside those arms, with the four-transaction sequence and the accept-count expectations documented at `:65-125`.
+`daemon_timeout` is the one shape whose message count is an equality rather than zero: every threaded participation announces its wait before the request goes out, so one `PAM_TEXT_INFO` is that announcement and a second would be a notice for the timeout itself. `DaemonTimedOut` has no notice in `Outcome::notice` while this module's own `TimedOut` is announced (`outcome.rs:262-290`), so the shape fails on two. The fake daemon answers with `00 00 00 04 62 02 08 02` (`scripts/ci/conv_thread_harness.c:388-404`).
+
+The harness keeps the behaviours a CSV cannot express in each row's `case` arm: which stack runs, the token marker's expected verdict, the daemon accept count, the thread the conversation ran on, and whether the conversation returned at all (`scripts/ci/test-pam-conv-thread.sh:16-181`, `:448-772`). The duplicate family — the immediate duplicate, the unavailable duplicate, the two cross-key negatives and the after-slow-module case — is driven by `run_duplicate_sequence` inside those arms, with the four-transaction sequence and the accept-count expectations documented at `:80-135`.
 
 ### 6.5 Source scans
 
@@ -518,21 +526,20 @@ These are the things the implementation does not prove. Each names its consequen
 
 | gap | consequence |
 | :--- | :--- |
-| `scripts/ci/test-pam-host-cases.sh` has not been run | it needs root; the package-level stack behaviour (including a `required` DM stack granting nothing) is therefore unverified for this branch |
-| `conclusion_cache_survives_fork` ships `#[ignore]`d and fails against the current `Mutex` | the D4 defect is documented, not fixed: a fork taken while another thread holds the lock leaves the child blocked on its first `pam_authenticate`, and the child inherits the record (`transaction.rs:1256-1329`) |
-| no `PAM_RHOST` corpus dimension and no RHOST e2e shape | a deployment that renames `PAMServiceName` is undetected — R1 keys on the service only, so such a caller is treated as local. `svc_sshd_near_miss` pins the false negative as behaviour, not as coverage |
-| `skip_never_hands_off` is inferential | it counts conversation lookups, not token reads, so it proves a skip never reaches the handoff entry point rather than that no `pam_get_authtok` occurred |
-| `pipe2` and `pthread_create` failure paths are untested | neither is injectable without changing the mechanism's signature; both end in `PAM_AUTH_ERR` with a best-effort cancel whose only observable is the daemon log |
-| `DaemonTimedOut`'s silence is unit-only | no e2e shape asserts that a daemon-side timeout shows no message; only the notice matrix does (`outcome.rs:274`) |
-| the sequential profile's poll-error cell is untested | no mock makes `poll` fail with a non-`EINTR` error, so the no-tty stop and the tty log-and-continue half of `Profile` are unexercised (`mechanism/sequential.rs:307-313`) |
-| the corpus's `plan` assertion derives its expectation from the same `tty` column | a row whose `tty` value is wrong stays self-consistent; the plan cell is checked for agreement with the column, not with the host |
-| no musl build and no Fedora/Arch container pass | the fork test's glibc-only gate is the whole story; `pthread_atfork` and mutex behaviour under musl are unverified, and the Fedora/Arch packaging paths are not exercised by this branch's tests |
+| a renamed `PAMServiceName` the deployment has **not** declared in `pam_refused_services` | R1 sees only the built-ins, so the rename is classified R10 and the phone is rung for a remote login and waits out the GUI timeout. Declaring the name closes it (`pam_logic.rs:238-246`); inference from `PAM_RHOST` was rejected because `sudo` sets it to the local hostname (§9(a)). `svc_sshd_near_miss` pins the undeclared false negative as behaviour, not as coverage |
+| the musl check is `cargo check`, not a link or a run (`.github/workflows/ci.yml:212-248`) | `pthread_atfork` and mutex behaviour under musl are unverified at runtime, and a musl-linked `libpam` is never loaded, so the fork fix is confirmed only on glibc. The Fedora/Arch container passes were last observed at `a55608b`, not at this branch's HEAD |
+| the daemon-side `Timeout` e2e shape exists only for an R5 threaded host | a sequential or pre-collected daemon timeout is covered only by `outcome_table_code_and_notice` and the transaction tests; no stack drives one |
+| `scripts/ci/test-pam-host-cases.sh` is covered in CI but has not been run locally | `.github/workflows/ci.yml:188-195` runs it as root in `build-and-test`, which runs on `pull_request` (`ci.yml:20-35`); PR #160 run 42286328114 / job 128127980029 shows the step succeeded at `a55608b`. Locally `sudo -n` fails (password required), so it cannot run here, and it has not been observed at this branch's HEAD |
+| the `pthread_atfork` registration-failure branch (`transaction.rs:538-547`) is unexercised | the `res != 0` warning and the "cache keeps working" fallback have no test; only a system where registration fails would exercise them, and on such a system the D4 deadlock would return silently |
+
+Covered by this follow-up and no longer gaps: fork safety, the `skip_never_hands_off` token read, the `pipe2`/`pthread_create` local-resource paths, the `DaemonTimedOut` silence on a threaded host, the sequential poll-error cell and the self-derived tty column. They are asserted by the tests named in §6.3 and §6.4.
+
+**The fork decision.** Option (i) shipped: the child reinitialises. A forked child is a new process, and this module's contract is that a new process always misses — `pam_end` unloads the module and the cache dies with it — so inheriting a parent grant would answer an authentication the child never performed, and one extra ring of the phone is the cheaper error. `CacheSlot` wraps the mutex in an `UnsafeCell`, every lock registers a `pthread_atfork` child handler, and that handler is the only write to the cell (`transaction.rs:455-547`). At `fork(2)` the child runs the handler before returning to user code and **before any `exec`**: it overwrites the slot with a fresh unlocked mutex holding `None`, leaking rather than dropping the inherited `Option` (freeing it would touch heap state the parent still owns), and it takes no lock, so it stays async-signal-safe (`transaction.rs:503-529`). The child therefore inherits no record and no held lock. Option (ii), an atomic/seqlock cell, was rejected because it needs a bounded reclamation story for the replaced record and a larger rewrite of the cache; option (iii), deleting the cache and F1, was rejected because the duplicate-ring regression it would reintroduce is not established as acceptable. The experiment that motivated the fix: on glibc 2.44 the previously `#[ignore]`d `conclusion_cache_survives_fork` failed in 5.00 s with wait status 14 (SIGALRM) — the child blocked on the mutex. The test now runs, and `reuse_suite_is_intact` asserts the crate contains no `#[ignore]` (`pam_logic.rs:2586-2592`).
 
 Open questions that remain decisions rather than defects:
 
-1. **Which fork fix, and does a child inherit the record?** `pthread_atfork`, an atomic/seqlock cell, or dropping the cache (F1) each keep the fix local to `transaction.rs`; they differ in whether a child may replay a parent's verdict.
-2. **Do the distro shared-stack profiles reach sshd's stack on Fedora/Arch?** Verified for Debian/Ubuntu (§2.8); the `system-auth`/`password-auth` path is not.
-3. **No mutation or fuzz gate over rule ordering.** Two named permutations are replayed (`policy.rs:1032`); R10's position is covered by `unreachable_rule_rows`; nothing searches further.
+1. **Do the distro shared-stack profiles reach sshd's stack on Fedora/Arch?** Verified for Debian/Ubuntu (§2.8); the `system-auth`/`password-auth` path is not.
+2. **No mutation or fuzz gate over rule ordering.** Two named permutations are replayed (`policy.rs:1213`); R10's position is covered by `unreachable_rule_rows`; nothing searches further.
 
 ---
 
@@ -544,9 +551,9 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 | :--- | :--- | :--- |
 | **R1 regresses** — a rule edit drops the service half, or replaces the exact set with a prefix/substring match | the §2.8 exposure returns on every packaged Debian/Ubuntu host: an SSH login grants on the phone alone, with no account password | `remote_rules` asserts the exact set, both cases, four process shapes and three near misses; `svc_sshd_near_miss` makes the widened match a test failure; the permutation test keeps R1 ahead of the process rules |
 | the packaged profile's position in `common-auth` is not asserted | an ordering change in `pam-auth-update` output, or a locally edited `common-auth`, is invisible to CI | `scripts/ci/test-ubuntu-deb.sh:305-310` checks presence only; the gap is recorded in §7 rather than papered over |
-| the fork defect | a child blocks or replays its parent's verdict | documented with its experiment (`transaction.rs:1256-1329`); the owner type keeps any fix local |
-| the sequential profile's mapping drifts | a hangup becomes the wrong reason, so the text and style change | the nine-cell table is the module's contract (`mechanism/sequential.rs:33-56`); eight of the nine cells have a named test (the poll-error cell does not, §7), and the profile has three fields rather than two code paths |
-| the corpus rots into a tautology | the characterisation harness stops characterising | rows were authored against the pre-refactor functions (`policy.rs:458-471`); `corpus_covers_every_rule` and the citation scan make a silent update visible; the `plan` column is the known weak spot (§7) |
+| the fork fix regresses | a child blocks on the parent's held lock, or replays its parent's verdict | the child handler reinitialises the slot to an empty record (`transaction.rs:503-547`); `conclusion_cache_survives_fork` (`transaction.rs:1407`) runs — never `#[ignore]`d — and kills both defects with distinct exit codes; `reuse_suite_is_intact` forbids a new `#[ignore]` (`pam_logic.rs:2586-2592`) |
+| the sequential profile's mapping drifts | a hangup becomes the wrong reason, so the text and style change | the nine-cell table is the module's contract (`mechanism/sequential.rs:33-56`); all nine cells have a named test — the poll-error cell by `poll_error_stops_the_no_terminal_wait` and `poll_error_is_logged_and_the_terminal_wait_continues` — and the profile has three fields rather than two code paths |
+| the corpus rots into a tautology | the characterisation harness stops characterising | rows were authored against the pre-refactor functions (`policy.rs:479-501`); `corpus_covers_every_rule` and the citation scan make a silent update visible; the `tty` column is checked against a literal, `EXPECTED_TTY` (`policy.rs:718-762`), before the plan is derived from it |
 | the source scans are string heuristics | a `PAM_*` return hides behind a re-export, or a scan stops covering a module | all three recurse and assert coverage; each has an in-memory positive control |
 | a wrong `Skip` silences the phone | on a `required` line a denial; on a `sufficient` line the stack decides | the class/decision relation is asserted twice, and the skip paths are counted on both policies |
 | hyprlock's race and xsecurelock's retries are real, accepted defects | a crash attributed to the module, or up to three rings | stated at R6 and R7 and accepted by D6; no e2e shape runs either host's real binary |
@@ -555,7 +562,7 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 ## 9. Rejected alternatives
 
-**(a) Keying the remote refusal on `PAM_RHOST`, or on `PAM_RHOST` plus the service name.** Rejected during implementation, and the reason is in the table's module doc (`policy.rs:15-20`, `:331-336`). `sudo` sets `PAM_RHOST` to the local hostname under `Defaults pam_rhost`; a *presence* test would therefore classify every `sudo` invocation as remote and silence the module on it — the commonest local privilege escalation on the desktop. Presence cannot distinguish "set to the local host" from "set to a peer", and reading the string would make the policy depend on hostname resolution. The service name is coarser but cannot misfire on `sudo`: it is the name of the stack, and the stacks that exist to authenticate a remote peer are the ones named `sshd`/`sshd-session`. The cost is the renamed-`PAMServiceName` false negative, recorded as a corpus row (`svc_sshd_near_miss`) and as a known gap (§7) rather than hidden.
+**(a) Keying the remote refusal on `PAM_RHOST`, or on `PAM_RHOST` plus the service name.** Rejected during implementation, and the reason is in the table's module doc (`policy.rs:15-20`, `:331-336`). `sudo` sets `PAM_RHOST` to the local hostname under `Defaults pam_rhost`; a *presence* test would therefore classify every `sudo` invocation as remote and silence the module on it — the commonest local privilege escalation on the desktop. Presence cannot distinguish "set to the local host" from "set to a peer", and reading the string would make the policy depend on hostname resolution. The service name is coarser but cannot misfire on `sudo`: it is the name of the stack, and the stacks that exist to authenticate a remote peer are the ones named `sshd`/`sshd-session`. The cost is the renamed-`PAMServiceName` false negative (`svc_sshd_near_miss`), which a deployment narrows by declaring the new name in `pam_refused_services` (`pam_logic.rs:238-246`); an undeclared rename still falls to R10, which §7 records rather than hides.
 
 **(b) A `dyn Trait` per mechanism.** Rejected: the set is closed by the PAM ABI — another thread, not at all, or the calling thread — so a trait object would add a vtable and lifetime plumbing for a set that cannot grow, and would lose the compile-time fact that `PreCollected` needs no `Plan` (`mechanism/mod.rs:12-13`).
 
@@ -597,13 +604,13 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 **D3 — The flags stay in this document.** *Status: as decided.* §5 is the only record of F1–F11, and ids are stable: F8 keeps its number with the status "removed".
 
-**D4 — The fork defect is documented, with a locality requirement.** *Partially superseded.* The locality shipped: `ConclusionCache` owns the private static, `lookup`/`record`/`replay_for` are the API, `mechanism/*` cannot name the lock (`8c6a7b9`). The fix did not ship, and the test ships ignored. The choice among the three fixes is still open (§7).
+**D4 — The fork defect is fixed in the child, with a locality requirement.** *Superseded.* The locality shipped first: `ConclusionCache` owns the private static, `lookup`/`record`/`replay_for` are the API, `mechanism/*` cannot name the lock (`8c6a7b9`). The fix then shipped as option (i) in `8ecea4c`: a `pthread_atfork` child handler replaces the mutex and clears the record, so the child starts empty (§7). `conclusion_cache_survives_fork` runs un-ignored (`transaction.rs:1407`).
 
 **D5 — R9 stays.** *Status: as decided.* `polkit_service_without_proc` is `policy.rs:429-432`; `POLKIT-1` with an unreadable `/proc` stays sequential, pinned by `proc_unreadable_polkit_upper`.
 
 **D6 — `hyprlock` and `authproto_pam` stay as they are.** *Status: as decided.* R6 and R7 keep both hosts threaded, and each rule's `why` states the accepted risk.
 
-**D7 — Remote authentication is refused; the `PAM_RUSER` fallback is removed.** *Superseded on the predicate.* R1 keys on the service name alone — `REMOTE_SERVICES = ["sshd", "sshd-session"]`, ASCII case-insensitive (`policy.rs:317-343`) — because `PAM_RHOST` is set by `sudo` to the local hostname, so a presence-based rule would silence the module there (§9(a)). The class, the second `SkipPolicy` and the ordering are as decided. The `PAM_RUSER` removal shipped unchanged in `8bc1225`.
+**D7 — Remote authentication is refused; the `PAM_RUSER` fallback is removed.** *Superseded on the predicate.* R1 keys on the service name alone — the built-in set `shared::config::DEFAULT_PAM_REFUSED_SERVICES` (`sshd`, `sshd-session`), ASCII case-insensitive (`policy.rs:317-343`), plus every name a deployment adds to `pam_refused_services` (`pam_logic.rs:238-246`) — because `PAM_RHOST` is set by `sudo` to the local hostname, so a presence-based rule would silence the module there (§9(a)). The class, the second `SkipPolicy` and the ordering are as decided. The `PAM_RUSER` removal shipped unchanged in `8bc1225`.
 
 **D8 — The two sequential loops are merged into one profile-driven loop.** *Status: as decided, shipped* in `5c1eea5`. The contract is `mechanism/sequential.rs:33-56`, and the mapping is the nine cells of §4.3.
 
@@ -652,5 +659,20 @@ Nineteen commits, each shippable, each reverting to a tree that builds and passe
 | 17 | `383a156` | The e2e harness reads the fixture instead of four hard-coded binary copies; the service names became rows |
 | 18 | `66b26b4` | Deleted the superseded representations: the old match, the doc block, the wrapper, the table test, and the five prose host lists |
 | 19 | `7d4c486` | Restored message parity and closed the scan gaps: the `WaitThenPassword` position, the `DaemonTimedOut` silence, the recursive scans |
+
+### The gap-closure follow-up
+
+Eight further commits on `refactor/pam-gap-closure` close the gaps §7 used to list. They are listed here so the §7 change is traceable; none changes the rule table's decisions, and `a55608b` (this document) sits between `7d4c486` and the first of them.
+
+| # | commit | what it did |
+| --: | :--- | :--- |
+| 20 | `8ecea4c` | Fork safety: `CacheSlot` wraps the mutex and a `pthread_atfork` child handler reinitialises it to an empty record; `conclusion_cache_survives_fork` stops being `#[ignore]`d (option (i), §7) |
+| 21 | `d94196e` | The threaded mechanism takes its `pipe2`/`pthread_create` through a `drive_with` seam; the three local-resource failures get tests |
+| 22 | `ae4afd4` | `run_loop` takes a `poll_fn`, so the sequential poll-error cell is tested on both profiles |
+| 23 | `b00f647` | The corpus `tty` column gets an independent oracle, `EXPECTED_TTY` |
+| 24 | `5a6c122` | A `daemon_timeout` e2e shape and the C harness's `daemon-timeout` mode prove a daemon-side `Timeout` is silent |
+| 25 | `753e3f9` | `HostIo` carries an injected `ReadAuthtok`, so `skip_never_hands_off` counts the actual token read |
+| 26 | `9f4fb57` | A separate `musl-check` CI job runs `cargo check` for `x86_64-unknown-linux-musl` |
+| 27 | `bdb39a7` | `pam_refused_services` lets a deployment declare a renamed `PAMServiceName`; the built-ins are additive |
 
 **What a partial revert needs to know.** Commits 1–5 stand alone: 1 is pure addition, 2–3 introduce types whose wrappers are removed again in 18, and 4–5 are the two behaviour changes. Commits 7–13 form a chain in one direction — each later one relies on the earlier `Outcome` — but 9, 10 and 11 touch one flow each, so any of them reverts alone while `run` still maps that flow's return. Commit 14 must precede 15 and 16, because both take `Armed`. Commit 16 reverts to two loop functions with no call-site change outside `mechanism/sequential.rs`. Commit 18 is a pure deletion and reverts alone, but it must not be reverted without also reverting the prose rewrite it carried: the five documentation files it edited are pointers to the table, and restoring the old lists would reintroduce a second source of truth. Commit 19 depends on 18 for the scans it trusts and reverts alone.
