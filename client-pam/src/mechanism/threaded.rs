@@ -14,7 +14,7 @@
 //! opens the conversation.
 
 use super::ExitReason;
-use crate::ipc_client::{IpcClient, IpcResponseReader};
+use crate::ipc_client::IpcResponseReader;
 use crate::outcome::{ErrorReason, UnavailableReason};
 use crate::pam_sys;
 use crate::plan::Plan;
@@ -103,6 +103,26 @@ unsafe extern "C-unwind" fn native_password_worker(
     }
 
     std::ptr::null_mut()
+}
+
+/// The worker entry point the spawn operation must accept.
+///
+/// `C-unwind` is what lets glibc's forced unwind (`abi::__forced_unwind`) from
+/// `pthread_cancel` pass through the worker frame without aborting.
+type WorkerStart =
+    unsafe extern "C-unwind" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
+
+// Custom FFI binding for pthread_create that accepts the correct
+// `extern "C-unwind"` function signature.  This avoids the undefined
+// behaviour of transmuting between C-unwind and C ABIs.
+extern "C" {
+    #[link_name = "pthread_create"]
+    fn pthread_create_unwind(
+        thread: *mut libc::pthread_t,
+        attr: *const libc::pthread_attr_t,
+        start_routine: WorkerStart,
+        arg: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int;
 }
 
 /// Cancel (optionally) and reap the native password worker.
@@ -279,24 +299,58 @@ fn run_gui_event_loop<T: IpcResponseReader>(
 /// concludes with it. The two local-resource failures (`pipe2`,
 /// `pthread_create`) are the only errors it can report, and both cancel the
 /// in-flight request first.
-pub(crate) fn drive<T: IpcResponseReader>(
+pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     armed: &mut Armed<T>,
     _plan: &Plan,
     deadline_at: Instant,
     pamh: *mut pam_sys::PamHandle,
+    cancel: X,
 ) -> MechanismEnd {
-    let (ipc, request_id) = armed.parts();
-
     // O_CLOEXEC prevents the pipe fds from leaking to child processes
     // started by the long-running privileged host (sudo, gdm, polkitd).
+    drive_with(
+        armed,
+        deadline_at,
+        pamh,
+        cancel,
+        |fds| unsafe { libc::pipe2(fds, libc::O_CLOEXEC) },
+        |thread, attr, start, arg| unsafe { pthread_create_unwind(thread, attr, start, arg) },
+    )
+}
+
+/// [`drive`] with its two local-resource operations injected.
+///
+/// `make_pipe` and `spawn` are the real `libc::pipe2` and the hand-declared
+/// `pthread_create_unwind` in production; a test passes a failing one so each
+/// failure arm and its best-effort cancel are observable. The `cancel` closure
+/// is the same one the sequential mechanism uses — production wires both to
+/// [`crate::pam_logic::cancel_on_fresh_connection`] — so the failure arms no
+/// longer open their own short-timeout connection.
+fn drive_with<T, X>(
+    armed: &mut Armed<T>,
+    deadline_at: Instant,
+    pamh: *mut pam_sys::PamHandle,
+    cancel: X,
+    make_pipe: impl FnOnce(*mut libc::c_int) -> libc::c_int,
+    spawn: impl FnOnce(
+        *mut libc::pthread_t,
+        *const libc::pthread_attr_t,
+        WorkerStart,
+        *mut std::os::raw::c_void,
+    ) -> libc::c_int,
+) -> MechanismEnd
+where
+    T: IpcResponseReader,
+    X: Fn(&str, &str),
+{
+    let (ipc, request_id) = armed.parts();
+
     let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    if make_pipe(pipe_fds.as_mut_ptr()) != 0 {
         let err = std::io::Error::last_os_error();
         tracing::error!("Failed to create secure self-pipe: {err}");
         // Best-effort cancel so the phone doesn't keep buzzing.
-        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-            let _ = c.send_cancel("gui-pipe2-fail", request_id);
-        }
+        cancel("gui-pipe2-fail", request_id);
         return MechanismEnd::Error(ErrorReason::LocalResource);
     }
     let pipe_read = pipe_fds[0];
@@ -316,36 +370,17 @@ pub(crate) fn drive<T: IpcResponseReader>(
     // is cancelled via pthread_cancel.
     let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
 
-    // Custom FFI binding for pthread_create that accepts the correct
-    // `extern "C-unwind"` function signature.  This avoids the undefined
-    // behaviour of transmuting between C-unwind and C ABIs.
-    extern "C" {
-        #[link_name = "pthread_create"]
-        fn pthread_create_unwind(
-            thread: *mut libc::pthread_t,
-            attr: *const libc::pthread_attr_t,
-            start_routine: unsafe extern "C-unwind" fn(
-                *mut std::os::raw::c_void,
-            ) -> *mut std::os::raw::c_void,
-            arg: *mut std::os::raw::c_void,
-        ) -> std::os::raw::c_int;
-    }
-
-    let spawn_res = unsafe {
-        pthread_create_unwind(
-            pthread_id.as_mut_ptr(),
-            std::ptr::null(),
-            native_password_worker,
-            &ctx as *const ThreadContext as *mut std::os::raw::c_void,
-        )
-    };
+    let spawn_res = spawn(
+        pthread_id.as_mut_ptr(),
+        std::ptr::null(),
+        native_password_worker,
+        &ctx as *const ThreadContext as *mut std::os::raw::c_void,
+    );
 
     if spawn_res != 0 {
         let err = std::io::Error::from_raw_os_error(spawn_res);
         tracing::error!("Failed to create native password thread: {err}");
-        if let Ok(mut c) = IpcClient::connect(Duration::from_millis(100)) {
-            let _ = c.send_cancel("gui-thread-spawn-fail", request_id);
-        }
+        cancel("gui-thread-spawn-fail", request_id);
         unsafe {
             libc::close(pipe_read);
             libc::close(pipe_write);
@@ -764,5 +799,189 @@ mod join_tests {
         );
 
         unsafe { libc::close(fds[0]) };
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod local_resource_tests {
+    use super::*;
+    use crate::transaction::{armed_for_test, MechanismEnd};
+    use std::cell::{Cell, RefCell};
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
+
+    /// An `IpcResponseReader` that is never read: the local-resource arms return
+    /// before the event loop.
+    struct NullReader {
+        stream: UnixStream,
+    }
+
+    impl NullReader {
+        fn new() -> Self {
+            let (_server, stream) = UnixStream::pair().unwrap();
+            NullReader { stream }
+        }
+    }
+
+    impl IpcResponseReader for NullReader {
+        fn fd(&self) -> RawFd {
+            self.stream.as_raw_fd()
+        }
+
+        fn try_read_response_nonblocking(
+            &mut self,
+        ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+            Ok(None)
+        }
+
+        fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    /// A failed `pipe2` returns `Error(LocalResource)`, cancels exactly once on
+    /// the request id, and never reaches the spawn operation.
+    ///
+    /// The defect this catches: the `pipe2` arm returning `Reason(..)`
+    /// (`PAM_AUTHINFO_UNAVAIL`) instead of `Error(..)` (`PAM_AUTH_ERR`), or
+    /// skipping/multiplying the best-effort cancel — the phone would keep
+    /// buzzing, and a `sufficient` stack would fall through as if the daemon had
+    /// been unreachable.
+    #[test]
+    fn pipe2_failure_cancels_once_and_reports_local_resource() {
+        let mut armed = armed_for_test(NullReader::new(), "pipe2-fail-request");
+        let cancels: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let spawn_called = Cell::new(false);
+
+        let end = drive_with(
+            &mut armed,
+            Instant::now() + Duration::from_secs(5),
+            std::ptr::null_mut(),
+            |reason: &str, rid: &str| cancels.borrow_mut().push(format!("{reason}:{rid}")),
+            |_fds| -1,
+            |_thread, _attr, _start, _arg| {
+                spawn_called.set(true);
+                0
+            },
+        );
+
+        assert!(
+            matches!(end, MechanismEnd::Error(ErrorReason::LocalResource)),
+            "a failed pipe2 must conclude as Error(LocalResource) (PAM_AUTH_ERR), \
+             not as a daemon unavailability"
+        );
+        assert_eq!(
+            cancels.borrow().as_slice(),
+            ["gui-pipe2-fail:pipe2-fail-request"],
+            "the pipe2 failure must cancel exactly once, on its own request id"
+        );
+        assert!(
+            !spawn_called.get(),
+            "no worker may be spawned after the self-pipe failed"
+        );
+    }
+
+    /// A failed `pthread_create` returns `Error(LocalResource)`, cancels
+    /// exactly once, and closes both pipe fds.
+    ///
+    /// The defect this catches: the spawn-failure arm leaking the two
+    /// `O_CLOEXEC` fds into the long-running privileged host (`sudo`, `gdm`,
+    /// `polkitd`) — the open fds are invisible in a passing build because the
+    /// return code is right either way — or cancelling with the wrong reason /
+    /// not at all.
+    #[test]
+    fn spawn_failure_cancels_once_closes_both_fds_and_reports_local_resource() {
+        let mut armed = armed_for_test(NullReader::new(), "spawn-fail-request");
+        let cancels: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let seen_fds = Cell::new([-1, -1]);
+
+        let end = drive_with(
+            &mut armed,
+            Instant::now() + Duration::from_secs(5),
+            std::ptr::null_mut(),
+            |reason: &str, rid: &str| cancels.borrow_mut().push(format!("{reason}:{rid}")),
+            |fds| {
+                let rc = unsafe { libc::pipe2(fds, libc::O_CLOEXEC) };
+                if rc == 0 {
+                    seen_fds.set(unsafe { [*fds, *fds.add(1)] });
+                }
+                rc
+            },
+            |_thread, _attr, _start, _arg| libc::EAGAIN,
+        );
+
+        assert!(
+            matches!(end, MechanismEnd::Error(ErrorReason::LocalResource)),
+            "a failed pthread_create must conclude as Error(LocalResource) \
+             (PAM_AUTH_ERR), not as a daemon unavailability"
+        );
+        assert_eq!(
+            cancels.borrow().as_slice(),
+            ["gui-thread-spawn-fail:spawn-fail-request"],
+            "the spawn failure must cancel exactly once, on its own request id"
+        );
+
+        let fds = seen_fds.get();
+        assert_ne!(fds, [-1, -1], "the test pipe was never created");
+        for fd in fds {
+            let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(
+                rc, -1,
+                "fd {fd} must be closed after a failed pthread_create, but fcntl \
+                 (F_GETFD) still resolves it: the fds leak into the host"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF),
+                "fd {fd} must be gone (EBADF), not merely not-cloexec"
+            );
+        }
+    }
+
+    /// The join-failure abort actually aborts.
+    ///
+    /// `std::process::abort()` cannot be observed from inside the process, so
+    /// this forks: the child joins itself (`pthread_join` on a joinable
+    /// `pthread_self()` yields `EDEADLK` on glibc), which drives the defensive
+    /// abort, and the parent asserts `SIGABRT`. The `alarm(5)` turns a hung
+    /// child into a `SIGALRM` failure rather than a hung suite; a child that
+    /// exits `0` (join unexpectedly succeeded) also fails.
+    ///
+    /// Platform assumption: glibc (`pthread_join(3)` returns `EDEADLK` when a
+    /// thread joins itself) and a Linux `fork` that runs the atfork handlers.
+    #[test]
+    fn join_failure_aborts_the_process() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: no `exit`, so no Rust destructor or atexit handler runs on
+            // the forked copy of the parent's state.
+            unsafe {
+                libc::alarm(5);
+                cancel_and_join(libc::pthread_self(), false);
+                libc::_exit(0);
+            }
+        }
+
+        let mut status: libc::c_int = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(reaped, pid, "waitpid must reap the child");
+        assert!(
+            libc::WIFSIGNALED(status),
+            "the child did not die by signal (wait status {status}): the \
+             pthread_join failure returned instead of aborting"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGABRT,
+            "a failed pthread_join must abort (SIGABRT), not exit or die of the \
+             test's own SIGALRM"
+        );
     }
 }

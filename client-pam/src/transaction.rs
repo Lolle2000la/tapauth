@@ -922,9 +922,11 @@ where
     // The mechanism owns the wait; it returns an exit, never a verdict, so the
     // daemon's answer becomes an `Outcome` exactly once, in `conclude`.
     let end = match plannable {
-        Plannable::Threaded => threaded::drive(&mut armed, &plan, deadline_at, host.pamh()),
+        Plannable::Threaded => {
+            threaded::drive(&mut armed, &plan, deadline_at, host.pamh(), &cancel)
+        }
         Plannable::Sequential => {
-            sequential::drive(&mut armed, &plan, deadline_at, tty_file, cancel)
+            sequential::drive(&mut armed, &plan, deadline_at, tty_file, &cancel)
         }
     };
 
