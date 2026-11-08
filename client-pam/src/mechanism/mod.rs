@@ -27,28 +27,65 @@
 //! transaction and the plan's announcements), so the text and the style of a
 //! failure are a property of the reason, not of the loop that observed it.
 //!
-//! Each body returns a [`crate::transaction::MechanismEnd`] — the daemon's
-//! owned response, an unavailability reason, or a local error reason — never an
-//! [`crate::outcome::Outcome`]: only `Armed::conclude` may turn one into a
+//! Each body returns a [`MechanismEnd`] — the daemon's owned response, an
+//! unavailability reason, or a local error reason — never an
+//! [`Outcome`](crate::outcome::Outcome): only
+//! [`Armed::conclude`](crate::transaction::Armed::conclude) may turn one into a
 //! conclusion, so a mechanism cannot mint one of its own.
 
 pub(crate) mod handoff;
 pub(crate) mod sequential;
 pub(crate) mod threaded;
 
-/// Why a poll loop stopped waiting.
+use crate::outcome::{ErrorReason, UnavailableReason};
+
+/// A mechanism's exit.
 ///
-/// Shared by the threaded loop (which has two more ways out: the user typed a
-/// password, or dismissed the dialog) and the sequential loop, because both
-/// distinguish "the deadline passed" from "the IPC layer said no". The variants
-/// are not verdicts: the caller maps them to a
-/// [`crate::outcome::UnavailableReason`], which is where the message and its
-/// style come from.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ExitReason {
-    Timeout,
-    IpcResponseReceived,
-    IpcError,
-    PasswordEntered,
-    PasswordFailed,
+/// It carries the daemon's response, an unavailability reason, or a local error
+/// reason — never an [`Outcome`](crate::outcome::Outcome): only
+/// [`Armed::conclude`](crate::transaction::Armed::conclude) may turn one into a
+/// conclusion, so a mechanism cannot mint one of its own. `Error` exists for the
+/// two local-resource failures the threaded mechanism owns (`pipe2`,
+/// `pthread_create`), which must keep returning `PAM_AUTH_ERR` and must keep
+/// being recorded. The response is owned, because a mechanism cannot return a
+/// borrow of its own local.
+#[derive(Debug)]
+pub(crate) enum MechanismEnd {
+    Response(shared::ipc::pb::PamAuthenticateResponse),
+    Reason(UnavailableReason),
+    Error(ErrorReason),
+}
+
+/// The two IPC failures both loops name the same way.
+///
+/// This is the whole of the duplicated failure table: a hangup is
+/// [`UnavailableReason::IpcConnectionLost`] and a decode error is
+/// [`UnavailableReason::IpcLoopError`], in the threaded loop and the sequential
+/// loop alike. The shared part is the *reason*, because that is what selects the
+/// text and the style (`Outcome::notice`); which observed event counts as a
+/// hangup stays in the loop that observed it, next to the `revents` test that
+/// decided it, and each loop maps its own local vocabulary onto this pair.
+///
+/// The poll-error arm is deliberately not here, because the two mechanisms
+/// answer it differently: the threaded loop records
+/// [`UnavailableReason::IpcLoopError`] and stops, while the sequential loop logs
+/// it and keeps waiting on the terminal shape and collapses it into
+/// [`UnavailableReason::IpcError`] (with a `gui-ipc-error` cancel) on the
+/// no-terminal one. There is no single reason to share for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpcFault {
+    /// The peer closed the connection, with or without a partial frame.
+    Hangup,
+    /// A read on the socket failed.
+    DecodeError,
+}
+
+impl IpcFault {
+    /// The reason both loops show for this failure.
+    fn reason(self) -> UnavailableReason {
+        match self {
+            IpcFault::Hangup => UnavailableReason::IpcConnectionLost,
+            IpcFault::DecodeError => UnavailableReason::IpcLoopError,
+        }
+    }
 }

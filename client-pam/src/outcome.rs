@@ -15,7 +15,9 @@
 //!
 //! A `Granted` therefore cannot be minted by a mechanism, a skip or a local
 //! error, and `Outcome::replayed` is the only way a grant exists without a fresh
-//! round trip.
+//! round trip. A mechanism returns a [`MechanismEnd`] instead, and
+//! `impl From<MechanismEnd> for Outcome` (below) is the one place that exit
+//! becomes a verdict.
 //!
 //! [`Outcome::notice`] is the pure half of the messaging: which single message
 //! (if any) an outcome shows, and in which style. Emission itself stays at the
@@ -23,6 +25,7 @@
 //! and the style are a property of the reason and not of the caller. A replayed
 //! conclusion emits nothing, which is what keeps a cache hit silent.
 
+use crate::mechanism::MechanismEnd;
 use crate::pam_messages::PamMessages;
 use crate::pam_sys;
 use crate::policy::SkipPolicy;
@@ -298,6 +301,24 @@ impl Outcome {
                 | ErrorReason::LocalResource => None,
             },
             Outcome::UserUnknown => None,
+        }
+    }
+}
+
+/// The verdict a mechanism's exit names.
+///
+/// The one mapping from a [`MechanismEnd`] to an [`Outcome`], and the reason the
+/// exit type lives in `mechanism`: it is the mechanism contract, while the
+/// verdict it becomes is this module's vocabulary. Used by
+/// [`Armed::conclude`](crate::transaction::Armed::conclude) for a transaction
+/// that reached the daemon and by `run`'s pre-collected handoff arm, which has
+/// no request to conclude.
+impl From<MechanismEnd> for Outcome {
+    fn from(end: MechanismEnd) -> Outcome {
+        match end {
+            MechanismEnd::Response(resp) => Outcome::from_daemon(resp),
+            MechanismEnd::Reason(reason) => Outcome::Unavailable(reason),
+            MechanismEnd::Error(reason) => Outcome::Error(reason),
         }
     }
 }

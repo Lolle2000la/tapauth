@@ -13,12 +13,12 @@
 //! text and the style, so this module holds no user-facing message and never
 //! opens the conversation.
 
-use super::ExitReason;
+use super::{IpcFault, MechanismEnd};
 use crate::ipc_client::IpcResponseReader;
 use crate::outcome::{ErrorReason, UnavailableReason};
 use crate::pam_sys;
 use crate::plan::Plan;
-use crate::transaction::{Armed, MechanismEnd};
+use crate::transaction::Armed;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,10 +177,26 @@ unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
     }
 }
 
+/// Why the GUI event loop stopped waiting.
+///
+/// The loop's own exit set: it is threaded's vocabulary, exactly as
+/// `sequential`'s `IpcFailure` is that loop's, and the two are not shared. The
+/// variants are not verdicts — the caller maps them to an
+/// [`UnavailableReason`] (or returns the response the loop collected), which is
+/// where the message and its style come from.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopExit {
+    Timeout,
+    IpcResponseReceived,
+    IpcError,
+    PasswordEntered,
+    PasswordFailed,
+}
+
 /// Central event loop for the graphical authentication flow.
 ///
-/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns an
-/// `ExitReason` plus whichever side-channel data was collected (the daemon
+/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns a
+/// `LoopExit` plus whichever side-channel data was collected (the daemon
 /// response, or the reason the IPC side failed).  Extracted from the main
 /// authentication body so the multiplexing logic can be unit-tested
 /// independently.
@@ -196,11 +212,11 @@ fn run_gui_event_loop<T: IpcResponseReader>(
     request_id: &str,
     auth_response: &mut Option<shared::ipc::pb::PamAuthenticateResponse>,
     pending: &mut Option<UnavailableReason>,
-) -> ExitReason {
+) -> LoopExit {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return ExitReason::Timeout;
+            return LoopExit::Timeout;
         }
 
         let remain = deadline
@@ -229,7 +245,7 @@ fn run_gui_event_loop<T: IpcResponseReader>(
                         "Password entered via Polkit agent. Cancelling TapAuth transaction."
                     );
                     let _ = ipc.send_cancel("gui-password-skip", request_id);
-                    return ExitReason::PasswordEntered;
+                    return LoopExit::PasswordEntered;
                 }
 
                 // Daemon IPC connection
@@ -238,7 +254,7 @@ fn run_gui_event_loop<T: IpcResponseReader>(
                         match ipc.try_read_response_nonblocking() {
                             Ok(Some(resp)) => {
                                 *auth_response = Some(resp);
-                                return ExitReason::IpcResponseReceived;
+                                return LoopExit::IpcResponseReceived;
                             }
                             Ok(None) => {
                                 if rev.contains(PollFlags::POLLHUP)
@@ -247,21 +263,21 @@ fn run_gui_event_loop<T: IpcResponseReader>(
                                     tracing::error!(
                                         "Daemon closed connection before sending response"
                                     );
-                                    *pending = Some(UnavailableReason::IpcConnectionLost);
-                                    return ExitReason::IpcError;
+                                    *pending = Some(IpcFault::Hangup.reason());
+                                    return LoopExit::IpcError;
                                 }
                                 continue;
                             }
                             Err(e) => {
                                 tracing::error!("IPC read failed: {e}");
-                                *pending = Some(UnavailableReason::IpcLoopError);
-                                return ExitReason::IpcError;
+                                *pending = Some(IpcFault::DecodeError.reason());
+                                return LoopExit::IpcError;
                             }
                         }
                     } else if rev.contains(PollFlags::POLLHUP) || rev.contains(PollFlags::POLLERR) {
                         tracing::error!("Daemon closed connection or error detected");
-                        *pending = Some(UnavailableReason::IpcConnectionLost);
-                        return ExitReason::IpcError;
+                        *pending = Some(IpcFault::Hangup.reason());
+                        return LoopExit::IpcError;
                     }
                 }
 
@@ -271,15 +287,20 @@ fn run_gui_event_loop<T: IpcResponseReader>(
                     if rev.contains(PollFlags::POLLIN) {
                         tracing::info!("Password dialog dismissed. Releasing transaction.");
                         let _ = ipc.send_cancel("gui-password-failed", request_id);
-                        return ExitReason::PasswordFailed;
+                        return LoopExit::PasswordFailed;
                     }
                 }
             }
             Err(e) => {
                 if e != nix::errno::Errno::EINTR {
                     tracing::warn!("poll error: {e}");
+                    // This arm is threaded's alone: a poll error stops this loop
+                    // as an `IpcLoopError`, while the sequential loop logs it and
+                    // keeps waiting on the terminal shape and collapses it into
+                    // `IpcError` on the no-terminal one — so it is not part of
+                    // `IpcFault`'s shared pair.
                     *pending = Some(UnavailableReason::IpcLoopError);
-                    return ExitReason::IpcError;
+                    return LoopExit::IpcError;
                 }
             }
         }
@@ -410,7 +431,7 @@ where
     unsafe {
         cancel_and_join(
             pthread_id,
-            exit_reason != ExitReason::PasswordEntered && exit_reason != ExitReason::PasswordFailed,
+            exit_reason != LoopExit::PasswordEntered && exit_reason != LoopExit::PasswordFailed,
         );
         libc::close(pipe_read);
         libc::close(pipe_write);
@@ -430,9 +451,9 @@ where
     // `sufficient` line that is `ignore`, and on a `required` line a real
     // failure — never `PAM_IGNORE`, which records no failure at all.
     MechanismEnd::Reason(match exit_reason {
-        ExitReason::PasswordEntered => UnavailableReason::PasswordChosen,
-        ExitReason::PasswordFailed => UnavailableReason::PasswordDismissed,
-        ExitReason::Timeout => UnavailableReason::TimedOut,
+        LoopExit::PasswordEntered => UnavailableReason::PasswordChosen,
+        LoopExit::PasswordFailed => UnavailableReason::PasswordDismissed,
+        LoopExit::Timeout => UnavailableReason::TimedOut,
         _ => match pending {
             Some(reason) => reason,
             // An `IpcError` always records its reason, so this arm is
@@ -517,7 +538,7 @@ mod gui_loop_tests {
             &mut pending,
         );
 
-        assert_eq!(reason, ExitReason::Timeout);
+        assert_eq!(reason, LoopExit::Timeout);
         assert!(auth_response.is_none());
         assert!(pending.is_none());
 
@@ -556,7 +577,7 @@ mod gui_loop_tests {
             &mut pending,
         );
 
-        assert_eq!(reason, ExitReason::PasswordEntered);
+        assert_eq!(reason, LoopExit::PasswordEntered);
         assert!(auth_response.is_none());
         assert!(pending.is_none());
 
@@ -595,7 +616,7 @@ mod gui_loop_tests {
             &mut pending,
         );
 
-        assert_eq!(reason, ExitReason::PasswordFailed);
+        assert_eq!(reason, LoopExit::PasswordFailed);
         assert!(auth_response.is_none());
         assert!(pending.is_none());
 
@@ -634,7 +655,7 @@ mod gui_loop_tests {
             &mut pending,
         );
 
-        assert_eq!(reason, ExitReason::IpcResponseReceived);
+        assert_eq!(reason, LoopExit::IpcResponseReceived);
         assert_eq!(
             auth_response.unwrap().outcome(),
             shared::ipc::pb::PamOutcome::Success
@@ -672,7 +693,7 @@ mod gui_loop_tests {
             &mut pending,
         );
 
-        assert_eq!(reason, ExitReason::IpcError);
+        assert_eq!(reason, LoopExit::IpcError);
         assert!(auth_response.is_none());
         assert_eq!(pending, Some(UnavailableReason::IpcConnectionLost));
 
@@ -812,7 +833,7 @@ mod join_tests {
 )]
 mod local_resource_tests {
     use super::*;
-    use crate::transaction::{armed_for_test, MechanismEnd};
+    use crate::transaction::armed_for_test;
     use std::cell::{Cell, RefCell};
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;

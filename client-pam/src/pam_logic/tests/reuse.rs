@@ -44,8 +44,8 @@ fn denied() -> Outcome {
 /// `Armed::conclude` takes a `MechanismEnd` now — a mechanism never mints an
 /// `Outcome` — so a test that records one of the three verdicts the daemon
 /// can reach has to name the exit that produces it.
-fn end_of(outcome: &Outcome) -> crate::transaction::MechanismEnd {
-    use crate::transaction::MechanismEnd;
+fn end_of(outcome: &Outcome) -> crate::mechanism::MechanismEnd {
+    use crate::mechanism::MechanismEnd;
     match outcome {
         Outcome::Granted(_) => {
             let mut resp = shared::ipc::pb::PamAuthenticateResponse::default();

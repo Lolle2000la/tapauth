@@ -20,9 +20,10 @@
 //! It never contacts the daemon, never reads or writes the reuse record, and
 //! never emits a message.
 
+use crate::mechanism::MechanismEnd;
 use crate::outcome::UnavailableReason;
 use crate::pam_sys;
-use crate::transaction::{HostIo, MechanismEnd};
+use crate::transaction::HostIo;
 
 /// Read the host's pre-collected token and hand it on.
 ///

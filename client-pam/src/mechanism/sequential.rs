@@ -55,10 +55,11 @@
 //!    `cancel` closure, which production wires to a *fresh* short-timeout
 //!    connection.
 
+use super::{IpcFault, MechanismEnd};
 use crate::ipc_client::IpcResponseReader;
 use crate::outcome::UnavailableReason;
 use crate::plan::{Plan, TtyUse};
-use crate::transaction::{Armed, MechanismEnd};
+use crate::transaction::Armed;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::fs::File;
@@ -367,12 +368,14 @@ fn ipc_failure<X: Fn(&str, &str)>(
             MechanismEnd::Reason(UnavailableReason::IpcError)
         }
         IpcFailureMap::Distinguish => MechanismEnd::Reason(match kind {
-            IpcFailure::Hangup => UnavailableReason::IpcConnectionLost,
-            IpcFailure::DecodeError => UnavailableReason::IpcLoopError,
+            IpcFailure::Hangup => IpcFault::Hangup.reason(),
+            IpcFailure::DecodeError => IpcFault::DecodeError.reason(),
             // A non-EINTR poll error only reaches this function on the
             // collapsing profile (`poll_error_stops`), so this arm is
             // unreachable; it is not a panic path because a shipped `cdylib`
-            // compiles panics out.
+            // compiles panics out. It is also the arm that keeps the poll-error
+            // cell local instead of in `IpcFault`: the threaded loop answers the
+            // same event with `IpcLoopError`.
             IpcFailure::PollError => UnavailableReason::IpcConnectionLost,
         }),
     }
@@ -610,8 +613,8 @@ mod tests {
     ///
     /// Same scenario and same assertion as the pre-merge `S1`
     /// (`test_sequential_loop_immediate_timeout`), retargeted onto the one loop:
-    /// the exit is a `MechanismEnd` now, not an `ExitReason`, because the loop
-    /// no longer reports a reason the caller maps.
+    /// the exit is a `MechanismEnd` now, not a loop-local exit code, because the
+    /// loop no longer reports a reason the caller maps.
     #[test]
     fn test_sequential_loop_immediate_timeout() {
         let expired = Instant::now() - Duration::from_secs(1);

@@ -30,7 +30,7 @@ use crate::conclusion_cache::replay_for;
 use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
 use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
-use crate::mechanism::{handoff, sequential, threaded};
+use crate::mechanism::{handoff, sequential, threaded, MechanismEnd};
 use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReason};
 use crate::pam_messages::PamMessages;
 use crate::pam_sys::{PamConversation, PamHandle, ReadAuthtok};
@@ -189,7 +189,9 @@ impl<I: IpcResponseReader> Armed<I> {
     /// request was on the wire, and consumes the mechanism's [`MechanismEnd`],
     /// so the daemon's answer is mapped to a verdict here and nowhere else: a
     /// mechanism cannot mint a `Granted` or a `Denied` of its own (§3.5.2
-    /// layer 4).
+    /// layer 4). The mapping itself is
+    /// `impl From<MechanismEnd> for Outcome`, which lives in `outcome.rs` beside
+    /// the verdict vocabulary it produces.
     pub(crate) fn conclude(
         self,
         end: MechanismEnd,
@@ -197,7 +199,7 @@ impl<I: IpcResponseReader> Armed<I> {
         service: Option<ServiceName>,
     ) -> Concluded {
         Concluded {
-            outcome: end.into_outcome(),
+            outcome: end.into(),
             username: username.to_owned(),
             service,
             via: Via::Daemon,
@@ -210,37 +212,6 @@ impl<I: IpcResponseReader> Armed<I> {
     /// mutable borrow and the id's shared borrow separately.
     pub(crate) fn parts(&mut self) -> (&mut I, &str) {
         (&mut self.ipc, &self.request_id)
-    }
-}
-
-/// A mechanism's exit.
-///
-/// It carries the daemon's response, an unavailability reason, or a local error
-/// reason — never an [`Outcome`]: only [`Armed::conclude`] may turn one into a
-/// conclusion, so a mechanism cannot mint one of its own. `Error` exists for the
-/// two local-resource failures the threaded mechanism owns (`pipe2`,
-/// `pthread_create`), which must keep returning `PAM_AUTH_ERR` and must keep
-/// being recorded. The response is owned, because a mechanism cannot return a
-/// borrow of its own local.
-#[derive(Debug)]
-pub(crate) enum MechanismEnd {
-    Response(shared::ipc::pb::PamAuthenticateResponse),
-    Reason(UnavailableReason),
-    Error(ErrorReason),
-}
-
-impl MechanismEnd {
-    /// The verdict this exit names.
-    ///
-    /// The one mapping from an exit to an outcome, used by [`Armed::conclude`]
-    /// for a transaction that reached the daemon and by [`run`]'s handoff arm,
-    /// which has no request to conclude.
-    fn into_outcome(self) -> Outcome {
-        match self {
-            MechanismEnd::Response(resp) => Outcome::from_daemon(resp),
-            MechanismEnd::Reason(reason) => Outcome::Unavailable(reason),
-            MechanismEnd::Error(reason) => Outcome::Error(reason),
-        }
     }
 }
 
@@ -465,7 +436,7 @@ pub(crate) fn run<T: IpcResponseReader>(
         Conversation::Threaded => Plannable::Threaded,
         Conversation::Sequential => Plannable::Sequential,
         Conversation::PreCollected => {
-            let outcome = handoff::perform(host).into_outcome();
+            let outcome = handoff::perform(host).into();
             return finish(host, Finished::Unrecorded(outcome));
         }
     };
