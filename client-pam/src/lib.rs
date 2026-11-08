@@ -163,6 +163,18 @@ pub extern "C" fn pam_sm_chauthtok(
     pam_sys::PAM_SUCCESS
 }
 
+/// Crate-wide source guardrails: the scans that assert invariants over every
+/// module of this crate rather than over one module's behaviour.
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod source_guards;
+
 // reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
