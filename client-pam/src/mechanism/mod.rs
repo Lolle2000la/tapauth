@@ -22,10 +22,10 @@
 //! the PAM handle, the `/dev/tty` file, the injected `cancel` closure, or
 //! [`crate::transaction::HostIo`].
 //!
-//! No mechanism emits a user-visible message either: the conversation is only
-//! touched by `transaction::run` (its one `Outcome::notice` per finished
-//! transaction and the plan's announcements), so the text and the style of a
-//! failure are a property of the reason, not of the loop that observed it.
+//! No mechanism emits a user-visible message either: the verdict's one
+//! `Outcome::notice` is emitted by `transaction::host_io::finish`, and the plan's
+//! announcements by `transaction::run`, so the text and the style of a failure
+//! are a property of the reason, not of the loop that observed it.
 //!
 //! Each body returns a [`MechanismEnd`] — the daemon's owned response, an
 //! unavailability reason, or a local error reason — never an
@@ -37,7 +37,7 @@ pub(crate) mod handoff;
 pub(crate) mod sequential;
 pub(crate) mod threaded;
 
-use crate::outcome::{ErrorReason, UnavailableReason};
+use crate::outcome::{ErrorReason, Outcome, UnavailableReason};
 
 /// A mechanism's exit.
 ///
@@ -54,6 +54,26 @@ pub(crate) enum MechanismEnd {
     Response(shared::ipc::pb::PamAuthenticateResponse),
     Reason(UnavailableReason),
     Error(ErrorReason),
+}
+
+/// The verdict a mechanism's exit names.
+///
+/// The one mapping from a [`MechanismEnd`] to an
+/// [`Outcome`](crate::outcome::Outcome), and the reason the exit type lives
+/// here: it is the mechanism contract, while the verdict it becomes is
+/// `outcome.rs`'s vocabulary. Used by
+/// [`Armed::conclude`](crate::transaction::Armed::conclude) for a transaction
+/// that reached the daemon and by `run`'s pre-collected handoff arm, which has
+/// no request to conclude. Keeping the impl here, beside the exit it maps, is
+/// what lets `outcome.rs` stay clear of the mechanism contract.
+impl From<MechanismEnd> for Outcome {
+    fn from(end: MechanismEnd) -> Outcome {
+        match end {
+            MechanismEnd::Response(resp) => Outcome::from_daemon(resp),
+            MechanismEnd::Reason(reason) => Outcome::Unavailable(reason),
+            MechanismEnd::Error(reason) => Outcome::Error(reason),
+        }
+    }
 }
 
 /// The two IPC failures both loops name the same way.

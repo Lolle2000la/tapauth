@@ -15,9 +15,10 @@
 //!
 //! A `Granted` therefore cannot be minted by a mechanism, a skip or a local
 //! error, and `Outcome::replayed` is the only way a grant exists without a fresh
-//! round trip. A mechanism returns a [`MechanismEnd`] instead, and
-//! `impl From<MechanismEnd> for Outcome` (below) is the one place that exit
-//! becomes a verdict.
+//! round trip. A mechanism returns its own `MechanismEnd` instead, and
+//! `impl From<MechanismEnd> for Outcome` in `mechanism/mod.rs` is the one place
+//! that exit becomes a verdict — which is why this module does not import the
+//! mechanism contract.
 //!
 //! [`Outcome::notice`] is the pure half of the messaging: which single message
 //! (if any) an outcome shows, and in which style. Emission itself stays at the
@@ -25,7 +26,6 @@
 //! and the style are a property of the reason and not of the caller. A replayed
 //! conclusion emits nothing, which is what keeps a cache hit silent.
 
-use crate::mechanism::MechanismEnd;
 use crate::pam_messages::PamMessages;
 use crate::pam_sys;
 use crate::policy::SkipPolicy;
@@ -305,24 +305,6 @@ impl Outcome {
     }
 }
 
-/// The verdict a mechanism's exit names.
-///
-/// The one mapping from a [`MechanismEnd`] to an [`Outcome`], and the reason the
-/// exit type lives in `mechanism`: it is the mechanism contract, while the
-/// verdict it becomes is this module's vocabulary. Used by
-/// [`Armed::conclude`](crate::transaction::Armed::conclude) for a transaction
-/// that reached the daemon and by `run`'s pre-collected handoff arm, which has
-/// no request to conclude.
-impl From<MechanismEnd> for Outcome {
-    fn from(end: MechanismEnd) -> Outcome {
-        match end {
-            MechanismEnd::Response(resp) => Outcome::from_daemon(resp),
-            MechanismEnd::Reason(reason) => Outcome::Unavailable(reason),
-            MechanismEnd::Error(reason) => Outcome::Error(reason),
-        }
-    }
-}
-
 /// Map the raw protobuf `outcome` field to a [`shared::ipc::pb::PamOutcome`],
 /// failing closed on a value this build does not know.
 fn outcome_from_raw(raw: i32) -> shared::ipc::pb::PamOutcome {
@@ -552,6 +534,27 @@ mod tests {
             );
             assert_eq!(outcome.into_pam(), pam_sys::PAM_AUTH_ERR);
         }
+    }
+
+    /// A mechanism's local error is a processing failure, not an
+    /// unavailability.
+    ///
+    /// The defect this catches: the `From<MechanismEnd> for Outcome` impl's
+    /// `Error` and `Reason` arms swapped, which would send a `pipe2` or
+    /// `pthread_create` failure to `PAM_AUTHINFO_UNAVAIL` — on a `sufficient`
+    /// line the stack would fall through as if the daemon had merely been
+    /// unreachable — and a daemon unavailability to `PAM_AUTH_ERR`.
+    #[test]
+    fn mechanism_end_error_maps_to_error() {
+        let outcome = Outcome::from(crate::mechanism::MechanismEnd::Error(
+            ErrorReason::LocalResource,
+        ));
+        assert_eq!(outcome, Outcome::Error(ErrorReason::LocalResource));
+        assert_eq!(
+            outcome.into_pam(),
+            pam_sys::PAM_AUTH_ERR,
+            "a local-resource failure must be a processing failure"
+        );
     }
 
     /// `Outcome::replayed` yields a grant if and only if its input was one.
