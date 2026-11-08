@@ -145,9 +145,9 @@ impl<I: IpcResponseReader> Armed<I> {
     ///
     /// `connect` and `send` are borrowed effects so both failure paths are
     /// testable without a daemon (`pam_logic::tests::reuse`); production passes
-    /// `IpcClient::connect_nonblocking` and [`crate::pam_logic`]'s
-    /// `send_authenticate_request`. They are `&mut dyn` rather than type
-    /// parameters so the reader stays this type's only generic argument.
+    /// `pam_logic::wiring`'s `connect` and `send_authenticate_request`. They are
+    /// `&mut dyn` rather than type parameters so the reader stays this type's
+    /// only generic argument.
     pub(crate) fn open(
         connect: &mut dyn FnMut() -> Result<I, IpcError>,
         send: &mut dyn FnMut(&mut I) -> Result<(), IpcError>,

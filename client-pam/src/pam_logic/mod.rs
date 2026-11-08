@@ -20,8 +20,8 @@
 //! 2. For a participant, load the config and refine the classification with the
 //!    configured refused service names
 //! 3. Resolve the username, the PAM conversation and the messages
-//! 4. Hand the participation to `transaction::run`, which sends one IPC request
-//!    to `tapauthd` and waits for the daemon's answer
+//! 4. Hand the participation to `transaction::run`, which sends at most one IPC
+//!    request (a handoff or a reuse hit sends none) and waits for the answer
 //! 5. Map the resulting verdict to a `PAM_*` code: `PAM_SUCCESS` on a phone tap,
 //!    `PAM_PERM_DENIED` on an explicit denial, `PAM_AUTHINFO_UNAVAIL` when the
 //!    service could not be consulted and `PAM_AUTH_ERR` on a processing failure,
@@ -30,8 +30,9 @@
 //!
 //! ## Threading
 //!
-//! The module sends one IPC request and waits for it on the calling thread; it
-//! starts no runtime and owns no daemon transport. The only thread it ever
+//! The module sends at most one IPC request — none on a handoff or a reuse
+//! hit — and waits for it on the calling thread; it starts no runtime and
+//! owns no daemon transport. The only thread it ever
 //! creates is the threaded mechanism's password worker. The sequential mechanism
 //! polls the daemon socket on the calling thread (and `/dev/tty` when the plan
 //! gave it a terminal) and never drives the conversation.

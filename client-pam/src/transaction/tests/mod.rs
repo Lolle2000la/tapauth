@@ -782,6 +782,118 @@ fn announcement_order_matches_today() {
     );
 }
 
+/// A reader whose socket is already hung up: `poll` reports it readable and
+/// at end-of-file, which is the no-terminal `gui-ipc-error` shape.
+struct HangupIpc {
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl HangupIpc {
+    fn new() -> Self {
+        let (live, peer) =
+            std::os::unix::net::UnixStream::pair().expect("the test can make a socket pair");
+        drop(peer);
+        HangupIpc { stream: live }
+    }
+}
+
+impl IpcResponseReader for HangupIpc {
+    fn fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.stream)
+    }
+
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
+        // A hung-up peer yields no frame: the loop's own `POLLHUP` handling is
+        // what classifies the event, so the reader never has to read.
+        Ok(None)
+    }
+
+    fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+/// The no-terminal IPC error cancels through the injected `Effects.cancel` seam
+/// exactly once, with its own reason.
+///
+/// The defect this catches: `run` handing the mechanism a different closure
+/// than `effects.cancel` — a local no-op, or a copy that is never invoked — so
+/// the phone keeps buzzing for a request the host already abandoned. Every
+/// other transaction test asserts `cancels == 0`, and a broken `run`→mechanism
+/// forwarding passes all of them; only a positive count proves the seam is
+/// wired. The assertion is on the effect `run` was given, never on the
+/// mechanism's own test double.
+#[test]
+fn gui_ipc_error_cancels_through_the_effects_seam() {
+    let ctx = context(
+        Some("cancel-seam-service"),
+        Some("xfce4-screensaver-dialog"),
+    );
+    let participation = participation_for(&ctx);
+    assert_eq!(
+        participation.conversation,
+        Conversation::Sequential,
+        "the no-terminal sequential shape is the one that cancels on an IPC error"
+    );
+    let msgs = PamMessages::new("en");
+    let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
+    let cancels: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+    let cfg = PamConfig {
+        pam_operation_timeout_secs: 5,
+        pam_gui_timeout_secs: 5,
+        ..PamConfig::default()
+    };
+    let finished = run(
+        ctx.service(),
+        "cancel-seam-user",
+        &participation,
+        &mut host,
+        &cfg,
+        &mut Effects {
+            probe_tty: &mut || None::<File>,
+            connect: &mut || Ok(HangupIpc::new()),
+            send: &mut |_: &mut HangupIpc, _: &SendParams<'_>| Ok(()),
+            cancel: &|reason, request_id| {
+                cancels
+                    .borrow_mut()
+                    .push((reason.to_owned(), request_id.to_owned()));
+            },
+        },
+    );
+
+    let recorded = cancels.into_inner();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the hung-up no-terminal wait cancels exactly once: {recorded:?}"
+    );
+    assert_eq!(
+        recorded.first().map(|(reason, _)| reason.as_str()),
+        Some("gui-ipc-error"),
+        "the cancel carries the exit's own reason: {recorded:?}"
+    );
+    assert_eq!(
+        recorded.first().map(|(_, request_id)| request_id.len()),
+        Some(32),
+        "the cancel carries the request id `run` put on the wire: {recorded:?}"
+    );
+    assert_eq!(
+        finished.outcome().clone().into_pam(),
+        crate::pam_sys::PAM_AUTHINFO_UNAVAIL,
+        "the cancelled no-terminal wait is an unavailability, not a grant"
+    );
+    assert!(
+        matches!(
+            finished.outcome(),
+            Outcome::Unavailable(UnavailableReason::IpcError)
+        ),
+        "the no-terminal IPC failure is named `IpcError`: {:?}",
+        finished.outcome()
+    );
+}
+
 /// A pre-collected participation neither probes nor plans.
 ///
 /// The defect this catches: the handoff placed after the probe, the cache

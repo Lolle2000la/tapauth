@@ -100,7 +100,7 @@ pub(super) static RULES: [Rule; 10] = [
         name: "hyprlock",
         class: FailureDirection::AlwaysRing,
         evidence: &[
-            "client-pam/src/policy/table.rs:257",
+            "client-pam/src/policy/table.rs:261",
             "client-pam/src/mechanism/threaded.rs:191",
         ],
         predicate: hyprlock,
@@ -111,7 +111,7 @@ pub(super) static RULES: [Rule; 10] = [
         name: "xsecurelock",
         class: FailureDirection::AlwaysRing,
         evidence: &[
-            "client-pam/src/policy/table.rs:262",
+            "client-pam/src/policy/table.rs:269",
             "client-pam/src/mechanism/threaded.rs:191",
         ],
         predicate: xsecurelock,
@@ -122,7 +122,7 @@ pub(super) static RULES: [Rule; 10] = [
         name: "precollected_locks",
         class: FailureDirection::NeverRing,
         evidence: &[
-            "client-pam/src/policy/table.rs:267",
+            "client-pam/src/policy/table.rs:274",
             "client-pam/src/mechanism/handoff.rs:31",
         ],
         predicate: precollected_locks,
@@ -133,7 +133,7 @@ pub(super) static RULES: [Rule; 10] = [
         name: "polkit_service_without_proc",
         class: FailureDirection::DeadlockAvoidance,
         evidence: &[
-            "client-pam/src/policy/table.rs:279",
+            "client-pam/src/policy/table.rs:286",
             "client-pam/src/context.rs:160",
         ],
         predicate: polkit_service_without_proc,
@@ -144,7 +144,7 @@ pub(super) static RULES: [Rule; 10] = [
         name: "default_sequential",
         class: FailureDirection::DeadlockAvoidance,
         evidence: &[
-            "client-pam/src/policy/table.rs:285",
+            "client-pam/src/policy/table.rs:292",
             "client-pam/src/mechanism/threaded.rs:203",
         ],
         predicate: default_sequential,

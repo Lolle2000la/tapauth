@@ -76,12 +76,12 @@ pub(crate) struct Effects<'a, T> {
 /// themselves emit nothing.
 ///
 /// `effects` is the transaction's whole outside world — see [`Effects`]:
-/// production passes the real `/dev/tty` open,
-/// `IpcClient::connect_nonblocking`, the `send_authenticate_start` closure and
-/// the fresh-connection cancel, and a test substitutes one field at a time with
-/// a counter, a failure or a recorder, so "the skip never reaches the daemon", "a
-/// connect failure records nothing" and "a timeout cancels nothing" are
-/// assertions rather than promises.
+/// production passes `pam_logic::wiring`'s `probe_tty`, `connect`,
+/// `send_authenticate_request` and `cancel_on_fresh_connection`, and a
+/// test substitutes one field at a time with a counter, a failure or a
+/// recorder, so "the skip never reaches the daemon", "a connect failure
+/// records nothing" and "a timeout cancels nothing" are assertions rather
+/// than promises.
 pub(crate) fn run<T: IpcResponseReader>(
     service: Option<&ServiceName>,
     username: &str,

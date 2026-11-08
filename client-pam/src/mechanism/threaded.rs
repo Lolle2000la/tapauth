@@ -344,7 +344,7 @@ pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
 /// `pthread_create_unwind` in production; a test passes a failing one so each
 /// failure arm and its best-effort cancel are observable. The `cancel` closure
 /// is the same one the sequential mechanism uses — production wires both to
-/// [`crate::pam_logic::cancel_on_fresh_connection`] — so the failure arms no
+/// `pam_logic::wiring::cancel_on_fresh_connection` — so the failure arms no
 /// longer open their own short-timeout connection.
 fn drive_with<T, X>(
     armed: &mut Armed<T>,

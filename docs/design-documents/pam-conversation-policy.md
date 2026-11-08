@@ -166,7 +166,7 @@ Notes that belong to the table:
 * **R3–R9 are order-insensitive**: their predicates are pairwise disjoint, asserted against the declared literal sets (`policy/mod.rs`, `rules_are_process_disjoint`).
 * **R10 is last and unconditional.** A row after it is dead, and no other row may match the null context (`policy/mod.rs`, `unreachable_rule_rows`).
 * **R5 parses no version.** The `kscreenlocker_worker` predicate encodes that: the name is the only signal in `/proc`, and `kscreenlocker_greet` is deliberately absent so the pre-6.8 helper stays sequential (`policy/table.rs`, `kscreenlocker_worker`). Corpus rows `kscreenlocker_truncated`, `kscreenlocker_greet` and `kscreenlocker_g` pin the three spellings.
-* **The `evidence` column is checked.** Every non-`external:` entry must resolve to a non-blank line in an existing file, and the scan asserts it read `policy/table.rs` itself (`policy/mod.rs`, `evidence_citations_resolve`).
+* **The `evidence` column is checked.** Every non-`external:` entry must resolve to an existing line, a citation into `policy/table.rs` must land on the declaration it names (the row's own predicate, `fn hyprlock`, for its predicate citation), a one-line drift is planted and reverted as the control, and the scan asserts it read `policy/table.rs` itself (`policy/mod.rs`, `evidence_citations_resolve`).
 
 #### 3.3.2 The class taxonomy
 
@@ -455,13 +455,13 @@ The earlier record kept `set_user` and the conversation prompt helpers under `#[
 
 | layer | command | result |
 | :--- | :--- | :--- |
-| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **107 passed, 0 failed, 0 ignored** |
+| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **108 passed, 0 failed, 0 ignored** |
 | workspace, `shared` | `cargo test --workspace` | **96 passed** |
-| workspace, `client-pam` | the same run | 107 passed, 0 ignored |
+| workspace, `client-pam` | the same run | 108 passed, 0 ignored |
 | workspace, every other target | the same run | 0 tests |
 | end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **16 shapes**, the `e2e=1` rows |
 
-203 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
+204 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
 
 ### 6.2 The corpus and its consumers
 
@@ -475,7 +475,7 @@ The Rust reader asserts, per row, the identity provenance, the env interpretatio
 * `refinement_cannot_change_a_participation` runs every corpus row through `classify` and then `refine` under three configs, and asserts that a skip stays skipped, that a participating row comes back **by value unchanged** (same conversation and class, hence the same mechanism and planned deadline), and that only a refused service name can add R1's skip (`policy/mod.rs`, `refinement_cannot_change_a_participation`). Whole-value equality is the point: a refinement that kept the conversation but changed the rule or the class would otherwise be caught only by `run`'s `debug_assert!`, which release builds drop.
 * `rule_permutation_moves_named_rows` moves R2 after R8 and R1 after R8, asserting the exact changed set **and** that every other row is unmoved (`policy/mod.rs`, `rule_permutation_moves_named_rows`).
 * `unreachable_rule_rows` asserts R10 is last, unconditional, and that no other rule matches the null context (`policy/mod.rs`, `unreachable_rule_rows`).
-* `evidence_citations_resolve` resolves every in-tree citation and reports which files it read (`policy/mod.rs`, `evidence_citations_resolve`).
+* `evidence_citations_resolve` resolves every in-tree citation, requires a `policy/table.rs` citation to land on the declaration it names (with a planted and reverted one-line drift as the control), and reports which files it read (`policy/mod.rs`, `evidence_citations_resolve`).
 
 The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for it, and asserts that the executed count equals the number of `e2e=1` rows, with a floor of 15 (`scripts/ci/test-pam-conv-thread.sh:283-286`, `:774-789`).
 

@@ -212,6 +212,9 @@ mod tests {
 
     const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/callers.csv");
 
+    /// The decision record, relative to the workspace root.
+    const TABLE_PATH: &str = "client-pam/src/policy/table.rs";
+
     /// The schema the corpus parser demands, in column order.
     const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
 
@@ -1172,10 +1175,73 @@ mod tests {
         assert_eq!(classify(&null), (RuleId::R10, DEFAULT_SEQUENTIAL));
     }
 
+    /// The symbol `line` declares, as `(keyword, name)`, or `None` when the
+    /// line declares nothing.
+    ///
+    /// A doc comment is never a declaration, whatever words it uses, and a
+    /// citation into the decision record is only meaningful when it lands on
+    /// the declaration it claims: the drift this distinguishes is a doc comment
+    /// or a closing brace sitting where a predicate used to be.
+    fn declared_symbol(line: &str) -> Option<(&'static str, &str)> {
+        const DECLARATIONS: [&str; 7] = ["fn", "const", "static", "type", "struct", "enum", "mod"];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return None;
+        }
+        let mut tokens = trimmed
+            .split(|character: char| {
+                character.is_whitespace() || character == '(' || character == ')'
+            })
+            .filter(|token| !token.is_empty());
+        while let Some(token) = tokens.next() {
+            if let Some(keyword) = DECLARATIONS.iter().find(|keyword| **keyword == token) {
+                return tokens
+                    .next()
+                    .map(|name| (*keyword, name.trim_end_matches(':')));
+            }
+        }
+        None
+    }
+
+    /// Why a `policy/table.rs` citation does not name the symbol this row
+    /// declares there, or `None` when it does.
+    ///
+    /// `fn <rule name>` is the row's own predicate, which is what every row
+    /// cites; any other `fn` is a different row's predicate reached by a shift.
+    /// A citation to some other table declaration (`const`, `struct`, …) is
+    /// accepted as long as it lands on a declaration, but never on a doc
+    /// comment, a brace or a bare expression.
+    fn table_citation_problem(
+        rule_name: &str,
+        citation: &str,
+        text: &str,
+        start: usize,
+    ) -> Option<String> {
+        let line = text.lines().nth(start - 1).unwrap_or_default();
+        match declared_symbol(line) {
+            Some(("fn", symbol)) if symbol == rule_name => None,
+            Some(("fn", symbol)) => Some(format!(
+                "rule {rule_name}: citation {citation:?} lands on `fn {symbol}`, not on this \
+                 rule's own `fn {rule_name}`"
+            )),
+            Some(_) => None,
+            None => Some(format!(
+                "rule {rule_name}: citation {citation:?} lands on {line:?}, which declares no \
+                 symbol"
+            )),
+        }
+    }
+
     /// Every `evidence` citation resolves in this tree, and the scan reports
     /// which files it checked so a relocated or emptied table cannot pass
     /// silently. Entries marked `external:` cite a specification or an
     /// out-of-tree program and are exempt.
+    ///
+    /// A citation into `policy/table.rs` must land on the declaration it
+    /// claims, not merely on a non-blank line: the row's own predicate
+    /// citation must hit `fn <rule name>`, and any other table citation must at
+    /// least hit a declaration ([`table_citation_problem`]). The plant-and-
+    /// revert control at the end is what keeps the strengthening honest.
     #[test]
     fn evidence_citations_resolve() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1233,12 +1299,60 @@ mod tests {
                     "rule {}: citation {citation:?} points at a blank line",
                     rule.name
                 );
+                if file == TABLE_PATH {
+                    if let Some(problem) = table_citation_problem(rule.name, citation, &text, start)
+                    {
+                        panic!("{problem}");
+                    }
+                }
                 checked.push(file);
             }
         }
 
+        // Positive control: plant one line of drift under R6's own citation in
+        // an in-memory copy of the decision record and observe the strengthened
+        // check reject it, then revert the plant and observe it accept again.
+        // Without the plant, everything above would also pass a check that
+        // accepted any non-blank line.
+        let r6 = RULES
+            .iter()
+            .find(|rule| rule.id == RuleId::R6)
+            .expect("the table has an R6 row");
+        let citation = r6
+            .evidence
+            .iter()
+            .find(|citation| citation.starts_with("client-pam/src/policy/table.rs:"))
+            .expect("R6 cites its own predicate");
+        let line_number: usize = citation
+            .rsplit_once(':')
+            .and_then(|(_, line)| line.parse().ok())
+            .expect("R6's table citation ends in a line number");
+        let table = std::fs::read_to_string(root.join(TABLE_PATH))
+            .expect("the decision record is readable");
+        let mut drifted: Vec<&str> = table.lines().collect();
+        let planted = drifted[line_number - 1];
         assert!(
-            checked.contains(&"client-pam/src/policy/table.rs"),
+            table_citation_problem(r6.name, citation, &table, line_number).is_none(),
+            "control precondition: R6's citation resolves before the plant"
+        );
+        drifted[line_number - 1] = "/// R6 — hyprlock.";
+        assert!(
+            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_some(),
+            "positive control: a one-line drift onto R6's doc comment must be rejected"
+        );
+        drifted[line_number - 1] = "fn xsecurelock(ctx: &CallerContext) -> bool {";
+        assert!(
+            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_some(),
+            "positive control: a shift onto another row's predicate must be rejected too"
+        );
+        drifted[line_number - 1] = planted;
+        assert!(
+            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_none(),
+            "reverted plant: R6's citation resolves again"
+        );
+
+        assert!(
+            checked.contains(&TABLE_PATH),
             "the citation scan never looked at this table's own file: {checked:?}"
         );
     }
