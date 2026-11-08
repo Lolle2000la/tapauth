@@ -459,10 +459,10 @@ fn classification_of(rule: &Rule) -> Classification {
 /// refused names.
 ///
 /// R1 runs before the config read by design, so it can only see the built-ins.
-/// This is the second half of the same refusal, for the names a deployment
-/// added to `pam_refused_services` (a renamed `PAMServiceName`): `orchestrate`
-/// calls it once the config is in hand, still before the username lookup,
-/// conversation, messages and transaction.
+/// This is the matcher behind the second half of the same refusal, for the names
+/// a deployment added to `pam_refused_services` (a renamed `PAMServiceName`):
+/// [`refine`] calls it once the config is in hand, still before the username
+/// lookup, conversation, messages and transaction.
 ///
 /// The match is ASCII case-insensitive, like R1's, and an entry that is empty
 /// matches nothing — an unresolved service never matches either. Malformed
@@ -474,6 +474,51 @@ pub(crate) fn refused_service(service: Option<&ServiceName>, configured: &[Strin
             .iter()
             .any(|name| !name.is_empty() && service.eq_ignore_ascii_case(name))
     })
+}
+
+/// The second decision phase: what the config read can add to [`classify`].
+///
+/// `classify` decides from the caller facts alone, before the config exists, so
+/// R1 can only see the built-in refused names. A deployment that renames
+/// OpenSSH's `PAMServiceName` arrives here as a participating call, and this
+/// gives that call R1's verdict. It is the *whole* of the second phase:
+/// `orchestrate` calls it exactly once, immediately after the config read and
+/// before the username lookup, the conversation, the messages and the
+/// transaction.
+///
+/// The invariant is one-directional, and the body is its strongest encoding:
+///
+/// * it may **add** a skip — a participating call whose service is one of the
+///   configured names becomes [`Classification::Skip`] with R1's own
+///   [`SkipPolicy::RemoteAuthentication`];
+/// * it may not remove or reclassify one: a [`Classification::Skip`] is handed
+///   back untouched, before the configured list is even consulted for it;
+/// * it may not change a participating call's mechanism or deadline: the
+///   [`Participation`] is moved back out unchanged, and
+///   [`Deadline`](crate::plan::Deadline) is derived from that conversation, so
+///   the only value this function ever constructs is a `Skip`.
+///
+/// `refinement_cannot_change_a_participation` walks the whole corpus through
+/// both phases with three configs and pins all three clauses.
+pub(crate) fn refine(
+    classification: Classification,
+    service: Option<&ServiceName>,
+    configured: &[String],
+) -> Classification {
+    match classification {
+        // A skip stays a skip, unchanged: this phase only ever adds one.
+        skip @ Classification::Skip(_) => skip,
+        // The participation is handed back exactly as it arrived unless the
+        // configured list refuses the service. The refused arm builds a skip,
+        // never a `Participation`, so the mechanism cannot move.
+        participate @ Classification::Participate(_) => {
+            if refused_service(service, configured) {
+                Classification::Skip(SkipPolicy::RemoteAuthentication)
+            } else {
+                participate
+            }
+        }
+    }
 }
 
 /// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this table's
@@ -499,6 +544,7 @@ pub(crate) fn refused_service(service: Option<&ServiceName>, configured: &[Strin
 )]
 mod tests {
     use super::*;
+    use crate::config::PamConfig;
     use crate::context::{classify_identity, GdmReauth};
     use crate::plan::{Announcement, Deadline, Plan, Plannable, TtyUse};
     use std::ffi::OsStr;
@@ -1193,6 +1239,162 @@ mod tests {
 
         // An unresolved service never matches, whatever is configured.
         assert!(!refused_service(None, &["sshd".to_owned()]));
+    }
+
+    /// The mechanism a classification fixes, and — for the two conversations
+    /// that reach a plan — the plan for `tty`. `None` for a skip, which has no
+    /// mechanism and no deadline.
+    fn mechanism_and_plan(
+        classification: &Classification,
+        tty: bool,
+    ) -> Option<(Conversation, Option<Plan>)> {
+        match classification {
+            Classification::Participate(participation) => {
+                let plan = match participation.conversation {
+                    Conversation::Threaded => Some(Plannable::Threaded.plan(tty)),
+                    Conversation::Sequential => Some(Plannable::Sequential.plan(tty)),
+                    Conversation::PreCollected => None,
+                };
+                Some((participation.conversation, plan))
+            }
+            Classification::Skip(_) => None,
+        }
+    }
+
+    /// The refinement may add a skip and nothing else.
+    ///
+    /// Walks the whole fixture corpus through `classify` and then `refine` with
+    /// the three configs that matter — the default, an empty configured list,
+    /// and a list naming every participating row's service — and asserts, per
+    /// row and per config:
+    ///
+    /// * a skipped row stays skipped, with its own rule and policy;
+    /// * a participating row whose service is *not* configured keeps its
+    ///   mechanism and its planned deadline;
+    /// * a participating row whose service *is* configured becomes R1's
+    ///   `Skip(RemoteAuthentication)`, and nothing else changes policy.
+    ///
+    /// The defect this catches: a refinement that rebuilds the participation
+    /// (so a threaded call could silently become sequential, which also moves
+    /// the planned deadline), one that "unrefuses" a skip (a configured or
+    /// built-in refusal turning back into a participation), and one that keys on
+    /// the process name rather than the service.
+    #[test]
+    fn refinement_cannot_change_a_participation() {
+        let rows = rows();
+        let all_participating_services: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.expected_policy,
+                    Policy::Threaded | Policy::Sequential | Policy::PreCollected
+                )
+            })
+            .filter_map(|row| row.service.clone())
+            .collect();
+
+        let configs: [(&str, Vec<String>); 3] = [
+            (
+                "the default",
+                PamConfig::default().effective_refused_services(),
+            ),
+            (
+                "an empty configured list",
+                PamConfig {
+                    pam_refused_services: vec![],
+                    ..PamConfig::default()
+                }
+                .effective_refused_services(),
+            ),
+            (
+                "every participating service",
+                PamConfig {
+                    pam_refused_services: all_participating_services.clone(),
+                    ..PamConfig::default()
+                }
+                .effective_refused_services(),
+            ),
+        ];
+
+        // The third config has to be able to refuse a participating row, or its
+        // clauses would be satisfied by every implementation.
+        assert!(
+            all_participating_services.iter().any(|name| {
+                !shared::config::DEFAULT_PAM_REFUSED_SERVICES
+                    .iter()
+                    .any(|built_in| built_in.eq_ignore_ascii_case(name))
+            }),
+            "the corpus must name a participating service that is not a built-in"
+        );
+
+        let mut flips = [0usize; 3];
+        for (index, (label, configured)) in configs.iter().enumerate() {
+            for row in &rows {
+                let identity =
+                    classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+                let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+                let ctx = row_context(row, &identity, reauth);
+
+                let before = classify(&ctx);
+                let before_rule = rule_of(&before);
+                let before_policy = policy_of(&before);
+                let before_mechanism = mechanism_and_plan(&before, row.tty);
+                let refused = row.service.as_deref().is_some_and(|service| {
+                    configured
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(service))
+                });
+                let after = refine(before, ctx.service(), configured);
+                let after_policy = policy_of(&after);
+
+                let was_skipped = before_mechanism.is_none();
+                if was_skipped {
+                    assert_eq!(
+                        after_policy, before_policy,
+                        "{label}: row {} ({}) is skipped and must stay skipped",
+                        row.id, row.why
+                    );
+                    assert_eq!(
+                        rule_of(&after),
+                        before_rule,
+                        "{label}: row {} must keep its own skip rule",
+                        row.id
+                    );
+                } else if refused {
+                    flips[index] += 1;
+                    assert_eq!(
+                        after_policy,
+                        Policy::SkipRemote,
+                        "{label}: a configured service must be refused through R1's policy",
+                    );
+                    assert_eq!(
+                        rule_of(&after),
+                        Some(RuleId::R1),
+                        "{label}: row {} must be refused through R1, not another rule",
+                        row.id
+                    );
+                } else {
+                    assert_eq!(
+                        after_policy, before_policy,
+                        "{label}: row {} ({}) must keep its decision",
+                        row.id, row.why
+                    );
+                    assert_eq!(
+                        mechanism_and_plan(&after, row.tty),
+                        before_mechanism,
+                        "{label}: row {} ({}) must keep its mechanism and planned deadline",
+                        row.id,
+                        row.why
+                    );
+                }
+            }
+        }
+
+        assert!(
+            flips[2] > 0,
+            "the all-participating config must flip at least one row to a skip, or \
+             its case proves nothing"
+        );
     }
 
     /// Moving a rule must move exactly the rows it should, by value, and leave

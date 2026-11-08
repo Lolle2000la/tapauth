@@ -193,33 +193,15 @@ where
     // from moving the decision below them.
     let classification = policy::classify(ctx);
 
-    let participation = match classification {
-        policy::Classification::Participate(participation) => participation,
-        // The two skip policies — a display-manager login (R2) and a remote
-        // caller (R1) — return here, before the username is resolved, so a skip
-        // never reaches `Armed::open` and never touches the recorded
-        // conclusion.  That is deliberate: it is a static policy decision about
-        // the caller, not a conclusion about credentials.  Only a daemon-path
-        // conclusion is ever recorded, and a pre-IPC path must not clobber the
-        // last real one.  `Outcome::from_skip` is the only mapping of a
-        // `SkipPolicy` to a verdict.
-        policy::Classification::Skip(skip) => {
-            let service = ctx.service().map(ServiceName::original).unwrap_or_default();
-            match skip {
-                policy::SkipPolicy::KeyringNeedsAuthtok => tracing::info!(
-                    "TapAuth: Service '{}' is a primary display manager. \
-                     Skipping to avoid breaking keyring auto-unlock.",
-                    service
-                ),
-                policy::SkipPolicy::RemoteAuthentication => tracing::info!(
-                    "TapAuth: Service '{}' authenticates a remote caller. \
-                     Skipping: this module does not take part in remote authentication.",
-                    service
-                ),
-            }
-            return Finished::Unrecorded(Outcome::from_skip(skip));
-        }
-    };
+    // The built-in skips — R1's service names and R2's display managers — return
+    // here, before the config read. A skip is a static policy decision about the
+    // caller, not a conclusion about credentials: it never reaches
+    // `Armed::open`, never touches the recorded conclusion, and must not clobber
+    // the last real one. `skip_finished` is the one return for either phase's
+    // skip.
+    if let policy::Classification::Skip(skip) = &classification {
+        return skip_finished(ctx, *skip);
+    }
 
     // Load configuration for timeouts
     let config = (io.load_config)();
@@ -228,22 +210,22 @@ where
         config.pam_operation_timeout_secs
     );
 
-    // Gap 8: R1 keys on the built-in service names and runs before the config
-    // read by design, so a deployment that renames OpenSSH's `PAMServiceName`
-    // arrives here as a participating call. The configured extras are therefore
-    // checked here — before the username lookup, the conversation, the messages
-    // and the transaction — and the answer is R1's: no request, no probe, no
-    // record, no message. A built-in name never reaches this point (R1 already
-    // returned).
-    if policy::refused_service(ctx.service(), &config.effective_refused_services()) {
-        let service = ctx.service().map(ServiceName::original).unwrap_or_default();
-        tracing::info!(
-            "TapAuth: Service '{}' authenticates a remote caller. \
-             Skipping: this module does not take part in remote authentication.",
-            service
-        );
-        return Finished::Unrecorded(Outcome::from_skip(policy::SkipPolicy::RemoteAuthentication));
-    }
+    // The second decision phase. `classify` sees only the built-in refused
+    // names, so a deployment that renames OpenSSH's `PAMServiceName` arrives
+    // here as a participating call; `policy::refine` is the one entry point for
+    // the configured half of R1. It runs immediately after the config read and
+    // before the username lookup, the conversation, the messages and the
+    // transaction, and it can only add a skip: the participation it returns
+    // unchanged is the one `classify` produced, mechanism and deadline
+    // included.
+    let participation = match policy::refine(
+        classification,
+        ctx.service(),
+        &config.effective_refused_services(),
+    ) {
+        policy::Classification::Participate(participation) => participation,
+        policy::Classification::Skip(skip) => return skip_finished(ctx, skip),
+    };
 
     let username = unsafe {
         match (io.get_user)(pamh) {
@@ -288,6 +270,29 @@ where
         send,
         cancel,
     )
+}
+
+/// The one return for a skip, whichever of the two decision phases produced it.
+///
+/// `Skip` is a static decision about the caller, not a conclusion about
+/// credentials: it returns before `Armed::open`, so it is never recorded, and
+/// `Outcome::from_skip` is the only mapping of a `SkipPolicy` to a verdict. The
+/// two log lines are the ones the module has always written for R1 and R2.
+fn skip_finished(ctx: &CallerContext, skip: policy::SkipPolicy) -> Finished {
+    let service = ctx.service().map(ServiceName::original).unwrap_or_default();
+    match skip {
+        policy::SkipPolicy::KeyringNeedsAuthtok => tracing::info!(
+            "TapAuth: Service '{}' is a primary display manager. \
+             Skipping to avoid breaking keyring auto-unlock.",
+            service
+        ),
+        policy::SkipPolicy::RemoteAuthentication => tracing::info!(
+            "TapAuth: Service '{}' authenticates a remote caller. \
+             Skipping: this module does not take part in remote authentication.",
+            service
+        ),
+    }
+    Finished::Unrecorded(Outcome::from_skip(skip))
 }
 
 /// The production `send`: the authenticate request, on the connected client.
@@ -992,6 +997,70 @@ mod tests {
         let planted = stripped_source(
             "let a = pam_sys::get_service_name(pamh);\n\
              let b = pam_sys::get_service_name(pamh);\n",
+        );
+        assert_eq!(
+            identifier_hits(&planted, NEEDLE).len(),
+            2,
+            "the detector must report both planted call sites"
+        );
+    }
+
+    /// `policy::refine` is called at exactly one site, immediately after the
+    /// config read, so the second decision phase has one home.
+    ///
+    /// The defect this catches: a second call site re-deriving the configured
+    /// refusal (the ad-hoc check the phase replaced) or a refinement run before
+    /// `PamConfig::load` — the first restores the split decision, the second
+    /// would always see the built-ins only and let a renamed remote stack ring
+    /// the phone. Same stripped-source technique and positive control as
+    /// `only_one_get_service_name_call_site`.
+    #[test]
+    fn only_one_refine_call_site() {
+        const NEEDLE: &str = "policy::refine";
+        let files = source_files();
+        let mut call_sites: Vec<String> = Vec::new();
+        let mut logic_source = String::new();
+        for path in &files {
+            let rel = relative_to_src(path);
+            let cleaned = production_source(path);
+            for (line, text) in identifier_hits(&cleaned, NEEDLE) {
+                call_sites.push(format!("{rel}:{line}: {text}"));
+            }
+            if rel == "pam_logic.rs" {
+                logic_source = cleaned;
+            }
+        }
+
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "the configured refusal must be decided at exactly one site, found:\n{}",
+            call_sites.join("\n")
+        );
+        let only = call_sites.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            only.starts_with("pam_logic.rs:"),
+            "the single refinement must run from `orchestrate`, found {only}"
+        );
+
+        // It must run after the config read, or it can never see a configured
+        // name: the byte-order check is the same one
+        // `cache_lookup_precedes_daemon_contact` uses.
+        let config_read = logic_source
+            .find("let config = (io.load_config)();")
+            .expect("the config read must stay in `orchestrate`");
+        let refine_at = logic_source
+            .find(NEEDLE)
+            .expect("the refinement call must stay in `orchestrate`");
+        assert!(
+            config_read < refine_at,
+            "the refinement (byte {refine_at}) must run after the config read \
+             (byte {config_read})"
+        );
+
+        // Positive control: two planted call sites must both be reported.
+        let planted = stripped_source(
+            "let a = policy::refine(c, s, cfg);\nlet b = policy::refine(c, s, cfg);\n",
         );
         assert_eq!(
             identifier_hits(&planted, NEEDLE).len(),
