@@ -57,7 +57,7 @@ pub(super) static RULES: [Rule; 10] = [
         class: FailureDirection::Keyring,
         evidence: &[
             "client-pam/src/policy/table.rs:223",
-            "client-pam/src/outcome.rs:79",
+            "client-pam/src/outcome.rs:82",
         ],
         predicate: dm_login_bypass,
         decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
@@ -145,7 +145,7 @@ pub(super) static RULES: [Rule; 10] = [
         class: FailureDirection::DeadlockAvoidance,
         evidence: &[
             "client-pam/src/policy/table.rs:292",
-            "client-pam/src/mechanism/threaded.rs:203",
+            "client-pam/src/mechanism/threaded.rs:219",
         ],
         predicate: default_sequential,
         decision: Decision::Participate(Conversation::Sequential),
