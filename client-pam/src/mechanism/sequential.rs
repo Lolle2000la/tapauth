@@ -378,6 +378,7 @@ fn ipc_failure<X: Fn(&str, &str)>(
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

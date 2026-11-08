@@ -21,7 +21,7 @@
 //!
 //! ## Behavior
 //!
-//! Every path produces one `outcome::Outcome`, and `Outcome::to_pam` is the only
+//! Every path produces one `outcome::Outcome`, and `Outcome::into_pam` is the only
 //! conversion from a verdict to a code — `authenticate` maps the two arms of the
 //! transaction's result (`Finished::Concluded` and `Finished::Unrecorded`), and
 //! nothing else in the crate produces a `PAM_*` value except the six constant
@@ -163,6 +163,7 @@ pub extern "C" fn pam_sm_chauthtok(
     pam_sys::PAM_SUCCESS
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

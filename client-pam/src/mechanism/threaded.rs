@@ -188,7 +188,6 @@ unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
 /// The out-parameter is a *reason*, not a message: which text and which style
 /// the failure shows is decided once, by `Outcome::notice`, so the loop cannot
 /// pick a different string from the terminal loop for the same failure.
-#[allow(clippy::too_many_arguments)]
 fn run_gui_event_loop<T: IpcResponseReader>(
     ipc: &mut T,
     pipe_read: libc::c_int,
@@ -444,12 +443,12 @@ where
     })
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::too_many_arguments,
     clippy::indexing_slicing
 )]
 mod gui_loop_tests {
@@ -707,6 +706,7 @@ mod gui_loop_tests {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod join_tests {
@@ -802,6 +802,7 @@ mod join_tests {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

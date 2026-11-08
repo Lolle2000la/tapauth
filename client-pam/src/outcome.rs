@@ -1,6 +1,6 @@
 //! The verdict as data, and the one place it becomes a `PAM_*` code.
 //!
-//! [`Outcome::to_pam`] is an exhaustive match with no wildcard, so a sixth
+//! [`Outcome::into_pam`] is an exhaustive match with no wildcard, so a sixth
 //! outcome variant is a compile error rather than a silent fallthrough. Every
 //! other `PAM_*` value in the crate comes from it — the `lib.rs` ABI stubs and
 //! the `pam_sys` plumbing excepted — which is what
@@ -142,10 +142,9 @@ impl Outcome {
     ///
     /// Five exhaustive arms and no wildcard: a new variant cannot inherit a
     /// neighbour's code silently. It consumes the verdict on purpose — that is
-    /// the token the caller spends to obtain the code — so the `self`-by-value
-    /// convention clippy wants for a `to_*` method does not apply.
-    #[allow(clippy::wrong_self_convention)]
-    pub(crate) fn to_pam(self) -> c_int {
+    /// the token the caller spends to obtain the code — which is also why it is
+    /// an `into_*` conversion: the verdict is consumed, not borrowed.
+    pub(crate) fn into_pam(self) -> c_int {
         match self {
             Outcome::Granted(_) => pam_sys::PAM_SUCCESS,
             Outcome::Denied(_) => pam_sys::PAM_PERM_DENIED,
@@ -321,6 +320,7 @@ fn outcome_from_raw(raw: i32) -> shared::ipc::pb::PamOutcome {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -409,7 +409,7 @@ mod tests {
                 seen_reasons.push(reason);
             }
             assert_eq!(
-                Outcome::Unavailable(reason).to_pam(),
+                Outcome::Unavailable(reason).into_pam(),
                 pam_sys::PAM_AUTHINFO_UNAVAIL,
                 "{reason:?} must be an unavailable service, not another verdict"
             );
@@ -438,7 +438,7 @@ mod tests {
                 seen_errors.push(reason.clone());
             }
             assert_eq!(
-                Outcome::Error(reason.clone()).to_pam(),
+                Outcome::Error(reason.clone()).into_pam(),
                 pam_sys::PAM_AUTH_ERR,
                 "{reason:?} must be a processing failure"
             );
@@ -452,28 +452,28 @@ mod tests {
 
         // The two verdicts, with and without a replay.
         let granted = Outcome::granted_from_daemon();
-        assert_eq!(granted.clone().to_pam(), pam_sys::PAM_SUCCESS);
+        assert_eq!(granted.clone().into_pam(), pam_sys::PAM_SUCCESS);
         assert_notice(
             &granted,
             &msgs,
             Some((NoticeStyle::Info, msgs.auth_successful())),
         );
         let replayed_grant = Outcome::replayed(&granted);
-        assert_eq!(replayed_grant.clone().to_pam(), pam_sys::PAM_SUCCESS);
+        assert_eq!(replayed_grant.clone().into_pam(), pam_sys::PAM_SUCCESS);
         assert_notice(&replayed_grant, &msgs, None);
 
         let denied = Outcome::Denied(DenyVia::PhoneDenial);
-        assert_eq!(denied.clone().to_pam(), pam_sys::PAM_PERM_DENIED);
+        assert_eq!(denied.clone().into_pam(), pam_sys::PAM_PERM_DENIED);
         assert_notice(
             &denied,
             &msgs,
             Some((NoticeStyle::Info, msgs.auth_denied())),
         );
         let replayed_denial = Outcome::replayed(&denied);
-        assert_eq!(replayed_denial.clone().to_pam(), pam_sys::PAM_PERM_DENIED);
+        assert_eq!(replayed_denial.clone().into_pam(), pam_sys::PAM_PERM_DENIED);
         assert_notice(&replayed_denial, &msgs, None);
 
-        assert_eq!(Outcome::UserUnknown.to_pam(), pam_sys::PAM_USER_UNKNOWN);
+        assert_eq!(Outcome::UserUnknown.into_pam(), pam_sys::PAM_USER_UNKNOWN);
         assert_notice(&Outcome::UserUnknown, &msgs, None);
     }
 
@@ -529,7 +529,7 @@ mod tests {
                 Outcome::Error(ErrorReason::Daemon("unknown".into())),
                 "raw outcome {raw} must fail closed"
             );
-            assert_eq!(outcome.to_pam(), pam_sys::PAM_AUTH_ERR);
+            assert_eq!(outcome.into_pam(), pam_sys::PAM_AUTH_ERR);
         }
     }
 
@@ -561,8 +561,8 @@ mod tests {
                 "{recorded:?} must not change verdict through a replay"
             );
             assert_eq!(
-                replayed.to_pam(),
-                recorded.clone().to_pam(),
+                replayed.into_pam(),
+                recorded.clone().into_pam(),
                 "{recorded:?} must replay the same code"
             );
         }

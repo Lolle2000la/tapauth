@@ -3,6 +3,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
+// reason: generated bindings; the `include!`d file is bindgen output, so its
+// C naming, unused items and indexing are not ours to fix.
 #[allow(
     non_camel_case_types,
     non_snake_case,
@@ -79,25 +81,6 @@ fn user_from_item(item: Option<&CStr>) -> Result<String, c_int> {
     item.to_str()
         .map(str::to_owned)
         .map_err(|_| PAM_USER_UNKNOWN)
-}
-
-/// Set the username in the PAM context.
-///
-/// `pam_set_item` duplicates string items internally, so the caller
-/// does not need to keep the passed pointer alive after this call.
-#[allow(dead_code)]
-pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int> {
-    if pamh.is_null() {
-        return Err(PAM_SYSTEM_ERR);
-    }
-    let username_cstring = CString::new(username).map_err(|_| PAM_USER_UNKNOWN)?;
-    let ret = ffi::pam_set_item(pamh, PAM_USER, username_cstring.as_ptr() as *const c_void);
-
-    if ret == PAM_SUCCESS {
-        Ok(())
-    } else {
-        Err(ret)
-    }
 }
 
 /// Retrieve the PAM conversation function pointer.
@@ -188,74 +171,6 @@ pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) ->
     }
 }
 
-/// Prompt the user for input via the PAM conversation function.
-///
-/// Returns the response string if the user provided one, or `None` if
-/// the response was empty.
-#[allow(dead_code)]
-pub unsafe fn prompt_user(
-    pamh: *mut PamHandle,
-    msg_style: c_int,
-    msg: &str,
-) -> Result<Option<String>, c_int> {
-    let conv_ptr = get_conv(pamh)?;
-    let conv = &*conv_ptr;
-
-    let conv_fn = match conv.conv {
-        Some(f) => f,
-        None => return Err(PAM_CONV_ERR),
-    };
-
-    let msg_cstring = CString::new(msg).map_err(|_| PAM_BUF_ERR)?;
-
-    let pam_msg = ffi::pam_message {
-        msg_style,
-        msg: msg_cstring.as_ptr(),
-    };
-
-    let msg_ptr = &pam_msg as *const ffi::pam_message;
-    let msg_array = &msg_ptr as *const *const ffi::pam_message;
-    let mut resp: *mut ffi::pam_response = std::ptr::null_mut();
-
-    let ret = conv_fn(
-        1,
-        msg_array as *mut *const ffi::pam_message,
-        &mut resp as *mut *mut ffi::pam_response,
-        conv.appdata_ptr,
-    );
-
-    if ret != PAM_SUCCESS {
-        if !resp.is_null() {
-            if !(*resp).resp.is_null() {
-                libc::free((*resp).resp as *mut c_void);
-            }
-            libc::free(resp as *mut c_void);
-        }
-        return Err(ret);
-    }
-
-    let result = if !resp.is_null() {
-        unsafe {
-            let response_ref: &mut ffi::pam_response = &mut *resp;
-            let out = if !response_ref.resp.is_null() {
-                let resp_cstr = CStr::from_ptr(response_ref.resp);
-                let s = resp_cstr.to_str().ok().map(|s| s.to_string());
-                libc::free(response_ref.resp as *mut c_void);
-                response_ref.resp = std::ptr::null_mut();
-                s
-            } else {
-                None
-            };
-            libc::free(resp as *mut c_void);
-            out
-        }
-    } else {
-        None
-    };
-
-    Ok(result)
-}
-
 /// Safe wrapper for PAM conversation operations.
 ///
 /// Provides a Rust-idiomatic interface to PAM conversation functions
@@ -298,7 +213,7 @@ impl<'a> PamConversation<'a> {
 
     /// Build a conversation wrapper without a PAM handle, for unit tests.
     ///
-    /// `send_message`/`prompt_user` call `get_conv`, which already rejects a
+    /// `send_message` calls `get_conv`, which already rejects a
     /// null handle with `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are
     /// clean no-ops here. Only the return-code logic that takes a
     /// `&PamConversation` can be exercised this way.
@@ -316,21 +231,8 @@ impl<'a> PamConversation<'a> {
     }
 
     /// Send an error message to the user.
-    #[allow(dead_code)]
     pub fn error(&self, message: &str) -> Result<(), c_int> {
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
-    }
-
-    /// Prompt the user for hidden input (e.g. password).
-    #[allow(dead_code)]
-    pub fn prompt_hidden(&self, prompt: &str) -> Result<Option<String>, c_int> {
-        unsafe { prompt_user(self.pamh, ffi::PAM_PROMPT_ECHO_OFF, prompt) }
-    }
-
-    /// Prompt the user for visible input (e.g. username).
-    #[allow(dead_code)]
-    pub fn prompt_visible(&self, prompt: &str) -> Result<Option<String>, c_int> {
-        unsafe { prompt_user(self.pamh, ffi::PAM_PROMPT_ECHO_ON, prompt) }
     }
 
     /// Try to send an informational message, logging any errors.
@@ -347,7 +249,6 @@ impl<'a> PamConversation<'a> {
     ///
     /// Convenience method that never fails — useful for non-critical
     /// user feedback.
-    #[allow(dead_code)]
     pub fn try_error(&self, message: &str) {
         if let Err(e) = self.error(message) {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
@@ -355,6 +256,7 @@ impl<'a> PamConversation<'a> {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

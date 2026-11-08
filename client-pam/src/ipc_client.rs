@@ -111,31 +111,6 @@ impl IpcClient {
         self.stream.set_nonblocking(on).map_err(IpcError::from)
     }
 
-    /// Send an authenticate request to the daemon.
-    pub fn send_authenticate(
-        &mut self,
-        username: &str,
-        tty_present: bool,
-        timeout_seconds: u32,
-        request_id: &str,
-    ) -> Result<ipc::PamAuthenticateResponse, IpcError> {
-        let req = ipc::PamAuthenticateRequest {
-            username: username.to_string(),
-            tty_present,
-            timeout_seconds,
-            request_id: request_id.to_string(),
-        };
-        let envelope = ipc::IpcEnvelope {
-            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
-        };
-
-        self.send_message(&envelope)?;
-        // Align with spec: wait exactly the session timeout
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(timeout_seconds as u64)))?;
-        self.recv_response()
-    }
-
     /// Start authenticate request without waiting (for polling caller)
     pub fn send_authenticate_start(
         &mut self,
@@ -317,12 +292,11 @@ impl IpcResponseReader for IpcClient {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use std::io::Write as _;
 
     // Helper to build an IpcClient around an existing UnixStream (test-only)
     fn client_from_stream(stream: UnixStream) -> IpcClient {

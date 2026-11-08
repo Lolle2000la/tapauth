@@ -294,7 +294,7 @@ pub(crate) static RULES: [Rule; 10] = [
               deadlock, at the cost of the shorter GUI timeout",
         evidence: &[
             "client-pam/src/policy.rs:435",
-            "client-pam/src/mechanism/threaded.rs:205",
+            "client-pam/src/mechanism/threaded.rs:204",
         ],
         predicate: default_sequential,
         decision: Decision::Participate(Conversation::Sequential),

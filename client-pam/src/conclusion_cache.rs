@@ -409,6 +409,7 @@ pub(crate) fn replay_for(username: &str, service: &str, now: Instant) -> Option<
 #[cfg(test)]
 pub(crate) static CACHE_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

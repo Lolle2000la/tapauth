@@ -52,9 +52,9 @@ use std::time::{Duration, Instant};
 /// ## Returns
 ///
 /// The orchestration returns a [`Finished`], whose two arms both carry an
-/// [`Outcome`]; `Outcome::to_pam` is the only conversion, and the `match` below
+/// [`Outcome`]; `Outcome::into_pam` is the only conversion, and the `match` below
 /// is its only caller. Which reasons reach which code is the table in
-/// `Outcome::to_pam` / `Outcome::notice`, not a per-call decision here:
+/// `Outcome::into_pam` / `Outcome::notice`, not a per-call decision here:
 ///
 /// - `PAM_SUCCESS`: this call's daemon response was a phone tap, or a duplicate
 ///   answered from this process's 500 ms reuse record (a replay, which records
@@ -89,7 +89,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // cache's key and the skip's decision. No second resolution exists.
     let ctx = unsafe { CallerContext::capture(pamh) };
     // The orchestration returns the verdict, never a code. This is the one
-    // place a `PAM_*` value is produced from it: `to_pam` is exhaustive, so an
+    // place a `PAM_*` value is produced from it: `into_pam` is exhaustive, so an
     // arm cannot be forgotten and a code cannot travel beside the verdict. A
     // conclusion is recorded here — after the body returned, which is what
     // anchors the 500 ms reuse window to *this module's return* — and `record`
@@ -104,9 +104,9 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         cancel_on_fresh_connection,
     ) {
         Finished::Concluded(concluded) => {
-            crate::conclusion_cache::record(concluded, Instant::now()).to_pam()
+            crate::conclusion_cache::record(concluded, Instant::now()).into_pam()
         }
-        Finished::Unrecorded(outcome) => outcome.to_pam(),
+        Finished::Unrecorded(outcome) => outcome.into_pam(),
     }
 }
 
@@ -330,7 +330,7 @@ fn cancel_on_fresh_connection(reason: &str, request_id: &str) {
 #[cfg(test)]
 ///
 /// Every return of `run` emits through this, so the message is decided by the
-/// verdict and not by the site that produced it, and `to_pam` is called exactly
+/// verdict and not by the site that produced it, and `into_pam` is called exactly
 /// once — by `authenticate`. The emission itself is the two calls the module has
 /// always made: `try_info` for information, `try_error` for an error, both of
 /// which swallow a failing conversation. A replayed verdict's notice is `None`,
@@ -349,6 +349,7 @@ fn emit_notice(
     outcome
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -504,7 +505,7 @@ mod tests {
                 "service {service}: R1 is an unrecorded RemoteAuthentication verdict"
             );
             assert_eq!(
-                finished.outcome().clone().to_pam(),
+                finished.outcome().clone().into_pam(),
                 pam_sys::PAM_AUTHINFO_UNAVAIL,
                 "service {service}: R1 must report the service as unavailable"
             );
@@ -750,7 +751,7 @@ mod tests {
             "a configured refusal keeps R1's verdict"
         );
         assert_eq!(
-            run.finished.outcome().clone().to_pam(),
+            run.finished.outcome().clone().into_pam(),
             pam_sys::PAM_AUTHINFO_UNAVAIL,
             "a configured refusal reports the service as unavailable"
         );
@@ -1170,7 +1171,7 @@ mod tests {
         // The daemon-answer path as the call sites run it: the verdict, its one
         // message and its code, from the response alone.
         let map = |resp: shared::ipc::pb::PamAuthenticateResponse| {
-            emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).to_pam()
+            emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).into_pam()
         };
 
         let resp_for = |outcome: shared::ipc::pb::PamOutcome,
@@ -1296,7 +1297,7 @@ mod tests {
             // The hand-built bytes really did carry the unknown outcome.
             assert_eq!(resp.outcome, raw, "hand-encoded bytes decode as expected");
 
-            let code = emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).to_pam();
+            let code = emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).into_pam();
             assert_ne!(
                 code,
                 pam_sys::PAM_SUCCESS,
@@ -1339,7 +1340,7 @@ mod tests {
                 detail: "detail".to_string(),
                 challenge: vec![],
             };
-            let code = emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).to_pam();
+            let code = emit_notice(&conv, &msgs, Outcome::from_daemon(resp)).into_pam();
             // `PAM_IGNORE` is 25 and is deliberately absent from this list: it
             // is not a verdict, so a later `optional pam_permit` can still make
             // the whole stack succeed.
@@ -1369,7 +1370,6 @@ mod tests {
     /// sources are ASCII apart from localisation strings, which are blanked
     /// here.  A non-ASCII *char* literal would be taken for a lifetime and
     /// copied verbatim, which can only hide a needle, never invent one.
-    #[allow(clippy::indexing_slicing)]
     pub(crate) fn stripped_source(source: &str) -> String {
         let b = source.as_bytes();
         let mut out: Vec<u8> = Vec::with_capacity(b.len());
@@ -1503,7 +1503,6 @@ mod tests {
     }
 
     /// `bytes[start..end]` as spaces, keeping its newlines.
-    #[allow(clippy::indexing_slicing)]
     fn blank(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
         bytes[start..end]
             .iter()
@@ -1520,7 +1519,6 @@ mod tests {
 
     /// Every occurrence of `needle` used as a whole identifier, as
     /// `(line, source line)`.
-    #[allow(clippy::indexing_slicing)]
     fn identifier_hits(cleaned: &str, needle: &str) -> Vec<(usize, String)> {
         let b = cleaned.as_bytes();
         let mut hits = Vec::new();
@@ -1552,7 +1550,6 @@ mod tests {
     /// The literal is evaluated rather than substring-matched, so `0.25`
     /// (rounded float), `0x25` (hex 37) and `1_025` (1025) are not hits while
     /// `25u32` is.
-    #[allow(clippy::indexing_slicing)]
     fn numeric_literals_equal_to(cleaned: &str, code: u128) -> Vec<(usize, String)> {
         let b = cleaned.as_bytes();
         let mut hits = Vec::new();
@@ -1577,7 +1574,6 @@ mod tests {
 
     /// Read the numeric literal starting at `start` as `(value, end)`, with
     /// `None` for floats.
-    #[allow(clippy::indexing_slicing)]
     fn read_numeric_literal(b: &[u8], start: usize) -> (Option<u128>, usize) {
         let mut i = start;
         let radix = if b[i] == b'0' {
@@ -1858,7 +1854,7 @@ mod tests {
     /// six `lib.rs` ABI sites named above.
     ///
     /// The defect this catches: a return code minted at the site that observed
-    /// the failure instead of through `Outcome::to_pam` — the 24 `pam_logic.rs`
+    /// the failure instead of through `Outcome::into_pam` — the 24 `pam_logic.rs`
     /// sites this step removes. Such a site can return `PAM_SUCCESS`, can return
     /// a code the verdict does not imply, and adds a path no outcome test
     /// covers. The exemption is by *function name* and the scan asserts it
@@ -1919,7 +1915,7 @@ mod tests {
 
         assert!(
             findings.is_empty(),
-            "every PAM code must come from `Outcome::to_pam`, found:\n{}",
+            "every PAM code must come from `Outcome::into_pam`, found:\n{}",
             findings.join("\n")
         );
         assert_eq!(
@@ -2224,6 +2220,7 @@ mod tests {
 /// and not about a parallel copy of its logic; each case holds
 /// `conclusion_cache::CACHE_SLOT_LOCK` for its whole body, because the record is one
 /// slot for the process.
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2372,7 +2369,7 @@ mod verdict_reuse_tests {
     fn another_users_conclusion_is_never_reused() {
         let _slot = slot();
         for outcome in [granted(), unavailable(), denied()] {
-            let code = outcome.clone().to_pam();
+            let code = outcome.clone().into_pam();
             let now = record_ago(1, "alice", Some(SERVICE), outcome);
             assert_eq!(
                 replayable("bob", SERVICE, now),
@@ -2386,7 +2383,7 @@ mod verdict_reuse_tests {
     fn another_services_conclusion_is_never_reused() {
         let _slot = slot();
         for outcome in [granted(), unavailable(), denied()] {
-            let code = outcome.clone().to_pam();
+            let code = outcome.clone().into_pam();
             let now = record_ago(1, "alice", Some("kscreenlocker"), outcome);
             assert_eq!(
                 replayable("alice", "polkit-1", now),

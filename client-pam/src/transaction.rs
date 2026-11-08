@@ -17,7 +17,7 @@
 //! refuses it — which is what keeps the fixed 500 ms window fixed.
 //!
 //! [`Concluded::outcome`] is the only way the orchestration's caller reads a
-//! verdict out of this type in a test build, and `Outcome::to_pam` the only way
+//! verdict out of this type in a test build, and `Outcome::into_pam` the only way
 //! it becomes a `PAM_*` code, so a code cannot travel beside the verdict.
 //!
 //! [`run`] is the transaction itself: it takes the classification the policy
@@ -370,7 +370,6 @@ impl<'a> HostIo<'a> {
     /// `announcement_order_matches_today` and `unrecorded_paths_emit_their_notice`
     /// need.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn for_test_recording(
         pamh: *mut PamHandle,
         msgs: &'a PamMessages,
@@ -434,6 +433,8 @@ fn finish(host: &HostIo<'_>, finished: Finished) -> Finished {
 /// recording cancel, so "the skip never reaches the daemon", "a connect failure
 /// records nothing" and "a timeout cancels nothing" are assertions rather than
 /// promises.
+// reason: `run` still takes the four effects as separate parameters; the
+// `Effects` seam replaces this signature in a later increment.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run<T, C, S, X>(
     ctx: &CallerContext,
@@ -651,6 +652,9 @@ pub(crate) fn armed_for_test<I: IpcResponseReader>(ipc: I, request_id: &str) -> 
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
+// This module's `#[cfg(test)]` stays immediately followed by `#[allow(`: the
+// split in `pam_logic`'s `cache_lookup_precedes_daemon_contact` relies on it.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -841,7 +845,7 @@ pub(crate) mod tests {
         let finished = Finished::Concluded(concluded(grant.clone(), Via::Daemon));
         assert_eq!(finished.outcome(), &grant);
         assert_eq!(
-            finished.outcome().clone().to_pam(),
+            finished.outcome().clone().into_pam(),
             crate::pam_sys::PAM_SUCCESS
         );
 
@@ -849,7 +853,7 @@ pub(crate) mod tests {
         let unrecorded = Finished::Unrecorded(unreachable.clone());
         assert_eq!(unrecorded.outcome(), &unreachable);
         assert_eq!(
-            unrecorded.outcome().clone().to_pam(),
+            unrecorded.outcome().clone().into_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
 
@@ -997,7 +1001,7 @@ pub(crate) mod tests {
             |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
-            (finished.outcome().clone().to_pam(), probes),
+            (finished.outcome().clone().into_pam(), probes),
             (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 0),
             "a threaded conversation must not open /dev/tty"
         );
@@ -1010,7 +1014,7 @@ pub(crate) mod tests {
             |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
-            (finished.outcome().clone().to_pam(), probes),
+            (finished.outcome().clone().into_pam(), probes),
             (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
             "a sequential conversation probes /dev/tty exactly once"
         );
@@ -1023,7 +1027,7 @@ pub(crate) mod tests {
             |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
-            (finished.outcome().clone().to_pam(), probes),
+            (finished.outcome().clone().into_pam(), probes),
             (crate::pam_sys::PAM_AUTHINFO_UNAVAIL, 1),
             "a sequential conversation probes once even when there is no terminal"
         );
@@ -1049,7 +1053,7 @@ pub(crate) mod tests {
         let service = "cache-hit-service";
         let ctx = context(Some(service), Some("xfce4-screensaver-dialog"));
         let conclusion = crate::outcome::Outcome::granted_from_daemon();
-        let conclusion_code = conclusion.clone().to_pam();
+        let conclusion_code = conclusion.clone().into_pam();
 
         for _ in 0..64 {
             record_conclusion(
@@ -1064,7 +1068,7 @@ pub(crate) mod tests {
                 || Err::<NullIpc, _>(no_daemon()),
                 |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
             );
-            if finished.outcome().clone().to_pam() != conclusion_code {
+            if finished.outcome().clone().into_pam() != conclusion_code {
                 // A concurrent test replaced the single record before the
                 // lookup; nothing was proved about the ordering, so re-take it.
                 continue;
@@ -1112,7 +1116,7 @@ pub(crate) mod tests {
             "a refused connect is an unrecorded DaemonUnreachable"
         );
         assert_eq!(
-            connect_failed.outcome().clone().to_pam(),
+            connect_failed.outcome().clone().into_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
         assert_eq!(
@@ -1139,7 +1143,7 @@ pub(crate) mod tests {
             "a failed write is an unrecorded DaemonSendFailed"
         );
         assert_eq!(
-            send_failed.outcome().clone().to_pam(),
+            send_failed.outcome().clone().into_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
         assert_eq!(
@@ -1483,7 +1487,7 @@ pub(crate) mod tests {
             "the handoff is an unrecorded PasswordHandoff verdict"
         );
         assert_eq!(
-            finished.outcome().clone().to_pam(),
+            finished.outcome().clone().into_pam(),
             crate::pam_sys::PAM_AUTHINFO_UNAVAIL
         );
     }
