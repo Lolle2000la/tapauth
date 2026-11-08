@@ -166,15 +166,16 @@ impl<I: IpcResponseReader> Armed<I> {
     /// genuine retry must dial the socket again instead of being answered from
     /// the record.
     ///
-    /// `connect` and `send` are parameters so both failure paths are testable
-    /// without a daemon (`verdict_reuse_tests`); production passes
+    /// `connect` and `send` are borrowed effects so both failure paths are
+    /// testable without a daemon (`verdict_reuse_tests`); production passes
     /// `IpcClient::connect_nonblocking` and [`crate::pam_logic`]'s
-    /// `send_authenticate_request` closure.
-    pub(crate) fn open<C, S>(connect: C, send: S, request_id: Box<str>) -> Result<Self, StartError>
-    where
-        C: FnOnce() -> Result<I, IpcError>,
-        S: FnOnce(&mut I) -> Result<(), IpcError>,
-    {
+    /// `send_authenticate_request`. They are `&mut dyn` rather than type
+    /// parameters so the reader stays this type's only generic argument.
+    pub(crate) fn open(
+        connect: &mut dyn FnMut() -> Result<I, IpcError>,
+        send: &mut dyn FnMut(&mut I) -> Result<(), IpcError>,
+        request_id: Box<str>,
+    ) -> Result<Self, StartError> {
         let mut ipc = connect().map_err(StartError::Connect)?;
         send(&mut ipc).map_err(StartError::Send)?;
         // The request is on the wire, so a daemon conclusion is now possible.
@@ -407,6 +408,18 @@ fn finish(host: &HostIo<'_>, finished: Finished) -> Finished {
     finished
 }
 
+/// The four things a transaction asks the platform to do.
+///
+/// `HostIo` is the PAM conversation surface; this is the outside world: probe a
+/// terminal, dial the daemon, put the request on the wire, cancel it. Production
+/// passes the module's own functions; tests substitute one field at a time.
+pub(crate) struct Effects<'a, T> {
+    pub(crate) probe_tty: &'a mut dyn FnMut() -> Option<File>,
+    pub(crate) connect: &'a mut dyn FnMut() -> Result<T, IpcError>,
+    pub(crate) send: &'a mut dyn for<'p> FnMut(&mut T, &SendParams<'p>) -> Result<(), IpcError>,
+    pub(crate) cancel: fn(&str, &str),
+}
+
 /// One authentication transaction, from the classification to the conclusion.
 ///
 /// Everything that happens *before* a request is on the wire returns
@@ -426,33 +439,21 @@ fn finish(host: &HostIo<'_>, finished: Finished) -> Finished {
 /// `None` by construction (`outcomes_that_precede_the_conversation_are_silent`).
 /// The mechanisms themselves emit nothing.
 ///
-/// `probe_tty`, `connect`, `send` and `cancel` are the transaction's four
-/// injected effects: production passes the real `/dev/tty` open,
+/// `effects` is the transaction's whole outside world — see [`Effects`]:
+/// production passes the real `/dev/tty` open,
 /// `IpcClient::connect_nonblocking`, the `send_authenticate_start` closure and
-/// the fresh-connection cancel, and a test passes counters, failures or a
-/// recording cancel, so "the skip never reaches the daemon", "a connect failure
-/// records nothing" and "a timeout cancels nothing" are assertions rather than
-/// promises.
-// reason: `run` still takes the four effects as separate parameters; the
-// `Effects` seam replaces this signature in a later increment.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run<T, C, S, X>(
+/// the fresh-connection cancel, and a test substitutes one field at a time with
+/// a counter, a failure or a recorder, so "the skip never reaches the daemon", "a
+/// connect failure records nothing" and "a timeout cancels nothing" are
+/// assertions rather than promises.
+pub(crate) fn run<T: IpcResponseReader>(
     ctx: &CallerContext,
     username: &str,
     participation: &Participation,
     host: &mut HostIo<'_>,
     cfg: &PamConfig,
-    probe_tty: impl FnOnce() -> Option<File>,
-    connect: C,
-    send: S,
-    cancel: X,
-) -> Finished
-where
-    T: IpcResponseReader,
-    C: FnOnce() -> Result<T, IpcError>,
-    S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-    X: Fn(&str, &str),
-{
+    effects: &mut Effects<'_, T>,
+) -> Finished {
     // `PreCollected` has no plan at all: its handoff is the last thing that
     // happens before the transaction machinery, and it returns before a probe,
     // a `Plan` or a cache lookup exists — which is why `plan::Plannable` has no
@@ -503,7 +504,7 @@ where
     // terminal branch either: it would start polling `/dev/tty` on this thread
     // and steal the stdin the host expects for its own dialog.
     let tty_file = if plannable.tty_use() == TtyUse::PollForKey {
-        probe_tty()
+        (effects.probe_tty)()
     } else {
         None
     };
@@ -591,8 +592,8 @@ where
     // The id is cloned into the `Armed` because `SendParams` borrows it and the
     // closure that consumes it runs inside `open`, after the `Armed` exists.
     let mut armed = match Armed::open(
-        connect,
-        |ipc| send(ipc, &request),
+        &mut *effects.connect,
+        &mut |ipc: &mut T| (effects.send)(ipc, &request),
         request_id.clone().into_boxed_str(),
     ) {
         Ok(armed) => armed,
@@ -632,10 +633,10 @@ where
     // daemon's answer becomes an `Outcome` exactly once, in `conclude`.
     let end = match plannable {
         Plannable::Threaded => {
-            threaded::drive(&mut armed, &plan, deadline_at, host.pamh(), &cancel)
+            threaded::drive(&mut armed, &plan, deadline_at, host.pamh(), effects.cancel)
         }
         Plannable::Sequential => {
-            sequential::drive(&mut armed, &plan, deadline_at, tty_file, &cancel)
+            sequential::drive(&mut armed, &plan, deadline_at, tty_file, effects.cancel)
         }
     };
 
@@ -783,34 +784,32 @@ pub(crate) mod tests {
 
     /// Drive `run` with a context, a tty probe and the two injected IPC effects,
     /// and report its result plus how many times the probe ran.
-    fn run_with_probe<T, C, S>(
+    fn run_with_probe<T: IpcResponseReader>(
         ctx: &CallerContext,
         tty: Option<&str>,
-        connect: C,
-        send: S,
-    ) -> (Finished, usize)
-    where
-        T: IpcResponseReader,
-        C: FnOnce() -> Result<T, IpcError>,
-        S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-    {
+        connect: &mut dyn FnMut() -> Result<T, IpcError>,
+        send: &mut dyn for<'p> FnMut(&mut T, &SendParams<'p>) -> Result<(), IpcError>,
+    ) -> (Finished, usize) {
         let msgs = PamMessages::new("en");
         let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
         let participation = participation_for(ctx);
         let mut probes = 0usize;
+        let mut probe = || {
+            probes += 1;
+            tty.and_then(|path| std::fs::File::open(path).ok())
+        };
         let finished = run(
             ctx,
             "tty-probe-test-user",
             &participation,
             &mut host,
             &zero_timeouts(),
-            || {
-                probes += 1;
-                tty.and_then(|path| std::fs::File::open(path).ok())
+            &mut Effects {
+                probe_tty: &mut probe,
+                connect,
+                send,
+                cancel: |_, _| {},
             },
-            connect,
-            send,
-            |_, _| {},
         );
         (finished, probes)
     }
@@ -879,14 +878,14 @@ pub(crate) mod tests {
     /// belongs.
     #[test]
     fn armed_requires_both_connect_and_send() {
-        let refused = || {
+        let mut refused = || {
             Err::<UnusedIpc, _>(IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "no daemon socket",
             )))
         };
 
-        let no_connect = Armed::open(refused, |_: &mut UnusedIpc| Ok(()), "rid".into());
+        let no_connect = Armed::open(&mut refused, &mut |_: &mut UnusedIpc| Ok(()), "rid".into());
         assert!(
             matches!(no_connect, Err(StartError::Connect(_))),
             "a refused connect must surface as a connect failure, not as a send \
@@ -895,8 +894,8 @@ pub(crate) mod tests {
 
         let mut sent = false;
         let bad_send = Armed::open(
-            || Ok(UnusedIpc),
-            |_: &mut UnusedIpc| {
+            &mut || Ok(UnusedIpc),
+            &mut |_: &mut UnusedIpc| {
                 sent = true;
                 Err(IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -911,8 +910,11 @@ pub(crate) mod tests {
         );
         assert!(sent, "the send closure is what failed, so it must have run");
 
-        let Ok(armed) = Armed::open(|| Ok(UnusedIpc), |_: &mut UnusedIpc| Ok(()), "rid".into())
-        else {
+        let Ok(armed) = Armed::open(
+            &mut || Ok(UnusedIpc),
+            &mut |_: &mut UnusedIpc| Ok(()),
+            "rid".into(),
+        ) else {
             panic!("both effects succeeded, so the request is on the wire");
         };
         let concluded = armed.conclude(
@@ -997,8 +999,8 @@ pub(crate) mod tests {
         let (finished, probes) = run_with_probe(
             &threaded,
             Some("/dev/null"),
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            &mut || Err::<NullIpc, _>(no_daemon()),
+            &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
             (finished.outcome().clone().into_pam(), probes),
@@ -1010,8 +1012,8 @@ pub(crate) mod tests {
         let (finished, probes) = run_with_probe(
             &sequential_tty,
             Some("/dev/null"),
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            &mut || Err::<NullIpc, _>(no_daemon()),
+            &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
             (finished.outcome().clone().into_pam(), probes),
@@ -1023,8 +1025,8 @@ pub(crate) mod tests {
         let (finished, probes) = run_with_probe(
             &sequential_no_tty,
             None,
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            &mut || Err::<NullIpc, _>(no_daemon()),
+            &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert_eq!(
             (finished.outcome().clone().into_pam(), probes),
@@ -1065,8 +1067,8 @@ pub(crate) mod tests {
             let (finished, probes) = run_with_probe(
                 &ctx,
                 Some("/dev/null"),
-                || Err::<NullIpc, _>(no_daemon()),
-                |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+                &mut || Err::<NullIpc, _>(no_daemon()),
+                &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
             );
             if finished.outcome().clone().into_pam() != conclusion_code {
                 // A concurrent test replaced the single record before the
@@ -1105,8 +1107,8 @@ pub(crate) mod tests {
         let (connect_failed, shown) = shown_while_running(
             &ctx,
             "unrecorded-emit-user",
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+            &mut || Err::<NullIpc, _>(no_daemon()),
+            &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         assert!(
             matches!(
@@ -1132,8 +1134,8 @@ pub(crate) mod tests {
         let (send_failed, shown) = shown_while_running(
             &ctx,
             "unrecorded-emit-user",
-            || Ok(NullIpc),
-            |_: &mut NullIpc, _: &SendParams<'_>| Err(no_daemon()),
+            &mut || Ok(NullIpc),
+            &mut |_: &mut NullIpc, _: &SendParams<'_>| Err(no_daemon()),
         );
         assert!(
             matches!(
@@ -1182,8 +1184,8 @@ pub(crate) mod tests {
             let (finished, _) = run_with_probe(
                 &ctx,
                 Some("/dev/null"),
-                || Err::<NullIpc, _>(no_daemon()),
-                |_, _| Ok(()),
+                &mut || Err::<NullIpc, _>(no_daemon()),
+                &mut |_, _| Ok(()),
             );
 
             let Finished::Concluded(concluded) = finished else {
@@ -1256,8 +1258,8 @@ pub(crate) mod tests {
             let (finished, shown) = shown_while_running(
                 &ctx,
                 "replay-emit-user",
-                || Err::<NullIpc, _>(no_daemon()),
-                |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+                &mut || Err::<NullIpc, _>(no_daemon()),
+                &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
             );
             let Finished::Concluded(concluded) = finished else {
                 // A concurrent test replaced the single record before the
@@ -1324,13 +1326,15 @@ pub(crate) mod tests {
             &participation,
             &mut host,
             &zero_timeouts(),
-            || tty.and_then(|path| std::fs::File::open(path).ok()),
-            || Ok(NullIpc),
-            |_: &mut NullIpc, _: &SendParams<'_>| {
-                log.borrow_mut().push(marker(OPEN_MARKER));
-                Ok(())
+            &mut Effects {
+                probe_tty: &mut || tty.and_then(|path| std::fs::File::open(path).ok()),
+                connect: &mut || Ok(NullIpc),
+                send: &mut |_: &mut NullIpc, _: &SendParams<'_>| {
+                    log.borrow_mut().push(marker(OPEN_MARKER));
+                    Ok(())
+                },
+                cancel: |_, _| {},
             },
-            |_, _| {},
         );
         log.into_inner()
     }
@@ -1342,17 +1346,12 @@ pub(crate) mod tests {
     /// it, so a test can never re-derive the message from the outcome. The
     /// participation comes from `ctx`, so the path under test is the one
     /// `classify` really picks.
-    fn shown_while_running<T, C, S>(
+    fn shown_while_running<T: IpcResponseReader>(
         ctx: &CallerContext,
         username: &str,
-        connect: C,
-        send: S,
-    ) -> (Finished, Vec<Emitted>)
-    where
-        T: IpcResponseReader,
-        C: FnOnce() -> Result<T, IpcError>,
-        S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-    {
+        connect: &mut dyn FnMut() -> Result<T, IpcError>,
+        send: &mut dyn for<'p> FnMut(&mut T, &SendParams<'p>) -> Result<(), IpcError>,
+    ) -> (Finished, Vec<Emitted>) {
         let msgs = PamMessages::new("en");
         let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
         let mut host =
@@ -1364,10 +1363,12 @@ pub(crate) mod tests {
             &participation,
             &mut host,
             &zero_timeouts(),
-            || None::<File>,
-            connect,
-            send,
-            |_, _| {},
+            &mut Effects {
+                probe_tty: &mut || None::<File>,
+                connect,
+                send,
+                cancel: |_, _| {},
+            },
         );
         (finished, log.into_inner())
     }
@@ -1465,16 +1466,18 @@ pub(crate) mod tests {
             &participation,
             &mut host,
             &zero_timeouts(),
-            || {
-                probes += 1;
-                std::fs::File::open("/dev/null").ok()
+            &mut Effects {
+                probe_tty: &mut || {
+                    probes += 1;
+                    std::fs::File::open("/dev/null").ok()
+                },
+                connect: &mut || {
+                    connects.set(connects.get() + 1);
+                    Err::<NullIpc, _>(no_daemon())
+                },
+                send: &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+                cancel: |_, _| {},
             },
-            || {
-                connects.set(connects.get() + 1);
-                Err::<NullIpc, _>(no_daemon())
-            },
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
-            |_, _| {},
         );
 
         assert_eq!(probes, 0, "a pre-collected host must not open /dev/tty");

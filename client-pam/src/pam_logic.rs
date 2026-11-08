@@ -43,7 +43,7 @@ use crate::outcome::Outcome;
 use crate::pam_messages;
 use crate::pam_sys;
 use crate::policy;
-use crate::transaction::{Finished, HostIo, SendParams};
+use crate::transaction::{Effects, Finished, HostIo, SendParams};
 use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
@@ -95,14 +95,21 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     // anchors the 500 ms reuse window to *this module's return* — and `record`
     // hands the verdict back so it becomes a code exactly once. Neither arm
     // emits: `run` already emitted its outcome's one notice.
-    match orchestrate(
-        pamh,
-        &ctx,
-        &OrchestrationIo::production(),
-        IpcClient::connect_nonblocking,
-        send_authenticate_request,
-        cancel_on_fresh_connection,
-    ) {
+    //
+    // The outside world this call asks for, as one value: the `/dev/tty` probe,
+    // the nonblocking daemon dial, the authenticate request and the
+    // fresh-connection cancel. Each function is bound to a local first so the
+    // struct borrows a named place rather than a temporary.
+    let mut probe = probe_tty;
+    let mut connect = IpcClient::connect_nonblocking;
+    let mut send = send_authenticate_request;
+    let mut effects = Effects {
+        probe_tty: &mut probe,
+        connect: &mut connect,
+        send: &mut send,
+        cancel: cancel_on_fresh_connection,
+    };
+    match orchestrate(pamh, &ctx, &OrchestrationIo::production(), &mut effects) {
         Finished::Concluded(concluded) => {
             crate::conclusion_cache::record(concluded, Instant::now()).into_pam()
         }
@@ -166,25 +173,20 @@ fn probe_tty() -> Option<std::fs::File> {
 /// after those four calls and borrows what they produced, so it cannot exist on
 /// a skip path.
 ///
-/// `connect`, `send` and `cancel` are the transaction's injected effects, the
-/// same seam `Armed::open` has: production passes
+/// `effects` is the transaction's outside world — the `/dev/tty` probe, the
+/// daemon dial, the request on the wire and the cancel, the same seam
+/// [`Armed::open`](crate::transaction::Armed::open) has. Production passes
 /// `IpcClient::connect_nonblocking`, [`send_authenticate_request`] and
-/// [`cancel_on_fresh_connection`], and a test passes counting closures or
-/// failures, so "the skip never reaches the daemon", "a connect failure records
-/// nothing" and "a timeout cancels nothing" are assertions rather than promises.
-fn orchestrate<T, C, S>(
+/// [`cancel_on_fresh_connection`] (built by [`authenticate`]), and a test passes
+/// counting closures or failures, so "the skip never reaches the daemon", "a
+/// connect failure records nothing" and "a timeout cancels nothing" are
+/// assertions rather than promises.
+fn orchestrate<T: IpcResponseReader>(
     pamh: *mut pam_sys::PamHandle,
     ctx: &CallerContext,
     io: &OrchestrationIo,
-    connect: C,
-    send: S,
-    cancel: fn(&str, &str),
-) -> Finished
-where
-    T: IpcResponseReader,
-    C: FnOnce() -> Result<T, IpcError>,
-    S: FnOnce(&mut T, &SendParams<'_>) -> Result<(), IpcError>,
-{
+    effects: &mut Effects<'_, T>,
+) -> Finished {
     // The conversation policy is decided from the caller facts `capture` read,
     // and it is decided *first*: a `Skip` returns before the config read, the
     // username lookup, the conversation and the messages, which is the order
@@ -259,17 +261,7 @@ where
     let msgs = (io.load_messages)(&username);
 
     let mut host = HostIo::new(pamh, &pam_conv, &msgs, io.read_authtok);
-    crate::transaction::run(
-        ctx,
-        &username,
-        &participation,
-        &mut host,
-        &config,
-        probe_tty,
-        connect,
-        send,
-        cancel,
-    )
+    crate::transaction::run(ctx, &username, &participation, &mut host, &config, effects)
 }
 
 /// The one return for a skip, whichever of the two decision phases produced it.
@@ -474,15 +466,18 @@ mod tests {
                 std::ptr::null_mut(),
                 &ctx,
                 &inert_io(),
-                || {
-                    connects.fetch_add(1, Ordering::SeqCst);
-                    Err::<NullIpc, _>(no_daemon())
+                &mut Effects {
+                    probe_tty: &mut probe_tty,
+                    connect: &mut || {
+                        connects.fetch_add(1, Ordering::SeqCst);
+                        Err::<NullIpc, _>(no_daemon())
+                    },
+                    send: &mut |_: &mut NullIpc, _: &SendParams<'_>| {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    cancel: |_, _| {},
                 },
-                |_: &mut NullIpc, _: &SendParams<'_>| {
-                    sends.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-                |_, _| {},
             );
 
             assert_eq!(
@@ -546,9 +541,12 @@ mod tests {
             std::ptr::null_mut(),
             ctx,
             &counting_io(),
-            || Err::<IpcClient, _>(no_daemon()),
-            |_: &mut IpcClient, _: &SendParams<'_>| Ok(()),
-            |_, _| {},
+            &mut Effects {
+                probe_tty: &mut probe_tty,
+                connect: &mut || Err::<IpcClient, _>(no_daemon()),
+                send: &mut |_: &mut IpcClient, _: &SendParams<'_>| Ok(()),
+                cancel: |_, _| {},
+            },
         );
         [
             CONFIG_CALLS.load(Ordering::SeqCst),
@@ -681,15 +679,18 @@ mod tests {
             std::ptr::null_mut(),
             ctx,
             &io,
-            || {
-                connects.fetch_add(1, Ordering::SeqCst);
-                Err::<NullIpc, _>(no_daemon())
+            &mut Effects {
+                probe_tty: &mut probe_tty,
+                connect: &mut || {
+                    connects.fetch_add(1, Ordering::SeqCst);
+                    Err::<NullIpc, _>(no_daemon())
+                },
+                send: &mut |_: &mut NullIpc, _: &SendParams<'_>| {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                cancel: |_, _| {},
             },
-            |_: &mut NullIpc, _: &SendParams<'_>| {
-                sends.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            |_, _| {},
         );
 
         RenamedRun {
@@ -868,15 +869,18 @@ mod tests {
                 std::ptr::null_mut(),
                 &context(Some(service), Some(process)),
                 &skip_io(),
-                || {
-                    connects.fetch_add(1, Ordering::SeqCst);
-                    Err::<NullIpc, _>(no_daemon())
+                &mut Effects {
+                    probe_tty: &mut probe_tty,
+                    connect: &mut || {
+                        connects.fetch_add(1, Ordering::SeqCst);
+                        Err::<NullIpc, _>(no_daemon())
+                    },
+                    send: &mut |_: &mut NullIpc, _: &SendParams<'_>| {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    cancel: |_, _| {},
                 },
-                |_: &mut NullIpc, _: &SendParams<'_>| {
-                    sends.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
-                |_, _| {},
             );
 
             assert_eq!(
@@ -915,9 +919,12 @@ mod tests {
             std::ptr::null_mut(),
             &context(Some("test-service"), Some("swaylock")),
             &skip_io(),
-            || Err::<NullIpc, _>(no_daemon()),
-            |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
-            |_, _| {},
+            &mut Effects {
+                probe_tty: &mut probe_tty,
+                connect: &mut || Err::<NullIpc, _>(no_daemon()),
+                send: &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
+                cancel: |_, _| {},
+            },
         );
         assert_eq!(
             HANDOFF_TOKEN_READS.load(Ordering::SeqCst),
@@ -1772,8 +1779,8 @@ mod tests {
     /// over a production half is "no forbidden token is present", which is also
     /// true of an empty string — so each scan names the declarations it must
     /// have seen, and this is the one place the message lives. The needles are
-    /// substrings of the declarations as written (`run` is generic, so it reads
-    /// `fn run<T, C, S, X>(`).
+    /// substrings of the declarations as written (`run` takes a `&mut Effects`,
+    /// so a scan that only had to reach the `fn run` head still does).
     pub(crate) fn assert_scan_reaches(rel: &str, cleaned: &str, needles: &[&str]) {
         for needle in needles {
             assert!(
@@ -2444,8 +2451,8 @@ mod verdict_reuse_tests {
         let now = Instant::now();
 
         let first = Armed::<NullIpc>::open(
-            || Err(no_daemon()),
-            |_: &mut NullIpc| Ok(()),
+            &mut || Err(no_daemon()),
+            &mut |_: &mut NullIpc| Ok(()),
             "failed-connect-request".into(),
         );
         assert!(
@@ -2462,8 +2469,8 @@ mod verdict_reuse_tests {
         // The retry: with nothing recorded it must dial again and arm a real
         // transaction, whose conclusion *is* recorded.
         let Ok(armed) = Armed::<NullIpc>::open(
-            || Ok(NullIpc),
-            |_: &mut NullIpc| Ok(()),
+            &mut || Ok(NullIpc),
+            &mut |_: &mut NullIpc| Ok(()),
             "retry-request".into(),
         ) else {
             panic!("the retry must be able to connect after the failed attempt");
