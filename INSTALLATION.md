@@ -305,7 +305,7 @@ This is a **safe, non-disruptive** configuration. Your system remains accessible
 TapAuth offers the phone wherever the module can safely drive or await the host's PAM
 conversation. The module picks one of three strategies automatically from the calling
 process and the PAM service, so nothing has to be configured per host: which host gets
-which strategy — and why — is the rule table in `client-pam/src/policy.rs`, one row per
+which strategy — and why — is the rule table in `client-pam/src/policy/table.rs`, one row per
 host. What you see as an operator is one of four outcomes:
 
 | Outcome | Behaviour |
