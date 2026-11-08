@@ -104,7 +104,7 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
         cancel_on_fresh_connection,
     ) {
         Finished::Concluded(concluded) => {
-            crate::transaction::record(concluded, Instant::now()).to_pam()
+            crate::conclusion_cache::record(concluded, Instant::now()).to_pam()
         }
         Finished::Unrecorded(outcome) => outcome.to_pam(),
     }
@@ -1872,7 +1872,7 @@ mod tests {
                 // Guard against a re-truncated scan: this test's claim is that
                 // `run` and the reuse cache produce no code of their own, so the
                 // scan must actually have seen both (see `production_source`).
-                assert_scan_reaches(&rel, &cleaned, &["fn run", "impl ConclusionCache"]);
+                assert_scan_reaches(&rel, &cleaned, &["fn run"]);
             }
             for (offset, text) in pam_code_sites(&cleaned) {
                 if rel == "lib.rs" {
@@ -1966,7 +1966,7 @@ mod tests {
                 // Guard against a re-truncated scan: the two grant constructors
                 // are reached from `run` and refused by the cache, so the scan
                 // must have seen both halves of this file.
-                assert_scan_reaches(&rel, &cleaned, &["fn run", "impl ConclusionCache"]);
+                assert_scan_reaches(&rel, &cleaned, &["fn run"]);
             }
             if rel == "outcome.rs" {
                 definitions += cleaned.matches("fn granted_from_daemon").count();
@@ -2183,10 +2183,11 @@ mod tests {
 /// The verdict-reuse record: the 500 ms window, its `(username, service)` key,
 /// and the two gates that decide what may be recorded.
 ///
-/// Every case drives the real `transaction::record` / `transaction::replay_for`
+/// Every case drives the real `conclusion_cache::record` /
+/// `conclusion_cache::replay_for`
 /// pair, so the assertions are about the record `authenticate` writes and reads
 /// and not about a parallel copy of its logic; each case holds
-/// `transaction::CACHE_SLOT_LOCK` for its whole body, because the record is one
+/// `conclusion_cache::CACHE_SLOT_LOCK` for its whole body, because the record is one
 /// slot for the process.
 #[cfg(test)]
 #[allow(
@@ -2197,9 +2198,10 @@ mod tests {
 )]
 mod verdict_reuse_tests {
     use super::*;
+    use crate::conclusion_cache::{record, replay_for};
     use crate::outcome::{DenyVia, UnavailableReason};
     use crate::transaction::tests::{no_daemon, NullIpc};
-    use crate::transaction::{record, replay_for, Armed, Concluded, StartError, Via};
+    use crate::transaction::{Armed, Concluded, StartError, Via};
 
     const SERVICE: &str = "tapauth-test";
 
@@ -2246,7 +2248,7 @@ mod verdict_reuse_tests {
 
     /// The single process-wide slot, held for the whole case.
     fn slot() -> std::sync::MutexGuard<'static, ()> {
-        crate::transaction::CACHE_SLOT_LOCK
+        crate::conclusion_cache::CACHE_SLOT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -2582,7 +2584,7 @@ mod verdict_reuse_tests {
             .iter()
             .map(|path| super::tests::relative_to_src(path))
             .collect();
-        for required in ["pam_logic.rs", "transaction.rs"] {
+        for required in ["pam_logic.rs", "transaction.rs", "conclusion_cache.rs"] {
             assert!(
                 names.iter().any(|name| name == required),
                 "the scan did not cover {required}: {names:?}"
@@ -2681,7 +2683,7 @@ mod verdict_reuse_tests {
             .map(|path| super::tests::relative_to_src(path))
             .collect();
         assert!(
-            names.iter().any(|name| name == "transaction.rs"),
+            names.iter().any(|name| name == "conclusion_cache.rs"),
             "the scan did not cover the cache's own module: {names:?}"
         );
 
@@ -2689,14 +2691,18 @@ mod verdict_reuse_tests {
         for path in &files {
             let rel = super::tests::relative_to_src(path);
             let production = super::tests::production_source(path);
-            if rel == "transaction.rs" {
+            if rel == "conclusion_cache.rs" {
                 // Guard against a re-truncated scan: the whole claim is about
                 // what the owner's module may do, and an empty production half
                 // satisfies "no other module names the lock" vacuously.
                 super::tests::assert_scan_reaches(
                     &rel,
                     &production,
-                    &["fn run", "impl ConclusionCache", "LAST_CONCLUSION"],
+                    &[
+                        "impl ConclusionCache",
+                        "LAST_CONCLUSION",
+                        "fn reinit_cache_in_child",
+                    ],
                 );
                 // The owner may lock the static; it may not hand the lock, the
                 // guard or the record out.
@@ -2716,7 +2722,7 @@ mod verdict_reuse_tests {
         }
         assert!(
             findings.is_empty(),
-            "only `transaction.rs` may name the reuse record's lock:\n{}",
+            "only `conclusion_cache.rs` may name the reuse record's lock:\n{}",
             findings.join("\n")
         );
 

@@ -58,6 +58,7 @@
 //!
 //! Must run as root to access `/etc/tapauth` configuration files.
 
+mod conclusion_cache;
 mod config;
 mod context;
 mod ipc_client;
