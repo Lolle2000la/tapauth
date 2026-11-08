@@ -1,10 +1,16 @@
-//! The decision record: `RULES`, one row per host.
+//! The decision record: `RULES`, one row per host, and its audit record.
 //!
 //! What the rules *are*. A row carries the class it was authored against (the
-//! failure direction it protects), the in-tree evidence for the behaviour it
-//! preserves, its predicate and its decision; the taxonomy those values are
-//! written in lives in the parent module, and the first-match engine that walks
-//! this table lives there too.
+//! failure direction it protects), its predicate and its decision; the taxonomy
+//! those values are written in lives in the parent module, and the first-match
+//! engine that walks this table lives there too.
+//!
+//! The human-readable half — each rule's symbolic name, the sentence saying why
+//! it exists, and the in-tree evidence for the behaviour it preserves — is the
+//! audit record at the bottom of this file, compiled only for tests. No string
+//! in it is read by the shipped binary, so the table needs no lint exemption;
+//! the policy tests read the record for name uniqueness, corpus coverage and
+//! citation resolution.
 
 use crate::context::{CallerContext, ProcessIdentity};
 
@@ -12,23 +18,16 @@ use super::{
     Classification, Conversation, Decision, FailureDirection, Participation, RuleId, SkipPolicy,
 };
 
-/// One row of the table.
+/// One row of the table: everything the shipped binary reads.
 ///
-/// `name` and `evidence` are the justification record: the shipped binary does
-/// not read them, and the policy tests do (uniqueness, corpus coverage and
-/// citation resolution), so they are exempt from the dead-code lint rather than
-/// dropped.
-// reason: name/evidence are the shipped audit record; only the policy tests read them.
-#[allow(dead_code)]
+/// The id `classify` returns next to the classification, the class that lands
+/// on the participation, the predicate the engine walks, and the decision it
+/// converts. The row's justification is the audit record (`audit`, at the
+/// bottom of this file), which is compiled only for tests; a field nothing but
+/// the tests read does not belong in the shipped table.
 pub(super) struct Rule {
     pub(crate) id: RuleId,
-    /// The rule's symbolic name (`dm_login_bypass`, …).
-    pub(crate) name: &'static str,
     pub(crate) class: FailureDirection,
-    /// `file:line` citations the rule must be able to defend. Entries prefixed
-    /// `external:` cite something outside this tree and are exempt from
-    /// resolution.
-    pub(crate) evidence: &'static [&'static str],
     pub(crate) predicate: fn(&CallerContext) -> bool,
     pub(crate) decision: Decision,
 }
@@ -40,113 +39,61 @@ pub(super) struct Rule {
 pub(super) static RULES: [Rule; 10] = [
     Rule {
         id: RuleId::R1,
-        name: "remote_refuse",
         class: FailureDirection::RefuseRemote,
-        evidence: &[
-            "external:pam_set_item(3) - PAM_RHOST is the remote requesting host, \
-             and OpenSSH sets it (auth-pam.c); sshd is PAMServiceName's default",
-            "external:OpenSSH PAMServiceName defaults to `sshd`, so the service \
-             name is a compile-time default, not a constant of the protocol",
-        ],
         predicate: remote_refuse,
         decision: Decision::Skip(SkipPolicy::RemoteAuthentication),
     },
     Rule {
         id: RuleId::R2,
-        name: "dm_login_bypass",
         class: FailureDirection::Keyring,
-        evidence: &[
-            "client-pam/src/policy/table.rs:223",
-            "client-pam/src/outcome.rs:82",
-        ],
         predicate: dm_login_bypass,
         decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
     },
     Rule {
         id: RuleId::R3,
-        name: "gdm_reauth_worker",
         class: FailureDirection::DeadlockAvoidance,
-        evidence: &[
-            "client-pam/src/policy/table.rs:230",
-            "client-pam/src/context.rs:74",
-        ],
         predicate: gdm_reauth_worker,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R4,
-        name: "polkit_agent",
         class: FailureDirection::DeadlockAvoidance,
-        evidence: &[
-            "client-pam/src/policy/table.rs:241",
-            "client-pam/src/mechanism/threaded.rs:227",
-        ],
         predicate: polkit_agent,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R5,
-        name: "kscreenlocker_worker",
         class: FailureDirection::DeadlockAvoidance,
-        evidence: &[
-            "client-pam/src/policy/table.rs:249",
-            "client-pam/src/mechanism/threaded.rs:191",
-        ],
         predicate: kscreenlocker_worker,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R6,
-        name: "hyprlock",
         class: FailureDirection::AlwaysRing,
-        evidence: &[
-            "client-pam/src/policy/table.rs:261",
-            "client-pam/src/mechanism/threaded.rs:191",
-        ],
         predicate: hyprlock,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R7,
-        name: "xsecurelock",
         class: FailureDirection::AlwaysRing,
-        evidence: &[
-            "client-pam/src/policy/table.rs:269",
-            "client-pam/src/mechanism/threaded.rs:191",
-        ],
         predicate: xsecurelock,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R8,
-        name: "precollected_locks",
         class: FailureDirection::NeverRing,
-        evidence: &[
-            "client-pam/src/policy/table.rs:274",
-            "client-pam/src/mechanism/handoff.rs:31",
-        ],
         predicate: precollected_locks,
         decision: Decision::Participate(Conversation::PreCollected),
     },
     Rule {
         id: RuleId::R9,
-        name: "polkit_service_without_proc",
         class: FailureDirection::DeadlockAvoidance,
-        evidence: &[
-            "client-pam/src/policy/table.rs:286",
-            "client-pam/src/context.rs:160",
-        ],
         predicate: polkit_service_without_proc,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
         id: RuleId::R10,
-        name: "default_sequential",
         class: FailureDirection::DeadlockAvoidance,
-        evidence: &[
-            "client-pam/src/policy/table.rs:292",
-            "client-pam/src/mechanism/threaded.rs:219",
-        ],
         predicate: default_sequential,
         decision: Decision::Participate(Conversation::Sequential),
     },
@@ -291,4 +238,131 @@ fn polkit_service_without_proc(ctx: &CallerContext) -> bool {
 /// R10 — the sequential default. Unconditional, and last.
 fn default_sequential(_ctx: &CallerContext) -> bool {
     true
+}
+
+/// One rule's audit record: its symbolic name, why it exists, and the in-tree
+/// evidence for the behaviour it preserves.
+///
+/// Test-only by construction, not by lint exemption. `Rule` used to carry
+/// `name` and `evidence` and needed `#[allow(dead_code)]` because the shipped
+/// binary reads neither; a record only the tests read is not production data,
+/// so it lives behind `cfg(test)` and the shipped table carries no escape.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) struct Audit {
+    /// The rule's symbolic name (`dm_login_bypass`, …). It must be the name of
+    /// the row's own predicate: `evidence_citations_resolve` requires the
+    /// row's `policy/table.rs` predicate citation to land on `fn <name>`.
+    pub(super) name: &'static str,
+    /// Why the rule exists, in one sentence. The predicate's doc comment keeps
+    /// the long form, including every accepted risk.
+    pub(super) why: &'static str,
+    /// `file:line` citations the rule must be able to defend. Entries prefixed
+    /// `external:` cite something outside this tree and are exempt from
+    /// resolution.
+    pub(super) evidence: &'static [&'static str],
+}
+
+/// `id`'s audit record.
+///
+/// The `match` is exhaustive over `RuleId` with no wildcard, so a rule added to
+/// the enum does not compile until its audit record is written. The other
+/// direction — a record whose row was deleted from `RULES` — is
+/// `audit_covers_rules` (`policy/mod.rs`).
+#[cfg(test)]
+pub(super) fn audit(id: RuleId) -> Audit {
+    match id {
+        RuleId::R1 => Audit {
+            name: "remote_refuse",
+            why: "the sshd stack authenticates a remote peer, so ringing the phone \
+                  for it can only add a wait nobody is sitting at",
+            evidence: &[
+                "external:pam_set_item(3) - PAM_RHOST is the remote requesting host, \
+                 and OpenSSH sets it (auth-pam.c); sshd is PAMServiceName's default",
+                "external:OpenSSH PAMServiceName defaults to `sshd`, so the service \
+                 name is a compile-time default, not a constant of the protocol",
+            ],
+        },
+        RuleId::R2 => Audit {
+            name: "dm_login_bypass",
+            why: "the login manager has to populate `PAM_AUTHTOK` for the session \
+                  keyring, and a grant without it is useless",
+            evidence: &[
+                "client-pam/src/policy/table.rs:170",
+                "client-pam/src/outcome.rs:82",
+            ],
+        },
+        RuleId::R3 => Audit {
+            name: "gdm_reauth_worker",
+            why: "a GDM reauthentication is driven by the session worker, whose \
+                  conversation stays answerable while a worker thread waits",
+            evidence: &[
+                "client-pam/src/policy/table.rs:177",
+                "client-pam/src/context.rs:74",
+            ],
+        },
+        RuleId::R4 => Audit {
+            name: "polkit_agent",
+            why: "polkit's agent helper feeds its conversation from a separate \
+                  process, so it can be answered while the caller waits",
+            evidence: &[
+                "client-pam/src/policy/table.rs:188",
+                "client-pam/src/mechanism/threaded.rs:227",
+            ],
+        },
+        RuleId::R5 => Audit {
+            name: "kscreenlocker_worker",
+            why: "kscreenlocker 6.8's worker answers on Qt's D-Bus daemon thread, so \
+                  the conversation survives the calling thread blocking",
+            evidence: &[
+                "client-pam/src/policy/table.rs:196",
+                "client-pam/src/mechanism/threaded.rs:191",
+            ],
+        },
+        RuleId::R6 => Audit {
+            name: "hyprlock",
+            why: "hyprlock answers from a worker thread; its unsynchronised \
+                  `resetConversation`/`checkWaiting` race is the accepted risk",
+            evidence: &[
+                "client-pam/src/policy/table.rs:208",
+                "client-pam/src/mechanism/threaded.rs:191",
+            ],
+        },
+        RuleId::R7 => Audit {
+            name: "xsecurelock",
+            why: "xsecurelock's helper answers from its own thread pool, at the cost \
+                  of up to three rings when `CallPAMWithRetries` re-runs the module",
+            evidence: &[
+                "client-pam/src/policy/table.rs:216",
+                "client-pam/src/mechanism/threaded.rs:191",
+            ],
+        },
+        RuleId::R8 => Audit {
+            name: "precollected_locks",
+            why: "these hosts collected the password before `pam_authenticate`, so \
+                  the phone must not be rung and the token is handed on instead",
+            evidence: &[
+                "client-pam/src/policy/table.rs:221",
+                "client-pam/src/mechanism/handoff.rs:31",
+            ],
+        },
+        RuleId::R9 => Audit {
+            name: "polkit_service_without_proc",
+            why: "polkit with an unreadable `/proc` cannot be shown to answer \
+                  concurrently, so it keeps the historic threaded behaviour",
+            evidence: &[
+                "client-pam/src/policy/table.rs:233",
+                "client-pam/src/context.rs:160",
+            ],
+        },
+        RuleId::R10 => Audit {
+            name: "default_sequential",
+            why: "every other caller is driven sequentially on the calling thread, \
+                  which is slower but can never wedge the host's event loop",
+            evidence: &[
+                "client-pam/src/policy/table.rs:239",
+                "client-pam/src/mechanism/threaded.rs:219",
+            ],
+        },
+    }
 }

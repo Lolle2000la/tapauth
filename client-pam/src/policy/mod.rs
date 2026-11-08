@@ -5,9 +5,9 @@
 //! Three responsibilities, three files:
 //!
 //! * `table.rs` is the decision record: `RULES`, one row per host, carrying the
-//!   class the row was authored against (the failure direction it protects), the
-//!   in-tree evidence for the behaviour it preserves, its predicate and its
-//!   decision.
+//!   class the row was authored against (the failure direction it protects), its
+//!   predicate and its decision, plus the test-only audit record (name, why,
+//!   evidence) that justifies each row.
 //! * this file is the taxonomy those rows are written in ([`Classification`],
 //!   [`Decision`], [`Participation`], [`Conversation`], [`FailureDirection`],
 //!   [`SkipPolicy`]) and the first-match engine: `classify` walks the table in
@@ -137,6 +137,30 @@ pub(crate) enum RuleId {
 }
 
 impl RuleId {
+    /// Every variant, in table order.
+    ///
+    /// Test-only, and the enumeration the audit guard walks: `as_str` and
+    /// `policy::table::audit` are exhaustive matches, so a new variant cannot
+    /// compile without its spelling and its audit record, and this list is what
+    /// lets the guard walk the variants to catch the other direction — a rule
+    /// whose row was deleted from `RULES`. Keeping the list complete is not a
+    /// compile-time property: a variant added to the enum, `as_str` and `audit`
+    /// but omitted here is not caught; everything it does list is checked
+    /// against `RULES` by `audit_covers_rules`.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        Self::R1,
+        Self::R2,
+        Self::R3,
+        Self::R4,
+        Self::R5,
+        Self::R6,
+        Self::R7,
+        Self::R8,
+        Self::R9,
+        Self::R10,
+    ];
+
     /// The spelling the fixture corpus uses (`R1` … `R10`).
     #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
@@ -203,6 +227,7 @@ fn classification_of(rule: &Rule) -> Classification {
 )]
 mod tests {
     use super::refine::refused_service;
+    use super::table::audit;
     use super::*;
     use crate::config::PamConfig;
     use crate::context::{classify_identity, GdmReauth, ProcessIdentity, ServiceName};
@@ -644,7 +669,10 @@ mod tests {
     /// Every rule in the table has at least one corpus row that names it.
     ///
     /// The check iterates `RULES`, not the corpus: iterating the corpus cannot
-    /// see a rule added without a fixture, which is the case that matters.
+    /// see a rule added without a fixture, which is the case that matters. The
+    /// name in the message is the audit record's (`policy/table.rs`, `audit`);
+    /// that record and this table are checked against each other by
+    /// `audit_covers_rules`.
     #[test]
     fn corpus_covers_every_rule() {
         let rows = rows();
@@ -654,13 +682,60 @@ mod tests {
                 "rule {} ({}) has no corpus row: add one to \
                  client-pam/tests/fixtures/callers.csv",
                 rule.id.as_str(),
-                rule.name
+                audit(rule.id).name
+            );
+        }
+    }
+
+    /// Every rule row has exactly one audit record, and every record is
+    /// complete and uniquely named.
+    ///
+    /// The audit record (`policy/table.rs`, `audit`) is the justification a
+    /// human reads: the rule's symbolic name, why it exists, and the citations
+    /// that defend it. It is `#[cfg(test)]`, so nothing but these tests keeps it
+    /// honest. Two directions are checked: `audit`'s exhaustive `match` makes a
+    /// rule without a record a compile error, and walking `RuleId::ALL` here
+    /// catches the other direction — a record whose row was deleted from
+    /// `RULES`, which `corpus_covers_every_rule` cannot see because it iterates
+    /// `RULES` too.
+    ///
+    /// The defect this catches: a rule whose row exists but whose record is
+    /// missing or empty (the audit record silently rotting away from the
+    /// table), a deleted row leaving an orphan record, and two rules sharing a
+    /// name, which would make a corpus row's `expected_rule` ambiguous.
+    #[test]
+    fn audit_covers_rules() {
+        assert_eq!(
+            RuleId::ALL.len(),
+            RULES.len(),
+            "the audit record and the rule table must have one entry per rule: \
+             RuleId::ALL is the enumeration the record is keyed by"
+        );
+
+        for id in RuleId::ALL {
+            let rows = RULES.iter().filter(|rule| rule.id == *id).count();
+            assert_eq!(rows, 1, "{id:?} must own exactly one row of RULES");
+
+            let record = audit(*id);
+            assert!(!record.name.is_empty(), "{id:?} has no name");
+            assert!(
+                !record.why.is_empty(),
+                "{id:?} ({}) has no justification",
+                record.name
+            );
+            assert!(
+                !record.evidence.is_empty(),
+                "{id:?} ({}) has no evidence",
+                record.name
             );
             assert_eq!(
-                RULES.iter().filter(|other| other.name == rule.name).count(),
+                RULES
+                    .iter()
+                    .filter(|rule| audit(rule.id).name == record.name)
+                    .count(),
                 1,
                 "rule name {:?} is used twice",
-                rule.name
+                record.name
             );
         }
     }
@@ -674,7 +749,7 @@ mod tests {
                 class_permits(rule.class, &rule.decision),
                 "rule {} ({}) pairs {:?} with a decision it does not permit",
                 rule.id.as_str(),
-                rule.name,
+                audit(rule.id).name,
                 rule.class
             );
         }
@@ -1166,7 +1241,7 @@ mod tests {
                 "rule {} ({}) matches the null context, so it is unconditional and \
                  every row after it is dead",
                 rule.id.as_str(),
-                rule.name
+                audit(rule.id).name
             );
         }
 
@@ -1232,16 +1307,18 @@ mod tests {
         }
     }
 
-    /// Every `evidence` citation resolves in this tree, and the scan reports
-    /// which files it checked so a relocated or emptied table cannot pass
-    /// silently. Entries marked `external:` cite a specification or an
-    /// out-of-tree program and are exempt.
+    /// Every `evidence` citation of the audit record resolves in this tree, and
+    /// the scan reports which files it checked so a relocated or emptied record
+    /// cannot pass silently. Entries marked `external:` cite a specification or
+    /// an out-of-tree program and are exempt.
     ///
-    /// A citation into `policy/table.rs` must land on the declaration it
-    /// claims, not merely on a non-blank line: the row's own predicate
-    /// citation must hit `fn <rule name>`, and any other table citation must at
-    /// least hit a declaration ([`table_citation_problem`]). The plant-and-
-    /// revert control at the end is what keeps the strengthening honest.
+    /// The record is test-only (`policy/table.rs`, `audit`), so this test is the
+    /// whole of its consumption: the citations live nowhere else. A citation
+    /// into `policy/table.rs` must land on the declaration it claims, not merely
+    /// on a non-blank line: the row's own predicate citation must hit
+    /// `fn <rule name>`, and any other table citation must at least hit a
+    /// declaration ([`table_citation_problem`]). The plant-and-revert control at
+    /// the end is what keeps the strengthening honest.
     #[test]
     fn evidence_citations_resolve() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1250,34 +1327,35 @@ mod tests {
         let mut checked: Vec<&str> = Vec::new();
 
         for rule in RULES.iter() {
+            let record = audit(rule.id);
             assert!(
-                !rule.evidence.is_empty(),
+                !record.evidence.is_empty(),
                 "rule {} ({}) has no evidence",
                 rule.id.as_str(),
-                rule.name
+                record.name
             );
-            for citation in rule.evidence {
+            for citation in record.evidence {
                 if let Some(external) = citation.strip_prefix("external:") {
                     assert!(
                         !external.trim().is_empty(),
                         "rule {} has an empty external citation",
-                        rule.name
+                        record.name
                     );
                     continue;
                 }
-                let (file, range) = citation
-                    .rsplit_once(':')
-                    .unwrap_or_else(|| panic!("rule {}: {citation:?} is not file:line", rule.name));
+                let (file, range) = citation.rsplit_once(':').unwrap_or_else(|| {
+                    panic!("rule {}: {citation:?} is not file:line", record.name)
+                });
                 let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|error| {
                     panic!(
                         "rule {}: citation {citation:?} does not resolve: {error}",
-                        rule.name
+                        record.name
                     )
                 });
                 let total = text.lines().count();
                 let number = |field: &str| {
                     field.trim().parse::<usize>().unwrap_or_else(|_| {
-                        panic!("rule {}: {citation:?} has a non-numeric line", rule.name)
+                        panic!("rule {}: {citation:?} has a non-numeric line", record.name)
                     })
                 };
                 let (start, end) = match range.split_once('-') {
@@ -1290,17 +1368,18 @@ mod tests {
                 assert!(
                     start >= 1 && end >= start && end <= total,
                     "rule {}: citation {citation:?} is outside {file} ({total} lines)",
-                    rule.name
+                    record.name
                 );
                 assert!(
                     text.lines()
                         .nth(start - 1)
                         .is_some_and(|line| !line.trim().is_empty()),
                     "rule {}: citation {citation:?} points at a blank line",
-                    rule.name
+                    record.name
                 );
                 if file == TABLE_PATH {
-                    if let Some(problem) = table_citation_problem(rule.name, citation, &text, start)
+                    if let Some(problem) =
+                        table_citation_problem(record.name, citation, &text, start)
                     {
                         panic!("{problem}");
                     }
@@ -1314,10 +1393,7 @@ mod tests {
         // check reject it, then revert the plant and observe it accept again.
         // Without the plant, everything above would also pass a check that
         // accepted any non-blank line.
-        let r6 = RULES
-            .iter()
-            .find(|rule| rule.id == RuleId::R6)
-            .expect("the table has an R6 row");
+        let r6 = audit(RuleId::R6);
         let citation = r6
             .evidence
             .iter()

@@ -11,7 +11,7 @@ The module answers four questions about one `pam_authenticate` call: *does the p
 | Piece | File | Responsibility |
 | :--- | :--- | :--- |
 | `CallerContext` | `context.rs` | The three caller facts — service, process, GDM reauth — read once, before any credential or conversation work (`context.rs:17-21`, `:31-55`) |
-| `classify` + `RULES` + `refine` | `policy/{mod,table,refine}.rs` | One ordered table of ten rules, each with a name, a class, evidence, a predicate and a decision (`policy/table.rs`, `RULES`), plus the one constrained second phase that can only add a skip (`policy/refine.rs`, `refine`) |
+| `classify` + `RULES` + `refine` | `policy/{mod,table,refine}.rs` | One ordered table of ten rules, each with a class, a predicate and a decision (`policy/table.rs`, `RULES`), the test-only audit record that names and justifies every row (`policy/table.rs`, `audit`), plus the one constrained second phase that can only add a skip (`policy/refine.rs`, `refine`) |
 | `Plan` | `plan.rs` | `Plannable` and one total function to `{deadline, announcement, tty_use}` (`plan.rs`, `Plannable::plan`) |
 | `Outcome` | `outcome.rs` | The verdict as data, converted to a `PAM_*` code in one exhaustive match (`outcome.rs`, `Outcome::into_pam`) |
 | `transaction::run`, `Armed` | `transaction/{run,lifecycle}.rs` | The transaction: handoff, reuse lookup, probe, plan, request, mechanism, conclusion, one emission (`transaction/run.rs`, `run`) |
@@ -22,7 +22,7 @@ The module answers four questions about one `pam_authenticate` call: *does the p
 
 **What the shape buys.**
 
-1. *One place to look* for "why does host X behave like this": a row with a class, evidence and citations, not a comment four hundred lines away. The `evidence` column is machine-checked (`policy/mod.rs`, `evidence_citations_resolve`). Policy is one table plus one constrained refinement, not two independent decision sites: `classify` decides from the caller facts before any config exists, and `policy::refine` (`policy/refine.rs`, `refine`) is the single second phase that may add R1's skip for a configured service name and may do nothing else (§3.3.1).
+1. *One place to look* for "why does host X behave like this": a row with a class, next to its audit record — name, why, citations — not a comment four hundred lines away. The record is `#[cfg(test)]`, so the shipped binary carries no string nothing reads and the table needs no lint escape; its citations are machine-checked (`policy/mod.rs`, `evidence_citations_resolve`). Policy is one table plus one constrained refinement, not two independent decision sites: `classify` decides from the caller facts before any config exists, and `policy::refine` (`policy/refine.rs`, `refine`) is the single second phase that may add R1's skip for a configured service name and may do nothing else (§3.3.1).
 2. *One place for ordering.* `Skip` and `Participate` are different types (`policy/mod.rs`, `Classification`), so a skip cannot acquire a plan, a deadline or a mechanism. `authenticate` returns on a `Skip` before config, username, conversation and messages (`pam_logic/mod.rs`, `orchestrate`), the refinement runs after the one config read and still before all four (`policy::refine`'s one call site in `orchestrate`), and that order is pinned by call-counter tests, not by the compiler.
 3. *One place that can grant.* `Outcome::Granted` is constructible only through `granted_from_daemon` (this call's `PamOutcome::Success`, `outcome.rs`, `Outcome::granted_from_daemon`) or `replayed` (a copy of this process's own record, `outcome.rs`, `Outcome::replayed`). A mechanism returns `MechanismEnd`, so it cannot mint a verdict (`mechanism/mod.rs`, `MechanismEnd`).
 4. *Testability.* Identity resolution, the GDM flag, the deadline clamp, the `has_tty` invariance, the two skip policies and the loop's per-shape mapping are pure functions or unit assertions (§6.3).
@@ -154,7 +154,7 @@ The table decides from the caller facts alone, before any config is read: that i
 | R9 | `polkit_service_without_proc` | `DeadlockAvoidance` | process `Unknown` **and** service exactly `polkit-1` | `Threaded` |
 | R10 | `default_sequential` | `DeadlockAvoidance` | unconditional | `Sequential` |
 
-The rows are `policy/table.rs`, `RULES`; the predicates are `remote_refuse` (R1), `dm_login_bypass` (R2), `gdm_reauth_worker` (R3), `polkit_agent` (R4), `kscreenlocker_worker` (R5), `hyprlock` (R6), `xsecurelock` (R7), `precollected_locks` (R8), `polkit_service_without_proc` (R9) and `default_sequential` (R10), all in `policy/table.rs`. The 13 prefixes are `policy/table.rs`, `DM_PREFIXES`.
+The rows are `policy/table.rs`, `RULES`; the predicates are `remote_refuse` (R1), `dm_login_bypass` (R2), `gdm_reauth_worker` (R3), `polkit_agent` (R4), `kscreenlocker_worker` (R5), `hyprlock` (R6), `xsecurelock` (R7), `precollected_locks` (R8), `polkit_service_without_proc` (R9) and `default_sequential` (R10), all in `policy/table.rs`. The 13 prefixes are `policy/table.rs`, `DM_PREFIXES`. A row carries only what the shipped binary reads — the id, the class, the predicate and the decision (`policy/table.rs`, `Rule`); its symbolic name, its one-sentence justification and its citations are the audit record (`policy/table.rs`, `audit`), compiled only for tests.
 
 Notes that belong to the table:
 
@@ -166,7 +166,7 @@ Notes that belong to the table:
 * **R3–R9 are order-insensitive**: their predicates are pairwise disjoint, asserted against the declared literal sets (`policy/mod.rs`, `rules_are_process_disjoint`).
 * **R10 is last and unconditional.** A row after it is dead, and no other row may match the null context (`policy/mod.rs`, `unreachable_rule_rows`).
 * **R5 parses no version.** The `kscreenlocker_worker` predicate encodes that: the name is the only signal in `/proc`, and `kscreenlocker_greet` is deliberately absent so the pre-6.8 helper stays sequential (`policy/table.rs`, `kscreenlocker_worker`). Corpus rows `kscreenlocker_truncated`, `kscreenlocker_greet` and `kscreenlocker_g` pin the three spellings.
-* **The `evidence` column is checked.** Every non-`external:` entry must resolve to an existing line, a citation into `policy/table.rs` must land on the declaration it names (the row's own predicate, `fn hyprlock`, for its predicate citation), a one-line drift is planted and reverted as the control, and the scan asserts it read `policy/table.rs` itself (`policy/mod.rs`, `evidence_citations_resolve`).
+* **The audit record is checked.** Each rule's symbolic name, one-sentence `why` and `evidence` live in the test-only record keyed by `RuleId` (`policy/table.rs`, `audit`), whose `match` is exhaustive, so a rule added to the enum does not compile without a record; `audit_covers_rules` holds the record and `RULES` to one entry per rule, one row per rule id and one rule per name (`policy/mod.rs`, `audit_covers_rules`), which is also what catches a record whose row was deleted. Every non-`external:` evidence entry must resolve to an existing line, a citation into `policy/table.rs` must land on the declaration it names (the row's own predicate, `fn hyprlock`, for its predicate citation), a one-line drift is planted and reverted as the control, and the scan asserts it read `policy/table.rs` itself (`policy/mod.rs`, `evidence_citations_resolve`).
 
 #### 3.3.2 The class taxonomy
 
@@ -312,7 +312,7 @@ flowchart LR
 
 ### 3.9 Adding a host
 
-For a new pre-collecting lock screen `foo-lock`: add one `Rule` row to `RULES` — name, class, `evidence`, predicate, decision (`policy/table.rs`, `Rule`) — and one corpus row with `expected_rule` naming it, `expected_policy=precollected`, and `e2e=1` if the shell harness runs it. `corpus_covers_every_rule` fails until the row exists, because it iterates `RULES` rather than the corpus (`policy/mod.rs`, `corpus_covers_every_rule`). If the row is `e2e=1`, the harness needs a `case "$id"` arm carrying that shape's assertions, and a row without one fails the run (`scripts/ci/test-pam-conv-thread.sh:714-719`). The harness copies the binary and writes the service file from the row itself (`scripts/ci/test-pam-conv-thread.sh:148-162`, `:225-273`), and the prose lists were replaced by pointers in `66b26b4` (§2.6).
+For a new pre-collecting lock screen `foo-lock`: add one `Rule` row to `RULES` — id, class, predicate, decision (`policy/table.rs`, `Rule`) — and its audit record in `audit` (`policy/table.rs`, `audit`), which will not compile until it is written, plus one corpus row with `expected_rule` naming it, `expected_policy=precollected`, and `e2e=1` if the shell harness runs it. `corpus_covers_every_rule` fails until the row exists, because it iterates `RULES` rather than the corpus (`policy/mod.rs`, `corpus_covers_every_rule`). If the row is `e2e=1`, the harness needs a `case "$id"` arm carrying that shape's assertions, and a row without one fails the run (`scripts/ci/test-pam-conv-thread.sh:714-719`). The harness copies the binary and writes the service file from the row itself (`scripts/ci/test-pam-conv-thread.sh:148-162`, `:225-273`), and the prose lists were replaced by pointers in `66b26b4` (§2.6).
 
 A renamed binary or an unknown host needs no edit: it falls to R10, unchanged behaviour, and `unknown_binary` asserts that.
 
@@ -455,19 +455,20 @@ The earlier record kept `set_user` and the conversation prompt helpers under `#[
 
 | layer | command | result |
 | :--- | :--- | :--- |
-| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **108 passed, 0 failed, 0 ignored** |
+| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **109 passed, 0 failed, 0 ignored** |
 | workspace, `shared` | `cargo test --workspace` | **96 passed** |
-| workspace, `client-pam` | the same run | 108 passed, 0 ignored |
+| workspace, `client-pam` | the same run | 109 passed, 0 ignored |
 | workspace, every other target | the same run | 0 tests |
 | end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **16 shapes**, the `e2e=1` rows |
 
-204 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
+205 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
 
 ### 6.2 The corpus and its consumers
 
 The Rust reader asserts, per row, the identity provenance, the env interpretation, the rule id, the decision and — for participating rows — the plan cell for the row's `tty` value, with that `tty` value itself checked against a literal oracle (`policy/mod.rs`, `corpus_characterises_the_decision_table`). Around it:
 
-* `corpus_covers_every_rule` iterates `RULES`, requires a row per rule and a unique rule name (`policy/mod.rs`, `corpus_covers_every_rule`).
+* `corpus_covers_every_rule` iterates `RULES` and requires a corpus row per rule (`policy/mod.rs`, `corpus_covers_every_rule`).
+* `audit_covers_rules` walks `RuleId::ALL` and requires exactly one `RULES` row per id and exactly one record per name, with a non-empty name, `why` and `evidence` on every record (`policy/mod.rs`, `audit_covers_rules`).
 * `class_agrees_with_conversation` asserts the class/decision relation over the table and over every row (`policy/mod.rs`, `class_agrees_with_conversation`).
 * `rules_are_process_disjoint` asserts the literal sets are pairwise disjoint and that each spelling fires its own rule (`policy/mod.rs`, `rules_are_process_disjoint`).
 * `remote_rules` exercises both service names, both cases, four process shapes and three near misses (`policy/mod.rs`, `remote_rules`).
@@ -475,7 +476,7 @@ The Rust reader asserts, per row, the identity provenance, the env interpretatio
 * `refinement_cannot_change_a_participation` runs every corpus row through `classify` and then `refine` under three configs, and asserts that a skip stays skipped, that a participating row comes back **by value unchanged** (same conversation and class, hence the same mechanism and planned deadline), and that only a refused service name can add R1's skip (`policy/mod.rs`, `refinement_cannot_change_a_participation`). Whole-value equality is the point: a refinement that kept the conversation but changed the rule or the class would otherwise be caught only by `run`'s `debug_assert!`, which release builds drop.
 * `rule_permutation_moves_named_rows` moves R2 after R8 and R1 after R8, asserting the exact changed set **and** that every other row is unmoved (`policy/mod.rs`, `rule_permutation_moves_named_rows`).
 * `unreachable_rule_rows` asserts R10 is last, unconditional, and that no other rule matches the null context (`policy/mod.rs`, `unreachable_rule_rows`).
-* `evidence_citations_resolve` resolves every in-tree citation, requires a `policy/table.rs` citation to land on the declaration it names (with a planted and reverted one-line drift as the control), and reports which files it read (`policy/mod.rs`, `evidence_citations_resolve`).
+* `evidence_citations_resolve` resolves every in-tree citation of the audit record, requires a `policy/table.rs` citation to land on the declaration it names (with a planted and reverted one-line drift as the control), and reports which files it read (`policy/mod.rs`, `evidence_citations_resolve`).
 
 The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for it, and asserts that the executed count equals the number of `e2e=1` rows, with a floor of 15 (`scripts/ci/test-pam-conv-thread.sh:283-286`, `:774-789`).
 
@@ -485,7 +486,7 @@ The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for
 | :--- | :--- |
 | `context.rs` | `strip_deleted_suffix` (the `(deleted)` strip including a basename that strips to empty); `comm_fallback_trims_and_rejects_empty` (`comm` trimming and empty rejection, asserted through to R5); `exe_wins_over_comm`; `gdm_reauth_env_parsing` (presence-only parsing without `set_var`); `gdm_reauth_requires_service` (the reauth flag needing the service half, including `sddm` with the flag set still skipping) |
 | `plan.rs` | `plan_table` (every `Plannable × has_tty` cell and exactly three distinct plans); `threaded_plan_ignores_has_tty`; `gui_deadline_is_min` (`GuiBounded` as `min` in four configurations including zero); `deadline_saturates_at_u32_max` |
-| `policy/mod.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
+| `policy/mod.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, the audit record, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
 | `outcome.rs` | `outcome_table_code_and_notice` (the code and notice matrix, including that `DaemonTimedOut` is silent while `TimedOut` is announced and that a replay is silent), `from_daemon_maps_every_answer`, `replay_never_upgrades`, `skip_policy_maps_to_outcome`, `mechanism_end_error_maps_to_error` (the `From<MechanismEnd> for Outcome` mapping keeps the `Error` arm a processing failure; the `outcome.rs` test module) |
 | `transaction/tests` | `finished_reports_its_outcome_and_provenance`; `armed_requires_both_connect_and_send`; `replay_notice_is_silent`; `tty_probe_only_for_sequential`; `cache_hit_does_not_open_tty`; `announcement_order_matches_today`, `precollected_never_plans`, `unrecorded_paths_emit_their_notice`, `a_cache_hit_is_a_replay_conclusion`, `a_replayed_failure_emits_nothing` |
 | `conclusion_cache.rs` | `reuse_key_is_case_sensitive`; `a_poisoned_lock_reads_as_a_cache_miss`; `conclusion_cache_survives_fork` (no longer `#[ignore]`d) |
@@ -540,6 +541,7 @@ These are the things the implementation does not prove. Each names its consequen
 | the daemon-side `Timeout` e2e shape exists only for an R5 threaded host | the verdict-and-notice mapping for a daemon-side `Timeout` is unit-covered (`outcome_table_code_and_notice`, and `Outcome::from_daemon`), but no test in `transaction/tests` names `PamOutcome::Timeout` or `DaemonTimedOut`: the transaction path for the sequential and pre-collected mechanisms is untested, and no stack drives one |
 | `scripts/ci/test-pam-host-cases.sh` is covered in CI but has not been run locally | `.github/workflows/ci.yml:188-195` runs it as root in `build-and-test`, which runs on `pull_request` (`ci.yml:20-35`); PR #160 run 42286328114 / job 128127980029 shows the step succeeded at `a55608b`. Locally `sudo -n` fails (password required), so it cannot run here, and it has not been observed at this branch's HEAD |
 | the `pthread_atfork` registration-failure branch (`conclusion_cache.rs:243-250`) is unexercised | the `res != 0` warning and the "cache keeps working" fallback have no test; only a system where registration fails would exercise them, and on such a system the D4 deadlock would return silently |
+| `RuleId::ALL` (`policy/mod.rs`) is the enumeration the audit guard walks, and nothing makes it complete at compile time | a variant added to `RuleId`, `as_str` and `audit` but omitted from `ALL` is not caught: `audit_covers_rules` would still see equal lengths for the variants it lists, and `corpus_covers_every_rule` iterates `RULES`, so a rule whose row and enumeration entry are both missing stays green. Adding a variant to `ALL` and not to `RULES` **is** caught, by the length comparison |
 
 Covered by this follow-up and no longer gaps: fork safety, the `skip_never_hands_off` token read, the `pipe2`/`pthread_create` local-resource paths, the `DaemonTimedOut` silence on a threaded host, the sequential poll-error cell and the self-derived tty column. They are asserted by the tests named in §6.3 and §6.4.
 
