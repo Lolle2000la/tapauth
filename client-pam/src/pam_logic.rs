@@ -1014,10 +1014,27 @@ mod tests {
     /// would always see the built-ins only and let a renamed remote stack ring
     /// the phone. Same stripped-source technique and positive control as
     /// `only_one_get_service_name_call_site`.
+    ///
+    /// The scan is the second line of defence, not the first: the configured
+    /// matcher it covers (`refused_service`) is private to `policy`, so a
+    /// second module cannot reach it at all and this text scan cannot be
+    /// defeated by an aliased import.
     #[test]
     fn only_one_refine_call_site() {
         const NEEDLE: &str = "policy::refine";
         let files = source_files();
+        let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
+        // The caller and the module that defines the phase. The count below
+        // cannot tell "the call site moved" from "the scan stopped reading the
+        // file", so each file must also be shown to carry the declarations the
+        // claim is about.
+        for required in ["pam_logic.rs", "policy.rs"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "the scan did not cover {required}: {names:?}"
+            );
+        }
+
         let mut call_sites: Vec<String> = Vec::new();
         let mut logic_source = String::new();
         for path in &files {
@@ -1026,8 +1043,18 @@ mod tests {
             for (line, text) in identifier_hits(&cleaned, NEEDLE) {
                 call_sites.push(format!("{rel}:{line}: {text}"));
             }
-            if rel == "pam_logic.rs" {
-                logic_source = cleaned;
+            match rel.as_str() {
+                "pam_logic.rs" => {
+                    // `orchestrate` holds the one call site, above this file's
+                    // only test module; a scan truncated at an early
+                    // `#[cfg(test)]` item would see neither.
+                    assert_scan_reaches(&rel, &cleaned, &["fn orchestrate"]);
+                    logic_source = cleaned;
+                }
+                "policy.rs" => {
+                    assert_scan_reaches(&rel, &cleaned, &["fn refine(", "fn refused_service("])
+                }
+                _ => {}
             }
         }
 
@@ -1870,8 +1897,12 @@ mod tests {
             let cleaned = production_source(path);
             if rel == "transaction.rs" {
                 // Guard against a re-truncated scan: this test's claim is that
-                // `run` and the reuse cache produce no code of their own, so the
-                // scan must actually have seen both (see `production_source`).
+                // `run` mints no `PAM_*` code of its own, so the scanned text
+                // must actually reach it (see `production_source`). Only `run`
+                // is asserted: the reuse cache is no longer in this file — it
+                // lives in `conclusion_cache.rs`, which this loop still scans
+                // for codes like any other module but whose ownership
+                // assertion is `cache_owner_is_local`'s, not this one's.
                 assert_scan_reaches(&rel, &cleaned, &["fn run"]);
             }
             for (offset, text) in pam_code_sites(&cleaned) {
@@ -1963,9 +1994,13 @@ mod tests {
             let rel = relative_to_src(path);
             let cleaned = production_source(path);
             if rel == "transaction.rs" {
-                // Guard against a re-truncated scan: the two grant constructors
-                // are reached from `run` and refused by the cache, so the scan
-                // must have seen both halves of this file.
+                // Guard against a re-truncated scan: what this file must be
+                // shown to contain is `run`, the orchestration half that reaches
+                // a constructor. The other half this comment used to name — the
+                // reuse cache, which is what stops a replay from reaching one —
+                // is in `conclusion_cache.rs` now, scanned by the loop below
+                // like any other module; its ownership assertion is
+                // `cache_owner_is_local`'s.
                 assert_scan_reaches(&rel, &cleaned, &["fn run"]);
             }
             if rel == "outcome.rs" {

@@ -22,7 +22,7 @@
 use crate::context::{CallerContext, ProcessIdentity, ServiceName};
 
 /// What the module does with the call.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Classification {
     Skip(SkipPolicy),
     Participate(Participation),
@@ -92,7 +92,7 @@ pub(crate) enum Decision {
 }
 
 /// A rule that matched, with the class it was authored against.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Participation {
     /// Which rule fired. Read by the policy tests today; consumed by the
     /// transaction's plan assertion once `transaction::run` exists.
@@ -468,7 +468,7 @@ fn classification_of(rule: &Rule) -> Classification {
 /// matches nothing — an unresolved service never matches either. Malformed
 /// entries are already dropped by `PamConfig::effective_refused_services`; the
 /// empty-name guard keeps a raw slice from matching a `None`/empty service.
-pub(crate) fn refused_service(service: Option<&ServiceName>, configured: &[String]) -> bool {
+fn refused_service(service: Option<&ServiceName>, configured: &[String]) -> bool {
     service.is_some_and(|service| {
         configured
             .iter()
@@ -1269,16 +1269,16 @@ mod tests {
     /// row and per config:
     ///
     /// * a skipped row stays skipped, with its own rule and policy;
-    /// * a participating row whose service is *not* configured keeps its
-    ///   mechanism and its planned deadline;
+    /// * a participating row whose service is *not* configured comes back by
+    ///   value unchanged (rule, conversation, class, hence the same deadline);
     /// * a participating row whose service *is* configured becomes R1's
     ///   `Skip(RemoteAuthentication)`, and nothing else changes policy.
     ///
     /// The defect this catches: a refinement that rebuilds the participation
-    /// (so a threaded call could silently become sequential, which also moves
-    /// the planned deadline), one that "unrefuses" a skip (a configured or
-    /// built-in refusal turning back into a participation), and one that keys on
-    /// the process name rather than the service.
+    /// — a different conversation (which moves the plan and the deadline), or
+    /// the same conversation with another rule or class, which only `run`'s
+    /// `debug_assert!` would see — one that "unrefuses" a skip, and one that
+    /// keys on the process name rather than the service.
     #[test]
     fn refinement_cannot_change_a_participation() {
         let rows = rows();
@@ -1344,7 +1344,7 @@ mod tests {
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(service))
                 });
-                let after = refine(before, ctx.service(), configured);
+                let after = refine(before.clone(), ctx.service(), configured);
                 let after_policy = policy_of(&after);
 
                 let was_skipped = before_mechanism.is_none();
@@ -1374,17 +1374,17 @@ mod tests {
                         row.id
                     );
                 } else {
+                    // Whole-value equality, not just the conversation and the
+                    // plan derived from it: `rule` and `failure_direction` are
+                    // part of the value, so a refine that rebuilt the
+                    // participation with the same conversation but another
+                    // class fails here rather than only in `run`'s
+                    // `debug_assert!`, which release builds drop.
                     assert_eq!(
-                        after_policy, before_policy,
-                        "{label}: row {} ({}) must keep its decision",
+                        after, before,
+                        "{label}: row {} ({}) must come back from the \
+                         refinement unchanged, class and rule included",
                         row.id, row.why
-                    );
-                    assert_eq!(
-                        mechanism_and_plan(&after, row.tty),
-                        before_mechanism,
-                        "{label}: row {} ({}) must keep its mechanism and planned deadline",
-                        row.id,
-                        row.why
                     );
                 }
             }
