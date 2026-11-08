@@ -897,7 +897,10 @@ fn the_walker_separates_test_modules_from_production() {
         "policy/mod.rs",
         "policy/refine.rs",
         "policy/table.rs",
-        "transaction.rs",
+        "transaction/host_io.rs",
+        "transaction/lifecycle.rs",
+        "transaction/mod.rs",
+        "transaction/run.rs",
     ] {
         assert!(
             shipped.iter().any(|name| name == required),
@@ -911,6 +914,7 @@ fn the_walker_separates_test_modules_from_production() {
             "pam_logic/tests/mod.rs".to_owned(),
             "pam_logic/tests/reuse.rs".to_owned(),
             "source_guards.rs".to_owned(),
+            "transaction/tests/mod.rs".to_owned(),
         ],
         "these are the only files a `#[cfg(test)] mod` declares"
     );
@@ -931,7 +935,11 @@ fn the_walker_separates_test_modules_from_production() {
         "a `#[cfg(test)] mod` file must scan as empty production"
     );
     assert!(
-        production_source(&src_root().join("transaction.rs")).contains("fn run"),
+        production_source(&src_root().join("transaction/tests/mod.rs")).is_empty(),
+        "a test module in its own file must scan as empty production"
+    );
+    assert!(
+        production_source(&src_root().join("transaction/run.rs")).contains("fn run"),
         "a production file must still be read, not dropped"
     );
 }
@@ -1021,7 +1029,9 @@ fn only_outcome_rs_returns_pam_constants() {
         "lib.rs",
         "pam_logic/mod.rs",
         "pam_logic/wiring.rs",
-        "transaction.rs",
+        "transaction/run.rs",
+        "transaction/lifecycle.rs",
+        "transaction/host_io.rs",
         "mechanism/mod.rs",
         "mechanism/threaded.rs",
         "mechanism/sequential.rs",
@@ -1043,12 +1053,12 @@ fn only_outcome_rs_returns_pam_constants() {
             continue;
         }
         let cleaned = production_source(path);
-        if rel == "transaction.rs" {
+        if rel == "transaction/run.rs" {
             // Guard against a re-truncated scan: this test's claim is that
             // `run` mints no `PAM_*` code of its own, so the scanned text
             // must actually reach it (see `production_source`). Only `run`
-            // is asserted: the reuse cache is no longer in this file — it
-            // lives in `conclusion_cache.rs`, which this loop still scans
+            // is asserted: the reuse cache is no longer in the transaction —
+            // it lives in `conclusion_cache.rs`, which this loop still scans
             // for codes like any other module but whose ownership
             // assertion is `cache_owner_is_local`'s, not this one's.
             assert_scan_reaches(&rel, &cleaned, &["fn run"]);
@@ -1081,10 +1091,10 @@ fn only_outcome_rs_returns_pam_constants() {
 /// findings for the file `rel`.
 ///
 /// `outcome.rs` is where both constructors are defined, and the orchestration
-/// (`pam_logic/mod.rs`) and the transaction (`transaction.rs`) are the only code
-/// allowed to call them. A mechanism, a rule, a plan or a test helper calling
-/// either — or building `Outcome::Granted` by hand — is a second way to mint a
-/// grant.
+/// (`pam_logic/mod.rs`) and the transaction's concluding half
+/// (`transaction/lifecycle.rs`) are the only code allowed to call them. A
+/// mechanism, a rule, a plan or a test helper calling either — or building
+/// `Outcome::Granted` by hand — is a second way to mint a grant.
 fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
     let mut findings = Vec::new();
     for (line, text) in identifier_hits(cleaned, "granted_from_daemon")
@@ -1097,7 +1107,7 @@ fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
             || text.contains("fn replayed");
         let allowed = match rel {
             "outcome.rs" => true,
-            "pam_logic/mod.rs" | "transaction.rs" => call,
+            "pam_logic/mod.rs" | "transaction/lifecycle.rs" => call,
             _ => false,
         };
         if !allowed {
@@ -1125,7 +1135,8 @@ fn granted_only_from_daemon() {
         "outcome.rs",
         "pam_logic/mod.rs",
         "pam_logic/wiring.rs",
-        "transaction.rs",
+        "transaction/run.rs",
+        "transaction/lifecycle.rs",
         "mechanism/mod.rs",
         "mechanism/threaded.rs",
         "mechanism/sequential.rs",
@@ -1142,7 +1153,7 @@ fn granted_only_from_daemon() {
     for path in &files {
         let rel = relative_to_src(path);
         let cleaned = production_source(path);
-        if rel == "transaction.rs" {
+        if rel == "transaction/run.rs" {
             // Guard against a re-truncated scan: what this file must be
             // shown to contain is `run`, the orchestration half that reaches
             // a constructor. The other half this comment used to name — the
@@ -1374,17 +1385,23 @@ fn test_pam_ignore_scan_detects_a_real_return() {
 /// meaningful.
 #[test]
 fn cache_lookup_precedes_daemon_contact() {
-    let source = include_str!("transaction.rs");
-    // Only the production half of the file: the test module contains the
-    // same identifiers, which would otherwise satisfy the searches no matter
-    // what the production code does. The split is on the test *module*
-    // declaration — `transaction.rs` also carries individual `#[cfg(test)]`
-    // items above `run` (`HostIo::for_test`, the two test accessors), which a
-    // bare `split_once("#[cfg(test)]")` would stop at.
-    let production = source
-        .split_once("\n#[cfg(test)]\n#[allow(")
-        .map(|(before, _)| before)
-        .unwrap_or(source);
+    // The lookup and the daemon contact both live in `run`, which is
+    // `transaction/run.rs`. `production_source` is the same reader every other
+    // scan uses: it cuts the file at its first `#[cfg(test)]` *module* and
+    // answers a test-only file with an empty scan, so the transaction's test
+    // module is not read as production however it is declared.
+    let production = production_source(&src_root().join("transaction/run.rs"));
+    // An empty scan would satisfy no assertion below (both searches panic), so
+    // the guard is that the read reached the driver at all.
+    assert_scan_reaches(
+        "transaction/run.rs",
+        &production,
+        &[
+            "fn run",
+            "replay_for(username, service_name.original(), Instant::now())",
+            "let request = SendParams {",
+        ],
+    );
 
     // The call, not the `if let` that contains it: rustfmt is free to break
     // the pattern across lines.
@@ -1422,7 +1439,7 @@ fn reuse_suite_is_intact() {
     let names: Vec<String> = files.iter().map(|path| relative_to_src(path)).collect();
     for required in [
         "pam_logic/tests/reuse.rs",
-        "transaction.rs",
+        "transaction/tests/mod.rs",
         "conclusion_cache.rs",
         "source_guards.rs",
     ] {
