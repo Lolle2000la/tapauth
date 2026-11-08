@@ -167,7 +167,7 @@ impl<I: IpcResponseReader> Armed<I> {
     /// the record.
     ///
     /// `connect` and `send` are borrowed effects so both failure paths are
-    /// testable without a daemon (`verdict_reuse_tests`); production passes
+    /// testable without a daemon (`pam_logic::tests::reuse`); production passes
     /// `IpcClient::connect_nonblocking` and [`crate::pam_logic`]'s
     /// `send_authenticate_request`. They are `&mut dyn` rather than type
     /// parameters so the reader stays this type's only generic argument.
@@ -655,7 +655,7 @@ pub(crate) fn armed_for_test<I: IpcResponseReader>(ipc: I, request_id: &str) -> 
 
 // reason: test module; the crate root denies unwrap/expect/panic/indexing.
 // This module's `#[cfg(test)]` stays immediately followed by `#[allow(`: the
-// split in `pam_logic`'s `cache_lookup_precedes_daemon_contact` relies on it.
+// split in `source_guards`' `cache_lookup_precedes_daemon_contact` relies on it.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

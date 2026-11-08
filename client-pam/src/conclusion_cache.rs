@@ -466,7 +466,7 @@ pub(crate) mod tests {
 
     /// A poisoned lock reads as a cache miss.
     ///
-    /// Moved here from `pam_logic::verdict_reuse_tests` when the record did: its
+    /// Moved here from `pam_logic::tests::reuse` when the record did: its
     /// seam (`lookup_in`, which takes the lock as a parameter) is private to the
     /// cache's module, so the test follows it. Same scenario, same assertion.
     ///

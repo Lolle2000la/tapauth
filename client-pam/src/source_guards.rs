@@ -12,7 +12,7 @@
 /// `PAM_SERVICE` is read at exactly one call site, in `CallerContext::capture`.
 ///
 /// The defect this catches: a second `pam_sys::get_service_name(pamh)` call
-/// reappearing in `pam_logic.rs`. The pre-refactor tree resolved the service
+/// reappearing in `pam_logic/mod.rs`. The pre-refactor tree resolved the service
 /// twice — once in the display-manager bypass and once for the conversation
 /// mode, the cache key and the request — so the bypass could decide from one
 /// string while the cache keyed on another.
@@ -107,7 +107,7 @@ fn only_one_refine_call_site() {
     // cannot tell "the call site moved" from "the scan stopped reading the
     // file", so each file must also be shown to carry the declarations the
     // claim is about.
-    for required in ["pam_logic.rs", "policy/refine.rs"] {
+    for required in ["pam_logic/mod.rs", "policy/refine.rs"] {
         assert!(
             names.iter().any(|name| name == required),
             "the scan did not cover {required}: {names:?}"
@@ -123,7 +123,7 @@ fn only_one_refine_call_site() {
             call_sites.push(format!("{rel}:{line}: {text}"));
         }
         match rel.as_str() {
-            "pam_logic.rs" => {
+            "pam_logic/mod.rs" => {
                 // `orchestrate` holds the one call site, above this file's
                 // only test module; a scan truncated at an early
                 // `#[cfg(test)]` item would see neither.
@@ -145,7 +145,7 @@ fn only_one_refine_call_site() {
     );
     let only = call_sites.first().map(String::as_str).unwrap_or_default();
     assert!(
-        only.starts_with("pam_logic.rs:"),
+        only.starts_with("pam_logic/mod.rs:"),
         "the single refinement must run from `orchestrate`, found {only}"
     );
 
@@ -889,7 +889,8 @@ fn the_walker_separates_test_modules_from_production() {
         "mechanism/sequential.rs",
         "mechanism/threaded.rs",
         "outcome.rs",
-        "pam_logic.rs",
+        "pam_logic/mod.rs",
+        "pam_logic/wiring.rs",
         "pam_messages.rs",
         "pam_sys.rs",
         "plan.rs",
@@ -906,8 +907,12 @@ fn the_walker_separates_test_modules_from_production() {
     let test_only: Vec<String> = gated.iter().map(|p| relative_to_src(p)).collect();
     assert_eq!(
         test_only,
-        vec!["source_guards.rs".to_owned()],
-        "this module is the only file a `#[cfg(test)] mod` declares"
+        vec![
+            "pam_logic/tests/mod.rs".to_owned(),
+            "pam_logic/tests/reuse.rs".to_owned(),
+            "source_guards.rs".to_owned(),
+        ],
+        "these are the only files a `#[cfg(test)] mod` declares"
     );
     let mut listed = shipped;
     listed.extend(test_only);
@@ -1014,7 +1019,8 @@ fn only_outcome_rs_returns_pam_constants() {
     for required in [
         "outcome.rs",
         "lib.rs",
-        "pam_logic.rs",
+        "pam_logic/mod.rs",
+        "pam_logic/wiring.rs",
         "transaction.rs",
         "mechanism/mod.rs",
         "mechanism/threaded.rs",
@@ -1074,11 +1080,11 @@ fn only_outcome_rs_returns_pam_constants() {
 /// The grant constructors, and any hand-built `Outcome::Granted`, as
 /// findings for the file `rel`.
 ///
-/// `outcome.rs` is where both constructors are defined, and the
-/// orchestration (`pam_logic.rs` now, `transaction.rs` once the cache moves
-/// there) is the only code allowed to call them. A mechanism, a rule, a
-/// plan or a test helper calling either — or building `Outcome::Granted`
-/// by hand — is a second way to mint a grant.
+/// `outcome.rs` is where both constructors are defined, and the orchestration
+/// (`pam_logic/mod.rs`) and the transaction (`transaction.rs`) are the only code
+/// allowed to call them. A mechanism, a rule, a plan or a test helper calling
+/// either — or building `Outcome::Granted` by hand — is a second way to mint a
+/// grant.
 fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
     let mut findings = Vec::new();
     for (line, text) in identifier_hits(cleaned, "granted_from_daemon")
@@ -1091,7 +1097,7 @@ fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
             || text.contains("fn replayed");
         let allowed = match rel {
             "outcome.rs" => true,
-            "pam_logic.rs" | "transaction.rs" => call,
+            "pam_logic/mod.rs" | "transaction.rs" => call,
             _ => false,
         };
         if !allowed {
@@ -1117,7 +1123,8 @@ fn granted_only_from_daemon() {
     let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
     for required in [
         "outcome.rs",
-        "pam_logic.rs",
+        "pam_logic/mod.rs",
+        "pam_logic/wiring.rs",
         "transaction.rs",
         "mechanism/mod.rs",
         "mechanism/threaded.rs",
@@ -1232,7 +1239,7 @@ fn granted_scan_detects_a_planted_construction() {
         "a mechanism must not build a grant or call a grant constructor: {mechanism:?}"
     );
 
-    let orchestration = grant_findings("pam_logic.rs", &planted);
+    let orchestration = grant_findings("pam_logic/mod.rs", &planted);
     assert_eq!(
         orchestration.len(),
         1,
@@ -1248,7 +1255,7 @@ fn granted_scan_detects_a_planted_construction() {
 }
 
 /// The mapping above only covers daemon responses.  Guard *every* file of
-/// this crate — not just `pam_logic.rs` and `lib.rs` — against
+/// this crate — not just `pam_logic` and `lib.rs` — against
 /// reintroducing `PAM_IGNORE`, by identifier and by its numeric value.
 ///
 /// The numeric half is the one that matters for regressions: the vectors
@@ -1269,7 +1276,8 @@ fn test_module_source_contains_no_pam_ignore_return() {
     // An empty or relocated scan must not pass silently: these files carry
     // the mechanism exits, the verdict mapping and the orchestration.
     for required in [
-        "pam_logic.rs",
+        "pam_logic/mod.rs",
+        "pam_logic/wiring.rs",
         "outcome.rs",
         "mechanism/sequential.rs",
         "mechanism/threaded.rs",
@@ -1412,7 +1420,12 @@ fn cache_lookup_precedes_daemon_contact() {
 fn reuse_suite_is_intact() {
     let files = source_files();
     let names: Vec<String> = files.iter().map(|path| relative_to_src(path)).collect();
-    for required in ["pam_logic.rs", "transaction.rs", "conclusion_cache.rs"] {
+    for required in [
+        "pam_logic/tests/reuse.rs",
+        "transaction.rs",
+        "conclusion_cache.rs",
+        "source_guards.rs",
+    ] {
         assert!(
             names.iter().any(|name| name == required),
             "the scan did not cover {required}: {names:?}"
