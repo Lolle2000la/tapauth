@@ -69,7 +69,7 @@ impl IpcClient {
         let sock_path = socket_path();
 
         // Connect and immediately set nonblocking for poll-based I/O
-        // No timeouts - poll() in pam_logic.rs handles all timing
+        // No timeouts - the loops in `mechanism/` handle all timing
         let stream = UnixStream::connect(&sock_path)?;
         stream.set_nonblocking(true)?;
 

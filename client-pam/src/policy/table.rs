@@ -20,7 +20,7 @@ use super::{
 /// dropped.
 // reason: name/evidence are the shipped audit record; only the policy tests read them.
 #[allow(dead_code)]
-pub(crate) struct Rule {
+pub(super) struct Rule {
     pub(crate) id: RuleId,
     /// The rule's symbolic name (`dm_login_bypass`, …).
     pub(crate) name: &'static str,
@@ -37,7 +37,7 @@ pub(crate) struct Rule {
 /// call is refused whatever its process or service is), R2 precedes everything
 /// after it (the keyring constraint belongs to the service, not to the process),
 /// and R10 is last and unconditional.
-pub(crate) static RULES: [Rule; 10] = [
+pub(super) static RULES: [Rule; 10] = [
     Rule {
         id: RuleId::R1,
         name: "remote_refuse",
@@ -254,11 +254,18 @@ fn kscreenlocker_worker(ctx: &CallerContext) -> bool {
 }
 
 /// R6 — hyprlock.
+///
+/// Accepted risk: the host answers from a worker `std::thread` with a
+/// mutex/condvar — a genuine concurrent race, accepted with an unsynchronised
+/// `resetConversation`/`checkWaiting`.
 fn hyprlock(ctx: &CallerContext) -> bool {
     matches!(ctx.process().name(), Some("hyprlock"))
 }
 
 /// R7 — xsecurelock's helper.
+///
+/// Accepted risk: the conversation is answered by the helper's own thread pool,
+/// and `CallPAMWithRetries` can re-run the module up to three times.
 fn xsecurelock(ctx: &CallerContext) -> bool {
     matches!(ctx.process().name(), Some("authproto_pam"))
 }

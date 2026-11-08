@@ -252,7 +252,7 @@ fn no_ruser_read() {
 /// sources are ASCII apart from localisation strings, which are blanked
 /// here.  A non-ASCII *char* literal would be taken for a lifetime and
 /// copied verbatim, which can only hide a needle, never invent one.
-pub(crate) fn stripped_source(source: &str) -> String {
+fn stripped_source(source: &str) -> String {
     let b = source.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0usize;
@@ -536,7 +536,7 @@ fn read_numeric_literal(b: &[u8], start: usize) -> (Option<u128>, usize) {
 /// Recursive: `src/mechanism/` is a directory with no `rs` extension, so a
 /// single-level `read_dir` would silently stop covering the mechanisms once
 /// step 6 creates them.
-pub(crate) fn source_files() -> Vec<std::path::PathBuf> {
+fn source_files() -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -707,7 +707,7 @@ fn module_file(declaring: &std::path::Path, name: &str) -> Option<std::path::Pat
 /// A source file's path relative to `src`, e.g. `outcome.rs` or
 /// `mechanism/threaded.rs`. Every exemption below is written against this,
 /// never against a bare file name.
-pub(crate) fn relative_to_src(path: &std::path::Path) -> String {
+fn relative_to_src(path: &std::path::Path) -> String {
     let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
     path.strip_prefix(src)
         .unwrap_or(path)
@@ -723,7 +723,7 @@ pub(crate) fn relative_to_src(path: &std::path::Path) -> String {
 /// would flag the assertions instead of the code. Cutting at the test
 /// *module* rather than at the first `#[cfg(test)]` item is what keeps the
 /// production code above it in the scan: a file that carries a test-only
-/// accessor early (`transaction.rs`'s `Finished::outcome`, `context.rs`'s
+/// accessor early (`transaction/lifecycle.rs`'s `Finished::outcome`, `context.rs`'s
 /// `from_parts`, `pam_sys.rs`'s `dummy`) would otherwise be scanned only up
 /// to that item, and every assertion over the file would pass vacuously.
 ///
@@ -731,7 +731,7 @@ pub(crate) fn relative_to_src(path: &std::path::Path) -> String {
 /// production half: it is answered with an empty scan. `production_paths` is
 /// the authority for that, and `the_walker_separates_test_modules_from_production`
 /// proves it does not also drop a production file.
-pub(crate) fn production_source(path: &std::path::Path) -> String {
+fn production_source(path: &std::path::Path) -> String {
     if !production_paths().contains(path) {
         return String::new();
     }
@@ -809,7 +809,7 @@ fn test_module_start(source: &str) -> Option<usize> {
 /// have seen, and this is the one place the message lives. The needles are
 /// substrings of the declarations as written (`run` takes a `&mut Effects`,
 /// so a scan that only had to reach the `fn run` head still does).
-pub(crate) fn assert_scan_reaches(rel: &str, cleaned: &str, needles: &[&str]) {
+fn assert_scan_reaches(rel: &str, cleaned: &str, needles: &[&str]) {
     for needle in needles {
         assert!(
             cleaned.contains(needle),

@@ -1,6 +1,6 @@
 # PAM conversation policy
 
-Status: specification of shipped behaviour. Scope: `client-pam`. This document ships with the change it specifies: it describes the module as it stands at the end of that change (nineteen commits, `57d829a..7d4c486`) plus the gap-closure follow-up (`8ecea4c`, `d94196e`, `ae4afd4`, `b00f647`, `5a6c122`, `753e3f9`, `9f4fb57`, `bdb39a7`, `7ad8f31`, `9da2d85`) the named second decision phase `policy::refine` (§3.3.1), the reuse record split into `conclusion_cache.rs` (§3.6), and the layout split of `transaction/`, `pam_logic/` and `policy/` (`9101192..1c17231`). `client-pam/src/policy/` is the executable form of the rule table in §3.3, and where this prose and that code disagree, the code is authoritative. §4's inventory (the fixture corpus) and §6's tests are what make such a disagreement visible.
+Status: specification of shipped behaviour. Scope: `client-pam`. This document ships with the change it specifies: it describes the module as it stands at the end of that change (nineteen commits, `57d829a..7d4c486`) plus the gap-closure follow-up (`8ecea4c`, `d94196e`, `ae4afd4`, `b00f647`, `5a6c122`, `753e3f9`, `9f4fb57`, `bdb39a7`, `7ad8f31`, `9da2d85`) the named second decision phase `policy::refine` (§3.3.1), the reuse record split into `conclusion_cache.rs` (§3.6), and the layout split of `transaction/`, `pam_logic/` and `policy/` (`9c69211..c639839`). `client-pam/src/policy/` is the executable form of the rule table in §3.3, and where this prose and that code disagree, the code is authoritative. §4's inventory (the fixture corpus) and §6's tests are what make such a disagreement visible.
 
 ---
 
@@ -18,7 +18,7 @@ The module answers four questions about one `pam_authenticate` call: *does the p
 | `ConclusionCache` | `conclusion_cache.rs` | The 500 ms reuse record, its gates and its `pthread_atfork` child handler (`conclusion_cache.rs:70-399`) |
 | `mechanism::{threaded, sequential, handoff}` | `mechanism/*.rs` | The three ways to answer a PAM ABI conversation; each takes `&mut Armed` and only what it needs, and returns a `MechanismEnd`, never an `Outcome` (`mechanism/mod.rs:30-34`) |
 
-`pam_logic/` is orchestration, wiring and scans only: `pam_logic/mod.rs` holds `authenticate` and `orchestrate`, `pam_logic/wiring.rs` the three production effects (`probe_tty`, `send_authenticate_request`, `cancel_on_fresh_connection`), and the tests live under `pam_logic/tests/` (`pam_logic/mod.rs`, `authenticate`; `orchestrate`).
+`pam_logic/` is orchestration, wiring and scans only: `pam_logic/mod.rs` holds `authenticate` and `orchestrate`, `pam_logic/wiring.rs` the four production effects (`probe_tty`, `connect`, `send_authenticate_request`, `cancel_on_fresh_connection`), and the tests live under `pam_logic/tests/` (`pam_logic/mod.rs`, `authenticate`; `orchestrate`).
 
 **What the shape buys.**
 
@@ -47,7 +47,7 @@ The pre-refactor file is reachable at `git show 57d829a^:client-pam/src/pam_logi
 
 ### 2.2 The failure-direction taxonomy is a table cell
 
-The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy/mod.rs`, `FailureDirection`), a field of every rule (`policy/table.rs`, `Rule`), copied onto the returned `Participation` (`policy/mod.rs`, `Participation`; `classification_of`), asserted against the conversation by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-checked where the value first meets the plan (`transaction/run.rs:149-157`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
+The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy/mod.rs`, `FailureDirection`), a field of every rule (`policy/table.rs`, `Rule`), copied onto the returned `Participation` (`policy/mod.rs`, `Participation`; `classification_of`), asserted against the conversation by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-checked where the value first meets the plan (`transaction/run.rs:158-166`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
 
 ### 2.3 The return code is produced at one site
 
@@ -102,7 +102,7 @@ lib.rs ──> pam_logic/ ──> context.rs
 
 Dependency direction is one-way. `context` depends on `pam_sys` and nothing else in the crate (`context.rs:8-10`); `policy` on `context` (`policy/mod.rs:31`); `plan` names no policy or caller type (`plan.rs:1-8`); `outcome` names `policy::SkipPolicy` from the policy and nothing else (`outcome.rs:31`); `transaction` on all of them plus the mechanisms (`transaction/run.rs:12-24`), and it reads the reuse record only through `conclusion_cache::record`/`replay_for`; `conclusion_cache` depends on `transaction` for `Concluded`/`Via` and on nothing else in the crate (`conclusion_cache.rs:24-26`); each mechanism on `transaction`'s `Armed`/`HostIo` and on the `MechanismEnd` contract in its own module (`mechanism/threaded.rs:16-21`, `mechanism/sequential.rs:58-62`, `mechanism/handoff.rs:23-26`). No mechanism takes `&CallerContext` or `&PamConfig`, so it cannot re-branch on identity or recompute the deadline (`mechanism/mod.rs:15-23`).
 
-Construction order is part of the contract: `capture` runs first (`pam_logic/mod.rs`, `authenticate`), `classify` is the first thing `orchestrate` does (`pam_logic/mod.rs`, `orchestrate`), and only a `Participate` reaches `PamConfig::load` (`pam_logic/mod.rs:213`). A built-in R1/R2 skip still returns before that read (`pam_logic/mod.rs:208-210`); a participating call loads the config, runs `policy::refine` exactly once (`pam_logic/mod.rs:227-234`), and returns R1's verdict for a configured name before `get_user`, `PamConversation::new` and `load_for_user` (the three calls at `pam_logic/mod.rs:236`, `:251` and `:265`).
+Construction order is part of the contract: `capture` runs first (`pam_logic/mod.rs`, `authenticate`), `classify` is the first thing `orchestrate` does (`pam_logic/mod.rs`, `orchestrate`), and only a `Participate` reaches `PamConfig::load` (`pam_logic/mod.rs:216`). A built-in R1/R2 skip still returns before that read (`pam_logic/mod.rs:211-213`); a participating call loads the config, runs `policy::refine` exactly once (`pam_logic/mod.rs:230-237`), and returns R1's verdict for a configured name before `get_user`, `PamConversation::new` and `load_for_user` (the three calls at `pam_logic/mod.rs:240`, `:255` and `:268`).
 
 ### 3.2 `CallerContext` (`context.rs`)
 
@@ -139,7 +139,7 @@ pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification)
 
 Order is load-bearing at the head and the tail: R1 before everything, R2 before everything after it, R10 last.
 
-The table decides from the caller facts alone, before any config is read: that is the **first phase**. The **second phase** is `policy::refine` (`policy/refine.rs`, `refine`), which `orchestrate` calls once, immediately after the one config read, and whose only job is to add R1's skip for a service a deployment named in `pam_refused_services` (`pam_logic/mod.rs:227-234`). The invariant is why the phases are not merged: refinement may **add** a skip, but it may never remove or reclassify one, may never change a participating call's mechanism, and may never change its deadline — the only value it ever constructs is `Skip(RemoteAuthentication)`, and the `Participation` it is handed comes back unchanged (`policy/refine.rs`, `refine`). `refinement_cannot_change_a_participation` (`policy/mod.rs`, `refinement_cannot_change_a_participation`) walks all 64 corpus rows through both phases with the default config, an empty configured list and a list naming every participating row's service, and asserts exactly that (§6.2).
+The table decides from the caller facts alone, before any config is read: that is the **first phase**. The **second phase** is `policy::refine` (`policy/refine.rs`, `refine`), which `orchestrate` calls once, immediately after the one config read, and whose only job is to add R1's skip for a service a deployment named in `pam_refused_services` (`pam_logic/mod.rs:230-237`). The invariant is why the phases are not merged: refinement may **add** a skip, but it may never remove or reclassify one, may never change a participating call's mechanism, and may never change its deadline — the only value it ever constructs is `Skip(RemoteAuthentication)`, and the `Participation` it is handed comes back unchanged (`policy/refine.rs`, `refine`). `refinement_cannot_change_a_participation` (`policy/mod.rs`, `refinement_cannot_change_a_participation`) walks all 64 corpus rows through both phases with the default config, an empty configured list and a list naming every participating row's service, and asserts exactly that (§6.2).
 
 | # | name | class | predicate | decision |
 | :-- | :--- | :--- | :--- | :--- |
@@ -158,14 +158,14 @@ The rows are `policy/table.rs`, `RULES`; the predicates are `remote_refuse` (R1)
 
 Notes that belong to the table:
 
-* **R1 keys on the service name alone** (`policy/table.rs`, `remote_refuse`). It cannot misfire on the process side, and `my-sshd`/`sshd-old` fall to R10. That false negative is narrowed by configuration, not by inference: a deployment that renames `PAMServiceName` declares the new name in `pam_refused_services`, and `orchestrate` refines the classification with those names after the config read (`pam_logic/mod.rs:227-234`). Without the declaration the rename still falls to R10 — the corpus row `svc_sshd_near_miss` — and `configured_refused_services_match_only_declared_names` pins that an undeclared name is not matched by prefix or substring (`policy/mod.rs`, `configured_refused_services_match_only_declared_names`). An unresolved service never matches (`policy/table.rs`, `remote_refuse`; `policy/refine.rs`, `refused_service`).
+* **R1 keys on the service name alone** (`policy/table.rs`, `remote_refuse`). It cannot misfire on the process side, and `my-sshd`/`sshd-old` fall to R10. That false negative is narrowed by configuration, not by inference: a deployment that renames `PAMServiceName` declares the new name in `pam_refused_services`, and `orchestrate` refines the classification with those names after the config read (`pam_logic/mod.rs:230-237`). Without the declaration the rename still falls to R10 — the corpus row `svc_sshd_near_miss` — and `configured_refused_services_match_only_declared_names` pins that an undeclared name is not matched by prefix or substring (`policy/mod.rs`, `configured_refused_services_match_only_declared_names`). An unresolved service never matches (`policy/table.rs`, `remote_refuse`; `policy/refine.rs`, `refused_service`).
 * **The refused set is additive.** `pam_refused_services` adds names to the built-ins; it cannot remove one. `PamConfig::effective_refused_services` starts from `shared::config::DEFAULT_PAM_REFUSED_SERVICES`, trims each configured entry, drops anything that is not a non-empty ASCII `pam.d` name (no `/`, no whitespace or control character, at most 255 bytes) with a warning, and deduplicates ASCII case-insensitively (`config.rs:75-110`, `:67-73`). `policy::refused_service` is the pure matcher the refinement uses, private to `policy` so the refinement stays its only caller at compile time rather than by scan (`policy/refine.rs`, `refused_service`). The daemon's `TapAuthConfig` carries the same field, so a `SaveConfig` round-trip preserves a user's rename while the file loads (`shared/src/config/toml_config.rs:136-148`, `:485`). The guarantee stops at a config file the daemon cannot read or parse: `TapAuthConfig::load_from_path` returns `Self::default()` on a read error (`shared/src/config/toml_config.rs:238-242`) and on a parse error (`:271-277`), and `handle_save_config` feeds that value to `save()` (`tapauthd/src/admin_handler.rs:695-707`), overwriting the file whenever the write itself succeeds. What survives is the built-in set, because both defaults carry `DEFAULT_PAM_REFUSED_SERVICES` (`shared/src/config/toml_config.rs:184-192`, `client-pam/src/config.rs:49-57`); what does not is every name the user added, permanently once the daemon writes. The loss is silent: `handle_save_config` returns success, and only the `debug!` (read) or `warn!` (parse) line inside `load_from_path` records the fallback. The module's own loader has the same hole: a syntax error falls back to `PamConfig::default()` (`client-pam/src/config.rs:145-151`), so that authentication treats the renamed stack as local and rings the phone until the name is declared again.
 * **R1 outranks the process rules.** `svc_sshd_under_swaylock` classifies R1, not R8; moving R1 after R8 moves exactly that row and nothing else (`policy/mod.rs`, `rule_permutation_moves_named_rows`).
 * **R1 and R2 are disjoint**, so their relative order is unobservable; the permutation test deliberately omits that swap as vacuous (the doc comment on `policy/mod.rs`, `rule_permutation_moves_named_rows`).
 * **R2 outranks R8.** `swaylock_under_sddm` and `i3lock_under_gdm_login` are skipped by R2; moving R2 after R8 moves exactly those two rows (`policy/mod.rs`, `rule_permutation_moves_named_rows`).
 * **R3–R9 are order-insensitive**: their predicates are pairwise disjoint, asserted against the declared literal sets (`policy/mod.rs`, `rules_are_process_disjoint`).
 * **R10 is last and unconditional.** A row after it is dead, and no other row may match the null context (`policy/mod.rs`, `unreachable_rule_rows`).
-* **R5 parses no version.** The `kscreenlocker_worker` row's doc comment says so: the name is the only signal in `/proc`, and `kscreenlocker_greet` is deliberately absent so the pre-6.8 helper stays sequential (`policy/table.rs`, `kscreenlocker_worker`). Corpus rows `kscreenlocker_truncated`, `kscreenlocker_greet` and `kscreenlocker_g` pin the three spellings.
+* **R5 parses no version.** The `kscreenlocker_worker` predicate encodes that: the name is the only signal in `/proc`, and `kscreenlocker_greet` is deliberately absent so the pre-6.8 helper stays sequential (`policy/table.rs`, `kscreenlocker_worker`). Corpus rows `kscreenlocker_truncated`, `kscreenlocker_greet` and `kscreenlocker_g` pin the three spellings.
 * **The `evidence` column is checked.** Every non-`external:` entry must resolve to a non-blank line in an existing file, and the scan asserts it read `policy/table.rs` itself (`policy/mod.rs`, `evidence_citations_resolve`).
 
 #### 3.3.2 The class taxonomy
@@ -178,7 +178,7 @@ Notes that belong to the table:
 | `AlwaysRing` | the phone is offered concurrently | one extra ring, or the host's dialog loses its race; never a grant, never a wedge |
 | `Keyring` | a grant would be useless without `PAM_AUTHTOK` | under-match: the keyring stays locked after a successful login. Over-match: the login manager's prompt is skipped and the stack falls through |
 
-`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy/mod.rs`, `FailureDirection`). The class is copied onto the participation (`policy/mod.rs`, `classification_of`), asserted against the decision by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-asserted at the point the class meets the plan (`transaction/run.rs:149-157`), so a mismatch fails a test rather than being a comment nobody reads.
+`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy/mod.rs`, `FailureDirection`). The class is copied onto the participation (`policy/mod.rs`, `classification_of`), asserted against the decision by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-asserted at the point the class meets the plan (`transaction/run.rs:158-166`), so a mismatch fails a test rather than being a comment nobody reads.
 
 Every skip still returns `PAM_AUTHINFO_UNAVAIL`, never `PAM_IGNORE`: on a `required` line that is a failure, on a `sufficient` line it is `ignore` and the stack decides (`pam_logic/mod.rs`, `authenticate`).
 
@@ -200,11 +200,11 @@ pub(crate) enum Plannable { Threaded, Sequential }
 | `Sequential` | `true` | `Operation` | `WaitSkipHint` | `PollForKey` |
 | `Sequential` | `false` | `GuiBounded` | `WaitThenPassword` | `DoNotOpen` |
 
-Four cells over three rows and three distinct plans; `plan_table` asserts both facts (`plan.rs`, `plan_table`), and `threaded_plan_ignores_has_tty` asserts the invariance directly (`plan.rs`, `threaded_plan_ignores_has_tty`). There is no `Plannable::PreCollected`: `run` returns the handoff before a plan can exist (`transaction/run.rs:91-98`), so `plan` has no unreachable arm (`plan.rs:82-86`).
+Four cells over three rows and three distinct plans; `plan_table` asserts both facts (`plan.rs`, `plan_table`), and `threaded_plan_ignores_has_tty` asserts the invariance directly (`plan.rs`, `threaded_plan_ignores_has_tty`). There is no `Plannable::PreCollected`: `run` returns the handoff before a plan can exist (`transaction/run.rs:100-107`), so `plan` has no unreachable arm (`plan.rs:82-86`).
 
-Two of the three announcements are emitted before the request and one after: `Wait` and `WaitSkipHint` immediately after planning (`transaction/run.rs:165-176`), `WaitThenPassword` after `Armed::open` and before the mechanism blocks (`transaction/run.rs:252-257`). The second position is why the announcement exists: an event-loop host reveals its password field only once a PAM message arrives, and it must already be blocked when one does (`plan.rs:67-70`).
+Two of the three announcements are emitted before the request and one after: `Wait` and `WaitSkipHint` immediately after planning (`transaction/run.rs:174-185`), `WaitThenPassword` after `Armed::open` and before the mechanism blocks (`transaction/run.rs:261-266`). The second position is why the announcement exists: an event-loop host reveals its password field only once a PAM message arrives, and it must already be blocked when one does (`plan.rs:67-70`).
 
-The tty probe is gated by `Plannable::tty_use`, not by a second copy of the mode test (`transaction/run.rs:133-137`), and it runs *after* the reuse lookup, so a cache hit does not open `/dev/tty` (`transaction/run.rs:113-123`, pinned by `cache_hit_does_not_open_tty` in `transaction/tests`). `HostIo` owns no terminal: the `Option<File>` is `run`'s local and is consumed by the sequential mechanism (`transaction/host_io.rs:36-37`).
+The tty probe is gated by `Plannable::tty_use`, not by a second copy of the mode test (`transaction/run.rs:142-146`), and it runs *after* the reuse lookup, so a cache hit does not open `/dev/tty` (`transaction/run.rs:122-132`, pinned by `cache_hit_does_not_open_tty` in `transaction/tests`). `HostIo` owns no terminal: the `Option<File>` is `run`'s local and is consumed by the sequential mechanism (`transaction/host_io.rs:36-37`).
 
 ### 3.5 `Outcome` (`outcome.rs`)
 
@@ -226,14 +226,14 @@ pub(crate) enum Outcome {
 
 * Two constructors: `granted_from_daemon` (`outcome.rs`, `Outcome::granted_from_daemon`) and `replayed` (`outcome.rs`, `Outcome::replayed`). `replayed` is a structural copy, so it cannot upgrade an unavailability into a grant, which `replay_never_upgrades` asserts exhaustively.
 * `from_daemon` maps each `PamOutcome` explicitly and fails closed on an unknown raw value (`outcome.rs`, `Outcome::from_daemon` and `outcome_from_raw`); the raw field is read directly because prost's accessor defaults to `SUCCESS`.
-* `Armed::conclude` is the only other producer, and it does no more than hand `MechanismEnd` to `impl From<MechanismEnd> for Outcome` (`transaction/lifecycle.rs`, `Armed::conclude`; `outcome.rs`, the `From` impl).
+* `Armed::conclude` is the only other producer, and it does no more than hand `MechanismEnd` to `impl From<MechanismEnd> for Outcome` (`transaction/lifecycle.rs`, `Armed::conclude`; `mechanism/mod.rs`, the `From` impl).
 * `Concluded::replay` is the only producer of `Via::Replay` (`transaction/lifecycle.rs`, `Concluded::replay`), and `record` refuses it (`conclusion_cache.rs:357-368`).
 
 A wrong *conversation* row is availability-only. A wrong *skip* is not: it silences the phone. R2 and R3 together decide whether the phone is consulted at all, and R3's three inputs are all caller-chosen — the binary basename, the service name and the caller's own environment — so a caller can turn its own skip into a participation. It cannot obtain a grant for another principal: the daemon must still answer `SUCCESS` in that call, and the stack belongs to the caller.
 
 #### 3.5.3 One message per transaction
 
-`Outcome::notice` is the pure half: which single message an outcome shows, and in which style (`outcome.rs`, `Outcome::notice`). A replayed verdict returns `None`, which is what keeps a cache hit silent (the two `VerdictReplay` arms of `Outcome::notice`). Emission is a single site: `finish` decides the notice from the verdict *and its provenance*, emits, and returns the `Finished` (`transaction/host_io.rs`, `finish`); every return of `run` goes through it (`transaction/run.rs:96`, `:121`, `:182`, `:233`, `:238`, `:271`). The mechanisms emit nothing (`mechanism/mod.rs:25-28`), so `try_info`/`try_error` are reached only through `HostIo::emit` (`transaction/host_io.rs`, `HostIo::emit`).
+`Outcome::notice` is the pure half: which single message an outcome shows, and in which style (`outcome.rs`, `Outcome::notice`). A replayed verdict returns `None`, which is what keeps a cache hit silent (the two `VerdictReplay` arms of `Outcome::notice`). Emission is a single site: `finish` decides the notice from the verdict *and its provenance*, emits, and returns the `Finished` (`transaction/host_io.rs`, `finish`); every return of `run` goes through it (`transaction/run.rs:105`, `:130`, `:191`, `:242`, `:247`, `:280`). The mechanisms emit nothing (`mechanism/mod.rs:25-28`), so `try_info`/`try_error` are reached only through `HostIo::emit` (`transaction/host_io.rs`, `HostIo::emit`).
 
 The reason set carries the text distinction the old per-loop strings carried: `IpcConnectionLost` and `IpcLoopError` are informational, `IpcError` is an error; `DaemonTimedOut` is silent while this module's own `TimedOut` is announced (`outcome.rs:276-280`, the two timeout arms).
 
@@ -241,7 +241,7 @@ The reason set carries the text distinction the old per-loop strings carried: `I
 
 ```rust
 pub(crate) fn run<T: IpcResponseReader>(
-    ctx: &CallerContext,
+    service: Option<&ServiceName>,
     username: &str,
     participation: &Participation,
     host: &mut HostIo<'_>,
@@ -254,16 +254,16 @@ pub(crate) fn run<T: IpcResponseReader>(
 
 `run` does, in this order:
 
-1. **Carrier or handoff.** The `match` on `participation.conversation` yields `Plannable::Threaded`/`Sequential`, or performs the pre-collected handoff and returns `Unrecorded` (`transaction/run.rs:91-98`). No probe, plan or lookup exists on that arm.
-2. **Reuse lookup**, only when the service resolved; a hit is `Concluded` with `Via::Replay` (`transaction/run.rs:113-123`).
-3. **The tty probe**, gated by `TtyUse` (`transaction/run.rs:133-137`).
-4. **The plan**, then the class/plan assertion, then the first announcements (`transaction/run.rs:139-176`, `:149-157`).
-5. **The request id** (16 random bytes, hex); failure returns `Unrecorded(Error(RequestId))` (`transaction/run.rs:179-186`).
-6. **The deadline**, resolved once and anchored *before* the request: a stalled connect or write consumes budget instead of running past it (`transaction/run.rs:188-203`).
-7. **`Armed::open`**, which runs `connect` then `send` and yields `Armed` only when both succeeded; the two failures return `Unrecorded` with `DaemonUnreachable` or `DaemonSendFailed` (`transaction/run.rs:221-240`). `SendParams` is what the send closure sees: username, `has_tty`, timeout, request id — nothing else (`transaction/run.rs:30-35`).
-8. **`WaitThenPassword`** on the sequential-no-tty arm, now that the request is on the wire (`transaction/run.rs:252-257`).
-9. **The mechanism**, one `match` over `Plannable`, returning `MechanismEnd` (`transaction/run.rs:261-268`).
-10. **`Armed::conclude`** and `finish` (`transaction/run.rs:270-271`).
+1. **Carrier or handoff.** The `match` on `participation.conversation` yields `Plannable::Threaded`/`Sequential`, or performs the pre-collected handoff and returns `Unrecorded` (`transaction/run.rs:100-107`). No probe, plan or lookup exists on that arm.
+2. **Reuse lookup**, only when the service resolved; a hit is `Concluded` with `Via::Replay` (`transaction/run.rs:122-132`).
+3. **The tty probe**, gated by `TtyUse` (`transaction/run.rs:142-146`).
+4. **The plan**, then the class/plan assertion, then the first announcements (`transaction/run.rs:148-185`, `:158-166`).
+5. **The request id** (16 random bytes, hex); failure returns `Unrecorded(Error(RequestId))` (`transaction/run.rs:188-195`).
+6. **The deadline**, resolved once and anchored *before* the request: a stalled connect or write consumes budget instead of running past it (`transaction/run.rs:197-212`).
+7. **`Armed::open`**, which runs `connect` then `send` and yields `Armed` only when both succeeded; the two failures return `Unrecorded` with `DaemonUnreachable` or `DaemonSendFailed` (`transaction/run.rs:230-249`). `SendParams` is what the send closure sees: username, `has_tty`, timeout, request id — nothing else (`transaction/run.rs:30-35`).
+8. **`WaitThenPassword`** on the sequential-no-tty arm, now that the request is on the wire (`transaction/run.rs:261-266`).
+9. **The mechanism**, one `match` over `Plannable`, returning `MechanismEnd` (`transaction/run.rs:270-277`).
+10. **`Armed::conclude`** and `finish` (`transaction/run.rs:279-280`).
 
 `Armed` is generic over the existing reader trait so tests can drive it without a socket (`transaction/lifecycle.rs`, `Armed`; `armed_for_test`).
 
@@ -273,7 +273,7 @@ pub(crate) fn run<T: IpcResponseReader>(
 
 ### 3.7 Mechanisms (`mechanism/`)
 
-`MechanismEnd` — `Response(PamAuthenticateResponse)`, `Reason(UnavailableReason)` or `Error(ErrorReason)` — is defined in `mechanism/mod.rs` beside the mechanism contract (`mechanism/mod.rs:42-57`), because it is what every mechanism body returns; `Armed::conclude` consumes it (`transaction/lifecycle.rs`, `Armed::conclude`) and maps it through `impl From<MechanismEnd> for Outcome`, so a mechanism still cannot mint a verdict. `LoopExit` (`mechanism/threaded.rs:188-194`) is the threaded loop's private internal vocabulary and is not a verdict: the caller maps it to a reason, and it is not shared with `sequential`'s `IpcFailure`.
+`MechanismEnd` — `Response(PamAuthenticateResponse)`, `Reason(UnavailableReason)` or `Error(ErrorReason)` — is defined in `mechanism/mod.rs` beside the mechanism contract (`mechanism/mod.rs:42-57`), because it is what every mechanism body returns; `Armed::conclude` consumes it (`transaction/lifecycle.rs`, `Armed::conclude`) and maps it through `impl From<MechanismEnd> for Outcome` in `mechanism/mod.rs`, so a mechanism still cannot mint a verdict. `LoopExit` (`mechanism/threaded.rs:188-194`) is the threaded loop's private internal vocabulary and is not a verdict: the caller maps it to a reason, and it is not shared with `sequential`'s `IpcFailure`.
 
 **`threaded::drive`** owns the password worker and both local-resource failures: `ThreadContext` on the caller's stack (`mechanism/threaded.rs:35-42`), a hand-declared `pthread_create` with the `C-unwind` ABI, `pam_get_authtok`, the `Release` store and the unconditional raw-`SYS_write` self-pipe notification with EINTR retried (`mechanism/threaded.rs:44-126`), and `cancel_and_join`, whose doc states why the join is load-bearing for stack safety and libpam ownership (`mechanism/threaded.rs`, `cancel_and_join`).
 
@@ -306,9 +306,9 @@ flowchart LR
 
 **(a) `kscreenlocker_worker` under service `kscreenlocker` — threaded.** `capture` reads service `kscreenlocker`, process `Exe("kscreenlocker_worker")`, no reauth (`context.rs:31-55`). `classify` reaches R5 (`policy/table.rs`, `kscreenlocker_worker`). The four orchestration calls run, `run` finds no reuse hit, probes no tty, plans `Operation/Wait/DoNotOpen`, announces the wait, opens the request, drives the threaded mechanism, concludes `Granted(PhoneTap)`, records, and returns `PAM_SUCCESS` (`transaction/run.rs`, `run`; `pam_logic/mod.rs`, `authenticate`).
 
-**(b) `swaylock` — pre-collected, no daemon contact.** `classify` reaches R8 (`policy/table.rs`, `precollected_locks`); `run`'s first match performs the handoff and returns `Unrecorded(Unavailable(PasswordHandoff))` before the lookup, the probe, the plan or `Armed` (`transaction/run.rs:91-98`). Nothing is recorded, and the code is `PAM_AUTHINFO_UNAVAIL` (`outcome.rs`, `Outcome::into_pam`). The phone is not a credential on such a host at all: a stack with no password module after `pam_tapauth.so` cannot unlock.
+**(b) `swaylock` — pre-collected, no daemon contact.** `classify` reaches R8 (`policy/table.rs`, `precollected_locks`); `run`'s first match performs the handoff and returns `Unrecorded(Unavailable(PasswordHandoff))` before the lookup, the probe, the plan or `Armed` (`transaction/run.rs:100-107`). Nothing is recorded, and the code is `PAM_AUTHINFO_UNAVAIL` (`outcome.rs`, `Outcome::into_pam`). The phone is not a credential on such a host at all: a stack with no password module after `pam_tapauth.so` cannot unlock.
 
-**(c) `sshd` or `sshd-session` — refused.** `classify` reaches R1 (`policy/table.rs`, `remote_refuse`) and `orchestrate` returns `Unrecorded(Outcome::from_skip(RemoteAuthentication))` before config, username, conversation or messages (`pam_logic/mod.rs:208-210`). No request, no probe, no record, no message.
+**(c) `sshd` or `sshd-session` — refused.** `classify` reaches R1 (`policy/table.rs`, `remote_refuse`) and `orchestrate` returns `Unrecorded(Outcome::from_skip(RemoteAuthentication))` before config, username, conversation or messages (`pam_logic/mod.rs:211-213`). No request, no probe, no record, no message.
 
 ### 3.9 Adding a host
 
@@ -424,12 +424,12 @@ The ids are stable; a flag whose status changed keeps its number.
 | F1 | 500 ms verdict-reuse window | **kept**, unchanged in duration and key; the assumption is stated at `conclusion_cache.rs:72-83` and the record has one owner (`8c6a7b9`) |
 | F2 | three 15-character truncated process spellings | **kept**, now table data and corpus rows (`policy/table.rs`, `gdm_reauth_worker`, `polkit_agent`, `kscreenlocker_worker`) |
 | F3 | four-layer identity degradation including R9 | **kept** (D5); R9 is `policy/table.rs`, `polkit_service_without_proc` and unit-testable through `from_parts` |
-| F4 | `hyprlock` threaded despite an unsynchronised race | **kept** (D6); stated in the `hyprlock` row's doc comment (`policy/table.rs`, `hyprlock`) |
-| F5 | `authproto_pam` may ring up to three times | **kept** (D6); stated in the `xsecurelock` row's doc comment (`policy/table.rs`, `xsecurelock`) |
+| F4 | `hyprlock` threaded despite an unsynchronised race | **kept** (D6); stated in the `hyprlock` predicate's doc comment (`policy/table.rs`, `hyprlock`) |
+| F5 | `authproto_pam` may ring up to three times | **kept** (D6); stated in the `xsecurelock` predicate's doc comment (`policy/table.rs`, `xsecurelock`) |
 | F6 | `pthread_cancel` + `C-unwind` + raw `SYS_write` + hand-declared FFI | **kept**, moved into `mechanism/threaded.rs` (`:44-126`); not rewritten |
 | F7 | `xfce4`/`mate` screen savers documented-only | **kept**; now corpus rows `mate_screensaver_dialog`, `mate_screensave`, `xfce4_screensav`, `sequential_no_tty` instead of a comment |
 | F8 | `PAM_RUSER` fallback on a null `PAM_USER` | **removed** in `8bc1225`; see below |
-| F9 | `load_for_user` NSS lookup and home read per call | **kept**; `load_messages` still runs before the reuse lookup (`pam_logic/mod.rs:265`, `transaction/run.rs:113-123`) |
+| F9 | `load_for_user` NSS lookup and home read per call | **kept**; `load_messages` still runs before the reuse lookup (`pam_logic/mod.rs:268`, `transaction/run.rs:122-132`) |
 | F10 | R9's case-sensitive `polkit-1` comparison | **kept** byte-for-byte (`policy/table.rs`, `polkit_service_without_proc`); `proc_unreadable_polkit_upper` documents it |
 | F11 | dead PAM helpers kept by `#[allow(dead_code)]` | **reversed and removed** in `9c69211`; see below |
 
@@ -455,13 +455,13 @@ The earlier record kept `set_user` and the conversation prompt helpers under `#[
 
 | layer | command | result |
 | :--- | :--- | :--- |
-| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **106 passed, 0 failed, 0 ignored** |
+| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **107 passed, 0 failed, 0 ignored** |
 | workspace, `shared` | `cargo test --workspace` | **96 passed** |
-| workspace, `client-pam` | the same run | 106 passed, 0 ignored |
+| workspace, `client-pam` | the same run | 107 passed, 0 ignored |
 | workspace, every other target | the same run | 0 tests |
 | end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **16 shapes**, the `e2e=1` rows |
 
-202 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
+203 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
 
 ### 6.2 The corpus and its consumers
 
@@ -486,7 +486,7 @@ The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for
 | `context.rs` | `strip_deleted_suffix` (the `(deleted)` strip including a basename that strips to empty); `comm_fallback_trims_and_rejects_empty` (`comm` trimming and empty rejection, asserted through to R5); `exe_wins_over_comm`; `gdm_reauth_env_parsing` (presence-only parsing without `set_var`); `gdm_reauth_requires_service` (the reauth flag needing the service half, including `sddm` with the flag set still skipping) |
 | `plan.rs` | `plan_table` (every `Plannable × has_tty` cell and exactly three distinct plans); `threaded_plan_ignores_has_tty`; `gui_deadline_is_min` (`GuiBounded` as `min` in four configurations including zero); `deadline_saturates_at_u32_max` |
 | `policy/mod.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
-| `outcome.rs` | `outcome_table_code_and_notice` (the code and notice matrix, including that `DaemonTimedOut` is silent while `TimedOut` is announced and that a replay is silent), `from_daemon_maps_every_answer`, `replay_never_upgrades`, `skip_policy_maps_to_outcome` (the `outcome.rs` test module) |
+| `outcome.rs` | `outcome_table_code_and_notice` (the code and notice matrix, including that `DaemonTimedOut` is silent while `TimedOut` is announced and that a replay is silent), `from_daemon_maps_every_answer`, `replay_never_upgrades`, `skip_policy_maps_to_outcome`, `mechanism_end_error_maps_to_error` (the `From<MechanismEnd> for Outcome` mapping keeps the `Error` arm a processing failure; the `outcome.rs` test module) |
 | `transaction/tests` | `finished_reports_its_outcome_and_provenance`; `armed_requires_both_connect_and_send`; `replay_notice_is_silent`; `tty_probe_only_for_sequential`; `cache_hit_does_not_open_tty`; `announcement_order_matches_today`, `precollected_never_plans`, `unrecorded_paths_emit_their_notice`, `a_cache_hit_is_a_replay_conclusion`, `a_replayed_failure_emits_nothing` |
 | `conclusion_cache.rs` | `reuse_key_is_case_sensitive`; `a_poisoned_lock_reads_as_a_cache_miss`; `conclusion_cache_survives_fork` (no longer `#[ignore]`d) |
 | `mechanism/sequential.rs` | `enter_skips_other_keys_do_not`, `tty_eof_stops_polling_not_waiting`, `timeout_does_not_cancel`, `partial_frame_with_hangup_is_connection_lost`, `read_error_maps_to_ipc_error`, `skip_cancels_with_tty_skip`, `ipc_error_cancels_only_without_tty`, the three loop tests, and the two poll-error tests `poll_error_stops_the_no_terminal_wait` and `poll_error_is_logged_and_the_terminal_wait_continues` |
@@ -535,7 +535,7 @@ These are the things the implementation does not prove. Each names its consequen
 
 | gap | consequence |
 | :--- | :--- |
-| a renamed `PAMServiceName` the deployment has **not** declared in `pam_refused_services` | R1 sees only the built-ins, so the rename is classified R10 and the phone is rung for a remote login: on the no-terminal sequential shape `svc_sshd_near_miss` covers it waits out the GUI timeout (`pam_gui_timeout_secs`, clamped to `pam_operation_timeout_secs`), while a renamed stack that has a terminal is bounded by `pam_operation_timeout_secs` alone. Declaring the name closes it (`pam_logic/mod.rs:227-234`); inference from `PAM_RHOST` was rejected because `sudo` sets it to the local hostname (§9(a)). `svc_sshd_near_miss` pins the undeclared false negative as behaviour, not as coverage |
+| a renamed `PAMServiceName` the deployment has **not** declared in `pam_refused_services` | R1 sees only the built-ins, so the rename is classified R10 and the phone is rung for a remote login: on the no-terminal sequential shape `svc_sshd_near_miss` covers it waits out the GUI timeout (`pam_gui_timeout_secs`, clamped to `pam_operation_timeout_secs`), while a renamed stack that has a terminal is bounded by `pam_operation_timeout_secs` alone. Declaring the name closes it (`pam_logic/mod.rs:230-237`); inference from `PAM_RHOST` was rejected because `sudo` sets it to the local hostname (§9(a)). `svc_sshd_near_miss` pins the undeclared false negative as behaviour, not as coverage |
 | the musl check is `cargo check`, not a link or a run (`.github/workflows/ci.yml:212-248`) | `pthread_atfork` and mutex behaviour under musl are unverified at runtime, and a musl-linked `libpam` is never loaded, so the fork fix is confirmed only on glibc. The Fedora/Arch container passes were last observed at `a55608b`, not at this branch's HEAD |
 | the daemon-side `Timeout` e2e shape exists only for an R5 threaded host | the verdict-and-notice mapping for a daemon-side `Timeout` is unit-covered (`outcome_table_code_and_notice`, and `Outcome::from_daemon`), but no test in `transaction/tests` names `PamOutcome::Timeout` or `DaemonTimedOut`: the transaction path for the sequential and pre-collected mechanisms is untested, and no stack drives one |
 | `scripts/ci/test-pam-host-cases.sh` is covered in CI but has not been run locally | `.github/workflows/ci.yml:188-195` runs it as root in `build-and-test`, which runs on `pull_request` (`ci.yml:20-35`); PR #160 run 42286328114 / job 128127980029 shows the step succeeded at `a55608b`. Locally `sudo -n` fails (password required), so it cannot run here, and it has not been observed at this branch's HEAD |
@@ -565,13 +565,13 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 | the corpus rots into a tautology | the characterisation harness stops characterising | rows were authored against the pre-refactor functions (the `policy/mod.rs` test-module doc comment); `corpus_covers_every_rule` and the citation scan make a silent update visible; the `tty` column is checked against a literal, `EXPECTED_TTY` (`policy/mod.rs`, `EXPECTED_TTY`), before the plan is derived from it |
 | the source scans are string heuristics | a `PAM_*` return hides behind a re-export, or a scan stops covering a module | all three recurse and assert coverage; each has an in-memory positive control |
 | a wrong `Skip` silences the phone | on a `required` line a denial; on a `sufficient` line the stack decides | the class/decision relation is asserted twice, and the skip paths are counted on both policies |
-| hyprlock's race and xsecurelock's retries are real, accepted defects | a crash attributed to the module, or up to three rings | stated at R6 and R7 and accepted by D6; no e2e shape runs either host's real binary |
+| hyprlock's race and xsecurelock's retries are real, accepted defects | a crash attributed to the module, or up to three rings | stated in the R6 and R7 predicates' doc comments and accepted by D6; no e2e shape runs either host's real binary |
 
 ---
 
 ## 9. Rejected alternatives
 
-**(a) Keying the remote refusal on `PAM_RHOST`, or on `PAM_RHOST` plus the service name.** Rejected during implementation, and the reason is in the module doc (`policy/mod.rs`, the module doc comment) and the rule's doc comment (`policy/table.rs`, `remote_refuse`). `sudo` sets `PAM_RHOST` to the local hostname under `Defaults pam_rhost`; a *presence* test would therefore classify every `sudo` invocation as remote and silence the module on it — the commonest local privilege escalation on the desktop. Presence cannot distinguish "set to the local host" from "set to a peer", and reading the string would make the policy depend on hostname resolution. The service name is coarser but cannot misfire on `sudo`: it is the name of the stack, and the stacks that exist to authenticate a remote peer are the ones named `sshd`/`sshd-session`. The cost is the renamed-`PAMServiceName` false negative (`svc_sshd_near_miss`), which a deployment narrows by declaring the new name in `pam_refused_services` (`pam_logic/mod.rs:227-234`); an undeclared rename still falls to R10, which §7 records rather than hides.
+**(a) Keying the remote refusal on `PAM_RHOST`, or on `PAM_RHOST` plus the service name.** Rejected during implementation, and the reason is in the module doc (`policy/mod.rs`, the module doc comment) and the rule's doc comment (`policy/table.rs`, `remote_refuse`). `sudo` sets `PAM_RHOST` to the local hostname under `Defaults pam_rhost`; a *presence* test would therefore classify every `sudo` invocation as remote and silence the module on it — the commonest local privilege escalation on the desktop. Presence cannot distinguish "set to the local host" from "set to a peer", and reading the string would make the policy depend on hostname resolution. The service name is coarser but cannot misfire on `sudo`: it is the name of the stack, and the stacks that exist to authenticate a remote peer are the ones named `sshd`/`sshd-session`. The cost is the renamed-`PAMServiceName` false negative (`svc_sshd_near_miss`), which a deployment narrows by declaring the new name in `pam_refused_services` (`pam_logic/mod.rs:230-237`); an undeclared rename still falls to R10, which §7 records rather than hides.
 
 **(b) A `dyn Trait` per mechanism.** Rejected: the set is closed by the PAM ABI — another thread, not at all, or the calling thread — so a trait object would add a vtable and lifetime plumbing for a set that cannot grow, and would lose the compile-time fact that `PreCollected` needs no `Plan` (`mechanism/mod.rs:12-13`).
 
@@ -585,7 +585,7 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 **(g) Folding `plan.rs` into `policy/`.** Rejected: the two touch different questions and are checked by different oracles — a first-match over predicates against literal rows, versus a total function over `Plannable × bool` against arithmetic. The split also keeps `Plannable` next to `Plan`, so the absence of a `PreCollected` arm is visible where it matters (`plan.rs:82-91`).
 
-**(h) Defining `MechanismEnd` beside `Armed`, in the transaction, rather than in `mechanism/mod.rs`.** Rejected by the refactor; the reverse is now the accepted design. `MechanismEnd` is the mechanism contract — what every mechanism body returns — so it lives with that contract in `mechanism/mod.rs` (`mechanism/mod.rs:42-57`). Moving it out of the transaction does not weaken the grant invariant: `Armed::conclude` still maps it through `impl From<MechanismEnd> for Outcome` (`transaction/lifecycle.rs`, `Armed::conclude`; `outcome.rs`), and a mechanism imports only `transaction::{Armed, HostIo}` — it never names `Concluded` or an `Outcome` constructor.
+**(h) Defining `MechanismEnd` beside `Armed`, in the transaction, rather than in `mechanism/mod.rs`.** Rejected by the refactor; the reverse is now the accepted design. `MechanismEnd` is the mechanism contract — what every mechanism body returns — so it lives with that contract in `mechanism/mod.rs` (`mechanism/mod.rs:42-57`). Moving it out of the transaction does not weaken the grant invariant: `Armed::conclude` still maps it through `impl From<MechanismEnd> for Outcome` (`transaction/lifecycle.rs`, `Armed::conclude`; `mechanism/mod.rs`), and a mechanism imports only `transaction::{Armed, HostIo}` — it never names `Concluded` or an `Outcome` constructor.
 
 **(i) `record(&Verdict, Instant)` instead of taking `Concluded` by value.** Rejected: a borrowed token carries no proof that a request was on the wire, so any caller could record a fabricated verdict. By value, recording is a move error unless a conclusion exists (`transaction/lifecycle.rs`, `Armed`; `conclusion_cache.rs`, `ConclusionCache::record`).
 
@@ -619,9 +619,9 @@ The direction of error is stated once: for `DeadlockAvoidance` a wrong decision 
 
 **D5 — R9 stays.** *Status: as decided.* `polkit_service_without_proc` is `policy/table.rs`, `polkit_service_without_proc`; `POLKIT-1` with an unreadable `/proc` stays sequential, pinned by `proc_unreadable_polkit_upper`.
 
-**D6 — `hyprlock` and `authproto_pam` stay as they are.** *Status: as decided.* R6 and R7 keep both hosts threaded, and each rule's doc comment states the accepted risk.
+**D6 — `hyprlock` and `authproto_pam` stay as they are.** *Status: as decided.* R6 and R7 keep both hosts threaded, and each rule's predicate doc comment states the accepted risk.
 
-**D7 — Remote authentication is refused; the `PAM_RUSER` fallback is removed.** *Superseded on the predicate.* R1 keys on the service name alone — the built-in set `shared::config::DEFAULT_PAM_REFUSED_SERVICES` (`sshd`, `sshd-session`), ASCII case-insensitive (`policy/table.rs`, `remote_refuse`), plus every name a deployment adds to `pam_refused_services` (`pam_logic/mod.rs:227-234`) — because `PAM_RHOST` is set by `sudo` to the local hostname, so a presence-based rule would silence the module there (§9(a)). The class, the second `SkipPolicy` and the ordering are as decided. The `PAM_RUSER` removal shipped unchanged in `8bc1225`.
+**D7 — Remote authentication is refused; the `PAM_RUSER` fallback is removed.** *Superseded on the predicate.* R1 keys on the service name alone — the built-in set `shared::config::DEFAULT_PAM_REFUSED_SERVICES` (`sshd`, `sshd-session`), ASCII case-insensitive (`policy/table.rs`, `remote_refuse`), plus every name a deployment adds to `pam_refused_services` (`pam_logic/mod.rs:230-237`) — because `PAM_RHOST` is set by `sudo` to the local hostname, so a presence-based rule would silence the module there (§9(a)). The class, the second `SkipPolicy` and the ordering are as decided. The `PAM_RUSER` removal shipped unchanged in `8bc1225`.
 
 **D8 — The two sequential loops are merged into one profile-driven loop.** *Status: as decided, shipped* in `5c1eea5`. The contract is `mechanism/sequential.rs:33-56`, and the mapping is the nine cells of §4.3.
 

@@ -8,7 +8,7 @@
 # without contacting the daemon (pre-collected hosts), and leaving the
 # conversation alone.  The choice is a rule table keyed on the caller — the
 # calling process, the PAM service name and the GDM reauth flag
-# (`classify` in client-pam/src/policy.rs), so none of the branches is reachable
+# (`classify` in client-pam/src/policy/mod.rs), so none of the branches is reachable
 # from a Rust unit test: it needs a real libpam stack, a dynamically loaded
 # `pam_tapauth.so`, and a process whose `/proc/self/exe` basename is on the
 # allowlist.
@@ -253,7 +253,7 @@ fi
 
 # The fixture is 10 comma-separated columns and a `why` containing a comma is a
 # parse error rather than a quoted field — the same rule the Rust reader in
-# client-pam/src/policy.rs (`parse_row`) enforces on the same file.
+# client-pam/src/policy/mod.rs (`parse_row`) enforces on the same file.
 read_fixture_row() {
     # shellcheck disable=SC2034  # every column is consumed by the caller
     IFS=, read -r F_ID F_SERVICE F_EXE F_COMM F_ENV F_TTY F_RULE F_POLICY F_WHY \

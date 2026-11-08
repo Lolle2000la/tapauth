@@ -20,7 +20,7 @@ const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
 /// Default PAM authentication timeout for GUI contexts whose conversation the
 /// module cannot drive (the sequential path — a host the rule table in
-/// `client-pam/src/policy.rs` does not classify as threaded), in seconds.
+/// `client-pam/src/policy/table.rs` does not classify as threaded), in seconds.
 /// Mirrors the default in the PAM module's `PamConfig` (client-pam).
 const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 
@@ -117,7 +117,7 @@ pub struct TapAuthConfig {
 
     /// Authentication timeout for graphical PAM contexts whose conversation the
     /// module cannot drive (the sequential path: a host the rule table in
-    /// `client-pam/src/policy.rs` does not classify as threaded, or an
+    /// `client-pam/src/policy/table.rs` does not classify as threaded, or an
     /// unrecognised host).
     /// Default: 30 seconds
     ///
