@@ -1,11 +1,20 @@
 //! The conversation policy: one ordered table of rules over
-//! [`CallerContext`](crate::context::CallerContext).
+//! [`CallerContext`](crate::context::CallerContext), and the two phases that
+//! consume it.
 //!
-//! `RULES` is the single decision record. Each row carries its class (the
-//! failure direction it is protecting), the one-line reason a reader consults,
-//! the in-tree evidence for the behaviour it preserves, its predicate and its
-//! decision. `classify` walks the table in order and takes the first row whose
-//! predicate matches.
+//! Three responsibilities, three files:
+//!
+//! * `table.rs` is the decision record: `RULES`, one row per host, carrying the
+//!   class the row was authored against (the failure direction it protects), the
+//!   in-tree evidence for the behaviour it preserves, its predicate and its
+//!   decision.
+//! * this file is the taxonomy those rows are written in ([`Classification`],
+//!   [`Decision`], [`Participation`], [`Conversation`], [`FailureDirection`],
+//!   [`SkipPolicy`]) and the first-match engine: `classify` walks the table in
+//!   order and returns the id of the row that matched, next to the
+//!   classification that row produces.
+//! * `refine.rs` is the config-dependent second phase, which may only add a
+//!   skip.
 //!
 //! Two types come out of `classify` — [`Classification::Skip`] and
 //! [`Classification::Participate`] — so a skip cannot acquire a deadline, a plan
@@ -19,7 +28,14 @@
 //! predicates are disjoint and their relative order is unobservable; what is
 //! load-bearing is R1 before the process rules (R3–R8) and before R10.
 
-use crate::context::{CallerContext, ProcessIdentity, ServiceName};
+use crate::context::CallerContext;
+
+mod refine;
+mod table;
+
+pub(crate) use refine::refine;
+
+use table::{Rule, DEFAULT_SEQUENTIAL, RULES};
 
 /// What the module does with the call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,12 +108,11 @@ pub(crate) enum Decision {
 }
 
 /// A rule that matched, with the class it was authored against.
+///
+/// Which rule matched is not part of the value: `classify` returns its id next
+/// to it, so no field is carried that only the tests would read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Participation {
-    /// Which rule fired. Read by the policy tests today; consumed by the
-    /// transaction's plan assertion once `transaction::run` exists.
-    #[allow(dead_code)]
-    pub(crate) rule: RuleId,
     pub(crate) conversation: Conversation,
     /// The rule's class, copied here so the failure direction is part of the
     /// value and not only of the table (`class_agrees_with_conversation`). Read
@@ -123,7 +138,7 @@ pub(crate) enum RuleId {
 
 impl RuleId {
     /// The spelling the fixture corpus uses (`R1` … `R10`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             RuleId::R1 => "R1",
@@ -140,384 +155,27 @@ impl RuleId {
     }
 }
 
-/// One row of the table.
-///
-/// `name`, `why` and `evidence` are the justification record: the shipped binary
-/// does not read them, and the policy tests do (uniqueness, corpus coverage and
-/// citation resolution), so they are exempt from the dead-code lint rather than
-/// dropped.
-#[allow(dead_code)]
-pub(crate) struct Rule {
-    pub(crate) id: RuleId,
-    /// The rule's symbolic name (`dm_login_bypass`, …).
-    pub(crate) name: &'static str,
-    pub(crate) class: FailureDirection,
-    /// One line: why this host is answered this way.
-    pub(crate) why: &'static str,
-    /// `file:line` citations the rule must be able to defend. Entries prefixed
-    /// `external:` cite something outside this tree and are exempt from
-    /// resolution.
-    pub(crate) evidence: &'static [&'static str],
-    pub(crate) predicate: fn(&CallerContext) -> bool,
-    pub(crate) decision: Decision,
-}
-
-/// The conversation policy, in order. R1 precedes every other rule (a remote
-/// call is refused whatever its process or service is), R2 precedes everything
-/// after it (the keyring constraint belongs to the service, not to the process),
-/// and R10 is last and unconditional.
-pub(crate) static RULES: [Rule; 10] = [
-    Rule {
-        id: RuleId::R1,
-        name: "remote_refuse",
-        class: FailureDirection::RefuseRemote,
-        why: "the module must not participate in a remote authentication: the \
-              phone is a possession factor, and ringing it for a login from \
-              another machine both rings a phone the user is not at and makes \
-              every remote login wait out the GUI timeout",
-        evidence: &[
-            "external:pam_set_item(3) - PAM_RHOST is the remote requesting host, \
-             and OpenSSH sets it (auth-pam.c); sshd is PAMServiceName's default",
-            "external:OpenSSH PAMServiceName defaults to `sshd`, so the service \
-             name is a compile-time default, not a constant of the protocol",
-        ],
-        predicate: remote_refuse,
-        decision: Decision::Skip(SkipPolicy::RemoteAuthentication),
-    },
-    Rule {
-        id: RuleId::R2,
-        name: "dm_login_bypass",
-        class: FailureDirection::Keyring,
-        why: "a grant without PAM_AUTHTOK breaks pam_kwallet6/pam_gnome_keyring auto-unlock",
-        evidence: &[
-            "client-pam/src/policy.rs:373",
-            "client-pam/src/outcome.rs:80",
-        ],
-        predicate: dm_login_bypass,
-        decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
-    },
-    Rule {
-        id: RuleId::R3,
-        name: "gdm_reauth_worker",
-        class: FailureDirection::DeadlockAvoidance,
-        why: "the worker's GLib loop answers on another thread, but only for a \
-              reauthentication; a login is bypassed by R2",
-        evidence: &[
-            "client-pam/src/policy.rs:380",
-            "client-pam/src/context.rs:74",
-        ],
-        predicate: gdm_reauth_worker,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R4,
-        name: "polkit_agent",
-        class: FailureDirection::DeadlockAvoidance,
-        why: "the conversation is a plain fd fed by the separate agent process",
-        evidence: &[
-            "client-pam/src/policy.rs:391",
-            "client-pam/src/mechanism/threaded.rs:190",
-        ],
-        predicate: polkit_agent,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R5,
-        name: "kscreenlocker_worker",
-        class: FailureDirection::DeadlockAvoidance,
-        why: "the >= 6.8 helper answers on Qt's daemon thread; no version is parsed, \
-              and kscreenlocker_greet stays sequential",
-        evidence: &[
-            "client-pam/src/policy.rs:399",
-            "client-pam/src/mechanism/threaded.rs:191",
-        ],
-        predicate: kscreenlocker_worker,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R6,
-        name: "hyprlock",
-        class: FailureDirection::AlwaysRing,
-        why: "a worker std::thread with mutex/condvar: a genuine concurrent race, \
-              accepted with an unsynchronised resetConversation/checkWaiting",
-        evidence: &[
-            "client-pam/src/policy.rs:407",
-            "client-pam/src/mechanism/threaded.rs:188",
-        ],
-        predicate: hyprlock,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R7,
-        name: "xsecurelock",
-        class: FailureDirection::AlwaysRing,
-        why: "answered by the helper's own thread pool; CallPAMWithRetries can \
-              re-run the module up to three times",
-        evidence: &[
-            "client-pam/src/policy.rs:412",
-            "client-pam/src/mechanism/threaded.rs:189",
-        ],
-        predicate: xsecurelock,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R8,
-        name: "precollected_locks",
-        class: FailureDirection::NeverRing,
-        why: "the password predates pam_authenticate (swaylock pam.c:51, gtklock \
-              auth.c:61, i3lock.c:836), so the phone must not be rung",
-        evidence: &[
-            "client-pam/src/policy.rs:417",
-            "client-pam/src/mechanism/threaded.rs:197",
-        ],
-        predicate: precollected_locks,
-        decision: Decision::Participate(Conversation::PreCollected),
-    },
-    Rule {
-        id: RuleId::R9,
-        name: "polkit_service_without_proc",
-        class: FailureDirection::DeadlockAvoidance,
-        why: "with /proc unreadable, keep the historic polkit behaviour instead \
-              of silently changing how it drives its conversation",
-        evidence: &[
-            "client-pam/src/policy.rs:429",
-            "client-pam/src/context.rs:160",
-        ],
-        predicate: polkit_service_without_proc,
-        decision: Decision::Participate(Conversation::Threaded),
-    },
-    Rule {
-        id: RuleId::R10,
-        name: "default_sequential",
-        class: FailureDirection::DeadlockAvoidance,
-        why: "the safe default: an unknown host keeps the behaviour that cannot \
-              deadlock, at the cost of the shorter GUI timeout",
-        evidence: &[
-            "client-pam/src/policy.rs:435",
-            "client-pam/src/mechanism/threaded.rs:204",
-        ],
-        predicate: default_sequential,
-        decision: Decision::Participate(Conversation::Sequential),
-    },
-];
-
-/// R10's result, and the value `classify` falls back to.
-///
-/// R10's predicate is `|_| true`, so `find` always returns and this value is
-/// unreachable; it exists so `classify` is total without a panic path
-/// (`clippy::panic` and `clippy::unwrap_used` are denied crate-wide).
-/// `unreachable_rule_rows` asserts it is exactly what the table's last row
-/// produces, so the two cannot drift.
-const DEFAULT_SEQUENTIAL: Classification = Classification::Participate(Participation {
-    rule: RuleId::R10,
-    conversation: Conversation::Sequential,
-    failure_direction: FailureDirection::DeadlockAvoidance,
-});
-
-/// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`).
-///
-/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default; `sshd-session` is
-/// the name its per-connection session binary uses on current releases. Both are
-/// a *default*, not a constant of the protocol: a deployment that renames the
-/// service falls through to R10, which is the documented false negative (see
-/// `svc_sshd_near_miss` in the corpus). A rename is declared by adding the new
-/// name to `pam_refused_services`; R1 itself keeps the built-ins.
-///
-/// The comparison is ASCII case-insensitive, because `PAM_SERVICE` is a
-/// `pam.d` filename and case folding here cannot over-match: a service literally
-/// named `SSHD` is sshd's stack whatever its spelling.
-const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
-
-/// R1 — refuse a remote authentication, keyed on the service name.
-///
-/// The module never reads `PAM_RHOST`: `sudo` sets it to the local hostname
-/// (`Defaults pam_rhost`), so a presence-only rule would silence the module on
-/// `sudo`. Keying on the service keeps the refusal to the stacks that exist to
-/// authenticate a remote peer. An unresolved service name never matches.
-fn remote_refuse(ctx: &CallerContext) -> bool {
-    ctx.service().is_some_and(|service| {
-        REMOTE_SERVICES
-            .iter()
-            .any(|remote| service.eq_ignore_ascii_case(remote))
-    })
-}
-
-/// The display-manager prefixes.
-///
-/// A service matches when its ASCII-lowercased name is a prefix exactly, or the
-/// prefix followed by a `-` boundary: `gdm`, `gdm3` and `gdm-password` qualify,
-/// `gdmfoo` does not. The match is `ServiceName::dm_prefixed`, and the folding
-/// is `to_ascii_lowercase` only — see
-/// [`ServiceName`](crate::context::ServiceName) — so U+212A KELVIN SIGN is
-/// *not* folded to `k`.
-const DM_PREFIXES: [&str; 13] = [
-    "sddm",
-    "gdm",
-    "gdm3",
-    "lightdm",
-    "lxdm",
-    "slim",
-    "xdm",
-    "kdm",
-    "greetd",
-    "ly",
-    "nodm",
-    "entrance",
-    "plasmalogin",
-];
-
-/// R2 — the display-manager bypass, with the GDM reauthentication exemption.
-///
-/// The prefix match is `ServiceName::dm_prefixed`, reached only through
-/// `ctx.service()`, so an absent service never matches.
-fn dm_login_bypass(ctx: &CallerContext) -> bool {
-    ctx.service()
-        .is_some_and(|service| DM_PREFIXES.iter().any(|prefix| service.dm_prefixed(prefix)))
-        && !ctx.is_gdm_reauth()
-}
-
-/// R3 — a GDM reauthentication driven by the session worker.
-fn gdm_reauth_worker(ctx: &CallerContext) -> bool {
-    matches!(
-        ctx.process().name(),
-        Some("gdm-session-worker" | "gdm-session-wor")
-    ) && ctx
-        .service()
-        .is_some_and(|service| service.eq_ignore_ascii_case("gdm-password"))
-        && ctx.is_gdm_reauth()
-}
-
-/// R4 — polkit's agent helper, full and `/proc/self/comm`-truncated spellings.
-fn polkit_agent(ctx: &CallerContext) -> bool {
-    matches!(
-        ctx.process().name(),
-        Some("polkit-agent-helper-1" | "polkit-agent-he")
-    )
-}
-
-/// R5 — kscreenlocker's worker, full and truncated spellings.
-fn kscreenlocker_worker(ctx: &CallerContext) -> bool {
-    matches!(
-        ctx.process().name(),
-        Some("kscreenlocker_worker" | "kscreenlocker_w")
-    )
-}
-
-/// R6 — hyprlock.
-fn hyprlock(ctx: &CallerContext) -> bool {
-    matches!(ctx.process().name(), Some("hyprlock"))
-}
-
-/// R7 — xsecurelock's helper.
-fn xsecurelock(ctx: &CallerContext) -> bool {
-    matches!(ctx.process().name(), Some("authproto_pam"))
-}
-
-/// R8 — hosts that collected the password before calling `pam_authenticate`.
-fn precollected_locks(ctx: &CallerContext) -> bool {
-    matches!(
-        ctx.process().name(),
-        Some("swaylock" | "gtklock" | "i3lock")
-    )
-}
-
-/// R9 — polkit with an unreadable `/proc`.
-///
-/// The service comparison is exact bytes, deliberately: `POLKIT-1` with an
-/// unreadable `/proc` stays sequential, which is the comparison this rule has
-/// always made.
-fn polkit_service_without_proc(ctx: &CallerContext) -> bool {
-    matches!(ctx.process(), ProcessIdentity::Unknown)
-        && ctx.service().is_some_and(|service| service.is("polkit-1"))
-}
-
-/// R10 — the sequential default. Unconditional, and last.
-fn default_sequential(_ctx: &CallerContext) -> bool {
-    true
-}
-
 /// The first rule that matches wins; R10 is unconditional, so this is total.
-pub(crate) fn classify(ctx: &CallerContext) -> Classification {
+///
+/// The id comes back next to the classification: the row is what a failing test
+/// names, and a `Participation` carrying it would carry a field nothing in the
+/// shipped binary reads.
+pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification) {
     RULES
         .iter()
         .find(|rule| (rule.predicate)(ctx))
-        .map_or(DEFAULT_SEQUENTIAL, classification_of)
+        .map_or((RuleId::R10, DEFAULT_SEQUENTIAL), |rule| {
+            (rule.id, classification_of(rule))
+        })
 }
 
 fn classification_of(rule: &Rule) -> Classification {
     match rule.decision {
         Decision::Skip(policy) => Classification::Skip(policy),
         Decision::Participate(conversation) => Classification::Participate(Participation {
-            rule: rule.id,
             conversation,
             failure_direction: rule.class,
         }),
-    }
-}
-
-/// Whether an already-participating call's service is one of the *configured*
-/// refused names.
-///
-/// R1 runs before the config read by design, so it can only see the built-ins.
-/// This is the matcher behind the second half of the same refusal, for the names
-/// a deployment added to `pam_refused_services` (a renamed `PAMServiceName`):
-/// [`refine`] calls it once the config is in hand, still before the username
-/// lookup, conversation, messages and transaction.
-///
-/// The match is ASCII case-insensitive, like R1's, and an entry that is empty
-/// matches nothing — an unresolved service never matches either. Malformed
-/// entries are already dropped by `PamConfig::effective_refused_services`; the
-/// empty-name guard keeps a raw slice from matching a `None`/empty service.
-fn refused_service(service: Option<&ServiceName>, configured: &[String]) -> bool {
-    service.is_some_and(|service| {
-        configured
-            .iter()
-            .any(|name| !name.is_empty() && service.eq_ignore_ascii_case(name))
-    })
-}
-
-/// The second decision phase: what the config read can add to [`classify`].
-///
-/// `classify` decides from the caller facts alone, before the config exists, so
-/// R1 can only see the built-in refused names. A deployment that renames
-/// OpenSSH's `PAMServiceName` arrives here as a participating call, and this
-/// gives that call R1's verdict. It is the *whole* of the second phase:
-/// `orchestrate` calls it exactly once, immediately after the config read and
-/// before the username lookup, the conversation, the messages and the
-/// transaction.
-///
-/// The invariant is one-directional, and the body is its strongest encoding:
-///
-/// * it may **add** a skip — a participating call whose service is one of the
-///   configured names becomes [`Classification::Skip`] with R1's own
-///   [`SkipPolicy::RemoteAuthentication`];
-/// * it may not remove or reclassify one: a [`Classification::Skip`] is handed
-///   back untouched, before the configured list is even consulted for it;
-/// * it may not change a participating call's mechanism or deadline: the
-///   [`Participation`] is moved back out unchanged, and
-///   [`Deadline`](crate::plan::Deadline) is derived from that conversation, so
-///   the only value this function ever constructs is a `Skip`.
-///
-/// `refinement_cannot_change_a_participation` walks the whole corpus through
-/// both phases with three configs and pins all three clauses.
-pub(crate) fn refine(
-    classification: Classification,
-    service: Option<&ServiceName>,
-    configured: &[String],
-) -> Classification {
-    match classification {
-        // A skip stays a skip, unchanged: this phase only ever adds one.
-        skip @ Classification::Skip(_) => skip,
-        // The participation is handed back exactly as it arrived unless the
-        // configured list refuses the service. The refused arm builds a skip,
-        // never a `Participation`, so the mechanism cannot move.
-        participate @ Classification::Participate(_) => {
-            if refused_service(service, configured) {
-                Classification::Skip(SkipPolicy::RemoteAuthentication)
-            } else {
-                participate
-            }
-        }
     }
 }
 
@@ -535,6 +193,7 @@ pub(crate) fn refine(
 /// would race every other test in this binary that reads the environment. The
 /// end-to-end shapes in `scripts/ci/test-pam-conv-thread.sh` stay the proof for
 /// the reads.
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -543,9 +202,10 @@ pub(crate) fn refine(
     clippy::indexing_slicing
 )]
 mod tests {
+    use super::refine::refused_service;
     use super::*;
     use crate::config::PamConfig;
-    use crate::context::{classify_identity, GdmReauth};
+    use crate::context::{classify_identity, GdmReauth, ProcessIdentity, ServiceName};
     use crate::plan::{Announcement, Deadline, Plan, Plannable, TtyUse};
     use std::ffi::OsStr;
     use std::path::Path;
@@ -699,15 +359,16 @@ mod tests {
         CallerContext::from_parts(row.service.as_deref(), identity.clone(), reauth)
     }
 
-    /// The rule that classified a row. Every skip policy belongs to exactly one
-    /// rule (`Classification` carries no rule id for a skip), so the mapping is
-    /// explicit here: `RemoteAuthentication` is R1's and `KeyringNeedsAuthtok`
-    /// is R2's.
-    fn rule_of(classification: &Classification) -> Option<RuleId> {
+    /// The rule an id-less classification belongs to. `classify` reports the id
+    /// itself; `refine` returns a bare `Classification`, so its skip is mapped
+    /// back through the policy, which belongs to exactly one rule
+    /// (`RemoteAuthentication` is R1's and `KeyringNeedsAuthtok` is R2's). A
+    /// participation carries no id at all, so it maps to nothing here.
+    fn skip_rule(classification: &Classification) -> Option<RuleId> {
         match classification {
-            Classification::Participate(participation) => Some(participation.rule),
             Classification::Skip(SkipPolicy::RemoteAuthentication) => Some(RuleId::R1),
             Classification::Skip(SkipPolicy::KeyringNeedsAuthtok) => Some(RuleId::R2),
+            Classification::Participate(_) => None,
         }
     }
 
@@ -903,10 +564,10 @@ mod tests {
                 row.env.as_deref().unwrap_or("-")
             );
 
-            let classification = classify(&row_context(row, &identity, reauth));
+            let (rule, classification) = classify(&row_context(row, &identity, reauth));
             assert_eq!(
-                rule_of(&classification).map(RuleId::as_str),
-                Some(row.expected_rule.as_str()),
+                rule.as_str(),
+                row.expected_rule.as_str(),
                 "row {} ({}): classify fired the wrong rule",
                 row.id,
                 row.why
@@ -1019,7 +680,7 @@ mod tests {
             let identity =
                 classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
             let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
-            let classification = classify(&row_context(&row, &identity, reauth));
+            let (rule, classification) = classify(&row_context(&row, &identity, reauth));
             match &classification {
                 Classification::Participate(participation) => assert!(
                     class_permits(
@@ -1036,7 +697,7 @@ mod tests {
                     // the policy the caller sees must be that rule's own: R1 and
                     // R2 are the only two skipping rules, and they carry
                     // different policies.
-                    let rule = rule_of(&classification).and_then(rule_by_id);
+                    let rule = rule_by_id(rule);
                     assert_eq!(
                         rule.map(|rule| rule.decision),
                         Some(Decision::Skip(*policy)),
@@ -1119,8 +780,8 @@ mod tests {
                 GdmReauth::Absent,
             );
             assert_eq!(
-                rule_of(&classify(&ctx)),
-                Some(RuleId::R10),
+                classify(&ctx).0,
+                RuleId::R10,
                 "{name:?} is nobody's key and must fall to the default"
             );
         }
@@ -1132,9 +793,9 @@ mod tests {
             ProcessIdentity::Unknown,
             GdmReauth::Absent,
         );
-        assert_eq!(rule_of(&classify(&unknown_polkit)), Some(RuleId::R9));
+        assert_eq!(classify(&unknown_polkit).0, RuleId::R9);
         let named_polkit = context_for_process(RuleId::R5, "kscreenlocker_worker");
-        assert_eq!(rule_of(&classify(&named_polkit)), Some(RuleId::R5));
+        assert_eq!(classify(&named_polkit).0, RuleId::R5);
     }
 
     /// A context for `service`/`process` with no reauth flag.
@@ -1166,8 +827,8 @@ mod tests {
                 None,
             ] {
                 assert_eq!(
-                    rule_of(&classify(&context(Some(service), process))),
-                    Some(RuleId::R1),
+                    classify(&context(Some(service), process)).0,
+                    RuleId::R1,
                     "{service:?} with process {process:?} must be refused before any process rule"
                 );
             }
@@ -1175,8 +836,8 @@ mod tests {
 
         for service in [Some("my-sshd"), Some("sshd-old"), Some("SSH"), None] {
             assert_ne!(
-                rule_of(&classify(&context(service, Some("sh")))),
-                Some(RuleId::R1),
+                classify(&context(service, Some("sh"))).0,
+                RuleId::R1,
                 "{service:?} is not a remote service and must take the normal path"
             );
         }
@@ -1184,8 +845,8 @@ mod tests {
         // The near miss by value, not merely "not R1": a renamed service on an
         // `sshd`-looking process is the documented false negative.
         assert_eq!(
-            rule_of(&classify(&context(Some("my-sshd"), Some("sshd")))),
-            Some(RuleId::R10)
+            classify(&context(Some("my-sshd"), Some("sshd"))).0,
+            RuleId::R10
         );
     }
 
@@ -1335,8 +996,7 @@ mod tests {
                 let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
                 let ctx = row_context(row, &identity, reauth);
 
-                let before = classify(&ctx);
-                let before_rule = rule_of(&before);
+                let (rule, before) = classify(&ctx);
                 let before_policy = policy_of(&before);
                 let before_mechanism = mechanism_and_plan(&before, row.tty);
                 let refused = row.service.as_deref().is_some_and(|service| {
@@ -1355,8 +1015,8 @@ mod tests {
                         row.id, row.why
                     );
                     assert_eq!(
-                        rule_of(&after),
-                        before_rule,
+                        skip_rule(&after),
+                        Some(rule),
                         "{label}: row {} must keep its own skip rule",
                         row.id
                     );
@@ -1368,22 +1028,21 @@ mod tests {
                         "{label}: a configured service must be refused through R1's policy",
                     );
                     assert_eq!(
-                        rule_of(&after),
+                        skip_rule(&after),
                         Some(RuleId::R1),
                         "{label}: row {} must be refused through R1, not another rule",
                         row.id
                     );
                 } else {
                     // Whole-value equality, not just the conversation and the
-                    // plan derived from it: `rule` and `failure_direction` are
-                    // part of the value, so a refine that rebuilt the
-                    // participation with the same conversation but another
-                    // class fails here rather than only in `run`'s
-                    // `debug_assert!`, which release builds drop.
+                    // plan derived from it: the failure direction is part of the
+                    // value, so a refine that rebuilt the participation with the
+                    // same conversation but another class fails here rather than
+                    // only in `run`'s `debug_assert!`, which release builds drop.
                     assert_eq!(
                         after, before,
                         "{label}: row {} ({}) must come back from the \
-                         refinement unchanged, class and rule included",
+                         refinement unchanged, class included",
                         row.id, row.why
                     );
                 }
@@ -1464,11 +1123,8 @@ mod tests {
                 classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
             let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
             let ctx = row_context(row, &identity, reauth);
-            let baseline_classification = classify(&ctx);
-            let baseline = (
-                rule_of(&baseline_classification).expect("every row names its rule"),
-                policy_of(&baseline_classification),
-            );
+            let (rule, baseline_classification) = classify(&ctx);
+            let baseline = (rule, policy_of(&baseline_classification));
             let permuted = classify_with(ordered, &ctx);
             match changed.iter().find(|(id, _)| *id == row.id) {
                 Some((_, expected)) => {
@@ -1512,8 +1168,8 @@ mod tests {
         }
 
         // The fallback `classify` uses if the table ever stops matching is
-        // exactly what R10 produces.
-        assert_eq!(classify(&null), DEFAULT_SEQUENTIAL);
+        // exactly what R10 produces, id included.
+        assert_eq!(classify(&null), (RuleId::R10, DEFAULT_SEQUENTIAL));
     }
 
     /// Every `evidence` citation resolves in this tree, and the scan reports
@@ -1582,7 +1238,7 @@ mod tests {
         }
 
         assert!(
-            checked.contains(&"client-pam/src/policy.rs"),
+            checked.contains(&"client-pam/src/policy/table.rs"),
             "the citation scan never looked at this table's own file: {checked:?}"
         );
     }

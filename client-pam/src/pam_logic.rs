@@ -191,7 +191,7 @@ where
     // the display-manager bypass has always had. `classify_before_side_effects`
     // counts those four calls, because nothing in the types stops a later edit
     // from moving the decision below them.
-    let classification = policy::classify(ctx);
+    let (_rule, classification) = policy::classify(ctx);
 
     // The built-in skips — R1's service names and R2's display managers — return
     // here, before the config read. A skip is a static policy decision about the
@@ -1029,7 +1029,7 @@ mod tests {
         // cannot tell "the call site moved" from "the scan stopped reading the
         // file", so each file must also be shown to carry the declarations the
         // claim is about.
-        for required in ["pam_logic.rs", "policy.rs"] {
+        for required in ["pam_logic.rs", "policy/refine.rs"] {
             assert!(
                 names.iter().any(|name| name == required),
                 "the scan did not cover {required}: {names:?}"
@@ -1052,7 +1052,7 @@ mod tests {
                     assert_scan_reaches(&rel, &cleaned, &["fn orchestrate"]);
                     logic_source = cleaned;
                 }
-                "policy.rs" => {
+                "policy/refine.rs" => {
                     assert_scan_reaches(&rel, &cleaned, &["fn refine(", "fn refused_service("])
                 }
                 _ => {}

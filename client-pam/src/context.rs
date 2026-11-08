@@ -12,8 +12,8 @@ use std::path::Path;
 /// The caller facts, captured before any other work in `authenticate`.
 ///
 /// Read once, at `capture`; every consumer reads the captured values. R1 is
-/// keyed on the service name alone (see `policy::remote_refuse`), so this type
-/// carries no remote-presence fact: the module never reads `PAM_RHOST`.
+/// keyed on the service name alone (see `policy::table::remote_refuse`), so this
+/// type carries no remote-presence fact: the module never reads `PAM_RHOST`.
 pub(crate) struct CallerContext {
     service: Option<ServiceName>,
     process: ProcessIdentity,
@@ -227,6 +227,7 @@ impl GdmReauth {
     }
 }
 
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -302,12 +303,12 @@ mod tests {
         // The name the policy matches, not just the shape of the value: the
         // trimmed spelling is what R5 sees.
         let ctx = CallerContext::from_parts(Some("kde"), trimmed, GdmReauth::Absent);
+        let (rule, classification) = crate::policy::classify(&ctx);
         assert!(
             matches!(
-                crate::policy::classify(&ctx),
-                crate::policy::Classification::Participate(participation)
-                    if participation.rule == crate::policy::RuleId::R5
-            ),
+                classification,
+                crate::policy::Classification::Participate(_)
+            ) && rule == crate::policy::RuleId::R5,
             "the trimmed comm spelling must reach R5"
         );
 
@@ -373,7 +374,7 @@ mod tests {
         assert!(!sddm.is_gdm_reauth());
         assert!(
             matches!(
-                crate::policy::classify(&sddm),
+                crate::policy::classify(&sddm).1,
                 crate::policy::Classification::Skip(crate::policy::SkipPolicy::KeyringNeedsAuthtok)
             ),
             "an sddm login with GDM_SESSION_FOR_REAUTH set must still be the \

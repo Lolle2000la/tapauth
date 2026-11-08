@@ -28,10 +28,10 @@ pub struct PamConfig {
     /// Authentication timeout for GUI contexts without a usable conversation.
     /// Default: 30 seconds
     ///
-    /// Sequential graphical PAM hosts (any host the rule table in `policy.rs`
-    /// does not name) cannot have their conversation function driven while
-    /// TapAuth waits for the phone, so no concurrent password entry is possible
-    /// there (see `mechanism::sequential`). To keep the lock screen
+    /// Sequential graphical PAM hosts (any host the rule table in
+    /// `policy/table.rs` does not name) cannot have their conversation function
+    /// driven while TapAuth waits for the phone, so no concurrent password entry
+    /// is possible there (see `mechanism::sequential`). To keep the lock screen
     /// responsive, the TapAuth wait in those contexts is capped at this
     /// duration before falling through to password authentication. It is
     /// additionally clamped to `pam_operation_timeout_secs`.

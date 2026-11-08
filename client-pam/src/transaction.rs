@@ -764,7 +764,7 @@ pub(crate) mod tests {
     /// re-branches on identity — so a test that drives `run` directly has to
     /// name the one the context classifies to.
     fn participation_for(ctx: &CallerContext) -> Participation {
-        match crate::policy::classify(ctx) {
+        match crate::policy::classify(ctx).1 {
             crate::policy::Classification::Participate(participation) => participation,
             crate::policy::Classification::Skip(skip) => {
                 panic!("expected a participation, got the skip {skip:?}")
