@@ -6,6 +6,7 @@
 //! corpus lives beside this module in `reuse`.
 
 use super::*;
+use crate::ipc_client::IpcClient;
 use crate::logging;
 use crate::transaction::tests::{no_daemon, NullIpc};
 // `SendParams` is the transaction's wire payload: `wiring` is its production
@@ -134,7 +135,7 @@ fn remote_skip_never_reaches_the_daemon() {
                     sends.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
-                cancel: |_, _| {},
+                cancel: &|_, _| {},
             },
         );
 
@@ -203,7 +204,7 @@ fn side_effects_of(ctx: &CallerContext) -> [usize; 4] {
             probe_tty: &mut probe_tty,
             connect: &mut || Err::<IpcClient, _>(no_daemon()),
             send: &mut |_: &mut IpcClient, _: &SendParams<'_>| Ok(()),
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
     [
@@ -347,7 +348,7 @@ fn run_renamed(ctx: &CallerContext, load_config: fn() -> PamConfig) -> RenamedRu
                 sends.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
 
@@ -535,7 +536,7 @@ fn skip_never_hands_off() {
                     sends.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
-                cancel: |_, _| {},
+                cancel: &|_, _| {},
             },
         );
 
@@ -579,7 +580,7 @@ fn skip_never_hands_off() {
             probe_tty: &mut probe_tty,
             connect: &mut || Err::<NullIpc, _>(no_daemon()),
             send: &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
     assert_eq!(

@@ -11,29 +11,30 @@
 //! the order of the effects (classify → config → refine → username →
 //! conversation → messages → `transaction::run`); [`OrchestrationIo`] is the
 //! injectable seam that makes that order observable. The `wiring` submodule
-//! holds the production values behind the transaction's `Effects` — the only
-//! file that knows both the PAM host and `IpcClient`.
+//! holds the platform values behind the transaction's `Effects`;
+//! [`OrchestrationIo::production`] builds the PAM-side seam beside it.
 //!
 //! ## Flow
 //!
-//! 1. Load paired devices for the user
-//! 2. Send authentication request via BLE/UDP multicast
-//! 3. Wait for phone tap or user skip (terminal only)
-//! 4. On skip, send IPC cancel to daemon (best effort) plus network cancel
-//! 5. Return `PAM_SUCCESS` on authentication; every other outcome returns a
-//!    real verdict (`PAM_PERM_DENIED`, `PAM_AUTHINFO_UNAVAIL` or `PAM_AUTH_ERR`),
-//!    never `PAM_IGNORE`: Linux-PAM records no failure for that code, so a later
-//!    `optional` module voting success (e.g. `pam_permit`) would grant the stack.
+//! 1. Capture the caller facts and classify them against the rule table
+//! 2. For a participant, load the config and refine the classification with the
+//!    configured refused service names
+//! 3. Resolve the username, the PAM conversation and the messages
+//! 4. Hand the participation to `transaction::run`, which sends one IPC request
+//!    to `tapauthd` and waits for the daemon's answer
+//! 5. Map the resulting verdict to a `PAM_*` code: `PAM_SUCCESS` on a phone tap,
+//!    `PAM_PERM_DENIED` on an explicit denial, `PAM_AUTHINFO_UNAVAIL` when the
+//!    service could not be consulted and `PAM_AUTH_ERR` on a processing failure,
+//!    never `PAM_IGNORE` (Linux-PAM records no failure for it, so a later
+//!    `optional` module voting success, e.g. `pam_permit`, would grant the stack)
 //!
 //! ## Threading
 //!
-//! Uses a shared async runtime to avoid the ~100ms overhead of creating a new
-//! runtime per authentication attempt. A separate thread monitors `/dev/tty`
-//! for skip signals in terminal contexts. TTY-less (GUI) hosts are split into
-//! three conversation modes by the policy table in `policy`; only allowlisted hosts get
-//! the worker thread, hosts that collect the password before calling into PAM
-//! get a synchronous replay and no daemon request at all, and everyone else
-//! keeps the conversation on the caller's thread.
+//! The module sends one IPC request and waits for it on the calling thread; it
+//! starts no runtime and owns no daemon transport. The only thread it ever
+//! creates is the threaded mechanism's password worker. The sequential mechanism
+//! polls the daemon socket on the calling thread (and `/dev/tty` when the plan
+//! gave it a terminal) and never drives the conversation.
 //!
 //! ## Return-code mapping
 //!
@@ -47,7 +48,7 @@
 
 use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
-use crate::ipc_client::{IpcClient, IpcResponseReader};
+use crate::ipc_client::IpcResponseReader;
 use crate::logging;
 use crate::outcome::Outcome;
 use crate::pam_messages;
@@ -56,7 +57,7 @@ use crate::policy;
 use crate::transaction::{Effects, Finished, HostIo};
 use std::os::raw::c_int;
 use std::time::Instant;
-use wiring::{cancel_on_fresh_connection, probe_tty, send_authenticate_request};
+use wiring::{cancel_on_fresh_connection, connect, probe_tty, send_authenticate_request};
 
 mod wiring;
 
@@ -111,16 +112,18 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     //
     // The outside world this call asks for, as one value: the `/dev/tty` probe,
     // the nonblocking daemon dial, the authenticate request and the
-    // fresh-connection cancel. Each function is bound to a local first so the
+    // fresh-connection cancel — all four bound from `wiring`, so this file names
+    // none of the platform calls. Each function is bound to a local first so the
     // struct borrows a named place rather than a temporary.
     let mut probe = probe_tty;
-    let mut connect = IpcClient::connect_nonblocking;
+    let mut connect = connect;
     let mut send = send_authenticate_request;
+    let cancel = cancel_on_fresh_connection;
     let mut effects = Effects {
         probe_tty: &mut probe,
         connect: &mut connect,
         send: &mut send,
-        cancel: cancel_on_fresh_connection,
+        cancel: &cancel,
     };
     match orchestrate(pamh, &ctx, &OrchestrationIo::production(), &mut effects) {
         Finished::Concluded(concluded) => {
@@ -180,7 +183,7 @@ impl OrchestrationIo {
 /// `effects` is the transaction's outside world — the `/dev/tty` probe, the
 /// daemon dial, the request on the wire and the cancel, the same seam
 /// [`Armed::open`](crate::transaction::Armed::open) has. Production passes
-/// `IpcClient::connect_nonblocking`, [`send_authenticate_request`](wiring::send_authenticate_request)
+/// [`connect`](wiring::connect), [`send_authenticate_request`](wiring::send_authenticate_request)
 /// and [`cancel_on_fresh_connection`](wiring::cancel_on_fresh_connection) (built
 /// by [`authenticate`]), and a test passes counting closures or failures, so
 /// "the skip never reaches the daemon", "a connect failure records nothing" and
@@ -265,7 +268,14 @@ fn orchestrate<T: IpcResponseReader>(
     let msgs = (io.load_messages)(&username);
 
     let mut host = HostIo::new(pamh, &pam_conv, &msgs, io.read_authtok);
-    crate::transaction::run(ctx, &username, &participation, &mut host, &config, effects)
+    crate::transaction::run(
+        ctx.service(),
+        &username,
+        &participation,
+        &mut host,
+        &config,
+        effects,
+    )
 }
 
 /// The one return for a skip, whichever of the two decision phases produced it.

@@ -11,7 +11,7 @@
 //! the record ([`StartError`]) nor produce a conclusion.
 
 use crate::context::ServiceName;
-use crate::ipc_client::{IpcClient, IpcError, IpcResponseReader};
+use crate::ipc_client::{IpcError, IpcResponseReader};
 use crate::mechanism::MechanismEnd;
 use crate::outcome::Outcome;
 
@@ -126,7 +126,7 @@ pub(crate) enum StartError {
 /// then `send`, and it returns `Armed` only when *both* succeeded. A local IPC
 /// failure is not a verdict about the phone, so it can neither arm the record
 /// nor produce a conclusion.
-pub(crate) struct Armed<I: IpcResponseReader = IpcClient> {
+pub(crate) struct Armed<I: IpcResponseReader> {
     ipc: I,
     request_id: Box<str>,
 }
@@ -167,8 +167,8 @@ impl<I: IpcResponseReader> Armed<I> {
     /// so the daemon's answer is mapped to a verdict here and nowhere else: a
     /// mechanism cannot mint a `Granted` or a `Denied` of its own (§3.5.2
     /// layer 4). The mapping itself is
-    /// `impl From<MechanismEnd> for Outcome`, which lives in `outcome.rs` beside
-    /// the verdict vocabulary it produces.
+    /// `impl From<MechanismEnd> for Outcome`, which lives in `mechanism/mod.rs`
+    /// beside the exit type it maps.
     pub(crate) fn conclude(
         self,
         end: MechanismEnd,

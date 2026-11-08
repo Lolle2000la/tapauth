@@ -1,13 +1,13 @@
-//! The production values behind the transaction's effects.
+//! The platform values behind the transaction's effects.
 //!
-//! [`authenticate`](super::authenticate) binds these into
-//! [`Effects`](crate::transaction::Effects), and this is the only file that
-//! knows both the PAM host and `IpcClient`: the `/dev/tty` probe, the
-//! authenticate request on the connected socket, and the best-effort cancel on
-//! a fresh connection. Splitting them out of `super` keeps the ordering policy
-//! and the platform calls readable apart; every test substitutes a field of
-//! `Effects` instead of calling one of these, so none of them has a test of its
-//! own.
+//! [`authenticate`](super::authenticate) binds all four into
+//! [`Effects`](crate::transaction::Effects): the `/dev/tty` probe, the
+//! nonblocking daemon dial, the authenticate request on the connected socket,
+//! and the best-effort cancel on a fresh connection. This is the one file that
+//! names the platform calls `Effects` is built from; no PAM conversation call
+//! lives here. Splitting them out of `super` keeps the ordering policy and the
+//! platform calls readable apart; every test substitutes a field of `Effects`
+//! instead of calling one of these, so none of them has a test of its own.
 
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::transaction::SendParams;
@@ -20,6 +20,14 @@ use std::time::Duration;
 /// without a terminal.
 pub(super) fn probe_tty() -> Option<std::fs::File> {
     std::fs::File::open("/dev/tty").ok()
+}
+
+/// The production `connect`: a nonblocking dial of the daemon socket.
+///
+/// A one-line wrapper rather than a re-export, because an inherent associated
+/// function cannot be named by a `use` path.
+pub(super) fn connect() -> Result<IpcClient, IpcError> {
+    IpcClient::connect_nonblocking()
 }
 
 /// The production `send`: the authenticate request, on the connected client.

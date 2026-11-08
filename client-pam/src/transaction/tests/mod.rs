@@ -17,11 +17,11 @@ use std::fs::File;
 use std::os::raw::{c_char, c_int};
 use std::time::Instant;
 
-/// An `IpcResponseReader` that carries nothing: enough to build an `Armed`
-/// for the paths that never touch the transport.
-struct UnusedIpc;
+/// The crate's transport double: an `IpcResponseReader` that carries nothing,
+/// enough to satisfy the transport bound for a path that never uses it.
+pub(crate) struct NullIpc;
 
-impl IpcResponseReader for UnusedIpc {
+impl IpcResponseReader for NullIpc {
     fn fd(&self) -> std::os::fd::RawFd {
         -1
     }
@@ -47,29 +47,9 @@ fn concluded(outcome: Outcome, via: Via) -> Concluded {
 }
 
 // ------------------------------------------------------------------
-// Driving `run`: the transport doubles and the harness the moved tests
-// share. No test opens a daemon socket.
+// Driving `run`: the harness the moved tests share. No test opens a
+// daemon socket.
 // ------------------------------------------------------------------
-
-/// An `IpcResponseReader` that carries nothing: enough to satisfy the
-/// transport bound for a path that fails before either end is used.
-pub(crate) struct NullIpc;
-
-impl IpcResponseReader for NullIpc {
-    fn fd(&self) -> std::os::fd::RawFd {
-        -1
-    }
-
-    fn try_read_response_nonblocking(
-        &mut self,
-    ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
-        Ok(None)
-    }
-
-    fn send_cancel(&mut self, _reason: &str, _request_id: &str) -> Result<(), std::io::Error> {
-        Ok(())
-    }
-}
 
 /// A connect that fails the way a missing socket does, for the paths whose
 /// call counts are the assertion.
@@ -147,7 +127,7 @@ fn run_with_probe<T: IpcResponseReader>(
         tty.and_then(|path| std::fs::File::open(path).ok())
     };
     let finished = run(
-        ctx,
+        ctx.service(),
         "tty-probe-test-user",
         &participation,
         &mut host,
@@ -156,7 +136,7 @@ fn run_with_probe<T: IpcResponseReader>(
             probe_tty: &mut probe,
             connect,
             send,
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
     (finished, probes)
@@ -227,13 +207,13 @@ fn finished_reports_its_outcome_and_provenance() {
 #[test]
 fn armed_requires_both_connect_and_send() {
     let mut refused = || {
-        Err::<UnusedIpc, _>(IpcError::Io(std::io::Error::new(
+        Err::<NullIpc, _>(IpcError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "no daemon socket",
         )))
     };
 
-    let no_connect = Armed::open(&mut refused, &mut |_: &mut UnusedIpc| Ok(()), "rid".into());
+    let no_connect = Armed::open(&mut refused, &mut |_: &mut NullIpc| Ok(()), "rid".into());
     assert!(
         matches!(no_connect, Err(StartError::Connect(_))),
         "a refused connect must surface as a connect failure, not as a send \
@@ -242,8 +222,8 @@ fn armed_requires_both_connect_and_send() {
 
     let mut sent = false;
     let bad_send = Armed::open(
-        &mut || Ok(UnusedIpc),
-        &mut |_: &mut UnusedIpc| {
+        &mut || Ok(NullIpc),
+        &mut |_: &mut NullIpc| {
             sent = true;
             Err(IpcError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -259,8 +239,8 @@ fn armed_requires_both_connect_and_send() {
     assert!(sent, "the send closure is what failed, so it must have run");
 
     let Ok(armed) = Armed::open(
-        &mut || Ok(UnusedIpc),
-        &mut |_: &mut UnusedIpc| Ok(()),
+        &mut || Ok(NullIpc),
+        &mut |_: &mut NullIpc| Ok(()),
         "rid".into(),
     ) else {
         panic!("both effects succeeded, so the request is on the wire");
@@ -657,18 +637,21 @@ fn marker(text: &str) -> Emitted {
 }
 
 /// What `run` showed, in order, with the point the request went on the wire
-/// marked.
+/// marked, and how many times it asked for a cancellation.
 ///
 /// The recording host is the only way an announcement can be observed
 /// without a real PAM handle; `send` runs inside `Armed::open`, so its mark
-/// is the request's position in the same log.
-fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<Emitted> {
+/// is the request's position in the same log. The cancel count is what makes
+/// the `Effects` seam's last field observable: with the zero-second budget
+/// these tests use, no path reaches a cancel.
+fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> (Vec<Emitted>, usize) {
     let msgs = PamMessages::new("en");
     let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
     let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log, unused_authtok);
     let participation = participation_for(ctx);
+    let cancels = std::cell::Cell::new(0usize);
     let _finished = run(
-        ctx,
+        ctx.service(),
         "announcement-order-user",
         &participation,
         &mut host,
@@ -680,10 +663,10 @@ fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> Vec<Emitted> {
                 log.borrow_mut().push(marker(OPEN_MARKER));
                 Ok(())
             },
-            cancel: |_, _| {},
+            cancel: &|_, _| cancels.set(cancels.get() + 1),
         },
     );
-    log.into_inner()
+    (log.into_inner(), cancels.get())
 }
 
 /// Drive `run` through a recording host with no terminal and report what it
@@ -704,7 +687,7 @@ fn shown_while_running<T: IpcResponseReader>(
     let mut host = HostIo::for_test_recording(std::ptr::null_mut(), &msgs, &log, unused_authtok);
     let participation = participation_for(ctx);
     let finished = run(
-        ctx,
+        ctx.service(),
         username,
         &participation,
         &mut host,
@@ -713,7 +696,7 @@ fn shown_while_running<T: IpcResponseReader>(
             probe_tty: &mut || None::<File>,
             connect,
             send,
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
     (finished, log.into_inner())
@@ -753,14 +736,19 @@ fn announcement_order_matches_today() {
     let msgs = PamMessages::new("en");
 
     // Threaded: `waiting_for_tap` before the request.
-    let log = shown_order(&context(Some("order-threaded"), Some("hyprlock")), None);
+    let (log, cancels) = shown_order(&context(Some("order-threaded"), Some("hyprlock")), None);
     assert!(
         once(&log, msgs.waiting_for_tap()) < once(&log, OPEN_MARKER),
         "the threaded wait is announced before the request: {log:?}"
     );
+    assert_eq!(
+        cancels, 0,
+        "the zero-second budget ends the threaded wait as a timeout, and a \
+         timeout cancels nothing"
+    );
 
     // Terminal: `waiting_for_tap_skip` before the request.
-    let log = shown_order(
+    let (log, cancels) = shown_order(
         &context(Some("order-terminal"), Some("xfce4-screensaver-dialog")),
         Some("/dev/null"),
     );
@@ -768,9 +756,14 @@ fn announcement_order_matches_today() {
         once(&log, msgs.waiting_for_tap_skip()) < once(&log, OPEN_MARKER),
         "the terminal wait is announced before the request: {log:?}"
     );
+    assert_eq!(
+        cancels, 0,
+        "the terminal timeout must not cancel: the daemon holds the same \
+         deadline and multicasts its own cancel"
+    );
 
     // No-terminal sequential: `waiting_for_tap_password` *after* it.
-    let log = shown_order(
+    let (log, cancels) = shown_order(
         &context(
             Some("order-gui-sequential"),
             Some("xfce4-screensaver-dialog"),
@@ -781,6 +774,11 @@ fn announcement_order_matches_today() {
         once(&log, msgs.waiting_for_tap_password()) > once(&log, OPEN_MARKER),
         "the password-route announcement follows the request, once the \
          module is about to block: {log:?}"
+    );
+    assert_eq!(
+        cancels, 0,
+        "the no-terminal sequential timeout must not open a fresh connection \
+         for a cancellation the daemon already decided"
     );
 }
 
@@ -807,7 +805,7 @@ fn precollected_never_plans() {
     let mut probes = 0usize;
     let connects = std::cell::Cell::new(0usize);
     let finished = run(
-        &ctx,
+        ctx.service(),
         "precollected-user",
         &participation,
         &mut host,
@@ -822,7 +820,7 @@ fn precollected_never_plans() {
                 Err::<NullIpc, _>(no_daemon())
             },
             send: &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
-            cancel: |_, _| {},
+            cancel: &|_, _| {},
         },
     );
 

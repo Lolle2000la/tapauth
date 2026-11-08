@@ -13,7 +13,7 @@ use super::host_io::finish;
 use super::{Armed, Finished, HostIo, StartError};
 use crate::conclusion_cache::replay_for;
 use crate::config::PamConfig;
-use crate::context::CallerContext;
+use crate::context::ServiceName;
 use crate::ipc_client::{IpcError, IpcResponseReader};
 use crate::mechanism::{handoff, sequential, threaded};
 use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReason};
@@ -39,14 +39,23 @@ pub(crate) struct SendParams<'a> {
 /// `HostIo` is the PAM conversation surface; this is the outside world: probe a
 /// terminal, dial the daemon, put the request on the wire, cancel it. Production
 /// passes the module's own functions; tests substitute one field at a time.
+///
+/// `cancel` is a shared `dyn Fn` rather than a function pointer so a test can
+/// count the calls: the mechanisms take any `X: Fn(&str, &str)`, and a captured
+/// counter satisfies that bound without a second seam.
 pub(crate) struct Effects<'a, T> {
     pub(crate) probe_tty: &'a mut dyn FnMut() -> Option<File>,
     pub(crate) connect: &'a mut dyn FnMut() -> Result<T, IpcError>,
     pub(crate) send: &'a mut dyn for<'p> FnMut(&mut T, &SendParams<'p>) -> Result<(), IpcError>,
-    pub(crate) cancel: fn(&str, &str),
+    pub(crate) cancel: &'a dyn Fn(&str, &str),
 }
 
 /// One authentication transaction, from the classification to the conclusion.
+///
+/// It takes the participant, not the caller's captured identity: the only
+/// caller fact it needs is the service name the reuse record keys on, so it
+/// cannot re-branch on identity and a mechanism selected by the policy cannot be
+/// overridden here.
 ///
 /// Everything that happens *before* a request is on the wire returns
 /// `Finished::Unrecorded`: the pre-collected handoff, a failed request id, a
@@ -74,7 +83,7 @@ pub(crate) struct Effects<'a, T> {
 /// connect failure records nothing" and "a timeout cancels nothing" are
 /// assertions rather than promises.
 pub(crate) fn run<T: IpcResponseReader>(
-    ctx: &CallerContext,
+    service: Option<&ServiceName>,
     username: &str,
     participation: &Participation,
     host: &mut HostIo<'_>,
@@ -110,7 +119,7 @@ pub(crate) fn run<T: IpcResponseReader>(
     // The captured service name keys the cache: `None` means the service is
     // unknown, which disables the cache for this call rather than collapsing
     // every such call into one key.
-    if let Some(service_name) = ctx.service() {
+    if let Some(service_name) = service {
         // A hit is a conclusion — an earlier call's — so it is `Concluded`,
         // with `Via::Replay` saying it must not be recorded again: that would
         // refresh the timestamp, so the window stays anchored to the original
@@ -267,6 +276,6 @@ pub(crate) fn run<T: IpcResponseReader>(
         }
     };
 
-    let concluded = armed.conclude(end, username, ctx.service().cloned());
+    let concluded = armed.conclude(end, username, service.cloned());
     finish(host, Finished::Concluded(concluded))
 }
