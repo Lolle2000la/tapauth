@@ -210,6 +210,15 @@ cargo build --manifest-path client-pam/Cargo.toml
   `packaging/arch/tapauth.install` and `packaging/arch-git/tapauth-git.install` are
   kept byte-identical and must be updated together.
 
+## CI & Merge Queue
+- `main` requires a merge queue (ruleset `16779046`). Setup, the path-filter caveat, and the
+  apply/verify/rollback commands: `docs/ci/merge-queue.md`; the payload is
+  `scripts/ci/merge-queue-ruleset.json` (never applied by CI).
+- **Required-check job names are load-bearing.** The ruleset matches seven `name:` strings
+  exactly; renaming a job that is a required check silently stalls the queue (nothing reports
+  the new name, so every entry waits out `check_response_timeout_minutes`). The
+  `merge_group` trigger must stay unfiltered — GitHub supports no `paths:` on that event.
+
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
 - Key settings: `udp_port` (default 36692), `pam_operation_timeout_secs` (default 120), `use_tpm` (default false), `enable_network` (default true, Local Network/UDP transport), `enable_ble` (default true, BLE transport). The transport toggles take effect on the next authentication attempt without a daemon restart and can be changed via admin IPC (Settings screen in the GUI; requires PolKit admin authorization).

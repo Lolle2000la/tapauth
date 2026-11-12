@@ -33,6 +33,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+  # No `paths:` here: GitHub does not support path filters on merge_group, and
+  # the required checks must be reported for every merge-group SHA.
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
