@@ -12,7 +12,18 @@ enforce_prod_feature_guard "Arch"
 if ! command -v cargo >/dev/null 2>&1; then
     # Arch does not support partial upgrades: upgrade the system while installing.
     echo "==> Installing build dependencies (cargo, protobuf, clang, pam, sccache)..."
-    pacman -Syu --noconfirm --needed cargo protobuf clang pam sccache
+    # Retried: a mirror DNS blip fails the sync before anything is installed.
+    for attempt in 1 2 3; do
+        if pacman -Syu --noconfirm --needed cargo protobuf clang pam sccache; then
+            break
+        fi
+        if [ "$attempt" -eq 3 ]; then
+            echo "!!! pacman -Syu failed after 3 attempts" >&2
+            exit 1
+        fi
+        echo "==> pacman -Syu failed (attempt ${attempt}/3), retrying in 5s..." >&2
+        sleep 5
+    done
 fi
 
 BUILD_DIR="/tmp/arch-build-src"
