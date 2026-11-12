@@ -17,24 +17,13 @@ on:
       - 'packaging/**'
       - 'create-dev-users.sh'
       - '.github/workflows/ci-android.yml'
+  # No `paths:` here: all five jobs are required status checks, and a required
+  # check cannot be path-filtered — a skipped run leaves it `Pending` forever,
+  # so the PR could be neither merged nor queued.
   pull_request:
     branches: [main]
-    paths:
-      - 'server-android/**'
-      - 'shared/**'
-      - 'tapauthd/**'
-      - 'client-pam/**'
-      - 'client-config-gui/**'
-      - 'scripts/**'
-      - 'proto/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'systemd/**'
-      - 'packaging/**'
-      - 'create-dev-users.sh'
-      - '.github/workflows/ci-android.yml'
-  # No `paths:` here: GitHub does not support path filters on merge_group, and
-  # the four required checks must be reported for every merge-group SHA.
+  # E2E is a required check, so the merge group must report it too. GitHub
+  # supports no `paths:` filter on this event.
   merge_group:
     types: [checks_requested]
     branches: [main]
@@ -395,9 +384,6 @@ jobs:
   e2e:
     name: Real-Android E2E Tests (Ubuntu, Fedora, Arch)
     needs: [build-android, build-pkg-ubuntu, build-pkg-fedora, build-pkg-arch]
-    # Not a required check, so skip it on merge-queue entries: the emulator,
-    # kernel-module and container suite would otherwise run for every group.
-    if: github.event_name != 'merge_group'
     runs-on: ubuntu-26.04
 
     steps:
