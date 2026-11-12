@@ -42,15 +42,17 @@ pub(crate) struct HostIo<'a> {
 }
 
 impl<'a> HostIo<'a> {
+    /// The one constructor: a test passes `None` for the conversation, which makes
+    /// every emission a no-op.
     pub(crate) fn new(
         pamh: *mut PamHandle,
-        conv: &'a PamConversation<'a>,
+        conv: Option<&'a PamConversation<'a>>,
         msgs: &'a PamMessages,
         read_authtok: ReadAuthtok,
     ) -> Self {
         HostIo {
             pamh,
-            conv: Some(conv),
+            conv,
             msgs,
             read_authtok,
             #[cfg(test)]
@@ -92,23 +94,6 @@ impl<'a> HostIo<'a> {
         match notice.style {
             NoticeStyle::Info => conv.try_info(&notice.text),
             NoticeStyle::Error => conv.try_error(&notice.text),
-        }
-    }
-
-    /// A host with no conversation: every emission is a no-op.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        pamh: *mut PamHandle,
-        conv: Option<&'a PamConversation<'a>>,
-        msgs: &'a PamMessages,
-        read_authtok: ReadAuthtok,
-    ) -> Self {
-        HostIo {
-            pamh,
-            conv,
-            msgs,
-            read_authtok,
-            emitted: None,
         }
     }
 

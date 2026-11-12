@@ -107,7 +107,7 @@ fn run_with_probe<T: IpcResponseReader>(
     send: &mut dyn for<'p> FnMut(&mut T, &SendParams<'p>) -> Result<(), IpcError>,
 ) -> (Finished, usize) {
     let msgs = PamMessages::new("en");
-    let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
+    let mut host = HostIo::new(std::ptr::null_mut(), None, &msgs, unused_authtok);
     let participation = participation_for(ctx);
     let mut probes = 0usize;
     let mut probe = || {
@@ -796,7 +796,7 @@ fn gui_ipc_error_cancels_through_the_effects_seam() {
         "the no-terminal sequential shape is the one that cancels on an IPC error"
     );
     let msgs = PamMessages::new("en");
-    let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
+    let mut host = HostIo::new(std::ptr::null_mut(), None, &msgs, unused_authtok);
     let cancels: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
     let cfg = PamConfig {
         pam_operation_timeout_secs: 5,
@@ -870,7 +870,7 @@ fn precollected_never_plans() {
     );
 
     let msgs = PamMessages::new("en");
-    let mut host = HostIo::for_test(std::ptr::null_mut(), None, &msgs, unused_authtok);
+    let mut host = HostIo::new(std::ptr::null_mut(), None, &msgs, unused_authtok);
     let mut probes = 0usize;
     let connects = std::cell::Cell::new(0usize);
     let finished = run(

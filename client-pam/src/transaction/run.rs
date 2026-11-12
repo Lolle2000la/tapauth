@@ -14,7 +14,7 @@ use crate::ipc_client::{IpcError, IpcResponseReader};
 use crate::mechanism::{handoff, sequential, threaded};
 use crate::outcome::{ErrorReason, Notice, NoticeStyle, Outcome, UnavailableReason};
 use crate::plan::{Announcement, Plannable, TtyUse};
-use crate::policy::{Conversation, FailureDirection, Participation};
+use crate::policy::{class_permits, Conversation, Participation};
 use std::borrow::Cow;
 use std::fs::File;
 use std::time::{Duration, Instant};
@@ -126,18 +126,18 @@ pub(crate) fn run<T: IpcResponseReader>(
     let has_tty = tty_file.is_some();
     let plan = plannable.plan(has_tty);
 
-    // This is where the class first meets the plan. This assert is not the class/conversation
-    // invariant — `policy`'s `class_permits`, walked over every `RULES` row and every corpus
-    // row by `class_agrees_with_conversation`, is. It is a debug-only blacklist of the two
-    // pairs a `RULES` row must never produce, and release builds drop it entirely.
+    // This is where the class first meets the plan. The pairing rule itself is not
+    // restated here: `policy`'s `class_permits` is one total function over
+    // `FailureDirection × Conversation`, with no wildcard, walked cell by cell by
+    // `class_permits_matches_its_expectation` and over every `RULES` row and every
+    // corpus row by `class_agrees_with_conversation`. This assertion only re-applies
+    // that one answer where the class meets a plan, and release builds drop it
+    // entirely.
     debug_assert!(
-        !matches!(
-            (participation.failure_direction, plannable),
-            (FailureDirection::NeverRing, _)
-                | (FailureDirection::AlwaysRing, Plannable::Sequential)
-        ),
-        "class {:?} cannot be planned as {plannable:?}",
-        participation.failure_direction
+        class_permits(participation.failure_direction, participation.conversation),
+        "class {:?} cannot be answered with a {:?} conversation",
+        participation.failure_direction,
+        participation.conversation
     );
 
     // Announce the wait. Each call is a single non-blocking `PAM_TEXT_INFO`: one conversation

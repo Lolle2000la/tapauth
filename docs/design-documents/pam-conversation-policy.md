@@ -47,7 +47,7 @@ The pre-refactor file is reachable at `git show 57d829a^:client-pam/src/pam_logi
 
 ### 2.2 The failure-direction taxonomy is a table cell
 
-The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy/mod.rs`, `FailureDirection`), a field of every rule (`policy/table.rs`, `Rule`), copied onto the returned `Participation` (`policy/mod.rs`, `Participation`; `classification_of`), asserted against the conversation by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-checked where the value first meets the plan (`transaction/run.rs:133-141`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
+The module used to distinguish *never ring*, *deadlock avoidance*, *always ring*, *keyring* and — after `1ec92bb` — *refuse remote* only in prose. `FailureDirection` is now one enum with those five variants (`policy/mod.rs`, `FailureDirection`), a field of every rule (`policy/table.rs`, `Rule`), copied onto the returned `Participation` (`policy/mod.rs`, `Participation`; `classification_of`), asserted against the conversation by one total, wildcard-free pairing function (`policy/mod.rs`, `class_permits`; `class_agrees_with_conversation`, `class_permits_matches_its_expectation`) and re-checked where the value first meets the plan (`transaction/run.rs:129-141`). A new arm cannot inherit its neighbour's direction silently, because the direction is a cell the tests name.
 
 ### 2.3 The return code is produced at one site
 
@@ -178,7 +178,7 @@ Notes that belong to the table:
 | `AlwaysRing` | the phone is offered concurrently | one extra ring, or the host's dialog loses its race; never a grant, never a wedge |
 | `Keyring` | a grant would be useless without `PAM_AUTHTOK` | under-match: the keyring stays locked after a successful login. Over-match: the login manager's prompt is skipped and the stack falls through |
 
-`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy/mod.rs`, `FailureDirection`). The class is copied onto the participation (`policy/mod.rs`, `classification_of`), asserted against the decision by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) and re-asserted at the point the class meets the plan (`transaction/run.rs:133-141`), so a mismatch fails a test rather than being a comment nobody reads.
+`Keyring` and `RefuseRemote` sit in the same enum but are orthogonal to the three failure directions: the first is about the value of a grant, the second about whether the call is ours to answer (`policy/mod.rs`, `FailureDirection`). The class is copied onto the participation (`policy/mod.rs`, `classification_of`), asserted against the decision by `class_agrees_with_conversation` (`policy/mod.rs`, `class_agrees_with_conversation`) against the one pairing function (`policy/mod.rs`, `class_permits`) and re-asserted at the point the class meets the plan (`transaction/run.rs:129-141`), so a mismatch fails a test rather than being a comment nobody reads.
 
 Every skip still returns `PAM_AUTHINFO_UNAVAIL`, never `PAM_IGNORE`: on a `required` line that is a failure, on a `sufficient` line it is `ignore` and the stack decides (`pam_logic/mod.rs`, `authenticate`).
 
@@ -257,7 +257,7 @@ pub(crate) fn run<T: IpcResponseReader>(
 1. **Carrier or handoff.** The `match` on `participation.conversation` yields `Plannable::Threaded`/`Sequential`, or performs the pre-collected handoff and returns `Unrecorded` (`transaction/run.rs:84-91`). No probe, plan or lookup exists on that arm.
 2. **Reuse lookup**, only when the service resolved; a hit is `Concluded` with `Via::Replay` (`transaction/run.rs:103-112`).
 3. **The tty probe**, gated by `TtyUse` (`transaction/run.rs:121-125`).
-4. **The plan**, then the class/plan assertion, then the first announcements (`transaction/run.rs:127-159`, `:133-141`).
+4. **The plan**, then the class/plan assertion, then the first announcements (`transaction/run.rs:127-159`, `:129-141`).
 5. **The request id** (16 random bytes, hex); failure returns `Unrecorded(Error(RequestId))` (`transaction/run.rs:162-169`).
 6. **The deadline**, resolved once and anchored *before* the request: a stalled connect or write consumes budget instead of running past it (`transaction/run.rs:171-186`).
 7. **`Armed::open`**, which runs `connect` then `send` and yields `Armed` only when both succeeded; the two failures return `Unrecorded` with `DaemonUnreachable` or `DaemonSendFailed` (`transaction/run.rs:201-220`). `SendParams` is what the send closure sees: username, `has_tty`, timeout, request id — nothing else (`transaction/run.rs:26-31`).
@@ -455,13 +455,13 @@ The earlier record kept `set_user` and the conversation prompt helpers under `#[
 
 | layer | command | result |
 | :--- | :--- | :--- |
-| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **109 passed, 0 failed, 0 ignored** |
+| `client-pam` | `cargo test --manifest-path client-pam/Cargo.toml` | **110 passed, 0 failed, 0 ignored** |
 | workspace, `shared` | `cargo test --workspace` | **96 passed** |
-| workspace, `client-pam` | the same run | 109 passed, 0 ignored |
+| workspace, `client-pam` | the same run | 110 passed, 0 ignored |
 | workspace, every other target | the same run | 0 tests |
 | end-to-end | `scripts/ci/test-pam-conv-thread.sh` | **16 shapes**, the `e2e=1` rows |
 
-205 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
+206 tests pass across the workspace and none is ignored. `conclusion_cache_survives_fork` (`conclusion_cache.rs`, `conclusion_cache_survives_fork`) now runs as part of that count — it is the D4 fix, not a skipped convenience (§7) — and the crate's own scan asserts that no `#[ignore]` remains (`source_guards.rs`, `reuse_suite_is_intact`). `scripts/ci/test-pam-host-cases.sh` is not part of these numbers: it needs root and has not been run locally (§7).
 
 ### 6.2 The corpus and its consumers
 
@@ -470,6 +470,7 @@ The Rust reader asserts, per row, the identity provenance, the env interpretatio
 * `corpus_covers_every_rule` iterates `RULES` and requires a corpus row per rule (`policy/mod.rs`, `corpus_covers_every_rule`).
 * `audit_covers_rules` walks `RuleId::ALL` and requires exactly one `RULES` row per id and exactly one record per name, with a non-empty name, `why` and `evidence` on every record (`policy/mod.rs`, `audit_covers_rules`).
 * `class_agrees_with_conversation` asserts the class/decision relation over the table and over every row (`policy/mod.rs`, `class_agrees_with_conversation`).
+* `class_permits_matches_its_expectation` walks every class × conversation cell against a hand-written expectation, and pins the two variant counts and the row count, so a cell cannot be admitted by a wildcard arm and a class or conversation cannot be added with its pairings undecided (`policy/mod.rs`, `class_permits_matches_its_expectation`).
 * `rules_are_process_disjoint` asserts the literal sets are pairwise disjoint and that each spelling fires its own rule (`policy/mod.rs`, `rules_are_process_disjoint`).
 * `remote_rules` exercises both service names, both cases, four process shapes and three near misses (`policy/mod.rs`, `remote_rules`).
 * `configured_refused_services_match_only_declared_names` pins the configured half of R1: an undeclared name is not matched, the comparison is ASCII-insensitive, and a malformed entry matches nothing (`policy/mod.rs`, `configured_refused_services_match_only_declared_names`).
@@ -486,7 +487,7 @@ The shell consumer runs each `e2e=1` row as one shape, requires a `case` arm for
 | :--- | :--- |
 | `context.rs` | `strip_deleted_suffix` (the `(deleted)` strip including a basename that strips to empty); `comm_fallback_trims_and_rejects_empty` (`comm` trimming and empty rejection, asserted through to R5); `exe_wins_over_comm`; `gdm_reauth_env_parsing` (presence-only parsing without `set_var`); `gdm_reauth_requires_service` (the reauth flag needing the service half, including `sddm` with the flag set still skipping) |
 | `plan.rs` | `plan_table` (every `Plannable × has_tty` cell and exactly three distinct plans); `threaded_plan_ignores_has_tty`; `gui_deadline_is_min` (`GuiBounded` as `min` in four configurations including zero); `deadline_saturates_at_u32_max` |
-| `policy/mod.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, the audit record, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
+| `policy/mod.rs` | `corpus_characterises_the_decision_table` (the corpus, with the `tty` column against `EXPECTED_TTY`), coverage, the audit record, the class × conversation table, class/decision agreement, disjointness, R1, the configured-name matcher, both permutations, reachability and citation resolution (§6.2) |
 | `outcome.rs` | `outcome_table_code_and_notice` (the code and notice matrix, including that `DaemonTimedOut` is silent while `TimedOut` is announced and that a replay is silent), `from_daemon_maps_every_answer`, `replay_never_upgrades`, `skip_policy_maps_to_outcome`, `mechanism_end_error_maps_to_error` (the `From<MechanismEnd> for Outcome` mapping keeps the `Error` arm a processing failure; the `outcome.rs` test module) |
 | `transaction/tests` | `finished_reports_its_outcome_and_provenance`; `armed_requires_both_connect_and_send`; `replay_notice_is_silent`; `tty_probe_only_for_sequential`; `cache_hit_does_not_open_tty`; `announcement_order_matches_today`, `precollected_never_plans`, `unrecorded_paths_emit_their_notice`, `a_cache_hit_is_a_replay_conclusion`, `a_replayed_failure_emits_nothing` |
 | `conclusion_cache.rs` | `reuse_key_is_case_sensitive`; `a_poisoned_lock_reads_as_a_cache_miss`; `conclusion_cache_survives_fork` (no longer `#[ignore]`d) |

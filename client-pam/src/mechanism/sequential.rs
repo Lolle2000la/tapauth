@@ -650,8 +650,10 @@ mod tests {
     #[test]
     fn timeout_does_not_cancel() {
         let expired = Instant::now() - Duration::from_secs(1);
-        for tty in [None, Some(tty_pipe().0)] {
-            let shape = if tty.is_some() { "terminal" } else { "no tty" };
+        // Both pipe ends are owned here: the read end travels into the loop as the
+        // `Some` and is closed when the loop drops it, the write end is closed below.
+        let (tty, write_end) = tty_pipe();
+        for (shape, tty) in [("terminal", Some(tty)), ("no tty", None)] {
             let (end, cancelled) = drive_recording(MockIpcReader::idle(), tty, expired);
             assert!(
                 matches!(end, MechanismEnd::Reason(UnavailableReason::TimedOut)),
@@ -662,6 +664,7 @@ mod tests {
                 "{shape}: a timeout must not cancel: {cancelled:?}"
             );
         }
+        unsafe { libc::close(write_end) };
     }
 
     /// A readable socket that closes with a partial frame is a hangup.

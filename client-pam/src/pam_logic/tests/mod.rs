@@ -585,7 +585,7 @@ fn emit_then_code(
 ) -> c_int {
     HostIo::new(
         std::ptr::null_mut(),
-        conv,
+        Some(conv),
         msgs,
         crate::transaction::tests::unused_authtok,
     )

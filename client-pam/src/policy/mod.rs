@@ -49,6 +49,15 @@ pub(crate) enum Conversation {
     PreCollected,
 }
 
+impl Conversation {
+    /// Every variant, for the guard's exhaustive walk. Test-only, like
+    /// [`RuleId::ALL`]: `class_permits`'s no-wildcard `match` is the compile-time
+    /// check on a new conversation, and this list is what lets the test reach every
+    /// cell it has, its literal cell count catching a variant left out here.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[Self::Threaded, Self::Sequential, Self::PreCollected];
+}
+
 /// The failure direction a rule protects, stated once per class. `Keyring` and
 /// `RefuseRemote` are orthogonal to the three failure directions: the former is
 /// about the value of a grant rather than the risk of asking, the latter a scope
@@ -73,6 +82,19 @@ pub(crate) enum FailureDirection {
     RefuseRemote,
 }
 
+impl FailureDirection {
+    /// Every variant, for the guard's exhaustive walk: test-only, for the reason
+    /// [`Conversation::ALL`] gives.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        Self::NeverRing,
+        Self::DeadlockAvoidance,
+        Self::AlwaysRing,
+        Self::Keyring,
+        Self::RefuseRemote,
+    ];
+}
+
 /// The decision cell of one row: a conversation, or a skip.
 ///
 /// It is separate from [`Classification`] because a row authors only this cell: the
@@ -82,6 +104,44 @@ pub(crate) enum FailureDirection {
 pub(crate) enum Decision {
     Skip(SkipPolicy),
     Participate(Conversation),
+}
+
+/// Whether `class` may be paired with `conversation`: the admissible pairs, as one
+/// total function. The `match` has no wildcard, so a new class or conversation does
+/// not compile until every pairing with it has an answer here, and
+/// `class_permits_matches_its_expectation` checks all fifteen cells against a
+/// hand-written table.
+///
+/// Why each class reads the way it does:
+/// * `NeverRing` — the phone must not be consulted, and `PreCollected` is the one
+///   shape that never reaches the daemon; any wait would ring it.
+/// * `DeadlockAvoidance` — either wait is safe (the host's own threads, or the
+///   calling thread), but `PreCollected` is `NeverRing`'s pairing, not a second
+///   way to silence the phone.
+/// * `AlwaysRing` — the phone is offered *concurrently*, which only `Threaded`
+///   gives; on `Sequential` nobody can answer while the module blocks.
+/// * `Keyring` — a grant without `PAM_AUTHTOK` is useless, so the class only
+///   skips (R2).
+/// * `RefuseRemote` — the call is not ours to answer, so the class only skips
+///   (R1).
+pub(crate) fn class_permits(class: FailureDirection, conversation: Conversation) -> bool {
+    match (class, conversation) {
+        (FailureDirection::NeverRing, Conversation::PreCollected) => true,
+        (FailureDirection::NeverRing, Conversation::Threaded | Conversation::Sequential) => false,
+        (
+            FailureDirection::DeadlockAvoidance,
+            Conversation::Threaded | Conversation::Sequential,
+        ) => true,
+        (FailureDirection::DeadlockAvoidance, Conversation::PreCollected) => false,
+        (FailureDirection::AlwaysRing, Conversation::Threaded) => true,
+        (FailureDirection::AlwaysRing, Conversation::Sequential | Conversation::PreCollected) => {
+            false
+        }
+        (
+            FailureDirection::Keyring | FailureDirection::RefuseRemote,
+            Conversation::Threaded | Conversation::Sequential | Conversation::PreCollected,
+        ) => false,
+    }
 }
 
 /// A rule that matched, with the class it was authored against. Which rule it was
@@ -697,13 +757,86 @@ mod tests {
         }
     }
 
+    /// Every class × conversation cell, against an independently written table.
+    ///
+    /// The table is a literal and deliberately not derived from `class_permits`: an
+    /// expectation computed from the function under test would agree with it by
+    /// construction.
+    ///
+    /// The defect this catches: an arm widened to admit a class over every
+    /// conversation — `DeadlockAvoidance`/`PreCollected`, which a `RULES` row could
+    /// otherwise reach through the pre-collected handoff — a cell whose answer
+    /// flipped, and, with `class_permits`'s no-wildcard `match`, a class or
+    /// conversation added without its pairings being decided. The two `ALL` lengths
+    /// and the row count are literals for the same reason: they are what makes an
+    /// added variant land here instead of only in the `match`.
+    #[test]
+    fn class_permits_matches_its_expectation() {
+        use Conversation::{PreCollected, Sequential, Threaded};
+        use FailureDirection::{AlwaysRing, DeadlockAvoidance, Keyring, NeverRing, RefuseRemote};
+
+        let expected: &[(FailureDirection, Conversation, bool)] = &[
+            // The one shape that never reaches the daemon.
+            (NeverRing, PreCollected, true),
+            (NeverRing, Threaded, false),
+            (NeverRing, Sequential, false),
+            // Either wait is safe; the handoff is `NeverRing`'s pairing.
+            (DeadlockAvoidance, Threaded, true),
+            (DeadlockAvoidance, Sequential, true),
+            (DeadlockAvoidance, PreCollected, false),
+            // Concurrently offered, which only the threaded wait collects.
+            (AlwaysRing, Threaded, true),
+            (AlwaysRing, Sequential, false),
+            (AlwaysRing, PreCollected, false),
+            // These two classes only ever skip.
+            (Keyring, Threaded, false),
+            (Keyring, Sequential, false),
+            (Keyring, PreCollected, false),
+            (RefuseRemote, Threaded, false),
+            (RefuseRemote, Sequential, false),
+            (RefuseRemote, PreCollected, false),
+        ];
+
+        assert_eq!(
+            (
+                FailureDirection::ALL.len(),
+                Conversation::ALL.len(),
+                expected.len()
+            ),
+            (5, 3, 15),
+            "a class or conversation was added: decide its pairings in `class_permits` \
+             and add one expectation row per cell here"
+        );
+
+        for class in FailureDirection::ALL {
+            for conversation in Conversation::ALL {
+                let cells: Vec<&(FailureDirection, Conversation, bool)> = expected
+                    .iter()
+                    .filter(|(cell_class, cell_conversation, _)| {
+                        cell_class == class && cell_conversation == conversation
+                    })
+                    .collect();
+                assert_eq!(
+                    cells.len(),
+                    1,
+                    "{class:?} × {conversation:?} must have exactly one expectation row"
+                );
+                assert_eq!(
+                    class_permits(*class, *conversation),
+                    cells[0].2,
+                    "{class:?} × {conversation:?} disagrees with the expectation"
+                );
+            }
+        }
+    }
+
     /// A rule's class and its conversation must agree; a class/conversation
     /// pair that does not is a table defect rather than a comment nobody reads.
     #[test]
     fn class_agrees_with_conversation() {
         for rule in RULES.iter() {
             assert!(
-                class_permits(rule.class, &rule.decision),
+                decision_permits(rule.class, &rule.decision),
                 "rule {} ({}) pairs {:?} with a decision it does not permit",
                 rule.id.as_str(),
                 audit(rule.id).name,
@@ -718,7 +851,7 @@ mod tests {
             let (rule, classification) = classify(&row_context(&row, &identity, reauth));
             match &classification {
                 Classification::Participate(participation) => assert!(
-                    class_permits(
+                    decision_permits(
                         participation.failure_direction,
                         &Decision::Participate(participation.conversation)
                     ),
@@ -742,24 +875,18 @@ mod tests {
         }
     }
 
-    fn class_permits(class: FailureDirection, decision: &Decision) -> bool {
-        matches!(
-            (class, decision),
-            (FailureDirection::Keyring, Decision::Skip(_))
-                | (FailureDirection::RefuseRemote, Decision::Skip(_))
-                | (
-                    FailureDirection::NeverRing,
-                    Decision::Participate(Conversation::PreCollected)
-                )
-                | (
-                    FailureDirection::AlwaysRing,
-                    Decision::Participate(Conversation::Threaded)
-                )
-                | (
-                    FailureDirection::DeadlockAvoidance,
-                    Decision::Participate(_)
-                )
-        )
+    fn decision_permits(class: FailureDirection, decision: &Decision) -> bool {
+        match decision {
+            // The conversation cells are the one guard; this wrapper maps the
+            // decision a row authored onto it.
+            Decision::Participate(conversation) => class_permits(class, *conversation),
+            // A skip is not a conversation, so `class_permits` has no cell for it:
+            // only the two classes whose whole existence is a skip may carry one.
+            Decision::Skip(_) => matches!(
+                class,
+                FailureDirection::Keyring | FailureDirection::RefuseRemote
+            ),
+        }
     }
 
     /// The process-keyed rules own disjoint literal sets, so their order is not

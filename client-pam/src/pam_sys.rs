@@ -131,7 +131,7 @@ pub(crate) type ReadAuthtok = unsafe fn(*mut PamHandle) -> (c_int, *const c_char
 /// # Safety
 ///
 /// `pamh` must be the live handle libpam passed to this thread's
-/// `pam_authenticate`, and the conversation behind it belongs to this thread.
+/// `pam_sm_authenticate`, and the conversation behind it belongs to this thread.
 pub(crate) unsafe fn read_authtok_for_handoff(pamh: *mut PamHandle) -> (c_int, *const c_char) {
     let mut authtok: *const c_char = std::ptr::null();
     let res = pam_get_authtok(pamh, PAM_AUTHTOK, &mut authtok, std::ptr::null());
