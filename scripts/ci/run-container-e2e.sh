@@ -51,14 +51,11 @@ case "$DISTRO" in
 
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
-        # Arch supports no partial upgrades: upgrade the container in the same
-        # transaction as the sync, then install from those synced databases.
-        # Syncing alone resolves current-repo packages against a base image that
-        # still links the old soname (openssl 4.1 broke libcrypto.so=3 for
-        # curl/pacman/sudo).
-        pacman -Syu --noconfirm
-        pacman -S --noconfirm --needed python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
-        pacman -S --noconfirm --needed polkit
+        # Arch supports no partial upgrades: the system upgrade and the installs
+        # below are one transaction, so pacman never resolves current-repo
+        # packages against a base image that still links the old soname
+        # (openssl 4.1 broke libcrypto.so=3 for curl/pacman/sudo).
+        pacman -Syu --noconfirm --needed python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux polkit
 
         # Arch ships no `pamtester` package (AUR-only), so compile the minimal
         # stand-in from scripts/ci/pamtester.c. The Ubuntu host and Fedora
