@@ -10,12 +10,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-/tmp/arch-build}"
 enforce_prod_feature_guard "Arch"
 
 if ! command -v cargo >/dev/null 2>&1; then
-    # Arch supports no partial upgrades: the base image is a rolling snapshot
-    # that always lags `extra`, so syncing without upgrading makes pacman
-    # resolve a current-repo package against an installed one that still links
-    # the old soname (openssl 4.1 broke libcrypto.so=3 for curl/pacman/sudo).
-    # Upgrade the whole container in the same transaction as the sync.
-    echo "==> Installing build dependencies (cargo, protobuf, clang, pam, sccache) with a full system upgrade..."
+    # Arch does not support partial upgrades: upgrade the system while installing.
+    echo "==> Installing build dependencies (cargo, protobuf, clang, pam, sccache)..."
     pacman -Syu --noconfirm --needed cargo protobuf clang pam sccache
 fi
 
