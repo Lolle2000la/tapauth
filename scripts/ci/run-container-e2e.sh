@@ -51,8 +51,8 @@ case "$DISTRO" in
 
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
-        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
-        pacman -Sy --noconfirm polkit
+        # Arch does not support partial upgrades: upgrade the system while installing.
+        pacman -Syu --noconfirm --needed python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux polkit
 
         # Arch ships no `pamtester` package (AUR-only), so compile the minimal
         # stand-in from scripts/ci/pamtester.c. The Ubuntu host and Fedora

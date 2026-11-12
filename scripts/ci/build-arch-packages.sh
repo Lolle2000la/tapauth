@@ -10,8 +10,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-/tmp/arch-build}"
 enforce_prod_feature_guard "Arch"
 
 if ! command -v cargo >/dev/null 2>&1; then
+    # Arch does not support partial upgrades: upgrade the system while installing.
     echo "==> Installing build dependencies (cargo, protobuf, clang, pam, sccache)..."
-    pacman -Sy --noconfirm --needed cargo protobuf clang pam sccache
+    pacman -Syu --noconfirm --needed cargo protobuf clang pam sccache
 fi
 
 BUILD_DIR="/tmp/arch-build-src"
