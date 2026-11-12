@@ -1,22 +1,6 @@
-//! The timed plan for a conversation: one total function from the carrier to
-//! `{deadline, announcement, tty_use}`.
-//!
-//! This module is a dependency leaf — it names no policy or caller type, only
-//! [`PamConfig`] for the one place the configured timeouts are resolved. The
-//! conversion from a `Participation` to a [`Plannable`] happens at the call
-//! site, together with the `PreCollected` handoff that returns before a plan
-//! can exist.
-//!
-//! Three cells are reachable, and the table is the normative statement of them
-//! (the two `Threaded` rows must produce the same plan, which is
-//! `threaded_plan_ignores_has_tty`):
-//!
-//! | conversation | `has_tty` | deadline | announcement | tty_use |
-//! | :--- | :--- | :--- | :--- | :--- |
-//! | `Threaded` | `true` | `Operation` | `Wait` | `DoNotOpen` |
-//! | `Threaded` | `false` | `Operation` | `Wait` | `DoNotOpen` |
-//! | `Sequential` | `true` | `Operation` | `WaitSkipHint` | `PollForKey` |
-//! | `Sequential` | `false` | `GuiBounded` | `WaitThenPassword` | `DoNotOpen` |
+//! The timed plan for a conversation: deadline, announcement and `/dev/tty` use.
+//! A dependency leaf — it names no policy or caller type, only [`PamConfig`] for
+//! the resolved timeouts.
 
 use crate::config::PamConfig;
 
@@ -43,11 +27,9 @@ pub(crate) enum Deadline {
 }
 
 impl Deadline {
-    /// The effective timeout in whole seconds, saturating at `u32::MAX`.
-    ///
-    /// This is the only place the clamp and the saturation exist. A sequential
-    /// host **with** a terminal is bounded by `pam_operation_timeout_secs`
-    /// alone, so `pam_gui_timeout_secs` never applies to it.
+    /// The effective timeout in whole seconds, saturating at `u32::MAX`. This is the
+    /// only place the clamp and the saturation exist; a sequential host **with** a
+    /// terminal is bounded by `pam_operation_timeout_secs` alone.
     pub(crate) fn resolve(self, cfg: &PamConfig) -> u32 {
         let secs = match self {
             Deadline::Operation => cfg.pam_operation_timeout_secs,
@@ -82,8 +64,8 @@ pub(crate) enum TtyUse {
 /// The two conversations that have a timed plan.
 ///
 /// There is deliberately no `PreCollected` variant: the handoff returns at the
-/// call site before a plan exists, so [`Plannable::plan`] has no unreachable arm
-/// (and no `unreachable!()` that a shipped `cdylib` would compile out).
+/// call site before a plan exists, so [`Plannable::plan`] matches exactly the two
+/// conversations that are waited for and has no unreachable arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Plannable {
     Threaded,
@@ -92,8 +74,7 @@ pub(crate) enum Plannable {
 
 impl Plannable {
     /// The probe gate: the single source of "does this conversation open
-    /// `/dev/tty`", so the mode test does not appear a second time at the
-    /// probe.
+    /// `/dev/tty`", so the mode test does not appear a second time at the probe.
     pub(crate) fn tty_use(self) -> TtyUse {
         match self {
             Plannable::Threaded => TtyUse::DoNotOpen,
@@ -142,15 +123,13 @@ mod tests {
         }
     }
 
-    /// Every `Plannable × has_tty` cell, and the three distinct plans they
-    /// produce.
+    /// Every `Plannable × has_tty` cell, and the three distinct plans it produces.
     ///
-    /// The defects this catches: a cell mapped to the wrong announcement (the
-    /// terminal wait announced after the request, or the no-terminal host
-    /// getting no announcement at all), `PollForKey` planned for a conversation
-    /// that must not open the terminal, and `GuiBounded` applied to a host with
-    /// a terminal — which would shorten a `sudo` wait that has a working
-    /// password field.
+    /// The defect this catches: a cell with the wrong announcement (the terminal
+    /// wait emitted after the request, or none for the no-terminal host),
+    /// `PollForKey` for a conversation that must not open the terminal, and
+    /// `GuiBounded` on a host with a terminal, which would shorten a `sudo` wait
+    /// that has a working password field.
     #[test]
     fn plan_table() {
         let threaded = Plan {
@@ -189,11 +168,9 @@ mod tests {
         assert_eq!(distinct.len(), 3, "the table has exactly three cells");
     }
 
-    /// The `has_tty` value must not reach a threaded plan.
-    ///
-    /// The defect this catches: the terminal probe or the mode test being moved
-    /// before the plan, so a threaded host that happens to have a terminal gets
-    /// the terminal announcement or a terminal-bounded deadline.
+    /// The `has_tty` value must not reach a threaded plan: with the probe or the
+    /// mode test moved before the plan, a threaded host that happens to have a
+    /// terminal gets the terminal announcement or a terminal-bounded deadline.
     #[test]
     fn threaded_plan_ignores_has_tty() {
         assert_eq!(
@@ -204,10 +181,10 @@ mod tests {
 
     /// `GuiBounded` is `min(gui, operation)`, in all four shapes.
     ///
-    /// The defect this catches: `min` written as `max` — which every integration
-    /// test in the repository still passes, because the host-cases shape sets
-    /// gui 2 s / op 4 s and never discriminates the two — and the clamp applied
-    /// to an `Operation` host.
+    /// The defect this catches: `min` written as `max` — every integration test in
+    /// the repository still passes, because the host-cases shape sets gui 2 s / op
+    /// 4 s and never discriminates the two — and the clamp applied to an
+    /// `Operation` host.
     #[test]
     fn gui_deadline_is_min() {
         let below = config(120, 30);
@@ -241,7 +218,6 @@ mod tests {
         let just_past = config(u64::MAX, u64::from(u32::MAX) + 1);
         assert_eq!(Deadline::GuiBounded.resolve(&just_past), u32::MAX);
 
-        // A value that fits is not clamped.
         let fits = config(u64::from(u32::MAX), 5);
         assert_eq!(Deadline::Operation.resolve(&fits), u32::MAX);
         assert_eq!(Deadline::GuiBounded.resolve(&fits), 5);

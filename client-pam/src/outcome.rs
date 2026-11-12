@@ -1,30 +1,9 @@
 //! The verdict as data, and the one place it becomes a `PAM_*` code.
 //!
 //! [`Outcome::into_pam`] is an exhaustive match with no wildcard, so a sixth
-//! outcome variant is a compile error rather than a silent fallthrough. Every
-//! other `PAM_*` value in the crate comes from it — the `lib.rs` ABI stubs and
-//! the `pam_sys` plumbing excepted — which is what
-//! `only_outcome_rs_returns_pam_constants` asserts once every call site has been
-//! converted.
-//!
-//! Two constructors produce a grant, and only two:
-//!
-//! * [`Outcome::granted_from_daemon`] — this call's daemon `PamOutcome::Success`;
-//! * [`Outcome::replayed`] — a copy of a conclusion this process already
-//!   recorded, marked [`GrantVia::VerdictReplay`].
-//!
-//! A `Granted` therefore cannot be minted by a mechanism, a skip or a local
-//! error, and `Outcome::replayed` is the only way a grant exists without a fresh
-//! round trip. A mechanism returns its own `MechanismEnd` instead, and
-//! `impl From<MechanismEnd> for Outcome` in `mechanism/mod.rs` is the one place
-//! that exit becomes a verdict — which is why this module does not import the
-//! mechanism contract.
-//!
+//! outcome variant is a compile error rather than a silent fallthrough.
 //! [`Outcome::notice`] is the pure half of the messaging: which single message
-//! (if any) an outcome shows, and in which style. Emission itself stays at the
-//! one place that owns the conversation (`try_info`/`try_error`), so the text
-//! and the style are a property of the reason and not of the caller. A replayed
-//! conclusion emits nothing, which is what keeps a cache hit silent.
+//! (if any) an outcome shows, and in which style.
 
 use crate::pam_messages::PamMessages;
 use crate::pam_sys;
@@ -36,15 +15,14 @@ use std::os::raw::c_int;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Authentication succeeded. Constructible only through
-    /// [`Outcome::granted_from_daemon`] or [`Outcome::replayed`].
+    /// [`Outcome::granted_from_daemon`] or [`Outcome::replayed`]: a mechanism, a
+    /// skip or a local error cannot mint one.
     Granted(GrantVia),
-    /// The phone explicitly denied the request, or a recorded denial was
-    /// replayed.
+    /// The phone explicitly denied the request, or a recorded denial was replayed.
     Denied(DenyVia),
     /// The credential could not be obtained. Maps to `PAM_AUTHINFO_UNAVAIL`.
     Unavailable(UnavailableReason),
-    /// This attempt failed while it was being processed. Maps to
-    /// `PAM_AUTH_ERR`.
+    /// This attempt failed while it was being processed. Maps to `PAM_AUTH_ERR`.
     Error(ErrorReason),
     /// No username to ask about. Maps to `PAM_USER_UNKNOWN`.
     UserUnknown,
@@ -70,12 +48,11 @@ pub(crate) enum DenyVia {
 
 /// Why the credential could not be obtained.
 ///
-/// The set is deliberately finer than the code it maps to, because the *text
-/// and the style* of the message are a property of the reason: the threaded and
-/// terminal loops announce a hangup with `connection_lost` through `try_info`
-/// while the no-terminal sequential path collapses every IPC failure into
-/// `communication_error` through `try_error`. A single `IpcError` could recover
-/// neither the text nor the style.
+/// Deliberately finer than the code it maps to: the *text and the style* of the
+/// message belong to the reason. The threaded and terminal loops announce a
+/// hangup with `connection_lost` through `try_info`, while the no-terminal
+/// sequential path collapses every IPC failure into `communication_error`
+/// through `try_error`; a single `IpcError` could recover neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnavailableReason {
     /// R2: the display manager's own stack must populate `PAM_AUTHTOK`.
@@ -144,9 +121,10 @@ impl Outcome {
     /// The one conversion from a verdict to a `PAM_*` code.
     ///
     /// Five exhaustive arms and no wildcard: a new variant cannot inherit a
-    /// neighbour's code silently. It consumes the verdict on purpose — that is
-    /// the token the caller spends to obtain the code — which is also why it is
-    /// an `into_*` conversion: the verdict is consumed, not borrowed.
+    /// neighbour's code silently. Every other `PAM_*` value the crate returns is
+    /// outside this conversion (the `lib.rs` ABI stubs and the `pam_sys`
+    /// plumbing), which `only_outcome_rs_returns_pam_constants` asserts. Consuming
+    /// the verdict is the token the caller spends, hence `into_*`.
     pub(crate) fn into_pam(self) -> c_int {
         match self {
             Outcome::Granted(_) => pam_sys::PAM_SUCCESS,
@@ -159,15 +137,14 @@ impl Outcome {
 
     /// The grant this call's daemon `Success` produces.
     ///
-    /// One of exactly two grant producers in the crate. The `match` in
-    /// [`Outcome::from_daemon`] is explicit per variant, so a proto variant
-    /// added later forces a decision here instead of defaulting to a grant.
+    /// One of exactly two grant producers. The `match` in
+    /// [`Outcome::from_daemon`] is explicit per variant, so a proto variant added
+    /// later forces a decision here instead of defaulting to a grant.
     pub(crate) fn granted_from_daemon() -> Outcome {
         Outcome::Granted(GrantVia::PhoneTap)
     }
 
-    /// A copy of a conclusion this process recorded earlier, marked as a
-    /// replay.
+    /// A copy of a conclusion this process recorded earlier, marked as a replay.
     ///
     /// A structural copy, not a mapper: a `Granted` can only come out of a
     /// `Granted` input, so a replay can never upgrade an unavailability into a
@@ -200,10 +177,9 @@ impl Outcome {
     /// The daemon's answer as a verdict.
     ///
     /// The raw `outcome` field is read, not prost's generated accessor: that
-    /// accessor is `try_from(self.outcome).unwrap_or_default()`, and the
-    /// default variant is `SUCCESS`, so an unknown value would decode as a
-    /// *grant*. Unknown values fail closed as [`ErrorReason::Daemon`], which
-    /// maps to `PAM_AUTH_ERR`.
+    /// accessor is `try_from(self.outcome).unwrap_or_default()`, and the default
+    /// variant is `SUCCESS`, so an unknown value would decode as a *grant*. Unknown
+    /// values fail closed as [`ErrorReason::Daemon`] (`PAM_AUTH_ERR`).
     pub(crate) fn from_daemon(resp: shared::ipc::pb::PamAuthenticateResponse) -> Outcome {
         let detail = resp.detail;
         match outcome_from_raw(resp.outcome) {
@@ -220,7 +196,7 @@ impl Outcome {
                 Outcome::Unavailable(UnavailableReason::DaemonTimedOut)
             }
             shared::ipc::pb::PamOutcome::Ignore => {
-                tracing::info!("Daemon indicated IGNORE");
+                tracing::info!("Daemon returned Ignore");
                 Outcome::Unavailable(UnavailableReason::DaemonIgnored)
             }
             shared::ipc::pb::PamOutcome::Error => {
@@ -232,9 +208,10 @@ impl Outcome {
 
     /// The single message (if any) this outcome shows, and its style.
     ///
-    /// Pure: no conversation, no PAM handle, no emission. The caller emits at
-    /// most one of these per finished transaction, which is what the
-    /// `Finished` emission rule relies on.
+    /// Pure: no conversation, no PAM handle, no emission. The caller emits at most
+    /// one of these per finished transaction, which the `Finished` emission rule
+    /// relies on; a replayed conclusion emits nothing, which keeps a cache hit
+    /// silent.
     pub(crate) fn notice<'a>(&self, msgs: &'a PamMessages) -> Option<Notice<'a>> {
         match self {
             Outcome::Granted(GrantVia::PhoneTap) => Some(Notice {
@@ -268,11 +245,11 @@ impl Outcome {
                     style: NoticeStyle::Error,
                     text: Cow::Borrowed(msgs.communication_error()),
                 }),
-                // §3.5.3's two timeout rows, which differ in silence: the
-                // daemon's own `PamOutcome::Timeout` is `DaemonTimedOut` and
-                // shows **no** message (it only leaves a `tracing::info!` behind,
-                // in `from_daemon`), while `TimedOut` is this module's own
-                // deadline and is the one the user is told about.
+                // §3.5.3's two timeout rows differ in silence: the daemon's own
+                // `PamOutcome::Timeout` is `DaemonTimedOut` and shows **no**
+                // message (only a `tracing::info!` in `from_daemon`), while
+                // `TimedOut` is this module's own deadline and is the one the
+                // user is told about.
                 UnavailableReason::DaemonTimedOut => None,
                 UnavailableReason::TimedOut => Some(Notice {
                     style: NoticeStyle::Info,
@@ -536,14 +513,13 @@ mod tests {
         }
     }
 
-    /// A mechanism's local error is a processing failure, not an
-    /// unavailability.
+    /// A mechanism's local error is a processing failure, not an unavailability.
     ///
-    /// The defect this catches: the `From<MechanismEnd> for Outcome` impl's
-    /// `Error` and `Reason` arms swapped, which would send a `pipe2` or
-    /// `pthread_create` failure to `PAM_AUTHINFO_UNAVAIL` — on a `sufficient`
-    /// line the stack would fall through as if the daemon had merely been
-    /// unreachable — and a daemon unavailability to `PAM_AUTH_ERR`.
+    /// The defect this catches: the `From<MechanismEnd> for Outcome` impl's `Error`
+    /// and `Reason` arms swapped, which would send a `pipe2` or `pthread_create`
+    /// failure to `PAM_AUTHINFO_UNAVAIL` — falling through a `sufficient` line as
+    /// if the daemon had merely been unreachable — and a daemon unavailability to
+    /// `PAM_AUTH_ERR`.
     #[test]
     fn mechanism_end_error_maps_to_error() {
         let outcome = Outcome::from(crate::mechanism::MechanismEnd::Error(
@@ -561,8 +537,8 @@ mod tests {
     ///
     /// The defect this catches: a replay constructor that "replays" an
     /// unavailability into a grant, or that keeps the original provenance so a
-    /// cache hit cannot be told apart from a fresh tap (which would re-emit the
-    /// message and re-record the conclusion).
+    /// cache hit cannot be told from a fresh tap (which would re-emit the message
+    /// and re-record the conclusion).
     #[test]
     fn replay_never_upgrades() {
         let granted = Outcome::granted_from_daemon();
@@ -592,7 +568,7 @@ mod tests {
         }
 
         // A replayed verdict is marked as such: that is what suppresses the
-        // message and (in step 5) the re-recording.
+        // message and the re-recording.
         assert_eq!(
             Outcome::replayed(&granted),
             Outcome::Granted(GrantVia::VerdictReplay)
@@ -605,10 +581,9 @@ mod tests {
 
     /// Both skip policies map to their own unavailability.
     ///
-    /// The defect this catches: R1's refusal mapped to R2's reason (or to a
-    /// bare `AUTHINFO_UNAVAIL` with no reason at all), which only
-    /// `remote_under_dm` distinguishes by rule id, so an inverted mapping would
-    /// otherwise pass.
+    /// The defect this catches: R1's refusal mapped to R2's reason (or to a bare
+    /// `AUTHINFO_UNAVAIL` with no reason at all), which only `remote_under_dm`
+    /// distinguishes by rule id, so an inverted mapping would otherwise pass.
     #[test]
     fn skip_policy_maps_to_outcome() {
         assert_eq!(

@@ -1,51 +1,18 @@
-//! PAM authentication logic for TapAuth: the orchestration policy.
+//! The orchestration policy: the order of the effects between PAM and the transaction, and
+//! [`authenticate`], the single place a verdict becomes a PAM code — by calling
+//! `Outcome::into_pam`.
 //!
-//! Implements the core authentication flow that integrates with Linux PAM.
-//! Supports both terminal (with skip detection via Enter key) and GUI contexts
-//! (e.g., Polkit dialogs).
-//!
-//! ## Layout
-//!
-//! This file is the orchestration *policy*. [`authenticate`] is the entry point
-//! and the one place a [`Finished`] becomes a `PAM_*` code; [`orchestrate`] fixes
-//! the order of the effects (classify → config → refine → username →
-//! conversation → messages → `transaction::run`); [`OrchestrationIo`] is the
-//! injectable seam that makes that order observable. The `wiring` submodule
-//! holds the platform values behind the transaction's `Effects`;
-//! [`OrchestrationIo::production`] builds the PAM-side seam beside it.
-//!
-//! ## Flow
-//!
-//! 1. Capture the caller facts and classify them against the rule table
-//! 2. For a participant, load the config and refine the classification with the
-//!    configured refused service names
-//! 3. Resolve the username, the PAM conversation and the messages
-//! 4. Hand the participation to `transaction::run`, which sends at most one IPC
-//!    request (a handoff or a reuse hit sends none) and waits for the answer
-//! 5. Map the resulting verdict to a `PAM_*` code: `PAM_SUCCESS` on a phone tap,
-//!    `PAM_PERM_DENIED` on an explicit denial, `PAM_AUTHINFO_UNAVAIL` when the
-//!    service could not be consulted and `PAM_AUTH_ERR` on a processing failure,
-//!    never `PAM_IGNORE` (Linux-PAM records no failure for it, so a later
-//!    `optional` module voting success, e.g. `pam_permit`, would grant the stack)
+//! [`orchestrate`] fixes that order (classify → config → refine → username → conversation →
+//! messages → `transaction::run`). Which verdict maps to which code is `Outcome::into_pam`'s
+//! table in `outcome.rs`, not a decision taken here. [`OrchestrationIo`] and `Effects` are the
+//! injectable seams that make the order observable.
 //!
 //! ## Threading
 //!
-//! The module sends at most one IPC request — none on a handoff or a reuse
-//! hit — and waits for it on the calling thread; it starts no runtime and
-//! owns no daemon transport. The only thread it ever
-//! creates is the threaded mechanism's password worker. The sequential mechanism
-//! polls the daemon socket on the calling thread (and `/dev/tty` when the plan
-//! gave it a terminal) and never drives the conversation.
-//!
-//! ## Return-code mapping
-//!
-//! | Transition | Code |
-//! | :--- | :--- |
-//! | Phone approved the request | `PAM_SUCCESS` |
-//! | Phone explicitly denied | `PAM_PERM_DENIED` |
-//! | Timeout, dialog dismissed, IPC error, no paired device, skip, DM bypass | `PAM_AUTHINFO_UNAVAIL` |
-//! | Daemon reported an internal error, or a local failure (conversation lookup, RNG, pipe/thread spawn) | `PAM_AUTH_ERR` |
-//! | Username lookup failed | `PAM_USER_UNKNOWN` |
+//! It sends at most one IPC request — none on a handoff or a reuse hit — and waits for it on
+//! the calling thread: no runtime, no daemon transport, and the only thread it ever creates is
+//! the threaded mechanism's password worker. The sequential mechanism never drives the
+//! conversation; on those hosts a reply posted from another thread deadlocks their event loop.
 
 use crate::config::PamConfig;
 use crate::context::{CallerContext, ServiceName};
@@ -62,60 +29,27 @@ use wiring::{cancel_on_fresh_connection, connect, probe_tty, send_authenticate_r
 
 mod wiring;
 
-/// Main PAM authentication entry point.
+/// PAM's authenticate entry point: capture the caller facts, orchestrate, and convert the one
+/// resulting verdict to a code.
 ///
-/// ## Returns
-///
-/// The orchestration returns a [`Finished`], whose two arms both carry an
-/// [`Outcome`]; `Outcome::into_pam` is the only conversion, and the `match` below
-/// is its only caller. Which reasons reach which code is the table in
-/// `Outcome::into_pam` / `Outcome::notice`, not a per-call decision here:
-///
-/// - `PAM_SUCCESS`: this call's daemon response was a phone tap, or a duplicate
-///   answered from this process's 500 ms reuse record (a replay, which records
-///   nothing and shows nothing)
-/// - `PAM_PERM_DENIED`: The user explicitly denied the request on the phone
-/// - `PAM_AUTHINFO_UNAVAIL`: The authentication service could not be consulted —
-///   no paired devices, the user skipped, the daemon is unreachable, the
-///   attempt timed out, a display-manager login or a remote caller was skipped,
-///   or a pre-collected host's token was handed on. On a `sufficient` line
-///   (which expands to
-///   `[success=done new_authtok_reqd=done default=ignore]`) this still falls
-///   through to the next module, so password fallback is preserved
-/// - `PAM_AUTH_ERR`: This attempt failed while being processed — the daemon
-///   reported an internal error, the conversation lookup failed, the request id
-///   could not be generated, or a local resource could not be created
-/// - `PAM_USER_UNKNOWN`: Failed to retrieve username from PAM
-///
-/// `PAM_IGNORE` is deliberately never returned.  Linux-PAM records no failure
-/// for it, so a later `optional` module that votes success (e.g. `pam_permit`)
-/// turns the whole stack into `PAM_SUCCESS` — an authentication bypass.  That is
-/// a `required`-line hazard, and it is the shape this protects: there
-/// `PAM_IGNORE` is explicitly `ignore` while `PAM_AUTHINFO_UNAVAIL` is `bad`.
-/// On a `sufficient` line both codes are `ignore` and a following
-/// `optional pam_permit` grants either way, so there the stack's own
-/// configuration, not the return code, is what prevents the grant.
+/// No `PAM_*` value is chosen here: the verdict→code table is `Outcome::into_pam` in
+/// `outcome.rs`. Never returns `PAM_IGNORE` — on a `required` line it is `ignore` while
+/// `PAM_AUTHINFO_UNAVAIL` is `bad`, so a later `optional pam_permit` would grant the whole
+/// stack.
 pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     logging::init_logging();
-    tracing::info!("TapAuth PAM module called (custom bindings)");
+    tracing::info!("TapAuth: pam_sm_authenticate called");
 
-    // The caller facts are read once, here, and every consumer reads the
-    // captured values — the policy, the log line in `capture`, the verdict
-    // cache's key and the skip's decision. No second resolution exists.
+    // The caller facts are read once; every consumer reads these captured values, so no second
+    // resolution exists.
     let ctx = unsafe { CallerContext::capture(pamh) };
-    // The orchestration returns the verdict, never a code. This is the one
-    // place a `PAM_*` value is produced from it: `into_pam` is exhaustive, so an
-    // arm cannot be forgotten and a code cannot travel beside the verdict. A
-    // conclusion is recorded here — after the body returned, which is what
-    // anchors the 500 ms reuse window to *this module's return* — and `record`
-    // hands the verdict back so it becomes a code exactly once. Neither arm
-    // emits: `run` already emitted its outcome's one notice.
+    // The conclusion is recorded here, after `into_pam`'s inputs are fixed, which anchors the
+    // 500 ms reuse window to *this module's return*; `record` hands the verdict back so it
+    // becomes a code exactly once. Neither arm emits: `run` already emitted its outcome's one
+    // notice.
     //
-    // The outside world this call asks for, as one value: the `/dev/tty` probe,
-    // the nonblocking daemon dial, the authenticate request and the
-    // fresh-connection cancel — all four bound from `wiring`, so this file names
-    // none of the platform calls. Each function is bound to a local first so the
-    // struct borrows a named place rather than a temporary.
+    // The four platform calls are bound to locals first so the struct borrows a named place
+    // rather than a temporary; `Effects` is what lets the transaction run without a PAM handle.
     let mut probe = probe_tty;
     let mut connect = connect;
     let mut send = send_authenticate_request;
@@ -134,12 +68,10 @@ pub fn authenticate(pamh: *mut pam_sys::PamHandle) -> c_int {
     }
 }
 
-/// The four side-effecting calls `classify` must precede, injected so they can
-/// be counted without a PAM handle.
+/// The four side-effecting calls `classify` must precede, injected so an end-to-end test can
+/// count them without a PAM handle.
 ///
-/// `classify_before_side_effects` drives `orchestrate` with this table replaced
-/// by counting wrappers and asserts every counter reads zero on a `Skip`. The
-/// context is passed in already captured, so the test can hand `orchestrate` a
+/// The context is passed to `orchestrate` already captured, so a test can hand it a
 /// `CallerContext::from_parts` directly.
 pub(crate) struct OrchestrationIo {
     pub load_config: fn() -> PamConfig,
@@ -147,9 +79,8 @@ pub(crate) struct OrchestrationIo {
     pub new_conversation:
         unsafe fn(*mut pam_sys::PamHandle) -> Result<pam_sys::PamConversation<'static>, c_int>,
     pub load_messages: fn(&str) -> pam_messages::PamMessages,
-    /// The pre-collected handoff's token read. Injected here as well as on
-    /// `HostIo` so a test that drives `orchestrate` end to end can count the
-    /// read, which is the only observable the handoff has.
+    /// The handoff's token read. Also on `HostIo`, which is where the handoff actually reads;
+    /// injected here so a test can count it, since the read is the handoff's only observable.
     pub read_authtok: pam_sys::ReadAuthtok,
 }
 
@@ -166,68 +97,47 @@ impl OrchestrationIo {
     }
 }
 
-/// Run one authentication: capture the caller facts, classify, resolve the
-/// inputs a participation needs, and hand the transaction to
-/// [`crate::transaction::run`].
+/// Run one authentication for an already captured context: classify, resolve what a
+/// participation needs, and hand the transaction to [`crate::transaction::run`].
 ///
-/// The body decides and acts; recording is the caller's (`authenticate`), so the
-/// 500 ms reuse window stays anchored to *this module's return* rather than to
-/// the moment the transaction concluded.
+/// The order is load-bearing: `classify` runs **before** `PamConfig::load`, `get_user`,
+/// `PamConversation::new` and `PamMessages::load_for_user`, so a `Skip` pays none of them, and
+/// `HostIo` — built after those four and borrowing what they produced — cannot exist on a skip
+/// path.
 ///
-/// The order is load-bearing and is asserted by `classify_before_side_effects`:
-/// `classify` runs **before** `PamConfig::load`, `get_user`,
-/// `PamConversation::new` and `PamMessages::load_for_user`, so a `Skip` (a
-/// display-manager login, a remote caller) pays none of them. `HostIo` is built
-/// after those four calls and borrows what they produced, so it cannot exist on
-/// a skip path.
-///
-/// `effects` is the transaction's outside world — the `/dev/tty` probe, the
-/// daemon dial, the request on the wire and the cancel, the same seam
-/// [`Armed::open`](crate::transaction::Armed::open) has. Production passes
-/// [`connect`](wiring::connect), [`send_authenticate_request`](wiring::send_authenticate_request)
-/// and [`cancel_on_fresh_connection`](wiring::cancel_on_fresh_connection) (built
-/// by [`authenticate`]), and a test passes counting closures or failures, so
-/// "the skip never reaches the daemon", "a connect failure records nothing" and
-/// "a timeout cancels nothing" are assertions rather than promises.
+/// `effects` is the transaction's outside world (see [`Effects`]). Recording is the caller's
+/// job, which keeps the 500 ms reuse window anchored to the module's return rather than to the
+/// moment the transaction concluded.
 fn orchestrate<T: IpcResponseReader>(
     pamh: *mut pam_sys::PamHandle,
     ctx: &CallerContext,
     io: &OrchestrationIo,
     effects: &mut Effects<'_, T>,
 ) -> Finished {
-    // The conversation policy is decided from the caller facts `capture` read,
-    // and it is decided *first*: a `Skip` returns before the config read, the
-    // username lookup, the conversation and the messages, which is the order
-    // the display-manager bypass has always had. `classify_before_side_effects`
-    // counts those four calls, because nothing in the types stops a later edit
-    // from moving the decision below them.
+    // The policy is decided *first*: a `Skip` returns before the config read, the username
+    // lookup, the conversation and the messages. `classify_before_side_effects` counts those
+    // four, because nothing in the types stops a later edit from moving the decision below
+    // them. The id it also returns is a fixture label (`RuleId`'s doc); production reads only
+    // the classification.
     let (_rule, classification) = policy::classify(ctx);
 
-    // The built-in skips — R1's service names and R2's display managers — return
-    // here, before the config read. A skip is a static policy decision about the
-    // caller, not a conclusion about credentials: it never reaches
-    // `Armed::open`, never touches the recorded conclusion, and must not clobber
-    // the last real one. `skip_finished` is the one return for either phase's
-    // skip.
+    // A skip is a static decision about the caller, not a conclusion about credentials: it
+    // never reaches `Armed::open`, never touches the recorded conclusion, and must not clobber
+    // the last real one.
     if let policy::Classification::Skip(skip) = &classification {
         return skip_finished(ctx, *skip);
     }
 
-    // Load configuration for timeouts
     let config = (io.load_config)();
     tracing::debug!(
         "PAM operation timeout: {}s",
         config.pam_operation_timeout_secs
     );
 
-    // The second decision phase. `classify` sees only the built-in refused
-    // names, so a deployment that renames OpenSSH's `PAMServiceName` arrives
-    // here as a participating call; `policy::refine` is the one entry point for
-    // the configured half of R1. It runs immediately after the config read and
-    // before the username lookup, the conversation, the messages and the
-    // transaction, and it can only add a skip: the participation it returns
-    // unchanged is the one `classify` produced, mechanism and deadline
-    // included.
+    // The second decision phase: `classify` sees only the built-in refused names, so a
+    // deployment that renames OpenSSH's `PAMServiceName` arrives here as a participating call.
+    // It runs right after the config read and can only add a skip; the participation it returns
+    // unchanged is `classify`'s own, mechanism and deadline included.
     let participation = match policy::refine(
         classification,
         ctx.service(),
@@ -264,8 +174,6 @@ fn orchestrate<T: IpcResponseReader>(
         }
     };
 
-    // No explicit root check here; shared config enforces file ownership/permissions.
-
     let msgs = (io.load_messages)(&username);
 
     let mut host = HostIo::new(pamh, &pam_conv, &msgs, io.read_authtok);
@@ -281,10 +189,8 @@ fn orchestrate<T: IpcResponseReader>(
 
 /// The one return for a skip, whichever of the two decision phases produced it.
 ///
-/// `Skip` is a static decision about the caller, not a conclusion about
-/// credentials: it returns before `Armed::open`, so it is never recorded, and
-/// `Outcome::from_skip` is the only mapping of a `SkipPolicy` to a verdict. The
-/// two log lines are the ones the module has always written for R1 and R2.
+/// `Outcome::from_skip` is the only mapping of a `SkipPolicy` to a verdict, and a skip is never
+/// recorded (it returns before `Armed::open`).
 fn skip_finished(ctx: &CallerContext, skip: policy::SkipPolicy) -> Finished {
     let service = ctx.service().map(ServiceName::original).unwrap_or_default();
     match skip {

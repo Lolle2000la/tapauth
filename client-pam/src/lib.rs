@@ -1,62 +1,34 @@
-//! TapAuth PAM module.
+//! TapAuth PAM module: libpam loads this cdylib to authenticate a Linux login
+//! through a paired phone, which it reaches through tapauthd's Unix socket.
+//!
+//! The ABI is the six symbols libpam resolves. The five non-authentication ones
+//! are no-ops:
+//!
+//! - `pam_sm_authenticate` — the only entry point that reaches a verdict
+//! - `pam_sm_setcred`, `pam_sm_acct_mgmt`, `pam_sm_open_session`,
+//!   `pam_sm_close_session`, `pam_sm_chauthtok` — answer `PAM_SUCCESS`
+//!
+//! `Outcome::into_pam` is the only conversion from a verdict to a code; the ABI
+//! sites are exempt by name (those five stubs and `guard`'s panic arm), and
+//! `source_guards::only_outcome_rs_returns_pam_constants` asserts both halves.
+//!
+//! It never returns `PAM_IGNORE`: on a `required` stack that code is `ignore`,
+//! so a following `optional pam_permit` would grant a failed authentication.
+//! Behaviour and the per-host conversation rules are in
+//! `docs/design-documents/pam-conversation-policy.md`.
+//!
+//! Test placement: unit tests are an inline `mod tests` at the bottom of the file
+//! they cover — including `policy`'s decision corpus, which reads the private
+//! `RuleId`/`RULES` there — while `pam_logic` and `transaction` keep a corpus in a
+//! `src/**/tests/` submodule, and the crate-wide scans live in `source_guards.rs`.
+//! There is no `tests/*.rs` integration suite, because the crate is cdylib-only;
+//! the walker test asserts which files carry `#[cfg(test)]`.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing
 )]
-//!
-//! Linux PAM authentication module that enables phone-tap-based authentication.
-//! Integrates with the system authentication stack to provide passwordless login
-//! via paired Android devices.
-//!
-//! ## PAM Integration
-//!
-//! Provides all required PAM entry points:
-//! - `pam_sm_authenticate`: Core authentication via BLE/UDP to paired devices
-//! - `pam_sm_setcred`: Credential management (no-op, returns success)
-//! - `pam_sm_acct_mgmt`: Account management (no-op, returns success)
-//! - `pam_sm_open_session`/`pam_sm_close_session`: Session management (no-ops)
-//! - `pam_sm_chauthtok`: Password change (no-op)
-//!
-//! ## Behavior
-//!
-//! Every path produces one `outcome::Outcome`, and `Outcome::into_pam` is the only
-//! conversion from a verdict to a code — `authenticate` maps the two arms of the
-//! transaction's result (`Finished::Concluded` and `Finished::Unrecorded`), and
-//! nothing else in the crate produces a `PAM_*` value except the six constant
-//! ABI sites named below:
-//!
-//! - `PAM_SUCCESS` — this call's daemon response was a phone tap, or a duplicate
-//!   answered from this process's 500 ms reuse record (a replay, which emits no
-//!   message)
-//! - `PAM_PERM_DENIED` — the phone explicitly denied the request
-//! - `PAM_AUTHINFO_UNAVAIL` — the service could not be consulted: no paired
-//!   device, the user skipped, the daemon timed out or was unreachable, the
-//!   conversation could not be driven, a display-manager login or a remote
-//!   caller was skipped, or a pre-collected host's own token was handed on
-//! - `PAM_AUTH_ERR` — a processing failure: the daemon reported an internal
-//!   error, the conversation lookup failed, the request id could not be
-//!   generated, or a local resource (pipe, thread) could not be created
-//! - `PAM_USER_UNKNOWN` — the username lookup failed
-//!
-//! The ABI surface is the exception, and it is exempt by name: `pam_sm_setcred`,
-//! `pam_sm_acct_mgmt`, `pam_sm_open_session`, `pam_sm_close_session` and
-//! `pam_sm_chauthtok` answer a non-authentication entry point with
-//! `PAM_SUCCESS`, and `guard`'s panic arm answers `PAM_AUTH_ERR`; none of them
-//! converts a verdict or sees an `Outcome`.
-//! (`only_outcome_rs_returns_pam_constants` asserts both halves.)
-//!
-//! It never returns `PAM_IGNORE`, which protects the
-//! `required` stack shape: there `PAM_IGNORE` is explicitly `ignore` while
-//! `PAM_AUTHINFO_UNAVAIL` is `bad`. On a `sufficient` line both codes are
-//! `ignore`, so a following `optional pam_permit` grants either way and only
-//! the stack's configuration prevents it. Password fallback still works on that
-//! `sufficient` line, whose default action for any non-success is `ignore`.
-//!
-//! ## Requirements
-//!
-//! Must run as root to access `/etc/tapauth` configuration files.
 
 mod conclusion_cache;
 mod config;
@@ -72,11 +44,11 @@ mod plan;
 mod policy;
 mod transaction;
 
-pub use ipc_client::*;
-
 use std::os::raw::c_int;
 use std::panic::catch_unwind;
-// Internal panic guard: returns PAM_AUTH_ERR if the inner closure panics.
+
+// PAM entry points must never unwind into the host process. The logging call is
+// guarded too: it must not panic on the path that is already unwinding.
 fn guard<F>(f: F) -> c_int
 where
     F: FnOnce() -> c_int + std::panic::UnwindSafe,
@@ -86,7 +58,7 @@ where
         Err(_) => {
             let _ = catch_unwind(|| {
                 tracing::error!(
-                    "TapAuth PAM: panic caught in guarded section; returning PAM_AUTH_ERR"
+                    "TapAuth: panic caught in the PAM entry point; returning PAM_AUTH_ERR"
                 );
             });
             pam_sys::PAM_AUTH_ERR
@@ -94,7 +66,7 @@ where
     }
 }
 
-/// PAM service module entry point for authentication
+/// PAM service module entry point for authentication.
 #[no_mangle]
 pub extern "C" fn pam_sm_authenticate(
     pamh: *mut pam_sys::PamHandle,
@@ -102,13 +74,11 @@ pub extern "C" fn pam_sm_authenticate(
     _argc: c_int,
     _argv: *const *const std::os::raw::c_char,
 ) -> c_int {
-    // Guard against panics: PAM modules must never unwind into the host process
     guard(|| pam_logic::authenticate(pamh))
 }
 
-/// PAM service module entry point for establishing/deleting user credentials
-/// Required by PAM specification for authentication modules.
-/// We don't manage credentials ourselves, so this is a no-op.
+/// PAM service module entry point for credentials (required by the PAM
+/// specification; this module has none to manage).
 #[no_mangle]
 pub extern "C" fn pam_sm_setcred(
     _pamh: *mut pam_sys::PamHandle,
@@ -119,7 +89,7 @@ pub extern "C" fn pam_sm_setcred(
     pam_sys::PAM_SUCCESS
 }
 
-/// PAM service module entry point for account management
+/// PAM service module entry point for account management.
 #[no_mangle]
 pub extern "C" fn pam_sm_acct_mgmt(
     _pamh: *mut pam_sys::PamHandle,
@@ -130,7 +100,7 @@ pub extern "C" fn pam_sm_acct_mgmt(
     pam_sys::PAM_SUCCESS
 }
 
-/// PAM service module entry point for session management
+/// PAM service module entry point for session management.
 #[no_mangle]
 pub extern "C" fn pam_sm_open_session(
     _pamh: *mut pam_sys::PamHandle,
@@ -141,7 +111,7 @@ pub extern "C" fn pam_sm_open_session(
     pam_sys::PAM_SUCCESS
 }
 
-/// PAM service module entry point for closing session
+/// PAM service module entry point for closing a session.
 #[no_mangle]
 pub extern "C" fn pam_sm_close_session(
     _pamh: *mut pam_sys::PamHandle,
@@ -152,7 +122,7 @@ pub extern "C" fn pam_sm_close_session(
     pam_sys::PAM_SUCCESS
 }
 
-/// PAM service module entry point for password change
+/// PAM service module entry point for password change.
 #[no_mangle]
 pub extern "C" fn pam_sm_chauthtok(
     _pamh: *mut pam_sys::PamHandle,
@@ -163,8 +133,6 @@ pub extern "C" fn pam_sm_chauthtok(
     pam_sys::PAM_SUCCESS
 }
 
-/// Crate-wide source guardrails: the scans that assert invariants over every
-/// module of this crate rather than over one module's behaviour.
 // reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(

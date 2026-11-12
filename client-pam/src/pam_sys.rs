@@ -24,8 +24,14 @@ pub use ffi::{
 
 pub type PamHandle = ffi::pam_handle_t;
 
-/// Retrieve the PAM service name (e.g. `"sudo"`, `"polkit-1"`, `"sddm"`)
-/// from the active authentication context.
+/// The `PAM_SERVICE` name (e.g. `"sudo"`, `"polkit-1"`, `"sddm"`), when it is
+/// set and UTF-8.
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate` and must outlive the call: the item read is libpam's
+/// own NUL-terminated string, valid while the handle lives.
 pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
     if pamh.is_null() {
         return None;
@@ -43,12 +49,18 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
     }
 }
 
-/// Retrieve the username from the PAM context.
+/// The username from the PAM context.
 ///
 /// A null `PAM_USER` is `PAM_USER_UNKNOWN`, never a substitution: the module
 /// authenticates the account libpam set for this stack, and a name taken from
 /// another item would raise a phone prompt for an account the stack will not
 /// authenticate (and would key the verdict cache on it).
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate`, and the `PAM_USER` item behind it is libpam's, valid
+/// while the handle lives.
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
     if pamh.is_null() {
         return Err(PAM_SYSTEM_ERR);
@@ -71,11 +83,9 @@ pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
 }
 
 /// The value interpretation of [`get_user`], split out so it is testable
-/// without a PAM handle: an absent item is [`PAM_USER_UNKNOWN`], and a present
-/// one must be UTF-8.
-///
-/// There is deliberately no second item to fall back to: the only input is
-/// `PAM_USER`.
+/// without a PAM handle: an absent item is [`PAM_USER_UNKNOWN`], a present one
+/// must be UTF-8, and `PAM_USER` is the only input — there is no second item to
+/// fall back to.
 fn user_from_item(item: Option<&CStr>) -> Result<String, c_int> {
     let item = item.ok_or(PAM_USER_UNKNOWN)?;
     item.to_str()
@@ -83,7 +93,13 @@ fn user_from_item(item: Option<&CStr>) -> Result<String, c_int> {
         .map_err(|_| PAM_USER_UNKNOWN)
 }
 
-/// Retrieve the PAM conversation function pointer.
+/// The conversation function libpam holds for this handle.
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate`. The `PAM_CONV` item it returns really is a
+/// `struct pam_conv` that libpam owns, valid while the handle lives.
 pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_int> {
     if pamh.is_null() {
         return Err(PAM_SYSTEM_ERR);
@@ -104,16 +120,13 @@ pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_i
 ///
 /// The read is the one effect `mechanism::handoff` performs on the PAM handle,
 /// so it is passed in through `transaction::HostIo` like every other effect: a
-/// test can then count it instead of inferring it from the absence of a
-/// conversation.
+/// test can count it instead of inferring it from a missing conversation.
 pub(crate) type ReadAuthtok = unsafe fn(*mut PamHandle) -> (c_int, *const c_char);
 
-/// Read `PAM_AUTHTOK` for the pre-collected handoff.
-///
-/// Exactly the call the handoff used to make inline: `pam_get_authtok` on this
-/// thread, with no prompt, and whatever token libpam produces. The code and the
-/// token are returned as-is; deciding that a null token means "nothing was
-/// collected" belongs to the handoff.
+/// Read `PAM_AUTHTOK` for the pre-collected handoff: `pam_get_authtok` on this
+/// thread, no prompt, whatever token libpam produces. The code and the token are
+/// returned as-is; treating a null token as "nothing was collected" is the
+/// handoff's decision.
 ///
 /// # Safety
 ///
@@ -125,11 +138,14 @@ pub(crate) unsafe fn read_authtok_for_handoff(pamh: *mut PamHandle) -> (c_int, *
     (res, authtok)
 }
 
-/// Send a message to the user via the PAM conversation function.
+/// Send a message to the user through the conversation function.
 ///
-/// Allocates a `pam_message` on the stack and calls the conversation
-/// callback.  The `pam_response` is allocated by the conversation
-/// function (`malloc`) and freed here with `libc::free`.
+/// # Safety
+///
+/// `pamh` must be the live handle libpam passed to this thread's
+/// `pam_sm_authenticate`, so the conversation it carries is callable on this
+/// thread. The callback mallocs the `pam_response` and nothing else frees it: this
+/// function owns it and frees the response and its buffer.
 pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) -> Result<(), c_int> {
     let conv_ptr = get_conv(pamh)?;
     let conv = &*conv_ptr;
@@ -171,31 +187,14 @@ pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) ->
     }
 }
 
-/// Safe wrapper for PAM conversation operations.
-///
-/// Provides a Rust-idiomatic interface to PAM conversation functions
-/// with proper lifetime management, eliminating the need for `unsafe`
-/// blocks when sending messages to users.
-///
-/// # Example
-///
-/// ```no_run
-/// # use client_pam::pam_sys::{PamHandle, PamConversation};
-/// # unsafe fn example(pamh: *mut PamHandle) -> Result<(), i32> {
-/// let pam_conv = PamConversation::new(pamh)?;
-/// pam_conv.try_info("Processing your request...");
-/// pam_conv.try_error("An error occurred");
-/// # Ok(())
-/// # }
-/// ```
+/// A checked conversation: `new` proves the handle carries a usable one, and
+/// `'a` keeps it borrowed for every `info`/`error`.
 pub struct PamConversation<'a> {
     pamh: *mut PamHandle,
     _phantom: std::marker::PhantomData<&'a mut PamHandle>,
 }
 
 impl<'a> PamConversation<'a> {
-    /// Create a new `PamConversation` wrapper.
-    ///
     /// # Safety
     ///
     /// The caller must ensure that:
@@ -203,7 +202,7 @@ impl<'a> PamConversation<'a> {
     /// - The PAM handle remains valid for the lifetime `'a`
     /// - The PAM handle is not used concurrently from other threads
     pub unsafe fn new(pamh: *mut PamHandle) -> Result<Self, c_int> {
-        let _ = get_conv(pamh)?;
+        get_conv(pamh)?;
 
         Ok(Self {
             pamh,
@@ -211,12 +210,11 @@ impl<'a> PamConversation<'a> {
         })
     }
 
-    /// Build a conversation wrapper without a PAM handle, for unit tests.
+    /// A handle-less conversation for unit tests.
     ///
-    /// `send_message` calls `get_conv`, which already rejects a
-    /// null handle with `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are
-    /// clean no-ops here. Only the return-code logic that takes a
-    /// `&PamConversation` can be exercised this way.
+    /// `send_message` starts at `get_conv`, which rejects a null handle with
+    /// `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are clean no-ops; only
+    /// return-code logic taking a `&PamConversation` is exercised this way.
     #[cfg(test)]
     pub unsafe fn dummy() -> Self {
         Self {
@@ -227,28 +225,25 @@ impl<'a> PamConversation<'a> {
 
     /// Send an informational message to the user.
     pub fn info(&self, message: &str) -> Result<(), c_int> {
+        // SAFETY: `pamh` is a handle `new` validated, or null, which `get_conv`
+        // rejects before it is used.
         unsafe { send_message(self.pamh, PAM_TEXT_INFO, message) }
     }
 
     /// Send an error message to the user.
     pub fn error(&self, message: &str) -> Result<(), c_int> {
+        // SAFETY: as `info`.
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
     }
 
-    /// Try to send an informational message, logging any errors.
-    ///
-    /// Convenience method that never fails — useful for non-critical
-    /// user feedback.
+    /// [`info`](Self::info), logging the failure instead of returning it.
     pub fn try_info(&self, message: &str) {
         if let Err(e) = self.info(message) {
             tracing::warn!("Failed to send info message to user: PAM error code {}", e);
         }
     }
 
-    /// Try to send an error message, logging any errors.
-    ///
-    /// Convenience method that never fails — useful for non-critical
-    /// user feedback.
+    /// [`error`](Self::error), logging the failure instead of returning it.
     pub fn try_error(&self, message: &str) {
         if let Err(e) = self.error(message) {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
@@ -269,14 +264,11 @@ mod tests {
 
     /// A null `PAM_USER` is `PAM_USER_UNKNOWN`, and nothing else is consulted.
     ///
-    /// The defect this catches: the retired fallback that read the remote-user
-    /// item and returned *that* as the username when `PAM_USER` was unset. That
-    /// string became the daemon request's `username`, the verdict cache's key and
-    /// the locale lookup's NSS name, so a stack with `PAM_USER` unset and the
-    /// remote-user item pointed at another account raised a phone prompt for an
-    /// account the stack would not authenticate. `user_from_item` has no second
-    /// item to consult, so the substitution cannot be reintroduced here without
-    /// changing this signature.
+    /// The defect this catches: a fallback to another item (the retired
+    /// remote-user read) returning *that* as the username. The name becomes the
+    /// daemon request's `username`, the verdict cache's key and the locale
+    /// lookup's NSS name, so it would prompt the phone for an account the stack
+    /// will not authenticate. `user_from_item` has no second item to consult.
     #[test]
     fn null_user_does_not_fall_back_to_ruser() {
         assert_eq!(user_from_item(None), Err(PAM_USER_UNKNOWN));

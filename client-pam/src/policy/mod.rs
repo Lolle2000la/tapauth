@@ -1,32 +1,10 @@
 //! The conversation policy: one ordered table of rules over
-//! [`CallerContext`](crate::context::CallerContext), and the two phases that
-//! consume it.
+//! [`CallerContext`](crate::context::CallerContext) (`table.rs`), the taxonomy
+//! those rows are written in, and the first-match engine `classify` that walks
+//! them. `refine` is the second, config-dependent phase; it can only add a skip.
 //!
-//! Three responsibilities, three files:
-//!
-//! * `table.rs` is the decision record: `RULES`, one row per host, carrying the
-//!   class the row was authored against (the failure direction it protects), its
-//!   predicate and its decision, plus the test-only audit record (name, why,
-//!   evidence) that justifies each row.
-//! * this file is the taxonomy those rows are written in ([`Classification`],
-//!   [`Decision`], [`Participation`], [`Conversation`], [`FailureDirection`],
-//!   [`SkipPolicy`]) and the first-match engine: `classify` walks the table in
-//!   order and returns the id of the row that matched, next to the
-//!   classification that row produces.
-//! * `refine.rs` is the config-dependent second phase, which may only add a
-//!   skip.
-//!
-//! Two types come out of `classify` — [`Classification::Skip`] and
-//! [`Classification::Participate`] — so a skip cannot acquire a deadline, a plan
-//! or a mechanism: [`SkipPolicy`] carries none of them. R10's predicate is
-//! unconditional, so `classify` is total.
-//!
-//! R1 (`remote_refuse`) keys on the PAM service name alone: the module never
-//! reads `PAM_RHOST`, because `sudo` sets it to the local hostname
-//! (`Defaults pam_rhost`), so a presence-only rule would silence the module on
-//! `sudo`. R2 keys only on the display-manager prefixes, so R1's and R2's
-//! predicates are disjoint and their relative order is unobservable; what is
-//! load-bearing is R1 before the process rules (R3–R8) and before R10.
+//! R1 keys on the service name and never on `PAM_RHOST`: `sudo` sets the latter
+//! to the local hostname, so a presence rule would silence the module on `sudo`.
 
 use crate::context::CallerContext;
 
@@ -44,23 +22,17 @@ pub(crate) enum Classification {
     Participate(Participation),
 }
 
-/// Why the phone is not consulted at all.
-///
-/// `RemoteAuthentication` is R1's: the module must not take part in a remote
-/// authentication at all, and the skip happens before any config read, username
-/// lookup, conversation construction or message load.
-///
-/// `KeyringNeedsAuthtok` is R2's: the display manager's own stack has to
-/// populate `PAM_AUTHTOK`, and issuing a second `PAM_PROMPT_ECHO_OFF` on a
-/// greeter handle is what the bypass exists to prevent.
-///
-/// The *other* no-daemon path — R8's pre-collected handoff, which calls
-/// `pam_get_authtok` and caches `PAM_AUTHTOK` — is deliberately **not** a skip:
-/// it is `Participation { conversation: PreCollected }`, so the handoff can only
-/// be reached through a participation and never through this type.
+/// Why the phone is not consulted at all. R8's pre-collected handoff is
+/// deliberately *not* one of these: it is `Participation { conversation:
+/// PreCollected }`, so it is reachable only through a participation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipPolicy {
+    /// R1's: a service in the built-in or configuration-declared refused lists,
+    /// whatever the caller's process.
     RemoteAuthentication,
+    /// R2's: the display manager's own stack has to populate `PAM_AUTHTOK`, and
+    /// a second `PAM_PROMPT_ECHO_OFF` on a greeter handle is what the bypass
+    /// exists to prevent.
     KeyringNeedsAuthtok,
 }
 
@@ -77,14 +49,14 @@ pub(crate) enum Conversation {
     PreCollected,
 }
 
-/// The failure direction a rule protects, stated once per class.
-///
-/// `Keyring` and `RefuseRemote` are orthogonal to the three failure directions:
-/// `Keyring` is about the value of a grant rather than the risk of asking, and
-/// `RefuseRemote` is a scope decision — this call is not ours to answer at all.
+/// The failure direction a rule protects, stated once per class. `Keyring` and
+/// `RefuseRemote` are orthogonal to the three failure directions: the former is
+/// about the value of a grant rather than the risk of asking, the latter a scope
+/// decision — this call is not ours to answer at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FailureDirection {
-    /// The phone must not be consulted at all.
+    /// The phone must not be consulted at all: R8's
+    /// `Conversation::PreCollected`, not a `SkipPolicy`.
     NeverRing,
     /// The conversation must not be driven from a second thread (or not driven
     /// at all); the wrong direction is a hang, so the safe one is "slower,
@@ -101,27 +73,30 @@ pub(crate) enum FailureDirection {
     RefuseRemote,
 }
 
+/// The decision cell of one row: a conversation, or a skip.
+///
+/// It is separate from [`Classification`] because a row authors only this cell: the
+/// failure direction is the row's own `class` column, and `classification_of`
+/// combines the two into a [`Participation`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     Skip(SkipPolicy),
     Participate(Conversation),
 }
 
-/// A rule that matched, with the class it was authored against.
-///
-/// Which rule matched is not part of the value: `classify` returns its id next
-/// to it, so no field is carried that only the tests would read.
+/// A rule that matched, with the class it was authored against. Which rule it was
+/// is not part of the value: `classify` returns the id next to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Participation {
     pub(crate) conversation: Conversation,
-    /// The rule's class, copied here so the failure direction is part of the
-    /// value and not only of the table (`class_agrees_with_conversation`). Read
-    /// in production by `transaction::run`'s class/plan assertion.
+    /// The rule's class, copied here so the failure direction is part of the value.
+    /// `class_agrees_with_conversation` checks it, and so does `transaction::run`'s
+    /// class/plan assertion — a `debug_assert!`, which release builds drop.
     pub(crate) failure_direction: FailureDirection,
 }
 
-/// A rule's stable id. The fixture corpus names it in its `expected_rule`
-/// column.
+/// A rule's stable id: a fixture label returned beside the classification, not
+/// part of `Participation`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RuleId {
     R1,
@@ -137,16 +112,11 @@ pub(crate) enum RuleId {
 }
 
 impl RuleId {
-    /// Every variant, in table order.
-    ///
-    /// Test-only, and the enumeration the audit guard walks: `as_str` and
-    /// `policy::table::audit` are exhaustive matches, so a new variant cannot
-    /// compile without its spelling and its audit record, and this list is what
-    /// lets the guard walk the variants to catch the other direction — a rule
-    /// whose row was deleted from `RULES`. Keeping the list complete is not a
-    /// compile-time property: a variant added to the enum, `as_str` and `audit`
-    /// but omitted here is not caught; everything it does list is checked
-    /// against `RULES` by `audit_covers_rules`.
+    /// Every variant, in table order. Test-only: `as_str` and `policy::table::audit`
+    /// are exhaustive matches, so a new variant cannot compile without its spelling
+    /// and its record; this list is what lets the guard catch a rule whose row was
+    /// deleted from `RULES`, and `audit_covers_rules`'s `ALL.len() == RULES.len()`
+    /// catches a variant omitted here.
     #[cfg(test)]
     pub(crate) const ALL: &[Self] = &[
         Self::R1,
@@ -179,15 +149,15 @@ impl RuleId {
     }
 }
 
-/// The first rule that matches wins; R10 is unconditional, so this is total.
-///
-/// The id comes back next to the classification: the row is what a failing test
-/// names, and a `Participation` carrying it would carry a field nothing in the
-/// shipped binary reads.
+/// The first rule that matches wins; R10 is unconditional, so this is total. The id
+/// comes back next to the classification so a failing test names the row;
+/// `Participation` does not carry it.
 pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification) {
     RULES
         .iter()
         .find(|rule| (rule.predicate)(ctx))
+        // Unreachable fallback: R10 is unconditional (`table.rs`, `DEFAULT_SEQUENTIAL`),
+        // so this only keeps `classify` total.
         .map_or((RuleId::R10, DEFAULT_SEQUENTIAL), |rule| {
             (rule.id, classification_of(rule))
         })
@@ -204,19 +174,16 @@ fn classification_of(rule: &Rule) -> Classification {
 }
 
 /// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this table's
-/// oracle, and the policy tests below are its consumers.
+/// oracle. It feeds literal inputs — the service string, `classify_identity` from
+/// the identity columns, `GdmReauth::from_env` from `env` — so the reads behind
+/// them (`/proc/self/exe`, `/proc/self/comm`, `GDM_SESSION_FOR_REAUTH`) stay
+/// unpinned: a `/proc` read cannot be characterised portably, and `set_var` would
+/// race every other test in this binary that reads the environment.
+/// `scripts/ci/test-pam-conv-thread.sh` is the proof for those.
 ///
-/// The rows were authored against the *pre-refactor* functions (the
-/// characterisation step), so a row is an expectation written before the code
-/// that has to satisfy it. What the corpus pins and what it does not: it feeds
-/// the table *literal* inputs — the service string, `classify_identity(exe,
-/// comm)` from the two identity columns and `GdmReauth::from_env` from the
-/// `env` column. It does not pin the reads that produce those inputs
-/// (`/proc/self/exe`, `/proc/self/comm`, `GDM_SESSION_FOR_REAUTH`): no unit test
-/// can characterise a `/proc` read portably, and a test that called `set_var`
-/// would race every other test in this binary that reads the environment. The
-/// end-to-end shapes in `scripts/ci/test-pam-conv-thread.sh` stay the proof for
-/// the reads.
+/// The rows were authored against the *pre-refactor* functions — the
+/// characterisation step — so a row is an expectation written before the code that
+/// must satisfy it, not a transcription of what the table already did.
 // reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
@@ -243,9 +210,9 @@ mod tests {
     /// The schema the corpus parser demands, in column order.
     const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
 
-    /// What the module decides to do with a call.
+    /// The decision a fixture row expects, compared against what `classify` produces.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Policy {
+    enum ExpectedPolicy {
         SkipRemote,
         SkipKeyring,
         Threaded,
@@ -269,7 +236,7 @@ mod tests {
         env: Option<String>,
         tty: bool,
         expected_rule: String,
-        expected_policy: Policy,
+        expected_policy: ExpectedPolicy,
         why: String,
         e2e: bool,
     }
@@ -299,13 +266,13 @@ mod tests {
         }
     }
 
-    fn parse_policy(field: &str) -> Policy {
+    fn parse_policy(field: &str) -> ExpectedPolicy {
         match field {
-            "skip_remote" => Policy::SkipRemote,
-            "skip_keyring" => Policy::SkipKeyring,
-            "threaded" => Policy::Threaded,
-            "sequential" => Policy::Sequential,
-            "precollected" => Policy::PreCollected,
+            "skip_remote" => ExpectedPolicy::SkipRemote,
+            "skip_keyring" => ExpectedPolicy::SkipKeyring,
+            "threaded" => ExpectedPolicy::Threaded,
+            "sequential" => ExpectedPolicy::Sequential,
+            "precollected" => ExpectedPolicy::PreCollected,
             other => panic!("{other:?} is not a known expected_policy"),
         }
     }
@@ -388,10 +355,10 @@ mod tests {
     }
 
     /// The rule an id-less classification belongs to. `classify` reports the id
-    /// itself; `refine` returns a bare `Classification`, so its skip is mapped
-    /// back through the policy, which belongs to exactly one rule
-    /// (`RemoteAuthentication` is R1's and `KeyringNeedsAuthtok` is R2's). A
-    /// participation carries no id at all, so it maps to nothing here.
+    /// itself; `refine` returns a bare `Classification`, so its skip is mapped back
+    /// through the policy, which belongs to exactly one rule
+    /// (`RemoteAuthentication` is R1's, `KeyringNeedsAuthtok` is R2's). A
+    /// participation maps to nothing here.
     fn skip_rule(classification: &Classification) -> Option<RuleId> {
         match classification {
             Classification::Skip(SkipPolicy::RemoteAuthentication) => Some(RuleId::R1),
@@ -400,7 +367,7 @@ mod tests {
         }
     }
 
-    fn policy_of(classification: &Classification) -> Policy {
+    fn policy_of(classification: &Classification) -> ExpectedPolicy {
         match classification {
             Classification::Skip(policy) => policy_for_decision(&Decision::Skip(*policy)),
             Classification::Participate(participation) => {
@@ -410,13 +377,13 @@ mod tests {
     }
 
     /// The corpus spelling of a table decision.
-    fn policy_for_decision(decision: &Decision) -> Policy {
+    fn policy_for_decision(decision: &Decision) -> ExpectedPolicy {
         match decision {
-            Decision::Skip(SkipPolicy::RemoteAuthentication) => Policy::SkipRemote,
-            Decision::Skip(SkipPolicy::KeyringNeedsAuthtok) => Policy::SkipKeyring,
-            Decision::Participate(Conversation::Threaded) => Policy::Threaded,
-            Decision::Participate(Conversation::Sequential) => Policy::Sequential,
-            Decision::Participate(Conversation::PreCollected) => Policy::PreCollected,
+            Decision::Skip(SkipPolicy::RemoteAuthentication) => ExpectedPolicy::SkipRemote,
+            Decision::Skip(SkipPolicy::KeyringNeedsAuthtok) => ExpectedPolicy::SkipKeyring,
+            Decision::Participate(Conversation::Threaded) => ExpectedPolicy::Threaded,
+            Decision::Participate(Conversation::Sequential) => ExpectedPolicy::Sequential,
+            Decision::Participate(Conversation::PreCollected) => ExpectedPolicy::PreCollected,
         }
     }
 
@@ -437,24 +404,18 @@ mod tests {
 
     /// The terminal state each participating row models, written out by hand.
     ///
-    /// This is the oracle the corpus's `tty` column is checked against, and it
-    /// is a literal for a reason: the §3.4.1 plan cell is a function of `tty`,
-    /// so an expected plan derived from the column under test agrees with a
-    /// wrong value by construction. Derived that way, only a row whose column
-    /// contradicted its own `expected_policy` could fail; a fixture row whose
-    /// `tty` simply misdescribed its host stayed green. The literal names the
-    /// host instead, so flipping any row's value — `sequential_with_tty`
-    /// losing its `1`, or `threaded_no_tty` gaining one — fails here.
+    /// This is the oracle the corpus's `tty` column is checked against, and it is a
+    /// literal for a reason: the plan cell is a function of `tty`, so an expected
+    /// plan derived from the column under test agrees with a wrong value by
+    /// construction — a row whose `tty` misdescribed its host would stay green.
     ///
-    /// Every row whose `expected_policy` is `Threaded` or `Sequential` (the only
-    /// rows that reach a `Plan`) must appear exactly once; no other row may
-    /// appear. `daemon_timeout` is the e2e row proving a daemon-side timeout is
-    /// silent: R5, threaded, no terminal.
+    /// Every row whose `expected_policy` is `Threaded` or `Sequential` must appear
+    /// exactly once, and no other row may. `daemon_timeout` is the e2e row proving
+    /// a daemon-side timeout is silent: R5, threaded, no terminal.
     const EXPECTED_TTY: &[(&str, bool)] = &[
-        // Threaded.  The plan is Operation/Wait/DoNotOpen whatever the value,
-        // and the hosts are lock-screen, polkit and GDM helpers that own no
-        // terminal — except `threaded_with_tty_unreachable`, which carries a `1`
-        // precisely to show the column cannot change a threaded decision.
+        // Threaded: the plan is Operation/Wait/DoNotOpen whatever the value. The
+        // hosts own no terminal, except `threaded_with_tty_unreachable`, whose `1`
+        // shows the column cannot change a threaded decision.
         ("daemon_timeout", false),
         ("reauth_zero_value", false),
         ("mixed_case_gdm", false),
@@ -497,9 +458,7 @@ mod tests {
     ];
 
     /// The terminal state `EXPECTED_TTY` gives a row, or a panic naming the row.
-    ///
-    /// Callers only reach it for a participating row, after the set check in
-    /// `corpus_characterises_the_decision_table`.
+    /// Callers reach it only for a participating row, after the set check.
     fn expected_tty(id: &str) -> bool {
         EXPECTED_TTY
             .iter()
@@ -511,26 +470,27 @@ mod tests {
     /// Every corpus row classifies to the rule and policy it names, and a
     /// participating row's `tty` column matches the host it models.
     ///
-    /// What the column-by-column feeding covers: the `exe`/`comm` pair is fed to
-    /// `classify_identity` before `classify`, so a precedence or `(deleted)`
-    /// regression fails at the column that caused it; `env` goes through
-    /// `GdmReauth::from_env`, so presence-only parsing is exercised rather than
-    /// assumed. The `tty` column is checked against `EXPECTED_TTY`, a literal
-    /// independent of the fixture, and only then fed to `Plannable::plan` — the
-    /// column cannot be its own oracle, because the plan is a function of it
-    /// (see `EXPECTED_TTY`). `skip_*` and `precollected` rows have no `Plan` —
-    /// the skip returns before a plan exists and the handoff returns before the
-    /// probe — so they assert the classification only.
+    /// `exe`/`comm` goes through `classify_identity` before `classify`, so a
+    /// precedence or `(deleted)` regression fails at the column that caused it, and
+    /// `env` through `GdmReauth::from_env`, so presence-only parsing is exercised
+    /// rather than assumed. The `tty` column is checked against `EXPECTED_TTY` first
+    /// and only then fed to `Plannable::plan`: the column cannot be its own oracle,
+    /// because the plan is a function of it. `skip_*` and `precollected` rows have
+    /// no `Plan`, so they assert the classification only.
     #[test]
     fn corpus_characterises_the_decision_table() {
         let rows = rows();
 
-        // The literal table and the set of rows that carry a plan must be the
-        // same set: one entry per participating row, and no entry for a row that
-        // is missing or carries no plan.
+        // The literal table and the rows that carry a plan must be the same set:
+        // one entry per participating row, none for a row missing or without a plan.
         let participating: Vec<&Row> = rows
             .iter()
-            .filter(|row| matches!(row.expected_policy, Policy::Threaded | Policy::Sequential))
+            .filter(|row| {
+                matches!(
+                    row.expected_policy,
+                    ExpectedPolicy::Threaded | ExpectedPolicy::Sequential
+                )
+            })
             .collect();
         for row in &participating {
             let entries = EXPECTED_TTY.iter().filter(|(id, _)| *id == row.id).count();
@@ -560,7 +520,11 @@ mod tests {
             // `/dev/tty` is only probed for a sequential conversation, so a
             // host that never reaches that branch cannot carry a terminal.
             assert!(
-                !row.tty || matches!(row.expected_policy, Policy::Sequential | Policy::Threaded),
+                !row.tty
+                    || matches!(
+                        row.expected_policy,
+                        ExpectedPolicy::Sequential | ExpectedPolicy::Threaded
+                    ),
                 "row {}: a pre-collected or skipped host has no terminal branch",
                 row.id
             );
@@ -608,12 +572,11 @@ mod tests {
                 row.why
             );
 
-            // The `tty` column is `plan`'s only input, so it is first checked
-            // against the host it models (`EXPECTED_TTY`, a literal) and the
-            // §3.4.1 cell is then derived from that expectation — never from the
-            // column, which would make a drifted value agree with itself.
+            // The `tty` column is `plan`'s only input, so it is checked against
+            // `EXPECTED_TTY` (a literal) first and the plan is derived from that
+            // expectation — never from the column, which would agree with itself.
             match row.expected_policy {
-                Policy::Threaded | Policy::Sequential => {
+                ExpectedPolicy::Threaded | ExpectedPolicy::Sequential => {
                     assert_eq!(
                         row.tty,
                         expected_tty(&row.id),
@@ -623,7 +586,7 @@ mod tests {
                     );
                     let tty = expected_tty(&row.id);
                     match row.expected_policy {
-                        Policy::Threaded => assert_eq!(
+                        ExpectedPolicy::Threaded => assert_eq!(
                             Plannable::Threaded.plan(tty),
                             Plan {
                                 deadline: Deadline::Operation,
@@ -659,9 +622,11 @@ mod tests {
                         ),
                     }
                 }
-                // A skip returns before a plan exists and the pre-collected
-                // handoff returns before the probe, so neither has a cell.
-                Policy::SkipRemote | Policy::SkipKeyring | Policy::PreCollected => {}
+                // No plan cell: the skip returns before a plan exists, the
+                // pre-collected handoff before the probe.
+                ExpectedPolicy::SkipRemote
+                | ExpectedPolicy::SkipKeyring
+                | ExpectedPolicy::PreCollected => {}
             }
         }
     }
@@ -669,10 +634,7 @@ mod tests {
     /// Every rule in the table has at least one corpus row that names it.
     ///
     /// The check iterates `RULES`, not the corpus: iterating the corpus cannot
-    /// see a rule added without a fixture, which is the case that matters. The
-    /// name in the message is the audit record's (`policy/table.rs`, `audit`);
-    /// that record and this table are checked against each other by
-    /// `audit_covers_rules`.
+    /// see a rule added without a fixture, which is the case that matters.
     #[test]
     fn corpus_covers_every_rule() {
         let rows = rows();
@@ -687,22 +649,17 @@ mod tests {
         }
     }
 
-    /// Every rule row has exactly one audit record, and every record is
-    /// complete and uniquely named.
+    /// Every rule row has exactly one audit record, and every record is complete and
+    /// uniquely named.
     ///
-    /// The audit record (`policy/table.rs`, `audit`) is the justification a
-    /// human reads: the rule's symbolic name, why it exists, and the citations
-    /// that defend it. It is `#[cfg(test)]`, so nothing but these tests keeps it
-    /// honest. Two directions are checked: `audit`'s exhaustive `match` makes a
-    /// rule without a record a compile error, and walking `RuleId::ALL` here
-    /// catches the other direction — a record whose row was deleted from
-    /// `RULES`, which `corpus_covers_every_rule` cannot see because it iterates
-    /// `RULES` too.
+    /// The record is `#[cfg(test)]`, so only these tests keep it honest: `audit`'s
+    /// exhaustive `match` makes a rule without a record a compile error, and walking
+    /// `RuleId::ALL` catches a record whose row was deleted from `RULES`, which
+    /// `corpus_covers_every_rule` cannot see because it iterates `RULES` too.
     ///
-    /// The defect this catches: a rule whose row exists but whose record is
-    /// missing or empty (the audit record silently rotting away from the
-    /// table), a deleted row leaving an orphan record, and two rules sharing a
-    /// name, which would make a corpus row's `expected_rule` ambiguous.
+    /// The defect this catches: a record missing or empty, a deleted row leaving an
+    /// orphan record, and two rules sharing a name, which would make a corpus row's
+    /// `expected_rule` ambiguous.
     #[test]
     fn audit_covers_rules() {
         assert_eq!(
@@ -771,10 +728,8 @@ mod tests {
                     participation.conversation
                 ),
                 Classification::Skip(policy) => {
-                    // A skip must come from a rule that declares a skip, and
-                    // the policy the caller sees must be that rule's own: R1 and
-                    // R2 are the only two skipping rules, and they carry
-                    // different policies.
+                    // A skip must come from a rule that declares a skip, and the
+                    // policy the caller sees must be that rule's own.
                     let rule = rule_by_id(rule);
                     assert_eq!(
                         rule.map(|rule| rule.decision),
@@ -810,10 +765,9 @@ mod tests {
     /// The process-keyed rules own disjoint literal sets, so their order is not
     /// load-bearing; R9 keys on a *missing* identity instead.
     ///
-    /// The literals are declared here rather than derived from the table
-    /// because a set cannot be read back out of a `fn` pointer; the test then
-    /// checks the *predicates* against them, so a spelling added to a second
-    /// rule, or a rule whose predicate drifts off its declared set, fails.
+    /// The literals are declared here because a set cannot be read back out of a `fn`
+    /// pointer; the test then checks the *predicates* against them, so a spelling
+    /// added to a second rule, or a predicate drifting off its set, fails.
     #[test]
     fn rules_are_process_disjoint() {
         let keys: &[(RuleId, &[&str])] = &[
@@ -885,15 +839,13 @@ mod tests {
         CallerContext::from_parts(service, process, GdmReauth::Absent)
     }
 
-    /// R1's predicate: the two remote service names, ASCII case-insensitively,
-    /// and nothing else — and it outranks every process rule.
+    /// R1's predicate: the two remote service names, ASCII case-insensitively, and
+    /// nothing else — and it outranks every process rule.
     ///
-    /// The defects this catches: R1 missing or inverted (an `sshd` call would
-    /// then be rung and would wait out the GUI timeout), a case-sensitive
-    /// comparison (`SSHD` would escape), a substring or prefix match
-    /// (`my-sshd` would be refused, silencing a local stack), an unresolved
-    /// service matching, and R1 losing its precedence (a `swaylock` under an
-    /// `sshd` service would be handed off instead of refused).
+    /// The defect this catches: R1 missing or inverted (an `sshd` call would wait out
+    /// the GUI timeout), a case-sensitive comparison (`SSHD` escapes), a substring or
+    /// prefix match (`my-sshd` refused, silencing a local stack), an unresolved
+    /// service matching, and R1 losing precedence to a process rule.
     #[test]
     fn remote_rules() {
         for service in ["sshd", "sshd-session", "SSHD", "Sshd-Session"] {
@@ -930,20 +882,16 @@ mod tests {
 
     /// The configured-refusal matcher's fixture table.
     ///
-    /// The CSV corpus has no column for a runtime config, so this literal table
-    /// is the fixture for the configured half of R1: a renamed `PAMServiceName`
-    /// is refused only when it is declared, the match is ASCII case-insensitive,
-    /// a near miss is not a prefix/substring match, and a malformed entry left
-    /// in the slice matches nothing. The last row is the shape
-    /// `PamConfig::effective_refused_services` hands over (built-ins included),
-    /// which is what proves the built-ins still match through this function.
+    /// The CSV corpus has no column for a runtime config, so this literal table is the
+    /// fixture for the configured half of R1: a renamed `PAMServiceName` is refused
+    /// only when declared, the match is ASCII case-insensitive, a near miss is not a
+    /// prefix/substring match, and a malformed entry in the slice matches nothing. The
+    /// last row is the shape `PamConfig::effective_refused_services` hands over.
     ///
-    /// The defect this catches: a matcher that returns true for any
-    /// participating call (the rename would be refused without being declared,
-    /// which is the negative control in `pam_logic`); one that compares
-    /// case-sensitively (`SSHD-RENAMED` would escape); one that prefix-matches
-    /// (`my-sshd` would be refused, silencing a local stack); and one that
-    /// lets an empty configured entry match.
+    /// The defect this catches: a matcher that returns true for any participating
+    /// call (the rename refused without being declared — the negative control in
+    /// `pam_logic`), a case-sensitive one (`SSHD-RENAMED` escapes), a prefix match
+    /// (`my-sshd` refused), and one that lets an empty configured entry match.
     #[test]
     fn configured_refused_services_match_only_declared_names() {
         let cases: &[(&str, &[&str], bool)] = &[
@@ -980,9 +928,8 @@ mod tests {
         assert!(!refused_service(None, &["sshd".to_owned()]));
     }
 
-    /// The mechanism a classification fixes, and — for the two conversations
-    /// that reach a plan — the plan for `tty`. `None` for a skip, which has no
-    /// mechanism and no deadline.
+    /// The mechanism a classification fixes, and — for the two conversations that
+    /// reach a plan — the plan for `tty`. `None` for a skip.
     fn mechanism_and_plan(
         classification: &Classification,
         tty: bool,
@@ -1002,22 +949,17 @@ mod tests {
 
     /// The refinement may add a skip and nothing else.
     ///
-    /// Walks the whole fixture corpus through `classify` and then `refine` with
-    /// the three configs that matter — the default, an empty configured list,
-    /// and a list naming every participating row's service — and asserts, per
-    /// row and per config:
+    /// Walks the whole corpus through `classify` and then `refine` with three configs —
+    /// the default, an empty list, and one naming every participating row's service —
+    /// and asserts per row and config: a skipped row stays skipped with its own rule
+    /// and policy; an unconfigured participating row comes back by value unchanged
+    /// (rule, conversation, class, hence the same deadline); a configured one becomes
+    /// R1's `Skip(RemoteAuthentication)`.
     ///
-    /// * a skipped row stays skipped, with its own rule and policy;
-    /// * a participating row whose service is *not* configured comes back by
-    ///   value unchanged (rule, conversation, class, hence the same deadline);
-    /// * a participating row whose service *is* configured becomes R1's
-    ///   `Skip(RemoteAuthentication)`, and nothing else changes policy.
-    ///
-    /// The defect this catches: a refinement that rebuilds the participation
-    /// — a different conversation (which moves the plan and the deadline), or
-    /// the same conversation with another rule or class, which only `run`'s
-    /// `debug_assert!` would see — one that "unrefuses" a skip, and one that
-    /// keys on the process name rather than the service.
+    /// The defect this catches: a refinement that rebuilds the participation — a
+    /// different conversation (moving the plan and the deadline), or the same
+    /// conversation with another class, which only `run`'s `debug_assert!` would see —
+    /// one that "unrefuses" a skip, and one keyed on the process name.
     #[test]
     fn refinement_cannot_change_a_participation() {
         let rows = rows();
@@ -1026,7 +968,9 @@ mod tests {
             .filter(|row| {
                 matches!(
                     row.expected_policy,
-                    Policy::Threaded | Policy::Sequential | Policy::PreCollected
+                    ExpectedPolicy::Threaded
+                        | ExpectedPolicy::Sequential
+                        | ExpectedPolicy::PreCollected
                 )
             })
             .filter_map(|row| row.service.clone())
@@ -1102,7 +1046,7 @@ mod tests {
                     flips[index] += 1;
                     assert_eq!(
                         after_policy,
-                        Policy::SkipRemote,
+                        ExpectedPolicy::SkipRemote,
                         "{label}: a configured service must be refused through R1's policy",
                     );
                     assert_eq!(
@@ -1134,34 +1078,38 @@ mod tests {
         );
     }
 
-    /// Moving a rule must move exactly the rows it should, by value, and leave
-    /// every other row where it was.
+    /// Moving a rule must move exactly the rows it should, by value, and leave every
+    /// other row where it was.
     ///
     /// Two load-bearing orderings:
-    /// * R2 after R8 — `swaylock_under_sddm` and `i3lock_under_gdm_login`
-    ///   become R8/pre-collected, because a process rule would then outrank the
-    ///   keyring constraint.
-    /// * R1 after R8 — `svc_sshd_under_swaylock` becomes R8/pre-collected,
-    ///   because R1 must precede the process rules.
+    /// * R2 after R8 — `swaylock_under_sddm` and `i3lock_under_gdm_login` become
+    ///   R8/pre-collected, because a process rule would then outrank the keyring
+    ///   constraint.
+    /// * R1 after R8 — `svc_sshd_under_swaylock` becomes R8/pre-collected, because R1
+    ///   must precede the process rules.
     ///
-    /// R1-after-R2 is deliberately *not* a case: R1 keys on the service names
-    /// `sshd`/`sshd-session` and R2 on the display-manager prefixes, so the two
-    /// predicates are disjoint and that swap changes no row at all — a vacuous
-    /// case, not a gate.
+    /// R1-after-R2 is deliberately *not* a case: their predicates are disjoint, so that
+    /// swap changes no row at all.
     #[test]
     fn rule_permutation_moves_named_rows() {
         assert_moved_rows(
             &reordered(RuleId::R2, RuleId::R8),
             &[
-                ("swaylock_under_sddm", (RuleId::R8, Policy::PreCollected)),
-                ("i3lock_under_gdm_login", (RuleId::R8, Policy::PreCollected)),
+                (
+                    "swaylock_under_sddm",
+                    (RuleId::R8, ExpectedPolicy::PreCollected),
+                ),
+                (
+                    "i3lock_under_gdm_login",
+                    (RuleId::R8, ExpectedPolicy::PreCollected),
+                ),
             ],
         );
         assert_moved_rows(
             &reordered(RuleId::R1, RuleId::R8),
             &[(
                 "svc_sshd_under_swaylock",
-                (RuleId::R8, Policy::PreCollected),
+                (RuleId::R8, ExpectedPolicy::PreCollected),
             )],
         );
     }
@@ -1178,7 +1126,7 @@ mod tests {
         rules
     }
 
-    fn classify_with(ordered: &[&'static Rule], ctx: &CallerContext) -> (RuleId, Policy) {
+    fn classify_with(ordered: &[&'static Rule], ctx: &CallerContext) -> (RuleId, ExpectedPolicy) {
         let rule = ordered
             .iter()
             .find(|rule| (rule.predicate)(ctx))
@@ -1188,7 +1136,7 @@ mod tests {
 
     /// Assert `changed` for the named rows and "unchanged from `RULES`" for every
     /// other corpus row.
-    fn assert_moved_rows(ordered: &[&'static Rule], changed: &[(&str, (RuleId, Policy))]) {
+    fn assert_moved_rows(ordered: &[&'static Rule], changed: &[(&str, (RuleId, ExpectedPolicy))]) {
         let rows = rows();
         for (id, _) in changed {
             assert!(
@@ -1250,13 +1198,12 @@ mod tests {
         assert_eq!(classify(&null), (RuleId::R10, DEFAULT_SEQUENTIAL));
     }
 
-    /// The symbol `line` declares, as `(keyword, name)`, or `None` when the
-    /// line declares nothing.
+    /// The symbol `line` declares, as `(keyword, name)`, or `None` when the line
+    /// declares nothing.
     ///
-    /// A doc comment is never a declaration, whatever words it uses, and a
-    /// citation into the decision record is only meaningful when it lands on
-    /// the declaration it claims: the drift this distinguishes is a doc comment
-    /// or a closing brace sitting where a predicate used to be.
+    /// A doc comment is never a declaration, whatever words it uses: the drift this
+    /// distinguishes is a doc comment or a closing brace sitting where a predicate
+    /// used to be.
     fn declared_symbol(line: &str) -> Option<(&'static str, &str)> {
         const DECLARATIONS: [&str; 7] = ["fn", "const", "static", "type", "struct", "enum", "mod"];
         let trimmed = line.trim_start();
@@ -1278,14 +1225,13 @@ mod tests {
         None
     }
 
-    /// Why a `policy/table.rs` citation does not name the symbol this row
-    /// declares there, or `None` when it does.
+    /// Why a `policy/table.rs` citation does not name the symbol this row declares
+    /// there, or `None` when it does.
     ///
-    /// `fn <rule name>` is the row's own predicate, which is what every row
-    /// cites; any other `fn` is a different row's predicate reached by a shift.
-    /// A citation to some other table declaration (`const`, `struct`, …) is
-    /// accepted as long as it lands on a declaration, but never on a doc
-    /// comment, a brace or a bare expression.
+    /// `fn <rule name>` is the row's own predicate, which is what every row cites; any
+    /// other `fn` is a different row's predicate reached by a shift. A citation to
+    /// some other table declaration (`const`, `struct`, …) is accepted as long as it
+    /// lands on a declaration.
     fn table_citation_problem(
         rule_name: &str,
         citation: &str,
@@ -1307,18 +1253,13 @@ mod tests {
         }
     }
 
-    /// Every `evidence` citation of the audit record resolves in this tree, and
-    /// the scan reports which files it checked so a relocated or emptied record
-    /// cannot pass silently. Entries marked `external:` cite a specification or
-    /// an out-of-tree program and are exempt.
+    /// Every `evidence` citation of the audit record resolves in this tree, and the scan
+    /// reports which files it checked so a relocated or emptied record cannot pass
+    /// silently. Entries marked `external:` are exempt.
     ///
-    /// The record is test-only (`policy/table.rs`, `audit`), so this test is the
-    /// whole of its consumption: the citations live nowhere else. A citation
-    /// into `policy/table.rs` must land on the declaration it claims, not merely
-    /// on a non-blank line: the row's own predicate citation must hit
-    /// `fn <rule name>`, and any other table citation must at least hit a
-    /// declaration ([`table_citation_problem`]). The plant-and-revert control at
-    /// the end is what keeps the strengthening honest.
+    /// A citation into `policy/table.rs` must land on the declaration it claims, not
+    /// merely on a non-blank line ([`table_citation_problem`]). The plant-and-revert
+    /// control at the end is what keeps the strengthening honest.
     #[test]
     fn evidence_citations_resolve() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1388,11 +1329,10 @@ mod tests {
             }
         }
 
-        // Positive control: plant one line of drift under R6's own citation in
-        // an in-memory copy of the decision record and observe the strengthened
-        // check reject it, then revert the plant and observe it accept again.
-        // Without the plant, everything above would also pass a check that
-        // accepted any non-blank line.
+        // Positive control: plant one line of drift under R6's own citation in an
+        // in-memory copy of the record, observe the strengthened check reject it, then
+        // revert and observe it accept again. Without the plant, a check that accepted
+        // any non-blank line would pass too.
         let r6 = audit(RuleId::R6);
         let citation = r6
             .evidence

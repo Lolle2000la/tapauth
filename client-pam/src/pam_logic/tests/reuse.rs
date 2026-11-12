@@ -1,19 +1,13 @@
-//! The 500 ms reuse corpus, driven through the real record the module writes
-//! and reads.
+//! The 500 ms reuse corpus: the window, its `(username, service)` key, and the two gates that
+//! decide what may be recorded.
 //!
-//! The verdict-reuse record: the 500 ms window, its `(username, service)` key,
-//! and the two gates that decide what may be recorded.
-//!
-//! Every case drives the real `conclusion_cache::record` /
-//! `conclusion_cache::replay_for`
-//! pair, so the assertions are about the record `authenticate` writes and reads
-//! and not about a parallel copy of its logic; each case holds
-//! `conclusion_cache::CACHE_SLOT_LOCK` for its whole body, because the record is one
-//! slot for the process.
+//! Every case drives the real `conclusion_cache::record` / `conclusion_cache::replay_for` pair,
+//! so the assertions are about the record `authenticate` writes and reads and not about a
+//! parallel copy of its logic. Each case holds `conclusion_cache::CACHE_SLOT_LOCK` for its
+//! whole body, because the record is one slot for the process.
 
-// `super::super` is `pam_logic` itself: the names these cases share with the
-// module that records (`Outcome`, `ServiceName`, …) come from its imports, as
-// they did when this corpus lived in the same file.
+// `super::super` is `pam_logic` itself: the names these cases share with the module that
+// records (`Outcome`, `ServiceName`, …) come from its imports.
 use super::super::*;
 use crate::conclusion_cache::{record, replay_for};
 use crate::outcome::{DenyVia, UnavailableReason};
@@ -23,10 +17,8 @@ use std::time::{Duration, Instant};
 
 const SERVICE: &str = "tapauth-test";
 
-/// The three verdicts these tests replay: a grant, an unavailable service
-/// and an explicit denial. They are the three the daemon can reach, and the
-/// record stores the verdict itself now, so a replay cannot re-enter the
-/// code path.
+/// The three verdicts these tests replay: a grant, an unavailable service and an explicit
+/// denial — the three the daemon can reach.
 fn granted() -> Outcome {
     Outcome::granted_from_daemon()
 }
@@ -41,9 +33,8 @@ fn denied() -> Outcome {
 
 /// The mechanism exit a recorded verdict arrives as.
 ///
-/// `Armed::conclude` takes a `MechanismEnd` now — a mechanism never mints an
-/// `Outcome` — so a test that records one of the three verdicts the daemon
-/// can reach has to name the exit that produces it.
+/// `Armed::conclude` takes a `MechanismEnd` — a mechanism never mints an `Outcome` — so a test
+/// that records one of the three verdicts has to name the exit that produces it.
 fn end_of(outcome: &Outcome) -> crate::mechanism::MechanismEnd {
     use crate::mechanism::MechanismEnd;
     match outcome {
@@ -71,9 +62,9 @@ fn slot() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Record `outcome` for `(user, service)` as if it had concluded `ms_ago`,
-/// through the same `Armed` — conclude — record path `authenticate` uses,
-/// and hand back the instant the lookup should use.
+/// Record `outcome` for `(user, service)` as if it had concluded `ms_ago`, through the same
+/// `Armed` — conclude — record path `authenticate` uses, and hand back the instant the lookup
+/// should use.
 fn record_ago(ms_ago: u64, user: &str, service: Option<&str>, outcome: Outcome) -> Instant {
     let now = Instant::now();
     let concluded = crate::transaction::armed_for_test(NullIpc, "reuse-test-request").conclude(
@@ -87,8 +78,8 @@ fn record_ago(ms_ago: u64, user: &str, service: Option<&str>, outcome: Outcome) 
 
 /// The verdict a lookup returns for `(user, service)` at `now`.
 ///
-/// A hit is `Outcome::replayed(..)` of what was recorded: the marker is the
-/// provenance this step adds, and `record` is what refuses it.
+/// A hit is `Outcome::replayed(..)` of what was recorded: the marker is the provenance this
+/// step adds, and `record` is what refuses it.
 fn replayable(user: &str, service: &str, now: Instant) -> Option<Outcome> {
     replay_for(user, service, now).map(|concluded| concluded.outcome().clone())
 }
@@ -211,18 +202,16 @@ fn recording_a_failure_replaces_the_cached_success() {
     );
 }
 
-/// A connect failure says nothing about the phone, so it must leave the
-/// process-wide record unarmed — and a retry must therefore be able to start
-/// a real transaction instead of replaying a verdict that never existed.
+/// A connect failure says nothing about the phone, so it must leave the process-wide record
+/// unarmed — and a retry must therefore be able to start a real transaction instead of
+/// replaying a verdict that never existed.
 ///
-/// The key is unique to this test: the record is process-wide and other
-/// tests in this module write to it in parallel.
+/// The key is unique to this test: the record is process-wide and other tests in this module
+/// write to it in parallel.
 ///
-/// Not covered here: a *caller* that records before opening a request —
-/// `record` takes a `Concluded` by value and `Armed::conclude` is its only
-/// fresh producer, so that shape is a move error rather than something a
-/// test has to look for. `armed_requires_both_connect_and_send` covers the
-/// arming itself.
+/// Not covered here: a *caller* that records before opening a request — `record` takes a
+/// `Concluded` by value and `Armed::conclude` is its only fresh producer, so that shape is a
+/// move error rather than something a test has to look for.
 #[test]
 fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
     let _slot = slot();
@@ -247,8 +236,8 @@ fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
          phone ever being asked"
     );
 
-    // The retry: with nothing recorded it must dial again and arm a real
-    // transaction, whose conclusion *is* recorded.
+    // The retry: with nothing recorded it must dial again and arm a real transaction, whose
+    // conclusion *is* recorded.
     let Ok(armed) = Armed::<NullIpc>::open(
         &mut || Ok(NullIpc),
         &mut |_: &mut NullIpc| Ok(()),
@@ -274,8 +263,8 @@ fn a_failed_connect_records_nothing_and_the_retry_dials_again() {
     );
 }
 
-/// A verdict replayed from the record must not be recorded again: that would
-/// refresh the timestamp and turn the fixed 500 ms window into a sliding one.
+/// A verdict replayed from the record must not be recorded again: that would refresh the
+/// timestamp and turn the fixed 500 ms window into a sliding one.
 #[test]
 fn a_from_cache_verdict_is_not_recorded() {
     let _slot = slot();
@@ -291,9 +280,9 @@ fn a_from_cache_verdict_is_not_recorded() {
     );
     record(recorded, now);
 
-    // A replay carrying a *different* verdict, recorded again on purpose: if
-    // `record` accepted it, the slot would hold the grant instead of the
-    // denial and the assertion below would see it.
+    // A replay carrying a *different* verdict, recorded again on purpose: if `record` accepted
+    // it, the slot would hold the grant instead of the denial and the assertion below would see
+    // it.
     let replay = Concluded::replay(granted(), USER.into(), ServiceName::new(UNIQUE_SERVICE));
     assert_eq!(record(replay, now), Outcome::replayed(&granted()));
     assert_eq!(
@@ -304,8 +293,8 @@ fn a_from_cache_verdict_is_not_recorded() {
     );
 }
 
-/// An unresolved service is never cached: the empty string would collapse
-/// every such call into one key.
+/// An unresolved service is never cached: the empty string would collapse every such call into
+/// one key.
 #[test]
 fn an_unresolved_service_is_not_recorded() {
     let _slot = slot();
@@ -335,9 +324,8 @@ fn a_future_timestamp_does_not_panic() {
             Some(ServiceName::new(SERVICE)),
         );
     record(recorded, now + Duration::from_millis(50));
-    // `saturating_duration_since` reads a clock anomaly as "no time has
-    // passed", so the conclusion still counts as fresh.  The point of the
-    // test is that it must not panic.
+    // `saturating_duration_since` reads a clock anomaly as "no time has passed", so the
+    // conclusion still counts as fresh. The point of the test is that it must not panic.
     assert_eq!(
         replayable("alice", SERVICE, now),
         Some(Outcome::replayed(&unavailable())),

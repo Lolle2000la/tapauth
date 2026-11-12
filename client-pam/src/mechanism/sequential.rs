@@ -1,34 +1,21 @@
 //! The sequential conversation: the host's own event loop owns the dialogue, so
 //! this module only waits for the daemon on the calling thread.
 //!
-//! Such a host typically implements the conversation as a synchronous
-//! round-trip that can only be answered by the event loop running on the very
-//! thread that called `pam_authenticate` (kscreenlocker ≤ 6.7, for instance,
-//! posts the answer back to that thread). For those hosts:
+//! These hosts answer the conversation synchronously on the thread that called
+//! `pam_authenticate` (kscreenlocker ≤ 6.7 posts the answer back to that
+//! thread), so two things are forbidden here: collecting the password from a
+//! worker thread deadlocks, because the reply is queued for an event loop that
+//! cannot run while it waits; and `pthread_cancel`-ing that thread as the
+//! threaded flow does would force-unwind through the host's non-Rust frames,
+//! which can `abort()` the host and take the lock screen down with it. So no
+//! query is sent and no input is read: the module blocks on the daemon socket,
+//! returns, and lets the PAM stack fall through to the password module, whose
+//! own conversation then runs on the host's terms. Nothing is consumed here, so
+//! a typed password only counts once the *following* module prompts for it,
+//! after the (shorter) GUI timeout — which is why `pam_gui_timeout_secs` exists.
 //!
-//! 1. collecting the password from a background thread deadlocks: the
-//!    conversation reply is queued for the blocked host event loop and can
-//!    never be dispatched, so password entry stops working entirely, and
-//! 2. `pthread_cancel`-ing that background thread (as the threaded flow does)
-//!    would force-unwind through the host's non-Rust frames, which can
-//!    `abort()` the host process and take the lock screen down with it.
-//!
-//! The safe pattern is to never drive the conversation from this thread: no
-//! query is sent and no input is read, and the conversation is not touched at
-//! all while the module waits. It blocks on the daemon IPC socket on the
-//! calling thread, returns the result, and lets the PAM stack fall through to
-//! the password module afterwards (whose own conversation then runs on the
-//! host's terms). The one exception is a single non-blocking `PAM_TEXT_INFO`
-//! announcement emitted immediately before this module is entered: it carries
-//! no input and hosts need it in order to reveal their password entry. Because
-//! nothing is consumed here, a typed password only counts once the *following*
-//! module prompts for it, after the (shorter) GUI timeout — which is why
-//! `pam_gui_timeout_secs` exists.
-//!
-//! This module emits nothing and names no conversation type: it never touches
-//! `pam_conv`, so a host whose conversation is broken still cannot change the
-//! verdict. It returns a [`MechanismEnd`], and the injected `cancel` closure is
-//! the only way it can ask for a cancellation.
+//! It never touches `pam_conv` and emits nothing, so a broken host conversation
+//! cannot change the verdict. Its only outgoing act is the injected `cancel`.
 //!
 //! # One loop, one profile
 //!
@@ -40,20 +27,18 @@
 //! remove, so the difference is data ([`Profile`]) and the order is written once:
 //!
 //! 1. the deadline first, at the top of every iteration;
-//! 2. one `poll` over `[ipc]` or `[ipc, tty]`, with the IPC fd always index 0;
+//! 2. one `poll` over `[ipc]` or `[ipc, tty]`, the IPC fd always index 0;
 //! 3. EINTR swallowed, every other poll error a profile decision;
-//! 4. `revents` tested before `read`, and a readable IPC socket decoded before
+//! 4. `revents` before `read`, and a readable IPC socket decoded before
 //!    `POLLHUP`/`POLLERR` is interpreted ("POLLIN can arrive with POLLHUP");
-//! 5. the IPC fd examined before the tty;
-//! 6. the conversation untouched — no `pam_conv`, no message;
-//! 7. only `Armed::conclude` mints an outcome, so the profile selects a
-//!    *reason*, never a code;
-//! 8. no client-side cancel on timeout, on either path: the daemon holds the
-//!    same deadline and multicasts its own cancel;
-//! 9. cancellation is a property of the exit — the tty Enter skip (`tty-skip`)
-//!    and the no-tty IPC error (`gui-ipc-error`) — through the injected
-//!    `cancel` closure, which production wires to a *fresh* short-timeout
-//!    connection.
+//! 5. the IPC fd before the tty, and the conversation untouched (no `pam_conv`);
+//! 6. only `Armed::conclude` mints an outcome: a profile selects a *reason*,
+//!    never a code;
+//! 7. no client-side cancel on timeout — the daemon holds the same deadline and
+//!    multicasts its own;
+//! 8. cancellation is a property of the exit (`tty-skip`, `gui-ipc-error`)
+//!    through the injected `cancel` closure, which production wires to a
+//!    *fresh* short-timeout connection.
 
 use super::{IpcFault, MechanismEnd};
 use crate::ipc_client::IpcResponseReader;
@@ -67,24 +52,24 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
-/// Everything that differs between the terminal and no-terminal paths.
+/// Everything that differs between the terminal and no-terminal shapes.
 ///
 /// The loop reads it; nothing else in the module branches on the tty.
 struct Profile {
     /// The probe's file; `None` ⇒ the no-terminal shape.
     tty: Option<File>,
-    /// How an IPC failure is named.
+    /// The mapping policy for an IPC failure.
     ipc_failure: IpcFailureMap,
-    /// Whether a non-EINTR `poll` error ends the wait (no-terminal) or is logged
-    /// while the terminal shape keeps waiting.
+    /// A non-`EINTR` `poll` error ends the wait on the no-terminal shape and is
+    /// only logged on the terminal one.
     poll_error_stops: bool,
 }
 
-/// Which reason set an IPC failure maps to.
+/// The mapping policy: which reason set an IPC failure maps to.
 ///
-/// `Collapse` is today's no-terminal loop: hangup, `Ok(None)` plus a hangup, a
+/// `Collapse` is the no-terminal shape: hangup, `Ok(None)` plus a hangup, a
 /// decode error and a poll error are all one `IpcError`, shown as an error, with
-/// a `gui-ipc-error` cancel. `Distinguish` is today's terminal loop: a hangup is
+/// a `gui-ipc-error` cancel. `Distinguish` is the terminal shape: a hangup is
 /// `IpcConnectionLost`, a decode error `IpcLoopError`, a poll error is logged
 /// and the loop continues, and nothing is cancelled.
 #[derive(Clone, Copy)]
@@ -93,7 +78,7 @@ enum IpcFailureMap {
     Distinguish,
 }
 
-/// Which event produced the IPC failure, for the profiles that distinguish them.
+/// The observed event, for the profiles that distinguish them.
 #[derive(Clone, Copy)]
 enum IpcFailure {
     /// The peer closed the connection, with or without a partial frame.
@@ -105,12 +90,8 @@ enum IpcFailure {
 }
 
 impl Profile {
-    /// The profile the plan and the probe produce.
-    ///
     /// `plan.tty_use` is the single source of "does this shape poll a terminal",
-    /// so the branch is not a second copy of the conversation test. The `File` is
-    /// data: `run` only probes when the plan says `PollForKey`, and drops it
-    /// otherwise.
+    /// so the branch is not a second copy of the conversation test.
     fn of(plan: &Plan, tty: Option<File>) -> Profile {
         match plan.tty_use {
             TtyUse::PollForKey => Profile {
@@ -129,10 +110,9 @@ impl Profile {
 
 /// Wait for the daemon in the shape the plan chose.
 ///
-/// `tty` is the file `run`'s probe produced and it is `Some` exactly when the
-/// plan says `PollForKey`. The plan itself is not otherwise read: `run` already
-/// resolved it into `deadline_at`, so the clamp keeps its single site and this
-/// module never sees the configuration.
+/// `tty` is the file `run`'s probe produced, `Some` exactly when the plan says
+/// `PollForKey`; the plan is otherwise unread because `run` already resolved it
+/// into `deadline_at`, so the clamp keeps its single site.
 pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     armed: &mut Armed<T>,
     plan: &Plan,
@@ -152,20 +132,13 @@ pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     )
 }
 
-/// The `poll` the loop calls, as a value.
-///
-/// It is a parameter rather than a direct call so the non-`EINTR` error cell —
-/// which the profiles answer differently — can be reached from a test with a
-/// mock. Production passes exactly [`nix::poll::poll`] (through
-/// [`production_poll`], which only widens its `c_int` count to `usize`); the
-/// error is forwarded unchanged, so the loop's mapping is unaffected.
+/// The `poll` the loop calls, as a value: a parameter so a test can reach the
+/// non-`EINTR` error cell, which production (through [`production_poll`]) does
+/// not.
 type PollFn = fn(&mut [PollFd<'_>], PollTimeout) -> Result<usize, nix::errno::Errno>;
 
-/// [`nix::poll::poll`] behind the seam's signature.
-///
-/// The only difference is the ready-count type: `poll` answers `c_int`, and on
-/// success that value is never negative, so the widening is exact. The
-/// `Err(Errno)` arm is passed through untouched — no errno is translated here.
+/// [`nix::poll::poll`] behind the seam: on success its `c_int` count is never
+/// negative, so the widening is exact; the `Err` arm is passed through untouched.
 fn production_poll(
     fds: &mut [PollFd<'_>],
     timeout: PollTimeout,
@@ -197,10 +170,9 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
     let mut poll_tty = profile.tty.is_some();
     let mut kb = [0u8; 4];
     loop {
-        // (1) The deadline first, at the top of every iteration. No
-        // client-side cancel: the daemon runs on the same deadline and
-        // multicasts its own AuthenticationCancel, so a cancel here would be a
-        // second message for a decision the daemon already made.
+        // (1) The deadline first, at the top of every iteration. No client-side
+        // cancel: the daemon runs on the same deadline and multicasts its own
+        // AuthenticationCancel, so a cancel here would be a second message.
         let now = Instant::now();
         if now >= deadline_at {
             return MechanismEnd::Reason(UnavailableReason::TimedOut);
@@ -210,9 +182,10 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
             .unwrap_or(Duration::ZERO);
         let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
 
-        // (2) One poll, the IPC fd always at index 0. The second slot is a
-        // placeholder until a tty is polled, so the slice never carries an
-        // invalid descriptor.
+        // (2) One poll, the IPC fd always index 0; the second slot is a placeholder
+        // until a tty is polled, so the slice never carries an invalid descriptor.
+        // SAFETY: `Armed` owns this reader (the live `IpcClient` in production),
+        // so its fd stays open as long as the loop borrows it.
         let ipc_fd = unsafe { BorrowedFd::borrow_raw(ipc.fd()) };
         let mut fds = [
             PollFd::new(ipc_fd, PollFlags::POLLIN),
@@ -220,6 +193,8 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
         ];
         if poll_tty {
             if let Some(tty) = profile.tty.as_ref() {
+                // SAFETY: `profile.tty` owns the `File`, which outlives every
+                // poll of this `BorrowedFd`.
                 fds[1] = PollFd::new(
                     unsafe { BorrowedFd::borrow_raw(tty.as_raw_fd()) },
                     PollFlags::POLLIN,
@@ -284,8 +259,7 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
                     }
                 }
 
-                // The tty: read one byte; Enter skips, any other key is
-                // consumed and discarded.
+                // The tty: read one byte; Enter skips, anything else is dropped.
                 if poll_tty {
                     if let Some(rev) = fds[1].revents() {
                         if rev.contains(PollFlags::POLLIN) {
@@ -295,13 +269,10 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
                                         let b = kb[0];
                                         if b == b'\n' || b == b'\r' {
                                             tracing::info!("User pressed Enter to skip");
-                                            // The request may still be in
-                                            // flight daemon-side, so the phone
-                                            // would keep buzzing: cancel
-                                            // through the injected seam (a fresh
-                                            // short-timeout connection in
-                                            // production, because the live fd is
-                                            // not the one the user gave up on).
+                                            // The request may still be in flight
+                                            // daemon-side, so cancel through the
+                                            // injected seam (a fresh connection in
+                                            // production, not the fd given up on).
                                             cancel("tty-skip", request_id);
                                             return MechanismEnd::Reason(
                                                 UnavailableReason::Skipped,
@@ -315,6 +286,8 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
                                         poll_tty = false;
                                     }
                                     Ok(_) => {
+                                        // The target is one byte, so `read` cannot
+                                        // report more than 1.
                                         unreachable!("read into 1-byte buffer cannot exceed 1")
                                     }
                                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -329,8 +302,7 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
                     }
                 }
             }
-            // (3) EINTR is swallowed; every other poll error is a profile
-            // decision.
+            // (3) EINTR is swallowed; every other poll error is a profile decision.
             Err(e) => {
                 if e != nix::errno::Errno::EINTR {
                     tracing::warn!("poll error: {}", e);
@@ -350,12 +322,9 @@ fn run_loop<T: IpcResponseReader, X: Fn(&str, &str)>(
 
 /// The one mapping from an IPC failure to the module's exit.
 ///
-/// `Collapse` names every failure `IpcError` and cancels with `gui-ipc-error`;
-/// the live fd is precisely the one that just failed, so production's fresh
-/// connection is what makes the cancel reach the daemon at all. `Distinguish`
-/// keeps the hangup/loop-error split and sends no cancel: a terminal host has
-/// already stopped waiting, and adding a message there would be a new network
-/// act on a path this refactor preserves.
+/// `Collapse` names every failure `IpcError` and cancels with `gui-ipc-error` on
+/// production's *fresh* connection, the live fd being the one that just failed.
+/// `Distinguish` keeps the hangup/loop-error split and sends no cancel.
 fn ipc_failure<X: Fn(&str, &str)>(
     map: IpcFailureMap,
     request_id: &str,
@@ -370,12 +339,9 @@ fn ipc_failure<X: Fn(&str, &str)>(
         IpcFailureMap::Distinguish => MechanismEnd::Reason(match kind {
             IpcFailure::Hangup => IpcFault::Hangup.reason(),
             IpcFailure::DecodeError => IpcFault::DecodeError.reason(),
-            // A non-EINTR poll error only reaches this function on the
-            // collapsing profile (`poll_error_stops`), so this arm is
-            // unreachable; it is not a panic path because a shipped `cdylib`
-            // compiles panics out. It is also the arm that keeps the poll-error
-            // cell local instead of in `IpcFault`: the threaded loop answers the
-            // same event with `IpcLoopError`.
+            // `Profile::of` pairs `poll_error_stops` with `Collapse` alone, so
+            // `Distinguish` never receives this event; the arm exists because
+            // the two arguments are independent.
             IpcFailure::PollError => UnavailableReason::IpcConnectionLost,
         }),
     }
@@ -398,16 +364,13 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
-    /// The request id every case drives, so a cancel log reads as
-    /// `"<reason>:<id>"`.
+    /// The request id every case drives, so a cancel log reads `<reason>:<id>`.
     const RID: &str = "sequential-loop-request";
 
     struct MockIpcReader {
         stream: UnixStream,
-        /// The far end, held open for the cases that need an *idle* socket: a
-        /// dropped peer would make the descriptor report `POLLHUP`, which is a
-        /// different cell of the mapping than "no data yet". Never read — the
-        /// field exists to keep the descriptor open.
+        /// The far end: held open so an idle socket does not report `POLLHUP`,
+        /// which is a different cell of the mapping than "no data yet".
         _peer: Option<UnixStream>,
         next_response:
             Option<Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error>>,
@@ -521,9 +484,8 @@ mod tests {
         Instant::now() + Duration::from_secs(5)
     }
 
-    /// Drive the one loop with a caller-supplied `poll`, so the non-`EINTR`
-    /// error cell can be reached. Production never takes this path: `drive`
-    /// always passes `production_poll` (`nix::poll::poll`).
+    /// Drive the one loop with a caller-supplied `poll`, which production never
+    /// does: `drive` always passes `production_poll`.
     fn run_loop_recording(
         ipc: MockIpcReader,
         tty: Option<File>,
@@ -547,9 +509,8 @@ mod tests {
         (end, log.into_inner())
     }
 
-    // How many times the mock `poll` below ran on this thread. Thread-local, so
-    // the two poll-error cases share one mock without racing each other or any
-    // other test in this binary.
+    // How many times the mock `poll` below ran on this thread; thread-local, so
+    // the two poll-error cases cannot race each other.
     thread_local! {
         static POLL_CALLS: Cell<usize> = const { Cell::new(0) };
     }
@@ -562,10 +523,9 @@ mod tests {
         POLL_CALLS.with(|calls| calls.set(0));
     }
 
-    /// A `poll` that always fails with `EIO` — an error that is *not* `EINTR`,
-    /// so it reaches the profile decision instead of being swallowed. The 1 ms
-    /// pause keeps the continuing profile at about a hundred iterations over the
-    /// 100 ms deadline rather than a hot spin.
+    /// A `poll` that always fails with `EIO`, an error that is not `EINTR`, so it
+    /// reaches the profile decision. The 1 ms pause keeps the continuing profile
+    /// at about a hundred iterations, not a hot spin.
     fn failing_poll(
         _fds: &mut [PollFd<'_>],
         _timeout: PollTimeout,
@@ -577,11 +537,8 @@ mod tests {
 
     /// Enter skips; every other key is consumed and the wait continues.
     ///
-    /// The defect this catches: a merged loop that treats *any* readable tty as
-    /// the skip (so a keystroke ends the authentication), or one that forgets
-    /// `\r` — the two keys a terminal maps Enter to. The `Ok(1)` arm is where
-    /// both live, and the positive half (`\n`, `\r` skip) makes the negative
-    /// half (`a` does not) meaningful.
+    /// The defect this catches: a loop that treats *any* readable tty as the
+    /// skip, or one that forgets `\r`, the other key a terminal maps Enter to.
     #[test]
     fn enter_skips_other_keys_do_not() {
         // A non-Enter key is consumed: the loop keeps waiting until the deadline.
@@ -609,12 +566,8 @@ mod tests {
         }
     }
 
-    /// The no-terminal shape ends at its deadline.
-    ///
-    /// Same scenario and same assertion as the pre-merge `S1`
-    /// (`test_sequential_loop_immediate_timeout`), retargeted onto the one loop:
-    /// the exit is a `MechanismEnd` now, not a loop-local exit code, because the
-    /// loop no longer reports a reason the caller maps.
+    /// The no-terminal shape ends at its deadline, as a `MechanismEnd` the
+    /// caller concludes with.
     #[test]
     fn test_sequential_loop_immediate_timeout() {
         let expired = Instant::now() - Duration::from_secs(1);
@@ -627,9 +580,6 @@ mod tests {
     }
 
     /// The no-terminal shape returns the daemon's frame.
-    ///
-    /// Same scenario as the pre-merge `S2`
-    /// (`test_sequential_loop_receives_response`).
     #[test]
     fn test_sequential_loop_receives_response() {
         let mut expected = shared::ipc::pb::PamAuthenticateResponse::default();
@@ -648,9 +598,6 @@ mod tests {
     }
 
     /// The no-terminal shape collapses a bare hangup into `IpcError`.
-    ///
-    /// Same scenario as the pre-merge `S3`
-    /// (`test_sequential_loop_daemon_hangup`).
     #[test]
     fn test_sequential_loop_daemon_hangup() {
         let (end, cancelled) = drive_recording(MockIpcReader::hung_up(Ok(None)), None, later());
@@ -663,11 +610,9 @@ mod tests {
 
     /// A tty at EOF stops being polled; the daemon socket keeps being waited on.
     ///
-    /// The defect this catches: a merged loop that turns a tty EOF, read error
-    /// or hangup into the call's exit (an `IpcConnectionLost` or an error) — the
-    /// terminal shape must instead drop the tty from the poll set and let the
-    /// daemon answer, because the host may simply have closed the terminal
-    /// while the phone was still being asked.
+    /// The defect this catches: a loop that turns a tty EOF, read error or hangup
+    /// into the call's exit instead of dropping the tty from the poll set — the
+    /// host may have closed the terminal while the phone was still being asked.
     #[test]
     fn tty_eof_stops_polling_not_waiting() {
         // EOF with an idle daemon: the deadline still ends the wait, and the
@@ -699,11 +644,9 @@ mod tests {
 
     /// The deadline ends the wait without a cancel, on both shapes.
     ///
-    /// The defect this catches: a merged loop that copies the *skip* path's
-    /// cancel onto the timeout path. The daemon holds the same deadline and
-    /// multicasts its own cancel, so a client cancel there is a second message
-    /// for a decision already made — and on the no-terminal shape it would be a
-    /// fresh connection opened for nothing.
+    /// The defect this catches: a loop that copies the *skip* path's cancel onto
+    /// the timeout path, a second message for a decision the daemon already made
+    /// — and on the no-terminal shape a fresh connection opened for nothing.
     #[test]
     fn timeout_does_not_cancel() {
         let expired = Instant::now() - Duration::from_secs(1);
@@ -724,10 +667,8 @@ mod tests {
     /// A readable socket that closes with a partial frame is a hangup.
     ///
     /// The defect this catches: the "read data first" rule applied one step too
-    /// far — a loop that sees POLLIN, reads `Ok(None)` and retries, instead of
-    /// treating the `POLLHUP` in the same `revents` as the terminal shape's
-    /// `connection_lost`. It is the cell that differs from the no-tty shape,
-    /// which collapses the same event into `IpcError`.
+    /// far — a loop that sees POLLIN, reads `Ok(None)` and retries instead of
+    /// treating the `POLLHUP` in the same `revents` as a hangup.
     #[test]
     fn partial_frame_with_hangup_is_connection_lost() {
         // A partial frame (fewer than the four length bytes) followed by the
@@ -761,10 +702,8 @@ mod tests {
     /// the other.
     ///
     /// The defect this catches: one reason for both shapes, which changes the
-    /// message *and* its style (the collapsing path shows `communication_error`
-    /// as an error, the terminal path shows it as information) — and the
-    /// missing cancel on the collapsing path, where the request is still in
-    /// flight daemon-side.
+    /// message *and* its style — and the missing cancel on the collapsing path,
+    /// where the request is still in flight daemon-side.
     #[test]
     fn read_error_maps_to_ipc_error() {
         let boom = || std::io::Error::other("read failed");
@@ -790,10 +729,9 @@ mod tests {
 
     /// The Enter skip cancels with `tty-skip` and nothing else.
     ///
-    /// The defect this catches: the skip returning without a cancel, so the
-    /// phone keeps buzzing until the daemon's own deadline for a request the
-    /// user already abandoned — or a skip that cancels with the IPC-error
-    /// reason, which would be a different event in the daemon's log.
+    /// The defect this catches: the skip returning without a cancel, so the phone
+    /// keeps buzzing for a request the user already abandoned, or one that
+    /// cancels with the IPC-error reason, a different event in the daemon's log.
     #[test]
     fn skip_cancels_with_tty_skip() {
         let (tty, write_end) = tty_pipe();
@@ -814,10 +752,8 @@ mod tests {
     /// An IPC failure cancels only on the no-terminal shape.
     ///
     /// The defect this catches: the asymmetry "fixed" in either direction — a
-    /// merged loop that cancels on both (a new network message on the terminal
-    /// path, which today sends none) or on neither (the phone keeps buzzing on
-    /// the no-terminal shape). The two halves run the *same* event so only the
-    /// profile differs.
+    /// loop that cancels on both (a new network message on the terminal path) or
+    /// on neither (the phone keeps buzzing on the no-terminal shape).
     #[test]
     fn ipc_error_cancels_only_without_tty() {
         let (tty, write_end) = tty_pipe();
@@ -851,10 +787,9 @@ mod tests {
     /// A non-`EINTR` `poll` error ends the no-terminal wait at once.
     ///
     /// The defect this catches: the `Collapse` half of the poll-error cell
-    /// (`Profile::poll_error_stops`) ignored — a loop that logs the error and
-    /// keeps polling, so a broken IPC socket waits out the whole GUI timeout
-    /// while the phone keeps buzzing instead of being cancelled immediately. The
-    /// call count is the other half: the loop must *end*, not retry.
+    /// ignored — a loop that logs the error and keeps polling, so a broken socket
+    /// waits out the whole GUI timeout while the phone keeps buzzing. The call
+    /// count is the other half: the loop must *end*, not retry.
     #[test]
     fn poll_error_stops_the_no_terminal_wait() {
         reset_poll_calls();
@@ -878,20 +813,18 @@ mod tests {
 
     /// The same error on the terminal profile is logged and the wait continues.
     ///
-    /// The defect this catches: the `Distinguish` half of the cell — a merged
-    /// loop that treats a non-`EINTR` poll error as an IPC failure on the
-    /// terminal shape too, ending the call with `IpcConnectionLost` (a different
-    /// message and style) for a transient error it must simply retry. The call
-    /// count is what distinguishes "continue" from "return a reason": one
-    /// iteration would mean the loop ended on the first error.
+    /// The defect this catches: the `Distinguish` half of the cell — a loop that
+    /// treats a non-`EINTR` poll error as an IPC failure on the terminal shape
+    /// too, ending the call with `IpcConnectionLost` for a transient error it
+    /// must simply retry. More than one call is what separates "continue" from
+    /// "return a reason".
     #[test]
     fn poll_error_is_logged_and_the_terminal_wait_continues() {
         reset_poll_calls();
         let (tty, write_end) = tty_pipe();
         // A 500 ms budget, not `shortly()`'s 100 ms: under high parallelism a
-        // scheduling stall of a few tens of ms could otherwise end the wait
-        // before the loop's second poll, failing the `> 1` assertion below for a
-        // reason unrelated to the behaviour under test.
+        // scheduling stall could otherwise end the wait before the loop's second
+        // poll and fail the `> 1` assertion for an unrelated reason.
         let (end, cancelled) = run_loop_recording(
             MockIpcReader::idle(),
             Some(tty),

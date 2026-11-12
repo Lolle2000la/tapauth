@@ -1,6 +1,6 @@
-//! The transaction's own behaviour: the armed→concluded state machine, the
-//! pre-arm IPC failures and their notices, the reuse replay, and the
-//! announcements' order. Declared (and allowed) by `transaction/mod.rs`.
+//! The transaction's own behaviour: the armed→concluded state machine, the pre-arm IPC failures
+//! and their notices, the reuse replay, and the announcements' order. Declared (and allowed) by
+//! `transaction/mod.rs`.
 
 use super::*;
 use crate::conclusion_cache::tests::take_slot;
@@ -17,8 +17,7 @@ use std::fs::File;
 use std::os::raw::{c_char, c_int};
 use std::time::Instant;
 
-/// The crate's transport double: an `IpcResponseReader` that carries nothing,
-/// enough to satisfy the transport bound for a path that never uses it.
+/// The crate's transport double: a reader that carries nothing, for paths that never use it.
 pub(crate) struct NullIpc;
 
 impl IpcResponseReader for NullIpc {
@@ -47,12 +46,10 @@ fn concluded(outcome: Outcome, via: Via) -> Concluded {
 }
 
 // ------------------------------------------------------------------
-// Driving `run`: the harness the moved tests share. No test opens a
-// daemon socket.
+// The harness the `run` tests share. No test opens a daemon socket.
 // ------------------------------------------------------------------
 
-/// A connect that fails the way a missing socket does, for the paths whose
-/// call counts are the assertion.
+/// A connect that fails the way a missing socket does, where call counts are the assertion.
 pub(crate) fn no_daemon() -> IpcError {
     IpcError::Io(std::io::Error::new(
         std::io::ErrorKind::ConnectionRefused,
@@ -67,9 +64,7 @@ fn success_end() -> MechanismEnd {
     MechanismEnd::Response(resp)
 }
 
-/// Timeouts of zero, so a path that gets as far as the mechanism returns
-/// without waiting: these tests assert call counts and orderings, not
-/// waiting.
+/// Timeouts of zero: these tests assert call counts and orderings, not waiting.
 fn zero_timeouts() -> PamConfig {
     PamConfig {
         pam_operation_timeout_secs: 0,
@@ -87,11 +82,7 @@ fn context(service: Option<&str>, process: Option<&str>) -> CallerContext {
     CallerContext::from_parts(service, process, crate::context::GdmReauth::Absent)
 }
 
-/// The participation `classify` produces for `ctx`.
-///
-/// `run` is downstream of the policy — it receives a participation and never
-/// re-branches on identity — so a test that drives `run` directly has to
-/// name the one the context classifies to.
+/// The participation `classify` produces for `ctx`, since `run` never re-branches on identity.
 fn participation_for(ctx: &CallerContext) -> Participation {
     match crate::policy::classify(ctx).1 {
         crate::policy::Classification::Participate(participation) => participation,
@@ -101,17 +92,14 @@ fn participation_for(ctx: &CallerContext) -> Participation {
     }
 }
 
-/// A handoff reader that reads nothing, for the tests whose paths never
-/// reach the pre-collected handoff.
-///
-/// `skip_never_hands_off` injects a counting reader instead, which is where
-/// the read is the assertion.
+/// A handoff reader that reads nothing, for the tests whose paths never reach the pre-collected
+/// handoff.
 pub(crate) unsafe fn unused_authtok(_pamh: *mut PamHandle) -> (c_int, *const c_char) {
     (crate::pam_sys::PAM_SUCCESS, std::ptr::null())
 }
 
-/// Drive `run` with a context, a tty probe and the two injected IPC effects,
-/// and report its result plus how many times the probe ran.
+/// Drive `run` with a context, a tty probe and the two injected IPC effects, and report its
+/// result plus how many times the probe ran.
 fn run_with_probe<T: IpcResponseReader>(
     ctx: &CallerContext,
     tty: Option<&str>,
@@ -142,8 +130,8 @@ fn run_with_probe<T: IpcResponseReader>(
     (finished, probes)
 }
 
-/// Record `outcome` for `(username, service)` at `at`, through the same
-/// `Armed`-conclude-record path `authenticate` uses.
+/// Record `outcome` for `(username, service)` at `at`, through the same `Armed`-conclude-record
+/// path `authenticate` uses.
 pub(crate) fn record_conclusion(username: &str, service: &str, outcome: Outcome, at: Instant) {
     let end = match outcome {
         Outcome::Granted(_) => success_end(),
@@ -158,14 +146,12 @@ pub(crate) fn record_conclusion(username: &str, service: &str, outcome: Outcome,
     let _ = record(concluded, at);
 }
 
-/// Both arms report the verdict they carry, and a `Concluded` keeps its
-/// provenance.
+/// Both arms report the verdict they carry, and a `Concluded` keeps its provenance.
 ///
-/// The defect this catches: a `Finished` accessor that reads only one arm
-/// (so a caller mapping `outcome()` would silently turn an unrecorded
-/// connect failure into something else), and a provenance field that cannot
-/// distinguish a fresh conclusion from a replay — which is what `record`
-/// refuses.
+/// The defect this catches: a `Finished` accessor that reads only one arm (so a caller mapping
+/// `outcome()` would silently turn an unrecorded connect failure into something else), and a
+/// provenance field that cannot distinguish a fresh conclusion from a replay — which is what
+/// `record` refuses.
 #[test]
 fn finished_reports_its_outcome_and_provenance() {
     let grant = Outcome::granted_from_daemon();
@@ -198,12 +184,10 @@ fn finished_reports_its_outcome_and_provenance() {
 
 /// An `Armed` exists only when the connect *and* the send succeeded.
 ///
-/// The defect this catches: a failed `send` (or a failed `connect`) still
-/// yielding an `Armed`, which would let the caller record a conclusion the
-/// daemon never had a chance to reach and answer the duplicate from it. The
-/// assertion is on the arm, not on "is an error": a `connect` failure
-/// reported as `Send` would send `communication_error` where `cannot_connect`
-/// belongs.
+/// The defect this catches: a failed `send` (or a failed `connect`) still yielding an `Armed`,
+/// which would let the caller record a conclusion the daemon never had a chance to reach and
+/// answer the duplicate from it. The assertion is on the arm, not on "is an error": a `connect`
+/// failure reported as `Send` would send `communication_error` where `cannot_connect` belongs.
 #[test]
 fn armed_requires_both_connect_and_send() {
     let mut refused = || {
@@ -259,12 +243,11 @@ fn armed_requires_both_connect_and_send() {
 
 /// A replayed conclusion shows no message.
 ///
-/// The defect this catches: `notice` on a replayed grant or denial returning
-/// the phone-tap text, so a cache hit either re-shows `auth_successful` /
-/// `auth_denied` (a duplicate the user never made) or, worse, re-enters the
-/// emission path with a verdict the daemon already answered. The
-/// total-emission rule reaches `notice` on a replay, so this is what keeps
-/// the cache hit silent.
+/// The defect this catches: `notice` on a replayed grant or denial returning the phone-tap
+/// text, so a cache hit either re-shows `auth_successful` / `auth_denied` (a duplicate the user
+/// never made) or, worse, re-enters the emission path with a verdict the daemon already
+/// answered. The total-emission rule reaches `notice` on a replay, so this is what keeps the
+/// cache hit silent.
 #[test]
 fn replay_notice_is_silent() {
     let msgs = crate::pam_messages::PamMessages::new("en");
@@ -294,9 +277,8 @@ fn replay_notice_is_silent() {
          answer a duplicate the user never made"
     );
 
-    // The control: the same verdicts, not replayed, do have their messages,
-    // so the assertion above is about the replay marker and not about the
-    // message being missing for these codes.
+    // The control: the same verdicts, not replayed, do have their messages, so the assertion
+    // above is about the replay marker and not about the message being missing for these codes.
     assert!(
         Outcome::granted_from_daemon().notice(&msgs).is_some(),
         "a fresh grant shows auth_successful"
@@ -310,17 +292,15 @@ fn replay_notice_is_silent() {
 }
 
 // ------------------------------------------------------------------
-// The transaction's own behaviour, moved with `run` when the mechanisms
-// became modules. Assertions unchanged.
+// The tty probe, the pre-arm failures and the reuse record.
 // ------------------------------------------------------------------
 
 /// `/dev/tty` is opened once, and only for the conversation that polls it.
 ///
-/// The defect this catches: the probe moved to the top of `run` (or gated on
-/// `conversation == Sequential` a second time, next to the plan), so a
-/// threaded host polls the terminal and steals the stdin its own dialog
-/// needs — or a plan maker and the probe disagree about whether a terminal
-/// exists.
+/// The defect this catches: the probe moved to the top of `run` (or gated on `conversation ==
+/// Sequential` a second time, next to the plan), so a threaded host polls the terminal and
+/// steals the stdin its own dialog needs — or a plan maker and the probe disagree about whether
+/// a terminal exists.
 #[test]
 fn tty_probe_only_for_sequential() {
     let threaded = context(Some("probe-threaded"), Some("hyprlock"));
@@ -365,17 +345,15 @@ fn tty_probe_only_for_sequential() {
 
 /// A duplicate answered from the reuse record does not open `/dev/tty`.
 ///
-/// The defect this catches: the probe left *before* the reuse lookup, where
-/// it used to be, so every hit opened the terminal for a transaction it
-/// never starts. The recorded conclusion is a success, so the returned code
-/// also proves the hit was taken rather than the probe merely being skipped
-/// on an early return.
+/// The defect this catches: the probe placed *before* the reuse lookup, so every hit opened the
+/// terminal for a transaction it never starts. The recorded conclusion is a success, so the
+/// returned code also proves the hit was taken rather than the probe merely being skipped on an
+/// early return.
 ///
-/// The reuse record is one process-wide slot that other tests in this binary
-/// also write, and the module's lookup happens after the injected
-/// `load_messages`, so the record is re-taken whenever a concurrent test
-/// replaced it. The assertion itself is never relaxed: it is only evaluated
-/// once a hit actually happened, which the returned code proves.
+/// The reuse record is one process-wide slot that other tests in this binary also write, and
+/// the module's lookup happens after the injected `load_messages`, so the record is re-taken
+/// whenever a concurrent test replaced it. The assertion itself is never relaxed: it is only
+/// evaluated once a hit actually happened, which the returned code proves.
 #[test]
 fn cache_hit_does_not_open_tty() {
     let _slot = take_slot();
@@ -399,8 +377,8 @@ fn cache_hit_does_not_open_tty() {
             &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         if finished.outcome().clone().into_pam() != conclusion_code {
-            // A concurrent test replaced the single record before the
-            // lookup; nothing was proved about the ordering, so re-take it.
+            // A concurrent test replaced the single record before the lookup; nothing was
+            // proved about the ordering, so re-take it.
             continue;
         }
         assert_eq!(
@@ -415,17 +393,14 @@ fn cache_hit_does_not_open_tty() {
     );
 }
 
-/// The two pre-arm IPC failures *emit* their own message, and neither is
-/// recorded.
+/// The two pre-arm IPC failures *emit* their own message, and neither is recorded.
 ///
-/// The defect this catches: the `host.emit` call deleted from the
-/// connect-failure or send-failure return, so the user is told nothing on
-/// the one path where the daemon could not be reached at all — and a
-/// restructure that emitted only inside the `Concluded` arm, which leaves
-/// both of these `Unrecorded` and silent. It also pins the mapping: a
-/// connect failure reported as `DaemonSendFailed` would show
-/// `communication_error` where `cannot_connect` belongs. The recorded
-/// emission is the assertion, not `notice(&msgs)` re-derived in the test,
+/// The defect this catches: the `host.emit` call deleted from the connect-failure or
+/// send-failure return, so the user is told nothing on the one path where the daemon could not
+/// be reached at all — and a restructure that emitted only inside the `Concluded` arm, which
+/// leaves both of these `Unrecorded` and silent. It also pins the mapping: a connect failure
+/// reported as `DaemonSendFailed` would show `communication_error` where `cannot_connect`
+/// belongs. The recorded emission is the assertion, not `notice(&msgs)` re-derived in the test,
 /// because a re-derived notice passes with every `emit` call deleted.
 #[test]
 fn unrecorded_paths_emit_their_notice() {
@@ -489,11 +464,10 @@ fn unrecorded_paths_emit_their_notice() {
 
 /// A duplicate answered from the record is a `Via::Replay` conclusion.
 ///
-/// The defect this catches: a cache hit reported as `Via::Daemon`, which
-/// `record` accepts — so the duplicate would re-record the verdict and turn
-/// the fixed 500 ms window into a sliding one — and a replay that keeps the
-/// original provenance, which re-emits the message the first call already
-/// showed.
+/// The defect this catches: a cache hit reported as `Via::Daemon`, which `record` accepts — so
+/// the duplicate would re-record the verdict and turn the fixed 500 ms window into a sliding
+/// one — and a replay that keeps the original provenance, which re-emits the message the first
+/// call already showed.
 #[test]
 fn a_cache_hit_is_a_replay_conclusion() {
     let _slot = take_slot();
@@ -517,8 +491,8 @@ fn a_cache_hit_is_a_replay_conclusion() {
         );
 
         let Finished::Concluded(concluded) = finished else {
-            // A concurrent test replaced the single record before the
-            // lookup; nothing was proved about the provenance.
+            // A concurrent test replaced the single record before the lookup; nothing was
+            // proved about the provenance.
             continue;
         };
         assert_eq!(
@@ -531,9 +505,8 @@ fn a_cache_hit_is_a_replay_conclusion() {
             &Outcome::replayed(&recorded),
             "a replay must carry the recorded verdict, marked as replayed"
         );
-        // The replay marker is what refuses the re-record (today's
-        // `from_cache`): recording the conclusion hands its verdict back
-        // and must leave the slot exactly as the first call recorded it.
+        // The replay marker is what refuses the re-record: recording the conclusion hands its
+        // verdict back and must leave the slot exactly as the first call recorded it.
         assert_eq!(
             crate::conclusion_cache::record(concluded, Instant::now()),
             Outcome::replayed(&recorded),
@@ -547,7 +520,7 @@ fn a_cache_hit_is_a_replay_conclusion() {
             )
             .map(|c| c.outcome().clone()),
             Some(Outcome::replayed(&recorded)),
-            "the slot must still hold the verdict the first call recorded, not                  the replay that tried to overwrite it"
+            "the slot must still hold the verdict the first call recorded, not the replay that tried to overwrite it"
         );
         return;
     }
@@ -557,16 +530,14 @@ fn a_cache_hit_is_a_replay_conclusion() {
     );
 }
 
-/// A replayed *failure* emits nothing, and its silence is a property of its
-/// provenance.
+/// A replayed *failure* emits nothing, and its silence is a property of its provenance.
 ///
-/// The defect this catches: the cache-hit return being silent only because
-/// it returns early, so a later restructure that emitted
-/// `outcome.notice(..)` on the way out re-shows `communication_error` for a
-/// duplicate the user never made. The recorded verdict is an unavailability
-/// that *does* have a message — `Outcome::replayed` keeps the reason — so
-/// the outcome alone cannot explain the silence: `Via::Replay` must, which
-/// is what [`finish`](super::host_io::finish) keys on.
+/// The defect this catches: the cache-hit return being silent only because it returns early, so
+/// a later restructure that emitted `outcome.notice(..)` on the way out re-shows
+/// `communication_error` for a duplicate the user never made. The recorded verdict is an
+/// unavailability that *does* have a message — `Outcome::replayed` keeps the reason — so the
+/// outcome alone cannot explain the silence: `Via::Replay` must, which is what
+/// [`finish`](super::host_io::finish) keys on.
 #[test]
 fn a_replayed_failure_emits_nothing() {
     let _slot = take_slot();
@@ -590,8 +561,8 @@ fn a_replayed_failure_emits_nothing() {
             &mut |_: &mut NullIpc, _: &SendParams<'_>| Ok(()),
         );
         let Finished::Concluded(concluded) = finished else {
-            // A concurrent test replaced the single record before the
-            // lookup; nothing was proved about the emission.
+            // A concurrent test replaced the single record before the lookup; nothing was
+            // proved about the emission.
             continue;
         };
         assert_eq!(
@@ -619,13 +590,10 @@ fn a_replayed_failure_emits_nothing() {
     );
 }
 // ------------------------------------------------------------------
-// The transaction's own ordering guarantees: the announcements and the
-// pre-collected arm.
+// The transaction's own ordering guarantees: the announcements and the pre-collected arm.
 // ------------------------------------------------------------------
 
-/// The marker `shown_order` puts in the log where the request went on the
-/// wire: one entry of the same log as the emissions, so its position is the
-/// request's position.
+/// The marker `shown_order` puts in the log at the point the request went on the wire.
 const OPEN_MARKER: &str = "Armed::open";
 
 /// A log entry that is not a message.
@@ -636,14 +604,13 @@ fn marker(text: &str) -> Emitted {
     }
 }
 
-/// What `run` showed, in order, with the point the request went on the wire
-/// marked, and how many times it asked for a cancellation.
+/// What `run` showed, in order, with the point the request went on the wire marked, and how
+/// many times it asked for a cancellation.
 ///
-/// The recording host is the only way an announcement can be observed
-/// without a real PAM handle; `send` runs inside `Armed::open`, so its mark
-/// is the request's position in the same log. The cancel count is what makes
-/// the `Effects` seam's last field observable: with the zero-second budget
-/// these tests use, no path reaches a cancel.
+/// The recording host is the only way an announcement can be observed without a real PAM
+/// handle, and `send` runs inside `Armed::open`, so its mark is the request's position in the
+/// same log. The cancel count makes the `Effects` seam's last field observable: with the
+/// zero-second budget these tests use, no path reaches a cancel.
 fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> (Vec<Emitted>, usize) {
     let msgs = PamMessages::new("en");
     let log: std::cell::RefCell<Vec<Emitted>> = std::cell::RefCell::new(Vec::new());
@@ -669,13 +636,11 @@ fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> (Vec<Emitted>, usize) 
     (log.into_inner(), cancels.get())
 }
 
-/// Drive `run` through a recording host with no terminal and report what it
-/// showed, in order.
+/// Drive `run` through a recording host with no terminal and report what it showed, in order.
 ///
-/// The transaction's own emissions are the assertion in the tests that use
-/// it, so a test can never re-derive the message from the outcome. The
-/// participation comes from `ctx`, so the path under test is the one
-/// `classify` really picks.
+/// The transaction's own emissions are the assertion in the tests that use it, so a test can
+/// never re-derive the message from the outcome. The participation comes from `ctx`, so the
+/// path under test is the one `classify` really picks.
 fn shown_while_running<T: IpcResponseReader>(
     ctx: &CallerContext,
     username: &str,
@@ -702,8 +667,7 @@ fn shown_while_running<T: IpcResponseReader>(
     (finished, log.into_inner())
 }
 
-/// The position of the message `needle` in `log`, which must appear exactly
-/// once.
+/// The position of the message `needle` in `log`, which must appear exactly once.
 fn once(log: &[Emitted], needle: &str) -> usize {
     let hits: Vec<usize> = log
         .iter()
@@ -721,16 +685,11 @@ fn once(log: &[Emitted], needle: &str) -> usize {
 
 /// The three announcements keep the ordering they have today.
 ///
-/// The defect this catches: `Wait`/`WaitSkipHint` emitted *after* the
-/// request — so a host whose conversation has to reveal the password entry
-/// before it can answer never sees the message in time — or
-/// `WaitThenPassword` emitted *before* it, which is the opposite failure on
-/// the one host shape that needs it after: an event-loop host must already
-/// be blocked when the message arrives, which is why today's code emits it
-/// between the send and the blocking wait. This replaces `S4`
-/// (`test_sequential_wait_is_announced_before_it_blocks`), which could only
-/// compare two source byte offsets and had to name a call that no longer
-/// exists.
+/// The defect this catches: `Wait`/`WaitSkipHint` emitted *after* the request — so a host whose
+/// conversation has to reveal the password entry before it can answer never sees the message in
+/// time — or `WaitThenPassword` emitted *before* it, which is the opposite failure on the one
+/// host shape that needs it after: an event-loop host must already be blocked when the message
+/// arrives.
 #[test]
 fn announcement_order_matches_today() {
     let msgs = PamMessages::new("en");
@@ -782,8 +741,8 @@ fn announcement_order_matches_today() {
     );
 }
 
-/// A reader whose socket is already hung up: `poll` reports it readable and
-/// at end-of-file, which is the no-terminal `gui-ipc-error` shape.
+/// A reader whose socket is already hung up: `poll` reports it readable and at end-of-file,
+/// which is the no-terminal `gui-ipc-error` shape.
 struct HangupIpc {
     stream: std::os::unix::net::UnixStream,
 }
@@ -805,8 +764,8 @@ impl IpcResponseReader for HangupIpc {
     fn try_read_response_nonblocking(
         &mut self,
     ) -> Result<Option<shared::ipc::pb::PamAuthenticateResponse>, std::io::Error> {
-        // A hung-up peer yields no frame: the loop's own `POLLHUP` handling is
-        // what classifies the event, so the reader never has to read.
+        // A hung-up peer yields no frame: the loop's own `POLLHUP` handling is what classifies
+        // the event, so the reader never has to read.
         Ok(None)
     }
 
@@ -815,15 +774,14 @@ impl IpcResponseReader for HangupIpc {
     }
 }
 
-/// The no-terminal IPC error cancels through the injected `Effects.cancel` seam
-/// exactly once, with its own reason.
+/// The no-terminal IPC error cancels through the injected `Effects.cancel` seam exactly once,
+/// with its own reason.
 ///
-/// The defect this catches: `run` handing the mechanism a different closure
-/// than `effects.cancel` — a local no-op, or a copy that is never invoked — so
-/// the phone keeps buzzing for a request the host already abandoned. Every
-/// other transaction test asserts `cancels == 0`, and a broken `run`→mechanism
-/// forwarding passes all of them; only a positive count proves the seam is
-/// wired. The assertion is on the effect `run` was given, never on the
+/// The defect this catches: `run` handing the mechanism a different closure than
+/// `effects.cancel` — a local no-op, or a copy that is never invoked — so the phone keeps
+/// buzzing for a request the host already abandoned. Every other transaction test asserts
+/// `cancels == 0`, and a broken `run`→mechanism forwarding passes all of them; only a positive
+/// count proves the seam is wired. The assertion is on the effect `run` was given, never on the
 /// mechanism's own test double.
 #[test]
 fn gui_ipc_error_cancels_through_the_effects_seam() {
@@ -896,12 +854,11 @@ fn gui_ipc_error_cancels_through_the_effects_seam() {
 
 /// A pre-collected participation neither probes nor plans.
 ///
-/// The defect this catches: the handoff placed after the probe, the cache
-/// lookup or the request — which would open `/dev/tty` for a host that never
-/// uses it, consult the reuse record for a transaction that never happened,
-/// or, worst, ring the phone for a user who already chose the password
-/// route. The probe would return a terminal here, so a probe count of zero
-/// is a real assertion rather than a check that the file was missing.
+/// The defect this catches: the handoff placed after the probe, the cache lookup or the request
+/// — which would open `/dev/tty` for a host that never uses it, consult the reuse record for a
+/// transaction that never happened, or, worst, ring the phone for a user who already chose the
+/// password route. The probe would return a terminal here, so a probe count of zero is a real
+/// assertion rather than a check that the file was missing.
 #[test]
 fn precollected_never_plans() {
     let ctx = context(Some("swaylock"), Some("swaylock"));

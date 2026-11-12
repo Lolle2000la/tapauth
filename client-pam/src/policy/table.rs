@@ -1,16 +1,5 @@
-//! The decision record: `RULES`, one row per host, and its audit record.
-//!
-//! What the rules *are*. A row carries the class it was authored against (the
-//! failure direction it protects), its predicate and its decision; the taxonomy
-//! those values are written in lives in the parent module, and the first-match
-//! engine that walks this table lives there too.
-//!
-//! The human-readable half — each rule's symbolic name, the sentence saying why
-//! it exists, and the in-tree evidence for the behaviour it preserves — is the
-//! audit record at the bottom of this file, compiled only for tests. No string
-//! in it is read by the shipped binary, so the table needs no lint exemption;
-//! the policy tests read the record for name uniqueness, corpus coverage and
-//! citation resolution.
+//! The decision record: `RULES`, one row per host, plus the test-only audit
+//! record that names each rule and cites the evidence for it.
 
 use crate::context::{CallerContext, ProcessIdentity};
 
@@ -18,13 +7,8 @@ use super::{
     Classification, Conversation, Decision, FailureDirection, Participation, RuleId, SkipPolicy,
 };
 
-/// One row of the table: everything the shipped binary reads.
-///
-/// The id `classify` returns next to the classification, the class that lands
-/// on the participation, the predicate the engine walks, and the decision it
-/// converts. The row's justification is the audit record (`audit`, at the
-/// bottom of this file), which is compiled only for tests; a field nothing but
-/// the tests read does not belong in the shipped table.
+/// One row of the table: the id `classify` reports, the class that lands on the
+/// participation, the predicate the engine walks, and the decision it converts.
 pub(super) struct Rule {
     pub(crate) id: RuleId,
     pub(crate) class: FailureDirection,
@@ -36,6 +20,20 @@ pub(super) struct Rule {
 /// call is refused whatever its process or service is), R2 precedes everything
 /// after it (the keyring constraint belongs to the service, not to the process),
 /// and R10 is last and unconditional.
+///
+/// Adding a host edits: a `Rule` row in `RULES`, whose length is the `[Rule; 10]` type;
+/// the predicate it names, with both its full and its `/proc/self/comm`-truncated
+/// (15-byte) spelling for a name that long; the `RuleId` variant, `RuleId::ALL` and
+/// `RuleId::as_str`; the `audit` arm, whose `evidence` cites
+/// `policy/table.rs:<line of fn ...>`; a `callers.csv` row with `expected_rule` and
+/// `expected_policy`; an `EXPECTED_TTY` entry only for a `threaded` or `sequential`
+/// row, since one for any other fails `corpus_characterises_the_decision_table`;
+/// its `(1..=10)` bound; and the key set in `rules_are_process_disjoint`, the one
+/// edit whose omission nothing fails loudly on. A service-keyed host (a display manager)
+/// is not a new `Rule`, only one `DM_PREFIXES` entry (bump `[&str; 13]`) plus one corpus
+/// row per prefix; an `e2e=1` row also needs `exe` set (the corpus reader fails a row
+/// without one) and a `case` arm in `scripts/ci/test-pam-conv-thread.sh`, which the Rust
+/// suite does not check.
 pub(super) static RULES: [Rule; 10] = [
     Rule {
         id: RuleId::R1,
@@ -99,30 +97,24 @@ pub(super) static RULES: [Rule; 10] = [
     },
 ];
 
-/// R10's result, and the value `classify` falls back to.
-///
-/// R10's predicate is `|_| true`, so `find` always returns and this value is
-/// unreachable; it exists so `classify` is total without a panic path
-/// (`clippy::panic` and `clippy::unwrap_used` are denied crate-wide).
-/// `unreachable_rule_rows` asserts it is exactly what the table's last row
-/// produces, so the two cannot drift.
+/// R10's result, and the value `classify` falls back to. R10's predicate is
+/// unconditional, so `find` always returns and this value is unreachable; it
+/// makes `classify` total without a panic path. `unreachable_rule_rows` asserts
+/// it is exactly what the table's last row produces, so the two cannot drift.
 pub(super) const DEFAULT_SEQUENTIAL: Classification = Classification::Participate(Participation {
     conversation: Conversation::Sequential,
     failure_direction: FailureDirection::DeadlockAvoidance,
 });
 
-/// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`).
+/// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`),
+/// compared ASCII case-insensitively: `PAM_SERVICE` is a `pam.d` filename, so a
+/// service literally named `SSHD` is sshd's stack whatever its spelling.
 ///
-/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default; `sshd-session` is
-/// the name its per-connection session binary uses on current releases. Both are
-/// a *default*, not a constant of the protocol: a deployment that renames the
-/// service falls through to R10, which is the documented false negative (see
-/// `svc_sshd_near_miss` in the corpus). A rename is declared by adding the new
-/// name to `pam_refused_services`; R1 itself keeps the built-ins.
-///
-/// The comparison is ASCII case-insensitive, because `PAM_SERVICE` is a
-/// `pam.d` filename and case folding here cannot over-match: a service literally
-/// named `SSHD` is sshd's stack whatever its spelling.
+/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default and `sshd-session`
+/// its per-connection session service. Both are defaults, not constants of the
+/// protocol: a deployment that renames the service falls through to R10 (the
+/// documented false negative, `svc_sshd_near_miss`) unless it declares the new
+/// name in `pam_refused_services`.
 const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
 
 /// R1 — refuse a remote authentication, keyed on the service name.
@@ -130,7 +122,7 @@ const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
 /// The module never reads `PAM_RHOST`: `sudo` sets it to the local hostname
 /// (`Defaults pam_rhost`), so a presence-only rule would silence the module on
 /// `sudo`. Keying on the service keeps the refusal to the stacks that exist to
-/// authenticate a remote peer. An unresolved service name never matches.
+/// authenticate a remote peer.
 fn remote_refuse(ctx: &CallerContext) -> bool {
     ctx.service().is_some_and(|service| {
         REMOTE_SERVICES
@@ -139,14 +131,11 @@ fn remote_refuse(ctx: &CallerContext) -> bool {
     })
 }
 
-/// The display-manager prefixes.
-///
-/// A service matches when its ASCII-lowercased name is a prefix exactly, or the
-/// prefix followed by a `-` boundary: `gdm`, `gdm3` and `gdm-password` qualify,
-/// `gdmfoo` does not. The match is `ServiceName::dm_prefixed`, and the folding
-/// is `to_ascii_lowercase` only — see
-/// [`ServiceName`](crate::context::ServiceName) — so U+212A KELVIN SIGN is
-/// *not* folded to `k`.
+/// The display-manager prefixes. A service matches when its ASCII-lowercased
+/// name is a prefix exactly, or the prefix followed by a `-` boundary: `gdm`,
+/// `gdm3` and `gdm-password` qualify, `gdmfoo` does not. The folding is
+/// `to_ascii_lowercase` only (`ServiceName::dm_prefixed`), so U+212A KELVIN
+/// SIGN is *not* folded to `k`.
 const DM_PREFIXES: [&str; 13] = [
     "sddm",
     "gdm",
@@ -164,9 +153,6 @@ const DM_PREFIXES: [&str; 13] = [
 ];
 
 /// R2 — the display-manager bypass, with the GDM reauthentication exemption.
-///
-/// The prefix match is `ServiceName::dm_prefixed`, reached only through
-/// `ctx.service()`, so an absent service never matches.
 fn dm_login_bypass(ctx: &CallerContext) -> bool {
     ctx.service()
         .is_some_and(|service| DM_PREFIXES.iter().any(|prefix| service.dm_prefixed(prefix)))
@@ -228,8 +214,7 @@ fn precollected_locks(ctx: &CallerContext) -> bool {
 /// R9 — polkit with an unreadable `/proc`.
 ///
 /// The service comparison is exact bytes, deliberately: `POLKIT-1` with an
-/// unreadable `/proc` stays sequential, which is the comparison this rule has
-/// always made.
+/// unreadable `/proc` stays sequential.
 fn polkit_service_without_proc(ctx: &CallerContext) -> bool {
     matches!(ctx.process(), ProcessIdentity::Unknown)
         && ctx.service().is_some_and(|service| service.is("polkit-1"))
@@ -241,18 +226,14 @@ fn default_sequential(_ctx: &CallerContext) -> bool {
 }
 
 /// One rule's audit record: its symbolic name, why it exists, and the in-tree
-/// evidence for the behaviour it preserves.
-///
-/// Test-only by construction, not by lint exemption. `Rule` used to carry
-/// `name` and `evidence` and needed `#[allow(dead_code)]` because the shipped
-/// binary reads neither; a record only the tests read is not production data,
-/// so it lives behind `cfg(test)` and the shipped table carries no escape.
+/// evidence for the behaviour it preserves. Test-only by construction: a record
+/// only the tests read is not production data, so the shipped table carries no
+/// `dead_code` exemption.
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) struct Audit {
-    /// The rule's symbolic name (`dm_login_bypass`, …). It must be the name of
-    /// the row's own predicate: `evidence_citations_resolve` requires the
-    /// row's `policy/table.rs` predicate citation to land on `fn <name>`.
+    /// The rule's symbolic name (`dm_login_bypass`, …), which must be the row's
+    /// own predicate: its citation has to land on `fn <name>`.
     pub(super) name: &'static str,
     /// Why the rule exists, in one sentence. The predicate's doc comment keeps
     /// the long form, including every accepted risk.
@@ -263,12 +244,10 @@ pub(super) struct Audit {
     pub(super) evidence: &'static [&'static str],
 }
 
-/// `id`'s audit record.
-///
-/// The `match` is exhaustive over `RuleId` with no wildcard, so a rule added to
-/// the enum does not compile until its audit record is written. The other
-/// direction — a record whose row was deleted from `RULES` — is
-/// `audit_covers_rules` (`policy/mod.rs`).
+/// `id`'s audit record. The `match` is exhaustive over `RuleId` with no wildcard,
+/// so a rule added to the enum does not compile until its record is written; the
+/// other direction — a record whose row was deleted from `RULES` — is
+/// `audit_covers_rules`.
 #[cfg(test)]
 pub(super) fn audit(id: RuleId) -> Audit {
     match id {
@@ -288,8 +267,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "the login manager has to populate `PAM_AUTHTOK` for the session \
                   keyring, and a grant without it is useless",
             evidence: &[
-                "client-pam/src/policy/table.rs:170",
-                "client-pam/src/outcome.rs:82",
+                "client-pam/src/policy/table.rs:156",
+                "client-pam/src/outcome.rs:59",
             ],
         },
         RuleId::R3 => Audit {
@@ -297,8 +276,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "a GDM reauthentication is driven by the session worker, whose \
                   conversation stays answerable while a worker thread waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:177",
-                "client-pam/src/context.rs:74",
+                "client-pam/src/policy/table.rs:163",
+                "client-pam/src/context.rs:80",
             ],
         },
         RuleId::R4 => Audit {
@@ -306,8 +285,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "polkit's agent helper feeds its conversation from a separate \
                   process, so it can be answered while the caller waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:188",
-                "client-pam/src/mechanism/threaded.rs:227",
+                "client-pam/src/policy/table.rs:174",
+                "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
         RuleId::R5 => Audit {
@@ -315,8 +294,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "kscreenlocker 6.8's worker answers on Qt's D-Bus daemon thread, so \
                   the conversation survives the calling thread blocking",
             evidence: &[
-                "client-pam/src/policy/table.rs:196",
-                "client-pam/src/mechanism/threaded.rs:191",
+                "client-pam/src/policy/table.rs:182",
+                "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
         RuleId::R6 => Audit {
@@ -324,8 +303,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "hyprlock answers from a worker thread; its unsynchronised \
                   `resetConversation`/`checkWaiting` race is the accepted risk",
             evidence: &[
-                "client-pam/src/policy/table.rs:208",
-                "client-pam/src/mechanism/threaded.rs:191",
+                "client-pam/src/policy/table.rs:194",
+                "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
         RuleId::R7 => Audit {
@@ -333,8 +312,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "xsecurelock's helper answers from its own thread pool, at the cost \
                   of up to three rings when `CallPAMWithRetries` re-runs the module",
             evidence: &[
-                "client-pam/src/policy/table.rs:216",
-                "client-pam/src/mechanism/threaded.rs:191",
+                "client-pam/src/policy/table.rs:202",
+                "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
         RuleId::R8 => Audit {
@@ -342,17 +321,17 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "these hosts collected the password before `pam_authenticate`, so \
                   the phone must not be rung and the token is handed on instead",
             evidence: &[
-                "client-pam/src/policy/table.rs:221",
-                "client-pam/src/mechanism/handoff.rs:31",
+                "client-pam/src/policy/table.rs:207",
+                "client-pam/src/mechanism/handoff.rs:25",
             ],
         },
         RuleId::R9 => Audit {
             name: "polkit_service_without_proc",
             why: "polkit with an unreadable `/proc` cannot be shown to answer \
-                  concurrently, so it keeps the historic threaded behaviour",
+                  concurrently, so it stays on the threaded conversation",
             evidence: &[
-                "client-pam/src/policy/table.rs:233",
-                "client-pam/src/context.rs:160",
+                "client-pam/src/policy/table.rs:218",
+                "client-pam/src/context.rs:164",
             ],
         },
         RuleId::R10 => Audit {
@@ -360,8 +339,8 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "every other caller is driven sequentially on the calling thread, \
                   which is slower but can never wedge the host's event loop",
             evidence: &[
-                "client-pam/src/policy/table.rs:239",
-                "client-pam/src/mechanism/threaded.rs:219",
+                "client-pam/src/policy/table.rs:224",
+                "client-pam/src/mechanism/sequential.rs:1",
             ],
         },
     }

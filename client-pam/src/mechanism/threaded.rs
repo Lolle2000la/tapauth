@@ -1,17 +1,10 @@
 //! The threaded conversation: a worker thread collects the password while the
 //! calling thread multiplexes the daemon socket and a self-pipe.
 //!
-//! Used for the hosts whose conversation stays answerable while the calling
-//! thread is blocked (see `policy`): blocking credential collection is offloaded
-//! to a native background thread so the host can process window events, and the
-//! main loop watches both the IPC socket and the self-pipe.
-//!
-//! This module owns both local-resource failures — `pipe2` and
-//! `pthread_create` — including their best-effort cancels, because they are the
-//! only errors a mechanism may report that are not about the daemon. It emits
-//! nothing: the loop records an [`UnavailableReason`] and the caller decides the
-//! text and the style, so this module holds no user-facing message and never
-//! opens the conversation.
+//! For the hosts whose conversation stays answerable while this thread blocks
+//! (see `policy`). This module owns both local-resource failures — `pipe2` and
+//! `pthread_create`, with their best-effort cancels, the only non-daemon errors a
+//! mechanism may report — and emits nothing: the caller decides the reason's text.
 
 use super::{IpcFault, MechanismEnd};
 use crate::ipc_client::IpcResponseReader;
@@ -24,38 +17,36 @@ use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Context passed to the raw POSIX worker thread.
-///
-/// # Safety
-///
-/// This lives on the main thread's stack.  The main thread strictly blocks on
-/// `pthread_join` before the context goes out of scope, so the worker thread's
-/// reference to it is valid for the entire worker lifetime.  No `Drop`-bearing
-/// types are placed on the worker's stack frame, making `pthread_cancel` safe.
+/// Context passed to the raw POSIX worker thread: it lives on the main thread's
+/// stack and is joined before that frame goes out of scope.
 struct ThreadContext {
     pamh: *mut pam_sys::PamHandle,
     password_entered: AtomicBool,
-    /// Write end of the self-pipe.  The worker writes a single byte here on
-    /// any exit path (success, failure, or dialog dismissal) to instantly
-    /// unblock the main loop's poll set.
+    /// Write end of the self-pipe: one byte on any exit unblocks the main loop.
     pipe_write_fd: std::os::raw::c_int,
 }
 
-/// Raw background worker using the `C-unwind` ABI so that glibc's forced
-/// stack unwinding (`abi::__forced_unwind`) triggered by `pthread_cancel`
-/// can pass through this frame without aborting the process.
+/// Raw background worker, `C-unwind` so glibc's forced unwind
+/// (`abi::__forced_unwind`) from `pthread_cancel` can pass through this frame
+/// without aborting the process. On natural completion it always writes the
+/// self-pipe; a cancel intercepts it inside `pam_get_authtok` and the write is
+/// bypassed. Nothing with a `Drop` lives on this frame, so that unwind is sound.
 ///
-/// Always writes to the self-pipe on natural completion.  When the thread
-/// is cancelled via `pthread_cancel`, the forced unwind intercepts
-/// execution inside `pam_get_authtok` and the write is cleanly bypassed.
+/// # Safety
+///
+/// `arg` must point to a `ThreadContext` that outlives this call: the main thread
+/// holds it and joins before its frame goes out of scope. Its `pipe_write_fd`
+/// must be an open write end owned by that thread until the join, and `pamh` must
+/// be the handle the conversation is running on.
 unsafe extern "C-unwind" fn native_password_worker(
     arg: *mut std::os::raw::c_void,
 ) -> *mut std::os::raw::c_void {
+    // SAFETY: `arg` points at the caller's `ThreadContext`, which it keeps alive
+    // until the join — see this function's `# Safety`.
     let ctx = unsafe { &*(arg as *const ThreadContext) };
     let mut authtok: *const std::os::raw::c_char = std::ptr::null();
 
-    // SAFETY: ctx is valid because the main thread guarantees it outlives
-    // this worker via pthread_join.
+    // SAFETY: `ctx.pamh` is the handle this conversation is running on.
     let res = unsafe {
         pam_sys::pam_get_authtok(
             ctx.pamh,
@@ -69,22 +60,16 @@ unsafe extern "C-unwind" fn native_password_worker(
         ctx.password_entered.store(true, Ordering::Release);
     }
 
-    // Unconditional write: notifies the main thread that the worker exited
-    // regardless of whether a password was collected or the dialog was
-    // cancelled.  Without this, cancel/poll-hang would force the full
-    // timeout.
-    //
-    // glibc's `write` is a cancellation point, so a `pthread_cancel` delivered
-    // inside it would throw `abi::__forced_unwind` through this call frame.
-    // `pam_get_authtok` above needs the `C-unwind` ABI for that, but the
-    // runtime `write` symbol must keep its canonical `extern "C"` signature:
-    // re-declaring it with a different ABI is what rustc's
-    // `invalid_runtime_symbol_definitions` rejects, and a mismatched runtime
-    // declaration risks UB.  Use the bare `write` syscall instead — the
-    // cancellation machinery lives in glibc's `write` wrapper, so the raw
-    // syscall is not a cancellation point and cannot unwind.
+    // Unconditional write: notifies the main thread that the worker exited,
+    // password or not, so a cancel cannot force the full timeout. The bare
+    // `write` syscall, not a `write` binding: glibc's wrapper is a cancellation
+    // point, so a cancel delivered inside it would unwind through this frame, and
+    // the `C-unwind` re-declaration that would need is what rustc's
+    // `invalid_runtime_symbol_definitions` rejects (and would be UB).
     let dummy: [u8; 1] = [1];
     loop {
+        // SAFETY: `ctx.pipe_write_fd` is an open write end owned by the main
+        // thread until the join, and `dummy` outlives this call.
         let written = unsafe {
             libc::syscall(
                 libc::SYS_write,
@@ -105,16 +90,13 @@ unsafe extern "C-unwind" fn native_password_worker(
     std::ptr::null_mut()
 }
 
-/// The worker entry point the spawn operation must accept.
-///
-/// `C-unwind` is what lets glibc's forced unwind (`abi::__forced_unwind`) from
-/// `pthread_cancel` pass through the worker frame without aborting.
+/// The worker entry point the spawn operation must accept: `C-unwind` is what
+/// lets glibc's forced unwind pass through the worker frame without aborting.
 type WorkerStart =
     unsafe extern "C-unwind" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
 
-// Custom FFI binding for pthread_create that accepts the correct
-// `extern "C-unwind"` function signature.  This avoids the undefined
-// behaviour of transmuting between C-unwind and C ABIs.
+// The hand-declared `pthread_create`, so a `C-unwind` start routine is passed
+// as-is: transmuting it to the `extern "C"` signature would be UB.
 extern "C" {
     #[link_name = "pthread_create"]
     fn pthread_create_unwind(
@@ -127,63 +109,52 @@ extern "C" {
 
 /// Cancel (optionally) and reap the native password worker.
 ///
-/// # Why the join is load-bearing
+/// The join is load-bearing twice over: `ThreadContext` lives on the caller's
+/// stack, so the worker must be gone before that frame is popped; and `pamh` is
+/// a plain, unlocked struct whose process-global libpam state (`caller_is`) the
+/// worker reads inside `pam_get_authtok`, so re-entering libpam — another `conv`
+/// call, a `pam_get_item`, the return from `pam_authenticate` — while it runs
+/// would race unsynchronised state. The join is what orders them, so it runs on
+/// every non-panicking path, including those where the worker has already exited.
 ///
-/// 1. Stack safety: `ThreadContext` lives on the caller's stack, so the worker
-///    must be gone before that frame is popped.
-/// 2. libpam ownership: `pamh` is a plain, unlocked struct and the libpam
-///    state the conversation depends on (`caller_is`) is process-global.  If
-///    the calling thread re-entered libpam — another `conv` call, a
-///    `pam_get_item`, or simply the return from `pam_authenticate` — while the
-///    worker could still be inside `pam_get_authtok`, the two would race on
-///    unsynchronised libpam state.  The join is what orders them, so it runs on
-///    every non-panicking path, including the ones where the worker is expected
-///    to have exited already.
-///
-/// A panic between the `pthread_create` and this join unwinds past the frame
-/// that holds `ThreadContext` without reaping the worker.  That pre-existing
-/// gap is not addressed by this change — closing it would need a drop guard —
-/// and `guard()` (`lib.rs`) only converts the panic into `PAM_AUTH_ERR`.
+/// A panic between `pthread_create` and this join unwinds past the frame holding
+/// `ThreadContext` without reaping the worker: a pre-existing gap that would need
+/// a drop guard, which `guard()` (`lib.rs`) does not close.
 ///
 /// # Safety
 ///
-/// `pthread_id` must be a live, joinable thread created by this module, and
+/// `pthread_id` must be the live, joinable thread created by [`drive_with`], and
 /// this must be its only join.
 unsafe fn cancel_and_join(pthread_id: libc::pthread_t, cancel: bool) {
-    // NOTE: pthread_cancel carries a theoretical risk of deadlocking the parent
-    // process if the cancellation signal arrives while the worker holds an
-    // internal libc lock (e.g. inside a malloc arena entered by
-    // pam_get_authtok).  This is an accepted architectural trade-off; fully
-    // isolating the conversation pipe would require a separate helper process,
-    // as Howdy does with its Python subprocess.
+    // NOTE: `pthread_cancel` can deadlock the host if the signal arrives while
+    // the worker holds an internal libc lock (a malloc arena entered inside
+    // `pam_get_authtok`, say). Accepted trade-off: isolating the conversation
+    // would need a helper process, as Howdy does.
     if cancel {
+        // SAFETY: the same live, joinable `pthread_id` the join below reaps.
         let cancel_res = unsafe { libc::pthread_cancel(pthread_id) };
-        // ESRCH is benign: the thread already exited naturally during a race
-        // between password entry and the phone tap response.
+        // ESRCH is benign: the thread exited naturally, racing the phone tap.
         if cancel_res != 0 && cancel_res != libc::ESRCH {
             let err = std::io::Error::from_raw_os_error(cancel_res);
             tracing::error!("pthread_cancel failed: {err}; worker may not have terminated");
         }
     }
 
-    // SAFETY: if pthread_join fails the worker thread may still be running with
-    // a dangling reference into the caller's stack frame.  Aborting is the only
+    // SAFETY: if `pthread_join` fails the worker may still be running with a
+    // dangling reference into the caller's stack frame; aborting is the only
     // safe response.
     let join_res = unsafe { libc::pthread_join(pthread_id, std::ptr::null_mut()) };
     if join_res != 0 {
         let err = std::io::Error::from_raw_os_error(join_res);
-        tracing::error!("pthread_join failed: {err}. Aborting to defend stack safety.");
+        tracing::error!(
+            "pthread_join failed: {err}; aborting because the worker must not outlive its \
+             stack frame"
+        );
         std::process::abort();
     }
 }
 
-/// Why the GUI event loop stopped waiting.
-///
-/// The loop's own exit set: it is threaded's vocabulary, exactly as
-/// `sequential`'s `IpcFailure` is that loop's, and the two are not shared. The
-/// variants are not verdicts — the caller maps them to an
-/// [`UnavailableReason`] (or returns the response the loop collected), which is
-/// where the message and its style come from.
+/// Why the GUI event loop stopped waiting: threaded's vocabulary, not a verdict.
 #[derive(Debug, PartialEq, Eq)]
 enum LoopExit {
     Timeout,
@@ -193,17 +164,9 @@ enum LoopExit {
     PasswordFailed,
 }
 
-/// Central event loop for the graphical authentication flow.
-///
-/// Polls the daemon IPC socket and the self-pipe simultaneously.  Returns a
-/// `LoopExit` plus whichever side-channel data was collected (the daemon
-/// response, or the reason the IPC side failed).  Extracted from the main
-/// authentication body so the multiplexing logic can be unit-tested
-/// independently.
-///
-/// The out-parameter is a *reason*, not a message: which text and which style
-/// the failure shows is decided once, by `Outcome::notice`, so the loop cannot
-/// pick a different string from the terminal loop for the same failure.
+/// Central event loop for the graphical authentication flow: it polls the daemon
+/// socket and the self-pipe together. The out-parameter is a *reason*, not a
+/// message, so the loop cannot pick a different string from the terminal loop.
 fn run_gui_event_loop<T: IpcResponseReader>(
     ipc: &mut T,
     pipe_read: libc::c_int,
@@ -223,6 +186,8 @@ fn run_gui_event_loop<T: IpcResponseReader>(
             .checked_duration_since(now)
             .unwrap_or(Duration::ZERO);
         let timeout = PollTimeout::try_from(remain).unwrap_or(PollTimeout::MAX);
+        // SAFETY: `Armed` owns this reader and `drive_with` owns the pipe until
+        // the join, so both fds outlive this poll set.
         let mut fds = [
             PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(ipc.fd()) },
@@ -237,18 +202,14 @@ fn run_gui_event_loop<T: IpcResponseReader>(
         match poll(&mut fds, timeout) {
             Ok(0) => continue,
             Ok(_) => {
-                // Priority: user password submission takes absolute
-                // precedence over any concurrent daemon response, so the
-                // user is never locked out of the password fallback.
+                // Priority: a submitted password beats any concurrent daemon
+                // response, so the user is never locked out of the fallback.
                 if ctx.password_entered.load(Ordering::Acquire) {
-                    tracing::info!(
-                        "Password entered via Polkit agent. Cancelling TapAuth transaction."
-                    );
+                    tracing::info!("Password submitted; cancelling the TapAuth wait.");
                     let _ = ipc.send_cancel("gui-password-skip", request_id);
                     return LoopExit::PasswordEntered;
                 }
 
-                // Daemon IPC connection
                 if let Some(rev) = fds[0].revents() {
                     if rev.contains(PollFlags::POLLIN) {
                         match ipc.try_read_response_nonblocking() {
@@ -281,11 +242,10 @@ fn run_gui_event_loop<T: IpcResponseReader>(
                     }
                 }
 
-                // Self-pipe: since password_entered was already checked,
-                // readability here means the dialog was dismissed.
+                // Self-pipe: `password_entered` was checked, so readable = dismissed.
                 if let Some(rev) = fds[1].revents() {
                     if rev.contains(PollFlags::POLLIN) {
-                        tracing::info!("Password dialog dismissed. Releasing transaction.");
+                        tracing::info!("Password dialog dismissed; cancelling the TapAuth wait.");
                         let _ = ipc.send_cancel("gui-password-failed", request_id);
                         return LoopExit::PasswordFailed;
                     }
@@ -294,11 +254,8 @@ fn run_gui_event_loop<T: IpcResponseReader>(
             Err(e) => {
                 if e != nix::errno::Errno::EINTR {
                     tracing::warn!("poll error: {e}");
-                    // This arm is threaded's alone: a poll error stops this loop
-                    // as an `IpcLoopError`, while the sequential loop logs it and
-                    // keeps waiting on the terminal shape and collapses it into
-                    // `IpcError` on the no-terminal one — so it is not part of
-                    // `IpcFault`'s shared pair.
+                    // Threaded's alone: a poll error stops this loop as an
+                    // `IpcLoopError`; sequential answers it per profile.
                     *pending = Some(UnavailableReason::IpcLoopError);
                     return LoopExit::IpcError;
                 }
@@ -310,15 +267,10 @@ fn run_gui_event_loop<T: IpcResponseReader>(
 /// The threaded GUI flow: a worker thread collects the password while the main
 /// thread multiplexes the daemon socket and a self-pipe.
 ///
-/// The plan is not read: `run` already resolved it into `deadline_at`, so the
-/// clamp keeps its single site and this module never sees the configuration. The PAM
-/// handle is here only because the password worker needs it — the loop emits
-/// nothing.
-///
-/// Returns a [`MechanismEnd`], never a code and never an outcome: the caller
-/// concludes with it. The two local-resource failures (`pipe2`,
-/// `pthread_create`) are the only errors it can report, and both cancel the
-/// in-flight request first.
+/// The plan is unread, arriving for uniformity alone (see `mechanism`); the PAM
+/// handle is here only because the password worker needs it. The two
+/// local-resource failures are the only errors it can report, and each cancels
+/// the in-flight request before returning.
 pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     armed: &mut Armed<T>,
     _plan: &Plan,
@@ -326,26 +278,26 @@ pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     pamh: *mut pam_sys::PamHandle,
     cancel: X,
 ) -> MechanismEnd {
-    // O_CLOEXEC prevents the pipe fds from leaking to child processes
-    // started by the long-running privileged host (sudo, gdm, polkitd).
+    // O_CLOEXEC keeps the pipe fds out of children the long-running privileged
+    // host starts (sudo, gdm, polkitd).
     drive_with(
         armed,
         deadline_at,
         pamh,
         cancel,
+        // SAFETY: `fds` is the two-element array `drive_with` owns; on success
+        // `pipe2` fills both entries with fds this process owns.
         |fds| unsafe { libc::pipe2(fds, libc::O_CLOEXEC) },
+        // SAFETY: `thread` points at `drive_with`'s `MaybeUninit` out-param, `attr`
+        // is null (defaults) and `arg` at the context it keeps alive until join.
         |thread, attr, start, arg| unsafe { pthread_create_unwind(thread, attr, start, arg) },
     )
 }
 
-/// [`drive`] with its two local-resource operations injected.
-///
-/// `make_pipe` and `spawn` are the real `libc::pipe2` and the hand-declared
-/// `pthread_create_unwind` in production; a test passes a failing one so each
-/// failure arm and its best-effort cancel are observable. The `cancel` closure
-/// is the same one the sequential mechanism uses — production wires both to
-/// `pam_logic::wiring::cancel_on_fresh_connection` — so the failure arms no
-/// longer open their own short-timeout connection.
+/// [`drive`] with its two local-resource operations injected: production passes
+/// `libc::pipe2` and `pthread_create_unwind`, a test a failing one so each arm
+/// and its best-effort cancel are observable. `cancel` is the seam the sequential
+/// mechanism uses too — one fresh shorter-timeout connection, never the live fd.
 fn drive_with<T, X>(
     armed: &mut Armed<T>,
     deadline_at: Instant,
@@ -382,12 +334,9 @@ where
         pipe_write_fd: pipe_write,
     };
 
-    // SAFETY: &ctx lives on this (the main) thread's stack.  All exit
-    // paths below unconditionally call pthread_join, which blocks until
-    // the worker has been fully reaped by the kernel.  Therefore the
-    // reference passed to the worker remains valid for its entire
-    // execution, regardless of whether the worker completes normally or
-    // is cancelled via pthread_cancel.
+    // SAFETY: `&ctx` lives on this (the main) thread's stack, and every exit path
+    // below joins the worker before that frame is popped, so the reference holds
+    // for the worker's whole life, cancelled or not.
     let mut pthread_id = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
 
     let spawn_res = spawn(
@@ -401,6 +350,8 @@ where
         let err = std::io::Error::from_raw_os_error(spawn_res);
         tracing::error!("Failed to create native password thread: {err}");
         cancel("gui-thread-spawn-fail", request_id);
+        // SAFETY: `pipe2` returned 0, so both fds are open and ours to close; no
+        // worker was spawned that could still use them.
         unsafe {
             libc::close(pipe_read);
             libc::close(pipe_write);
@@ -408,6 +359,7 @@ where
         return MechanismEnd::Error(ErrorReason::LocalResource);
     }
 
+    // SAFETY: the spawn returned 0, so it wrote the `pthread_id` out-param.
     let pthread_id = unsafe { pthread_id.assume_init() };
 
     let mut auth_response = None;
@@ -423,11 +375,11 @@ where
         &mut pending,
     );
 
-    // Cancel the worker if it hasn't already exited on its own, then always
-    // reap it (see `cancel_and_join` for why the join is load-bearing).
-    //
-    // Password entry and dialog dismissal both mean the worker has left
-    // `pam_get_authtok` on its own, so those paths skip the cancel.
+    // Cancel unless the worker left `pam_get_authtok` on its own (password
+    // entered, dialog dismissed), then always reap it — see `cancel_and_join`
+    // for why the join is load-bearing, and the closes for the pipe's owner.
+    // SAFETY: `pthread_id` is the thread just spawned and not yet joined, and the
+    // two fds are the ones `pipe2` filled; the join happens before this returns.
     unsafe {
         cancel_and_join(
             pthread_id,
@@ -442,23 +394,19 @@ where
         return MechanismEnd::Response(resp);
     }
 
-    // No response, so the service could not be consulted. The reason comes
-    // from the exit: the user chose the password (`PasswordEntered`, which
-    // leaves the token cached by `pam_get_authtok` for the next module),
-    // dismissed the dialog (`PasswordFailed`), the daemon went quiet
-    // (`Timeout`) or the IPC layer failed (`IpcError`, with the reason the
-    // loop recorded). Every one of them is `PAM_AUTHINFO_UNAVAIL`: on a
-    // `sufficient` line that is `ignore`, and on a `required` line a real
-    // failure — never `PAM_IGNORE`, which records no failure at all.
+    // No response, so the service could not be consulted. Every exit is
+    // `PAM_AUTHINFO_UNAVAIL` — on a `sufficient` line that is `ignore`, on a
+    // `required` line a real failure, and never `PAM_IGNORE`, which records no
+    // failure at all. `PasswordEntered` leaves `pam_get_authtok`'s token cached
+    // for the next module.
     MechanismEnd::Reason(match exit_reason {
         LoopExit::PasswordEntered => UnavailableReason::PasswordChosen,
         LoopExit::PasswordFailed => UnavailableReason::PasswordDismissed,
         LoopExit::Timeout => UnavailableReason::TimedOut,
         _ => match pending {
             Some(reason) => reason,
-            // An `IpcError` always records its reason, so this arm is
-            // unreachable; it is not a panic path because a shipped
-            // `cdylib` compiles panics out.
+            // Every `IpcError` return from the loop records its reason, so this
+            // arm cannot be reached; it answers a reason rather than panicking.
             None => UnavailableReason::ProtocolError,
         },
     })
@@ -740,10 +688,9 @@ mod join_tests {
         pipe_read: libc::c_int,
     }
 
-    /// Blocks in `read(2)` — a cancellation point, just like
-    /// `pam_get_authtok` — so `cancel_and_join` can only return promptly by
-    /// actually cancelling the thread.  `C-unwind` lets glibc's
-    /// `abi::__forced_unwind` pass through this frame.
+    /// Blocks in `read(2)`, a cancellation point like `pam_get_authtok`, so
+    /// `cancel_and_join` can only return promptly by cancelling the thread;
+    /// `C-unwind` lets glibc's forced unwind pass through this frame.
     unsafe extern "C-unwind" fn join_test_worker(arg: *mut c_void) -> *mut c_void {
         let ctx = unsafe { &*(arg as *const JoinTestCtx) };
         JOIN_TEST_STARTED.store(true, Ordering::Release);
@@ -752,18 +699,6 @@ mod join_tests {
             libc::read(ctx.pipe_read, buf.as_mut_ptr() as *mut c_void, 1);
         }
         std::ptr::null_mut()
-    }
-
-    // `libc::pthread_create` wants an `extern "C"` fn; this binding keeps the
-    // worker's `C-unwind` ABI without transmuting function signatures.
-    extern "C" {
-        #[link_name = "pthread_create"]
-        fn pthread_create_unwind(
-            thread: *mut libc::pthread_t,
-            attr: *const libc::pthread_attr_t,
-            start_routine: unsafe extern "C-unwind" fn(*mut c_void) -> *mut c_void,
-            arg: *mut c_void,
-        ) -> libc::c_int;
     }
 
     #[test]
@@ -872,9 +807,8 @@ mod local_resource_tests {
     ///
     /// The defect this catches: the `pipe2` arm returning `Reason(..)`
     /// (`PAM_AUTHINFO_UNAVAIL`) instead of `Error(..)` (`PAM_AUTH_ERR`), or
-    /// skipping/multiplying the best-effort cancel — the phone would keep
-    /// buzzing, and a `sufficient` stack would fall through as if the daemon had
-    /// been unreachable.
+    /// skipping/multiplying the cancel — the phone keeps buzzing, and a
+    /// `sufficient` stack falls through as if the daemon had been unreachable.
     #[test]
     fn pipe2_failure_cancels_once_and_reports_local_resource() {
         let mut armed = armed_for_test(NullReader::new(), "pipe2-fail-request");
@@ -913,10 +847,9 @@ mod local_resource_tests {
     /// exactly once, and closes both pipe fds.
     ///
     /// The defect this catches: the spawn-failure arm leaking the two
-    /// `O_CLOEXEC` fds into the long-running privileged host (`sudo`, `gdm`,
-    /// `polkitd`) — the open fds are invisible in a passing build because the
-    /// return code is right either way — or cancelling with the wrong reason /
-    /// not at all.
+    /// `O_CLOEXEC` fds into the long-running privileged host — invisible in a
+    /// passing build because the return code is right either way — or cancelling
+    /// with the wrong reason, or not at all.
     ///
     /// The whole sequence runs in a forked child and the parent only asserts the
     /// child's exit status. Checking `fcntl(fd, F_GETFD)` in the test process
@@ -1007,10 +940,9 @@ mod local_resource_tests {
         0
     }
 
-    /// Write `message` to stderr and return 1: the only failure channel a
-    /// forked child may use. No `panic!` (a Rust panic in the child would run
-    /// unwinding machinery on the copied parent state) and no `eprintln!`
-    /// (which takes the stdio lock another thread may hold at fork time).
+    /// Write `message` to stderr and return 1: the only failure channel a forked
+    /// child may use — no `panic!` (unwinding on the copied parent state) and no
+    /// `eprintln!` (it takes the stdio lock another thread may hold at fork time).
     fn child_diagnostic(message: &[u8]) -> libc::c_int {
         unsafe {
             libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
@@ -1027,8 +959,8 @@ mod local_resource_tests {
     /// child into a `SIGALRM` failure rather than a hung suite; a child that
     /// exits `0` (join unexpectedly succeeded) also fails.
     ///
-    /// Platform assumption: glibc (`pthread_join(3)` returns `EDEADLK` when a
-    /// thread joins itself) and a Linux `fork` that runs the atfork handlers.
+    /// Platform assumption: glibc's `pthread_join` returns `EDEADLK` on a
+    /// self-join, and a Linux `fork` that runs the atfork handlers.
     #[test]
     fn join_failure_aborts_the_process() {
         let pid = unsafe { libc::fork() };
