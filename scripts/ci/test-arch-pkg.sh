@@ -342,17 +342,23 @@ assert_removed() {
 # ---------------------------------------------------------------------------
 if [ "$SKIP_BUILD" = false ]; then
     step "Installing Arch build dependencies"
-    pacman -Sy --noconfirm --needed sudo cargo rust protobuf clang pam dbus \
+    # Arch supports no partial upgrades: the base image is a rolling snapshot
+    # that always lags `extra`, so syncing without upgrading makes pacman
+    # resolve a current-repo package against an installed one that still links
+    # the old soname (openssl 4.1 broke libcrypto.so=3 for curl/pacman/sudo).
+    pacman -Syu --noconfirm --needed sudo cargo rust protobuf clang pam dbus \
         systemd git tar binutils findutils sed grep
 
     step "Building Arch packages into ${PKG_DIR}"
     bash "${WORKSPACE_DIR}/scripts/ci/build-arch-packages.sh" --output-dir "${PKG_DIR}"
 else
     step "Installing minimal tooling (--skip-build)"
-    # Refresh the databases so a later dependency resolution during pacman -U
-    # does not fail on a stale sync database.
-    pacman -Sy --noconfirm || skip "pacman -Sy failed; continuing with existing databases"
-    pacman -S --noconfirm --needed grep sed findutils
+    # Everything in one transaction: the sync lands before pacman resolves, so
+    # a failed `-Syu` would leave new databases on an old system, and a
+    # follow-up install would then pull current-repo packages onto it (the very
+    # partial upgrade this avoids). Tolerated: if it fails, the old system is
+    # still usable for the `pacman -U` below and nothing is left upgraded.
+    pacman -Syu --noconfirm --needed grep sed findutils || skip "pacman -Syu failed; continuing with existing databases"
 fi
 
 # ---------------------------------------------------------------------------
