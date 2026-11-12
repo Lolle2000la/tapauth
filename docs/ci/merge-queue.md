@@ -189,7 +189,10 @@ Removing a **rule** is the lever; `enforcement` is ruleset-scoped
   No workflow change is required; the job keeps reporting as an advisory signal.
 - **Unblock merges entirely on a wrong required name:** delete the whole
   `{"type": "required_status_checks", …}` rule. That restores direct merges without
-  touching the queue rule.
+  touching the queue rule, but it also makes `scripts/ci/check-required-checks.sh`
+  exit non-zero ("declares no required_status_checks contexts"), and that guard runs
+  inside `Code Quality & Format Checks`. Remove the guard step in the same change, or
+  that required check is red on every run from then on.
 - **Blunt lever:** setting the ruleset's top-level `enforcement` to `disabled`
   switches off *every* rule at once — `deletion`, `required_linear_history`,
   `pull_request` and `non_fast_forward` included. Use it only as an emergency stop,

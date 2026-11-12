@@ -186,8 +186,8 @@ Android emulators provide an internal Bluetooth simulation service called **Nets
 
 ### In CI (GitHub Actions)
 E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and on every
-`merge_group` event, where it is a required merge-queue check. It also runs on pushes to `main`
-that touch that workflow's `paths:` list — the `push` trigger is deliberately path-filtered, so a
+`merge_group` event, where it will be a required merge-queue check once the ruleset payload is
+applied. It also runs on pushes to `main` that touch that workflow's `paths:` list — the `push` trigger is deliberately path-filtered, so a
 merge that changed none of those paths produces no post-merge `e2e` run (the pull request and the
 merge group already ran it). See [`docs/ci/merge-queue.md`](../ci/merge-queue.md).
 
