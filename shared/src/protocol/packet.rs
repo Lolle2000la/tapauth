@@ -1,148 +1,158 @@
+//! Outer authenticated-encryption framing (`EncryptedPacket`) and `WrapperMessage` builders.
+//!
+//! v2 has exactly one AEAD construction: a 12-byte random nonce is prepended to the
+//! ciphertext, the key is the CSK, and the AAD binds the cleartext packet header
+//! (`encryption_algorithm` and `temporal_identifier`) into the tag, so a downgrade or a
+//! temporal-ID tamper is detected before the inner payload is decrypted or parsed.
+
 use prost::Message as ProstMessage;
 
+use super::messages::PROTOCOL_VERSION_V2;
 use super::ProtocolError;
 use crate::crypto::{
-    decrypt_with_csk, decrypt_with_csk_and_prepended_nonce, encrypt_with_csk,
-    encrypt_with_csk_and_random_nonce, generate_current_temporal_identifier, ClientSymmetricKey,
+    decrypt_with_csk_and_prepended_nonce, encrypt_with_csk_and_random_nonce, encrypted_packet_aad,
+    generate_current_temporal_identifier_with_alg, ClientSymmetricKey,
 };
 use crate::protocol::pb::*;
 
-#[cfg(test)]
-use super::messages::sign_wrapper_message;
-
-/// Encrypt and package a WrapperMessage into an EncryptedPacket
-pub fn create_encrypted_packet(
-    csk: &ClientSymmetricKey,
-    challenge: &[u8; 32],
-    context: &[u8],
-    wrapper: &WrapperMessage,
-) -> Result<EncryptedPacket, ProtocolError> {
-    // Generate temporal identifier
-    let temporal_identifier = generate_current_temporal_identifier(csk)?.to_vec();
-
-    // Serialize the wrapper message
-    let plaintext = wrapper.encode_to_vec();
-
-    // Encrypt with CSK
-    let ciphertext = encrypt_with_csk(csk, challenge, context, &plaintext)?;
-
-    Ok(EncryptedPacket {
-        temporal_identifier,
-        encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-        ciphertext,
-    })
-}
-
-/// Encrypt and package a WrapperMessage into an EncryptedPacket using CSK with a random nonce
-/// The random 12-byte nonce is prepended to the ciphertext; used when challenge is inside payload.
+/// Serialize, encrypt and package an already-signed `WrapperMessage` into an `EncryptedPacket`.
+///
+/// The caller is expected to have signed `wrapper` with
+/// [`sign_wrapper_message`](super::messages::sign_wrapper_message); its signature travels
+/// inside the ciphertext. The temporal identifier is the current 60s window under
+/// `hash_algorithm`, and the AAD is
+/// `encrypted_packet_aad(encryption_algorithm, &temporal_identifier)`.
 pub fn create_encrypted_packet_with_csk_nonce(
     csk: &ClientSymmetricKey,
+    symmetric_algorithm: SymmetricAlgorithm,
+    hash_algorithm: HashAlgorithm,
     wrapper: &WrapperMessage,
 ) -> Result<EncryptedPacket, ProtocolError> {
-    // Generate temporal identifier
-    let temporal_identifier = generate_current_temporal_identifier(csk)?.to_vec();
+    let temporal_identifier =
+        generate_current_temporal_identifier_with_alg(csk, hash_algorithm)?.to_vec();
 
-    // Serialize the wrapper message
+    let encryption_algorithm = symmetric_algorithm as i32;
+    let aad = encrypted_packet_aad(encryption_algorithm, &temporal_identifier);
+
     let plaintext = wrapper.encode_to_vec();
-
-    // Encrypt with CSK using a random, prepended nonce
-    let ciphertext = encrypt_with_csk_and_random_nonce(csk, &plaintext)?;
+    let ciphertext = encrypt_with_csk_and_random_nonce(csk, symmetric_algorithm, &plaintext, &aad)?;
 
     Ok(EncryptedPacket {
         temporal_identifier,
-        encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+        encryption_algorithm,
         ciphertext,
     })
 }
 
-/// Decrypt an EncryptedPacket and extract the WrapperMessage
-pub fn decrypt_encrypted_packet(
-    csk: &ClientSymmetricKey,
-    challenge: &[u8; 32],
-    context: &[u8],
-    packet: &EncryptedPacket,
-) -> Result<WrapperMessage, ProtocolError> {
-    // Decrypt the ciphertext
-    let plaintext = decrypt_with_csk(csk, challenge, context, &packet.ciphertext)?;
-
-    // Deserialize the wrapper message
-    let wrapper = WrapperMessage::decode(&plaintext[..])?;
-
-    Ok(wrapper)
-}
-
-/// Decrypt an EncryptedPacket created with CSK random, prepended nonce and extract the WrapperMessage
+/// Decrypt an `EncryptedPacket` and recover the signed `WrapperMessage`.
+///
+/// Rejects a packet whose `encryption_algorithm` differs from
+/// `expected_symmetric_algorithm` **before** touching the ciphertext, and decrypts with
+/// `AAD = encrypted_packet_aad(packet.encryption_algorithm, &packet.temporal_identifier)`,
+/// so a tampered header fails authentication instead of being silently accepted.
 pub fn decrypt_encrypted_packet_with_csk_nonce(
     csk: &ClientSymmetricKey,
+    expected_symmetric_algorithm: SymmetricAlgorithm,
     packet: &EncryptedPacket,
 ) -> Result<WrapperMessage, ProtocolError> {
-    // Decrypt the ciphertext using the prepended random nonce
-    let plaintext = decrypt_with_csk_and_prepended_nonce(csk, &packet.ciphertext)?;
+    if packet.encryption_algorithm != expected_symmetric_algorithm as i32 {
+        return Err(ProtocolError::AlgorithmMismatch);
+    }
 
-    // Deserialize the wrapper message
-    let wrapper = WrapperMessage::decode(&plaintext[..])?;
+    let aad = encrypted_packet_aad(packet.encryption_algorithm, &packet.temporal_identifier);
+    let plaintext = decrypt_with_csk_and_prepended_nonce(
+        csk,
+        expected_symmetric_algorithm,
+        &packet.ciphertext,
+        &aad,
+    )?;
 
+    let wrapper = WrapperMessage::decode(plaintext.as_slice())?;
     Ok(wrapper)
 }
 
 /// Create a WrapperMessage containing an AuthenticationRequest
 pub fn wrap_auth_request(request: AuthenticationRequest) -> WrapperMessage {
     WrapperMessage {
-        version: 1,
+        version: PROTOCOL_VERSION_V2,
         signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        payload_type: PayloadType::AuthRequest as i32,
+        payload: request.encode_to_vec(),
         signature: Vec::new(),
-        payload: Some(wrapper_message::Payload::AuthRequest(request)),
     }
 }
 
 /// Create a WrapperMessage containing an AuthenticationGrant
 pub fn wrap_auth_grant(grant: AuthenticationGrant) -> WrapperMessage {
     WrapperMessage {
-        version: 1,
+        version: PROTOCOL_VERSION_V2,
         signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        payload_type: PayloadType::AuthGrant as i32,
+        payload: grant.encode_to_vec(),
         signature: Vec::new(),
-        payload: Some(wrapper_message::Payload::AuthGrant(grant)),
     }
 }
 
 /// Create a WrapperMessage containing an AuthenticationDenial
 pub fn wrap_auth_denial(denial: AuthenticationDenial) -> WrapperMessage {
     WrapperMessage {
-        version: 1,
+        version: PROTOCOL_VERSION_V2,
         signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        payload_type: PayloadType::AuthDenial as i32,
+        payload: denial.encode_to_vec(),
         signature: Vec::new(),
-        payload: Some(wrapper_message::Payload::AuthDenial(denial)),
     }
 }
 
 /// Create a WrapperMessage containing a GrantConfirmation
 pub fn wrap_grant_confirmation(confirmation: GrantConfirmation) -> WrapperMessage {
     WrapperMessage {
-        version: 1,
+        version: PROTOCOL_VERSION_V2,
         signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        payload_type: PayloadType::GrantConfirmation as i32,
+        payload: confirmation.encode_to_vec(),
         signature: Vec::new(),
-        payload: Some(wrapper_message::Payload::GrantConfirmation(confirmation)),
     }
 }
 
 /// Create a WrapperMessage containing an AuthenticationCancel
 pub fn wrap_auth_cancel(cancel: AuthenticationCancel) -> WrapperMessage {
     WrapperMessage {
-        version: 1,
+        version: PROTOCOL_VERSION_V2,
         signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+        payload_type: PayloadType::AuthCancel as i32,
+        payload: cancel.encode_to_vec(),
         signature: Vec::new(),
-        payload: Some(wrapper_message::Payload::AuthCancel(cancel)),
     }
 }
 
-/// Extract the challenge from a WrapperMessage if it contains a message with a challenge
+/// Extract the inner `challenge` field, dispatching on `wrapper.payload_type`.
+///
+/// Returns `None` for an unknown/absent payload type or a payload that does not decode.
 pub fn extract_challenge(wrapper: &WrapperMessage) -> Option<Vec<u8>> {
-    match &wrapper.payload {
-        Some(wrapper_message::Payload::AuthRequest(req)) => Some(req.challenge.clone()),
-        Some(wrapper_message::Payload::AuthDenial(denial)) => Some(denial.challenge.clone()),
-        Some(wrapper_message::Payload::GrantConfirmation(conf)) => Some(conf.challenge.clone()),
-        Some(wrapper_message::Payload::AuthCancel(cancel)) => Some(cancel.challenge.clone()),
-        _ => None,
+    let payload = wrapper.payload.as_slice();
+    let payload_type = wrapper.payload_type;
+
+    if payload_type == PayloadType::AuthRequest as i32 {
+        AuthenticationRequest::decode(payload)
+            .ok()
+            .map(|m| m.challenge)
+    } else if payload_type == PayloadType::AuthGrant as i32 {
+        AuthenticationGrant::decode(payload)
+            .ok()
+            .map(|m| m.challenge)
+    } else if payload_type == PayloadType::AuthDenial as i32 {
+        AuthenticationDenial::decode(payload)
+            .ok()
+            .map(|m| m.challenge)
+    } else if payload_type == PayloadType::GrantConfirmation as i32 {
+        GrantConfirmation::decode(payload).ok().map(|m| m.challenge)
+    } else if payload_type == PayloadType::AuthCancel as i32 {
+        AuthenticationCancel::decode(payload)
+            .ok()
+            .map(|m| m.challenge)
+    } else {
+        None
     }
 }
 
@@ -156,37 +166,249 @@ pub fn extract_challenge(wrapper: &WrapperMessage) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::crypto::Ed25519KeyPair;
-    use crate::protocol::messages::create_auth_request;
+    use crate::protocol::messages::{
+        create_auth_request_with_challenge, create_auth_request_with_context, sign_wrapper_message,
+        verify_and_decode_payload, DecodedPayload, COMMAND_PREVIEW_MAX_BYTES,
+        PAM_SERVICE_MAX_BYTES, PROCESS_NAME_MAX_BYTES,
+    };
+
+    const ED25519: i32 = SignatureAlgorithm::Ed25519 as i32;
+    const AES: SymmetricAlgorithm = SymmetricAlgorithm::Aes256Gcm;
+    const CHACHA: SymmetricAlgorithm = SymmetricAlgorithm::Chacha20Poly1305;
+    const SHA256: HashAlgorithm = HashAlgorithm::Sha256;
+
+    /// Mirrors `models::ble::MAX_GATT_PAYLOAD_BYTES`: a 517-byte ATT MTU leaves 514 bytes
+    /// minus the 3-byte GATT Write Without Response header = 512 bytes of payload.
+    const GATT_PAYLOAD_BUDGET_BYTES: usize = 512;
+
+    /// The payload type a [`DecodedPayload`] was decoded from.
+    fn decoded_payload_type(decoded: &DecodedPayload) -> i32 {
+        match decoded {
+            DecodedPayload::AuthRequest(_) => PayloadType::AuthRequest as i32,
+            DecodedPayload::AuthGrant(_) => PayloadType::AuthGrant as i32,
+            DecodedPayload::AuthDenial(_) => PayloadType::AuthDenial as i32,
+            DecodedPayload::GrantConfirmation(_) => PayloadType::GrantConfirmation as i32,
+            DecodedPayload::AuthCancel(_) => PayloadType::AuthCancel as i32,
+        }
+    }
+
+    fn signed_grant_wrapper(keypair: &Ed25519KeyPair, challenge: [u8; 32]) -> WrapperMessage {
+        let mut wrapper = wrap_auth_grant(AuthenticationGrant {
+            challenge: challenge.to_vec(),
+        });
+        sign_wrapper_message(&mut wrapper, keypair).unwrap();
+        wrapper
+    }
 
     #[test]
-    fn test_packet_encryption_decryption() {
+    fn test_packet_round_trip_for_all_payload_types_and_algorithms() {
         let csk = ClientSymmetricKey::generate().unwrap();
         let keypair = Ed25519KeyPair::generate().unwrap();
-        let challenge = [1u8; 32];
-        let context = b"test_context";
+        let challenge = [0x2Au8; 32];
 
-        // Create a request
-        let request = create_auth_request("user", "host").unwrap();
-        let mut wrapper = wrap_auth_request(request);
-        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+        let cases: Vec<(WrapperMessage, PayloadType)> = vec![
+            (
+                wrap_auth_request(
+                    create_auth_request_with_challenge("user", "host", &challenge).unwrap(),
+                ),
+                PayloadType::AuthRequest,
+            ),
+            (
+                wrap_auth_grant(AuthenticationGrant {
+                    challenge: challenge.to_vec(),
+                }),
+                PayloadType::AuthGrant,
+            ),
+            (
+                wrap_auth_denial(AuthenticationDenial {
+                    challenge: challenge.to_vec(),
+                    reason: "user rejected".to_string(),
+                }),
+                PayloadType::AuthDenial,
+            ),
+            (
+                wrap_grant_confirmation(GrantConfirmation {
+                    challenge: challenge.to_vec(),
+                }),
+                PayloadType::GrantConfirmation,
+            ),
+            (
+                wrap_auth_cancel(AuthenticationCancel {
+                    challenge: challenge.to_vec(),
+                }),
+                PayloadType::AuthCancel,
+            ),
+        ];
+        assert_eq!(cases.len(), 5);
 
-        // Encrypt
-        let packet = create_encrypted_packet(&csk, &challenge, context, &wrapper).unwrap();
+        for symmetric in [AES, CHACHA] {
+            for (unsigned, expected_type) in &cases {
+                let mut wrapper = unsigned.clone();
+                assert_eq!(wrapper.version, PROTOCOL_VERSION_V2);
+                assert_eq!(wrapper.payload_type, *expected_type as i32);
+                assert!(wrapper.signature.is_empty());
+                // The wrapper carries the raw serialized payload, so a non-empty payload
+                // must already be present before signing.
+                assert!(!wrapper.payload.is_empty());
+                sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+                assert_eq!(wrapper.signature.len(), 64);
 
-        // Decrypt
-        let decrypted_wrapper =
-            decrypt_encrypted_packet(&csk, &challenge, context, &packet).unwrap();
+                let packet =
+                    create_encrypted_packet_with_csk_nonce(&csk, symmetric, SHA256, &wrapper)
+                        .unwrap();
+                assert_eq!(packet.encryption_algorithm, symmetric as i32);
+                assert_eq!(packet.temporal_identifier.len(), 16);
+                // 12-byte nonce || plaintext || 16-byte tag
+                assert_eq!(
+                    packet.ciphertext.len(),
+                    wrapper.encode_to_vec().len() + 12 + 16
+                );
 
-        // Verify the payload matches
+                let decrypted =
+                    decrypt_encrypted_packet_with_csk_nonce(&csk, symmetric, &packet).unwrap();
+                assert_eq!(decrypted, wrapper);
+
+                let decoded =
+                    verify_and_decode_payload(&decrypted, &keypair.verifying_key_bytes(), ED25519)
+                        .unwrap();
+                assert_eq!(decoded_payload_type(&decoded), *expected_type as i32);
+                assert_eq!(extract_challenge(&decrypted).unwrap(), challenge.to_vec());
+            }
+        }
+    }
+
+    #[test]
+    fn test_temporal_identifier_tampering_fails_aead() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let wrapper = signed_grant_wrapper(&keypair, [0x31u8; 32]);
+
+        let packet = create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+
+        // Flip one bit of the temporal identifier: it is bound into the AAD.
+        let mut tampered = packet.clone();
+        tampered.temporal_identifier[0] ^= 0x01;
+        assert_eq!(tampered.temporal_identifier.len(), 16);
         assert!(matches!(
-            decrypted_wrapper.payload,
-            Some(wrapper_message::Payload::AuthRequest(_))
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &tampered),
+            Err(ProtocolError::Crypto(_))
+        ));
+
+        // Same ciphertext, same length, only the identifier differs by one bit.
+        assert_eq!(tampered.ciphertext, packet.ciphertext);
+        assert_ne!(tampered.temporal_identifier, packet.temporal_identifier);
+
+        // The untouched packet still decrypts.
+        let decrypted = decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet).unwrap();
+        assert_eq!(decrypted, wrapper);
+        assert_eq!(decrypted.payload, wrapper.payload);
+    }
+
+    #[test]
+    fn test_encryption_algorithm_field_tampering_fails_aead() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let wrapper = signed_grant_wrapper(&keypair, [0x32u8; 32]);
+
+        let packet = create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+
+        // Relabel the packet as ChaCha20-Poly1305 without re-encrypting. The verifier
+        // follows the claimed algorithm, so this must fail authentication: the AAD now
+        // carries a different algorithm id than the tag was produced with.
+        let mut tampered = packet.clone();
+        tampered.encryption_algorithm = CHACHA as i32;
+        assert_eq!(tampered.ciphertext, packet.ciphertext);
+        assert!(matches!(
+            decrypt_encrypted_packet_with_csk_nonce(&csk, CHACHA, &tampered),
+            Err(ProtocolError::Crypto(_))
+        ));
+
+        // The original still decrypts under its own algorithm.
+        let decrypted = decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet).unwrap();
+        assert_eq!(decrypted, wrapper);
+    }
+
+    #[test]
+    fn test_decrypt_rejects_algorithm_mismatch_before_decrypting() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let wrapper = signed_grant_wrapper(&keypair, [0x33u8; 32]);
+
+        let mut packet =
+            create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+        assert_eq!(packet.encryption_algorithm, AES as i32);
+
+        // Replace the ciphertext with unusable bytes: only an algorithm check that runs
+        // before decryption can produce AlgorithmMismatch here.
+        packet.ciphertext = vec![0x00; 1];
+
+        // Caller pinned to ChaCha20-Poly1305 while the packet claims AES-256-GCM.
+        assert!(matches!(
+            decrypt_encrypted_packet_with_csk_nonce(&csk, CHACHA, &packet),
+            Err(ProtocolError::AlgorithmMismatch)
+        ));
+
+        // Control: with the matching algorithm the same packet fails as a cipher error,
+        // not as an algorithm mismatch.
+        assert!(matches!(
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet),
+            Err(ProtocolError::Crypto(_))
         ));
     }
 
     #[test]
+    fn test_signed_context_request_fits_ble_gatt_budget() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let keypair = Ed25519KeyPair::generate().unwrap();
+
+        // Every field at its documented maximum.
+        let username = "u".repeat(32);
+        let hostname = "h".repeat(64);
+        let pam_service = "p".repeat(PAM_SERVICE_MAX_BYTES);
+        let process_name = "n".repeat(PROCESS_NAME_MAX_BYTES);
+        let command_preview = "c".repeat(COMMAND_PREVIEW_MAX_BYTES);
+
+        let request = create_auth_request_with_context(
+            &username,
+            &hostname,
+            &[0x5Au8; 32],
+            &pam_service,
+            &process_name,
+            &command_preview,
+            true,
+        )
+        .unwrap();
+        assert_eq!(request.username.len(), 32);
+        assert_eq!(request.hostname.len(), 64);
+        assert_eq!(request.pam_service.len(), PAM_SERVICE_MAX_BYTES);
+        assert_eq!(request.process_name.len(), PROCESS_NAME_MAX_BYTES);
+        assert_eq!(request.command_preview.len(), COMMAND_PREVIEW_MAX_BYTES);
+
+        let mut wrapper = wrap_auth_request(request);
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+
+        let packet = create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+        let encoded = packet.encode_to_vec();
+        let measured = encoded.len();
+
+        assert!(
+            measured <= GATT_PAYLOAD_BUDGET_BYTES,
+            "signed EncryptedPacket is {measured} bytes, BLE GATT budget is {GATT_PAYLOAD_BUDGET_BYTES}"
+        );
+        // The exact measured size: 341-byte AuthenticationRequest payload -> 416-byte
+        // signed WrapperMessage (14B domain + 3 be32 words are only in the signature
+        // transcript, not on the wire) -> 467-byte EncryptedPacket
+        // (18B temporal_identifier + 2B algorithm + 12B nonce + 416B plaintext + 16B tag).
+        assert_eq!(
+            measured, 467,
+            "worst-case signed EncryptedPacket size changed"
+        );
+        assert_eq!(EncryptedPacket::decode(encoded.as_slice()).unwrap(), packet);
+    }
+
+    #[test]
     fn test_extract_challenge() {
-        let request = create_auth_request("user", "host").unwrap();
+        let request = create_auth_request_with_challenge("user", "host", &[0x44u8; 32]).unwrap();
         let challenge = request.challenge.clone();
         let wrapper = wrap_auth_request(request);
 
@@ -196,26 +418,35 @@ mod tests {
 
     #[test]
     fn test_extract_challenge_from_auth_grant() {
-        use crate::crypto::Ed25519KeyPair;
-        use crate::protocol::messages::create_auth_grant;
+        // v2 AuthenticationGrant carries the raw challenge inside the signed payload.
+        let wrapper = wrap_auth_grant(AuthenticationGrant {
+            challenge: vec![5u8; 32],
+        });
 
-        let keypair = Ed25519KeyPair::generate().unwrap();
-        let challenge = [5u8; 32];
-
-        let grant = create_auth_grant(&keypair, &challenge).unwrap();
-        let wrapper = wrap_auth_grant(grant);
-
-        // AuthGrant does not carry the challenge, so extract_challenge returns None
-        assert!(extract_challenge(&wrapper).is_none());
+        assert_eq!(extract_challenge(&wrapper).unwrap(), vec![5u8; 32]);
     }
 
     #[test]
     fn test_extract_challenge_empty_wrapper() {
         let wrapper = WrapperMessage {
-            version: 1,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            version: PROTOCOL_VERSION_V2,
+            signature_algorithm: ED25519,
+            payload_type: PayloadType::Unspecified as i32,
+            payload: Vec::new(),
             signature: Vec::new(),
-            payload: None,
+        };
+
+        assert!(extract_challenge(&wrapper).is_none());
+    }
+
+    #[test]
+    fn test_extract_challenge_undecodable_payload_is_none() {
+        let wrapper = WrapperMessage {
+            version: PROTOCOL_VERSION_V2,
+            signature_algorithm: ED25519,
+            payload_type: PayloadType::AuthGrant as i32,
+            payload: vec![0xFF, 0xFF, 0xFF],
+            signature: vec![0xAA; 64],
         };
 
         assert!(extract_challenge(&wrapper).is_none());
@@ -352,13 +583,18 @@ mod protobuf_tests {
             username: "testuser".to_string(),
             hostname: "testhost".to_string(),
             timestamp_unix_seconds: 1234567890,
+            pam_service: String::new(),
+            process_name: String::new(),
+            command_preview: String::new(),
+            tty_present: false,
         };
 
         let wrapper = WrapperMessage {
-            version: 1,
+            version: PROTOCOL_VERSION_V2,
             signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            payload_type: PayloadType::AuthRequest as i32,
+            payload: request.encode_to_vec(),
             signature: vec![0xBB; 64],
-            payload: Some(wrapper_message::Payload::AuthRequest(request)),
         };
 
         let mut buf = Vec::new();
@@ -366,10 +602,11 @@ mod protobuf_tests {
 
         // Parse and verify type
         let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert!(matches!(
-            parsed.payload,
-            Some(wrapper_message::Payload::AuthRequest(_))
-        ));
+        assert_eq!(parsed.payload_type, PayloadType::AuthRequest as i32);
+        assert_eq!(
+            AuthenticationRequest::decode(parsed.payload.as_slice()).unwrap(),
+            request
+        );
     }
 
     #[test]
@@ -379,20 +616,22 @@ mod protobuf_tests {
         };
 
         let wrapper = WrapperMessage {
-            version: 1,
+            version: PROTOCOL_VERSION_V2,
             signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            payload_type: PayloadType::GrantConfirmation as i32,
+            payload: confirmation.encode_to_vec(),
             signature: vec![0xBB; 64],
-            payload: Some(wrapper_message::Payload::GrantConfirmation(confirmation)),
         };
 
         let mut buf = Vec::new();
         wrapper.encode(&mut buf).unwrap();
 
         let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert!(matches!(
-            parsed.payload,
-            Some(wrapper_message::Payload::GrantConfirmation(_))
-        ));
+        assert_eq!(parsed.payload_type, PayloadType::GrantConfirmation as i32);
+        assert_eq!(
+            GrantConfirmation::decode(parsed.payload.as_slice()).unwrap(),
+            confirmation
+        );
     }
 
     #[test]
@@ -402,20 +641,22 @@ mod protobuf_tests {
         };
 
         let wrapper = WrapperMessage {
-            version: 1,
+            version: PROTOCOL_VERSION_V2,
             signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            payload_type: PayloadType::AuthCancel as i32,
+            payload: cancel.encode_to_vec(),
             signature: vec![0xCC; 64],
-            payload: Some(wrapper_message::Payload::AuthCancel(cancel)),
         };
 
         let mut buf = Vec::new();
         wrapper.encode(&mut buf).unwrap();
 
         let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert!(matches!(
-            parsed.payload,
-            Some(wrapper_message::Payload::AuthCancel(_))
-        ));
+        assert_eq!(parsed.payload_type, PayloadType::AuthCancel as i32);
+        assert_eq!(
+            AuthenticationCancel::decode(parsed.payload.as_slice()).unwrap(),
+            cancel
+        );
     }
 
     #[test]
@@ -426,13 +667,18 @@ mod protobuf_tests {
             username: "user".to_string(),
             hostname: "host".to_string(),
             timestamp_unix_seconds: 1234567890,
+            pam_service: String::new(),
+            process_name: String::new(),
+            command_preview: String::new(),
+            tty_present: false,
         };
 
         let wrapper = WrapperMessage {
             version: 42, // Non-standard version
             signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            payload_type: PayloadType::AuthRequest as i32,
+            payload: request.encode_to_vec(),
             signature: vec![0xFF; 64],
-            payload: Some(wrapper_message::Payload::AuthRequest(request)),
         };
 
         let mut buf = Vec::new();
@@ -440,26 +686,25 @@ mod protobuf_tests {
 
         let parsed = WrapperMessage::decode(&buf[..]).unwrap();
         assert_eq!(parsed.version, 42);
-        assert!(matches!(
-            parsed.payload,
-            Some(wrapper_message::Payload::AuthRequest(_))
-        ));
+        assert_eq!(parsed.payload_type, PayloadType::AuthRequest as i32);
     }
 
     #[test]
     fn test_wrapper_message_unknown_type() {
         // Empty wrapper message (no payload set)
         let wrapper = WrapperMessage {
-            version: 1,
+            version: PROTOCOL_VERSION_V2,
             signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
+            payload_type: PayloadType::Unspecified as i32,
+            payload: Vec::new(),
             signature: Vec::new(),
-            payload: None,
         };
 
         let mut buf = Vec::new();
         wrapper.encode(&mut buf).unwrap();
 
         let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert!(parsed.payload.is_none());
+        assert_eq!(parsed.payload_type, PayloadType::Unspecified as i32);
+        assert!(parsed.payload.is_empty());
     }
 }

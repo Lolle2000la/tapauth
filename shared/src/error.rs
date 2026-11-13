@@ -58,6 +58,12 @@ impl From<crate::crypto::CryptoError> for TapAuthError {
                 TapAuthError::Crypto("random generation failed".to_string())
             }
             CryptoError::SystemTimeError => TapAuthError::State("system time error".to_string()),
+            // v2: an unspecified/unknown negotiated algorithm, or an AEAD call
+            // that dropped its mandatory associated data.
+            CryptoError::UnsupportedAlgorithm => {
+                TapAuthError::InvalidInput(format!("crypto: {}", err))
+            }
+            CryptoError::InvalidAad => TapAuthError::InvalidInput(format!("crypto: {}", err)),
         }
     }
 }
