@@ -1693,6 +1693,8 @@ mod tests {
     #[tokio::test]
     async fn a_second_phone_never_reaches_verification_for_another_users_session() {
         let (phone_a, phone_b, key_a, key_b) = two_phones();
+        // Only the BLE assertion below consumes the second phone's key.
+        #[cfg(feature = "ble")]
         let other_key = phone_b.public_key.clone();
         let mut paired = HashMap::new();
         paired.insert("phone-a".to_string(), phone_a);
