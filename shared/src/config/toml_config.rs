@@ -27,7 +27,7 @@ const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 /// The PAM service names the module always refuses to take part in: `sshd` is
 /// OpenSSH's compiled-in `PAMServiceName` default, `sshd-session` the name its
 /// per-connection session binary uses on current releases. This list is the one
-/// canonical definition (the PAM module's R1 and its config parser both read it);
+/// canonical definition (the PAM module's `RemoteRefuse` and its config parser both read it);
 /// a deployment that renames `PAMServiceName` adds the new name to
 /// `pam_refused_services`, which can only add, never remove.
 pub const DEFAULT_PAM_REFUSED_SERVICES: &[&str] = &["sshd", "sshd-session"];

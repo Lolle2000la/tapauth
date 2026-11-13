@@ -151,7 +151,7 @@ static atomic_int conv_returned;
 static atomic_int conv_ran_on_main_thread;
 static atomic_int daemon_accepted;
 /* Every `PAM_TEXT_INFO`/`PAM_ERROR_MSG` the module sent through the
- * conversation.  The skip paths (R1, R2) and the pre-collected handoff (R8)
+ * conversation.  The skip paths (`RemoteRefuse`, `DmLoginBypass`) and the pre-collected handoff (`PreCollectedLocks`)
  * emit no notice; a participation announces its wait. */
 static atomic_int conv_text_info;
 

@@ -8,7 +8,7 @@
 # without contacting the daemon (pre-collected hosts), and leaving the
 # conversation alone.  The choice is a rule table keyed on the caller — the
 # calling process, the PAM service name and the GDM reauth flag
-# (`classify` in client-pam/src/policy/mod.rs), so none of the branches is reachable
+# (`classify` in client-pam/src/policy.rs), so none of the branches is reachable
 # from a Rust unit test: it needs a real libpam stack, a dynamically loaded
 # `pam_tapauth.so`, and a process whose `/proc/self/exe` basename is on the
 # allowlist.
@@ -137,7 +137,7 @@
 #                entered, daemon 0, and the next module sees no token).
 #
 #   sshd         the service file is `sshd` (and `sshd-session` for the second
-#                shape) with the `bypass` stack: R1 refuses a remote stack on
+#                shape) with the `bypass` stack: `RemoteRefuse` refuses a remote stack on
 #                the service name alone, before any config read, username
 #                lookup, conversation construction or message load.  Asserted:
 #                the conversation is not entered, the daemon is not contacted,
@@ -227,7 +227,7 @@ fi
 
 # The fixture is 10 comma-separated columns and a `why` containing a comma is a
 # parse error rather than a quoted field — the same rule the Rust reader in
-# client-pam/src/policy/mod.rs (`parse_row`) enforces on the same file.
+# client-pam/src/policy.rs (`parse_row`) enforces on the same file.
 read_fixture_row() {
     # shellcheck disable=SC2034  # every column is consumed by the caller
     IFS=, read -r F_ID F_SERVICE F_EXE F_COMM F_ENV F_TTY F_RULE F_POLICY F_WHY \
@@ -251,7 +251,7 @@ while read_fixture_row; do
     fi
 done <"$FIXTURE"
 
-# The floor is the 13 shapes this layer has always run plus the two R1 service
+# The floor is the 13 shapes this layer has always run plus the two `RemoteRefuse` service
 # names: losing one of them removes the only end-to-end proof of a rule or a
 # mechanism, so the number is asserted rather than reported.
 MIN_SHAPES=15
@@ -649,7 +649,7 @@ while read_fixture_row; do
         ;;
 
     # ---- gdm reauth: an unlock is offered the phone
-    # The row is R3's other spelling: `/proc/self/comm` truncates the worker's name
+    # The row is `GdmReauthWorker`'s other spelling: `/proc/self/comm` truncates the worker's name
     # to `gdm-session-wor`, while the login row below uses the full name.
     threaded_gdm_worker_truncated)
         ROW_MARKER="$TMP_DIR/token-seen-$ROW_ID"
@@ -702,7 +702,7 @@ while read_fixture_row; do
         SHAPES+=("control=pass")
         ;;
 
-    # ---- R1: the service name alone refuses a remote stack
+    # ---- `RemoteRefuse`: the service name alone refuses a remote stack
     # The refusal happens before the config read, the username lookup, the
     # conversation and the message load.  The `required` + `optional pam_permit`
     # stack makes the non-success verdict part of the shape: PAM_IGNORE would record
