@@ -27,9 +27,9 @@ pub(super) struct Rule {
 /// its `/proc/self/comm`-truncated (15-byte) spelling, the `RuleId` variant
 /// with its `ALL` entry and `as_str` arm, the `audit` arm (whose `evidence`
 /// cites `policy/table.rs:<line of fn ...>`), a `callers.csv` row with
-/// `expected_rule` and `expected_policy`, the `(1..=10)` bound, and the
-/// `rules_are_process_disjoint` key set — the one edit nothing fails loudly
-/// on. An `EXPECTED_TTY` entry belongs only to a `threaded` or `sequential`
+/// `expected_rule` and `expected_policy`, and the `rules_are_process_disjoint`
+/// key set — the one edit nothing fails loudly on.
+/// An `EXPECTED_TTY` entry belongs only to a `threaded` or `sequential`
 /// row, or `corpus_characterises_the_decision_table` fails. A display manager
 /// is not a new `Rule`: one `DM_PREFIXES` entry (bump `[&str; 13]`) plus a
 /// corpus row per prefix. An `e2e=1` row also needs `exe` and a `case` arm in
