@@ -1,6 +1,9 @@
 name: CI - Rust & Packages
 
 on:
+  # `push` keeps its `paths:` filter. The merge group and the pull request have
+  # already validated the change, so a third, unfiltered post-merge run is pure
+  # cost; the filtered push run stays a safety net for direct/bypass pushes.
   push:
     branches: [main]
     paths:
@@ -17,22 +20,15 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+  # No `paths:` here: these jobs are required status checks, and a required
+  # check cannot be path-filtered — GitHub leaves a check whose run was skipped
+  # `Pending` forever, so the PR could be neither merged nor queued.
   pull_request:
     branches: [main]
-    paths:
-      - 'shared/**'
-      - 'tapauthd/**'
-      - 'client-pam/**'
-      - 'client-config-gui/**'
-      - 'proto/**'
-      - 'packaging/**'
-      - 'systemd/**'
-      - 'scripts/**'
-      - 'install.sh'
-      - 'uninstall.sh'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/ci.yml'
+  # No `paths:` here either: GitHub supports no path filters on merge_group.
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +42,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      # Every context the merge-queue ruleset requires must still match a job
+      # `name:` here or in ci-android.yml. A rename is otherwise silent: nothing
+      # reports the old name, so queued entries wait out the response timeout.
+      - name: Check required checks match job names
+        run: ./scripts/ci/check-required-checks.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

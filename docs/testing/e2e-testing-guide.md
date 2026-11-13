@@ -185,7 +185,13 @@ Android emulators provide an internal Bluetooth simulation service called **Nets
 ## 5. Running the Tests
 
 ### In CI (GitHub Actions)
-E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and push to `main`.
+E2E testing runs in `.github/workflows/ci-android.yml` on every pull request and on every
+`merge_group` event, where it will be a required merge-queue check once the ruleset is
+configured. It also runs on pushes to `main` that touch that workflow's `paths:` list — the
+`push` trigger is deliberately path-filtered, so a
+merge that changed none of those paths produces no post-merge `e2e` run (the pull request and the
+merge group already ran it). The required-check names are recorded in
+`scripts/ci/check-required-checks.sh`.
 
 CI runs in **systemd mode on all three distros**. The daemon is installed as the real
 `tapauthd.service`/`tapauthd.socket` units, is socket-activated (no `fallback-socket`), runs as the
