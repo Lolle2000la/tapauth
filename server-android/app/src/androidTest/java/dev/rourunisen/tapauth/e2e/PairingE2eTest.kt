@@ -18,6 +18,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
@@ -32,13 +33,18 @@ import org.junit.runner.RunWith
  * am instrument`:
  *
  * adb shell am instrument -w \ -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \ -e pairing_url
- * "tapauth://pair?v=2&sid=...&pk=...&p=...&ip4=..." \ [-e reject_sas true] \
- * dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
+ * "tapauth://pair?v=2&sid=...&pk=...&p=...&ip4=..." \ [-e reject_sas true] \ [-e hold_sas_ms 8000]
+ * \ dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
  *
  * `pairing_url` is **required**: it carries the QR `sid` and `pk` a v2 handshake needs, and the QR
  * pin (`PairingResponse.client_x25519_public_key == pk`) cannot be established without it. A run
  * given only `pairing_host`/`pairing_port` fails with a descriptive assertion instead of silently
  * pairing against an unpinned ephemeral key.
+ *
+ * `hold_sas_ms` (optional, default 0) keeps the phone on the SAS screen for that many milliseconds
+ * after it has displayed and published the code, before it acts on it. The harness uses it to hold
+ * the session open long enough for a desktop-initiated `cancel-pairing` to reach the phone (Phase
+ * 1a-iii); at 0 the flow approves immediately.
  *
  * With `reject_sas true` this runs the negative case (Phase 1a): the flow progresses far enough to
  * derive the SAS, then the test rejects it, asserts the rejection is reported, and asserts nothing
@@ -69,6 +75,7 @@ class PairingE2eTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val args = InstrumentationRegistry.getArguments()
         val rejectSas = args.getString("reject_sas")?.toBoolean() ?: false
+        val holdSasMs = args.getString("hold_sas_ms")?.toLongOrNull() ?: 0L
         val expectedUser = args.getString("pairing_username")?.takeIf { it.isNotBlank() }
 
         val pairingUrl = resolvePairingUrl(args)
@@ -105,6 +112,13 @@ class PairingE2eTest {
 
             publishSas(context, awaiting.sas)
             Log.i(TAG, "SAS reached the phone over ${awaiting.transport}")
+
+            // Optional hold: keeps the session in `awaitApproval`, so the harness can drive a
+            // desktop-side cancel against a phone that is genuinely still deciding.
+            if (holdSasMs > 0) {
+                Log.i(TAG, "Holding the SAS decision for ${holdSasMs}ms")
+                delay(holdSasMs)
+            }
 
             if (rejectSas) {
                 session.rejectSas()
