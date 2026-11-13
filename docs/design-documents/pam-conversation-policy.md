@@ -30,7 +30,7 @@ Every non-test module under `client-pam/src`, plus the test-only `source_guards.
 | `policy/refine.rs` | `refine`: the config-dependent second phase that can add one skip | `context`, `policy` |
 | `plan.rs` | `Plan`, `Deadline`, `Announcement`, `TtyUse`, `Plannable::plan` | `config` |
 | `outcome.rs` | `Outcome` taxonomy and `into_pam`, the only verdict-to-code conversion | `pam_messages`, `pam_sys`, `policy` |
-| `transaction.rs` | re-export hub for `run`, `Armed`, `Concluded`, `Finished`, `Via`, `Effects` | `transaction/*` |
+| `transaction.rs` | re-export hub for `run`, `Armed`, `HostIo`, `Concluded`, `Finished`, `StartError`, `Via`, `Effects` | `transaction/*` |
 | `transaction/run.rs` | the transaction driver: handoff, reuse lookup, probe, plan, arm, mechanism, conclude | `conclusion_cache`, `config`, `context`, `ipc_client`, `mechanism`, `outcome`, `plan`, `policy` |
 | `transaction/lifecycle.rs` | `Armed` (constructed only by `Armed::open`), `Concluded`, `Via`, `Finished`, `StartError` | `context`, `ipc_client`, `mechanism`, `outcome` |
 | `transaction/host_io.rs` | `HostIo` (PAM handle, conversation, messages, authtok reader) and `finish`, the single emission site | `outcome`, `pam_messages`, `pam_sys` |
@@ -120,7 +120,7 @@ sequenceDiagram
     Module->>Daemon: connect, PamAuthenticateRequest
     Module->>Module: arm
     Daemon->>Phone: ring
-    Note over Module,Daemon: the mechanism drives the host conversation while waiting
+    Note over Module,Daemon: the selected mechanism waits for the phone
     Daemon-->>Module: PamAuthenticateResponse
     Module->>Module: conclude, emit one notice
     Module->>Module: record, into_pam
@@ -428,7 +428,7 @@ Adding a host:
 7. Add an `EXPECTED_TTY` entry in `policy.rs` when the flow is threaded or sequential.
 8. For an e2e-covered host, add its `case` arm to `scripts/ci/test-pam-conv-thread.sh` and set `e2e=1`.
 
-Every step except 6 fails a test or the compiler: a `RuleId` without its audit arm does not compile, a mis-cited record trips `evidence_citations_resolve`, a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, and an `e2e=1` row without an arm fails the harness. The `rules_are_process_disjoint` key set is the one edit nothing fails loudly on, so update it by hand.
+All but two of these fail loudly: a `RuleId` without its audit arm does not compile, a mis-cited record trips `evidence_citations_resolve`, a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision or tty disagrees trips `corpus_characterises_the_decision_table`, and an `e2e=1` row without an arm fails the harness. The two silent edits are the `RuleId::ALL` arm — a rule missing from both `ALL` and `RULES` stays green — and the `rules_are_process_disjoint` key set; update both by hand.
 
 A display manager is not a new rule: add a `DM_PREFIXES` entry (and its array length) plus one corpus row per prefix.
 
