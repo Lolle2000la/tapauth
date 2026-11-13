@@ -162,7 +162,7 @@ sequenceDiagram
     Module->>Daemon: PamAuthenticateRequest
     Module->>Worker: pthread_create, pam_get_authtok
     Daemon->>Phone: ring
-    Note over Worker: password dialog on the worker; the main thread polls the daemon and a self-pipe
+    Note over Worker: password dialog on the worker, the main thread polls the daemon and a self-pipe
     alt phone answers first
         Phone-->>Daemon: grant or denial
         Daemon-->>Module: PamAuthenticateResponse
@@ -205,7 +205,7 @@ sequenceDiagram
 
     Host->>Module: pam_authenticate
     Module->>Daemon: PamAuthenticateRequest
-    Note over Module: waits on the calling thread; the conversation is not driven
+    Note over Module: waits on the calling thread, the conversation is not driven
     Daemon->>Phone: ring
     alt phone answers
         Phone-->>Daemon: grant or denial
@@ -243,7 +243,7 @@ sequenceDiagram
 
     Host->>Module: pam_authenticate
     Module->>Module: pam_get_authtok on the calling thread
-    Note over Module: caches PAM_AUTHTOK for the next module; no daemon contact
+    Note over Module: caches PAM_AUTHTOK for the next module, no daemon contact
     Module-->>Host: PAM_AUTHINFO_UNAVAIL
 ```
 
