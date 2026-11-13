@@ -44,7 +44,10 @@ pub(crate) const CHALLENGE_LEN: usize = 32;
 pub(crate) const CSK_LEN: usize = 32;
 
 /// Length of the UDP/GATT temporal identifier.
-pub(crate) const TEMPORAL_ID_LEN: usize = 16;
+///
+/// Taken from the packet layer so the Kotlin-facing path and
+/// `decrypt_encrypted_packet_with_csk_nonce` cannot disagree on the rule.
+pub(crate) const TEMPORAL_ID_LEN: usize = crate::protocol::packet::TEMPORAL_IDENTIFIER_LEN;
 
 /// Length of the BLE advertisement temporal identifier.
 pub(crate) const BLE_TEMPORAL_ID_LEN: usize = 10;
@@ -206,10 +209,14 @@ fn challenge_32(challenge: &[u8]) -> Result<[u8; CHALLENGE_LEN], JniError> {
 /// Decrypt an `EncryptedPacket` under the CSK and return the raw `WrapperMessage` bytes.
 ///
 /// The packet's `encryption_algorithm` must equal the caller's pinned algorithm; the
-/// check runs **before** any AEAD work so a downgrade is reported as such. The AAD
-/// binds the cleartext header, so a tampered `temporal_identifier` fails the tag
-/// instead of being accepted. The returned bytes are the decrypted plaintext exactly
-/// as the peer serialized it — nothing is re-encoded.
+/// check runs **before** any AEAD work so a downgrade is reported as such. A
+/// `temporal_identifier` that is not [`TEMPORAL_ID_LEN`] bytes is a malformed
+/// envelope and is rejected as an argument error before decryption, matching
+/// [`decrypt_encrypted_packet_with_csk_nonce`] (the BLE GATT specification fixes the
+/// on-air identifier at the full 16 bytes). The AAD binds the cleartext header, so a
+/// tampered `temporal_identifier` fails the tag instead of being accepted. The
+/// returned bytes are the decrypted plaintext exactly as the peer serialized it —
+/// nothing is re-encoded.
 pub(crate) fn decrypt_packet_bytes(
     packet_bytes: &[u8],
     csk: &[u8; CSK_LEN],
@@ -217,6 +224,15 @@ pub(crate) fn decrypt_packet_bytes(
 ) -> Result<Vec<u8>, JniError> {
     let expected = symmetric_algorithm(expected_symmetric_algorithm)?;
     let packet = decode_encrypted_packet(packet_bytes)?;
+
+    // Malformed envelope, not a security event: refuse it before the algorithm
+    // check and before any AEAD work.
+    if packet.temporal_identifier.len() != TEMPORAL_ID_LEN {
+        return Err(JniError::Argument(format!(
+            "temporal identifier must be {TEMPORAL_ID_LEN} bytes, got {}",
+            packet.temporal_identifier.len()
+        )));
+    }
 
     if packet.encryption_algorithm != expected as i32 {
         return Err(JniError::Security(format!(
@@ -957,6 +973,56 @@ mod tests {
             decrypt_packet_bytes(&[0xFF, 0xFF, 0xFF], &csk, AES),
             Err(JniError::Io(_))
         ));
+    }
+
+    /// A `temporal_identifier` that is not 16 bytes is a malformed envelope on the
+    /// path Android actually uses, so it must be an *argument* failure raised before
+    /// any decryption.
+    /// The defect this catches: `decrypt_packet_bytes` skipping the length rule that
+    /// `decrypt_encrypted_packet_with_csk_nonce` enforces, so a short identifier is
+    /// either accepted as a valid frame or reported only as an AEAD failure (which
+    /// makes a malformed envelope indistinguishable from a forged one).
+    #[test]
+    fn decrypt_packet_rejects_non_16_byte_temporal_identifier() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let csk_bytes = *csk.as_bytes();
+        let genuine = grant_packet(&csk_bytes, &keypair, AES, [0x42; 32]);
+
+        // The genuine 16-byte packet still decrypts, and to the genuine signed
+        // grant, so the rejections below are caused by the identifier length and
+        // nothing else.
+        let decrypted = decrypt_packet_bytes(&genuine, &csk_bytes, AES).unwrap();
+        let wrapper = WrapperMessage::decode(decrypted.as_slice()).unwrap();
+        match crate::protocol::messages::verify_and_decode_payload(
+            &wrapper,
+            &keypair.verifying_key_bytes(),
+            ED25519,
+        )
+        .unwrap()
+        {
+            DecodedPayload::AuthGrant(grant) => assert_eq!(grant.challenge, vec![0x42; 32]),
+            other => panic!("expected the genuine AuthGrant, got {other:?}"),
+        }
+
+        let packet = EncryptedPacket::decode(genuine.as_slice()).unwrap();
+        assert_eq!(packet.temporal_identifier.len(), TEMPORAL_ID_LEN);
+
+        for len in [5usize, 17] {
+            let mut resized = packet.clone();
+            resized.temporal_identifier = vec![0xAB; len];
+            match decrypt_packet_bytes(&resized.encode_to_vec(), &csk_bytes, AES) {
+                Err(JniError::Argument(message)) => {
+                    assert!(
+                        message.contains("temporal identifier"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => panic!(
+                    "a {len}-byte temporal identifier must be an argument error, got {other:?}"
+                ),
+            }
+        }
     }
 
     // ---------------------------------------------------------------
