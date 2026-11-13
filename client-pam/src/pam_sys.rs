@@ -3,6 +3,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
+// reason: generated bindings; the `include!`d file is bindgen output, so its
+// C naming, unused items and indexing are not ours to fix.
 #[allow(
     non_camel_case_types,
     non_snake_case,
@@ -22,8 +24,14 @@ pub use ffi::{
 
 pub type PamHandle = ffi::pam_handle_t;
 
-/// Retrieve the PAM service name (e.g. `"sudo"`, `"polkit-1"`, `"sddm"`)
-/// from the active authentication context.
+/// The `PAM_SERVICE` name (e.g. `"sudo"`, `"polkit-1"`, `"sddm"`), when it is
+/// set and UTF-8.
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate` and must outlive the call: the item read is libpam's
+/// own NUL-terminated string, valid while the handle lives.
 pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
     if pamh.is_null() {
         return None;
@@ -41,57 +49,57 @@ pub unsafe fn get_service_name(pamh: *mut PamHandle) -> Option<String> {
     }
 }
 
-/// Retrieve the username from the PAM context.
+/// The username from the PAM context.
 ///
-/// Falls back to `PAM_RUSER` (remote user) when `PAM_USER` is null.
+/// A null `PAM_USER` is `PAM_USER_UNKNOWN`, never a substitution: the module
+/// authenticates the account libpam set for this stack, and a name taken from
+/// another item would raise a phone prompt for an account the stack will not
+/// authenticate (and would key the verdict cache on it).
+///
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate`, and the `PAM_USER` item behind it is libpam's, valid
+/// while the handle lives.
 pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
     if pamh.is_null() {
         return Err(PAM_SYSTEM_ERR);
     }
     let mut item: *const c_void = std::ptr::null();
-    let mut ret = ffi::pam_get_item(pamh, PAM_USER, &mut item);
+    let ret = ffi::pam_get_item(pamh, PAM_USER, &mut item);
 
     if ret != PAM_SUCCESS {
         return Err(ret);
     }
 
-    if item.is_null() {
-        ret = ffi::pam_get_item(pamh, ffi::PAM_RUSER, &mut item);
-        if ret != PAM_SUCCESS {
-            return Err(ret);
-        }
-        if item.is_null() {
-            return Err(PAM_USER_UNKNOWN);
-        }
-    }
+    // SAFETY: `pam_get_item` succeeded, so a non-null `item` is the C string
+    // libpam holds for `PAM_USER`; a null one means the item is unset.
+    let item = if item.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(item as *const c_char) })
+    };
+    user_from_item(item)
+}
 
-    let user_cstr = CStr::from_ptr(item as *const c_char);
-    user_cstr
-        .to_str()
-        .map(|s| s.to_string())
+/// The value interpretation of [`get_user`], split out so it is testable
+/// without a PAM handle: an absent item is [`PAM_USER_UNKNOWN`], a present one
+/// must be UTF-8, and `PAM_USER` is the only input — there is no second item to
+/// fall back to.
+fn user_from_item(item: Option<&CStr>) -> Result<String, c_int> {
+    let item = item.ok_or(PAM_USER_UNKNOWN)?;
+    item.to_str()
+        .map(str::to_owned)
         .map_err(|_| PAM_USER_UNKNOWN)
 }
 
-/// Set the username in the PAM context.
+/// The conversation function libpam holds for this handle.
 ///
-/// `pam_set_item` duplicates string items internally, so the caller
-/// does not need to keep the passed pointer alive after this call.
-#[allow(dead_code)]
-pub unsafe fn set_user(pamh: *mut PamHandle, username: &str) -> Result<(), c_int> {
-    if pamh.is_null() {
-        return Err(PAM_SYSTEM_ERR);
-    }
-    let username_cstring = CString::new(username).map_err(|_| PAM_USER_UNKNOWN)?;
-    let ret = ffi::pam_set_item(pamh, PAM_USER, username_cstring.as_ptr() as *const c_void);
-
-    if ret == PAM_SUCCESS {
-        Ok(())
-    } else {
-        Err(ret)
-    }
-}
-
-/// Retrieve the PAM conversation function pointer.
+/// # Safety
+///
+/// `pamh` must be the handle libpam passed to this thread's
+/// `pam_sm_authenticate`. The `PAM_CONV` item it returns really is a
+/// `struct pam_conv` that libpam owns, valid while the handle lives.
 pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_int> {
     if pamh.is_null() {
         return Err(PAM_SYSTEM_ERR);
@@ -108,11 +116,34 @@ pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_i
     Ok(item as *const ffi::pam_conv)
 }
 
-/// Send a message to the user via the PAM conversation function.
+/// The pre-collected token read, injected through `transaction::HostIo` like every
+/// other effect so a test can count it instead of inferring it from a missing
+/// conversation.
+pub(crate) type ReadAuthtok = unsafe fn(*mut PamHandle) -> (c_int, *const c_char);
+
+/// Read `PAM_AUTHTOK` for the pre-collected handoff: `pam_get_authtok` on this
+/// thread, no prompt, whatever token libpam produces. The code and the token are
+/// returned as-is; treating a null token as "nothing was collected" is the
+/// handoff's decision.
 ///
-/// Allocates a `pam_message` on the stack and calls the conversation
-/// callback.  The `pam_response` is allocated by the conversation
-/// function (`malloc`) and freed here with `libc::free`.
+/// # Safety
+///
+/// `pamh` must be the live handle libpam passed to this thread's
+/// `pam_sm_authenticate`, and the conversation behind it belongs to this thread.
+pub(crate) unsafe fn read_authtok_for_handoff(pamh: *mut PamHandle) -> (c_int, *const c_char) {
+    let mut authtok: *const c_char = std::ptr::null();
+    let res = pam_get_authtok(pamh, PAM_AUTHTOK, &mut authtok, std::ptr::null());
+    (res, authtok)
+}
+
+/// Send a message to the user through the conversation function.
+///
+/// # Safety
+///
+/// `pamh` must be the live handle libpam passed to this thread's
+/// `pam_sm_authenticate`, so the conversation it carries is callable on this
+/// thread. The callback mallocs the `pam_response` and nothing else frees it: this
+/// function owns it and frees the response and its buffer.
 pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) -> Result<(), c_int> {
     let conv_ptr = get_conv(pamh)?;
     let conv = &*conv_ptr;
@@ -154,99 +185,14 @@ pub unsafe fn send_message(pamh: *mut PamHandle, msg_style: c_int, msg: &str) ->
     }
 }
 
-/// Prompt the user for input via the PAM conversation function.
-///
-/// Returns the response string if the user provided one, or `None` if
-/// the response was empty.
-#[allow(dead_code)]
-pub unsafe fn prompt_user(
-    pamh: *mut PamHandle,
-    msg_style: c_int,
-    msg: &str,
-) -> Result<Option<String>, c_int> {
-    let conv_ptr = get_conv(pamh)?;
-    let conv = &*conv_ptr;
-
-    let conv_fn = match conv.conv {
-        Some(f) => f,
-        None => return Err(PAM_CONV_ERR),
-    };
-
-    let msg_cstring = CString::new(msg).map_err(|_| PAM_BUF_ERR)?;
-
-    let pam_msg = ffi::pam_message {
-        msg_style,
-        msg: msg_cstring.as_ptr(),
-    };
-
-    let msg_ptr = &pam_msg as *const ffi::pam_message;
-    let msg_array = &msg_ptr as *const *const ffi::pam_message;
-    let mut resp: *mut ffi::pam_response = std::ptr::null_mut();
-
-    let ret = conv_fn(
-        1,
-        msg_array as *mut *const ffi::pam_message,
-        &mut resp as *mut *mut ffi::pam_response,
-        conv.appdata_ptr,
-    );
-
-    if ret != PAM_SUCCESS {
-        if !resp.is_null() {
-            if !(*resp).resp.is_null() {
-                libc::free((*resp).resp as *mut c_void);
-            }
-            libc::free(resp as *mut c_void);
-        }
-        return Err(ret);
-    }
-
-    let result = if !resp.is_null() {
-        unsafe {
-            let response_ref: &mut ffi::pam_response = &mut *resp;
-            let out = if !response_ref.resp.is_null() {
-                let resp_cstr = CStr::from_ptr(response_ref.resp);
-                let s = resp_cstr.to_str().ok().map(|s| s.to_string());
-                libc::free(response_ref.resp as *mut c_void);
-                response_ref.resp = std::ptr::null_mut();
-                s
-            } else {
-                None
-            };
-            libc::free(resp as *mut c_void);
-            out
-        }
-    } else {
-        None
-    };
-
-    Ok(result)
-}
-
-/// Safe wrapper for PAM conversation operations.
-///
-/// Provides a Rust-idiomatic interface to PAM conversation functions
-/// with proper lifetime management, eliminating the need for `unsafe`
-/// blocks when sending messages to users.
-///
-/// # Example
-///
-/// ```no_run
-/// # use client_pam::pam_sys::{PamHandle, PamConversation};
-/// # unsafe fn example(pamh: *mut PamHandle) -> Result<(), i32> {
-/// let pam_conv = PamConversation::new(pamh)?;
-/// pam_conv.try_info("Processing your request...");
-/// pam_conv.try_error("An error occurred");
-/// # Ok(())
-/// # }
-/// ```
+/// A checked conversation: `new` proves the handle carries a usable one, and
+/// `'a` keeps it borrowed for every `info`/`error`.
 pub struct PamConversation<'a> {
     pamh: *mut PamHandle,
     _phantom: std::marker::PhantomData<&'a mut PamHandle>,
 }
 
 impl<'a> PamConversation<'a> {
-    /// Create a new `PamConversation` wrapper.
-    ///
     /// # Safety
     ///
     /// The caller must ensure that:
@@ -254,7 +200,7 @@ impl<'a> PamConversation<'a> {
     /// - The PAM handle remains valid for the lifetime `'a`
     /// - The PAM handle is not used concurrently from other threads
     pub unsafe fn new(pamh: *mut PamHandle) -> Result<Self, c_int> {
-        let _ = get_conv(pamh)?;
+        get_conv(pamh)?;
 
         Ok(Self {
             pamh,
@@ -262,12 +208,11 @@ impl<'a> PamConversation<'a> {
         })
     }
 
-    /// Build a conversation wrapper without a PAM handle, for unit tests.
+    /// A handle-less conversation for unit tests.
     ///
-    /// `send_message`/`prompt_user` call `get_conv`, which already rejects a
-    /// null handle with `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are
-    /// clean no-ops here. Only the return-code logic that takes a
-    /// `&PamConversation` can be exercised this way.
+    /// `send_message` starts at `get_conv`, which rejects a null handle with
+    /// `PAM_SYSTEM_ERR`, so `info`/`error` fail harmlessly and `try_info`/`try_error`
+    /// only log; such a test exercises the return-code logic, not the conversation.
     #[cfg(test)]
     pub unsafe fn dummy() -> Self {
         Self {
@@ -278,45 +223,59 @@ impl<'a> PamConversation<'a> {
 
     /// Send an informational message to the user.
     pub fn info(&self, message: &str) -> Result<(), c_int> {
+        // SAFETY: `pamh` is a handle `new` validated, or null, which `get_conv`
+        // rejects before it is used.
         unsafe { send_message(self.pamh, PAM_TEXT_INFO, message) }
     }
 
     /// Send an error message to the user.
-    #[allow(dead_code)]
     pub fn error(&self, message: &str) -> Result<(), c_int> {
+        // SAFETY: as `info`.
         unsafe { send_message(self.pamh, PAM_ERROR_MSG, message) }
     }
 
-    /// Prompt the user for hidden input (e.g. password).
-    #[allow(dead_code)]
-    pub fn prompt_hidden(&self, prompt: &str) -> Result<Option<String>, c_int> {
-        unsafe { prompt_user(self.pamh, ffi::PAM_PROMPT_ECHO_OFF, prompt) }
-    }
-
-    /// Prompt the user for visible input (e.g. username).
-    #[allow(dead_code)]
-    pub fn prompt_visible(&self, prompt: &str) -> Result<Option<String>, c_int> {
-        unsafe { prompt_user(self.pamh, ffi::PAM_PROMPT_ECHO_ON, prompt) }
-    }
-
-    /// Try to send an informational message, logging any errors.
-    ///
-    /// Convenience method that never fails — useful for non-critical
-    /// user feedback.
+    /// [`info`](Self::info), logging the failure instead of returning it.
     pub fn try_info(&self, message: &str) {
         if let Err(e) = self.info(message) {
             tracing::warn!("Failed to send info message to user: PAM error code {}", e);
         }
     }
 
-    /// Try to send an error message, logging any errors.
-    ///
-    /// Convenience method that never fails — useful for non-critical
-    /// user feedback.
-    #[allow(dead_code)]
+    /// [`error`](Self::error), logging the failure instead of returning it.
     pub fn try_error(&self, message: &str) {
         if let Err(e) = self.error(message) {
             tracing::warn!("Failed to send error message to user: PAM error code {}", e);
         }
+    }
+}
+
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// A null `PAM_USER` is `PAM_USER_UNKNOWN`, and nothing else is consulted.
+    ///
+    /// Catches a fallback to another item (the retired remote-user read): the name becomes the
+    /// daemon request's `username`, the verdict cache's key and the locale lookup's NSS name, so
+    /// it would prompt the phone for an account the stack will not authenticate.
+    #[test]
+    fn null_user_does_not_fall_back_to_ruser() {
+        assert_eq!(user_from_item(None), Err(PAM_USER_UNKNOWN));
+
+        let user = CString::new("alice").unwrap();
+        assert_eq!(
+            user_from_item(Some(user.as_c_str())),
+            Ok("alice".to_owned())
+        );
+
+        let raw: &CStr = c"\xff";
+        assert_eq!(user_from_item(Some(raw)), Err(PAM_USER_UNKNOWN));
     }
 }

@@ -19,9 +19,18 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
 /// Default PAM authentication timeout for GUI contexts whose conversation the
-/// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7), in
-/// seconds. Mirrors the default in the PAM module's `PamConfig` (client-pam).
+/// module cannot drive (the sequential path — a host the rule table in
+/// `client-pam/src/policy/table.rs` does not classify as threaded), in seconds.
+/// Mirrors the default in the PAM module's `PamConfig` (client-pam).
 const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
+
+/// The PAM service names the module always refuses to take part in: `sshd` is
+/// OpenSSH's compiled-in `PAMServiceName` default, `sshd-session` the name its
+/// per-connection session binary uses on current releases. This list is the one
+/// canonical definition (the PAM module's `RemoteRefuse` and its config parser both read it);
+/// a deployment that renames `PAMServiceName` adds the new name to
+/// `pam_refused_services`, which can only add, never remove.
+pub const DEFAULT_PAM_REFUSED_SERVICES: &[&str] = &["sshd", "sshd-session"];
 
 /// Default UDP port for authentication
 const DEFAULT_UDP_PORT: u16 = 36692;
@@ -105,21 +114,32 @@ pub struct TapAuthConfig {
     pub pam_operation_timeout_secs: u64,
 
     /// Authentication timeout for graphical PAM contexts whose conversation the
-    /// module cannot drive (the sequential path, e.g. kscreenlocker <= 6.7 or an
-    /// unrecognised host).
+    /// module cannot drive (the sequential path: a host the rule table in
+    /// `client-pam/src/policy/table.rs` does not classify as threaded).
     /// Default: 30 seconds
     ///
     /// In those contexts the TapAuth wait is capped at this duration before
-    /// falling through to password entry. The PAM module additionally clamps
-    /// this to `pam_operation_timeout_secs`. Graphical hosts whose conversation
-    /// can be driven from a worker thread (polkit, kscreenlocker >= 6.8,
-    /// hyprlock, xsecurelock, GDM unlock) are bounded by
-    /// `pam_operation_timeout_secs` instead.
+    /// falling through to password entry. The PAM module additionally clamps this
+    /// to `pam_operation_timeout_secs`, and only for a sequential host **without**
+    /// a terminal; hosts whose conversation can be driven from a worker thread are
+    /// bounded by `pam_operation_timeout_secs` instead.
     ///
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a
     /// missing field would silently delete the user's setting.
     pub pam_gui_timeout_secs: u64,
+
+    /// Additional PAM service names the module must refuse to take part in.
+    ///
+    /// The built-ins ([`DEFAULT_PAM_REFUSED_SERVICES`]) are always refused; entries
+    /// here are *added* to them and cannot remove one. A deployment that renames
+    /// OpenSSH's `PAMServiceName` declares the rename here; without it that stack is
+    /// treated as local and the phone is rung for a remote login.
+    ///
+    /// This field must exist here (not only in the PAM module's own parser)
+    /// because the daemon rewrites the whole config file on SaveConfig; a
+    /// missing field would silently delete the user's setting.
+    pub pam_refused_services: Vec<String>,
 
     /// UDP port for authentication (default: 36692)
     pub udp_port: u16,
@@ -160,6 +180,10 @@ impl Default for TapAuthConfig {
         Self {
             pam_operation_timeout_secs: DEFAULT_PAM_TIMEOUT_SECS,
             pam_gui_timeout_secs: DEFAULT_PAM_GUI_TIMEOUT_SECS,
+            pam_refused_services: DEFAULT_PAM_REFUSED_SERVICES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
             udp_port: DEFAULT_UDP_PORT,
             enable_network: DEFAULT_TRANSPORT_ENABLED,
             enable_ble: DEFAULT_TRANSPORT_ENABLED,
@@ -295,6 +319,10 @@ mod tests {
         let config = TapAuthConfig::default();
         assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.pam_gui_timeout_secs, 30);
+        assert_eq!(
+            config.pam_refused_services,
+            vec!["sshd".to_string(), "sshd-session".to_string()]
+        );
         assert_eq!(config.udp_port, 36692);
         assert!(config.enable_network);
         assert!(config.enable_ble);
@@ -312,6 +340,7 @@ mod tests {
         let toml = r#"
             pam_operation_timeout_secs = 5
             pam_gui_timeout_secs = 15
+            pam_refused_services = ["sshd", "sshd-renamed"]
             udp_port = 12345
             enable_network = false
             enable_ble = false
@@ -322,6 +351,7 @@ mod tests {
         let toml = r#"
             pam_operation_timeout_secs = 5
             pam_gui_timeout_secs = 15
+            pam_refused_services = ["sshd", "sshd-renamed"]
             udp_port = 12345
             enable_network = false
             enable_ble = false
@@ -330,6 +360,10 @@ mod tests {
         let config: TapAuthConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 5);
         assert_eq!(config.pam_gui_timeout_secs, 15);
+        assert_eq!(
+            config.pam_refused_services,
+            vec!["sshd".to_string(), "sshd-renamed".to_string()]
+        );
         assert_eq!(config.udp_port, 12345);
         assert!(!config.enable_network);
         assert!(!config.enable_ble);
@@ -354,6 +388,11 @@ mod tests {
         let config: TapAuthConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 120);
         assert_eq!(config.pam_gui_timeout_secs, 30);
+        // A missing list is not "refuse nothing": the built-ins are the default.
+        assert_eq!(
+            config.pam_refused_services,
+            vec!["sshd".to_string(), "sshd-session".to_string()]
+        );
         assert_eq!(config.udp_port, 36692);
         assert!(config.enable_network);
         assert!(config.enable_ble);
@@ -369,6 +408,7 @@ mod tests {
         let config = TapAuthConfig {
             pam_operation_timeout_secs: 10,
             pam_gui_timeout_secs: 20,
+            pam_refused_services: vec!["sshd".to_string(), "sshd-renamed".to_string()],
             udp_port: 54321,
             enable_network: false,
             enable_ble: true,
@@ -386,6 +426,10 @@ mod tests {
             config.pam_operation_timeout_secs
         );
         assert_eq!(parsed.pam_gui_timeout_secs, config.pam_gui_timeout_secs);
+        assert_eq!(
+            parsed.pam_refused_services, config.pam_refused_services,
+            "the refused-service list must survive serialization"
+        );
         assert_eq!(parsed.udp_port, config.udp_port);
         assert_eq!(parsed.enable_network, config.enable_network);
         assert_eq!(parsed.enable_ble, config.enable_ble);
@@ -422,5 +466,40 @@ mod tests {
         assert_eq!(reloaded.udp_port, 36692);
         assert!(!reloaded.enable_ble);
         assert!(rewritten.contains("pam_gui_timeout_secs = 45"));
+    }
+
+    /// Regression test for the same rewrite hazard as `pam_gui_timeout_secs`.
+    ///
+    /// The defect this catches: the daemon's SaveConfig round-trip dropping
+    /// `pam_refused_services`, so a deployment that declared its renamed
+    /// `PAMServiceName` lost the refusal on the first settings change and began
+    /// ringing the phone for remote logins again.
+    #[test]
+    fn test_save_preserves_pam_refused_services() {
+        let toml = r#"
+            pam_operation_timeout_secs = 60
+            pam_refused_services = ["sshd", "sshd-session", "sshd-renamed"]
+            udp_port = 40000
+        "#;
+        let config: TapAuthConfig = toml::from_str(toml).unwrap();
+
+        // Simulate the daemon's SaveConfig: mutate unrelated fields and
+        // re-serialize the whole struct back to TOML.
+        let mut saved = config;
+        saved.udp_port = 36692;
+        saved.enable_ble = false;
+        let rewritten = toml::to_string_pretty(&saved).unwrap();
+
+        let reloaded: TapAuthConfig = toml::from_str(&rewritten).unwrap();
+        assert_eq!(
+            reloaded.pam_refused_services,
+            vec![
+                "sshd".to_string(),
+                "sshd-session".to_string(),
+                "sshd-renamed".to_string()
+            ],
+            "SaveConfig must not delete the configured refused services"
+        );
+        assert!(rewritten.contains("sshd-renamed"));
     }
 }

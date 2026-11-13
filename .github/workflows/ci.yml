@@ -210,3 +210,34 @@ jobs:
 
       - name: Run all workspace tests
         run: cargo test --workspace --verbose
+
+  musl-check:
+    name: Musl Target Build Check (client-pam)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libpam0g-dev \
+            protobuf-compiler \
+            build-essential
+
+      - name: Add the musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Check shared and client PAM module for the musl target
+        run: |
+          cargo check -p shared --target x86_64-unknown-linux-musl
+          cargo check -p client-pam --target x86_64-unknown-linux-musl

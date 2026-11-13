@@ -11,15 +11,25 @@
 pam_operation_timeout_secs = 120
 
 # Timeout for graphical PAM contexts whose conversation TapAuth cannot drive
-# (the sequential path, e.g. kscreenlocker <= 6.7 or an unrecognised host). In
-# those contexts the wait is capped at this duration before falling through to
-# password entry.
-# Graphical hosts whose conversation can be driven from a worker thread
-# (polkit, kscreenlocker >= 6.8, hyprlock, xsecurelock, GDM unlock) are bounded
-# by pam_operation_timeout_secs instead.
-# Clamped to pam_operation_timeout_secs.
+# (the sequential path: a host the rule table in `client-pam/src/policy/table.rs` does
+# not classify as threaded, or an unrecognised host). In those contexts the wait
+# is capped at this duration before falling through to password entry.
+# Graphical hosts whose conversation can be driven from a worker thread are
+# bounded by pam_operation_timeout_secs instead.
+# Clamped to pam_operation_timeout_secs, and only for a sequential host without
+# a terminal.
 # Default: 30
 pam_gui_timeout_secs = 30
+
+# Refused PAM services
+# The PAM module refuses to take part in remote authentication for OpenSSH's
+# service names ("sshd" and "sshd-session"). Those built-in names are ALWAYS
+# refused; this setting only ADDS names and cannot remove a built-in.
+# A deployment that renames OpenSSH's PAMServiceName (sshd_config) must list the
+# new name here, or remote logins through that stack are treated as local: the
+# phone is rung and the login waits out the PAM timeout.
+# Default: ["sshd", "sshd-session"]
+# pam_refused_services = ["sshd", "sshd-session"]
 
 # Network Settings
 # UDP port for the authentication protocol.
@@ -48,7 +58,7 @@ enable_ble = true
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.
 # When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).
-# This provides hardware-backed key protection - keys cannot be extracted even with root access.
+# The sealed blob cannot be used on another machine - but root here can unseal it into daemon memory to sign.
 # 
 # Requirements:
 #   - TPM 2.0 hardware available on the system

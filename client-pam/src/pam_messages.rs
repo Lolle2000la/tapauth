@@ -1,13 +1,8 @@
-//! Localized user-facing messages for the PAM module.
+//! Localized user-facing PAM messages.
 //!
-//! Uses the same Fluent (FTL) localization engine as the GUI, matching its
-//! locale detection (LC_ALL → LC_MESSAGES → LANG) and embedding FTL strings
-//! at compile time via `include_str!()`.  All keys are resolved at construction
-//! time so accessors return `&str` with zero runtime cost.
-//!
-//! When a key is missing in a non-English locale, the English bundle is used
-//! as a fallback.  Fluent parse / resource errors are logged and recovered
-//! from gracefully — PAM modules must never panic.
+//! The GUI's Fluent (FTL) engine and locale detection, with the bundles embedded at compile time
+//! and every key resolved in `new` so the accessors are plain `&str`. A parse error is logged,
+//! never fatal: a PAM module must not panic.
 
 use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
@@ -143,14 +138,12 @@ impl PamMessages {
     }
 }
 
-/// Detect locale from POSIX environment variables.
-/// Mirrors the GUI's `detect_locale()` logic.
+/// Detect locale from POSIX environment variables, as the GUI's
+/// `detect_locale()` does.
 pub fn detect_locale() -> &'static str {
     shared::l10n::detect_locale(locales_codegen::AVAILABLE_LOCALES)
 }
 
-/// Resolve the effective locale for a user, respecting the GUI's persisted
-/// preference if available.
 fn resolve_locale(username: &str) -> String {
     if let Some(loc) = load_user_locale(username) {
         return loc;
@@ -168,6 +161,8 @@ fn load_user_locale(username: &str) -> Option<String> {
         .map(|u| u.dir.to_path_buf())?;
     let path = home.join(".config/tapauth/locale");
 
+    // O_NOFOLLOW and O_NONBLOCK: as root, a planted symlink or FIFO in the
+    // user's home must neither be followed nor block the authentication.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -187,8 +182,8 @@ fn load_user_locale(username: &str) -> Option<String> {
     Some(s.trim().to_string()).filter(|s| locales_codegen::AVAILABLE_LOCALES.contains(&s.as_str()))
 }
 
-/// Load PAM messages for the given username, respecting any persisted
-/// locale preference from ~/.config/tapauth/locale.
+/// PAM messages for `username`, honouring a persisted
+/// `~/.config/tapauth/locale` preference.
 pub fn load_for_user(username: &str) -> PamMessages {
     PamMessages::new(&resolve_locale(username))
 }

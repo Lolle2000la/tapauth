@@ -4,7 +4,7 @@ TapAuth requires SELinux policy adjustments to allow display managers (like SDDM
 
 ## Problem
 
-By default, SELinux blocks `xdm_t` (display managers like SDDM) from writing to the tapauthd socket, which has the `var_run_t` context. This prevents authentication from working at the login screen and lock screen.
+By default, SELinux blocks `xdm_t` (display managers like SDDM) from writing to the tapauthd socket, `/run/tapauthd/tapauthd.sock` (`root:tapauthd-clients 0660`, `systemd/tapauthd.socket`), which has the `var_run_t` context. This prevents authentication from working at the login screen and lock screen.
 
 ## Solution
 
@@ -89,5 +89,15 @@ sudo setenforce 1  # Re-enable enforcing mode
 The install script does not automatically configure SELinux. This must be done manually after installation, as it requires:
 1. Attempting authentication to generate denials
 2. Using those denials to create the policy
+
+What the installer *does* do is label restoration, not policy: it runs
+`restorecon` (when available) on the installed daemon, PAM module and GUI, on the
+systemd units and the PolKit drop-in, and `restorecon -RF` over
+`/var/lib/tapauth`, `/var/log/tapauth` and `/run/tapauthd` including the socket
+(`install.sh`). That only re-applies the distribution's default labels, so the
+`sock_file` access rule above is still something you have to add. At the end of a
+run the installer also notices `getenforce` reporting `Enforcing` and prints the
+`ausearch … | audit2allow -M tapauth_sddm && sudo semodule -i tapauth_sddm.pp`
+quick fix from the section above.
 
 Consider running the automatic policy generation as part of your first-time setup after installing TapAuth.

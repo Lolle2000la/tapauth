@@ -1,6 +1,6 @@
-/// Simple IPC client helpers for PAM to communicate with tapauthd.
-///
-/// Provides synchronous wrappers over length-delimited protobuf IPC.
+//! Length-prefixed protobuf IPC over the tapauthd Unix socket: connect, frame,
+//! send, and read a response. `IpcResponseReader` is the seam the poll loops are
+//! generic over.
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 use shared::ipc::pb as ipc;
@@ -36,23 +36,18 @@ pub enum IpcError {
 /// Synchronous IPC client for tapauthd communication.
 pub struct IpcClient {
     stream: UnixStream,
-    // Buffer for assembling length-prefixed frames in nonblocking mode
     read_buf: BytesMut,
     expected_total: Option<usize>, // 4 (len) + payload
 }
 
 impl IpcClient {
-    /// Connect to tapauthd socket with configurable timeout for blocking operations.
-    ///
-    /// The timeout applies to connect, send, and receive operations to prevent
-    /// PAM module hangs if the daemon is unresponsive.
+    /// Connect, applying `timeout` to reads and writes so an unresponsive
+    /// daemon cannot hang the PAM stack.
     pub fn connect(timeout: Duration) -> Result<Self, IpcError> {
         let sock_path = socket_path();
 
         let stream = UnixStream::connect(&sock_path)?;
 
-        // Set timeouts for all blocking operations
-        // This prevents hanging if daemon becomes unresponsive
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
@@ -63,13 +58,11 @@ impl IpcClient {
         })
     }
 
-    /// Connect and set nonblocking immediately (for poll/select driven loops).
-    /// Does NOT set read/write timeouts since poll() handles all timing.
+    /// Connect nonblocking, without read/write timeouts: the poll loops own all
+    /// timing.
     pub fn connect_nonblocking() -> Result<Self, IpcError> {
         let sock_path = socket_path();
 
-        // Connect and immediately set nonblocking for poll-based I/O
-        // No timeouts - poll() in pam_logic.rs handles all timing
         let stream = UnixStream::connect(&sock_path)?;
         stream.set_nonblocking(true)?;
 
@@ -80,7 +73,6 @@ impl IpcClient {
         })
     }
 
-    /// Send a cancel request to the daemon with a short timeout.
     pub fn send_cancel(
         &mut self,
         reason: &str,
@@ -95,48 +87,18 @@ impl IpcClient {
         };
 
         self.send_message(&envelope)?;
-        // Short read timeout for cancel acknowledgement
+        // The stream's own timeout is the caller's; the acknowledgement gets a
+        // short one of its own.
         self.stream
             .set_read_timeout(Some(Duration::from_millis(750)))?;
         self.recv_response()
     }
 
-    /// Get the raw file descriptor (for poll/select)
+    /// The raw file descriptor, for poll/select.
     pub fn fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
 
-    /// Set socket nonblocking flag
-    pub fn set_nonblocking(&mut self, on: bool) -> Result<(), IpcError> {
-        self.stream.set_nonblocking(on).map_err(IpcError::from)
-    }
-
-    /// Send an authenticate request to the daemon.
-    pub fn send_authenticate(
-        &mut self,
-        username: &str,
-        tty_present: bool,
-        timeout_seconds: u32,
-        request_id: &str,
-    ) -> Result<ipc::PamAuthenticateResponse, IpcError> {
-        let req = ipc::PamAuthenticateRequest {
-            username: username.to_string(),
-            tty_present,
-            timeout_seconds,
-            request_id: request_id.to_string(),
-        };
-        let envelope = ipc::IpcEnvelope {
-            msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),
-        };
-
-        self.send_message(&envelope)?;
-        // Align with spec: wait exactly the session timeout
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(timeout_seconds as u64)))?;
-        self.recv_response()
-    }
-
-    /// Start authenticate request without waiting (for polling caller)
     pub fn send_authenticate_start(
         &mut self,
         username: &str,
@@ -157,14 +119,14 @@ impl IpcClient {
         self.send_message(&envelope)
     }
 
-    /// Nonblocking attempt to read a full response frame; Ok(None) if incomplete.
+    /// Nonblocking attempt to read a full response frame; `Ok(None)` if incomplete.
     pub fn try_read_response_nonblocking(
         &mut self,
     ) -> Result<Option<ipc::PamAuthenticateResponse>, IpcError> {
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
-                Ok(0) => break, // EOF or no more data
+                Ok(0) => break,
                 Ok(n) => {
                     if let Some(slice) = tmp.get(..n) {
                         self.read_buf.extend_from_slice(slice);
@@ -217,7 +179,7 @@ impl IpcClient {
         if let Some(total) = self.expected_total {
             if self.read_buf.len() >= total {
                 let frame = self.read_buf.split_to(total);
-                self.expected_total = None; // reset for next
+                self.expected_total = None;
                 let data = frame.get(4..).ok_or(IpcError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "frame too short",
@@ -247,10 +209,8 @@ impl IpcClient {
         let encoded_len = msg.encoded_len();
         let msg_len = u32::try_from(encoded_len).map_err(|_| IpcError::FrameTooLarge(u32::MAX))?;
 
-        // 4 bytes for length prefix + encoded message
         let mut buf = BytesMut::with_capacity(4 + encoded_len);
 
-        // Write length prefix
         buf.put_u32(msg_len);
 
         msg.encode(&mut buf)?;
@@ -283,14 +243,43 @@ impl IpcClient {
     }
 }
 
+/// Minimal abstraction over the IPC transport, so the poll loops can be tested
+/// with a mock backed by real file descriptors. It sits beside the client it
+/// abstracts so `transaction::Armed` depends on the transport, not on `pam_logic`.
+pub trait IpcResponseReader {
+    fn fd(&self) -> RawFd;
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<ipc::PamAuthenticateResponse>, std::io::Error>;
+    /// Best-effort cancellation of an in-flight authentication request.
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error>;
+}
+
+impl IpcResponseReader for IpcClient {
+    fn fd(&self) -> RawFd {
+        IpcClient::fd(self)
+    }
+
+    fn try_read_response_nonblocking(
+        &mut self,
+    ) -> Result<Option<ipc::PamAuthenticateResponse>, std::io::Error> {
+        IpcClient::try_read_response_nonblocking(self)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn send_cancel(&mut self, reason: &str, request_id: &str) -> Result<(), std::io::Error> {
+        IpcClient::send_cancel(self, reason, request_id)
+            .map(|_| ())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use std::io::Write as _;
 
-    // Helper to build an IpcClient around an existing UnixStream (test-only)
     fn client_from_stream(stream: UnixStream) -> IpcClient {
         IpcClient {
             stream,
@@ -319,7 +308,6 @@ mod tests {
     #[test]
     fn frame_too_large_nonblocking() {
         let (mut a, b) = UnixStream::pair().expect("failed to create socket pair");
-        // Set client nonblocking and wrap
         b.set_nonblocking(true).expect("failed to set nonblocking");
         let mut cli = client_from_stream(b);
 

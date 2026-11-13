@@ -1,13 +1,8 @@
-//! Logging configuration for client-pam
+//! Logging for the PAM module: journald under systemd, plus a stderr layer when
+//! running outside it (systemd already forwards stderr, so both would duplicate).
 //!
-//! Logs go to journald (via `tracing-journald`).  When running outside
-//! systemd, a stderr layer is added for terminal visibility.  Under
-//! systemd the stderr layer is skipped because systemd already forwards
-//! stderr to the journal, avoiding duplicate entries.
-//!
-//! Environment variables:
-//! - `TAPAUTH_LOG_LEVEL`: Controls stderr log level (default: warn)
-//! - `TAPAUTH_JOURNALD_LOG_LEVEL`: Controls journald log level (default: info)
+//! `TAPAUTH_LOG_LEVEL` sets the stderr level (default `warn`);
+//! `TAPAUTH_JOURNALD_LOG_LEVEL` the journald level (default `info`).
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -26,6 +21,8 @@ pub fn init_logging() {
     let journald_level =
         std::env::var("TAPAUTH_JOURNALD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
+    // Every arm installs the subscriber once; `try_init` failing because one is
+    // already installed is normal, so the result is ignored.
     if let Ok(journald_layer) = tracing_journald::layer() {
         if std::env::var("JOURNAL_STREAM").is_ok() {
             let filter =

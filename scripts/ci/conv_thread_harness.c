@@ -1,6 +1,6 @@
 /*
  * conv_thread_harness.c — drives a real PAM stack through pam_tapauth.so to
- * prove the threaded-conversation path end to end.
+ * prove the conversation strategies end to end.
  *
  * WHY THIS EXISTS
  *   `client-pam` picks between three GUI strategies at runtime:
@@ -12,8 +12,8 @@
  *     - Sequential: the conversation is never touched; the module only waits
  *       for the daemon.
  *
- *   The choice is an allowlist keyed on the calling process (see
- *   `conversation_mode` in client-pam/src/pam_logic.rs).  None of it is
+ *   The choice is a rule table keyed on the caller's PAM service name and
+ *   process name (see `RULES` in client-pam/src/policy/table.rs).  None of it is
  *   reachable from a Rust unit test: it needs a real libpam stack, a real
  *   dynamically loaded module, and a process whose `/proc/self/exe` has the
  *   allowlisted name.
@@ -22,26 +22,23 @@
  *   - A private PAM confdir (created by scripts/ci/test-pam-conv-thread.sh)
  *     holds the service file named by $CONV_TEST_SERVICE.  Its first `auth`
  *     entry is the freshly built `libclient_pam.so` by absolute path; what
- *     follows depends on the stack shape under test (see the script):
- *     `sufficient` + a token check, `required` + a token check, `required` +
- *     `optional pam_permit.so`, or a bare `sufficient` (the `grant` shape, whose
- *     grant comes from the phone rather than from a password the next module
- *     would have accepted).  $CONV_TEST_SERVICE is therefore not fixed here.
+ *     follows depends on the stack shape under test (the script lists them).
+ *     $CONV_TEST_SERVICE is therefore not fixed here.
  *   - A fake daemon listens on $TAPAUTHD_SOCK and accepts the module's
- *     connection.  In every mode but `grant` it then only drains the request
- *     and never answers, never closes: the module must reach the password path
- *     on its own rather than from a daemon response.  In `grant` mode it waits
- *     until the conversation has been entered and then writes a granted
- *     `IpcEnvelope`, so the grant always lands while the conversation is still
- *     parked.  Its accept count is what makes "did the module contact the
- *     daemon at all?" observable.
+ *     connection.  Outside `grant` and `daemon-timeout` it then only drains the
+ *     request and never answers, never closes: the module must reach the
+ *     password path on its own rather than from a daemon response.  Its accept
+ *     count is what makes "did the module contact the daemon at all?"
+ *     observable.
  *   - The conversation blocks in `PAM_PROMPT_ECHO_OFF` until a helper thread
  *     writes a password after ~200 ms, and records on which thread it ran and
  *     whether it had returned by the time `pam_authenticate` came back.
  *     With $CONV_TEST_PRECOLLECT=1 it instead replays the stored password
  *     immediately, which is what swaylock/gtklock/i3lock do.  With
- *     $CONV_TEST_BLOCK=cancel it instead parks in `pthread_cond_wait` and is
- *     never signalled: the conversation can only end by being cancelled.
+ *     $CONV_TEST_BLOCK=cancel it instead parks in a cancellation point that is
+ *     never signalled.  Every `PAM_TEXT_INFO`/`PAM_ERROR_MSG` it is handed is
+ *     counted (`conv_text_info`), so "a skipped call showed the user nothing" is
+ *     an assertion the script can make rather than a claim.
  *   - The script copies this binary to the allowlisted process name under test
  *     (`kscreenlocker_worker`, `swaylock`, `gdm-session-worker`) and runs the
  *     copy, so `/proc/self/exe`'s basename is on the allowlist.  A symlink
@@ -65,67 +62,31 @@
  *                                          conversation was parked: entered,
  *                                          off the calling thread, NEVER
  *                                          returned, daemon >= 1
+ *                             daemon-timeout
+ *                                        — the daemon answered `PamOutcome::
+ *                                          Timeout` while the conversation was
+ *                                          parked: entered, off the calling
+ *                                          thread, NEVER returned, daemon >= 1,
+ *                                          and exactly one message (the wait
+ *                                          announcement).  A daemon-side
+ *                                          timeout is silent, unlike the
+ *                                          module's own deadline.
  *                             precollect — conversation entered, returned, ON
  *                                          the calling thread, daemon == 0
  *                             bypass     — conversation not entered, daemon == 0
- *                             every `duplicate*` mode runs several complete
- *                             transactions on separate handles in one process,
- *                             kept open until the end because `pam_end`
- *                             unloads the module (and with it the window):
- *                             duplicate  — user, user, (300 ms) user,
- *                                          (300 ms) user: all four must grant
- *                                          and the fake daemon must have
- *                                          accepted exactly TWO connections.
- *                                          The immediate second transaction is
- *                                          the duplicate a lock screen issues;
- *                                          it and the T0+300 ms call are
- *                                          answered from the window under any
- *                                          model, while the T0+600 ms call is
- *                                          outside the fixed 500 ms window and
- *                                          must start a real one again (a
- *                                          sliding window, which re-records on
- *                                          each hit, fails on the count).
- *                             duplicate-unavailable
- *                                        — user, user, but the fake daemon
- *                                          hangs up on the first connection, so
- *                                          both transactions conclude
- *                                          `PAM_AUTHINFO_UNAVAIL` with exactly
- *                                          ONE accepted connection: the
- *                                          concluded failure, not just a
- *                                          success, is what gets reused.  A
- *                                          second connection (which only a
- *                                          broken window produces) is granted,
- *                                          so the regression shows up in the
- *                                          verdict too.
- *                             duplicate-cross-user
- *                                        — user-a, user-b against a granting
- *                                          daemon: both must grant and the
- *                                          daemon must have accepted TWO
- *                                          connections.  A negative test: the
- *                                          window is keyed on the user, so a
- *                                          second user must always be asked for
- *                                          independently.
- *                             duplicate-cross-service
- *                                        — the same user against two different
- *                                          services (CONV_TEST_SERVICE and
- *                                          CONV_TEST_SERVICE_2), granting
- *                                          daemon: both must grant and the
- *                                          daemon must have accepted TWO
- *                                          connections.  The second negative
- *                                          test: the window is also keyed on
- *                                          the PAM service, so another stack
- *                                          must always ring the phone.
+ *                             duplicate, duplicate-unavailable,
+ *                             duplicate-cross-user, duplicate-cross-service,
  *                             duplicate-after-slow-module
- *                                        — user, user, granting daemon, against
- *                                          a stack whose second `auth` line is
- *                                          `pam_exec.so /bin/sleep 0.8`: the
- *                                          first call returns ~800 ms after the
- *                                          module did, so the immediate
- *                                          duplicate is outside the 500 ms
- *                                          window and must reach the daemon
- *                                          (TWO connections).  This pins the
- *                                          window's end, the documented
- *                                          limitation of the suppression.
+ *                                        — several complete transactions on
+ *                                          separate handles in one process,
+ *                                          kept open until the end because
+ *                                          `pam_end` unloads the module (and
+ *                                          with it the reuse window).  Each
+ *                                          asserts the fake daemon's accept
+ *                                          count; the stacks and counts are in
+ *                                          the shape list in
+ *                                          scripts/ci/test-pam-conv-thread.sh
+ *                                          and `run_duplicate_sequence` below.
  *     CONV_TEST_PRECOLLECT  `1` makes the conversation replay the password
  *                           immediately instead of waiting for the helper
  *     CONV_TEST_BLOCK       `cancel` makes the `PAM_PROMPT_ECHO_OFF` branch park
@@ -169,14 +130,17 @@ static int precollect;
 /* `grant` mode: the fake daemon answers with a granted envelope, and the
  * conversation parks in a cancellation point until the module abandons it. */
 static int grant_mode;
-/* `duplicate-unavailable` mode: the fake daemon accepts and closes at once, so
- * the module concludes `PAM_AUTHINFO_UNAVAIL` through its IPC-error path in
- * milliseconds instead of waiting out a timeout. */
+/* `daemon-timeout` mode: the fake daemon answers with `PamOutcome::Timeout`
+ * instead, so the timeout originates daemon-side rather than from the module's
+ * own deadline. */
+static int daemon_timeout_mode;
+/* `duplicate-unavailable` mode: the fake daemon accepts and closes at once, so the
+ * module concludes `PAM_AUTHINFO_UNAVAIL` through its IPC-error path in milliseconds
+ * instead of waiting out a timeout. */
 static int close_immediately;
 static int block_cancel;
-/* `duplicate` mode: the conversation parks in a `sem_wait` instead of the
- * condition variable.  `sem_wait` is a cancellation point and holds no mutex,
- * so a cancelled waiter cannot leave a lock behind for the next transaction. */
+/* Every `duplicate*` mode: the conversation parks in a `sem_wait` instead of the
+ * condition variable (see `test_conv`). */
 static int block_sem;
 static sem_t conv_park_sem;
 static pthread_mutex_t conv_block_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -186,6 +150,10 @@ static atomic_int conv_entered;
 static atomic_int conv_returned;
 static atomic_int conv_ran_on_main_thread;
 static atomic_int daemon_accepted;
+/* Every `PAM_TEXT_INFO`/`PAM_ERROR_MSG` the module sent through the
+ * conversation.  The skip paths (`RemoteRefuse`, `DmLoginBypass`) and the pre-collected handoff (`PreCollectedLocks`)
+ * emit no notice; a participation announces its wait. */
+static atomic_int conv_text_info;
 
 static void fail(const char *what) {
     fprintf(stderr, "RESULT: FAIL %s\n", what);
@@ -300,7 +268,10 @@ static int test_conv(int num_msg, const struct pam_message **msg,
             break;
         case PAM_TEXT_INFO:
         case PAM_ERROR_MSG:
-            /* Informational only: return immediately. */
+            /* Informational only: return immediately, but count it.  A skipped
+             * call must send none at all, and a participating one sends its
+             * single announcement, which is what makes the count an assertion. */
+            atomic_fetch_add(&conv_text_info, 1);
             break;
         default:
             free(out);
@@ -338,8 +309,8 @@ typedef struct {
 } conn_arg;
 
 /*
- * A granted `IpcEnvelope`, in the length-prefixed framing every IPC message
- * uses (4-byte big-endian length, then the protobuf body):
+ * A granted `IpcEnvelope`, in the length-prefixed framing every IPC message uses
+ * (4-byte big-endian length, then the protobuf body):
  *
  *   00 00 00 02   body length = 2
  *   62            field 12 (`pam_response`, wire type 2) => (12 << 3) | 2
@@ -348,13 +319,31 @@ typedef struct {
  * An empty response decodes as `outcome = SUCCESS` (0, the first declared
  * `PamOutcome`, so proto3 omits the default) with an empty `challenge` and
  * `detail`.  client-pam accepts exactly that: `map_pam_outcome` switches on
- * `outcome` only, and nothing correlates `challenge` against the request (the
- * proto comment calls it informational; `response_outcome` reads only the raw
- * `outcome` field).  So there is nothing to echo back from the request bytes.
+ * `outcome` only, and nothing correlates `challenge` against the request, so
+ * there is nothing to echo back from the request bytes.
  */
 static const unsigned char grant_frame[] = {
     0x00, 0x00, 0x00, 0x02, /* big-endian body length */
     0x62, 0x00,             /* IpcEnvelope.pam_response {} */
+};
+
+/*
+ * A `PamAuthenticateResponse { outcome: TIMEOUT }` in the same framing:
+ *
+ *   00 00 00 04   body length = 4
+ *   62            field 12 (`pam_response`, wire type 2) => (12 << 3) | 2
+ *   02            the response's length = 2
+ *   08 02         field 1 (`outcome`), varint 2 = TIMEOUT
+ *
+ * `TIMEOUT` is the daemon's own verdict ("no response within session timeout"),
+ * which client-pam maps to `DaemonTimedOut` — deliberately *silent*, unlike the
+ * module's own `TimedOut` (`client-pam/src/outcome.rs`).  This frame is what
+ * lets an e2e shape assert that difference: the daemon decides, so the user has
+ * already stopped waiting and gets no message about it.
+ */
+static const unsigned char timeout_frame[] = {
+    0x00, 0x00, 0x00, 0x04, /* big-endian body length */
+    0x62, 0x02, 0x08, 0x02, /* IpcEnvelope.pam_response { outcome: TIMEOUT } */
 };
 
 #define GRANT_WAIT_TOTAL_MS 2000
@@ -384,11 +373,36 @@ static void wait_for_conversation(void) {
 }
 
 /*
- * Consume whatever the module sends and then hold the connection open: closing
- * it would surface as POLLHUP and turn the run into an IPC error, and sending
- * a response would let the daemon win the race the test is measuring — except
- * in `grant` mode, where winning that race *after* the conversation has parked
- * is precisely the behaviour under test.
+ * Write a complete frame to the module, retrying short writes and EINTR. A
+ * frame that only arrives in part would be decoded as a hang-up, so a failed
+ * write is a hard failure of the run.
+ */
+static void write_frame(int fd, const unsigned char *frame, size_t len,
+                        const char *what) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, frame + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        fprintf(stderr, "RESULT: FAIL write() of %s to the module failed\n",
+                what);
+        fflush(stdout);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
+/*
+ * Consume whatever the module sends and then hold the connection open: closing it
+ * would surface as POLLHUP and turn the run into an IPC error, and an unsolicited
+ * response would let the daemon win the race the test is measuring — except in
+ * `grant` and `daemon-timeout` mode, where answering *after* the conversation has
+ * parked is precisely the behaviour under test.
  */
 static void *conn_reader(void *arg) {
     int fd = ((conn_arg *)arg)->fd;
@@ -399,30 +413,25 @@ static void *conn_reader(void *arg) {
         /* `duplicate-unavailable`: the first connection is accepted and closed
          * with no response, so the module sees POLLHUP and concludes
          * `PAM_AUTHINFO_UNAVAIL` at once (`test_gui_loop_daemon_hangup` covers
-         * that path).  Any *later* connection is granted instead: with the
-         * reuse window neutered the duplicate transaction really does reach the
-         * daemon, and then it must be caught on the verdict too (the second
-         * call would succeed instead of repeating the failure), not only on the
-         * accept count. */
+         * that path).  Any *later* connection is granted instead, so that a
+         * broken reuse window is caught on the verdict (the second call would
+         * succeed instead of repeating the failure), not only on the count. */
         close(fd);
         return NULL;
     }
 
-    if (grant_mode || close_immediately) {
+    if (daemon_timeout_mode) {
+        /* The daemon's own timeout: wait until the host's conversation is
+         * parked, then answer `TIMEOUT` — the response must land while the
+         * worker is still blocked, so the run measures the module's reaction to
+         * a daemon verdict rather than password fallback. */
         wait_for_conversation();
-
-        size_t off = 0;
-        while (off < sizeof grant_frame) {
-            ssize_t n = write(fd, grant_frame + off, sizeof grant_frame - off);
-            if (n > 0) {
-                off += (size_t)n;
-                continue;
-            }
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            fail("write() of the granted response to the module failed");
-        }
+        write_frame(fd, timeout_frame, sizeof timeout_frame,
+                    "the timeout response");
+    } else if (grant_mode || close_immediately) {
+        wait_for_conversation();
+        write_frame(fd, grant_frame, sizeof grant_frame,
+                    "the granted response");
     }
 
     char buf[512];
@@ -526,30 +535,9 @@ typedef struct {
  * while the first one is still running): several complete PAM transactions on
  * separate handles in one process.  Only the transactions the reuse window does
  * not cover may reach the daemon, so the fake daemon's accept count is the
- * discriminator for every variant:
- *
- *   duplicate              user, user, (300 ms) user, (300 ms) user
- *                          daemon grants twice.  The immediate duplicate and
- *                          the T0+300 ms call are hits under any model; the
- *                          T0+600 ms call is outside the fixed 500 ms window
- *                          and must start a real transaction again, while a
- *                          sliding window (which re-records on each hit) would
- *                          still answer it and leave the count at 1;
- *   duplicate-unavailable  user, user                   daemon hangs up once
- *                          both transactions conclude `PAM_AUTHINFO_UNAVAIL`
- *                          from a single connection, so a concluded failure is
- *                          reused too;
- *   duplicate-cross-user   user-a, user-b               daemon grants twice
- *                          a negative test: the window is per user, so a second
- *                          user must be asked for independently;
- *   duplicate-after-slow-module
- *                          user, user                   daemon grants twice
- *                          the window's *end*, pinned: a module after
- *                          `pam_tapauth.so` blocks 800 ms, so the first
- *                          `pam_authenticate` returns > 800 ms after the
- *                          module did and the immediate duplicate is already
- *                          outside the 500 ms window.  Suppression must not
- *                          cover it: the phone is rung twice.
+ * discriminator for every variant.  The stacks and the expected counts are in the
+ * shape list in scripts/ci/test-pam-conv-thread.sh; this function owns the step
+ * sequences below.
  *
  * The conversation is parked in a cancellation point nothing signals (see
  * `block_sem`), so no password is ever delivered and a `PAM_SUCCESS` can only
@@ -613,6 +601,7 @@ static void run_duplicate_sequence(const char *confdir, const dup_step *steps,
     int accepted = atomic_load(&daemon_accepted);
     printf("conv_entered: %d\n", entered);
     printf("daemon_accepted: %d\n", accepted);
+    printf("conv_text_info: %d\n", atomic_load(&conv_text_info));
 
     for (int i = 0; i < count; i++) {
         if (verdicts[i] != steps[i].expected) {
@@ -682,6 +671,7 @@ int main(void) {
 
     int mode_threaded = strcmp(assert_mode, "threaded") == 0;
     int mode_grant = strcmp(assert_mode, "grant") == 0;
+    int mode_daemon_timeout = strcmp(assert_mode, "daemon-timeout") == 0;
     int mode_precollect = strcmp(assert_mode, "precollect") == 0;
     int mode_bypass = strcmp(assert_mode, "bypass") == 0;
     int mode_duplicate = strcmp(assert_mode, "duplicate") == 0;
@@ -694,11 +684,12 @@ int main(void) {
     int duplicate_mode = mode_duplicate || mode_dup_unavail ||
                          mode_dup_cross_user || mode_dup_cross_service ||
                          mode_dup_slow_module;
-    if (!mode_threaded && !mode_grant && !mode_precollect && !mode_bypass &&
-        !duplicate_mode) {
-        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'precollect', 'bypass', "
-             "'duplicate', 'duplicate-unavailable', 'duplicate-cross-user', "
-             "'duplicate-cross-service' or 'duplicate-after-slow-module'");
+    if (!mode_threaded && !mode_grant && !mode_daemon_timeout &&
+        !mode_precollect && !mode_bypass && !duplicate_mode) {
+        fail("CONV_TEST_MODE must be 'threaded', 'grant', 'daemon-timeout', "
+             "'precollect', 'bypass', 'duplicate', 'duplicate-unavailable', "
+             "'duplicate-cross-user', 'duplicate-cross-service' or "
+             "'duplicate-after-slow-module'");
         return 1; /* unreachable: fail() exits */
     }
 
@@ -706,16 +697,15 @@ int main(void) {
     precollect = (precollect_env != NULL && strcmp(precollect_env, "1") == 0) ||
                  mode_precollect;
 
-    /* The granting variants also need the daemon to grant a second connection:
-     * with the reuse window neutered the duplicate transaction really does
-     * reach the daemon, and only then is the accepted count what makes the
-     * regression visible.  `duplicate-unavailable` needs the opposite on the
-     * first connection -- a hang-up -- and gets it from `close_immediately`
-     * below; any later connection there is granted, so the regression is caught
-     * on the verdict as well as the count. */
+    /* The granting variants also need the daemon to grant a later connection: with
+     * the reuse window neutered the duplicate transaction really does reach the
+     * daemon, and only then is the accepted count what makes the regression
+     * visible.  `duplicate-unavailable` needs a hang-up on the first connection
+     * instead (see `conn_reader`). */
     grant_mode = mode_grant || mode_duplicate || mode_dup_cross_user ||
                  mode_dup_cross_service || mode_dup_slow_module;
     close_immediately = mode_dup_unavail;
+    daemon_timeout_mode = mode_daemon_timeout;
 
     const char *block_env = getenv("CONV_TEST_BLOCK");
     if (block_env != NULL && *block_env != '\0') {
@@ -803,16 +793,14 @@ int main(void) {
             {service, user, 0, PAM_SUCCESS},
             /* The modelled 0.37 ms duplicate: a hit under every model. */
             {service, user, 0, PAM_SUCCESS},
-            /* T0 + ~300 ms: still a hit under *both* a fixed window and a
-             * sliding one that re-records on each hit, so this step alone
-             * proves nothing about which the module implements. */
+            /* T0 + ~300 ms: still a hit under both a fixed and a sliding window,
+             * so this step alone proves nothing about which is implemented. */
             {service, user, 300, PAM_SUCCESS},
-            /* T0 + ~600 ms: 600 ms after the *original* verdict, so a fixed
-             * window misses and a new transaction must start (daemon contact
-             * 2).  A sliding window would have re-recorded at T0 + ~300 ms and
-             * would still hit here, leaving the count at 1.  `nanosleep` never
-             * sleeps *less* than requested, so overshoot can only push this
-             * further outside the window, never back inside it. */
+            /* T0 + ~600 ms: 600 ms after the *original* verdict, so a fixed window
+             * misses and a new transaction must start (daemon contact 2), while a
+             * sliding window would have re-recorded at T0 + ~300 ms and would still
+             * hit here.  `nanosleep` never sleeps *less* than requested, so
+             * overshoot can only push this further outside the window. */
             {service, user, 300, PAM_SUCCESS},
         };
         const dup_step unavailable_steps[] = {
@@ -827,14 +815,13 @@ int main(void) {
             {service, user, 0, PAM_SUCCESS},
             {other_service, user, 0, PAM_SUCCESS},
         };
-        /* The window's end: the same user and service, and the second call
-         * issued immediately after the first returned — but the stack puts
+        /* The window's end: the same user and service, and the second call issued
+         * immediately after the first returned — but the stack puts
          * `pam_exec.so /bin/sleep 0.8` after `pam_tapauth.so`, so the first
          * `pam_authenticate` only comes back ~800 ms after the module did.  The
          * window is anchored at the module's return, so the duplicate is already
-         * well outside the 500 ms it covers and must ring the phone again
-         * (two accepts).  Widening the window past 800 ms turns this into one
-         * accept. */
+         * well outside the 500 ms it covers and must ring the phone again (two
+         * accepts).  Widening the window past 800 ms turns this into one accept. */
         const dup_step slow_module_steps[] = {
             {service, user, 0, PAM_SUCCESS},
             {service, user, 0, PAM_SUCCESS},
@@ -885,12 +872,13 @@ int main(void) {
     printf("conv_returned: %d\n", returned);
     printf("conv_ran_on_main_thread: %d\n", on_main);
     printf("daemon_accepted: %d\n", accepted);
+    printf("conv_text_info: %d\n", atomic_load(&conv_text_info));
 
     int end_status = pam_end(pamh, auth_ret);
 
-    /* The stack verdict is the point of the per-shape expectation: on a
-     * `sufficient` line a password collected by the worker must still let the
-     * stack succeed, and on a `required` line there must be no grant at all. */
+    /* The stack verdict, per the `sufficient`/`required` split: a password the
+     * worker collected must let a `sufficient` stack succeed, and a `required`
+     * stack must not grant at all. */
     if (expect_success && auth_ret != PAM_SUCCESS) {
         fprintf(stderr,
                 "expected pam_authenticate to grant (password fallback on a "
@@ -941,6 +929,41 @@ int main(void) {
         }
         if (accepted < 1) {
             fail("the fake daemon accepted no connection");
+        }
+    } else if (mode_daemon_timeout) {
+        /* The daemon answered `PamOutcome::Timeout` while the host's
+         * conversation was parked: the verdict is the daemon's own timeout, not
+         * this module's deadline.  All five facts are needed to rule out every
+         * other explanation for the failing stack:
+         *   - nothing was collected, so this is not password fallback;
+         *   - the daemon was contacted, so the verdict came off the wire;
+         *   - the worker ran off the calling thread, so the threaded strategy
+         *     handled it;
+         *   - the user saw exactly one message: the wait announcement a
+         *     participation always shows, and nothing for the timeout itself.
+         *     `DaemonTimedOut` has no notice in `Outcome::notice`, while this
+         *     module's own `TimedOut` is announced — so a second message is the
+         *     regression this shape exists to catch. */
+        if (!entered) {
+            fail("the conversation was never entered (threaded mode not selected?)");
+        }
+        if (on_main) {
+            fail("the conversation ran on the pam_authenticate thread, not the worker");
+        }
+        if (returned) {
+            fail("the conversation returned a password: a daemon-side timeout "
+                 "cannot be distinguished from password fallback (worker not "
+                 "cancelled?)");
+        }
+        if (accepted < 1) {
+            fail("the fake daemon accepted no connection");
+        }
+        if (atomic_load(&conv_text_info) != 1) {
+            fprintf(stderr,
+                    "conv_text_info: %d, expected the single wait announcement "
+                    "and no message for the daemon's own timeout\n",
+                    atomic_load(&conv_text_info));
+            fail("a daemon-side timeout must not be announced");
         }
     } else if (mode_precollect) {
         if (!entered) {

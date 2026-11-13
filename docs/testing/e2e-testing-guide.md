@@ -225,6 +225,7 @@ Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.
 - `./scripts/ci/check-production-build.sh` verifies the shipped binaries contain no dev env-var overrides.
 - `./scripts/ci/test-pam-host-cases.sh` (root, in the `build-and-test` job) pins the module's non-interactive verdicts against real `/etc/pam.d` stacks — TTY-less wait announcement, display-manager bypass, `sufficient` fallthrough and double invocation; see the section below.
+- `./scripts/ci/test-pam-conv-thread.sh` (unprivileged, in the same `build-and-test` job) drives the module's three conversation strategies through the 16 real PAM stack shapes of the caller corpus — password fallback on `sufficient`, fail-closed on `required`, the keyring-bypass shape, pre-collected hosts, the phone winning while the host is parked, the duplicate family and the refused `sshd`/`sshd-session` names; see the section below.
 - `tapauth-ipc-cli` is a testing-only admin harness and is deliberately **not** shipped by the distro packages. The E2E runner builds it from the workspace and the container runs reuse that binary through the mounted workspace (`scripts/ci/run-all-e2e.sh`).
 - The CI pipeline builds real `.deb`/`.rpm`/`.pkg.tar.zst` packages and runs the suite against an installed Ubuntu package on the host plus installed Fedora/Arch packages inside systemd containers; see `.github/workflows/ci-android.yml`, `scripts/ci/run-all-e2e.sh`, `scripts/ci/run-systemd-container.sh` and `scripts/ci/run-container-e2e.sh`.
 
@@ -294,14 +295,43 @@ status, and prints the elapsed time on failure:
 | `double_invocation_never_ignore` | `0868f81`; widened by the verdict cache | a second invocation of the module in the same transaction also returns exactly `9`, and it is answered from the per-process verdict cache: exactly one daemon connection and exactly one `${GUI_TIMEOUT_SECS}`s wait are observed (more than half a wait, less than one and a half), so a regression that loses the cache shows up as a second connection and a second wait |
 | `fast_path_does_not_announce_the_wait` | `c40543f` | with no daemon the module fails fast (exactly `9`, `< 1.5 s`) and emits **no** `TEXT_INFO`; it does emit a `PAM_ERROR_MSG` ("Cannot connect to daemon…"), which is allowed and expected — only the wait announcement is forbidden on a path that never waits |
 
+### PAM Conversation Shapes (`scripts/ci/test-pam-conv-thread.sh`)
+
+The module's other half — how it talks to the host's PAM conversation — is
+covered by a second suite. The choice is made by a rule table keyed on the
+caller (`classify` in `client-pam/src/policy.rs`, table in
+`client-pam/src/policy/table.rs`); the decision can be asserted from the corpus,
+but *executing* it cannot: that needs a real libpam stack, a dynamically loaded
+`pam_tapauth.so`, and a process whose `/proc/self/exe` basename is on the table.
+The rules behind the table are documented in
+[`docs/design-documents/pam-module.md`](../design-documents/pam-module.md).
+
+It runs **unprivileged** and needs Linux-PAM ≥ 1.5 (`pam_start_confdir`, so it
+writes no file under `/etc/pam.d`), `gcc` and the `libpam` headers; it builds the
+module itself in release with `dev-socket-override` (the socket is the script's
+own, under `$TMPDIR`) and compiles its C harness into `$TMPDIR`.
+
+Each executed shape is one `e2e=1` row of the shared caller corpus
+(`client-pam/tests/fixtures/callers.csv`, 16 rows today): the row supplies the
+service name, the `exe` name, the env value and mode, and its `case` arm supplies
+the stack and the assertions. The run fails if a row has no arm, if the executed
+count differs from the corpus, or if it drops below the script's floor of 15.
+Every row asserts numeric facts — daemon accept counts, whether the conversation
+was entered (and on which thread), the number of messages shown, and the token
+marker that the module after `pam_tapauth.so` sees.
+
+```bash
+./scripts/ci/test-pam-conv-thread.sh
+```
+
 ### Manual test matrix (cannot be automated)
 
 These need a real desktop session or a real distro install and stay manual:
 
 | Scenario | Do | Observe | Failure looks like |
 | :--- | :--- | :--- | :--- |
-| GDM / gnome-shell password entry | install the module, log out to GDM, start typing at the password prompt | the password field is revealed immediately (the `TEXT_INFO` arrives before the wait) and accepts typing during the wait; TapAuth does not consume that input, so it only counts once the next password module prompts — i.e. after the GUI timeout (`pam_gui_timeout_secs`) | no prompt/field until the TapAuth timeout elapses, or the session hangs with a frozen spinner |
-| KDE lock screen (`kscreenlocker_worker`) | lock the session with a paired phone present but unlocked/away | one "Waiting for your phone…" message, the unlock field is revealed during the wait (the threaded conversation collects the password with `pam_get_authtok` and leaves it in `PAM_AUTHTOK`, so it is not consumed by TapAuth and the next password module uses it), and unlocking with the password works immediately — TapAuth stops waiting as soon as it is entered, while the phone wait runs to `pam_operation_timeout_secs`, not the 30 s GUI timeout | the lock screen freezes, never shows the field, or the worker dies (lock screen crash / X session reset) |
+| GDM / gnome-shell password entry | install the module, log out to GDM, start typing at the password prompt | on a **login** TapAuth is bypassed (`DmLoginBypass` `skip_keyring`, `client-pam/src/policy/table.rs`): no message, no wait, and `PAM_AUTHTOK` is left for the keyring module, so the field is available immediately; on a **reauthentication** (`GDM_SESSION_FOR_REAUTH`, `GdmReauthWorker`) the conversation is threaded, one "Waiting for your phone…" message is shown, the field accepts typing during the wait, and the wait runs to `pam_operation_timeout_secs` | no prompt/field until a TapAuth timeout elapses, or the session hangs with a frozen spinner |
+| KDE lock screen (`kscreenlocker_worker`) | lock the session with a paired phone present but unlocked/away | one "Waiting for your phone…" message, the unlock field is revealed during the wait (the `kscreenlocker_worker` row of the rule table in `client-pam/src/policy/table.rs` is threaded, so the conversation collects the password with `pam_get_authtok` and leaves it in `PAM_AUTHTOK` — it is not consumed by TapAuth and the next password module uses it), and unlocking with the password works immediately — TapAuth stops waiting as soon as it is entered, while the phone wait runs to `pam_operation_timeout_secs`, not the 30 s GUI timeout | the lock screen freezes, never shows the field, or the worker dies (lock screen crash / X session reset) |
 | Arch GDM boot with the required stack | on a real Arch GDM install, put `auth required pam_tapauth.so`, `auth optional pam_permit.so`, `auth required pam_env.so` in `/etc/pam.d/gdm-password` | login without a phone fails (returns the password prompt / denies), never grants a session | you land on the desktop with only the password (or with no credentials) — a `PAM_IGNORE` verdict would have granted the stack |
 | Distro `sufficient` line | use the packaged `sufficient`/`[success=1 default=ignore]` line from `packaging/` | login with the phone → session starts; without the phone → password prompt; wrong password → rejected | TapAuth silently succeeds without the phone, or the password prompt never appears |
 

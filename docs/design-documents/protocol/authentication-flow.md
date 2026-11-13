@@ -50,7 +50,7 @@ To ensure confidentiality and privacy, all post-pairing communication is encrypt
     1.  Construct the full `WrapperMessage` with the desired payload (e.g., `AuthenticationRequest`).
     2.  Serialize the `WrapperMessage` to a byte array.
     3.  Construct the `EncryptedPacket`.
-    4.  Set the `encryption_algorithm` field to the algorithm agreed upon during pairing (e.g., `AES_256_GCM`).
+    4.  Set the `encryption_algorithm` field to `AES_256_GCM` — the only value `SymmetricAlgorithm` defines, and the value every shipped path writes (`create_encrypted_packet` / `create_encrypted_packet_with_csk_nonce` in `shared/src/protocol/packet.rs`); the algorithm negotiated at pairing is not consulted at transmission time.
     5.  Encrypt the serialized `WrapperMessage` using the specified algorithm and the shared `CSK`. The result is placed in the `ciphertext` field.
     6.  Serialize and transmit the `EncryptedPacket`.
 
@@ -60,7 +60,7 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
 
 * **Client `AuthenticationRequest` Retransmission**:
     * **Strategy**: Exponential backoff.
-    * **Intervals**: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms (doubling each retry).
+    * **Intervals**: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms — `200 ms × 2^attempt`, capped at 6400 ms from the sixth interval onwards (`get_client_retry_interval`, `shared/src/network/discovery.rs`).
     * **Rationale**: This ensures that a single dropped packet has a minimal impact on the initial notification time, while avoiding excessive network traffic.
 
 * **Server `AuthenticationGrant`/`Denial` Retransmission**:
@@ -70,22 +70,26 @@ To ensure responsiveness, the protocol employs an aggressive retransmission stra
     * **Rationale**: After user interaction, the Server persistently delivers the result to ensure the login completes promptly even with network packet loss. The 10-second timeout with 20 attempts is sufficient for reliable delivery on local networks while conserving battery and network resources. Retransmission continues until a `GrantConfirmation` is received from the Client or the retransmission timeout expires.
 
 * **Session Timeouts**:
-    * The entire authentication attempt (from initial request to user interaction) will time out after **120 seconds**. This applies to the Client's login process and the user prompt on the Server.
+    * The daemon's authentication session (from initial request to user interaction) times out after **120 seconds**, a fixed constant (`get_session_timeout()`, `shared/src/network/discovery.rs`). The user prompt on the Server and the PAM module's wait are bounded by that same session, and the PAM-side wait is additionally the configurable `pam_operation_timeout_secs` (default 120).
     * Server response retransmission has a separate timeout of **10 seconds** as described above.
+
+* **Daemon-side duplicate suppression**: before opening a session, `tapauthd` checks a map of recent requests keyed on the **username alone** and answers a repeat for the same user arriving within **1 second** with `PamOutcome::Ignore` (`handle_pam_authenticate`, `DEDUP_WINDOW`, `tapauthd/src/main.rs`), so no second request is sent to the phone. The map lives on `ServerState`, so it spans every IPC connection the daemon serves and ignores the PAM service, the caller's UID and the request id; entries are pruned only by a later request, once they are 2 seconds old. The test is the timestamp, not whether the first session is still running, so a request is suppressed even after that session has concluded. This is the daemon's own deduplication, distinct from the PAM module's `(username, service)` reuse window (`ConclusionCache::replay_for`, the reuse lookup in `transaction::run`; see [`../pam-module.md`](../pam-module.md)). Two different authentication contexts for the same user inside that second — a `sudo` prompt and a lock-screen unlock — can therefore have the second answered `Ignore` by the daemon instead of rung on the phone.
 
 ### 2.3. Signature Generation
 
-All signed messages must use a canonical format to guarantee verifiability *before encryption*. Signatures are placed on the `WrapperMessage`, not on individual inner messages.
+All signed messages must use a canonical format to guarantee verifiability *before encryption*. Signatures are placed on the `WrapperMessage`, not on individual inner messages — with the one exception noted at the end of this section.
 
 * **Data-To-Be-Signed**: The **binary-serialized `WrapperMessage`** with its `signature` field set to empty bytes. The `WrapperMessage` contains the inner payload (e.g., `AuthenticationRequest`) in its `payload` field.
 * **Process**:
     1.  Construct the inner message object (e.g., `AuthenticationRequest`).
     2.  Place the inner message into a `WrapperMessage` using the appropriate `payload` variant.
-    3.  Set the `signature_algorithm` field on the `WrapperMessage` to the algorithm agreed upon during pairing (e.g., `ED25519`).
+    3.  Set the `signature_algorithm` field on the `WrapperMessage` to `ED25519` — the only value `SignatureAlgorithm` defines, and the value `sign_wrapper_message` always writes.
     4.  Leave the `signature` field empty and serialize the `WrapperMessage` to a byte array. This is the data to be signed.
     5.  Sign the byte array using the sender's private key and the specified algorithm.
     6.  Place the resulting signature into the `signature` field of the `WrapperMessage`.
     7.  The completed `WrapperMessage` is then serialized, encrypted, and placed into an `EncryptedPacket` for transmission.
+
+* **Inner signature on grants**: `AuthenticationGrant.signed_challenge` carries an additional Server Ed25519 signature over the raw 32-byte `challenge`, so on a grant the challenge is signed twice — once inside the payload and once through the wrapper. `verify_auth_grant` checks both signatures (`shared/src/protocol/messages.rs`).
 
 ### 2.4. Transport Layer Considerations
 
@@ -108,7 +112,7 @@ The protocol is transport-agnostic, but relies on specific behaviors for discove
 
 ### Step 1: Parallel Discovery (Client)
 
-* When the PAM module is activated, the Client immediately begins multicasting/advertising the `EncryptedPacket` containing the `AuthenticationRequest` on all available channels.
+* When the PAM module requests authentication, it forwards the request to `tapauthd` over the daemon's Unix socket, and the daemon immediately begins multicasting/advertising the `EncryptedPacket` containing the `AuthenticationRequest` on all available channels. Hosts the module classifies as display managers, or as hosts whose conversation it cannot drive, never reach this step — the phone is not rung at all (see [`../pam-module.md`](../pam-module.md)).
 
 ### Step 2: Request Handling (Server)
 
@@ -125,7 +129,7 @@ An incoming `AuthenticationRequest` **must** be validated against two independen
 
 1.  **Nonce Check (Primary Defense)**: The `challenge` field in the request acts as a unique nonce for the authentication session. The Server **must** maintain a cache of all received `challenge` nonces for the duration of the session timeout (120 seconds). If a request is received with a `challenge` that is already in the cache, it is a replay and **must** be silently discarded.
 
-2.  **Timestamp Check (Secondary Defense)**: The `timestamp_unix_seconds` in the request is compared against the Server's current UTC time. If the timestamp is older than a **60-second** validity window, it is considered stale and **must** be silently discarded. This prevents the replay of very old packets that may have been captured from a previous session and are no longer in the nonce cache.
+2.  **Timestamp Check (Secondary Defense)**: The `timestamp_unix_seconds` in the request is compared against the Server's current UTC time. If the timestamp is more than a **60-second** window away from the Server's clock in either direction (stale or ahead), it is considered invalid and **must** be silently discarded. This prevents the replay of very old packets that may have been captured from a previous session and are no longer in the nonce cache. The window is symmetric (`ReplayMitigationCache.isReplay`; `is_request_timestamp_valid` in `shared/src/protocol/messages.rs`).
 
 ### Step 3: Response (Server)
 

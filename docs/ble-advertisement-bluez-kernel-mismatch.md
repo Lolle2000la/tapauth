@@ -75,9 +75,16 @@ Any **one** of the following resolves it:
    (for Ubuntu this arrives as a package update/SRU), a regular
    `sudo apt update && sudo apt upgrade` is enough. No TapAuth changes
    needed.
-2. **Temporarily boot a kernel without the strict validation** — for
-   Ubuntu 26.04, kernel `7.0.0-27-generic` predates the change and works
-   (select it in the GRUB "Advanced options" menu).
+2. **Run a kernel that carries the upstream relaxation.** Mainline commit
+   `149324fc762c` (*Bluetooth: MGMT: Fix backward compatibility with
+   userspace*, 2026-06-03) relaxed the check so it only rejects a command whose
+   expected length *exceeds* the data, and it was backported to the 6.18 stable
+   series. On a kernel with that fix the oversized command from an old
+   `bluetoothd` is accepted again, so a kernel update alone clears the symptom;
+   which distribution kernels have it depends on their update level. A kernel
+   that predates the validation entirely behaves the same way — for Ubuntu
+   26.04, kernel `7.0.0-27-generic` predates it and works (select it in the GRUB
+   "Advanced options" menu).
 3. **Disable BLE transport** (`enable_ble = false` in
    `/etc/tapauth/config.toml`, or via the tapauth-config GUI) to silence the
    warnings if you only use UDP anyway.

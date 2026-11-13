@@ -1,0 +1,1539 @@
+//! The conversation policy: the taxonomy `table.rs`'s ordered rows are
+//! written in, and the first-match engine `classify` that walks them.
+//! `refine` is the second, config-dependent phase; it can only add a skip.
+//!
+//! `remote_refuse` keys on the service name, never on `PAM_RHOST` (`table.rs`):
+//! `sudo` sets the latter to the local hostname.
+
+use crate::context::CallerContext;
+
+mod refine;
+mod table;
+
+pub(crate) use refine::refine;
+
+use table::{Rule, DEFAULT_SEQUENTIAL, RULES};
+
+/// What the module does with the call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Classification {
+    Skip(SkipPolicy),
+    Participate(Participation),
+}
+
+/// Why the phone is not consulted at all. `precollected_locks`' pre-collected
+/// handoff is deliberately *not* one of these — it touches the handle, so it is
+/// a `Participation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkipPolicy {
+    /// `remote_refuse`'s: a service in the built-in or configuration-declared
+    /// refused lists, whatever the caller's process.
+    RemoteAuthentication,
+    /// `dm_login_bypass`'s: the display manager's own stack has to populate
+    /// `PAM_AUTHTOK`, and a second `PAM_PROMPT_ECHO_OFF` on a greeter handle
+    /// is what the bypass prevents.
+    KeyringNeedsAuthtok,
+}
+
+/// How the host's PAM conversation may be driven.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Conversation {
+    /// The conversation can be driven from a worker thread while the calling
+    /// thread waits for the daemon.
+    Threaded,
+    /// The conversation must be left to the calling thread/host event loop.
+    Sequential,
+    /// The host collected the password before calling `pam_authenticate` and
+    /// its conversation only replays it, so the phone is not consulted.
+    PreCollected,
+}
+
+impl Conversation {
+    /// Every variant, for the guard's exhaustive walk. Test-only, for the
+    /// reason [`RuleId::ALL`] gives; `class_permits`'s no-wildcard `match` is
+    /// the compile-time check on a new conversation, and the literal cell
+    /// count in `class_permits_matches_its_expectation` catches a variant
+    /// left out of here.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[Self::Threaded, Self::Sequential, Self::PreCollected];
+}
+
+/// The failure direction a rule protects, stated once per class. `Keyring` and
+/// `RefuseRemote` are orthogonal to the three directions: the former is about
+/// the value of a grant rather than the risk of asking, the latter a scope
+/// decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FailureDirection {
+    /// The phone must not be consulted at all: `precollected_locks`'
+    /// `Conversation::PreCollected`, not a `SkipPolicy`.
+    NeverRing,
+    /// The conversation must not be driven from a second thread (or not
+    /// driven at all); the wrong direction is a hang, so the safe one is
+    /// "slower, never wedged".
+    DeadlockAvoidance,
+    /// The phone is offered concurrently; the host can answer while we wait.
+    AlwaysRing,
+    /// A grant would be useless without `PAM_AUTHTOK`.
+    Keyring,
+    /// The module must not participate in a remote authentication. Its
+    /// under-match (a remote caller classified local) is the security cost —
+    /// the phone is rung for a login nobody is sitting at — and its
+    /// over-match (a local caller classified remote) silences the phone for a
+    /// local login.
+    RefuseRemote,
+}
+
+impl FailureDirection {
+    /// Every variant, for the guard's exhaustive walk: test-only, for the reason
+    /// [`Conversation::ALL`] gives.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        Self::NeverRing,
+        Self::DeadlockAvoidance,
+        Self::AlwaysRing,
+        Self::Keyring,
+        Self::RefuseRemote,
+    ];
+}
+
+/// The decision cell of one row: a conversation, or a skip. A row authors
+/// only this cell; the failure direction is its own `class` column, and
+/// `classification_of` combines the two into a [`Participation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Decision {
+    Skip(SkipPolicy),
+    Participate(Conversation),
+}
+
+/// Whether `class` may be paired with `conversation`: the admissible pairs,
+/// as one total function. The `match` has no wildcard, so a new class or
+/// conversation does not compile until every pairing with it has an answer
+/// here; `class_permits_matches_its_expectation` checks all fifteen cells
+/// against a hand-written table.
+///
+/// `PreCollected` is `NeverRing`'s pairing only (it is the one shape that
+/// never reaches the daemon), `AlwaysRing` needs `Threaded` (nobody can
+/// answer while `Sequential` blocks), and `Keyring`/`RefuseRemote` only ever
+/// skip.
+pub(crate) fn class_permits(class: FailureDirection, conversation: Conversation) -> bool {
+    match (class, conversation) {
+        (FailureDirection::NeverRing, Conversation::PreCollected) => true,
+        (FailureDirection::NeverRing, Conversation::Threaded | Conversation::Sequential) => false,
+        (
+            FailureDirection::DeadlockAvoidance,
+            Conversation::Threaded | Conversation::Sequential,
+        ) => true,
+        (FailureDirection::DeadlockAvoidance, Conversation::PreCollected) => false,
+        (FailureDirection::AlwaysRing, Conversation::Threaded) => true,
+        (FailureDirection::AlwaysRing, Conversation::Sequential | Conversation::PreCollected) => {
+            false
+        }
+        (
+            FailureDirection::Keyring | FailureDirection::RefuseRemote,
+            Conversation::Threaded | Conversation::Sequential | Conversation::PreCollected,
+        ) => false,
+    }
+}
+
+/// A rule that matched, with the class it was authored against. Which rule it
+/// was is not part of the value: `classify` returns the id next to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Participation {
+    pub(crate) conversation: Conversation,
+    /// The rule's class, copied here so the failure direction is part of the value.
+    /// `class_agrees_with_conversation` checks it, and so does `transaction::run`'s
+    /// class/plan assertion — a `debug_assert!`, which release builds drop.
+    pub(crate) failure_direction: FailureDirection,
+}
+
+/// A rule's stable id: a fixture label returned beside the classification, not
+/// part of `Participation`. Each variant is named for the host or service shape
+/// its row is written for; the canonical spelling is the audit record's own
+/// `name` (see `as_str`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RuleId {
+    RemoteRefuse,
+    DmLoginBypass,
+    GdmReauthWorker,
+    PolkitAgent,
+    KscreenlockerWorker,
+    Hyprlock,
+    Xsecurelock,
+    PreCollectedLocks,
+    PolkitServiceWithoutProc,
+    DefaultSequential,
+}
+
+impl RuleId {
+    /// Every variant, in table order. Test-only: `as_str` and
+    /// `policy::table::audit` are exhaustive matches, so a new variant cannot
+    /// compile without its spelling and its record; this list is what lets
+    /// the guard catch a rule whose row was deleted from `RULES`, and
+    /// `audit_covers_rules`'s `ALL.len() == RULES.len()` catches a variant
+    /// omitted here.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        Self::RemoteRefuse,
+        Self::DmLoginBypass,
+        Self::GdmReauthWorker,
+        Self::PolkitAgent,
+        Self::KscreenlockerWorker,
+        Self::Hyprlock,
+        Self::Xsecurelock,
+        Self::PreCollectedLocks,
+        Self::PolkitServiceWithoutProc,
+        Self::DefaultSequential,
+    ];
+
+    /// The rule's canonical name: the fixture corpus's `expected_rule` spelling
+    /// and the audit record's `name`, never the design document's row number.
+    /// `every_rule_names_its_audit_record` pins the two together.
+    #[cfg(test)]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RuleId::RemoteRefuse => "remote_refuse",
+            RuleId::DmLoginBypass => "dm_login_bypass",
+            RuleId::GdmReauthWorker => "gdm_reauth_worker",
+            RuleId::PolkitAgent => "polkit_agent",
+            RuleId::KscreenlockerWorker => "kscreenlocker_worker",
+            RuleId::Hyprlock => "hyprlock",
+            RuleId::Xsecurelock => "xsecurelock",
+            RuleId::PreCollectedLocks => "precollected_locks",
+            RuleId::PolkitServiceWithoutProc => "polkit_service_without_proc",
+            RuleId::DefaultSequential => "default_sequential",
+        }
+    }
+}
+
+/// The first rule that matches wins; `default_sequential` is unconditional, so
+/// this is total. The id comes back next to the classification so a failing
+/// test names the row.
+pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification) {
+    RULES
+        .iter()
+        .find(|rule| (rule.predicate)(ctx))
+        // Unreachable fallback: `default_sequential` is unconditional
+        // (`table.rs`, `DEFAULT_SEQUENTIAL`), so this only keeps `classify` total.
+        .map_or((RuleId::DefaultSequential, DEFAULT_SEQUENTIAL), |rule| {
+            (rule.id, classification_of(rule))
+        })
+}
+
+fn classification_of(rule: &Rule) -> Classification {
+    match rule.decision {
+        Decision::Skip(policy) => Classification::Skip(policy),
+        Decision::Participate(conversation) => Classification::Participate(Participation {
+            conversation,
+            failure_direction: rule.class,
+        }),
+    }
+}
+
+/// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this
+/// table's oracle. It feeds literal inputs — the service string,
+/// `classify_identity` from the identity columns, `GdmReauth::from_env` from
+/// `env` — so the reads behind them (`/proc/self/exe`, `/proc/self/comm`,
+/// `GDM_SESSION_FOR_REAUTH`) stay unpinned: a `/proc` read cannot be
+/// characterised portably, and `set_var` would race every other test in this
+/// binary that reads the environment. `scripts/ci/test-pam-conv-thread.sh` is
+/// the proof for those.
+///
+/// The rows were authored against the *pre-refactor* functions, so a row is
+/// an expectation written before the code that must satisfy it, not a
+/// transcription of what the table already did.
+// reason: test module; the crate root denies unwrap/expect/panic/indexing.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::refine::refused_service;
+    use super::table::audit;
+    use super::*;
+    use crate::config::PamConfig;
+    use crate::context::{classify_identity, GdmReauth, ProcessIdentity, ServiceName};
+    use crate::plan::{Announcement, Deadline, Plan, Plannable, TtyUse};
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/callers.csv");
+
+    /// The decision record, relative to the workspace root.
+    const TABLE_PATH: &str = "client-pam/src/policy/table.rs";
+
+    /// The schema the corpus parser demands, in column order.
+    const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
+
+    /// The decision a fixture row expects.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ExpectedPolicy {
+        SkipRemote,
+        SkipKeyring,
+        Threaded,
+        Sequential,
+        PreCollected,
+    }
+
+    /// Where the resolved process name came from.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Provenance {
+        Exe,
+        Comm,
+        Unknown,
+    }
+
+    struct Row {
+        id: String,
+        service: Option<String>,
+        exe: Option<String>,
+        comm: Option<String>,
+        env: Option<String>,
+        tty: bool,
+        expected_rule: String,
+        expected_policy: ExpectedPolicy,
+        why: String,
+        e2e: bool,
+    }
+
+    fn parse_bool(field: &str) -> bool {
+        match field {
+            "0" => false,
+            "1" => true,
+            other => panic!("{other:?} is not a 0/1 column value"),
+        }
+    }
+
+    /// `-` is "unreadable"/"unset"; `~` is the literal empty string, which is a
+    /// different input from a missing one.
+    fn name_field(field: &str) -> Option<String> {
+        match field {
+            "-" => None,
+            "~" => Some(String::new()),
+            other => Some(other.to_owned()),
+        }
+    }
+
+    fn optional_field(field: &str) -> Option<String> {
+        match field {
+            "-" => None,
+            other => Some(other.to_owned()),
+        }
+    }
+
+    fn parse_policy(field: &str) -> ExpectedPolicy {
+        match field {
+            "skip_remote" => ExpectedPolicy::SkipRemote,
+            "skip_keyring" => ExpectedPolicy::SkipKeyring,
+            "threaded" => ExpectedPolicy::Threaded,
+            "sequential" => ExpectedPolicy::Sequential,
+            "precollected" => ExpectedPolicy::PreCollected,
+            other => panic!("{other:?} is not a known expected_policy"),
+        }
+    }
+
+    fn parse_row(line: &str) -> Row {
+        let fields: Vec<&str> = line.split(',').collect();
+        // A `why` containing a comma is a parse error, not a quoted field.
+        assert_eq!(
+            fields.len(),
+            10,
+            "row {line}: a field contains a comma (10 columns expected)"
+        );
+        Row {
+            id: fields[0].to_owned(),
+            service: optional_field(fields[1]),
+            exe: name_field(fields[2]),
+            comm: name_field(fields[3]),
+            env: optional_field(fields[4]),
+            tty: parse_bool(fields[5]),
+            expected_rule: fields[6].to_owned(),
+            expected_policy: parse_policy(fields[7]),
+            why: fields[8].to_owned(),
+            e2e: parse_bool(fields[9]),
+        }
+    }
+
+    fn rows() -> Vec<Row> {
+        let text =
+            std::fs::read_to_string(CORPUS_PATH).expect("the fixture corpus must be readable");
+        let header = text
+            .lines()
+            .next()
+            .expect("the fixture corpus has a header");
+        assert_eq!(header, HEADER, "the fixture corpus changed its schema");
+        let rows: Vec<Row> = text
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(parse_row)
+            .collect();
+        assert!(!rows.is_empty(), "the fixture corpus has no rows");
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                !rows.iter().skip(index + 1).any(|other| other.id == row.id),
+                "duplicate row id {:?}",
+                row.id
+            );
+        }
+        rows
+    }
+
+    fn provenance(identity: &ProcessIdentity) -> Provenance {
+        match identity {
+            ProcessIdentity::Exe(_) => Provenance::Exe,
+            ProcessIdentity::Comm(_) => Provenance::Comm,
+            ProcessIdentity::Unknown => Provenance::Unknown,
+        }
+    }
+
+    /// The provenance the two identity columns imply: a non-empty `exe` wins,
+    /// otherwise a non-blank `comm`, otherwise nothing.
+    fn expected_provenance(row: &Row) -> Provenance {
+        if row.exe.as_deref().is_some_and(|exe| !exe.is_empty()) {
+            Provenance::Exe
+        } else if row
+            .comm
+            .as_deref()
+            .is_some_and(|comm| !comm.trim().is_empty())
+        {
+            Provenance::Comm
+        } else {
+            Provenance::Unknown
+        }
+    }
+
+    /// The context a row describes, built from the row's columns.
+    fn row_context(row: &Row, identity: &ProcessIdentity, reauth: GdmReauth) -> CallerContext {
+        CallerContext::from_parts(row.service.as_deref(), identity.clone(), reauth)
+    }
+
+    /// The rule an id-less classification belongs to. `classify` reports the
+    /// id itself; `refine` returns a bare `Classification`, so its skip is
+    /// mapped back through the policy, which belongs to exactly one rule
+    /// (`RemoteAuthentication` is `remote_refuse`'s, `KeyringNeedsAuthtok` is
+    /// `dm_login_bypass`'s). A participation maps to nothing here.
+    fn skip_rule(classification: &Classification) -> Option<RuleId> {
+        match classification {
+            Classification::Skip(SkipPolicy::RemoteAuthentication) => Some(RuleId::RemoteRefuse),
+            Classification::Skip(SkipPolicy::KeyringNeedsAuthtok) => Some(RuleId::DmLoginBypass),
+            Classification::Participate(_) => None,
+        }
+    }
+
+    fn policy_of(classification: &Classification) -> ExpectedPolicy {
+        match classification {
+            Classification::Skip(policy) => policy_for_decision(&Decision::Skip(*policy)),
+            Classification::Participate(participation) => {
+                policy_for_decision(&Decision::Participate(participation.conversation))
+            }
+        }
+    }
+
+    /// The corpus spelling of a table decision.
+    fn policy_for_decision(decision: &Decision) -> ExpectedPolicy {
+        match decision {
+            Decision::Skip(SkipPolicy::RemoteAuthentication) => ExpectedPolicy::SkipRemote,
+            Decision::Skip(SkipPolicy::KeyringNeedsAuthtok) => ExpectedPolicy::SkipKeyring,
+            Decision::Participate(Conversation::Threaded) => ExpectedPolicy::Threaded,
+            Decision::Participate(Conversation::Sequential) => ExpectedPolicy::Sequential,
+            Decision::Participate(Conversation::PreCollected) => ExpectedPolicy::PreCollected,
+        }
+    }
+
+    fn rule_by_id(id: RuleId) -> Option<&'static Rule> {
+        RULES.iter().find(|rule| rule.id == id)
+    }
+
+    /// A context in which `name` should fire rule `id`.
+    fn context_for_process(id: RuleId, name: &str) -> CallerContext {
+        let process = ProcessIdentity::Exe(name.into());
+        match id {
+            RuleId::GdmReauthWorker => {
+                CallerContext::from_parts(Some("gdm-password"), process, GdmReauth::Present)
+            }
+            _ => CallerContext::from_parts(Some("kde"), process, GdmReauth::Absent),
+        }
+    }
+
+    /// The terminal state each participating row models, written out by hand.
+    ///
+    /// This is the oracle the corpus's `tty` column is checked against, and it
+    /// is a literal for a reason: the plan is a function of `tty`, so an
+    /// expected plan derived from the column under test agrees with a wrong
+    /// value by construction.
+    ///
+    /// Every row whose `expected_policy` is `Threaded` or `Sequential` must
+    /// appear exactly once, and no other row may.
+    const EXPECTED_TTY: &[(&str, bool)] = &[
+        // Threaded: the plan is Operation/Wait/DoNotOpen whatever the value. The
+        // hosts own no terminal, except `threaded_with_tty_unreachable`, whose `1`
+        // shows the column cannot change a threaded decision.
+        ("daemon_timeout", false),
+        ("reauth_zero_value", false),
+        ("mixed_case_gdm", false),
+        ("threaded_gdm_worker_truncated", false),
+        ("threaded_polkit_agent", false),
+        ("threaded_polkit_agent_truncated", false),
+        ("comm_only_fallback", false),
+        ("exe_beats_comm", false),
+        ("kscreenlocker_truncated", false),
+        ("service_unknown", false),
+        ("threaded_no_tty", false),
+        ("threaded_with_tty_unreachable", true),
+        ("threaded_hyprlock", false),
+        ("threaded_xsecurelock", false),
+        ("proc_unreadable_polkit", false),
+        // Sequential.  `sequential_with_tty` is the `login`/`su` shape where the
+        // Enter skip exists; every other row is a screen saver, an unknown
+        // binary or a near miss with no terminal on the calling side.
+        ("dm_ly_not", false),
+        ("dm_kelvin", false),
+        ("sddmfoo_not_dm", false),
+        ("unknown_binary", false),
+        ("renamed_binary", false),
+        ("reauth_wrong_service", false),
+        ("proc_unreadable_polkit_upper", false),
+        ("proc_unreadable_other", false),
+        ("empty_process_name", false),
+        ("kscreenlocker_greet", false),
+        ("service_unknown_polkit", false),
+        ("sequential_with_tty", true),
+        ("sequential_no_tty", false),
+        ("service_case_sudo", false),
+        ("service_case_SUDO", false),
+        ("svc_sshd_near_miss", false),
+        ("svc_unknown_not_sshd", false),
+        ("kscreenlocker_g", false),
+        ("xfce4_screensav", false),
+        ("mate_screensaver_dialog", false),
+        ("mate_screensave", false),
+    ];
+
+    /// The terminal state `EXPECTED_TTY` gives a row, or a panic naming the row.
+    fn expected_tty(id: &str) -> bool {
+        EXPECTED_TTY
+            .iter()
+            .find(|(name, _)| *name == id)
+            .map(|(_, tty)| *tty)
+            .unwrap_or_else(|| panic!("row {id} is missing from EXPECTED_TTY"))
+    }
+
+    /// Every corpus row classifies to the rule and policy it names, and a
+    /// participating row's `tty` column matches the host it models.
+    ///
+    /// `exe`/`comm` goes through `classify_identity` before `classify`, so a
+    /// precedence or `(deleted)` regression fails at the column that caused
+    /// it, and `env` through `GdmReauth::from_env`, so presence-only parsing
+    /// is exercised rather than assumed. `skip_*` and `precollected` rows
+    /// have no `Plan`, so they assert the classification only.
+    #[test]
+    fn corpus_characterises_the_decision_table() {
+        let rows = rows();
+
+        // The literal table and the rows that carry a plan must be the same set:
+        // one entry per participating row, none for a row missing or without a plan.
+        let participating: Vec<&Row> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.expected_policy,
+                    ExpectedPolicy::Threaded | ExpectedPolicy::Sequential
+                )
+            })
+            .collect();
+        for row in &participating {
+            let entries = EXPECTED_TTY.iter().filter(|(id, _)| *id == row.id).count();
+            assert_eq!(
+                entries, 1,
+                "row {}: EXPECTED_TTY must carry exactly one entry for it, found {}",
+                row.id, entries
+            );
+        }
+        for (id, _) in EXPECTED_TTY {
+            assert!(
+                participating.iter().any(|row| row.id == *id),
+                "{id}: EXPECTED_TTY names a row that is missing or has no plan"
+            );
+        }
+
+        for row in &rows {
+            assert!(!row.why.is_empty(), "row {} has no justification", row.id);
+            assert!(
+                RuleId::ALL
+                    .iter()
+                    .any(|id| id.as_str() == row.expected_rule),
+                "row {}: expected_rule {:?} is not a known rule name",
+                row.id,
+                row.expected_rule
+            );
+            // `/dev/tty` is only probed for a sequential conversation, so a
+            // host that never reaches that branch cannot carry a terminal.
+            assert!(
+                !row.tty
+                    || matches!(
+                        row.expected_policy,
+                        ExpectedPolicy::Sequential | ExpectedPolicy::Threaded
+                    ),
+                "row {}: a pre-collected or skipped host has no terminal branch",
+                row.id
+            );
+            // A shape the shell harness must run needs a binary name to copy
+            // the harness to.
+            assert!(
+                !row.e2e || row.exe.is_some(),
+                "row {}: an e2e row must set its exe column",
+                row.id
+            );
+
+            let identity =
+                classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+            assert_eq!(
+                provenance(&identity),
+                expected_provenance(row),
+                "row {}: exe {:?} / comm {:?} resolved to the wrong source",
+                row.id,
+                row.exe,
+                row.comm
+            );
+
+            let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+            assert_eq!(
+                reauth == GdmReauth::Present,
+                row.env.is_some(),
+                "row {}: GDM_SESSION_FOR_REAUTH is presence-only, so {} is present",
+                row.id,
+                row.env.as_deref().unwrap_or("-")
+            );
+
+            let (rule, classification) = classify(&row_context(row, &identity, reauth));
+            assert_eq!(
+                rule.as_str(),
+                row.expected_rule.as_str(),
+                "row {} ({}): classify fired the wrong rule",
+                row.id,
+                row.why
+            );
+            assert_eq!(
+                policy_of(&classification),
+                row.expected_policy,
+                "row {} ({}): classify produced the wrong policy",
+                row.id,
+                row.why
+            );
+
+            match row.expected_policy {
+                ExpectedPolicy::Threaded | ExpectedPolicy::Sequential => {
+                    assert_eq!(
+                        row.tty,
+                        expected_tty(&row.id),
+                        "row {} ({}): the tty column disagrees with the host it models",
+                        row.id,
+                        row.why
+                    );
+                    let tty = expected_tty(&row.id);
+                    match row.expected_policy {
+                        ExpectedPolicy::Threaded => assert_eq!(
+                            Plannable::Threaded.plan(tty),
+                            Plan {
+                                deadline: Deadline::Operation,
+                                announcement: Announcement::Wait,
+                                tty_use: TtyUse::DoNotOpen,
+                            },
+                            "row {}: a threaded host plans Operation/Wait/DoNotOpen for \
+                             either tty value",
+                            row.id
+                        ),
+                        _ => assert_eq!(
+                            Plannable::Sequential.plan(tty),
+                            Plan {
+                                deadline: if tty {
+                                    Deadline::Operation
+                                } else {
+                                    Deadline::GuiBounded
+                                },
+                                announcement: if tty {
+                                    Announcement::WaitSkipHint
+                                } else {
+                                    Announcement::WaitThenPassword
+                                },
+                                tty_use: if tty {
+                                    TtyUse::PollForKey
+                                } else {
+                                    TtyUse::DoNotOpen
+                                },
+                            },
+                            "row {} ({}): the sequential plan must match the host's terminal",
+                            row.id,
+                            row.why
+                        ),
+                    }
+                }
+                // No plan cell: the skip returns before a plan exists, the
+                // pre-collected handoff before the probe.
+                ExpectedPolicy::SkipRemote
+                | ExpectedPolicy::SkipKeyring
+                | ExpectedPolicy::PreCollected => {}
+            }
+        }
+    }
+
+    /// Every rule in the table has at least one corpus row that names it.
+    ///
+    /// The check iterates `RULES`, not the corpus: iterating the corpus cannot
+    /// see a rule added without a fixture, which is the case that matters.
+    #[test]
+    fn corpus_covers_every_rule() {
+        let rows = rows();
+        for rule in RULES.iter() {
+            assert!(
+                rows.iter().any(|row| row.expected_rule == rule.id.as_str()),
+                "rule {} ({}) has no corpus row: add one to \
+                 client-pam/tests/fixtures/callers.csv",
+                rule.id.as_str(),
+                audit(rule.id).name
+            );
+        }
+    }
+
+    /// Every rule row has exactly one audit record, and every record is complete and
+    /// uniquely named.
+    ///
+    /// The defect this catches: a record missing or empty, a deleted row
+    /// leaving an orphan record — `audit`'s exhaustive `match` makes the
+    /// other direction a compile error — and two rules sharing a name, which
+    /// would make a corpus row's `expected_rule` ambiguous.
+    #[test]
+    fn audit_covers_rules() {
+        assert_eq!(
+            RuleId::ALL.len(),
+            RULES.len(),
+            "the audit record and the rule table must have one entry per rule: \
+             RuleId::ALL is the enumeration the record is keyed by"
+        );
+
+        for id in RuleId::ALL {
+            let rows = RULES.iter().filter(|rule| rule.id == *id).count();
+            assert_eq!(rows, 1, "{id:?} must own exactly one row of RULES");
+
+            let record = audit(*id);
+            assert!(!record.name.is_empty(), "{id:?} has no name");
+            assert!(
+                !record.why.is_empty(),
+                "{id:?} ({}) has no justification",
+                record.name
+            );
+            assert!(
+                !record.evidence.is_empty(),
+                "{id:?} ({}) has no evidence",
+                record.name
+            );
+            assert_eq!(
+                RULES
+                    .iter()
+                    .filter(|rule| audit(rule.id).name == record.name)
+                    .count(),
+                1,
+                "rule name {:?} is used twice",
+                record.name
+            );
+        }
+    }
+
+    /// A rule's canonical spelling *is* its audit record's name, and no two
+    /// rules share it.
+    ///
+    /// The defect this catches: a variant renamed (or an `as_str` string edited)
+    /// while the `audit` arm kept the old `name`, which would leave the corpus
+    /// asserting one spelling and the record defending another; a naming clash,
+    /// which would make a corpus row's `expected_rule` ambiguous; and a rule
+    /// added to `RuleId::ALL` without a fresh name.
+    #[test]
+    fn every_rule_names_its_audit_record() {
+        assert_eq!(
+            RuleId::ALL.len(),
+            10,
+            "the table has ten rows, so there are ten names to pin"
+        );
+
+        for id in RuleId::ALL {
+            assert_eq!(
+                id.as_str(),
+                audit(*id).name,
+                "{id:?}: `as_str` and the audit record's `name` must be the same \
+                 spelling, or a corpus row names a rule the record does not"
+            );
+        }
+
+        let mut seen: Vec<&'static str> = Vec::new();
+        for id in RuleId::ALL {
+            assert!(
+                !seen.contains(&id.as_str()),
+                "{id:?} repeats the name {:?} of another rule",
+                id.as_str()
+            );
+            seen.push(id.as_str());
+        }
+    }
+
+    /// Every class × conversation cell, against an independently written
+    /// table: a literal, because an expectation computed from the function
+    /// under test agrees with it by construction.
+    ///
+    /// The defect this catches: an arm widened to admit a class over every
+    /// conversation — `DeadlockAvoidance`/`PreCollected`, which a `RULES` row
+    /// could otherwise reach through the pre-collected handoff — a cell whose
+    /// answer flipped, and a class or conversation added without its pairings
+    /// decided.
+    #[test]
+    fn class_permits_matches_its_expectation() {
+        use Conversation::{PreCollected, Sequential, Threaded};
+        use FailureDirection::{AlwaysRing, DeadlockAvoidance, Keyring, NeverRing, RefuseRemote};
+
+        let expected: &[(FailureDirection, Conversation, bool)] = &[
+            // The one shape that never reaches the daemon.
+            (NeverRing, PreCollected, true),
+            (NeverRing, Threaded, false),
+            (NeverRing, Sequential, false),
+            // Either wait is safe; the handoff is `NeverRing`'s pairing.
+            (DeadlockAvoidance, Threaded, true),
+            (DeadlockAvoidance, Sequential, true),
+            (DeadlockAvoidance, PreCollected, false),
+            // Concurrently offered, which only the threaded wait collects.
+            (AlwaysRing, Threaded, true),
+            (AlwaysRing, Sequential, false),
+            (AlwaysRing, PreCollected, false),
+            // These two classes only ever skip.
+            (Keyring, Threaded, false),
+            (Keyring, Sequential, false),
+            (Keyring, PreCollected, false),
+            (RefuseRemote, Threaded, false),
+            (RefuseRemote, Sequential, false),
+            (RefuseRemote, PreCollected, false),
+        ];
+
+        assert_eq!(
+            (
+                FailureDirection::ALL.len(),
+                Conversation::ALL.len(),
+                expected.len()
+            ),
+            (5, 3, 15),
+            "a class or conversation was added: decide its pairings in `class_permits` \
+             and add one expectation row per cell here"
+        );
+
+        for class in FailureDirection::ALL {
+            for conversation in Conversation::ALL {
+                let cells: Vec<&(FailureDirection, Conversation, bool)> = expected
+                    .iter()
+                    .filter(|(cell_class, cell_conversation, _)| {
+                        cell_class == class && cell_conversation == conversation
+                    })
+                    .collect();
+                assert_eq!(
+                    cells.len(),
+                    1,
+                    "{class:?} × {conversation:?} must have exactly one expectation row"
+                );
+                assert_eq!(
+                    class_permits(*class, *conversation),
+                    cells[0].2,
+                    "{class:?} × {conversation:?} disagrees with the expectation"
+                );
+            }
+        }
+    }
+
+    /// A rule's class and its conversation must agree; a class/conversation
+    /// pair that does not is a table defect rather than a comment nobody reads.
+    #[test]
+    fn class_agrees_with_conversation() {
+        for rule in RULES.iter() {
+            assert!(
+                decision_permits(rule.class, &rule.decision),
+                "rule {} ({}) pairs {:?} with a decision it does not permit",
+                rule.id.as_str(),
+                audit(rule.id).name,
+                rule.class
+            );
+        }
+
+        for row in rows() {
+            let identity =
+                classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+            let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+            let (rule, classification) = classify(&row_context(&row, &identity, reauth));
+            match &classification {
+                Classification::Participate(participation) => assert!(
+                    decision_permits(
+                        participation.failure_direction,
+                        &Decision::Participate(participation.conversation)
+                    ),
+                    "row {}: {:?} cannot be answered with {:?}",
+                    row.id,
+                    participation.failure_direction,
+                    participation.conversation
+                ),
+                Classification::Skip(policy) => {
+                    // A skip must come from a rule that declares a skip, and the
+                    // policy the caller sees must be that rule's own.
+                    let rule = rule_by_id(rule);
+                    assert_eq!(
+                        rule.map(|rule| rule.decision),
+                        Some(Decision::Skip(*policy)),
+                        "row {}: the skip policy must be the one its rule declares",
+                        row.id
+                    );
+                }
+            }
+        }
+    }
+
+    fn decision_permits(class: FailureDirection, decision: &Decision) -> bool {
+        match decision {
+            // The conversation cells are the one guard; this wrapper maps the
+            // decision a row authored onto it.
+            Decision::Participate(conversation) => class_permits(class, *conversation),
+            // A skip is not a conversation, so `class_permits` has no cell for it:
+            // only the two classes whose whole existence is a skip may carry one.
+            Decision::Skip(_) => matches!(
+                class,
+                FailureDirection::Keyring | FailureDirection::RefuseRemote
+            ),
+        }
+    }
+
+    /// The process-keyed rules own disjoint literal sets, so their order is not
+    /// load-bearing; `polkit_service_without_proc` keys on a *missing* identity
+    /// instead.
+    ///
+    /// The literals are declared here because a set cannot be read back out of a `fn`
+    /// pointer; the test then checks the *predicates* against them, so a spelling
+    /// added to a second rule, or a predicate drifting off its set, fails.
+    #[test]
+    fn rules_are_process_disjoint() {
+        let keys: &[(RuleId, &[&str])] = &[
+            (
+                RuleId::GdmReauthWorker,
+                &["gdm-session-worker", "gdm-session-wor"],
+            ),
+            (
+                RuleId::PolkitAgent,
+                &["polkit-agent-helper-1", "polkit-agent-he"],
+            ),
+            (
+                RuleId::KscreenlockerWorker,
+                &["kscreenlocker_worker", "kscreenlocker_w"],
+            ),
+            (RuleId::Hyprlock, &["hyprlock"]),
+            (RuleId::Xsecurelock, &["authproto_pam"]),
+            (
+                RuleId::PreCollectedLocks,
+                &["swaylock", "gtklock", "i3lock"],
+            ),
+        ];
+
+        for (index, (id_a, keys_a)) in keys.iter().enumerate() {
+            for (id_b, keys_b) in keys.iter().skip(index + 1) {
+                for key in *keys_a {
+                    assert!(
+                        !keys_b.contains(key),
+                        "{key:?} is a key of both {id_a:?} and {id_b:?}"
+                    );
+                }
+            }
+        }
+
+        for (id, owned) in keys {
+            for key in *owned {
+                let ctx = context_for_process(*id, key);
+                let fired = RULES
+                    .iter()
+                    .find(|rule| (rule.predicate)(&ctx))
+                    .map(|rule| rule.id);
+                assert_eq!(
+                    fired,
+                    Some(*id),
+                    "{key:?} must fire {id:?}, not the rule that matched"
+                );
+            }
+        }
+
+        for name in ["sh", "kscreenlocker_worker2", "polkit-agent-helper"] {
+            let ctx = CallerContext::from_parts(
+                Some("kde"),
+                ProcessIdentity::Exe(name.into()),
+                GdmReauth::Absent,
+            );
+            assert_eq!(
+                classify(&ctx).0,
+                RuleId::DefaultSequential,
+                "{name:?} is nobody's key and must fall to the default"
+            );
+        }
+
+        // `polkit_service_without_proc`'s key is the absence of a process name,
+        // and its service comparison is exact bytes.
+        let unknown_polkit = CallerContext::from_parts(
+            Some("polkit-1"),
+            ProcessIdentity::Unknown,
+            GdmReauth::Absent,
+        );
+        assert_eq!(
+            classify(&unknown_polkit).0,
+            RuleId::PolkitServiceWithoutProc
+        );
+        let named_polkit = context_for_process(RuleId::KscreenlockerWorker, "kscreenlocker_worker");
+        assert_eq!(classify(&named_polkit).0, RuleId::KscreenlockerWorker);
+    }
+
+    /// A context for `service`/`process` with no reauth flag.
+    fn context(service: Option<&str>, process: Option<&str>) -> CallerContext {
+        let process = match process {
+            Some(name) => ProcessIdentity::Exe(name.into()),
+            None => ProcessIdentity::Unknown,
+        };
+        CallerContext::from_parts(service, process, GdmReauth::Absent)
+    }
+
+    /// `remote_refuse`'s predicate: the two remote service names, ASCII
+    /// case-insensitively, and nothing else — and it outranks every process rule.
+    ///
+    /// The defect this catches: the rule missing or inverted (an `sshd` call would
+    /// wait out the GUI timeout), a case-sensitive comparison (`SSHD` escapes), a
+    /// substring or prefix match (`my-sshd` refused, silencing a local stack), an
+    /// unresolved service matching, and it losing precedence to a process rule.
+    #[test]
+    fn remote_rules() {
+        for service in ["sshd", "sshd-session", "SSHD", "Sshd-Session"] {
+            for process in [
+                Some("sh"),
+                Some("swaylock"),
+                Some("gdm-session-worker"),
+                Some("kscreenlocker_worker"),
+                None,
+            ] {
+                assert_eq!(
+                    classify(&context(Some(service), process)).0,
+                    RuleId::RemoteRefuse,
+                    "{service:?} with process {process:?} must be refused before any process rule"
+                );
+            }
+        }
+
+        for service in [Some("my-sshd"), Some("sshd-old"), Some("SSH"), None] {
+            assert_ne!(
+                classify(&context(service, Some("sh"))).0,
+                RuleId::RemoteRefuse,
+                "{service:?} is not a remote service and must take the normal path"
+            );
+        }
+
+        // The near miss by value, not merely "not the remote refusal": a renamed
+        // service on an `sshd`-looking process is the documented false negative.
+        assert_eq!(
+            classify(&context(Some("my-sshd"), Some("sshd"))).0,
+            RuleId::DefaultSequential
+        );
+    }
+
+    /// The configured-refusal matcher's fixture table: the CSV corpus has no
+    /// column for a runtime config, so this literal is the fixture for the
+    /// configured half of `remote_refuse`.
+    ///
+    /// The defect this catches: a matcher that returns true for any
+    /// participating call (the rename refused without being declared — the
+    /// negative control in `pam_logic`), a case-sensitive one (`SSHD-RENAMED`
+    /// escapes), a prefix match (`my-sshd` refused), and one that lets an
+    /// empty configured entry match.
+    #[test]
+    fn configured_refused_services_match_only_declared_names() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            // A renamed service is refused only when it is declared.
+            ("sshd-renamed", &["sshd-renamed"], true),
+            ("sshd-renamed", &[], false),
+            // Case variants, in both directions.
+            ("SSHD-RENAMED", &["sshd-renamed"], true),
+            ("sshd-renamed", &["SSHD-RENAMED"], true),
+            // Near misses: not a prefix, not a substring, not a sibling name.
+            ("my-sshd", &["sshd-renamed"], false),
+            ("sshd-renamed", &["sshd"], false),
+            ("sshd-renamed", &["sshd-renamed-old"], false),
+            // A malformed entry left in the slice matches nothing.
+            ("sshd-renamed", &["", "sshd/x", "ssh d"], false),
+            // The built-ins still match when they are in the slice, which is the
+            // list `effective_refused_services` always produces.
+            ("sshd", &["sshd", "sshd-session"], true),
+            ("Sshd-Session", &["sshd", "sshd-session"], true),
+        ];
+
+        for (name, configured, expected) in cases {
+            let configured: Vec<String> =
+                configured.iter().map(|entry| (*entry).to_owned()).collect();
+            let service = ServiceName::new(name);
+            assert_eq!(
+                refused_service(Some(&service), &configured),
+                *expected,
+                "service {name:?} against configured {configured:?}"
+            );
+        }
+
+        // An unresolved service never matches, whatever is configured.
+        assert!(!refused_service(None, &["sshd".to_owned()]));
+    }
+
+    /// The mechanism a classification fixes, and — for the two conversations that
+    /// reach a plan — the plan for `tty`. `None` for a skip.
+    fn mechanism_and_plan(
+        classification: &Classification,
+        tty: bool,
+    ) -> Option<(Conversation, Option<Plan>)> {
+        match classification {
+            Classification::Participate(participation) => {
+                let plan = match participation.conversation {
+                    Conversation::Threaded => Some(Plannable::Threaded.plan(tty)),
+                    Conversation::Sequential => Some(Plannable::Sequential.plan(tty)),
+                    Conversation::PreCollected => None,
+                };
+                Some((participation.conversation, plan))
+            }
+            Classification::Skip(_) => None,
+        }
+    }
+
+    /// The refinement may add a skip and nothing else.
+    ///
+    /// Walks the whole corpus through `classify` and then `refine` with three configs —
+    /// the default, an empty list, and one naming every participating row's
+    /// service.
+    ///
+    /// The defect this catches: a refinement that rebuilds the participation
+    /// — a different conversation (moving the plan and the deadline), or the
+    /// same conversation with another class, which only `run`'s
+    /// `debug_assert!` would see — one that "unrefuses" a skip, and one keyed
+    /// on the process name.
+    #[test]
+    fn refinement_cannot_change_a_participation() {
+        let rows = rows();
+        let all_participating_services: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.expected_policy,
+                    ExpectedPolicy::Threaded
+                        | ExpectedPolicy::Sequential
+                        | ExpectedPolicy::PreCollected
+                )
+            })
+            .filter_map(|row| row.service.clone())
+            .collect();
+
+        let configs: [(&str, Vec<String>); 3] = [
+            (
+                "the default",
+                PamConfig::default().effective_refused_services(),
+            ),
+            (
+                "an empty configured list",
+                PamConfig {
+                    pam_refused_services: vec![],
+                    ..PamConfig::default()
+                }
+                .effective_refused_services(),
+            ),
+            (
+                "every participating service",
+                PamConfig {
+                    pam_refused_services: all_participating_services.clone(),
+                    ..PamConfig::default()
+                }
+                .effective_refused_services(),
+            ),
+        ];
+
+        // The third config has to be able to refuse a participating row, or its
+        // clauses would be satisfied by every implementation.
+        assert!(
+            all_participating_services.iter().any(|name| {
+                !shared::config::DEFAULT_PAM_REFUSED_SERVICES
+                    .iter()
+                    .any(|built_in| built_in.eq_ignore_ascii_case(name))
+            }),
+            "the corpus must name a participating service that is not a built-in"
+        );
+
+        let mut flips = [0usize; 3];
+        for (index, (label, configured)) in configs.iter().enumerate() {
+            for row in &rows {
+                let identity =
+                    classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+                let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+                let ctx = row_context(row, &identity, reauth);
+
+                let (rule, before) = classify(&ctx);
+                let before_policy = policy_of(&before);
+                let before_mechanism = mechanism_and_plan(&before, row.tty);
+                let refused = row.service.as_deref().is_some_and(|service| {
+                    configured
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(service))
+                });
+                let after = refine(before.clone(), ctx.service(), configured);
+                let after_policy = policy_of(&after);
+
+                let was_skipped = before_mechanism.is_none();
+                if was_skipped {
+                    assert_eq!(
+                        after_policy, before_policy,
+                        "{label}: row {} ({}) is skipped and must stay skipped",
+                        row.id, row.why
+                    );
+                    assert_eq!(
+                        skip_rule(&after),
+                        Some(rule),
+                        "{label}: row {} must keep its own skip rule",
+                        row.id
+                    );
+                } else if refused {
+                    flips[index] += 1;
+                    assert_eq!(
+                        after_policy,
+                        ExpectedPolicy::SkipRemote,
+                        "{label}: a configured service must be refused through \
+                         `remote_refuse`'s policy",
+                    );
+                    assert_eq!(
+                        skip_rule(&after),
+                        Some(RuleId::RemoteRefuse),
+                        "{label}: row {} must be refused through `remote_refuse`, not another rule",
+                        row.id
+                    );
+                } else {
+                    // Whole-value equality: a refine that rebuilt the
+                    // participation with the same conversation but another
+                    // class fails here too.
+                    assert_eq!(
+                        after, before,
+                        "{label}: row {} ({}) must come back from the \
+                         refinement unchanged, class included",
+                        row.id, row.why
+                    );
+                }
+            }
+        }
+
+        assert!(
+            flips[2] > 0,
+            "the all-participating config must flip at least one row to a skip, or \
+             its case proves nothing"
+        );
+    }
+
+    /// Moving a rule must move exactly the rows it should, by value, and
+    /// leave every other row where it was.
+    ///
+    /// Two load-bearing orderings:
+    /// * `dm_login_bypass` after `precollected_locks` — `swaylock_under_sddm` and
+    ///   `i3lock_under_gdm_login` become `precollected_locks`/pre-collected, because
+    ///   a process rule would then outrank the keyring constraint.
+    /// * `remote_refuse` after `precollected_locks` — `svc_sshd_under_swaylock`
+    ///   becomes `precollected_locks`/pre-collected, because the remote refusal must
+    ///   precede the process rules.
+    ///
+    /// `remote_refuse`-after-`dm_login_bypass` is deliberately *not* a case: their
+    /// predicates are disjoint, so that swap changes no row at all.
+    #[test]
+    fn rule_permutation_moves_named_rows() {
+        assert_moved_rows(
+            &reordered(RuleId::DmLoginBypass, RuleId::PreCollectedLocks),
+            &[
+                (
+                    "swaylock_under_sddm",
+                    (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
+                ),
+                (
+                    "i3lock_under_gdm_login",
+                    (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
+                ),
+            ],
+        );
+        assert_moved_rows(
+            &reordered(RuleId::RemoteRefuse, RuleId::PreCollectedLocks),
+            &[(
+                "svc_sshd_under_swaylock",
+                (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
+            )],
+        );
+    }
+
+    /// `RULES` with `moved` taken out and re-inserted directly after `after`.
+    fn reordered(moved: RuleId, after: RuleId) -> Vec<&'static Rule> {
+        let rule = rule_by_id(moved).expect("the moved rule exists");
+        let mut rules: Vec<&'static Rule> = RULES.iter().filter(|rule| rule.id != moved).collect();
+        let anchor = rules
+            .iter()
+            .position(|rule| rule.id == after)
+            .expect("the anchor rule exists");
+        rules.insert(anchor + 1, rule);
+        rules
+    }
+
+    fn classify_with(ordered: &[&'static Rule], ctx: &CallerContext) -> (RuleId, ExpectedPolicy) {
+        let rule = ordered
+            .iter()
+            .find(|rule| (rule.predicate)(ctx))
+            .expect("the table always ends with the unconditional `default_sequential`");
+        (rule.id, policy_for_decision(&rule.decision))
+    }
+
+    /// Assert `changed` for the named rows and "unchanged from `RULES`" for
+    /// every other corpus row.
+    fn assert_moved_rows(ordered: &[&'static Rule], changed: &[(&str, (RuleId, ExpectedPolicy))]) {
+        let rows = rows();
+        for (id, _) in changed {
+            assert!(
+                rows.iter().any(|row| row.id == *id),
+                "{id} is not a corpus row, so this permutation case is vacuous"
+            );
+        }
+        for row in &rows {
+            let identity =
+                classify_identity(row.exe.as_deref().map(Path::new), row.comm.as_deref());
+            let reauth = GdmReauth::from_env(row.env.as_deref().map(OsStr::new));
+            let ctx = row_context(row, &identity, reauth);
+            let (rule, baseline_classification) = classify(&ctx);
+            let baseline = (rule, policy_of(&baseline_classification));
+            let permuted = classify_with(ordered, &ctx);
+            match changed.iter().find(|(id, _)| *id == row.id) {
+                Some((_, expected)) => {
+                    assert_eq!(permuted, *expected, "row {} must move", row.id);
+                }
+                None => assert_eq!(
+                    permuted, baseline,
+                    "row {} must not move under this permutation",
+                    row.id
+                ),
+            }
+        }
+    }
+
+    /// A rule placed after the unconditional `default_sequential` is dead, and no
+    /// other rule may be unconditional.
+    #[test]
+    fn unreachable_rule_rows() {
+        // The null context matches nothing but the default: no service, no
+        // process name, no reauth flag.
+        let null = CallerContext::from_parts(None, ProcessIdentity::Unknown, GdmReauth::Absent);
+
+        let last = RULES.last().expect("the rule table is not empty");
+        assert_eq!(
+            last.id,
+            RuleId::DefaultSequential,
+            "`default_sequential` must be the last row, or the rows after it are dead"
+        );
+        assert!(
+            (last.predicate)(&null),
+            "`default_sequential`'s predicate must be unconditional"
+        );
+        for rule in RULES
+            .iter()
+            .filter(|rule| rule.id != RuleId::DefaultSequential)
+        {
+            assert!(
+                !(rule.predicate)(&null),
+                "rule {} ({}) matches the null context, so it is unconditional and \
+                 every row after it is dead",
+                rule.id.as_str(),
+                audit(rule.id).name
+            );
+        }
+
+        // The fallback `classify` uses if the table ever stops matching is
+        // exactly what `default_sequential` produces, id included.
+        assert_eq!(
+            classify(&null),
+            (RuleId::DefaultSequential, DEFAULT_SEQUENTIAL)
+        );
+    }
+
+    /// The symbol `line` declares, as `(keyword, name)`, or `None` when it
+    /// declares nothing. A doc comment is never a declaration, whatever words
+    /// it uses: the drift this distinguishes is a doc comment or a closing
+    /// brace where a predicate used to be.
+    fn declared_symbol(line: &str) -> Option<(&'static str, &str)> {
+        const DECLARATIONS: [&str; 7] = ["fn", "const", "static", "type", "struct", "enum", "mod"];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return None;
+        }
+        let mut tokens = trimmed
+            .split(|character: char| {
+                character.is_whitespace() || character == '(' || character == ')'
+            })
+            .filter(|token| !token.is_empty());
+        while let Some(token) = tokens.next() {
+            if let Some(keyword) = DECLARATIONS.iter().find(|keyword| **keyword == token) {
+                return tokens
+                    .next()
+                    .map(|name| (*keyword, name.trim_end_matches(':')));
+            }
+        }
+        None
+    }
+
+    /// Why a `policy/table.rs` citation does not name the symbol this row
+    /// declares there, or `None` when it does.
+    ///
+    /// `fn <rule name>` is the row's own predicate, which is what every row cites; any
+    /// other `fn` is a different row's predicate reached by a shift. A
+    /// citation to another table declaration (`const`, `struct`, …) is
+    /// accepted if it lands on a declaration.
+    fn table_citation_problem(
+        rule_name: &str,
+        citation: &str,
+        text: &str,
+        start: usize,
+    ) -> Option<String> {
+        let line = text.lines().nth(start - 1).unwrap_or_default();
+        match declared_symbol(line) {
+            Some(("fn", symbol)) if symbol == rule_name => None,
+            Some(("fn", symbol)) => Some(format!(
+                "rule {rule_name}: citation {citation:?} lands on `fn {symbol}`, not on this \
+                 rule's own `fn {rule_name}`"
+            )),
+            Some(_) => None,
+            None => Some(format!(
+                "rule {rule_name}: citation {citation:?} lands on {line:?}, which declares no \
+                 symbol"
+            )),
+        }
+    }
+
+    /// Every `evidence` citation of the audit record resolves in this tree, and the scan
+    /// reports which files it checked so a relocated or emptied record cannot pass
+    /// silently. Entries marked `external:` are exempt.
+    ///
+    /// A citation into `policy/table.rs` must land on the declaration it
+    /// claims, not merely on a non-blank line ([`table_citation_problem`]);
+    /// the plant-and-revert control at the end keeps that strengthening
+    /// honest.
+    #[test]
+    fn evidence_citations_resolve() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("client-pam lives in the workspace root");
+        let mut checked: Vec<&str> = Vec::new();
+
+        for rule in RULES.iter() {
+            let record = audit(rule.id);
+            assert!(
+                !record.evidence.is_empty(),
+                "rule {} ({}) has no evidence",
+                rule.id.as_str(),
+                record.name
+            );
+            for citation in record.evidence {
+                if let Some(external) = citation.strip_prefix("external:") {
+                    assert!(
+                        !external.trim().is_empty(),
+                        "rule {} has an empty external citation",
+                        record.name
+                    );
+                    continue;
+                }
+                let (file, range) = citation.rsplit_once(':').unwrap_or_else(|| {
+                    panic!("rule {}: {citation:?} is not file:line", record.name)
+                });
+                let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|error| {
+                    panic!(
+                        "rule {}: citation {citation:?} does not resolve: {error}",
+                        record.name
+                    )
+                });
+                let total = text.lines().count();
+                let number = |field: &str| {
+                    field.trim().parse::<usize>().unwrap_or_else(|_| {
+                        panic!("rule {}: {citation:?} has a non-numeric line", record.name)
+                    })
+                };
+                let (start, end) = match range.split_once('-') {
+                    Some((start, end)) => (number(start), number(end)),
+                    None => {
+                        let line = number(range);
+                        (line, line)
+                    }
+                };
+                assert!(
+                    start >= 1 && end >= start && end <= total,
+                    "rule {}: citation {citation:?} is outside {file} ({total} lines)",
+                    record.name
+                );
+                assert!(
+                    text.lines()
+                        .nth(start - 1)
+                        .is_some_and(|line| !line.trim().is_empty()),
+                    "rule {}: citation {citation:?} points at a blank line",
+                    record.name
+                );
+                if file == TABLE_PATH {
+                    if let Some(problem) =
+                        table_citation_problem(record.name, citation, &text, start)
+                    {
+                        panic!("{problem}");
+                    }
+                }
+                checked.push(file);
+            }
+        }
+
+        // Positive control: plant one line of drift under `hyprlock`'s own citation
+        // in an in-memory copy of the record, observe the strengthened check reject
+        // it, then revert and observe it accept again — without which a check that
+        // accepted any non-blank line would pass too.
+        let hyprlock = audit(RuleId::Hyprlock);
+        let citation = hyprlock
+            .evidence
+            .iter()
+            .find(|citation| citation.starts_with("client-pam/src/policy/table.rs:"))
+            .expect("`hyprlock` cites its own predicate");
+        let line_number: usize = citation
+            .rsplit_once(':')
+            .and_then(|(_, line)| line.parse().ok())
+            .expect("`hyprlock`'s table citation ends in a line number");
+        let table = std::fs::read_to_string(root.join(TABLE_PATH))
+            .expect("the decision record is readable");
+        let mut drifted: Vec<&str> = table.lines().collect();
+        let planted = drifted[line_number - 1];
+        assert!(
+            table_citation_problem(hyprlock.name, citation, &table, line_number).is_none(),
+            "control precondition: `hyprlock`'s citation resolves before the plant"
+        );
+        drifted[line_number - 1] = "/// `hyprlock` — the lock screen's worker thread.";
+        assert!(
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_some(),
+            "positive control: a one-line drift onto `hyprlock`'s doc comment must be rejected"
+        );
+        drifted[line_number - 1] = "fn xsecurelock(ctx: &CallerContext) -> bool {";
+        assert!(
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_some(),
+            "positive control: a shift onto another row's predicate must be rejected too"
+        );
+        drifted[line_number - 1] = planted;
+        assert!(
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_none(),
+            "reverted plant: `hyprlock`'s citation resolves again"
+        );
+
+        assert!(
+            checked.contains(&TABLE_PATH),
+            "the citation scan never looked at this table's own file: {checked:?}"
+        );
+    }
+}

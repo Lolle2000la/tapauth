@@ -20,7 +20,7 @@
 
 mod toml_config;
 
-pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH};
+pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
