@@ -2,11 +2,18 @@
 
 ## Overview
 
-TapAuth supports TPM (Trusted Platform Module) 2.0 hardware for **hardware-backed key security**. When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK), making them **impossible to extract** even with root access.
+TapAuth supports TPM (Trusted Platform Module) 2.0 hardware for **hardware-backed key security**. When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK), so no usable copy exists on disk — not even for root.
 
 **Key Security Model:**
 - **TPM Enabled**: Keys sealed in TPM hardware only - no plaintext on disk ✓
 - **TPM Disabled**: Keys stored as files with 600 permissions - readable by root ⚠️
+
+One narrowing belongs with the first bullet: the seal carries **no authorisation
+policy** — TapAuth passes only a PCR list to `tpm2_create` (no `-p` auth value,
+no signed policy), so the PCR values are the sole gate. Anyone who can run
+`tpm2_load`/`tpm2_unseal` against the sealed files *and* whose boot state matches
+the PCRs unseals the key; what root cannot do without the TPM is read it off the
+disk.
 
 ## How It Works
 
@@ -23,11 +30,11 @@ Since TPM 2.0 doesn't natively support Ed25519 signatures, TapAuth uses `tpm2-to
 TPM 2.0 Enabled (Secure Mode):
   
   Ed25519 Key → TPM Seal (SRK) → Encrypted Blob
-  (32 bytes)                      └─→ client_key.tpm.{pub,priv}
+  (32 bytes)                      └─→ client_key.pub / client_key.priv
                                       /var/lib/tapauth/
   
   ✓ Hardware-protected
-  ✓ Cannot be extracted (even by root)
+  ✓ No usable key file (not even for root)
   ✓ Machine-bound (cannot unseal on different TPM)
   ⚠ TPM failure = Recovery via GUI required
 
@@ -47,8 +54,8 @@ TPM 2.0 Disabled (File Mode):
 
 | Feature | TPM Enabled (Standard) | TPM Enabled (Paranoid) | TPM Disabled |
 |---------|------------------------|------------------------|--------------|
-| **Root Protection** | ✅ Yes - key in TPM | ✅ Yes - key in TPM | ⚠️ No - file readable |
-| **Key Extraction** | ✅ Impossible | ✅ Impossible | ⚠️ Possible (by root) |
+| **Root Protection** | ⚠️ No usable file; root can still unseal via this TPM | ⚠️ No usable file; root can still unseal via this TPM | ⚠️ No - file readable |
+| **Key Extraction** | ⚠️ Only through this machine's TPM | ⚠️ Only through this machine's TPM | ⚠️ Possible (by root) |
 | **Machine Binding** | ✅ Yes - TPM locked | ✅ Yes - TPM locked | ⚠️ No - portable file |
 | **Boot Tampering** | ✅ PCR 7+14 protected | ✅ PCR 0+2+7+14 protected | ⚠️ No protection |
 | **BIOS Updates** | ✅ Still works | ⚠️ Breaks (regenerate keys) | ✅ N/A |
@@ -59,7 +66,7 @@ TPM 2.0 Disabled (File Mode):
 ### Attack Scenarios
 
 **Attacker with root access (system running):**
-- TPM Mode: ❌ Cannot extract key from TPM
+- TPM Mode: ❌ Cannot read the key off the disk; ⚠️ can unseal it through this machine's TPM while the boot state matches
 - File Mode: ✅ Can copy `/var/lib/tapauth/client_key`
 
 **Attacker modifies bootloader (evil maid attack):**
@@ -96,17 +103,20 @@ Verify TPM is available:
 tpm2_getrandom 8 --hex
 ```
 
-**Note**: TPM support is **opt-in** and must be explicitly enabled during build:
+**Note**: TPM support is **opt-in** and must be explicitly enabled during build.
+The workspace root is a virtual manifest, so name the crates:
 
 ```bash
-# Build WITH TPM support
-cargo build --release --features tpm
+# Build WITH TPM support (the daemon, and the PAM module + GUI it pairs with)
+cargo build --release --manifest-path tapauthd/Cargo.toml --features tpm
+cargo build --release --manifest-path client-pam/Cargo.toml --features tpm
+cargo build --release --manifest-path client-config-gui/Cargo.toml --features tpm
 
-# Or via install script
+# Or via install script (does all three)
 ./install.sh --use-tpm
 
 # Default build (no TPM)
-cargo build --release  # BLE only, no TPM
+cargo build --release --manifest-path tapauthd/Cargo.toml  # ble + firewall, no TPM
 ```
 
 ### Enabling TPM Support
@@ -118,9 +128,11 @@ sudo ./install.sh --use-tpm
 ```
 
 This will:
-1. Check if `tpm2-tools` is installed
+1. Check if `tpm2-tools` is installed (with no `--use-tpm` the installer asks, and
+   silently disables TPM when the tools are missing)
 2. Set `use_tpm = true` in `/etc/tapauth/config.toml`
-3. Generate TPM-sealed keys during first run
+3. Seal the Ed25519 keypair the first time a device is paired — `StartPairing`
+   generates and seals one when no keypair can be loaded yet
 4. **Not create** plaintext backup files
 
 ## Configuration
@@ -138,6 +150,11 @@ use_tpm = true
 # Default: "standard"
 tpm_pcr_policy = "standard"
 ```
+
+Both keys exist in the schema only when TapAuth was built with the `tpm`
+feature (`shared/src/config/toml_config.rs`, both fields are `#[cfg(feature =
+"tpm")]`); a build without the feature ignores them, so `tpm_pcr_policy` is also
+left commented out in `config.toml.example`.
 
 ### PCR Sealing Policies
 
@@ -216,15 +233,21 @@ tpm_pcr_policy = "paranoid"
 /etc/tapauth/
 └── config.toml                  # use_tpm = true
 
-/var/lib/tapauth/
+/var/lib/tapauth/                # 0700 tapauthd:tapauthd
 ├── client_config.json           # Hostname only (mode 600)
-├── client_key.tpm.pub          # TPM sealed public portion (mode 600)
-├── client_key.tpm.priv         # TPM sealed private portion (mode 600)
+├── client_key.pub               # TPM sealed public portion (tpm2_create output)
+├── client_key.priv              # TPM sealed private portion (tpm2_create output)
 ├── client_symmetric_key         # CSK (mode 600)
 └── paired_servers.json          # Server pairings (mode 600)
 
 NO PLAINTEXT KEY FILE EXISTS
 ```
+
+The sealed pair is written by `tpm2_create` itself, so its mode is whatever the
+daemon's umask gives; the enclosing directory is 0700, which is what keeps it
+private. (TapAuth's own files — `client_config.json`, `client_key`,
+`client_symmetric_key`, `paired_servers.json` — are written through
+`write_secure_file`, which forces 0600.)
 
 ### With TPM Disabled
 
@@ -245,9 +268,11 @@ NO PLAINTEXT KEY FILE EXISTS
 
 If the TPM chip fails or you replace the motherboard:
 
-1. **Symptom**: Daemon fails to start, PAM shows error:
+1. **Symptom**: The daemon starts in **degraded mode** — it stays alive
+   (`DaemonState::new` keeps the load error and leaves the keypair `None`) and
+   every authentication answers with an error; the PAM module prints
    ```
-   TapAuth: Error - Failed to load keypair: [TPM error]. Please run tapauth-config to regenerate keys.
+   TapAuth: Error - Failed to load keypair: <TPM error>. Please open tapauth-config GUI to regenerate keys.
    ```
 
 2. **Login**: Use your password (PAM fallback works)
@@ -288,9 +313,9 @@ If TPM unsealing fails but hardware is functional:
 - **Boot order changes** - Different device firmware loaded
 
 **Symptoms:**
-- Daemon fails to start with "Failed to unseal key from TPM" error
-- PAM authentication prompts you to use the GUI
-- GUI shows "⚠️ Keypair load failed" warning
+- The daemon logs `Failed to load keypair: Failed to unseal key from TPM: <error>. Use tapauth-config GUI to recover.` at startup and stays up in degraded mode
+- PAM authentication answers with `PAM_AUTH_ERR`: on a `sufficient` line the stack falls through to password, on a `required` line it fails the stack
+- The GUI's main menu shows that error text in red above a "Recover Keys (Will Clear Pairings)" button (`get_daemon_status` reports it while the daemon has no keypair)
 
 **Recovery:** 
 1. Check if Secure Boot is still enabled: `mokutil --sb-state`
@@ -330,57 +355,54 @@ If you need to migrate to new hardware:
 
 ### TPM Operations
 
-TapAuth uses the following `tpm2-tools` commands:
+TapAuth shells out to `tpm2-tools`; these are the argv it actually runs
+(`shared/src/tpm.rs`), not a paraphrase:
 
-**Sealing (save_keypair):**
+**Sealing (`save_keypair` → `seal_data_with_tpm`):**
 ```bash
-# Create sealed object using SRK (handle 0x81000001)
-# With configurable PCR binding and SHA-384
+# The private key is written to a temp file next to the target and passed with -i;
+# the two output halves are the target path with its extension replaced.
 
 # Standard policy (PCR 7+14):
-tpm2_create \
-    --parent 0x81000001 \
-    --policy "sha256:7,14" \
-    --hash-algorithm sha384 \
-    --type keyedseal \
-    --public /var/lib/tapauth/client_key.tpm.pub \
-    --private /var/lib/tapauth/client_key.tpm.priv \
-    --input <(echo -n "$ED25519_KEY_32_BYTES")
+tpm2_create -C 0x81000001 -l sha256:7,14 -g sha384 -G keyedseal \
+    -i /var/lib/tapauth/client_key.tmp_in \
+    -u /var/lib/tapauth/client_key.pub \
+    -r /var/lib/tapauth/client_key.priv
 
-# Paranoid policy (PCR 0+2+7+14):
-tpm2_create \
-    --parent 0x81000001 \
-    --policy "sha256:0,2,7,14" \
-    --hash-algorithm sha384 \
-    --type keyedseal \
-    --public /var/lib/tapauth/client_key.tpm.pub \
-    --private /var/lib/tapauth/client_key.tpm.priv \
-    --input <(echo -n "$ED25519_KEY_32_BYTES")
+# Paranoid policy (PCR 0+2+7+14): the same command with -l sha256:0,2,7,14
 ```
 
-The PCR list is determined by the `tpm_pcr_policy` setting in config.toml.
+The `-l` value is `sha256:` followed by `TpmPcrPolicy::pcr_list()`, i.e. the
+`tpm_pcr_policy` setting in config.toml; `-C 0x81000001` is the SRK handle and
+`-g sha384 -G keyedseal` describe the sealed object.
 
-**Unsealing (load_keypair):**
+**Unsealing (`load_keypair` → `unseal_data_with_tpm`):**
 ```bash
-# Load sealed object into TPM
-HANDLE=$(tpm2_load \
-    --parent 0x81000001 \
-    --public client_key.tpm.pub \
-    --private client_key.tpm.priv \
-    | awk '{print $2}')
+# Load the sealed object into a transient context, then unseal that context
+tpm2_load -C 0x81000001 \
+    -u /var/lib/tapauth/client_key.pub \
+    -r /var/lib/tapauth/client_key.priv \
+    -c /var/lib/tapauth/client_key.ctx
 
-# Unseal to recover key
-tpm2_unseal --object-context $HANDLE
+tpm2_unseal -c /var/lib/tapauth/client_key.ctx \
+    -o /var/lib/tapauth/client_key.tmp_out
 ```
+
+The unsealed bytes must be exactly 32 (`InvalidKeyFormat` otherwise) and are
+then rebuilt into an Ed25519 signing key; the temp files are removed afterwards.
 
 ### Storage Root Key (SRK)
 
 - **Handle**: 0x81000001 (TPM persistent handle)
 - **Type**: RSA 2048 primary key
 - **Purpose**: Parent key for sealing/unsealing operations
-- **Creation**: Automatic on first TPM use (or via `tpm2_createprimary`)
+- **Creation**: **Not created by TapAuth.** Every command names the handle
+  directly (`-C 0x81000001`) and nothing in the repository runs
+  `tpm2_createprimary`, so the SRK must already exist at that handle (as
+  provisioned by the distribution's `systemd-creds`/`tpm2` tooling). A system
+  without it fails sealing with `tpm2_create failed: …`
 
-The SRK is created using the TPM's endorsement hierarchy and is unique to each TPM chip.
+The SRK lives in the TPM's endorsement hierarchy and is unique to each TPM chip.
 
 ### Error Handling
 
@@ -392,7 +414,7 @@ The SRK is created using the TPM's endorsement hierarchy and is unique to each T
 
 **PAM Module Behavior:**
 - Receives error response from daemon
-- Displays: "TapAuth: Error - Failed to load keypair: [details]. Please run tapauth-config to regenerate keys."
+- Displays: "TapAuth: Error - Failed to load keypair: <details>. Please open tapauth-config GUI to regenerate keys."
 - Returns `PAM_AUTH_ERR` (never `PAM_IGNORE`) so the attempt fails closed; on a
   `sufficient` line the stack still falls through to password
 
@@ -424,9 +446,14 @@ Failed to seal key with TPM: permission denied
 ```
 
 **Solution**:
-- Ensure daemon runs as root (it does via systemd)
+- The daemon runs as the unprivileged `tapauthd` user (`systemd/tapauthd.service`,
+  `User=tapauthd`), not as root — so the TPM device node must be accessible to
+  *that* user. Nothing in the repository adds `tapauthd` to the `tss` group, so
+  a stock `crw-rw---- tss tss` `/dev/tpmrm0` is not enough on its own; grant it
+  explicitly (group membership plus a `tss`-owned device node, or a matching
+  udev rule).
 - Check `/dev/tpmrm0` permissions: `ls -l /dev/tpmrm0`
-- Should be: `crw-rw---- 1 tss tss`
+- Should be readable/writable by the daemon's user
 
 ### Keys Won't Unseal After Update
 
@@ -438,12 +465,12 @@ Failed to load TPM-sealed key
 **Possible Causes**:
 - BIOS/firmware update changed TPM state
 - TPM was cleared in BIOS
-- Secure Boot state changed (if using PCR sealing - future)
+- Secure Boot state changed (PCR 7, which both sealing policies bind to)
 
 **Solution**:
 Run `tapauth-config` and click "Recover Keys"
 
-### Daemon Won't Start
+### Daemon Runs But Won't Authenticate
 
 **Check logs**:
 ```bash
@@ -452,7 +479,7 @@ sudo journalctl -u tapauthd -n 50
 
 **Look for**:
 - "Failed to load keypair"
-- "TPM unsealing error"
+- "Failed to unseal key from TPM"
 
 **Fix**: Run `tapauth-config` to regenerate keys
 
@@ -472,7 +499,7 @@ TPM operations are slower than file I/O:
 
 ### What TPM Protects Against
 
-✅ **Root-level key extraction** (running system)  
+✅ **Root-level key copying** (running system — there is no usable file to copy)  
 ✅ **Cold boot attacks** (key not in memory when system off)  
 ✅ **Disk forensics** (key cannot be unsealed without TPM)  
 ✅ **Key reuse on different hardware** (machine-bound)  
@@ -481,7 +508,9 @@ TPM operations are slower than file I/O:
 
 ❌ **Memory dumps while daemon running** (key in RAM)  
 ❌ **Physical TPM attacks** (advanced hardware attacks)  
-❌ **Evil maid attacks** (unless using PCR sealing - future feature)  
+❌ **Evil maid attacks on the kernel/initramfs** (the sealed PCRs are 7+14 by
+default, or 0+2+7+14 under `paranoid`; none of them measures the kernel image.
+A modified kernel is caught only indirectly, by Secure Boot refusing to boot it)  
 
 ### Best Practices
 
@@ -493,19 +522,15 @@ TPM operations are slower than file I/O:
 
 ## Future Enhancements
 
-### PCR-Based Sealing (Planned)
+### PCR-Based Sealing (implemented)
 
-Seal keys to Platform Configuration Registers (PCRs) that measure:
-- BIOS/UEFI firmware
-- Bootloader state
-- Kernel integrity
-- Secure Boot status
-
-This would prevent unsealing if:
-- BIOS is modified (rootkit/bootkit)
-- Bootloader is tampered with
-- Kernel is modified
-- Secure Boot is disabled
+PCR sealing is not planned — it is what TPM mode does today. `tpm_pcr_policy =
+"standard"` seals to PCR 7 (Secure Boot state) and PCR 14 (MOK keys);
+`"paranoid"` adds PCR 0 (BIOS/UEFI firmware code) and PCR 2 (Option ROM code).
+Unsealing then fails whenever a measured value changes, which is why the
+recovery paths in "Recovery Scenarios" above exist. What is still not measured
+is the kernel image and the initramfs: neither policy binds to them, so a
+modified kernel is caught only indirectly, by Secure Boot refusing to boot it.
 
 ### Remote Attestation (Planned)
 
