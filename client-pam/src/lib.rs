@@ -7,7 +7,7 @@
 //! stubs and `guard`'s panic arm are exempt by name, and
 //! `source_guards::only_outcome_rs_returns_pam_constants` asserts both halves.
 //! Behaviour and the per-host conversation rules are in
-//! `docs/design-documents/pam-conversation-policy.md`.
+//! `docs/design-documents/pam-module.md`.
 //!
 //! # Module map
 //!

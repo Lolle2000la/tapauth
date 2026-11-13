@@ -1,4 +1,4 @@
-# PAM conversation policy
+# PAM module
 
 `client-pam` is a PAM service module. For one `pam_authenticate` call it either asks the paired phone for a verdict through `tapauthd`, or deliberately falls through to whatever the host's stack does next. It runs unprivileged and reaches the daemon only through its Unix-socket IPC.
 

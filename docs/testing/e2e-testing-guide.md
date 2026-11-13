@@ -304,7 +304,7 @@ caller (`classify` in `client-pam/src/policy.rs`, table in
 but *executing* it cannot: that needs a real libpam stack, a dynamically loaded
 `pam_tapauth.so`, and a process whose `/proc/self/exe` basename is on the table.
 The rules behind the table are documented in
-[`docs/design-documents/pam-conversation-policy.md`](../design-documents/pam-conversation-policy.md).
+[`docs/design-documents/pam-module.md`](../design-documents/pam-module.md).
 
 It runs **unprivileged** and needs Linux-PAM ≥ 1.5 (`pam_start_confdir`, so it
 writes no file under `/etc/pam.d`), `gcc` and the `libpam` headers; it builds the
