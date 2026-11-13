@@ -211,19 +211,19 @@ cargo build --manifest-path client-pam/Cargo.toml
   kept byte-identical and must be updated together.
 
 ## CI & Merge Queue
-- **Merge queue (payload written, not applied).** `scripts/ci/merge-queue-ruleset.json` is the
-  payload that would make `main` require a merge queue (ruleset `16779046`); it is never applied
-  by CI, an admin PUTs it by hand in the documented order. Setup, the path-filter rule, and the
-  apply/verify/rollback commands: `docs/ci/merge-queue.md`.
-- **Required-check job names are load-bearing.** The payload matches eight `name:` strings exactly
-  — the three jobs in `ci.yml` and all five in `ci-android.yml`, E2E included. Renaming a required
-  job silently stalls the queue (nothing reports the new name, so every entry waits out
-  `check_response_timeout_minutes`); `scripts/ci/check-required-checks.sh` is the guard and runs
-  in CI.
+- **Required-check job names are load-bearing.** The eight required contexts are listed
+  authoritatively in `scripts/ci/check-required-checks.sh`, which runs in
+  `Code Quality & Format Checks` — the three jobs in `ci.yml` and all five in `ci-android.yml`,
+  E2E included. Renaming a required job silently stalls the queue (nothing reports the new name,
+  so every entry waits out `check_response_timeout_minutes`); the payload live in GitHub must be
+  edited alongside it.
 - **Both workflows must stay unfiltered on `pull_request:`.** A required check cannot be
-  path-filtered: a skipped run leaves it `Pending` forever and the PR can be neither merged nor
-  queued. The `push:` filters stay on purpose (the merge group already validated the change), and
-  no `merge_group` trigger may carry `paths:` — GitHub supports none on that event.
+  path-filtered: a skipped run leaves it `Pending` forever, so the PR can be neither merged nor
+  queued. The `paths:` filters on `push:` stay deliberately — the PR and the merge group already
+  ran the change, so the filtered push run is only a safety net for bypass pushes.
+- **No `merge_group` trigger may carry `paths:`** — GitHub supports none on that event.
+- **The merge queue is not enabled yet.** Enabling it means editing ruleset `16779046` in the
+  GitHub UI or via the API; until then `main` requires no merge queue.
 
 ## Configuration
 - Default config at `/etc/tapauth/config.toml` (see `config.toml.example`)
