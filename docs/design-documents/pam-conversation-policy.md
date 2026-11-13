@@ -17,7 +17,7 @@ The module authenticates the stack's `PAM_USER`. On `su` that is the target acco
 
 ## Code map
 
-Every production file under `client-pam/src`. "May import" lists the crate-internal modules each file names; nothing may import upwards.
+Every file under `client-pam/src`, production and test-only. "May import" lists the crate-internal modules each file names; the arrows below run from the entry point to the leaves.
 
 | File | Responsibility | May import |
 | :--- | :--- | :--- |
@@ -32,13 +32,13 @@ Every production file under `client-pam/src`. "May import" lists the crate-inter
 | `outcome.rs` | `Outcome` taxonomy and `into_pam`, the only verdict-to-code conversion | `pam_messages`, `pam_sys`, `policy` |
 | `transaction.rs` | re-export hub for `run`, `Armed`, `Concluded`, `Finished`, `Via`, `Effects` | `transaction/*` |
 | `transaction/run.rs` | the transaction driver: handoff, reuse lookup, probe, plan, arm, mechanism, conclude | `conclusion_cache`, `config`, `context`, `ipc_client`, `mechanism`, `outcome`, `plan`, `policy` |
-| `transaction/lifecycle.rs` | `Armed` (constructed only by `open`), `Concluded`, `Via`, `Finished`, `StartError` | `context`, `ipc_client`, `mechanism`, `outcome` |
+| `transaction/lifecycle.rs` | `Armed` (constructed only by `Armed::open`), `Concluded`, `Via`, `Finished`, `StartError` | `context`, `ipc_client`, `mechanism`, `outcome` |
 | `transaction/host_io.rs` | `HostIo` (PAM handle, conversation, messages, authtok reader) and `finish`, the single emission site | `outcome`, `pam_messages`, `pam_sys` |
 | `conclusion_cache.rs` | the 500 ms reuse record, its gates, and the `pthread_atfork` child handler | `context`, `outcome`, `transaction` |
 | `mechanism.rs` | `MechanismEnd` (`Response`/`Reason`/`Error`) and its conversion to `Outcome` | `outcome` |
-| `mechanism/threaded.rs` | password on a worker pthread, daemon polled on the calling thread | `mechanism`, `ipc_client`, `outcome`, `pam_sys`, `plan`, `transaction` |
-| `mechanism/sequential.rs` | waits on the calling thread, never touches the conversation | `mechanism`, `ipc_client`, `outcome`, `plan`, `transaction` |
-| `mechanism/handoff.rs` | pre-collected hosts: `pam_get_authtok` and return, no daemon | `mechanism`, `outcome`, `pam_sys`, `transaction` |
+| `mechanism/threaded.rs` | password on a worker pthread, daemon polled on the calling thread | `mechanism`, `ipc_client`, `outcome`, `pam_sys`, `plan`, `transaction` (types) |
+| `mechanism/sequential.rs` | waits on the calling thread, never touches the conversation | `mechanism`, `ipc_client`, `outcome`, `plan`, `transaction` (types) |
+| `mechanism/handoff.rs` | pre-collected hosts: `pam_get_authtok` and return, no daemon | `mechanism`, `outcome`, `pam_sys`, `transaction` (types) |
 | `config.rs` | `PamConfig`: timeouts, refused services, `effective_refused_services` | — (only `shared`) |
 | `ipc_client.rs` | length-prefixed protobuf IPC over the daemon socket | — (`shared` only) |
 | `pam_sys.rs` | FFI bindings and safe wrappers: service, user, conversation, authtok | — |
@@ -54,7 +54,7 @@ flowchart LR
     pam_logic --> context
     pam_logic --> policy
     pam_logic --> config
-    pam_logic --> ipc[pam_logic/ipc_client]
+    pam_logic --> ipc_client
     pam_logic --> plan
     pam_logic --> transaction
     pam_logic --> outcome
@@ -70,20 +70,20 @@ flowchart LR
     transaction --> plan
     transaction --> outcome
     transaction --> context
-    transaction --> ipc
+    transaction --> ipc_client
     mechanism --> outcome
-    mechanism --> transaction
+    mechanism -.-> transaction
     context --> pam_sys
     cache --> outcome
     cache --> context
     cache -.-> transaction
 ```
 
-The dashed edge is a type reference only: `conclusion_cache` names `Concluded` and `Via` from `transaction` but calls nothing in it. Every other edge is a call direction.
+The dashed edges are type references only: `mechanism/*` names `Armed` and `HostIo` from `transaction`, and `conclusion_cache` names `Concluded` and `Via`; neither calls into `transaction`. Every other edge is a call direction.
 
 Two rules a contributor must not break, both enforced by `source_guards.rs`:
 
-* **Only `outcome.rs` produces a `PAM_*` value.** `Outcome::into_pam` is the single conversion; the six `pam_sm_*` stubs in `lib.rs` are named exemptions, and `pam_sys::PAM_AUTHTOK` is an argument, not a code. `only_outcome_rs_returns_pam_constants` scans for `return pam_sys::PAM_*` and for a bare tail-position constant.
+* **Only `outcome.rs` produces a `PAM_*` value.** `Outcome::into_pam` is the single conversion; the six exemptions named in `lib.rs` are `guard`'s panic arm and the five constant ABI stubs (`setcred`, `acct_mgmt`, `open_session`, `close_session`, `chauthtok`), and `pam_sys::PAM_AUTHTOK` is an argument, not a code. `only_outcome_rs_returns_pam_constants` scans for `return pam_sys::PAM_*` and for a bare tail-position constant.
 * **Only `conclusion_cache.rs` touches the reuse record.** No other module may name `.lock()`, `.try_lock()`, `MutexGuard` or the record static; `cache_owner_is_local` asserts it, and the record's `pub(crate)` surface hands out values, never the lock or the stored struct.
 
 Also enforced: `only_one_get_service_name_call_site` (the service is read only in `context.rs`), `only_one_refine_call_site` (one `policy::refine` call, in `pam_logic.rs`), `no_ruser_read`, `granted_only_from_daemon`, and `test_module_source_contains_no_pam_ignore_return`.
@@ -140,6 +140,7 @@ flowchart TD
     D --> E{refine refuses service?}
     E -- yes --> K
     E -- no --> F[username, conversation, messages]
+    F -- lookup fails --> Z[PAM_USER_UNKNOWN or PAM_AUTH_ERR]
     F --> G{pre-collected?}
     G -- yes --> H[pam_get_authtok]
     H --> K
@@ -148,7 +149,7 @@ flowchart TD
     J --> R[return that code]
     I -- no --> L[probe tty, plan, resolve deadline]
     L --> M[connect and send request]
-    M -- failure --> K
+    M -- connect or send fails --> K
     M --> N[arm, run mechanism]
     N --> O[conclude]
     O --> P[record]
@@ -161,11 +162,11 @@ The order matters and is asserted by tests, not by the type system: `classify` r
 
 `policy::classify` walks `RULES` in order; the first matching row decides. The table is data in `client-pam/src/policy/table.rs`: each row carries an id, a `FailureDirection`, a predicate and a `Decision`.
 
-| Rule | Matches | Yields | On skip |
+| Rule | Matches | Yields | Skip code |
 | :--- | :--- | :--- | :--- |
 | `RemoteRefuse` | `PAM_SERVICE` is `sshd` or `sshd-session`, ASCII case-insensitive; process ignored | skip | `PAM_AUTHINFO_UNAVAIL` |
 | `DmLoginBypass` | `PAM_SERVICE` is a display-manager name (`DM_PREFIXES`), unless this is a GDM reauthentication | skip | `PAM_AUTHINFO_UNAVAIL` |
-| `GdmReauthWorker` | process `gdm-session-worker`, service `gdm-password`, `GDM_SESSION_FOR_REAUTH` set | threaded | — |
+| `GdmReauthWorker` | process `gdm-session-worker`, service `gdm-password` (ASCII case-insensitive), `GDM_SESSION_FOR_REAUTH` set | threaded | — |
 | `PolkitAgent` | process `polkit-agent-helper-1` | threaded | — |
 | `KscreenlockerWorker` | process `kscreenlocker_worker` | threaded | — |
 | `Hyprlock` | process `hyprlock` | threaded | — |
@@ -176,30 +177,38 @@ The order matters and is asserted by tests, not by the type system: `classify` r
 
 `DM_PREFIXES`: `sddm`, `gdm`, `gdm3`, `lightdm`, `lxdm`, `slim`, `xdm`, `kdm`, `greetd`, `ly`, `nodm`, `entrance`, `plasmalogin`. A service matches a prefix when it equals it or continues with `-`, after ASCII lowercasing.
 
-Process names are the basename of `/proc/self/exe`, falling back to `/proc/self/comm`; every process rule accepts both the full name and the 15-byte `comm` truncation (`gdm-session-wor`, `polkit-agent-he`, `kscreenlocker_w`). GDM reauthentication requires both `GDM_SESSION_FOR_REAUTH` and the `gdm-password` service.
+Process names are the basename of `/proc/self/exe`, falling back to `/proc/self/comm`; every process rule accepts both the full name and the 15-byte `comm` truncation (`gdm-session-wor`, `polkit-agent-he`, `kscreenlocker_w`). GDM reauthentication requires both `GDM_SESSION_FOR_REAUTH` and the `gdm-password` service — `gdm3-password` is not exempt, it takes the bypass.
+
+`sudo` and `su` match no row: they fall to `DefaultSequential`, and because both have a terminal they use the operation deadline.
 
 ```mermaid
 flowchart TD
     A[service, process, GDM flag] --> B{remote service?}
     B -- yes --> R[skip: PAM_AUTHINFO_UNAVAIL]
-    B -- no --> C{display manager and not GDM reauth?}
+    B -- no --> C{display-manager service and not GDM reauth?}
     C -- yes --> S[skip: PAM_AUTHINFO_UNAVAIL]
-    C -- no --> D{GDM reauth worker?}
+    C -- no --> D{gdm-session-worker with gdm-password?}
     D -- yes --> T[threaded]
-    D -- no --> E{polkit agent, kscreenlocker, hyprlock or xsecurelock?}
+    D -- no --> E{polkit-agent-helper-1?}
     E -- yes --> T
-    E -- no --> F{swaylock, gtklock or i3lock?}
-    F -- yes --> P[pre-collected]
-    F -- no --> G{process unknown and service polkit-1?}
+    E -- no --> F{kscreenlocker_worker?}
+    F -- yes --> T
+    F -- no --> G{hyprlock?}
     G -- yes --> T
-    G -- no --> Q[sequential]
+    G -- no --> H{authproto_pam?}
+    H -- yes --> T
+    H -- no --> I{swaylock, gtklock or i3lock?}
+    I -- yes --> P[pre-collected]
+    I -- no --> J{process unknown and service polkit-1?}
+    J -- yes --> T
+    J -- no --> Q[sequential]
 ```
 
-Config cannot reorder or replace any of this. `policy::refine` runs once after the config read and can only turn a participation into the `RemoteRefuse` skip for a name listed in `pam_refused_services`; an existing skip, a selected flow and a deadline are never changed. That second phase exists because `classify` sees the caller's facts only, before any config is loaded.
+Config cannot reorder or replace any of this. `policy::refine` runs once after the config read and can only turn a participation into the `RemoteRefuse` skip for a name listed in `pam_refused_services`, compared ASCII case-insensitively as a whole string; an existing skip, a selected flow and a deadline are never changed. That second phase exists because `classify` sees the caller's facts only, before any config is loaded.
 
 ## The three flows
 
-Each flow is one module under `client-pam/src/mechanism/`; all three answer the same PAM conversation, and the choice is made by the rule table before any of them runs.
+Each flow is one module under `client-pam/src/mechanism/`. All three produce a `MechanismEnd`; they differ in which thread drives the host's conversation, if any. The rule table chooses between them before any of them runs.
 
 ### Threaded
 
@@ -244,8 +253,8 @@ A response from the daemon is the verdict whatever the loop exit was; the worker
 | Selected by | `GdmReauthWorker`, `PolkitAgent`, `KscreenlockerWorker`, `Hyprlock`, `Xsecurelock`, `PolkitServiceWithoutProc` |
 | Threads | `pam_get_authtok` on a worker pthread; the calling thread polls the daemon fd and a self-pipe |
 | Daemon sees | the request; a cancel on the live connection when a password is submitted or the dialog fails; no cancel on timeout |
-| User sees | the host's password dialog and the phone prompt; the first answer wins |
-| Phone never answers | `pam_operation_timeout_secs` expires, the worker is cancelled and joined, `PAM_AUTHINFO_UNAVAIL` |
+| User sees | the host's password dialog and the phone prompt together; a submitted password wins over a response that becomes readable at the same moment, and otherwise the first of the two ends the wait |
+| Phone never answers | `pam_operation_timeout_secs` expires, the worker is cancelled and joined, `PAM_AUTHINFO_UNAVAIL`; the module does not dismiss the host's dialog, and whatever module follows in the stack drives the next prompt |
 
 ### Sequential
 
@@ -268,6 +277,9 @@ sequenceDiagram
         Module-->>Host: PAM_SUCCESS or PAM_PERM_DENIED
     else user presses Enter on /dev/tty
         Module->>Daemon: PamCancelRequest tty-skip
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    else IPC fails without a terminal
+        Module->>Daemon: PamCancelRequest gui-ipc-error
         Module-->>Host: PAM_AUTHINFO_UNAVAIL
     else deadline expires
         Module-->>Host: PAM_AUTHINFO_UNAVAIL
@@ -330,9 +342,9 @@ The remote refusal covers the built-in names before the config read and any `pam
 | Sequential | absent | `Deadline::GuiBounded` | `pam_gui_timeout_secs` (30 s), clamped to the operation timeout |
 | Pre-collected | — | none | — |
 
-`Plannable::plan` picks the variant from the conversation and `has_tty`; `Deadline::resolve` in `plan.rs` turns it into seconds and saturates at `u32::MAX`. `transaction/run.rs` adds those seconds to the current instant and sends the same value to the daemon, so both sides expire together.
+`Plannable::plan` picks the variant from the `Plannable` shape and `has_tty`; `Deadline::resolve` in `plan.rs` turns it into seconds and saturates at `u32::MAX`. `transaction/run.rs` adds those seconds to the current instant and sends the same value to the daemon, so both sides expire together.
 
-The clamp is `pam_gui_timeout_secs.min(pam_operation_timeout_secs)` and applies only to a sequential host without a terminal. Only that shape probes `/dev/tty` (`TtyUse::PollForKey`); threaded and no-terminal sequential never open it.
+The clamp is `pam_gui_timeout_secs.min(pam_operation_timeout_secs)` and applies only to a sequential host that finds no terminal. Every sequential host attempts the probe (`Plannable::tty_use` is `PollForKey` for both sequential shapes and `DoNotOpen` for threaded); a host without a terminal gets `None` back, and only then does its plan become `GuiBounded`.
 
 On expiry the mechanism returns `MechanismEnd::Reason(UnavailableReason::TimedOut)`, no cancel is sent, and the module returns `PAM_AUTHINFO_UNAVAIL` after one `timed_out` message. A timeout the daemon reports itself is `UnavailableReason::DaemonTimedOut`: the same code, no message.
 
@@ -343,7 +355,7 @@ On expiry the mechanism returns `MechanismEnd::Reason(UnavailableReason::TimedOu
 | `Granted` | `PAM_SUCCESS` | the phone granted this call, or this process's own grant was replayed |
 | `Denied` | `PAM_PERM_DENIED` | the user denied on the phone |
 | `Unavailable` | `PAM_AUTHINFO_UNAVAIL` | the module could not ask: a skip, a timeout, no daemon, no paired device, or the password handoff |
-| `Error` | `PAM_AUTH_ERR` | processing failed: conversation lookup, request id, daemon protocol |
+| `Error` | `PAM_AUTH_ERR` | `PamConversation::new` failed, request-id generation failed, the daemon returned an outcome this build does not know, or `guard()` caught a panic |
 | `UserUnknown` | `PAM_USER_UNKNOWN` | the username lookup failed |
 
 Only two constructors can produce a grant: `Outcome::granted_from_daemon` (a `PamOutcome::Success` this call received, `GrantVia::PhoneTap`) and `Outcome::replayed` (a copy of this process's own record, `GrantVia::VerdictReplay`). `granted_only_from_daemon` scans for any other construction.
@@ -382,7 +394,7 @@ flowchart TD
 
 The key is `(username, service)` compared with plain string equality, so `sudo` and `SUDO` are distinct services. The window is `VERDICT_REUSE_WINDOW` (500 ms) measured from `concluded_at`; the anchor is the module's return path, not the moment the phone answered.
 
-`record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from.
+`record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from. Everything the daemon answered is recorded, including a timeout and a protocol error: the record holds the verdict, not just a grant, so a later call inside the window receives the same code without ringing the phone.
 
 A forked child inherits neither: the `pthread_atfork` child handler writes a fresh empty record over the inherited slot, so the child starts with no conclusion and no held lock.
 
@@ -405,14 +417,14 @@ A forked child inherits neither: the `pthread_atfork` child handler writes a fre
 Adding a host:
 
 1. Add the predicate in `policy/table.rs`, accepting both the full process name and its 15-byte `comm` truncation.
-2. Add the `RuleId` variant with its `ALL` and `as_str` arms in `policy.rs`, and the row in `RULES`.
+2. Add the `RuleId` variant with its `ALL` and `as_str` arms in `policy.rs`, and the row in `RULES` with its `FailureDirection` and `Decision`.
 3. Add the audit arm in `policy/table.rs`: name, why, and the evidence citation.
 4. Add a row to `client-pam/tests/fixtures/callers.csv` with `expected_rule` and `expected_policy`.
 5. Add the process key to the `rules_are_process_disjoint` set.
 6. Add an `EXPECTED_TTY` entry in `policy.rs` when the flow is threaded or sequential.
 7. For an e2e-covered host, add its `case` arm to `scripts/ci/test-pam-conv-thread.sh` and set `e2e=1`.
 
-Skipping a step fails a named test: a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, a missing audit arm trips `audit_covers_rules`, a duplicated or drifting process key trips `rules_are_process_disjoint`, and an `e2e=1` row without an arm fails the harness.
+Every step except 5 fails a named test: a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, a missing audit arm trips `audit_covers_rules`, and an `e2e=1` row without an arm fails the harness. The `rules_are_process_disjoint` key set is the one edit nothing fails loudly on, so update it by hand.
 
 A display manager is not a new rule: add a `DM_PREFIXES` entry (and its array length) plus one corpus row per prefix.
 
@@ -428,8 +440,8 @@ The `FailureDirection` of a rule decides which conversations it may select, so c
 
 | Direction | Permits | Use when |
 | :--- | :--- | :--- |
-| `DeadlockAvoidance` | threaded or sequential | the host's conversation is answerable, or must not be driven |
-| `AlwaysRing` | threaded | the host can be rung on a worker while it waits |
+| `DeadlockAvoidance` | threaded or sequential | driving the conversation from the wrong thread would deadlock the host, so the rule picks per process |
+| `AlwaysRing` | threaded | the host's conversation stays answerable on a worker, and the phone is always rung |
 | `NeverRing` | pre-collected | the host read the password before calling |
 | `Keyring` | skips only | the login manager must populate `PAM_AUTHTOK` |
 | `RefuseRemote` | skips only | a remote login must never be completed by the phone |
@@ -443,7 +455,7 @@ The `FailureDirection` of a rule decides which conversations it may select, so c
 - `RuleId::ALL` completeness is not compile-enforced: a rule missing from both `ALL` and `RULES` stays green.
 - A panic between `pthread_create` and the join leaks the worker; `guard()` does not close it.
 - `pthread_cancel` can deadlock a host that holds an internal libc lock. Accepted: isolating the conversation would need a helper process.
-- No unit test names `PamOutcome::Timeout` or `DaemonTimedOut`; the daemon-timeout e2e exists only for a threaded host.
+- No mechanism-level test drives a `PamOutcome::Timeout` through a sequential loop; the daemon-timeout e2e uses a threaded host.
 - The host-cases suite (`scripts/ci/test-pam-host-cases.sh`) needs root to write `/etc/pam.d`; a non-root run reports one skip per case and fails.
 - Nothing asserts where the `su` line sits relative to `pam_wheel.so`.
 - The Debian packaged `common-auth` stack is only string-checked; no test drives it.
