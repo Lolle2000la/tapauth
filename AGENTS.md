@@ -59,6 +59,11 @@ cd server-android && ./gradlew test
 cd server-android && ./gradlew connectedE2eAndroidTest
 ```
 
+## Rust Conventions
+- **Module layout**: a module is `foo.rs`, plus a `foo/` directory for its children — not `foo/mod.rs`. No crate in the workspace has one today and that is the intended state; the only exception is a test setup that genuinely requires `mod.rs`, and then the commit message must say why.
+- **Moving or renaming a module**: use `git mv` so history follows, and update the module lists in `client-pam/src/source_guards.rs` in the same commit. The scans cover exactly what those lists name, so a stale entry silently narrows them; the walker resolves only the flat `NAME.rs` form, so a module left at `NAME/mod.rs` drops out of every scan. `the_walker_separates_test_modules_from_production` asserts the lists match the tree.
+- **Naming**: name code after the thing it describes, not a design document's numbering — hence the `RuleId` variants are `RemoteRefuse`, `DmLoginBypass`, `PreCollectedLocks`, and the row-number mapping stays in the design document.
+
 ## Feature Flags (critical)
 
 | Crate | Default | Features |
