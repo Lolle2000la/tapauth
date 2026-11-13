@@ -1,5 +1,8 @@
-//! The decision record: `RULES`, one row per host, plus the test-only audit
-//! record that names each rule and cites the evidence for it.
+//! The decision record: `RULES`, an ordered list of named rules over
+//! `CallerContext`, matched first-wins and keyed on whichever caller fact
+//! identifies the host or service — the service name for `R1` and `R2`, the
+//! process name for the rest — plus the test-only audit record that names each
+//! rule and cites the evidence for it.
 
 use crate::context::{CallerContext, ProcessIdentity};
 
@@ -258,7 +261,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "the login manager has to populate `PAM_AUTHTOK` for the session \
                   keyring, and a grant without it is useless",
             evidence: &[
-                "client-pam/src/policy/table.rs:152",
+                "client-pam/src/policy/table.rs:155",
                 "client-pam/src/outcome.rs:59",
             ],
         },
@@ -267,7 +270,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "a GDM reauthentication is driven by the session worker, whose \
                   conversation stays answerable while a worker thread waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:158",
+                "client-pam/src/policy/table.rs:161",
                 "client-pam/src/context.rs:80",
             ],
         },
@@ -276,7 +279,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "polkit's agent helper feeds its conversation from a separate \
                   process, so it can be answered while the caller waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:168",
+                "client-pam/src/policy/table.rs:171",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -285,7 +288,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "kscreenlocker 6.8's worker answers on Qt's D-Bus daemon thread, so \
                   the conversation survives the calling thread blocking",
             evidence: &[
-                "client-pam/src/policy/table.rs:175",
+                "client-pam/src/policy/table.rs:178",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -294,7 +297,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "hyprlock answers from a worker thread; its unsynchronised \
                   `resetConversation`/`checkWaiting` race is the accepted risk",
             evidence: &[
-                "client-pam/src/policy/table.rs:187",
+                "client-pam/src/policy/table.rs:190",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -303,7 +306,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "xsecurelock's helper answers from its own thread pool, at the cost \
                   of up to three rings when `CallPAMWithRetries` re-runs the module",
             evidence: &[
-                "client-pam/src/policy/table.rs:195",
+                "client-pam/src/policy/table.rs:198",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -312,7 +315,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "these hosts collected the password before `pam_authenticate`, so \
                   the phone must not be rung and the token is handed on instead",
             evidence: &[
-                "client-pam/src/policy/table.rs:200",
+                "client-pam/src/policy/table.rs:203",
                 "client-pam/src/mechanism/handoff.rs:25",
             ],
         },
@@ -321,7 +324,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "polkit with an unreadable `/proc` cannot be shown to answer \
                   concurrently, so it stays on the threaded conversation",
             evidence: &[
-                "client-pam/src/policy/table.rs:211",
+                "client-pam/src/policy/table.rs:214",
                 "client-pam/src/context.rs:164",
             ],
         },
@@ -330,7 +333,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "every other caller is driven sequentially on the calling thread, \
                   which is slower but can never wedge the host's event loop",
             evidence: &[
-                "client-pam/src/policy/table.rs:216",
+                "client-pam/src/policy/table.rs:219",
                 "client-pam/src/mechanism/sequential.rs:1",
             ],
         },
