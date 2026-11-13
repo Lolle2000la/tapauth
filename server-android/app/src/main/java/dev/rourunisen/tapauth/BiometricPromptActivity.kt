@@ -158,9 +158,7 @@ class BiometricPromptActivity : FragmentActivity() {
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle("Authentication Request")
                 .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
-                .setDescription(
-                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}",
-                )
+                .setDescription(AuthRequestManager.promptDescription(authRequest))
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                 .setConfirmationRequired(false) // Don't require additional confirmation

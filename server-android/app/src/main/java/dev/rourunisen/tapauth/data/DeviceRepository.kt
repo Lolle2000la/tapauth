@@ -129,9 +129,22 @@ class DeviceRepository(context: Context) {
             put("pairedAt", device.pairedAt)
             // Store allowed users list
             put("allowedUsers", JSONArray(device.allowedUsers))
+            // Store the negotiated algorithm suite and protocol version
+            put("symmetricAlgorithm", device.symmetricAlgorithm)
+            put("hashAlgorithm", device.hashAlgorithm)
+            put("signatureAlgorithm", device.signatureAlgorithm)
+            put("protocolVersion", device.protocolVersion)
         }
     }
 
+    /**
+     * Read one persisted device.
+     *
+     * Records written before protocol v2 have none of the algorithm/version fields, so they load
+     * with `protocolVersion = 1` and the AES-256-GCM/SHA-256/Ed25519 defaults. Such a legacy record
+     * cannot authenticate over the v2 wire format and must be re-paired; there is deliberately no
+     * compatibility path that would let it silently fall back to v1 crypto.
+     */
     private fun jsonToDevice(json: JSONObject): PairedDevice {
         // Parse allowed users list (with backwards compatibility)
         val allowedUsers =
@@ -149,6 +162,10 @@ class DeviceRepository(context: Context) {
             displayName = json.getString("displayName"),
             pairedAt = json.getLong("pairedAt"),
             allowedUsers = allowedUsers,
+            symmetricAlgorithm = json.optInt("symmetricAlgorithm", 1),
+            hashAlgorithm = json.optInt("hashAlgorithm", 1),
+            signatureAlgorithm = json.optInt("signatureAlgorithm", 1),
+            protocolVersion = json.optInt("protocolVersion", 1),
         )
     }
 }

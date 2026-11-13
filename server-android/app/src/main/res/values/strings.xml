@@ -27,6 +27,8 @@
     <string name="pairing_user_cancelled">User cancelled</string>
     <string name="pairing_no_ip">No IP address available</string>
     <string name="pairing_cancelled_message">Pairing cancelled</string>
+    <string name="pairing_via_bluetooth">via Bluetooth</string>
+    <string name="pairing_via_network">via network</string>
 
     <!-- QR Scanner Screen -->
     <string name="scanner_title">Scan QR Code</string>

@@ -1,7 +1,7 @@
 package dev.rourunisen.tapauth.service
 
 import android.util.Log
-import dev.rourunisen.tapauth.crypto.generateTemporalId
+import dev.rourunisen.tapauth.crypto.generateTemporalIdWithAlg
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -41,7 +41,11 @@ class TemporalIdCache(
      */
     @Volatile private var devicesLoaded = false
 
-    private data class CachedDevice(val deviceId: String, val csk: ByteArray)
+    private data class CachedDevice(
+        val deviceId: String,
+        val csk: ByteArray,
+        val hashAlgorithm: Int,
+    )
 
     fun start() {
         stop()
@@ -109,7 +113,7 @@ class TemporalIdCache(
             // returns early without advancing lastComputedWindow so the next packet retries.
             devices =
                 deviceRepository.getAllPairedDevicesSync().map {
-                    CachedDevice(it.deviceId, it.csk)
+                    CachedDevice(it.deviceId, it.csk, it.hashAlgorithm)
                 }
             cachedDevices = devices
             devicesLoaded = true
@@ -126,7 +130,7 @@ class TemporalIdCache(
     suspend fun refreshDeviceList() {
         try {
             val pairedDevices = deviceRepository.getAllPairedDevices()
-            val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
+            val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk, it.hashAlgorithm) }
             synchronized(this) {
                 cachedDevices = mapped
                 devicesLoaded = true
@@ -152,10 +156,10 @@ class TemporalIdCache(
 
         for (device in devices) {
             try {
-                newIds[generateTemporalIdentifier(device.csk, currentWindow * TIME_WINDOW_MS)] =
+                newIds[generateTemporalIdentifier(device, currentWindow * TIME_WINDOW_MS)] =
                     device.deviceId
 
-                newIds[generateTemporalIdentifier(device.csk, previousWindow * TIME_WINDOW_MS)] =
+                newIds[generateTemporalIdentifier(device, previousWindow * TIME_WINDOW_MS)] =
                     device.deviceId
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
@@ -165,9 +169,13 @@ class TemporalIdCache(
         return newIds
     }
 
-    private fun generateTemporalIdentifier(csk: ByteArray, timestampMs: Long): String {
+    /**
+     * Hash one 60s window with the hash algorithm this pairing negotiated, so a device paired with
+     * e.g. BLAKE3 is matched by BLAKE3 ids and never by SHA-256 ones.
+     */
+    private fun generateTemporalIdentifier(device: CachedDevice, timestampMs: Long): String {
         val timestampSeconds = timestampMs / 1000
-        return generateTemporalId(csk, timestampSeconds).toHex()
+        return generateTemporalIdWithAlg(device.csk, timestampSeconds, device.hashAlgorithm).toHex()
     }
 
     private fun ByteArray.toHex(): String {

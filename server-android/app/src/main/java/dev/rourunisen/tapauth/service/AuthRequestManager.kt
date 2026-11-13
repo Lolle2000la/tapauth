@@ -5,12 +5,15 @@ import android.content.Context
 import android.content.Intent
 import android.util.Base64
 import android.util.Log
+import android.view.View
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.TransportType
 import java.util.UUID
@@ -69,7 +72,13 @@ class AuthRequestManager private constructor() {
         val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
 
-    /** Submit an authentication request for user approval Returns a request ID */
+    /**
+     * Submit an authentication request for user approval Returns a request ID
+     *
+     * The four context parameters carry the Client's signed caller context (§3.3); they are
+     * defaults so BLE/older call sites keep compiling, and they appear before [callback] because a
+     * trailing lambda always binds to the last parameter.
+     */
     fun submitRequest(
         context: Context,
         deviceId: String,
@@ -80,6 +89,10 @@ class AuthRequestManager private constructor() {
         timestamp: Long,
         transportType: TransportType,
         bleDeviceAddress: String? = null, // Optional: BLE MAC address for disconnect cleanup
+        pamService: String = "",
+        processName: String = "",
+        commandPreview: String = "",
+        ttyPresent: Boolean = false,
         callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
@@ -108,6 +121,10 @@ class AuthRequestManager private constructor() {
                 challenge = challenge,
                 timestamp = timestamp,
                 transportType = transportType,
+                pamService = pamService,
+                processName = processName,
+                commandPreview = commandPreview,
+                ttyPresent = ttyPresent,
             )
 
         // Store the pending request
@@ -219,11 +236,41 @@ class AuthRequestManager private constructor() {
             val timeElapsed = currentTime - timestamp
             val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
 
+            // §3.3: the primary header stays `username@hostname`; the secondary line below it is
+            // the re-sanitized caller context, capped at two lines with an end ellipsis.
+            val secondaryLine = contextLine(authRequest)
+            val contentViews =
+                RemoteViews(
+                        context.packageName,
+                        dev.rourunisen.tapauth.R.layout.notification_auth_request,
+                    )
+                    .apply {
+                        val titleId = dev.rourunisen.tapauth.R.id.notification_title
+                        val contextId = dev.rourunisen.tapauth.R.id.notification_context
+                        setTextViewText(titleId, "$username@$hostname")
+                        if (secondaryLine.isEmpty()) {
+                            setViewVisibility(contextId, View.GONE)
+                        } else {
+                            setTextViewText(contextId, secondaryLine)
+                            setViewVisibility(contextId, View.VISIBLE)
+                        }
+                        // A custom content view does not inherit `setContentIntent`; wire the tap
+                        // target explicitly so tapping the body still opens the prompt.
+                        setOnClickPendingIntent(
+                            dev.rourunisen.tapauth.R.id.notification_root,
+                            pendingIntent,
+                        )
+                    }
+
             val notificationBuilder =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
                     .setContentText("${deviceName}: ${username}@${hostname}")
+                    .setCustomContentView(contentViews)
+                    // Clone so the collapsed and expanded views are distinct instances; both are
+                    // this same two-row layout, so the summary never loses the context line.
+                    .setCustomBigContentView(contentViews.clone())
                     .setContentIntent(pendingIntent)
                     .addAction(
                         dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground,
@@ -574,6 +621,55 @@ class AuthRequestManager private constructor() {
 
         /** Delay in ms before debug auto-approval fires when no biometrics are enrolled. */
         const val DEBUG_AUTO_APPROVE_DELAY_MS = 1000L
+
+        /** Byte budget for the secondary context line under the notification header. */
+        const val CONTEXT_LINE_MAX_BYTES = 128
+
+        /** Byte budget for the context paragraph inside the biometric prompt. */
+        const val PROMPT_CONTEXT_MAX_BYTES = 256
+
+        private const val TTY_TAG = "tty"
+        private const val CONTEXT_SEPARATOR = " · "
+
+        /**
+         * Secondary context line rendered under the primary `username@hostname` header (§3.3).
+         *
+         * The Client's `command_preview`/`process_name`/`pam_service` are untrusted, so every part
+         * is re-sanitized with [ContextSanitizer] here and the assembled line is sanitized again —
+         * that bounds the whole line to [maxBytes] and re-adds the end ellipsis after the join.
+         *
+         * Degradation order: the command preview when present, otherwise `pamService ·
+         * processName`; the `tty` indicator is prepended so truncation cannot hide it. Returns ""
+         * when the Client sent no context at all, in which case the caller renders nothing extra.
+         */
+        fun contextLine(authRequest: AuthRequest, maxBytes: Int = CONTEXT_LINE_MAX_BYTES): String {
+            val command = ContextSanitizer.sanitize(authRequest.commandPreview, maxBytes)
+            val parts = ArrayList<String>(3)
+            if (command.isNotEmpty()) {
+                parts.add(command)
+            } else {
+                // Degrade to `pamService · processName` when the Client sent no command line.
+                val pamService = ContextSanitizer.sanitize(authRequest.pamService)
+                val processName = ContextSanitizer.sanitize(authRequest.processName)
+                if (pamService.isNotEmpty()) parts.add(pamService)
+                if (processName.isNotEmpty()) parts.add(processName)
+            }
+            if (parts.isEmpty()) return ""
+            if (authRequest.ttyPresent) parts.add(0, TTY_TAG)
+            return ContextSanitizer.sanitize(parts.joinToString(CONTEXT_SEPARATOR), maxBytes)
+        }
+
+        /**
+         * Description shown by both biometric prompts: one sanitized context paragraph followed by
+         * the device/transport line that was already there. Both the in-app prompt and the
+         * notification-launched one render exactly this string, so they cannot drift apart.
+         */
+        fun promptDescription(authRequest: AuthRequest): String {
+            val deviceLine =
+                "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}"
+            val contextText = contextLine(authRequest, PROMPT_CONTEXT_MAX_BYTES)
+            return if (contextText.isEmpty()) deviceLine else "$contextText\n\n$deviceLine"
+        }
 
         /**
          * E2E-build-only auto-approval used when no biometrics are enrolled.

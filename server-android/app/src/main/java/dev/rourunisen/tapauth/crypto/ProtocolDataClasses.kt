@@ -17,6 +17,10 @@ package dev.rourunisen.tapauth.crypto
  * @property timestampUnixSeconds Unix timestamp when request was created
  * @property signatureAlgorithm Signature algorithm from WrapperMessage (e.g., Ed25519 = 1)
  * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
+ * @property pamService PAM service name (e.g. "sudo"); empty when the Client did not send it
+ * @property processName Calling process name; empty when the Client did not send it
+ * @property commandPreview Sanitized command line preview; empty when the Client did not send it
+ * @property ttyPresent Whether the caller had a controlling terminal
  */
 data class AuthRequest(
     val challenge: ByteArray,
@@ -25,6 +29,10 @@ data class AuthRequest(
     val timestampUnixSeconds: Long,
     val signatureAlgorithm: Int,
     val signature: ByteArray,
+    val pamService: String = "",
+    val processName: String = "",
+    val commandPreview: String = "",
+    val ttyPresent: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
@@ -38,6 +46,10 @@ data class AuthRequest(
         if (timestampUnixSeconds != other.timestampUnixSeconds) return false
         if (signatureAlgorithm != other.signatureAlgorithm) return false
         if (!signature.contentEquals(other.signature)) return false
+        if (pamService != other.pamService) return false
+        if (processName != other.processName) return false
+        if (commandPreview != other.commandPreview) return false
+        if (ttyPresent != other.ttyPresent) return false
 
         return true
     }
@@ -49,6 +61,10 @@ data class AuthRequest(
         result = 31 * result + timestampUnixSeconds.hashCode()
         result = 31 * result + signatureAlgorithm
         result = 31 * result + signature.contentHashCode()
+        result = 31 * result + pamService.hashCode()
+        result = 31 * result + processName.hashCode()
+        result = 31 * result + commandPreview.hashCode()
+        result = 31 * result + ttyPresent.hashCode()
         return result
     }
 }
@@ -154,88 +170,6 @@ data class EncryptedPacketInfo(
         var result = temporalIdentifier.contentHashCode()
         result = 31 * result + encryptionAlgorithm
         result = 31 * result + ciphertext.contentHashCode()
-        return result
-    }
-}
-
-/**
- * Parsed PairingResponse message.
- *
- * @property version Protocol version
- * @property x25519PublicKey Client's X25519 public key for key exchange
- * @property ed25519PublicKey Client's Ed25519 public key for signing
- * @property deviceName Client device name
- * @property selectedSymmetricAlgorithm Client's selected symmetric algorithm
- * @property selectedHashAlgorithm Client's selected hash algorithm
- * @property selectedSignatureAlgorithm Client's selected signature algorithm
- */
-data class PairingResponse(
-    val version: Int,
-    val x25519PublicKey: ByteArray,
-    val ed25519PublicKey: ByteArray,
-    val deviceName: String,
-    val selectedSymmetricAlgorithm: Int,
-    val selectedHashAlgorithm: Int,
-    val selectedSignatureAlgorithm: Int,
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this == other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as PairingResponse
-
-        if (version != other.version) return false
-        if (!x25519PublicKey.contentEquals(other.x25519PublicKey)) return false
-        if (!ed25519PublicKey.contentEquals(other.ed25519PublicKey)) return false
-        if (deviceName != other.deviceName) return false
-        if (selectedSymmetricAlgorithm != other.selectedSymmetricAlgorithm) return false
-        if (selectedHashAlgorithm != other.selectedHashAlgorithm) return false
-        if (selectedSignatureAlgorithm != other.selectedSignatureAlgorithm) return false
-
-        return true
-    }
-
-    override fun hashCode(): Int {
-        var result = version
-        result = 31 * result + x25519PublicKey.contentHashCode()
-        result = 31 * result + ed25519PublicKey.contentHashCode()
-        result = 31 * result + deviceName.hashCode()
-        result = 31 * result + selectedSymmetricAlgorithm
-        result = 31 * result + selectedHashAlgorithm
-        result = 31 * result + selectedSignatureAlgorithm
-        return result
-    }
-}
-
-/**
- * Parsed PairingComplete message.
- *
- * @property success Whether pairing completed successfully
- * @property hashAlgorithm Hash algorithm used for the CSK hash
- * @property encryptedCskHash CSK SHA-256 hash encrypted with the ephemeral PSK
- */
-data class PairingComplete(
-    val success: Boolean,
-    val hashAlgorithm: Int,
-    val encryptedCskHash: ByteArray,
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as PairingComplete
-
-        if (success != other.success) return false
-        if (hashAlgorithm != other.hashAlgorithm) return false
-        if (!encryptedCskHash.contentEquals(other.encryptedCskHash)) return false
-
-        return true
-    }
-
-    override fun hashCode(): Int {
-        var result = success.hashCode()
-        result = 31 * result + hashAlgorithm
-        result = 31 * result + encryptedCskHash.contentHashCode()
         return result
     }
 }
