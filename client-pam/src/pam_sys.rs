@@ -116,11 +116,9 @@ pub unsafe fn get_conv(pamh: *mut PamHandle) -> Result<*const ffi::pam_conv, c_i
     Ok(item as *const ffi::pam_conv)
 }
 
-/// The pre-collected token read, as a value the handoff can be given.
-///
-/// The read is the one effect `mechanism::handoff` performs on the PAM handle,
-/// so it is passed in through `transaction::HostIo` like every other effect: a
-/// test can count it instead of inferring it from a missing conversation.
+/// The pre-collected token read, injected through `transaction::HostIo` like every
+/// other effect so a test can count it instead of inferring it from a missing
+/// conversation.
 pub(crate) type ReadAuthtok = unsafe fn(*mut PamHandle) -> (c_int, *const c_char);
 
 /// Read `PAM_AUTHTOK` for the pre-collected handoff: `pam_get_authtok` on this
@@ -213,8 +211,8 @@ impl<'a> PamConversation<'a> {
     /// A handle-less conversation for unit tests.
     ///
     /// `send_message` starts at `get_conv`, which rejects a null handle with
-    /// `PAM_SYSTEM_ERR`, so `info`/`try_info`/`error` are clean no-ops; only
-    /// return-code logic taking a `&PamConversation` is exercised this way.
+    /// `PAM_SYSTEM_ERR`, so `info`/`error` fail harmlessly and `try_info`/`try_error`
+    /// only log; such a test exercises the return-code logic, not the conversation.
     #[cfg(test)]
     pub unsafe fn dummy() -> Self {
         Self {
@@ -264,24 +262,19 @@ mod tests {
 
     /// A null `PAM_USER` is `PAM_USER_UNKNOWN`, and nothing else is consulted.
     ///
-    /// The defect this catches: a fallback to another item (the retired
-    /// remote-user read) returning *that* as the username. The name becomes the
-    /// daemon request's `username`, the verdict cache's key and the locale
-    /// lookup's NSS name, so it would prompt the phone for an account the stack
-    /// will not authenticate. `user_from_item` has no second item to consult.
+    /// Catches a fallback to another item (the retired remote-user read): the name becomes the
+    /// daemon request's `username`, the verdict cache's key and the locale lookup's NSS name, so
+    /// it would prompt the phone for an account the stack will not authenticate.
     #[test]
     fn null_user_does_not_fall_back_to_ruser() {
         assert_eq!(user_from_item(None), Err(PAM_USER_UNKNOWN));
 
-        // The other direction, which the removal must not break: a set
-        // `PAM_USER` is returned as-is, whatever else the handle carries.
         let user = CString::new("alice").unwrap();
         assert_eq!(
             user_from_item(Some(user.as_c_str())),
             Ok("alice".to_owned())
         );
 
-        // Non-UTF-8 stays a lookup failure rather than a lossy name.
         let raw: &CStr = c"\xff";
         assert_eq!(user_from_item(Some(raw)), Err(PAM_USER_UNKNOWN));
     }

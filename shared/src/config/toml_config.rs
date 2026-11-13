@@ -24,14 +24,12 @@ const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 /// Mirrors the default in the PAM module's `PamConfig` (client-pam).
 const DEFAULT_PAM_GUI_TIMEOUT_SECS: u64 = 30;
 
-/// The PAM service names the module always refuses to take part in.
-///
-/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default; `sshd-session` is
-/// the name its per-connection session binary uses on current releases. Both are
-/// a *default*, not a constant of the protocol: this list is the one canonical
-/// definition (the PAM module's R1 and its config parser both read it), and a
-/// deployment that renames `PAMServiceName` declares the new name by adding it to
-/// `pam_refused_services`. The built-in names cannot be removed by config.
+/// The PAM service names the module always refuses to take part in: `sshd` is
+/// OpenSSH's compiled-in `PAMServiceName` default, `sshd-session` the name its
+/// per-connection session binary uses on current releases. This list is the one
+/// canonical definition (the PAM module's R1 and its config parser both read it);
+/// a deployment that renames `PAMServiceName` adds the new name to
+/// `pam_refused_services`, which can only add, never remove.
 pub const DEFAULT_PAM_REFUSED_SERVICES: &[&str] = &["sshd", "sshd-session"];
 
 /// Default UDP port for authentication
@@ -117,16 +115,14 @@ pub struct TapAuthConfig {
 
     /// Authentication timeout for graphical PAM contexts whose conversation the
     /// module cannot drive (the sequential path: a host the rule table in
-    /// `client-pam/src/policy/table.rs` does not classify as threaded, or an
-    /// unrecognised host).
+    /// `client-pam/src/policy/table.rs` does not classify as threaded).
     /// Default: 30 seconds
     ///
     /// In those contexts the TapAuth wait is capped at this duration before
-    /// falling through to password entry. The PAM module additionally clamps
-    /// this to `pam_operation_timeout_secs`, and only for a sequential host
-    /// **without** a terminal. Graphical hosts whose conversation can be driven
-    /// from a worker thread are bounded by `pam_operation_timeout_secs`
-    /// instead.
+    /// falling through to password entry. The PAM module additionally clamps this
+    /// to `pam_operation_timeout_secs`, and only for a sequential host **without**
+    /// a terminal; hosts whose conversation can be driven from a worker thread are
+    /// bounded by `pam_operation_timeout_secs` instead.
     ///
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a
@@ -135,12 +131,10 @@ pub struct TapAuthConfig {
 
     /// Additional PAM service names the module must refuse to take part in.
     ///
-    /// The built-in names ([`DEFAULT_PAM_REFUSED_SERVICES`]: `sshd` and
-    /// `sshd-session`) are always refused; entries here are *added* to them and
-    /// cannot remove a built-in. A deployment that renames OpenSSH's
-    /// `PAMServiceName` (sshd_config) declares the rename by adding the new name
-    /// to this list; without it that stack is treated as local and the phone is
-    /// rung for a remote login.
+    /// The built-ins ([`DEFAULT_PAM_REFUSED_SERVICES`]) are always refused; entries
+    /// here are *added* to them and cannot remove one. A deployment that renames
+    /// OpenSSH's `PAMServiceName` declares the rename here; without it that stack is
+    /// treated as local and the phone is rung for a remote login.
     ///
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a
@@ -474,8 +468,7 @@ mod tests {
         assert!(rewritten.contains("pam_gui_timeout_secs = 45"));
     }
 
-    /// Regression test: the same rewrite hazard as `pam_gui_timeout_secs` above,
-    /// for the configurable remote-refusal list.
+    /// Regression test for the same rewrite hazard as `pam_gui_timeout_secs`.
     ///
     /// The defect this catches: the daemon's SaveConfig round-trip dropping
     /// `pam_refused_services`, so a deployment that declared its renamed

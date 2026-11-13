@@ -1,8 +1,8 @@
 //! The PAM host surface, and the crate's single emission site.
 //!
-//! [`HostIo`] is the handle, the conversation, the messages and the one pre-collected token
-//! read — the only thing a transaction touches on the host. [`finish`] decides which message a
-//! finished transaction shows, so no early return can lose a message or double it.
+//! [`HostIo`] is everything a transaction touches on the host, and every return of
+//! [`run()`](crate::transaction::run()) passes through [`finish`], so no early return can lose a
+//! message or show it twice.
 
 use super::lifecycle::{Finished, Via};
 use crate::outcome::{Notice, NoticeStyle};
@@ -10,10 +10,8 @@ use crate::pam_messages::PamMessages;
 use crate::pam_sys::{PamConversation, PamHandle, ReadAuthtok};
 use std::os::raw::{c_char, c_int};
 
-/// One thing [`HostIo::emit`] was asked to show, with the style it was shown in.
-///
-/// The recording sink's entry: the text alone would let an `Error`-style message be asserted
-/// where an `Info` one belongs.
+/// The recording sink's entry: the style is recorded too, so an `Error`-style message cannot be
+/// asserted where an `Info` one belongs.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Emitted {
@@ -25,7 +23,7 @@ pub(crate) struct Emitted {
 /// conversation they belong to.
 ///
 /// A conversation-less host makes [`HostIo::emit`] a no-op, so a test never opens a real PAM
-/// handle; `for_test_recording` records text and style instead.
+/// handle.
 ///
 /// The type deliberately owns no terminal: the `/dev/tty` file is `run`'s local and is consumed
 /// by the sequential mechanism.
@@ -36,14 +34,11 @@ pub(crate) struct HostIo<'a> {
     pub(super) msgs: &'a PamMessages,
     /// The handoff's one handle read, injected so a test can count it.
     read_authtok: ReadAuthtok,
-    /// Test-only record of what `emit` was asked to show.
     #[cfg(test)]
     emitted: Option<&'a std::cell::RefCell<Vec<Emitted>>>,
 }
 
 impl<'a> HostIo<'a> {
-    /// The one constructor: a test passes `None` for the conversation, which makes
-    /// every emission a no-op.
     pub(crate) fn new(
         pamh: *mut PamHandle,
         conv: Option<&'a PamConversation<'a>>,
@@ -60,12 +55,10 @@ impl<'a> HostIo<'a> {
         }
     }
 
-    /// The handle a mechanism needs for its one conversation call, if any.
     pub(crate) fn pamh(&self) -> *mut PamHandle {
         self.pamh
     }
 
-    /// Read the host's pre-collected token, through the injected reader.
     pub(crate) fn read_authtok(&self) -> (c_int, *const c_char) {
         // SAFETY: the reader is the caller's `pam_get_authtok` wrapper, which takes the live
         // handle this host carries; the conversation belongs to this thread.
@@ -74,9 +67,9 @@ impl<'a> HostIo<'a> {
 
     /// Show one notice, if there is one.
     ///
-    /// The one emission site in the crate: `try_info`/`try_error` swallow a failing
-    /// conversation, so a broken host conversation cannot change the verdict, and the style
-    /// comes from the notice's reason rather than from the site that observed the failure.
+    /// `try_info`/`try_error` swallow a failing conversation, so a broken host conversation
+    /// cannot change the verdict; the style comes from the notice's reason, not from the site
+    /// that observed the failure.
     pub(crate) fn emit(&self, notice: Option<Notice<'_>>) {
         let Some(notice) = notice else {
             return;
@@ -98,9 +91,6 @@ impl<'a> HostIo<'a> {
     }
 
     /// A host that records what it was asked to show, in order, with styles.
-    ///
-    /// The test seam: the only way an ordering or a message assertion can see what the
-    /// transaction emitted without a real PAM handle.
     #[cfg(test)]
     pub(crate) fn for_test_recording(
         pamh: *mut PamHandle,
@@ -118,15 +108,12 @@ impl<'a> HostIo<'a> {
     }
 }
 
-/// The transaction's one emission site: show `finished`'s message through `host`, then hand it
-/// back.
+/// Show `finished`'s message through `host`, then hand `finished` back.
 ///
-/// Every return in [`run()`](crate::transaction::run()) goes through here, so the message is
-/// decided by the verdict *and by how it was reached*, never by the site that produced it.
-/// `Concluded`'s [`Via`] is what suppresses it: a replay was already announced when its
-/// conclusion was first reached, and it must stay silent because of its provenance, not because
-/// the cache-hit arm happens to return early — a restructure that routed a replayed
-/// `Unavailable(..)` or `Error(..)` through an ordinary return still could not speak.
+/// The message is decided by the verdict *and by how it was reached*, never by the site that
+/// produced it: a `Via::Replay` conclusion stays silent because of its provenance, not because
+/// its return happens to be early, so a restructure that routed a replayed `Unavailable(..)` or
+/// `Error(..)` through an ordinary return still could not speak.
 pub(super) fn finish(host: &HostIo<'_>, finished: Finished) -> Finished {
     let notice = match &finished {
         Finished::Concluded(concluded) if concluded.via == Via::Replay => None,

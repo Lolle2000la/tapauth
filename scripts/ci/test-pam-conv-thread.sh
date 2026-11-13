@@ -50,10 +50,9 @@
 #
 #   grant        auth sufficient <module>       (harness run as
 #                account required pam_permit.so   `kscreenlocker_worker`)
-#                CONV_TEST_BLOCK=cancel parks the conversation in
-#                `pthread_cond_wait` — a POSIX cancellation point — and never
-#                signals it, while the fake daemon waits for the conversation to
-#                be entered and then writes a granted IpcEnvelope.  The phone
+#                CONV_TEST_BLOCK=cancel parks the conversation in a cancellation
+#                point that is never signalled, while the fake daemon waits for it
+#                to be entered and then writes a granted IpcEnvelope.  The phone
 #                therefore wins while the host is still blocked, and the module
 #                must abandon the worker (`pthread_cancel`) instead of waiting
 #                for a password that never comes.  A pass cannot be explained by
@@ -66,31 +65,27 @@
 #                auth required <module>          (harness run as
 #                auth optional pam_permit.so      `kscreenlocker_worker`)
 #                account required pam_permit.so
-#                The same parked conversation, but the fake daemon waits for it
-#                and then answers `PamOutcome::Timeout`: the timeout is the
-#                daemon's verdict, not the module's own deadline.  That
-#                difference is the point — `DaemonTimedOut` shows the user no
-#                message, while `TimedOut` announces itself — so the shape
-#                asserts exactly one message, the wait announcement every
-#                participation shows, and a notice for the timeout itself fails
-#                it.  The `required` + optional stack is deliberate: `PAM_IGNORE`
-#                would record no failure and let the optional line grant, so the
-#                non-success verdict re-proves that invariant too.
+#                The same parked conversation, but the fake daemon answers
+#                `PamOutcome::Timeout`: the timeout is the daemon's verdict, not
+#                the module's own deadline.  That difference is the point —
+#                `DaemonTimedOut` shows the user no message, while `TimedOut`
+#                announces itself — so the shape asserts exactly one message, the
+#                wait announcement every participation shows, and a notice for
+#                the timeout itself fails it.  The `required` + optional stack is
+#                deliberate: `PAM_IGNORE` would record no failure and let the
+#                optional line grant, so the non-success verdict re-proves that
+#                invariant too.
 #
 #   duplicate    auth sufficient <module>       (harness run as
 #                account required pam_permit.so   `kscreenlocker_worker`)
-#                Four transactions in one process (pam_start/pam_authenticate
-#                pairs, all handles kept open): user at T0, user immediately
-#                (the modelled 0.37 ms duplicate), user at T0+300 ms and user
-#                at T0+600 ms.  All four must grant and the fake daemon must
-#                have accepted exactly TWO connections: T0 and T0+600 ms.  The
-#                T0+300 ms call is a hit under a fixed *and* a sliding window,
-#                so only the T0+600 ms call can tell them apart — under the
-#                fixed 500 ms window it has been 600 ms since T0 and must start
-#                a real transaction, while a window that re-records on each hit
-#                would answer it and leave the count at one.  `pam_end` unloads
-#                the module and its window, hence the open handles — see
-#                run_duplicate_sequence in conv_thread_harness.c.
+#                Four transactions in one process (all handles kept open, because
+#                `pam_end` unloads the module and its window): user at T0, user
+#                immediately (the modelled 0.37 ms duplicate), user at T0+300 ms
+#                and user at T0+600 ms.  All four must grant and the fake daemon
+#                must have accepted exactly TWO connections: T0 and T0+600 ms.
+#                Only the T0+600 ms call tells a fixed window from one that
+#                re-records on each hit (see `run_duplicate_sequence` in
+#                conv_thread_harness.c).
 #
 #   duplicate-unavailable
 #                auth required <module>          (harness run as
@@ -99,18 +94,17 @@
 #                the first connection, so both conclude PAM_AUTHINFO_UNAVAIL
 #                within milliseconds (no full timeout) with exactly one
 #                connection: a concluded failure is reused just like a success,
-#                because the duplicate was queued while the first transaction
-#                was still running and re-asking would only cost another ring
-#                and another wait.
+#                because the duplicate was queued while the first transaction was
+#                still running, so re-asking would only cost another ring and
+#                another wait.
 #
 #   duplicate-cross-user
 #                auth sufficient <module>       (harness run as
 #                account required pam_permit.so   `kscreenlocker_worker`)
-#                A negative test: the immediate duplicate for a *different*
-#                user (this user, then `nobody`) must not be answered from the
-#                window, so both must grant and the daemon must have accepted
-#                exactly TWO connections.  It fails if the window ever drops the
-#                username from its key.
+#                A negative test: the immediate duplicate for a *different* user
+#                must not be answered from the window, so both must grant and the
+#                daemon must have accepted exactly TWO connections.  It fails if
+#                the window ever drops the username from its key.
 #
 #   duplicate-cross-service
 #                auth sufficient <module>       (harness run as
@@ -127,17 +121,12 @@
 #                auth required pam_exec.so /bin/sleep 0.8
 #                auth required pam_permit.so      `kscreenlocker_worker`)
 #                account required pam_permit.so
-#                The window's *end*, pinned.  The harness issues its two
-#                transactions immediately one after the other, but the first
-#                `pam_authenticate` only returns after the module *after*
-#                `pam_tapauth.so` has blocked for 800 ms — and the window is
-#                anchored at the module's return, not at the end of the stack.
-#                The duplicate therefore starts >= 800 ms after the module
-#                returned, outside the 500 ms the window covers, so the phone
-#                must be rung a second time: both calls grant, the conversation
-#                is entered, and the daemon accepts exactly TWO connections.
-#                This is the documented limitation, and it fails if the window
-#                is widened past 800 ms.
+#                The window's *end*: the first `pam_authenticate` only returns after
+#                the module *after* `pam_tapauth.so` has blocked for 800 ms, and the
+#                window is anchored at the module's return, so the immediate
+#                duplicate is already outside the 500 ms and the phone must be rung
+#                again (TWO connections).  This is the documented limitation, and it
+#                fails if the window is widened past 800 ms.
 #
 #   gdm reauth   the service file is `gdm-password` and the harness runs as
 #                `gdm-session-worker` with GDM_SESSION_FOR_REAUTH=1: a GDM
@@ -155,26 +144,13 @@
 #                and the module shows no message at all — the last one is what
 #                proves the refusal happened before anything could announce.
 #
-# This script therefore:
-#   1. builds `libclient_pam.so` release with `dev-socket-override` so the
-#      module talks to a socket under our control instead of /run/tapauthd;
-#   2. compiles scripts/ci/conv_thread_harness.c (the driver) and
-#      scripts/ci/conv_thread_token_check.c (the token-check module) into $TMP;
-#   3. for each `e2e=1` row of the shared caller corpus
-#      (client-pam/tests/fixtures/callers.csv), writes a private confdir service
-#      file named after the row's `service`, copies the harness (not a symlink —
-#      the kernel resolves /proc/self/exe) to the row's `exe` name, applies the
-#      row's `env` column to GDM_SESSION_FOR_REAUTH, runs it with the matching
-#      CONV_TEST_MODE assertion set, and asserts `RESULT: PASS`, the stack
-#      verdict, the strategy actually taken, and — where the stack has one —
-#      that the token check saw the cached password.  The row's `case` arm adds
-#      what a CSV cannot express: which stack runs, the markers, the accept
-#      counts, the thread the conversation ran on and how many messages the
-#      module showed;
-#   4. runs a row whose process is deliberately NOT allowlisted and asserts it
-#      does not pass, so step 3 cannot succeed vacuously;
-#   5. asserts that the executed shapes are exactly the corpus's `e2e=1` rows,
-#      so a dropped row fails the run instead of quietly shrinking it.
+# The module is built with `dev-socket-override` so it talks to a socket under this
+# script's control; the two C files are compiled into $TMP; each `e2e=1` fixture row
+# supplies the service, the `exe` name (copied, never a symlink — the kernel resolves
+# /proc/self/exe), the env value and the mode, and its `case` arm supplies the stack
+# and the assertions a CSV cannot express.  A row whose id has no arm fails the run,
+# and the executed count is asserted against the corpus, so a dropped row cannot
+# silently drop its coverage.
 #
 # The threaded runs must finish in well under `pam_gui_timeout_secs` (default
 # 30 s).  A regression to the sequential path would either be killed by
@@ -239,12 +215,10 @@ export CONV_TEST_CONFDIR="$CONFDIR"
 
 # ------------------------------------------------------- the caller fixture --
 # Which hosts and services run is decided by the shared caller corpus, not by a
-# list in this script: a row with `e2e=1` is executed as one shape, a row with
-# no `case` arm below fails the run, and the executed count is asserted against
-# the corpus, so a dropped row cannot silently drop its coverage.  What a row
-# proves about the daemon — which stack runs, the token marker, the accept
-# counts, the thread the conversation ran on, how many messages the user saw —
-# cannot be expressed in the CSV and stays in that row's arm.
+# list in this script.  What a row proves about the daemon — which stack runs, the
+# token marker, the accept counts, the thread the conversation ran on, how many
+# messages the user saw — cannot be expressed in the CSV and stays in that row's
+# arm.
 FIXTURE="$PROJECT_ROOT/client-pam/tests/fixtures/callers.csv"
 if [ ! -f "$FIXTURE" ]; then
     echo "❌ ERROR: the shared caller fixture is missing: $FIXTURE"
@@ -297,8 +271,8 @@ fail_row() {
 
 # write_stack <service-file> <pam.d line>...
 #
-# The stack is the arm's business: the fixture says which host and service run,
-# not which modules follow `pam_tapauth.so`.
+# The fixture says which host and service run, not which modules follow
+# `pam_tapauth.so`: that is the arm's business.
 write_stack() {
     local file="$1"
     shift
@@ -388,9 +362,9 @@ run_harness() {
 
 # assert_threaded <label>
 #
-# The four facts a threaded shape must show, whatever its stack: the
-# conversation was entered, it ran off the calling thread, the phone was asked,
-# and the user was shown the wait announcement.  The last one is also the
+# The five facts a threaded shape must show, whatever its stack: the conversation
+# was entered and had returned, it ran off the calling thread, the phone was
+# asked, and the user was shown the wait announcement.  The last one is also the
 # positive control for `conv_text_info`: the skip and handoff arms assert the
 # same counter is 0, which would be vacuous if the counter never moved.
 assert_threaded() {
@@ -441,10 +415,10 @@ assert_accepts() {
 
 # ------------------------------------------------------------ the rows ------
 #
-# One arm per executed row, keyed by the row's `id`.  The arm writes the stack
-# (the CSV has no column for it), runs the row's harness copy, and asserts what
-# that shape proves.  A row whose id has no arm is a hard failure: the count
-# alone cannot catch a row added without assertions.
+# One arm per executed row, keyed by the row's `id`: the arm writes the stack, runs
+# the row's harness copy, and asserts what that shape proves.  A row whose id has no
+# arm is a hard failure, because the count alone cannot catch a row added without
+# assertions.
 EXECUTED=0
 while read_fixture_row; do
     if [ -n "$F_REST" ]; then
@@ -578,17 +552,12 @@ while read_fixture_row; do
         ;;
 
     # ---- daemon-side timeout: the daemon's own verdict must be silent
-    # The fake daemon waits for the conversation to park and then answers
-    # `PamOutcome::Timeout`, so the module concludes `DaemonTimedOut` while the
-    # worker is still blocked.  `Outcome::notice` gives that reason no message,
-    # while this module's own deadline (`TimedOut`) is announced — which is the
-    # difference this shape pins end to end.  `CONV_TEST_BLOCK=cancel` is what
-    # keeps the conversation parked (nothing signal it, so only the module's
-    # `pthread_cancel` ends it), exactly as in the `grant` shape.  The stack is
-    # `required` + `optional pam_permit` for the R1 reason: `PAM_IGNORE` would
-    # record no failure and let the optional line grant, so `non-success`
-    # re-proves the invariant.  `conv_text_info` must be exactly 1 — the wait
-    # announcement every participation shows, and nothing for the timeout.
+    # The fake daemon answers `PamOutcome::Timeout` while the conversation is
+    # parked, so the module concludes `DaemonTimedOut`: `Outcome::notice` gives that
+    # reason no message, unlike this module's own `TimedOut`, so `conv_text_info`
+    # must be exactly 1 (the wait announcement).  The `required` + optional stack
+    # re-proves that `PAM_IGNORE` would record no failure and let the optional line
+    # grant.
     daemon_timeout)
         write_stack "$CONFDIR/$ROW_SERVICE" \
             "auth required $MODULE_PATH" \
@@ -615,12 +584,8 @@ while read_fixture_row; do
 
     # ---- duplicate: the previous success is reused, two phone requests
     # The row sets `env=0`: the module's reauth read is presence-only, so a
-    # set-but-`0` variable must take the gdm-password reauth path (threaded) and
-    # not the display-manager login bypass.  Four transactions in one process
-    # (T0, an immediate duplicate, T0+300 ms, T0+600 ms; every handle stays
-    # open) must all grant, with exactly TWO daemon connections: T0 and
-    # T0+600 ms.  The T0+300 ms call is a hit under a fixed *and* a sliding
-    # window, so only the T0+600 ms call can tell them apart.
+    # set-but-`0` variable must take the gdm-password reauth path (threaded) and not
+    # the display-manager login bypass.
     reauth_zero_value)
         write_stack "$CONFDIR/$ROW_SERVICE" \
             "auth sufficient $MODULE_PATH" \
@@ -633,11 +598,9 @@ while read_fixture_row; do
         ;;
 
     # ---- duplicate-unavailable: a concluded failure is reused too
-    # The fake daemon hangs up on the first connection, so both transactions
-    # conclude PAM_AUTHINFO_UNAVAIL within milliseconds (no full timeout) with
-    # exactly one connection.  Without the reuse window the second call starts a
-    # fresh transaction, which the daemon grants — so the regression fails on the
-    # verdict as well as on the count.
+    # Without the reuse window the second call starts a fresh transaction, which the
+    # hanging-up daemon grants — so the regression fails on the verdict as well as on
+    # the count.
     threaded_polkit_agent)
         write_stack "$CONFDIR/$ROW_SERVICE" \
             "auth required $MODULE_PATH" \
@@ -658,8 +621,6 @@ while read_fixture_row; do
         ;;
 
     # ---- duplicate-cross-service: the window is per service (negative test)
-    # A second service file means a second stack: a window keyed only on the user
-    # would let a lock-screen unlock answer a `sudo`/polkit prompt silently.
     threaded_xsecurelock)
         SECOND_SERVICE="$ROW_SERVICE-e2e-second"
         write_stack "$CONFDIR/$ROW_SERVICE" \
@@ -674,11 +635,8 @@ while read_fixture_row; do
         ;;
 
     # ---- duplicate-after-slow-module: the window's end, pinned
-    # The stack puts `pam_exec.so /bin/sleep 0.8` after `pam_tapauth.so`, so the
-    # first `pam_authenticate` only returns ~800 ms after the module did, and the
-    # immediate duplicate is already outside the 500 ms window: the phone must be
-    # rung a second time (two accepts).  A window widened past 800 ms turns this
-    # into one accept.
+    # A window widened past 800 ms turns the second call into a window hit (one
+    # accept instead of two).
     threaded_polkit_agent_truncated)
         write_stack "$CONFDIR/$ROW_SERVICE" \
             "auth required $MODULE_PATH" \
@@ -691,9 +649,8 @@ while read_fixture_row; do
         ;;
 
     # ---- gdm reauth: an unlock is offered the phone
-    # The row is R3's other spelling: `/proc/self/comm` truncates the worker's
-    # name to `gdm-session-wor` (TASK_COMM_LEN - 1), while the login row above
-    # uses the full `gdm-session-worker`.
+    # The row is R3's other spelling: `/proc/self/comm` truncates the worker's name
+    # to `gdm-session-wor`, while the login row below uses the full name.
     threaded_gdm_worker_truncated)
         ROW_MARKER="$TMP_DIR/token-seen-$ROW_ID"
         write_stack "$CONFDIR/$ROW_SERVICE" \
@@ -746,12 +703,10 @@ while read_fixture_row; do
         ;;
 
     # ---- R1: the service name alone refuses a remote stack
-    # The module must not take part in a remote authentication, and the refusal
-    # happens before the config read, the username lookup, the conversation and
-    # the message load.  The stack is `required` + `optional pam_permit`: if the
-    # module answered PAM_IGNORE (the code it must never return) the required
-    # line would record no failure and the optional line would grant, so the
-    # non-success verdict is part of the shape.  `conv_text_info == 0` is the
+    # The refusal happens before the config read, the username lookup, the
+    # conversation and the message load.  The `required` + `optional pam_permit`
+    # stack makes the non-success verdict part of the shape: PAM_IGNORE would record
+    # no failure and let the optional line grant.  `conv_text_info == 0` is the
     # ordering-independent half: any participation would have announced its wait.
     svc_sshd | svc_sshd_session)
         write_stack "$CONFDIR/$ROW_SERVICE" \

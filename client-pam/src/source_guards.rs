@@ -4,18 +4,14 @@
 
 /// `PAM_SERVICE` is read at exactly one call site, in `CallerContext::capture`.
 ///
-/// The defect this catches: a second `pam_sys::get_service_name(pamh)` call. It
-/// is how the pre-refactor tree resolved the service twice, letting the
-/// display-manager bypass decide from one string while the cache key used
-/// another. Same stripped-source technique and positive control as
-/// `test_module_source_contains_no_pam_ignore_return`.
+/// The defect this catches: a second `pam_sys::get_service_name(pamh)` call. It is
+/// how the pre-refactor tree resolved the service twice, letting the
+/// display-manager bypass decide from one string while the cache key used another.
 #[test]
 fn only_one_get_service_name_call_site() {
     const NEEDLE: &str = "get_service_name";
     let files = source_files();
     let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
-    // The shared recursive walk, not one `read_dir` level: a second read could
-    // appear in `mechanism/`, a directory with no `rs` extension.
     for required in [
         "context.rs",
         "pam_sys.rs",
@@ -58,8 +54,7 @@ fn only_one_get_service_name_call_site() {
         "the single read must be `CallerContext::capture`, found {only}"
     );
 
-    // Positive control: two planted call sites must both be reported, or a
-    // scan that stopped matching would pass the assertion above.
+    // Positive control: both planted call sites must be reported.
     let planted = stripped_source(
         "let a = pam_sys::get_service_name(pamh);\n\
          let b = pam_sys::get_service_name(pamh);\n",
@@ -71,14 +66,13 @@ fn only_one_get_service_name_call_site() {
     );
 }
 
-/// `policy::refine` is called at exactly one site, immediately after the
-/// config read: there the second decision phase has its one home.
+/// `policy::refine` is called at exactly one site, immediately after the config
+/// read: there the second decision phase has its one home.
 ///
-/// The defect this catches: a second call site re-deriving the configured
-/// refusal, or a refinement run before `PamConfig::load`, which would always see
-/// the built-ins only and let a renamed remote stack ring the phone. The scan is
-/// the second line of defence: `refused_service` is private to `policy`, so no
-/// other module can reach it and an alias cannot defeat this text scan.
+/// The defect this catches: a second call site re-deriving the configured refusal,
+/// or a refinement run before `PamConfig::load`, which would always see the
+/// built-ins only and let a renamed remote stack ring the phone. `refused_service`
+/// is private to `policy`, so an alias cannot defeat this text scan either.
 #[test]
 fn only_one_refine_call_site() {
     const NEEDLE: &str = "policy::refine";
@@ -103,9 +97,8 @@ fn only_one_refine_call_site() {
         }
         match rel.as_str() {
             "pam_logic/mod.rs" => {
-                // `orchestrate` holds the one call site, above this file's only
-                // test module: a scan truncated at an early `#[cfg(test)]` item
-                // would see neither.
+                // A scan truncated at an early `#[cfg(test)]` item would see
+                // neither the one call site nor the config read below.
                 assert_scan_reaches(&rel, &cleaned, &["fn orchestrate"]);
                 logic_source = cleaned;
             }
@@ -154,23 +147,21 @@ fn only_one_refine_call_site() {
 
 /// The remote-user item is read nowhere in this crate's production code.
 ///
-/// The defect this catches: the retired `PAM_RUSER` fallback reappearing, either
-/// by identifier or by the item's numeric value — `pam_get_item(pamh, 8, ..)`
-/// is the same read without the name. A name resolved for the wrong account is
-/// why the fallback is gone: it became the daemon request's username, the cache
-/// key and the locale lookup's NSS name. Only the production half of each file
-/// is scanned, because the test pinning the removal names the item in strings.
+/// The defect this catches: the retired `PAM_RUSER` fallback reappearing, either by
+/// identifier or by the item's numeric value — `pam_get_item(pamh, 8, ..)` is the
+/// same read without the name. A name resolved for the wrong account is why the
+/// fallback is gone: it became the daemon request's username, the cache key and the
+/// locale lookup's NSS name. Only the production half of each file is scanned,
+/// because the test pinning the removal names the item in strings.
 #[test]
 fn no_ruser_read() {
     const ITEM: &str = "PAM_RUSER";
-    // The item's numeric value, spelled arithmetically so this test's own
-    // source carries no literal for its own scan to find.
+    // Spelled arithmetically so this test's own source carries no literal for its
+    // own scan to find.
     let item_number: u128 = 2 * 2 * 2;
 
     let files = source_files();
     let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
-    // The shared recursive walk and the same `#[cfg(test)]` split as the other
-    // scans, so a read in `mechanism/` is covered and this file is exempt.
     for required in ["pam_sys.rs", "mechanism/sequential.rs"] {
         assert!(
             names.iter().any(|name| name == required),
@@ -197,8 +188,7 @@ fn no_ruser_read() {
         findings.join("\n")
     );
 
-    // Positive control: both detectors must fire on an in-memory snippet, or an
-    // emptied or broken scan passes for the wrong reason.
+    // Positive control: both detectors must fire on the planted snippet.
     let planted = stripped_source(
         "let a = pam_get_item(pamh, 8, &mut item);\n\
          let b = ffi::PAM_RUSER;\n",
@@ -215,20 +205,18 @@ fn no_ruser_read() {
     );
 }
 
-/// Blank every comment, string literal and char literal, keeping the newlines
-/// so reported line numbers still match the file on disk.
+/// Blank every comment, string literal and char literal, keeping the newlines so
+/// reported line numbers still match the file on disk.
 ///
-/// The docs in this crate deliberately name the forbidden code in prose, and the
-/// assertions quote both needles, so scanning raw source would flag those.
-/// Runs over bytes: every delimiter involved is ASCII. A non-ASCII char literal
-/// would be taken for a lifetime and copied verbatim, which can only hide a
-/// needle, never invent one.
+/// The docs here deliberately name the forbidden code in prose, so scanning raw
+/// source would flag the prose. Runs over bytes (every delimiter involved is ASCII):
+/// a non-ASCII char literal is taken for a lifetime and copied verbatim, which can
+/// hide a needle but never invent one.
 fn stripped_source(source: &str) -> String {
     let b = source.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0usize;
     while i < b.len() {
-        // Line comment.
         if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
@@ -397,12 +385,10 @@ fn pam_ignore_identifiers(cleaned: &str) -> Vec<(usize, String)> {
     identifier_hits(cleaned, "PAM_IGNORE")
 }
 
-/// Every numeric literal in `cleaned` whose value equals `code`, as
-/// `(line, token)`.
+/// Every numeric literal in `cleaned` whose value equals `code`, as `(line, token)`.
 ///
-/// The literal is evaluated rather than substring-matched, so `0.25`
-/// (rounded float), `0x25` (hex 37) and `1_025` (1025) are not hits while
-/// `25u32` is.
+/// The literal is evaluated rather than substring-matched, so `0.25` (rounded
+/// float), `0x25` (hex 37) and `1_025` (1025) are not hits while `25u32` is.
 fn numeric_literals_equal_to(cleaned: &str, code: u128) -> Vec<(usize, String)> {
     let b = cleaned.as_bytes();
     let mut hits = Vec::new();
@@ -496,11 +482,9 @@ fn read_numeric_literal(b: &[u8], start: usize) -> (Option<u128>, usize) {
     (digits.parse::<u128>().ok(), i)
 }
 
-/// Every `client-pam/src/**/*.rs`, sorted, so a new module cannot be added and
-/// stay outside the scans.
-///
-/// Recursive: `src/mechanism/` is a directory with no `rs` extension, so a
-/// single-level `read_dir` would silently stop covering the mechanisms.
+/// Every `client-pam/src/**/*.rs`, sorted, so a new module cannot be added and stay
+/// outside the scans. Recursive on purpose: `src/mechanism/` is a directory with no
+/// `rs` extension, so a single-level `read_dir` would silently stop covering it.
 fn source_files() -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -539,13 +523,13 @@ fn production_paths() -> &'static std::collections::HashSet<std::path::PathBuf> 
     PATHS.get_or_init(|| module_tree(src_root()).0.into_iter().collect())
 }
 
-/// Split the module tree rooted at `root` into (production files, files that
-/// only a `#[cfg(test)] mod` declares).
+/// Split the module tree rooted at `root` into (production files, files that only a
+/// `#[cfg(test)] mod` declares).
 ///
 /// `lib.rs` is the root and every `mod NAME;` is followed to `NAME.rs` or
-/// `NAME/mod.rs`, so the walk mirrors the compiler, not a directory listing.
-/// Gating is inherited: a file reached through a `#[cfg(test)]` declaration, and
-/// everything it declares, is test-only — which keeps `src/**/tests/*.rs` out.
+/// `NAME/mod.rs`, so the walk mirrors the compiler, not a directory listing. The gate
+/// is inherited by everything a test-gated declaration declares, which keeps
+/// `src/**/tests/*.rs` out of the production set.
 fn module_tree(root: &std::path::Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     let mut production: Vec<std::path::PathBuf> = Vec::new();
     let mut gated: Vec<std::path::PathBuf> = Vec::new();
@@ -604,13 +588,12 @@ fn module_declaration_name(line: &str) -> Option<String> {
 /// Every `mod NAME;` declaration in `source`, as `(name, gated on cfg(test))`.
 ///
 /// The gate is the attribute block directly above the declaration, which may span
-/// several lines (`#[allow(…)]` is written multi-line here), so the block is
-/// skipped by square-bracket depth, as `test_module_start` does. Doc and line
-/// comments are skipped without counting, so a doc block quoting an attribute
-/// cannot confuse the association. A declaration inside an inline `mod … { … }`
-/// block carries its own `cfg` only, not the enclosing block's; the walker's
-/// positive control asserts the production set exactly, so that layout fails
-/// loudly instead of quietly shrinking the scans.
+/// several lines, so the block is skipped by square-bracket depth as
+/// `test_module_start` does; doc and line comments are skipped without counting, so a
+/// doc block quoting an attribute cannot confuse the association. A declaration
+/// inside an inline `mod … { … }` block carries its own `cfg` only, not the enclosing
+/// block's, and the walker's positive control asserts the production set exactly, so
+/// that layout fails loudly instead of quietly shrinking the scans.
 fn module_declarations(source: &str) -> Vec<(String, bool)> {
     let mut declarations = Vec::new();
     let mut gated = false;
@@ -674,19 +657,15 @@ fn relative_to_src(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-/// The production half of a source file: everything before the first
-/// `#[cfg(test)]` **module**, and nothing at all for a file that only a
-/// `#[cfg(test)] mod` declares.
+/// The production half of a source file: everything before the first `#[cfg(test)]`
+/// **module**, and nothing at all for a file that only a `#[cfg(test)] mod` declares.
 ///
-/// The tests quote every forbidden token, so scanning the whole file would flag
-/// the assertions instead of the code. Cut at the test *module*, not at the first
+/// The tests quote every forbidden token, so scanning the whole file would flag the
+/// assertions instead of the code. Cut at the test *module*, not at the first
 /// `#[cfg(test)]` item: a file with an early test-only accessor
-/// (`transaction/lifecycle.rs`'s `Finished::outcome`, `context.rs`'s
-/// `from_parts`, `pam_sys.rs`'s `dummy`) would otherwise be scanned only up to
-/// that item and every assertion over it would pass vacuously. `production_paths`
-/// is the authority for the test-file answer, and
-/// `the_walker_separates_test_modules_from_production` proves it drops no
-/// production file.
+/// (`transaction/lifecycle.rs`'s `Finished::outcome`, `context.rs`'s `from_parts`,
+/// `pam_sys.rs`'s `dummy`) would otherwise be scanned only up to that item and every
+/// assertion over it would pass vacuously.
 fn production_source(path: &std::path::Path) -> String {
     if !production_paths().contains(path) {
         return String::new();
@@ -700,11 +679,8 @@ fn production_source(path: &std::path::Path) -> String {
 /// The byte offset of the first `#[cfg(test)]` **module**, i.e. the start of the
 /// file's test module.
 ///
-/// Only an attribute decorating a `mod` item counts, not a test-only `fn`,
-/// accessor or `impl`, which sits inside the production half and must stay in the
-/// scanned text. The attribute block may carry further attributes (`#[allow(..)]`)
-/// and indentation, so the item is the first following line that is not itself an
-/// attribute, a doc comment or blank.
+/// Only an attribute decorating a `mod` item counts, not a test-only `fn`, accessor or
+/// `impl`, which sits inside the production half and must stay in the scanned text.
 fn test_module_start(source: &str) -> Option<usize> {
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut offsets = Vec::with_capacity(lines.len() + 1);
@@ -772,15 +748,15 @@ fn assert_scan_reaches(rel: &str, cleaned: &str, needles: &[&str]) {
     }
 }
 
-/// The walker's own positive control: a file a `#[cfg(test)] mod` declares is not
-/// production, and no file under `src` is silently left out.
+/// The walker's own control: a file a `#[cfg(test)] mod` declares is not production,
+/// and no file under `src` is silently left out.
 ///
 /// The defect this catches, in both directions: a test file scanned as though it
-/// shipped, and a production file the walker stops reading — which would make
-/// every "no forbidden token" assertion over it vacuous. The coverage list below
-/// is the claim the scans make, so a module that is added, moved or split must
-/// update it deliberately. The fixture tree is written outside `src/`, because
-/// planting files there would race the parallel recursive walk.
+/// shipped, and a production file the walker stops reading — which would make every
+/// "no forbidden token" assertion over it vacuous. The coverage list below is the
+/// claim the scans make, so a module that is added, moved or split must update it
+/// deliberately. The fixture tree is written outside `src/`, because planting files
+/// there would race the parallel recursive walk.
 #[test]
 fn the_walker_separates_test_modules_from_production() {
     let root = std::env::temp_dir().join(format!("tapauth-module-tree-{}", std::process::id()));
@@ -941,9 +917,9 @@ fn enclosing_fn(cleaned: &str, at: usize) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The `lib.rs` functions allowed to answer with a constant: the five constant
-/// ABI stubs and `guard`'s panic arm. They are the whole ABI surface, convert no
-/// verdict, never see an `Outcome`, and are part of no authentication decision.
+/// The `lib.rs` functions allowed to answer with a constant: the five constant ABI
+/// stubs (the whole ABI surface outside `pam_sm_authenticate`) and `guard`'s panic
+/// arm. None converts a verdict, sees an `Outcome`, or decides an authentication.
 const LIB_PAM_EXEMPTIONS: [&str; 6] = [
     "guard",
     "pam_sm_setcred",
@@ -953,15 +929,14 @@ const LIB_PAM_EXEMPTIONS: [&str; 6] = [
     "pam_sm_chauthtok",
 ];
 
-/// No `pam_sys::PAM_*` value is produced outside `outcome.rs`, except the six
-/// `lib.rs` ABI sites named above.
+/// No `pam_sys::PAM_*` value is produced outside `outcome.rs`, except the six `lib.rs`
+/// ABI sites named above.
 ///
 /// The defect this catches: a return code minted where the failure was observed
-/// instead of through `Outcome::into_pam`. Such a site can return `PAM_SUCCESS`,
-/// or a code the verdict does not imply, and adds a path no outcome test covers.
-/// The exemption is by *function name*, and the scan asserts it covered
-/// `outcome.rs` (by path), `lib.rs`, the orchestration, the transaction and every
-/// mechanism, so a moved or emptied scan cannot pass vacuously.
+/// instead of through `Outcome::into_pam`. Such a site can return `PAM_SUCCESS`, or a
+/// code the verdict does not imply, and adds a path no outcome test covers. The
+/// exemption is by *function name*, and the scan asserts the files it covered, so a
+/// moved or emptied scan cannot pass vacuously.
 #[test]
 fn only_outcome_rs_returns_pam_constants() {
     let files = source_files();
@@ -996,11 +971,9 @@ fn only_outcome_rs_returns_pam_constants() {
         }
         let cleaned = production_source(path);
         if rel == "transaction/run.rs" {
-            // Guard against a re-truncated scan: the claim is that `run` mints no
-            // `PAM_*` of its own, so the scanned text must actually reach it (see
-            // `production_source`). Only `run` is asserted: the reuse cache lives
-            // in `conclusion_cache.rs`, which this loop scans like any other
-            // module, and its ownership assertion is `cache_owner_is_local`'s.
+            // The claim is that `run` mints no `PAM_*` of its own, so the scanned
+            // text must actually reach it. The reuse cache lives in
+            // `conclusion_cache.rs`, scanned by this loop like any other module.
             assert_scan_reaches(&rel, &cleaned, &["fn run"]);
         }
         for (offset, text) in pam_code_sites(&cleaned) {
@@ -1061,10 +1034,10 @@ fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
 ///
 /// The defect this catches: a mechanism, rule, plan or test helper building
 /// `Outcome::Granted(..)` directly or calling a constructor — a second grant path
-/// beside the daemon's `Success` and the replay. "The token `Outcome::Granted`
-/// appears only in `outcome.rs`" is deliberately not the check: it passes for the
-/// code that defines the constructors, so it cannot catch a grant minted inside
-/// that module or reached from a mechanism.
+/// beside the daemon's `Success` and the replay. "The token `Outcome::Granted` appears
+/// only in `outcome.rs`" is deliberately not the check: it passes for the code that
+/// defines the constructors, so it cannot catch a grant minted inside that module or
+/// reached from a mechanism.
 #[test]
 fn granted_only_from_daemon() {
     let files = source_files();
@@ -1092,11 +1065,9 @@ fn granted_only_from_daemon() {
         let rel = relative_to_src(path);
         let cleaned = production_source(path);
         if rel == "transaction/run.rs" {
-            // Guard against a re-truncated scan: this file must be shown to
-            // contain `run`, the orchestration half that reaches a constructor.
-            // The reuse cache that keeps a replay from reaching one lives in
-            // `conclusion_cache.rs`, scanned by the loop below like any other
-            // module; its ownership assertion is `cache_owner_is_local`'s.
+            // This file must be shown to contain `run`, the half that reaches a
+            // constructor; the reuse cache that keeps a replay from reaching one
+            // lives in `conclusion_cache.rs` and has its own scan there.
             assert_scan_reaches(&rel, &cleaned, &["fn run"]);
         }
         if rel == "outcome.rs" {
@@ -1120,11 +1091,9 @@ fn granted_only_from_daemon() {
     );
 }
 
-/// The `PAM_*` return-site detector fires on a planted return and on a
-/// planted bare arm, and not on a comparison or on prose.
-///
-/// Without this, a detector that stopped matching would make
-/// `only_outcome_rs_returns_pam_constants` pass for every tree.
+/// The `PAM_*` return-site detector fires on a planted return and on a planted bare
+/// arm, and not on a comparison or on prose. Without it a detector that stopped
+/// matching would make `only_outcome_rs_returns_pam_constants` pass for every tree.
 #[test]
 fn pam_return_scan_detects_a_planted_return() {
     let planted = stripped_source(
@@ -1167,11 +1136,9 @@ fn pam_return_scan_detects_a_planted_return() {
     );
 }
 
-/// The grant detector reports a hand-built `Granted` and a constructor call from
-/// a mechanism, and accepts `outcome.rs` and the orchestration.
-///
-/// Without this, `granted_only_from_daemon` would pass for a tree in which the
-/// detector had stopped matching.
+/// The grant detector reports a hand-built `Granted` and a constructor call from a
+/// mechanism, and accepts `outcome.rs` and the orchestration. Without it,
+/// `granted_only_from_daemon` would pass for a tree whose detector stopped matching.
 #[test]
 fn granted_scan_detects_a_planted_construction() {
     let planted = stripped_source(
@@ -1204,12 +1171,9 @@ fn granted_scan_detects_a_planted_construction() {
 /// No file of this crate — not just `pam_logic` and `lib.rs` — may reintroduce
 /// `PAM_IGNORE`, by identifier and by its numeric value.
 ///
-/// The numeric half is the one that matters: a `pam_sys::PAM_IGNORE` re-export
-/// reaching a `return`, or a bare literal equal to its value, is one edit away
-/// from the `required`-stack bypass this guards, and a name-only scan would miss
-/// it. The walk is `source_files`, i.e. recursive: `src/mechanism/` has no `rs`
-/// extension, so a single-level `read_dir` would silently stop covering the
-/// modules that read daemon responses and decide `PreCollected`.
+/// The numeric half is the one that matters: a bare literal equal to its value is one
+/// edit away from the `required`-stack bypass this guards, and a name-only scan would
+/// miss it.
 #[test]
 fn test_module_source_contains_no_pam_ignore_return() {
     let files = source_files();
@@ -1230,8 +1194,8 @@ fn test_module_source_contains_no_pam_ignore_return() {
         );
     }
 
-    // Spelled arithmetically so this test's own source carries no literal
-    // for its own scan to find.
+    // Spelled arithmetically so this test's own source carries no literal for its
+    // own scan to find.
     let ignore_code: u128 = 5 * 5;
     let mut findings: Vec<String> = Vec::new();
     for path in &files {
@@ -1256,10 +1220,10 @@ fn test_module_source_contains_no_pam_ignore_return() {
 }
 
 /// The whole-crate scan above returns empty for two independent reasons — every
-/// `PAM_IGNORE` here is prose inside a comment, and no bare literal holds its
-/// value — so it would stay green even if the stripper or either detector were
-/// broken. Prove both detectors fire on a synthetic snippet, and that a comment or
-/// a string naming the code does not count.
+/// `PAM_IGNORE` here is prose inside a comment, and no bare literal holds its value —
+/// so it would stay green even if the stripper or either detector were broken. Prove
+/// both detectors fire on a synthetic snippet, and that a comment or a string naming
+/// the code does not count.
 #[test]
 fn test_pam_ignore_scan_detects_a_real_return() {
     // Spelled arithmetically so this test's own source carries no literal for its
@@ -1314,12 +1278,8 @@ fn test_pam_ignore_scan_detects_a_real_return() {
 /// daemon accepted: this ordering is what makes those counts meaningful.
 #[test]
 fn cache_lookup_precedes_daemon_contact() {
-    // The lookup and the daemon contact both live in `run`, in
-    // `transaction/run.rs`; `production_source` is the reader every other scan
-    // uses (see above for what it cuts and why).
+    // The lookup and the daemon contact both live in `run`, in `transaction/run.rs`.
     let production = production_source(&src_root().join("transaction/run.rs"));
-    // An empty scan would satisfy no assertion below (both searches panic), so the
-    // guard is that the read reached the driver at all.
     assert_scan_reaches(
         "transaction/run.rs",
         &production,
@@ -1354,10 +1314,9 @@ fn cache_lookup_precedes_daemon_contact() {
 
 /// Every reuse case is present by name, and no test in the crate is ignored.
 ///
-/// The defect this catches: a rewritten suite that silently drops a case —
-/// presence is asserted by name, so a deleted test fails here instead of passing
-/// as "all green with fewer tests". If `#[ignore]` could silence a broken case, a
-/// defect could ship as green, so the crate must contain none.
+/// The defect this catches: a rewritten suite that silently drops a case. If
+/// `#[ignore]` could silence a broken case, a defect could ship as green, so the
+/// crate must contain none.
 #[test]
 fn reuse_suite_is_intact() {
     let files = source_files();
@@ -1373,9 +1332,8 @@ fn reuse_suite_is_intact() {
             "the scan did not cover {required}: {names:?}"
         );
     }
-    // Comment- and string-stripped, so a doc comment quoting a name or an
-    // attribute is not a finding, and this test's own literals cannot satisfy its
-    // searches.
+    // Comment- and string-stripped, so a doc comment quoting a name or an attribute
+    // is not a finding, and this test's own literals cannot satisfy its searches.
     let sources: String = files
         .iter()
         .map(|path| {
@@ -1418,8 +1376,7 @@ fn reuse_suite_is_intact() {
          `Concluded` replaces it, and a weaker copy must not return"
     );
 
-    // The rest of the corpus: the cache's key, its notices and its ownership, so
-    // a dropped one fails like any other.
+    // The rest of the corpus: the cache's key, its notices and its ownership.
     for name in [
         "reuse_key_is_case_sensitive",
         "replay_notice_is_silent",
@@ -1445,10 +1402,9 @@ fn reuse_suite_is_intact() {
 /// The defect this catches: a second file reaching `LAST_CONCLUSION` (or any
 /// `.lock()` on it), or the owner handing the guard out through a non-test
 /// `pub(crate)` getter — either defeats the ownership that keeps a fork fix (an
-/// `atfork` reinit, an atomic cell, dropping the cache) inside one file. The scan
-/// runs over the stripped production half of every `src/**/*.rs`. The positive
-/// control runs the detector over an in-memory string, never a planted file under
-/// `src/`, which would race the parallel recursive walk.
+/// `atfork` reinit, an atomic cell, dropping the cache) inside one file. The positive
+/// controls run over in-memory strings, never a planted file under `src/`, which would
+/// race the parallel recursive walk.
 #[test]
 fn cache_owner_is_local() {
     let files = source_files();
@@ -1463,8 +1419,8 @@ fn cache_owner_is_local() {
         let rel = relative_to_src(path);
         let production = production_source(path);
         if rel == "conclusion_cache.rs" {
-            // Guard against a re-truncated scan: an empty production half
-            // satisfies "no other module names the lock" vacuously.
+            // An empty production half would satisfy "no other module names the
+            // lock" vacuously.
             assert_scan_reaches(
                 &rel,
                 &production,
@@ -1474,8 +1430,8 @@ fn cache_owner_is_local() {
                     "fn reinit_cache_in_child",
                 ],
             );
-            // The owner may lock the static; it may not hand the lock, the guard
-            // or the record out.
+            // The owner may lock the static, but may not hand the lock, the guard or
+            // the record out.
             for (line, text) in production.lines().enumerate() {
                 let leaks_guard = text.contains("MutexGuard");
                 let exposes_record =

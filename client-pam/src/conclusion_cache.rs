@@ -1,11 +1,7 @@
 //! The process's 500 ms verdict-reuse record: a duplicate `pam_authenticate`
 //! issued just after a transaction concludes is answered here instead of starting
-//! a second one.
-//!
-//! The state is one private static behind a [`ConclusionCache`], named by no other
-//! module (a source scan asserts it), which keeps any fork fix inside this file;
-//! [`Concluded`] stays in `transaction`, to be recorded and replayed here but never
-//! constructed.
+//! a second one. The state is one private static named by no other module (a
+//! source scan asserts it), which keeps any fork fix inside this file.
 
 use crate::context::ServiceName;
 use crate::outcome::Outcome;
@@ -18,50 +14,45 @@ use std::time::{Duration, Instant};
 /// Window during which the verdict this process just concluded may be replayed
 /// instead of starting a second authentication transaction.
 ///
-/// What it guards: a duplicate transaction some lock screens issue right after a
+/// What it guards: the duplicate transaction some lock screens issue right after a
 /// transaction concludes. kscreenlocker ≥ 6.8 queues the duplicate
 /// `Authenticate()` about a second into the first transaction — while it is still
 /// running — and dispatches it the moment the first call returns, whatever its
-/// outcome, because its `PamAuthenticator::promptInternal()` clears the busy
-/// guard before the heartbeat's request can be observed and dropped. The real fix
-/// is upstream; until then the duplicate is answered here, because the
-/// alternative is a full second transaction: a new request id, a new daemon
-/// challenge, and a second ring of the phone (or a second full timeout) for a
-/// single unlock.
+/// outcome, because its `PamAuthenticator::promptInternal()` clears the busy guard
+/// before the heartbeat's request can be observed and dropped. The real fix is
+/// upstream; until then the duplicate is answered here, because the alternative is
+/// a full second transaction: a new request id, a new daemon challenge, and a
+/// second ring of the phone (or a second full timeout) for a single unlock.
 ///
 /// Why replay *any* concluded code, not just `Success`: the duplicate was queued
 /// while the first transaction was still running, so no user could have initiated
-/// it. Re-asking the phone about a request the user never made is wrong in both
-/// directions — a success would ring twice, and a failure would wait out another
-/// full timeout for a question that was just answered.
+/// it — a success would ring twice, and a failure would wait out another full
+/// timeout for a question that was just answered.
 ///
-/// Why 500 ms: the observed duplicate gap is 0.37 ms, so 500 ms absorbs
-/// scheduling jitter on a loaded host, while a human re-lock or a second login as
-/// the same user takes seconds — no human-initiated retry can fall inside the
-/// window, which keeps a genuine second attempt from being answered from a cached
-/// failure.
+/// Why 500 ms: the observed duplicate gap is 0.37 ms, so 500 ms absorbs scheduling
+/// jitter on a loaded host, while a human re-lock or a second login as the same
+/// user takes seconds and so cannot be answered from a cached failure.
 ///
-/// Where the window starts: at this module's **return**. `authenticate` records
-/// the conclusion only after `orchestrate` has handed it back, so the 500 ms runs
-/// from the end of the `pam_authenticate` call, not from the moment the
-/// transaction concluded. That matches the host behaviour it exists for, but it
-/// also bounds the suppression: a module *after* `pam_tapauth.so` in the same
-/// stack that blocks for longer than 500 ms pushes the host's duplicate outside
-/// the window, and that duplicate rings the phone again. Suppression is a
-/// heuristic for a host that re-enters immediately, not a guarantee.
+/// The anchor is this module's **return**, not the moment the transaction
+/// concluded: `authenticate` records the conclusion only after `orchestrate` has
+/// handed it back. That also bounds the suppression — a module *after*
+/// `pam_tapauth.so` in the same stack that blocks for longer than 500 ms pushes the
+/// host's duplicate outside the window, and that duplicate rings the phone again.
+/// Suppression is a heuristic for a host that re-enters immediately, not a
+/// guarantee.
 const VERDICT_REUSE_WINDOW: Duration = Duration::from_millis(500);
 
-/// The conclusion this process recorded last, with the user and service it
-/// belongs to.
+/// The conclusion this process recorded last, with the user and service it belongs
+/// to.
 ///
 /// Process-wide because the duplicate transaction comes from the same host
 /// process. Keyed on `(username, service)` because the duplicate is the same user
-/// against the same PAM service, so a different user *or* a different service
-/// takes the normal path and rings the phone. The remaining assumption is that no
+/// against the same PAM service, so a different user *or* a different service takes
+/// the normal path and rings the phone. The standing assumption is that no
 /// legitimate host performs an *independent* authentication for the same user and
-/// service within 500 ms of a concluded one: the key cannot tell such a request
-/// apart from a duplicate. A new process always misses, because `pam_end` unloads
-/// the module and the cache dies with it.
+/// service within the window: the key cannot tell such a request apart from a
+/// duplicate. A new process always misses, because `pam_end` unloads the module and
+/// the cache dies with it.
 struct LastConclusion {
     concluded_at: Instant,
     username: String,
@@ -72,17 +63,18 @@ struct LastConclusion {
 /// The lock that guards the last conclusion of this process, replayed for
 /// [`VERDICT_REUSE_WINDOW`] only.
 ///
-/// `std::sync::Mutex` is const-constructible on stable, so no lazy initializer is
-/// needed. The lock is an optimisation, never a credential: a poisoned lock is
-/// ignored rather than fatal, so losing the cache only costs one duplicate request.
+/// The lock is an optimisation, never a credential: a poisoned lock is ignored
+/// rather than fatal, so losing the cache only costs one duplicate request.
+///
+/// `std::sync::Mutex` is const-constructible on stable, so the static needs no
+/// first-use init; a lazy one in a forked child could block on a libc lock the
+/// parent held at fork.
 ///
 /// The mutex sits in an [`UnsafeCell`] because a forked child has to replace it
-/// wholesale (see [`reinit_cache_in_child`]). The only write is that child-side
-/// handler, which runs when the process is single-threaded again, so no reader can
-/// race it; every other access goes through the mutex itself.
-///
-/// The static is private to this module and named by no other file, which is what
-/// keeps this representation inside the type.
+/// wholesale (see [`reinit_cache_in_child`]); that handler is the only write, and it
+/// runs when the process is single-threaded again, so no reader can race it. The
+/// static is private to this module and named by no other file, which keeps this
+/// representation inside the type.
 struct CacheSlot {
     /// The record under its lock, replaced (never mutated through the cell) only
     /// by [`reinit_cache_in_child`].
@@ -124,10 +116,9 @@ impl CacheSlot {
         }
     }
 
-    /// Read the record under the lock, if the lock is not poisoned.
-    ///
-    /// A poisoned lock yields `None`: the cache is an optimisation, so ignoring it
-    /// is always a correct answer. No guard leaves this module.
+    /// Read the record under the lock; `None` if the lock is poisoned. The cache
+    /// is an optimisation, so ignoring it is always a correct answer, and no guard
+    /// leaves this module.
     fn with_read<R>(&self, f: impl FnOnce(&Option<LastConclusion>) -> R) -> Option<R> {
         self.install_atfork_handler();
         // SAFETY: no write can happen while a shared reference is live (see the
@@ -137,7 +128,7 @@ impl CacheSlot {
         Some(f(&guard))
     }
 
-    /// Replace the record under the lock, if the lock is not poisoned.
+    /// Replace the record under the lock; `None` if the lock is poisoned.
     fn with_write<R>(&self, f: impl FnOnce(&mut Option<LastConclusion>) -> R) -> Option<R> {
         self.install_atfork_handler();
         // SAFETY: as `with_read`.
@@ -147,7 +138,7 @@ impl CacheSlot {
     }
 }
 
-/// The process's one slot. The static is the only state `CACHE` owns.
+/// The process's one slot — the only state `CACHE` owns.
 static LAST_CONCLUSION: CacheSlot = CacheSlot::new();
 
 /// The child half of the `pthread_atfork` registration.
@@ -155,14 +146,14 @@ static LAST_CONCLUSION: CacheSlot = CacheSlot::new();
 /// A fork taken while another thread holds `LAST_CONCLUSION` leaves the child
 /// owning a mutex whose holder does not exist there, so the child's first
 /// `pam_authenticate` would block until its host kills it. This overwrites the
-/// slot with a fresh, unlocked mutex. The child is single-threaded at this point
-/// (the kernel has copied only the forking thread), so no reader can race it, and
-/// no lock can be taken here: the handler must stay async-signal-safe.
+/// slot with a fresh, unlocked mutex. The child is single-threaded here (the kernel
+/// has copied only the forking thread), so no reader can race it, and no lock can
+/// be taken: the handler must stay async-signal-safe.
 ///
-/// The child also starts with an **empty** record: a forked child is a new process,
-/// and the module's contract is that a new process always misses (`pam_end`
-/// unloads the module). Inheriting a parent grant would answer an authentication
-/// the child never performed, and one extra ring of the phone is the cheaper error.
+/// The child starts with an **empty** record: a forked child is a new process, and
+/// the module's contract is that a new process always misses (`pam_end` unloads the
+/// module). Inheriting a parent grant would answer an authentication the child never
+/// performed, and one extra ring of the phone is the cheaper error.
 ///
 /// The replaced `Option` is leaked rather than dropped: dropping it would free the
 /// record's strings on a copy of heap state the parent is still using.
@@ -188,19 +179,16 @@ impl CacheSlot {
     /// can hold the lock across a fork. It never blocks (see [`CacheSlot`]).
     ///
     /// `pthread_atfork` is **not** in POSIX's async-signal-safe table, so two
-    /// residuals remain, documented rather than claimed impossible:
-    ///
-    /// * a fork taken while another thread is inside `pthread_atfork` copies
-    ///   libc's internal atfork lock; the child's own registration attempt could
-    ///   then block on it;
-    /// * a child that forks before this module's first cache access ran registers
-    ///   lazily on that first access; on a libc whose child-side `malloc` is not
-    ///   fork-safe (musl), that allocation is unsafe if the parent was mid-`malloc`
-    ///   at the fork.
+    /// residuals remain, documented rather than claimed impossible: a fork taken
+    /// while another thread is inside `pthread_atfork` copies libc's internal atfork
+    /// lock, which the child's own registration attempt could then block on; and a
+    /// child that forks before this module's first cache access registers lazily on
+    /// that access, where a libc whose child-side `malloc` is not fork-safe (musl)
+    /// makes the allocation unsafe if the parent was mid-`malloc` at the fork.
     ///
     /// A failed registration is logged once and remembered in
-    /// [`REGISTRATION_FAILED`], so the cache keeps working and later accesses do
-    /// not retry (or re-log) a call the process already knows fails. Only the fork
+    /// [`REGISTRATION_FAILED`], so the cache keeps working and later accesses do not
+    /// retry (or re-log) a call the process already knows fails. Only the fork
     /// hazard is lost.
     fn install_atfork_handler(&self) {
         if self.registered.load(Ordering::Acquire) != NOT_REGISTERED {
@@ -222,11 +210,9 @@ impl CacheSlot {
     }
 }
 
-/// The 500 ms reuse record and its lock, owned by exactly one type.
-///
-/// Zero-sized: the state is the private static above. It exists so the record has
-/// an owner to hang `lookup` and `record` on, and so no other module can name the
-/// lock — `pam_logic` reaches it through [`record`] and [`replay_for`] only.
+/// The reuse record's owner: zero-sized, since the state is the private static above,
+/// and no other module can name the lock — `pam_logic` reaches it through [`record`]
+/// and [`replay_for`] only.
 pub(crate) struct ConclusionCache {
     _private: (),
 }
@@ -238,10 +224,10 @@ const CACHE: ConclusionCache = ConclusionCache { _private: () };
 /// any code, not just a success.
 ///
 /// Pure, so the window is testable without touching the process-wide cache.
-/// `Instant` is `CLOCK_MONOTONIC` and never steps backwards, so the subtraction
-/// can only be unavailable when the recorded instant came from another clock
-/// origin (or is a later `Instant` constructed in a test); saturating reads that
-/// as "no time passed" instead of panicking.
+/// `Instant` is `CLOCK_MONOTONIC` and never steps backwards, so a reversed
+/// subtraction can only mean a recorded instant from another clock origin (or a
+/// later `Instant` constructed in a test); saturating reads that as "no time
+/// passed" instead of panicking.
 fn reusable_conclusion(
     prev: &LastConclusion,
     username: &str,
@@ -257,8 +243,8 @@ fn reusable_conclusion(
     None
 }
 
-/// The replayable record inside `slot` at `now`, with its age — the distance from
-/// the recorded instant, which is this module's return.
+/// The replayable record inside `slot` at `now`, with its age since the recorded
+/// instant — this module's return, not the moment the transaction concluded.
 fn recorded_in(
     slot: &Option<LastConclusion>,
     username: &str,
@@ -283,8 +269,8 @@ impl ConclusionCache {
     /// The cache hit for `(username, service)` as a conclusion that must not be
     /// recorded.
     ///
-    /// The hit log lives here rather than at the call site: it is the cache's own
-    /// event, and it carries the age the record knows.
+    /// The hit is logged here, not at the call site: it is the cache's own event and
+    /// carries the age the record knows.
     fn replay_for(&self, username: &str, service: &str, now: Instant) -> Option<Concluded> {
         let (recorded, age) = self.lookup(username, service, now)?;
         tracing::debug!(
@@ -301,18 +287,17 @@ impl ConclusionCache {
         ))
     }
 
-    /// Remember `concluded` as this process's last conclusion, and hand its
-    /// verdict back.
+    /// Remember `concluded` as this process's last conclusion, and hand its verdict
+    /// back.
     ///
-    /// The token is taken **by value**, so one conclusion cannot be recorded
-    /// twice, and both existing gates are inside: a conclusion whose service never
-    /// resolved records nothing (it would collapse unrelated services into the
-    /// empty key), and a [`Via::Replay`] one records nothing (that would refresh
-    /// the timestamp and turn the fixed window into a sliding one). It is the
-    /// *last* conclusion, so a non-success verdict overwrites an earlier success: a
-    /// later denial must invalidate the cached grant, never sit behind it. The
-    /// record holds the `Outcome`, not a code, so a replay cannot re-enter the code
-    /// path.
+    /// The token is taken **by value**, so one conclusion cannot be recorded twice,
+    /// and both gates are inside: a conclusion whose service never resolved records
+    /// nothing (it would collapse unrelated services into the empty key), and a
+    /// [`Via::Replay`] one records nothing (that would refresh the timestamp and turn
+    /// the fixed window into a sliding one). It is the *last* conclusion, so a
+    /// non-success verdict overwrites an earlier success: a later denial must
+    /// invalidate the cached grant, never sit behind it. The record holds the
+    /// `Outcome`, not a code, so a replay cannot re-enter the code path.
     ///
     /// `at` is the moment the module returned to the host, which is the anchor of
     /// [`VERDICT_REUSE_WINDOW`] — not the moment the transaction concluded.
@@ -362,8 +347,8 @@ pub(crate) fn replay_for(username: &str, service: &str, now: Instant) -> Option<
 }
 
 /// Serialises the tests that drive the process-wide reuse slot from a record to a
-/// lookup: the slot is one per process, so two tests would otherwise overwrite
-/// each other between the two steps and read a miss. It lives beside the slot it
+/// lookup: the slot is one per process, so two tests would otherwise overwrite each
+/// other between the two steps and read a miss. It lives beside the slot it
 /// serialises, and the source scan that keeps the lock local exempts it.
 #[cfg(test)]
 pub(crate) static CACHE_SLOT_LOCK: Mutex<()> = Mutex::new(());
@@ -389,9 +374,6 @@ pub(crate) mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The record is keyed on the service name's original bytes, so `sudo` and
-    /// `SUDO` are different keys.
-    ///
     /// The defect this catches: keying on an ASCII-lowercased service, which would
     /// let a conclusion recorded for `sudo` answer a `SUDO` stack — the corpus's
     /// `service_case_*` rows only prove that `classify` sees both spellings alike.
@@ -422,12 +404,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// A poisoned lock reads as a cache miss.
-    ///
-    /// The defect this catches: a poisoned lock unwrapped or panicked on, or read
-    /// as a hit — either way a `PAM_SUCCESS` that is otherwise inside the window
-    /// would be returned after another thread panicked. The seam takes the lock as
-    /// a parameter so the process-wide one is never poisoned.
+    /// The defect this catches: a poisoned lock unwrapped or panicked on, or read as
+    /// a hit — either way a `PAM_SUCCESS` otherwise inside the window would be
+    /// returned after another thread panicked.
     #[test]
     fn a_poisoned_lock_reads_as_a_cache_miss() {
         let local: Mutex<Option<LastConclusion>> = Mutex::new(Some(LastConclusion {
@@ -458,14 +437,14 @@ pub(crate) mod tests {
     /// The cache survives a fork taken while another thread holds its lock, and
     /// the child starts with an empty record.
     ///
-    /// The defect this catches (D4): without a registered `pthread_atfork`
-    /// handler, a fork taken while another thread holds the lock leaves the child
-    /// blocked forever on its first `pam_authenticate` — the lock's owner does not
-    /// exist there — and, even with a reinitialised lock, a child that kept the
-    /// inherited record could replay a verdict this process reached before the fork
-    /// for a request the child never made. Distinct exit codes kill both:
-    /// `SIGALRM` (a blocked child is killed by its own 5-second alarm), and `3` for
-    /// an inherited record. Only an unlocked slot and an empty record exit `0`.
+    /// The defect this catches (D4): without a registered `pthread_atfork` handler,
+    /// a fork taken while another thread holds the lock leaves the child blocked
+    /// forever on its first `pam_authenticate` — the lock's owner does not exist
+    /// there — and even with a reinitialised lock, a child that kept the inherited
+    /// record could replay a verdict reached before the fork for a request it never
+    /// made. Distinct exit codes catch both: `SIGALRM` for a blocked child (its own
+    /// 5-second alarm), `3` for an inherited record; only an unlocked slot and an
+    /// empty record exit `0`.
     ///
     /// The child drives the real API (`ConclusionCache::lookup` / `replay_for`), so
     /// this exercises the atfork reinit rather than a copy of it.
@@ -474,16 +453,16 @@ pub(crate) mod tests {
     /// `std::sync::Mutex` is the futex mutex; no musl target is built in CI.
     #[test]
     fn conclusion_cache_survives_fork() {
-        // The cache is one process-wide slot, so serialise with every other
-        // test that drives it. The child does not touch `CACHE_SLOT_LOCK`, so
-        // holding it across the fork is safe: the child never waits on it.
+        // The cache is one process-wide slot, so serialise with every other test
+        // that drives it. The child does not touch `CACHE_SLOT_LOCK`, so holding it
+        // across the fork is safe: the child never waits on it.
         let _slot = take_slot();
         static HELD: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
 
-        // One fixed instant for the seed, the parent's check and the child's
-        // lookup: the 500 ms window can then never age out on a loaded runner,
-        // so a failure means the reinit did not happen, not that time passed.
+        // One fixed instant for the seed, the parent's check and the child's lookup:
+        // the 500 ms window can then never age out on a loaded runner, so a failure
+        // means the reinit did not happen, not that time passed.
         let now = Instant::now();
         record_conclusion(
             "alice",
@@ -515,10 +494,10 @@ pub(crate) mod tests {
 
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            // Child. Keep to what a post-fork child may safely do: an `alarm`
-            // so a blocked lock cannot hang the suite, the cache's real API,
-            // and `_exit` — not `exit`, so no atexit handler or Rust
-            // destructor runs on the forked copy of the parent's state.
+            // Child. Keep to what a post-fork child may safely do: an `alarm` so a
+            // blocked lock cannot hang the suite, the cache's real API, and `_exit`
+            // — not `exit`, so no atexit handler or Rust destructor runs on the
+            // forked copy of the parent's state.
             unsafe {
                 libc::alarm(5);
             }

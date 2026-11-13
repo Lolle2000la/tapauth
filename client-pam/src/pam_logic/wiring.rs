@@ -1,11 +1,7 @@
-//! The platform values behind the transaction's effects.
-//!
-//! This is the one file that names the calls [`authenticate`](super::authenticate) binds into
-//! [`Effects`](crate::transaction::Effects): the `/dev/tty` probe, the nonblocking daemon dial,
-//! the authenticate request and the best-effort cancel. No PAM conversation call lives here.
-//!
-//! Tests substitute a field of `Effects` instead of calling these, so none of them has a test
-//! of its own.
+//! The platform values behind the transaction's effects: the one file that names the calls
+//! [`authenticate`](super::authenticate) binds into [`Effects`](crate::transaction::Effects).
+//! No PAM conversation call lives here, and tests substitute a field of `Effects` instead of
+//! calling these, so none of them has a test of its own.
 
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::transaction::SendParams;
@@ -21,8 +17,8 @@ pub(super) fn probe_tty() -> Option<std::fs::File> {
 
 /// The production `connect`: a nonblocking dial of the daemon socket.
 ///
-/// A one-line wrapper rather than a re-export, because an inherent associated function cannot
-/// be named by a `use` path.
+/// A wrapper rather than a re-export: an inherent associated function cannot be named by a
+/// `use` path.
 pub(super) fn connect() -> Result<IpcClient, IpcError> {
     IpcClient::connect_nonblocking()
 }

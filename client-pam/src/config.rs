@@ -19,11 +19,10 @@ pub struct PamConfig {
     /// password. Must be at least the transport timeout, or the daemon can
     /// never finish in time.
     pub pam_operation_timeout_secs: u64,
-    /// The wait cap for sequential GUI hosts — those the rule table
-    /// (`policy/table.rs`) does not name — where the conversation cannot be
-    /// driven while TapAuth waits, so no concurrent password entry exists
-    /// (`mechanism::sequential`). Default 30 s; additionally clamped to
-    /// `pam_operation_timeout_secs`.
+    /// The wait cap for a sequential GUI host — one the rule table
+    /// (`policy/table.rs`) does not classify as threaded — whose conversation is
+    /// never driven, so no concurrent password entry exists. Default 30 s,
+    /// additionally clamped to `pam_operation_timeout_secs`.
     pub pam_gui_timeout_secs: u64,
     /// Extra `pam.d` service names to refuse, *added* to the built-ins
     /// (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`), never replacing them:
@@ -46,9 +45,8 @@ impl Default for PamConfig {
     }
 }
 
-/// Whether `name` can be a `pam.d` service name: after trimming, non-empty pure
-/// ASCII, no `/`, no whitespace or control character, at most 255 bytes
-/// (`PAM_SERVICE` is a file name under `/etc/pam.d`, so it must fit `NAME_MAX`).
+/// Whether `name` can be a `pam.d` service name. The 255-byte cap is `NAME_MAX`:
+/// `PAM_SERVICE` names a file under `/etc/pam.d`.
 fn valid_service_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255
@@ -59,13 +57,13 @@ fn valid_service_name(name: &str) -> bool {
 
 impl PamConfig {
     /// The built-ins plus every valid configured entry: config can add a name,
-    /// never remove one of the built-ins.
+    /// never remove one.
     ///
     /// Entries are trimmed and deduplicated ASCII case-insensitively (`pam.d`
-    /// cannot distinguish `SSHD` from `sshd`). An entry that cannot be a service
-    /// name is dropped with a warning — silently ignoring a misspelled rename
-    /// would leave the deployment treating the stack as local, the very false
-    /// negative this setting exists to close.
+    /// cannot distinguish `SSHD` from `sshd`). An invalid entry is dropped with a
+    /// warning: silently ignoring a misspelled rename would leave the deployment
+    /// treating the stack as local, the false negative this setting exists to
+    /// close.
     pub(crate) fn effective_refused_services(&self) -> Vec<String> {
         let mut effective: Vec<String> = shared::config::DEFAULT_PAM_REFUSED_SERVICES
             .iter()
@@ -91,12 +89,10 @@ impl PamConfig {
         effective
     }
 
-    /// Load configuration from the default path, using defaults for missing fields.
     pub fn load() -> Self {
         Self::load_from_path(DEFAULT_CONFIG_PATH)
     }
 
-    /// Load configuration from a specific path, using defaults for missing fields.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
 
@@ -190,9 +186,8 @@ mod tests {
         );
     }
 
-    /// The defect this catches: a case-sensitive dedup, which would leave
-    /// `["sshd", "SSHD"]` in the list and make it unclear which entry the
-    /// refusal came from.
+    /// The defect this catches: a case-sensitive dedup, leaving `SSHD` beside
+    /// `sshd` in the list.
     #[test]
     fn refused_services_are_deduplicated_case_insensitively() {
         let config = PamConfig {
@@ -214,8 +209,8 @@ mod tests {
     }
 
     /// The defect this catches: a malformed entry reaching the matcher (the empty
-    /// string would match an unresolved/empty service) or a parser that rejects
-    /// the whole list because of one bad name.
+    /// string would match an unresolved service), or a parser that rejects the
+    /// whole list over one bad name.
     #[test]
     fn invalid_refused_services_are_dropped_without_losing_valid_ones() {
         let config = PamConfig {
@@ -276,7 +271,6 @@ mod tests {
 
     #[test]
     fn test_parse_partial_toml() {
-        // Missing fields should use defaults
         let toml = "";
         let config: PamConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 120);

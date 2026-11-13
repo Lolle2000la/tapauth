@@ -36,7 +36,6 @@ pub enum IpcError {
 /// Synchronous IPC client for tapauthd communication.
 pub struct IpcClient {
     stream: UnixStream,
-    // Assembles length-prefixed frames in nonblocking mode.
     read_buf: BytesMut,
     expected_total: Option<usize>, // 4 (len) + payload
 }
@@ -74,7 +73,6 @@ impl IpcClient {
         })
     }
 
-    /// Send a cancel request to the daemon with a short timeout.
     pub fn send_cancel(
         &mut self,
         reason: &str,
@@ -89,7 +87,8 @@ impl IpcClient {
         };
 
         self.send_message(&envelope)?;
-        // Short read timeout for cancel acknowledgement
+        // The stream's own timeout is the caller's; the acknowledgement gets a
+        // short one of its own.
         self.stream
             .set_read_timeout(Some(Duration::from_millis(750)))?;
         self.recv_response()
@@ -100,7 +99,6 @@ impl IpcClient {
         self.stream.as_raw_fd()
     }
 
-    /// Start authenticate request without waiting (for polling caller)
     pub fn send_authenticate_start(
         &mut self,
         username: &str,
@@ -128,7 +126,7 @@ impl IpcClient {
         let mut tmp = [0u8; 4096];
         loop {
             match self.stream.read(&mut tmp) {
-                Ok(0) => break, // EOF or no more data
+                Ok(0) => break,
                 Ok(n) => {
                     if let Some(slice) = tmp.get(..n) {
                         self.read_buf.extend_from_slice(slice);
@@ -247,8 +245,7 @@ impl IpcClient {
 
 /// Minimal abstraction over the IPC transport, so the poll loops can be tested
 /// with a mock backed by real file descriptors. It sits beside the client it
-/// abstracts, so `transaction::Armed`, which is generic over it, depends on the
-/// transport rather than on `pam_logic`.
+/// abstracts so `transaction::Armed` depends on the transport, not on `pam_logic`.
 pub trait IpcResponseReader {
     fn fd(&self) -> RawFd;
     fn try_read_response_nonblocking(

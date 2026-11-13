@@ -1,10 +1,10 @@
 //! The threaded conversation: a worker thread collects the password while the
 //! calling thread multiplexes the daemon socket and a self-pipe.
 //!
-//! For the hosts whose conversation stays answerable while this thread blocks
-//! (see `policy`). This module owns both local-resource failures — `pipe2` and
-//! `pthread_create`, with their best-effort cancels, the only non-daemon errors a
-//! mechanism may report — and emits nothing: the caller decides the reason's text.
+//! It serves the hosts whose conversation stays answerable while the calling
+//! thread blocks (see `policy::table`). This module owns the only non-daemon
+//! errors a mechanism may report — `pipe2` and `pthread_create`, each with its
+//! best-effort cancel — and emits nothing: the caller decides the reason's text.
 
 use super::{IpcFault, MechanismEnd};
 use crate::ipc_client::IpcResponseReader;
@@ -17,8 +17,8 @@ use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Context passed to the raw POSIX worker thread: it lives on the main thread's
-/// stack and is joined before that frame goes out of scope.
+/// The worker's context, on the main thread's stack and joined before that frame
+/// goes out of scope.
 struct ThreadContext {
     pamh: *mut pam_sys::PamHandle,
     password_entered: AtomicBool,
@@ -90,8 +90,7 @@ unsafe extern "C-unwind" fn native_password_worker(
     std::ptr::null_mut()
 }
 
-/// The worker entry point the spawn operation must accept: `C-unwind` is what
-/// lets glibc's forced unwind pass through the worker frame without aborting.
+/// The `C-unwind` entry point the spawn operation must accept.
 type WorkerStart =
     unsafe extern "C-unwind" fn(*mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
 
@@ -113,13 +112,13 @@ extern "C" {
 /// stack, so the worker must be gone before that frame is popped; and `pamh` is
 /// a plain, unlocked struct whose process-global libpam state (`caller_is`) the
 /// worker reads inside `pam_get_authtok`, so re-entering libpam — another `conv`
-/// call, a `pam_get_item`, the return from `pam_authenticate` — while it runs
-/// would race unsynchronised state. The join is what orders them, so it runs on
-/// every non-panicking path, including those where the worker has already exited.
+/// call, a `pam_get_item`, the return from `pam_authenticate` — would race it.
+/// So the join runs on every non-panicking path, even where the worker has
+/// already exited.
 ///
-/// A panic between `pthread_create` and this join unwinds past the frame holding
-/// `ThreadContext` without reaping the worker: a pre-existing gap that would need
-/// a drop guard, which `guard()` (`lib.rs`) does not close.
+/// A panic between `pthread_create` and this join unwinds past `ThreadContext`
+/// without reaping the worker: a pre-existing gap `guard()` (`lib.rs`) does not
+/// close, and a drop guard would.
 ///
 /// # Safety
 ///
@@ -164,9 +163,8 @@ enum LoopExit {
     PasswordFailed,
 }
 
-/// Central event loop for the graphical authentication flow: it polls the daemon
-/// socket and the self-pipe together. The out-parameter is a *reason*, not a
-/// message, so the loop cannot pick a different string from the terminal loop.
+/// The threaded event loop. Its out-parameter is a *reason*, not a message, so
+/// the loop cannot pick a different string from the sequential one.
 fn run_gui_event_loop<T: IpcResponseReader>(
     ipc: &mut T,
     pipe_read: libc::c_int,
@@ -264,13 +262,12 @@ fn run_gui_event_loop<T: IpcResponseReader>(
     }
 }
 
-/// The threaded GUI flow: a worker thread collects the password while the main
-/// thread multiplexes the daemon socket and a self-pipe.
+/// The threaded GUI flow: a password worker beside the wait on the daemon socket.
 ///
 /// The plan is unread, arriving for uniformity alone (see `mechanism`); the PAM
-/// handle is here only because the password worker needs it. The two
-/// local-resource failures are the only errors it can report, and each cancels
-/// the in-flight request before returning.
+/// handle is here only because that worker needs it. The two local-resource
+/// failures are the only errors it can report, and each cancels the in-flight
+/// request before returning.
 pub(crate) fn drive<T: IpcResponseReader, X: Fn(&str, &str)>(
     armed: &mut Armed<T>,
     _plan: &Plan,
@@ -375,9 +372,9 @@ where
         &mut pending,
     );
 
-    // Cancel unless the worker left `pam_get_authtok` on its own (password
-    // entered, dialog dismissed), then always reap it — see `cancel_and_join`
-    // for why the join is load-bearing, and the closes for the pipe's owner.
+    // Cancel unless the worker left `pam_get_authtok` on its own, then always
+    // reap it and close the pipe — see `cancel_and_join` for why the join is
+    // load-bearing.
     // SAFETY: `pthread_id` is the thread just spawned and not yet joined, and the
     // two fds are the ones `pipe2` filled; the join happens before this returns.
     unsafe {

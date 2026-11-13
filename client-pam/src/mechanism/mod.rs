@@ -1,17 +1,12 @@
 //! The conversation-driver layer: one body per PAM conversation shape — threaded,
-//! sequential, and the pre-collected handoff — around the exit type they share.
+//! sequential and the pre-collected handoff — around the exit type they share.
 //! The set is closed by the PAM ABI and dispatched by a plain `match`, never a
 //! trait object, so the compiler can see which bodies take a plan.
 //!
-//! # Contract
-//!
 //! No body takes the caller's captured identity or the module's configuration:
 //! identity cannot be re-derived and the deadline cannot be recomputed inside
-//! one, so a mechanism can never disagree with the policy that selected it.
-//! Everything arrives as `&mut Armed`, `&Plan`, the resolved `deadline_at`, and
-//! — only where needed — the PAM handle, `/dev/tty`, the injected `cancel`
-//! closure or [`crate::transaction::HostIo`]. The threaded body receives the
-//! plan for uniformity alone and never opens the tty.
+//! one, so a mechanism can never disagree with the policy that selected it. The
+//! threaded body takes a plan for uniformity alone.
 //!
 //! No body emits a user-visible message: the verdict's one `Outcome::notice`
 //! comes from `transaction::host_io::finish` and the plan's announcements from
@@ -41,9 +36,9 @@ pub(crate) enum MechanismEnd {
 
 /// The one mapping from a mechanism's exit to the verdict it names.
 ///
-/// Used by [`Armed::conclude`](crate::transaction::Armed::conclude) for a
-/// transaction that reached the daemon, and by `run`'s pre-collected arm, which
-/// has no request to conclude. Keeping it beside the exit it maps is what lets
+/// [`Armed::conclude`](crate::transaction::Armed::conclude) uses it for a
+/// transaction that reached the daemon, and `run`'s pre-collected arm, which has
+/// no request to conclude. Keeping it beside the exit it maps is what lets
 /// `outcome.rs` stay clear of the mechanism contract.
 impl From<MechanismEnd> for Outcome {
     fn from(end: MechanismEnd) -> Outcome {
@@ -55,16 +50,14 @@ impl From<MechanismEnd> for Outcome {
     }
 }
 
-/// The shared reason pair: the two IPC failures both loops name the same way.
+/// The two IPC failures both loops name the same way.
 ///
 /// Only the *reason* is shared, because that is what selects the text and the
 /// style (`Outcome::notice`); which observed event counts as a hangup stays in
 /// the loop that observed it, next to the `revents` test that decided it.
 ///
-/// The poll-error arm is deliberately not here, because the loops answer it
-/// differently: the threaded loop records `IpcLoopError` and stops, while the
-/// sequential loop logs it and keeps waiting on the terminal shape and collapses
-/// it into `IpcError` (with a `gui-ipc-error` cancel) on the no-terminal one.
+/// The poll error is deliberately absent: the loops answer it differently, and
+/// each records its own (see `IpcFailureMap` and `run_gui_event_loop`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IpcFault {
     /// The peer closed the connection, with or without a partial frame.
@@ -74,7 +67,6 @@ enum IpcFault {
 }
 
 impl IpcFault {
-    /// The reason both loops show for this failure.
     fn reason(self) -> UnavailableReason {
         match self {
             IpcFault::Hangup => UnavailableReason::IpcConnectionLost,

@@ -1,10 +1,9 @@
-//! The conversation policy: one ordered table of rules over
-//! [`CallerContext`](crate::context::CallerContext) (`table.rs`), the taxonomy
-//! those rows are written in, and the first-match engine `classify` that walks
-//! them. `refine` is the second, config-dependent phase; it can only add a skip.
+//! The conversation policy: the taxonomy `table.rs`'s ordered rows are
+//! written in, and the first-match engine `classify` that walks them.
+//! `refine` is the second, config-dependent phase; it can only add a skip.
 //!
-//! R1 keys on the service name and never on `PAM_RHOST`: `sudo` sets the latter
-//! to the local hostname, so a presence rule would silence the module on `sudo`.
+//! R1 keys on the service name, never on `PAM_RHOST` (`table.rs`,
+//! `remote_refuse`): `sudo` sets the latter to the local hostname.
 
 use crate::context::CallerContext;
 
@@ -23,16 +22,16 @@ pub(crate) enum Classification {
 }
 
 /// Why the phone is not consulted at all. R8's pre-collected handoff is
-/// deliberately *not* one of these: it is `Participation { conversation:
-/// PreCollected }`, so it is reachable only through a participation.
+/// deliberately *not* one of these — it touches the handle, so it is a
+/// `Participation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipPolicy {
-    /// R1's: a service in the built-in or configuration-declared refused lists,
-    /// whatever the caller's process.
+    /// R1's: a service in the built-in or configuration-declared refused
+    /// lists, whatever the caller's process.
     RemoteAuthentication,
-    /// R2's: the display manager's own stack has to populate `PAM_AUTHTOK`, and
-    /// a second `PAM_PROMPT_ECHO_OFF` on a greeter handle is what the bypass
-    /// exists to prevent.
+    /// R2's: the display manager's own stack has to populate `PAM_AUTHTOK`,
+    /// and a second `PAM_PROMPT_ECHO_OFF` on a greeter handle is what the
+    /// bypass prevents.
     KeyringNeedsAuthtok,
 }
 
@@ -50,26 +49,27 @@ pub(crate) enum Conversation {
 }
 
 impl Conversation {
-    /// Every variant, for the guard's exhaustive walk. Test-only, like
-    /// [`RuleId::ALL`]: `class_permits`'s no-wildcard `match` is the compile-time
-    /// check on a new conversation, and this list is what lets the test reach every
-    /// cell it has, its literal cell count catching a variant left out here.
+    /// Every variant, for the guard's exhaustive walk. Test-only, for the
+    /// reason [`RuleId::ALL`] gives; `class_permits`'s no-wildcard `match` is
+    /// the compile-time check on a new conversation, and the literal cell
+    /// count in `class_permits_matches_its_expectation` catches a variant
+    /// left out of here.
     #[cfg(test)]
     pub(crate) const ALL: &[Self] = &[Self::Threaded, Self::Sequential, Self::PreCollected];
 }
 
 /// The failure direction a rule protects, stated once per class. `Keyring` and
-/// `RefuseRemote` are orthogonal to the three failure directions: the former is
-/// about the value of a grant rather than the risk of asking, the latter a scope
-/// decision — this call is not ours to answer at all.
+/// `RefuseRemote` are orthogonal to the three directions: the former is about
+/// the value of a grant rather than the risk of asking, the latter a scope
+/// decision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FailureDirection {
     /// The phone must not be consulted at all: R8's
     /// `Conversation::PreCollected`, not a `SkipPolicy`.
     NeverRing,
-    /// The conversation must not be driven from a second thread (or not driven
-    /// at all); the wrong direction is a hang, so the safe one is "slower,
-    /// never wedged".
+    /// The conversation must not be driven from a second thread (or not
+    /// driven at all); the wrong direction is a hang, so the safe one is
+    /// "slower, never wedged".
     DeadlockAvoidance,
     /// The phone is offered concurrently; the host can answer while we wait.
     AlwaysRing,
@@ -77,8 +77,9 @@ pub(crate) enum FailureDirection {
     Keyring,
     /// The module must not participate in a remote authentication. Its
     /// under-match (a remote caller classified local) is the security cost —
-    /// the phone is rung for a login nobody is sitting at — and its over-match
-    /// (a local caller classified remote) silences the phone for a local login.
+    /// the phone is rung for a login nobody is sitting at — and its
+    /// over-match (a local caller classified remote) silences the phone for a
+    /// local login.
     RefuseRemote,
 }
 
@@ -95,35 +96,25 @@ impl FailureDirection {
     ];
 }
 
-/// The decision cell of one row: a conversation, or a skip.
-///
-/// It is separate from [`Classification`] because a row authors only this cell: the
-/// failure direction is the row's own `class` column, and `classification_of`
-/// combines the two into a [`Participation`].
+/// The decision cell of one row: a conversation, or a skip. A row authors
+/// only this cell; the failure direction is its own `class` column, and
+/// `classification_of` combines the two into a [`Participation`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     Skip(SkipPolicy),
     Participate(Conversation),
 }
 
-/// Whether `class` may be paired with `conversation`: the admissible pairs, as one
-/// total function. The `match` has no wildcard, so a new class or conversation does
-/// not compile until every pairing with it has an answer here, and
-/// `class_permits_matches_its_expectation` checks all fifteen cells against a
-/// hand-written table.
+/// Whether `class` may be paired with `conversation`: the admissible pairs,
+/// as one total function. The `match` has no wildcard, so a new class or
+/// conversation does not compile until every pairing with it has an answer
+/// here; `class_permits_matches_its_expectation` checks all fifteen cells
+/// against a hand-written table.
 ///
-/// Why each class reads the way it does:
-/// * `NeverRing` — the phone must not be consulted, and `PreCollected` is the one
-///   shape that never reaches the daemon; any wait would ring it.
-/// * `DeadlockAvoidance` — either wait is safe (the host's own threads, or the
-///   calling thread), but `PreCollected` is `NeverRing`'s pairing, not a second
-///   way to silence the phone.
-/// * `AlwaysRing` — the phone is offered *concurrently*, which only `Threaded`
-///   gives; on `Sequential` nobody can answer while the module blocks.
-/// * `Keyring` — a grant without `PAM_AUTHTOK` is useless, so the class only
-///   skips (R2).
-/// * `RefuseRemote` — the call is not ours to answer, so the class only skips
-///   (R1).
+/// `PreCollected` is `NeverRing`'s pairing only (it is the one shape that
+/// never reaches the daemon), `AlwaysRing` needs `Threaded` (nobody can
+/// answer while `Sequential` blocks), and `Keyring`/`RefuseRemote` only ever
+/// skip.
 pub(crate) fn class_permits(class: FailureDirection, conversation: Conversation) -> bool {
     match (class, conversation) {
         (FailureDirection::NeverRing, Conversation::PreCollected) => true,
@@ -144,8 +135,8 @@ pub(crate) fn class_permits(class: FailureDirection, conversation: Conversation)
     }
 }
 
-/// A rule that matched, with the class it was authored against. Which rule it was
-/// is not part of the value: `classify` returns the id next to it.
+/// A rule that matched, with the class it was authored against. Which rule it
+/// was is not part of the value: `classify` returns the id next to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Participation {
     pub(crate) conversation: Conversation,
@@ -172,11 +163,12 @@ pub(crate) enum RuleId {
 }
 
 impl RuleId {
-    /// Every variant, in table order. Test-only: `as_str` and `policy::table::audit`
-    /// are exhaustive matches, so a new variant cannot compile without its spelling
-    /// and its record; this list is what lets the guard catch a rule whose row was
-    /// deleted from `RULES`, and `audit_covers_rules`'s `ALL.len() == RULES.len()`
-    /// catches a variant omitted here.
+    /// Every variant, in table order. Test-only: `as_str` and
+    /// `policy::table::audit` are exhaustive matches, so a new variant cannot
+    /// compile without its spelling and its record; this list is what lets
+    /// the guard catch a rule whose row was deleted from `RULES`, and
+    /// `audit_covers_rules`'s `ALL.len() == RULES.len()` catches a variant
+    /// omitted here.
     #[cfg(test)]
     pub(crate) const ALL: &[Self] = &[
         Self::R1,
@@ -209,9 +201,9 @@ impl RuleId {
     }
 }
 
-/// The first rule that matches wins; R10 is unconditional, so this is total. The id
-/// comes back next to the classification so a failing test names the row;
-/// `Participation` does not carry it.
+/// The first rule that matches wins; R10 is unconditional, so this is total.
+/// The id comes back next to the classification so a failing test names the
+/// row.
 pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification) {
     RULES
         .iter()
@@ -233,17 +225,18 @@ fn classification_of(rule: &Rule) -> Classification {
     }
 }
 
-/// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this table's
-/// oracle. It feeds literal inputs — the service string, `classify_identity` from
-/// the identity columns, `GdmReauth::from_env` from `env` — so the reads behind
-/// them (`/proc/self/exe`, `/proc/self/comm`, `GDM_SESSION_FOR_REAUTH`) stay
-/// unpinned: a `/proc` read cannot be characterised portably, and `set_var` would
-/// race every other test in this binary that reads the environment.
-/// `scripts/ci/test-pam-conv-thread.sh` is the proof for those.
+/// The fixture corpus (`client-pam/tests/fixtures/callers.csv`) is this
+/// table's oracle. It feeds literal inputs — the service string,
+/// `classify_identity` from the identity columns, `GdmReauth::from_env` from
+/// `env` — so the reads behind them (`/proc/self/exe`, `/proc/self/comm`,
+/// `GDM_SESSION_FOR_REAUTH`) stay unpinned: a `/proc` read cannot be
+/// characterised portably, and `set_var` would race every other test in this
+/// binary that reads the environment. `scripts/ci/test-pam-conv-thread.sh` is
+/// the proof for those.
 ///
-/// The rows were authored against the *pre-refactor* functions — the
-/// characterisation step — so a row is an expectation written before the code that
-/// must satisfy it, not a transcription of what the table already did.
+/// The rows were authored against the *pre-refactor* functions, so a row is
+/// an expectation written before the code that must satisfy it, not a
+/// transcription of what the table already did.
 // reason: test module; the crate root denies unwrap/expect/panic/indexing.
 #[cfg(test)]
 #[allow(
@@ -270,7 +263,7 @@ mod tests {
     /// The schema the corpus parser demands, in column order.
     const HEADER: &str = "id,service,exe,comm,env,tty,expected_rule,expected_policy,why,e2e";
 
-    /// The decision a fixture row expects, compared against what `classify` produces.
+    /// The decision a fixture row expects.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum ExpectedPolicy {
         SkipRemote,
@@ -414,9 +407,9 @@ mod tests {
         CallerContext::from_parts(row.service.as_deref(), identity.clone(), reauth)
     }
 
-    /// The rule an id-less classification belongs to. `classify` reports the id
-    /// itself; `refine` returns a bare `Classification`, so its skip is mapped back
-    /// through the policy, which belongs to exactly one rule
+    /// The rule an id-less classification belongs to. `classify` reports the
+    /// id itself; `refine` returns a bare `Classification`, so its skip is
+    /// mapped back through the policy, which belongs to exactly one rule
     /// (`RemoteAuthentication` is R1's, `KeyringNeedsAuthtok` is R2's). A
     /// participation maps to nothing here.
     fn skip_rule(classification: &Classification) -> Option<RuleId> {
@@ -464,14 +457,13 @@ mod tests {
 
     /// The terminal state each participating row models, written out by hand.
     ///
-    /// This is the oracle the corpus's `tty` column is checked against, and it is a
-    /// literal for a reason: the plan cell is a function of `tty`, so an expected
-    /// plan derived from the column under test agrees with a wrong value by
-    /// construction — a row whose `tty` misdescribed its host would stay green.
+    /// This is the oracle the corpus's `tty` column is checked against, and it
+    /// is a literal for a reason: the plan is a function of `tty`, so an
+    /// expected plan derived from the column under test agrees with a wrong
+    /// value by construction.
     ///
-    /// Every row whose `expected_policy` is `Threaded` or `Sequential` must appear
-    /// exactly once, and no other row may. `daemon_timeout` is the e2e row proving
-    /// a daemon-side timeout is silent: R5, threaded, no terminal.
+    /// Every row whose `expected_policy` is `Threaded` or `Sequential` must
+    /// appear exactly once, and no other row may.
     const EXPECTED_TTY: &[(&str, bool)] = &[
         // Threaded: the plan is Operation/Wait/DoNotOpen whatever the value. The
         // hosts own no terminal, except `threaded_with_tty_unreachable`, whose `1`
@@ -518,7 +510,6 @@ mod tests {
     ];
 
     /// The terminal state `EXPECTED_TTY` gives a row, or a panic naming the row.
-    /// Callers reach it only for a participating row, after the set check.
     fn expected_tty(id: &str) -> bool {
         EXPECTED_TTY
             .iter()
@@ -531,12 +522,10 @@ mod tests {
     /// participating row's `tty` column matches the host it models.
     ///
     /// `exe`/`comm` goes through `classify_identity` before `classify`, so a
-    /// precedence or `(deleted)` regression fails at the column that caused it, and
-    /// `env` through `GdmReauth::from_env`, so presence-only parsing is exercised
-    /// rather than assumed. The `tty` column is checked against `EXPECTED_TTY` first
-    /// and only then fed to `Plannable::plan`: the column cannot be its own oracle,
-    /// because the plan is a function of it. `skip_*` and `precollected` rows have
-    /// no `Plan`, so they assert the classification only.
+    /// precedence or `(deleted)` regression fails at the column that caused
+    /// it, and `env` through `GdmReauth::from_env`, so presence-only parsing
+    /// is exercised rather than assumed. `skip_*` and `precollected` rows
+    /// have no `Plan`, so they assert the classification only.
     #[test]
     fn corpus_characterises_the_decision_table() {
         let rows = rows();
@@ -632,9 +621,6 @@ mod tests {
                 row.why
             );
 
-            // The `tty` column is `plan`'s only input, so it is checked against
-            // `EXPECTED_TTY` (a literal) first and the plan is derived from that
-            // expectation — never from the column, which would agree with itself.
             match row.expected_policy {
                 ExpectedPolicy::Threaded | ExpectedPolicy::Sequential => {
                     assert_eq!(
@@ -712,14 +698,10 @@ mod tests {
     /// Every rule row has exactly one audit record, and every record is complete and
     /// uniquely named.
     ///
-    /// The record is `#[cfg(test)]`, so only these tests keep it honest: `audit`'s
-    /// exhaustive `match` makes a rule without a record a compile error, and walking
-    /// `RuleId::ALL` catches a record whose row was deleted from `RULES`, which
-    /// `corpus_covers_every_rule` cannot see because it iterates `RULES` too.
-    ///
-    /// The defect this catches: a record missing or empty, a deleted row leaving an
-    /// orphan record, and two rules sharing a name, which would make a corpus row's
-    /// `expected_rule` ambiguous.
+    /// The defect this catches: a record missing or empty, a deleted row
+    /// leaving an orphan record — `audit`'s exhaustive `match` makes the
+    /// other direction a compile error — and two rules sharing a name, which
+    /// would make a corpus row's `expected_rule` ambiguous.
     #[test]
     fn audit_covers_rules() {
         assert_eq!(
@@ -757,19 +739,15 @@ mod tests {
         }
     }
 
-    /// Every class × conversation cell, against an independently written table.
-    ///
-    /// The table is a literal and deliberately not derived from `class_permits`: an
-    /// expectation computed from the function under test would agree with it by
-    /// construction.
+    /// Every class × conversation cell, against an independently written
+    /// table: a literal, because an expectation computed from the function
+    /// under test agrees with it by construction.
     ///
     /// The defect this catches: an arm widened to admit a class over every
-    /// conversation — `DeadlockAvoidance`/`PreCollected`, which a `RULES` row could
-    /// otherwise reach through the pre-collected handoff — a cell whose answer
-    /// flipped, and, with `class_permits`'s no-wildcard `match`, a class or
-    /// conversation added without its pairings being decided. The two `ALL` lengths
-    /// and the row count are literals for the same reason: they are what makes an
-    /// added variant land here instead of only in the `match`.
+    /// conversation — `DeadlockAvoidance`/`PreCollected`, which a `RULES` row
+    /// could otherwise reach through the pre-collected handoff — a cell whose
+    /// answer flipped, and a class or conversation added without its pairings
+    /// decided.
     #[test]
     fn class_permits_matches_its_expectation() {
         use Conversation::{PreCollected, Sequential, Threaded};
@@ -1007,18 +985,15 @@ mod tests {
         );
     }
 
-    /// The configured-refusal matcher's fixture table.
+    /// The configured-refusal matcher's fixture table: the CSV corpus has no
+    /// column for a runtime config, so this literal is the fixture for the
+    /// configured half of R1.
     ///
-    /// The CSV corpus has no column for a runtime config, so this literal table is the
-    /// fixture for the configured half of R1: a renamed `PAMServiceName` is refused
-    /// only when declared, the match is ASCII case-insensitive, a near miss is not a
-    /// prefix/substring match, and a malformed entry in the slice matches nothing. The
-    /// last row is the shape `PamConfig::effective_refused_services` hands over.
-    ///
-    /// The defect this catches: a matcher that returns true for any participating
-    /// call (the rename refused without being declared — the negative control in
-    /// `pam_logic`), a case-sensitive one (`SSHD-RENAMED` escapes), a prefix match
-    /// (`my-sshd` refused), and one that lets an empty configured entry match.
+    /// The defect this catches: a matcher that returns true for any
+    /// participating call (the rename refused without being declared — the
+    /// negative control in `pam_logic`), a case-sensitive one (`SSHD-RENAMED`
+    /// escapes), a prefix match (`my-sshd` refused), and one that lets an
+    /// empty configured entry match.
     #[test]
     fn configured_refused_services_match_only_declared_names() {
         let cases: &[(&str, &[&str], bool)] = &[
@@ -1077,16 +1052,14 @@ mod tests {
     /// The refinement may add a skip and nothing else.
     ///
     /// Walks the whole corpus through `classify` and then `refine` with three configs —
-    /// the default, an empty list, and one naming every participating row's service —
-    /// and asserts per row and config: a skipped row stays skipped with its own rule
-    /// and policy; an unconfigured participating row comes back by value unchanged
-    /// (rule, conversation, class, hence the same deadline); a configured one becomes
-    /// R1's `Skip(RemoteAuthentication)`.
+    /// the default, an empty list, and one naming every participating row's
+    /// service.
     ///
-    /// The defect this catches: a refinement that rebuilds the participation — a
-    /// different conversation (moving the plan and the deadline), or the same
-    /// conversation with another class, which only `run`'s `debug_assert!` would see —
-    /// one that "unrefuses" a skip, and one keyed on the process name.
+    /// The defect this catches: a refinement that rebuilds the participation
+    /// — a different conversation (moving the plan and the deadline), or the
+    /// same conversation with another class, which only `run`'s
+    /// `debug_assert!` would see — one that "unrefuses" a skip, and one keyed
+    /// on the process name.
     #[test]
     fn refinement_cannot_change_a_participation() {
         let rows = rows();
@@ -1183,11 +1156,9 @@ mod tests {
                         row.id
                     );
                 } else {
-                    // Whole-value equality, not just the conversation and the
-                    // plan derived from it: the failure direction is part of the
-                    // value, so a refine that rebuilt the participation with the
-                    // same conversation but another class fails here rather than
-                    // only in `run`'s `debug_assert!`, which release builds drop.
+                    // Whole-value equality: a refine that rebuilt the
+                    // participation with the same conversation but another
+                    // class fails here too.
                     assert_eq!(
                         after, before,
                         "{label}: row {} ({}) must come back from the \
@@ -1205,8 +1176,8 @@ mod tests {
         );
     }
 
-    /// Moving a rule must move exactly the rows it should, by value, and leave every
-    /// other row where it was.
+    /// Moving a rule must move exactly the rows it should, by value, and
+    /// leave every other row where it was.
     ///
     /// Two load-bearing orderings:
     /// * R2 after R8 — `swaylock_under_sddm` and `i3lock_under_gdm_login` become
@@ -1261,8 +1232,8 @@ mod tests {
         (rule.id, policy_for_decision(&rule.decision))
     }
 
-    /// Assert `changed` for the named rows and "unchanged from `RULES`" for every
-    /// other corpus row.
+    /// Assert `changed` for the named rows and "unchanged from `RULES`" for
+    /// every other corpus row.
     fn assert_moved_rows(ordered: &[&'static Rule], changed: &[(&str, (RuleId, ExpectedPolicy))]) {
         let rows = rows();
         for (id, _) in changed {
@@ -1325,12 +1296,10 @@ mod tests {
         assert_eq!(classify(&null), (RuleId::R10, DEFAULT_SEQUENTIAL));
     }
 
-    /// The symbol `line` declares, as `(keyword, name)`, or `None` when the line
-    /// declares nothing.
-    ///
-    /// A doc comment is never a declaration, whatever words it uses: the drift this
-    /// distinguishes is a doc comment or a closing brace sitting where a predicate
-    /// used to be.
+    /// The symbol `line` declares, as `(keyword, name)`, or `None` when it
+    /// declares nothing. A doc comment is never a declaration, whatever words
+    /// it uses: the drift this distinguishes is a doc comment or a closing
+    /// brace where a predicate used to be.
     fn declared_symbol(line: &str) -> Option<(&'static str, &str)> {
         const DECLARATIONS: [&str; 7] = ["fn", "const", "static", "type", "struct", "enum", "mod"];
         let trimmed = line.trim_start();
@@ -1352,13 +1321,13 @@ mod tests {
         None
     }
 
-    /// Why a `policy/table.rs` citation does not name the symbol this row declares
-    /// there, or `None` when it does.
+    /// Why a `policy/table.rs` citation does not name the symbol this row
+    /// declares there, or `None` when it does.
     ///
     /// `fn <rule name>` is the row's own predicate, which is what every row cites; any
-    /// other `fn` is a different row's predicate reached by a shift. A citation to
-    /// some other table declaration (`const`, `struct`, …) is accepted as long as it
-    /// lands on a declaration.
+    /// other `fn` is a different row's predicate reached by a shift. A
+    /// citation to another table declaration (`const`, `struct`, …) is
+    /// accepted if it lands on a declaration.
     fn table_citation_problem(
         rule_name: &str,
         citation: &str,
@@ -1384,9 +1353,10 @@ mod tests {
     /// reports which files it checked so a relocated or emptied record cannot pass
     /// silently. Entries marked `external:` are exempt.
     ///
-    /// A citation into `policy/table.rs` must land on the declaration it claims, not
-    /// merely on a non-blank line ([`table_citation_problem`]). The plant-and-revert
-    /// control at the end is what keeps the strengthening honest.
+    /// A citation into `policy/table.rs` must land on the declaration it
+    /// claims, not merely on a non-blank line ([`table_citation_problem`]);
+    /// the plant-and-revert control at the end keeps that strengthening
+    /// honest.
     #[test]
     fn evidence_citations_resolve() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1458,8 +1428,8 @@ mod tests {
 
         // Positive control: plant one line of drift under R6's own citation in an
         // in-memory copy of the record, observe the strengthened check reject it, then
-        // revert and observe it accept again. Without the plant, a check that accepted
-        // any non-blank line would pass too.
+        // revert and observe it accept again — without which a check that accepted any
+        // non-blank line would pass too.
         let r6 = audit(RuleId::R6);
         let citation = r6
             .evidence

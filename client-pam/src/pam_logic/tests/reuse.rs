@@ -1,10 +1,7 @@
 //! The 500 ms reuse corpus: the window, its `(username, service)` key, and the two gates that
-//! decide what may be recorded.
-//!
-//! Every case drives the real `conclusion_cache::record` / `conclusion_cache::replay_for` pair,
-//! so the assertions are about the record `authenticate` writes and reads and not about a
-//! parallel copy of its logic. Each case holds `conclusion_cache::CACHE_SLOT_LOCK` for its
-//! whole body, because the record is one slot for the process.
+//! decide what may be recorded. Every case drives the real `conclusion_cache::record` /
+//! `replay_for` pair and holds `conclusion_cache::CACHE_SLOT_LOCK` for its whole body, because
+//! the record is one slot for the process.
 
 // `super::super` is `pam_logic` itself: the names these cases share with the module that
 // records (`Outcome`, `ServiceName`, …) come from its imports.
@@ -31,10 +28,9 @@ fn denied() -> Outcome {
     Outcome::Denied(DenyVia::PhoneDenial)
 }
 
-/// The mechanism exit a recorded verdict arrives as.
-///
-/// `Armed::conclude` takes a `MechanismEnd` — a mechanism never mints an `Outcome` — so a test
-/// that records one of the three verdicts has to name the exit that produces it.
+/// The mechanism exit a recorded verdict arrives as: `Armed::conclude` takes a `MechanismEnd` —
+/// a mechanism never mints an `Outcome` — so a test that records one of the three verdicts has
+/// to name the exit that produces it.
 fn end_of(outcome: &Outcome) -> crate::mechanism::MechanismEnd {
     use crate::mechanism::MechanismEnd;
     match outcome {
@@ -76,10 +72,8 @@ fn record_ago(ms_ago: u64, user: &str, service: Option<&str>, outcome: Outcome) 
     now
 }
 
-/// The verdict a lookup returns for `(user, service)` at `now`.
-///
-/// A hit is `Outcome::replayed(..)` of what was recorded: the marker is the provenance this
-/// step adds, and `record` is what refuses it.
+/// The verdict a lookup returns for `(user, service)` at `now`: a hit is `Outcome::replayed(..)`
+/// of what was recorded, the provenance this step adds and `record` refuses.
 fn replayable(user: &str, service: &str, now: Instant) -> Option<Outcome> {
     replay_for(user, service, now).map(|concluded| concluded.outcome().clone())
 }
@@ -205,9 +199,6 @@ fn recording_a_failure_replaces_the_cached_success() {
 /// A connect failure says nothing about the phone, so it must leave the process-wide record
 /// unarmed — and a retry must therefore be able to start a real transaction instead of
 /// replaying a verdict that never existed.
-///
-/// The key is unique to this test: the record is process-wide and other tests in this module
-/// write to it in parallel.
 ///
 /// Not covered here: a *caller* that records before opening a request — `record` takes a
 /// `Concluded` by value and `Armed::conclude` is its only fresh producer, so that shape is a

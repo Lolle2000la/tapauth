@@ -16,24 +16,21 @@ pub(super) struct Rule {
     pub(crate) decision: Decision,
 }
 
-/// The conversation policy, in order. R1 precedes every other rule (a remote
-/// call is refused whatever its process or service is), R2 precedes everything
-/// after it (the keyring constraint belongs to the service, not to the process),
-/// and R10 is last and unconditional.
+/// The conversation policy, in order: R1 first (a remote call is refused
+/// whatever its process or service), R2 next (its keyring constraint belongs
+/// to the service, not the process), R10 last and unconditional.
 ///
-/// Adding a host edits: a `Rule` row in `RULES`, whose length is the `[Rule; 10]` type;
-/// the predicate it names, with both its full and its `/proc/self/comm`-truncated
-/// (15-byte) spelling for a name that long; the `RuleId` variant, `RuleId::ALL` and
-/// `RuleId::as_str`; the `audit` arm, whose `evidence` cites
-/// `policy/table.rs:<line of fn ...>`; a `callers.csv` row with `expected_rule` and
-/// `expected_policy`; an `EXPECTED_TTY` entry only for a `threaded` or `sequential`
-/// row, since one for any other fails `corpus_characterises_the_decision_table`;
-/// its `(1..=10)` bound; and the key set in `rules_are_process_disjoint`, the one
-/// edit whose omission nothing fails loudly on. A service-keyed host (a display manager)
-/// is not a new `Rule`, only one `DM_PREFIXES` entry (bump `[&str; 13]`) plus one corpus
-/// row per prefix; an `e2e=1` row also needs `exe` set (the corpus reader fails a row
-/// without one) and a `case` arm in `scripts/ci/test-pam-conv-thread.sh`, which the Rust
-/// suite does not check.
+/// Adding a host edits the `Rule` row, the predicate with both its full and
+/// its `/proc/self/comm`-truncated (15-byte) spelling, the `RuleId` variant
+/// with its `ALL` entry and `as_str` arm, the `audit` arm (whose `evidence`
+/// cites `policy/table.rs:<line of fn ...>`), a `callers.csv` row with
+/// `expected_rule` and `expected_policy`, the `(1..=10)` bound, and the
+/// `rules_are_process_disjoint` key set — the one edit nothing fails loudly
+/// on. An `EXPECTED_TTY` entry belongs only to a `threaded` or `sequential`
+/// row, or `corpus_characterises_the_decision_table` fails. A display manager
+/// is not a new `Rule`: one `DM_PREFIXES` entry (bump `[&str; 13]`) plus a
+/// corpus row per prefix. An `e2e=1` row also needs `exe` and a `case` arm in
+/// `scripts/ci/test-pam-conv-thread.sh`, which no Rust test checks.
 pub(super) static RULES: [Rule; 10] = [
     Rule {
         id: RuleId::R1,
@@ -98,30 +95,30 @@ pub(super) static RULES: [Rule; 10] = [
 ];
 
 /// R10's result, and the value `classify` falls back to. R10's predicate is
-/// unconditional, so `find` always returns and this value is unreachable; it
-/// makes `classify` total without a panic path. `unreachable_rule_rows` asserts
-/// it is exactly what the table's last row produces, so the two cannot drift.
+/// unconditional, so this value is unreachable: it makes `classify` total
+/// without a panic path, and `unreachable_rule_rows` asserts it is what the
+/// table's last row produces.
 pub(super) const DEFAULT_SEQUENTIAL: Classification = Classification::Participate(Participation {
     conversation: Conversation::Sequential,
     failure_direction: FailureDirection::DeadlockAvoidance,
 });
 
 /// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`),
-/// compared ASCII case-insensitively: `PAM_SERVICE` is a `pam.d` filename, so a
-/// service literally named `SSHD` is sshd's stack whatever its spelling.
+/// compared ASCII case-insensitively: `PAM_SERVICE` is a `pam.d` filename, so
+/// a service literally named `SSHD` is sshd's stack whatever its spelling.
 ///
-/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default and `sshd-session`
-/// its per-connection session service. Both are defaults, not constants of the
-/// protocol: a deployment that renames the service falls through to R10 (the
-/// documented false negative, `svc_sshd_near_miss`) unless it declares the new
-/// name in `pam_refused_services`.
+/// `sshd` is OpenSSH's compiled-in `PAMServiceName` default and
+/// `sshd-session` its per-connection session service, so a deployment that
+/// renames the service falls through to R10 (the documented false negative,
+/// `svc_sshd_near_miss`) unless it declares the new name in
+/// `pam_refused_services`.
 const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
 
 /// R1 — refuse a remote authentication, keyed on the service name.
 ///
 /// The module never reads `PAM_RHOST`: `sudo` sets it to the local hostname
-/// (`Defaults pam_rhost`), so a presence-only rule would silence the module on
-/// `sudo`. Keying on the service keeps the refusal to the stacks that exist to
+/// (`Defaults pam_rhost`), so a presence-only rule would silence the module
+/// on `sudo`. The service keeps the refusal to the stacks that exist to
 /// authenticate a remote peer.
 fn remote_refuse(ctx: &CallerContext) -> bool {
     ctx.service().is_some_and(|service| {
@@ -152,14 +149,12 @@ const DM_PREFIXES: [&str; 13] = [
     "plasmalogin",
 ];
 
-/// R2 — the display-manager bypass, with the GDM reauthentication exemption.
 fn dm_login_bypass(ctx: &CallerContext) -> bool {
     ctx.service()
         .is_some_and(|service| DM_PREFIXES.iter().any(|prefix| service.dm_prefixed(prefix)))
         && !ctx.is_gdm_reauth()
 }
 
-/// R3 — a GDM reauthentication driven by the session worker.
 fn gdm_reauth_worker(ctx: &CallerContext) -> bool {
     matches!(
         ctx.process().name(),
@@ -170,7 +165,6 @@ fn gdm_reauth_worker(ctx: &CallerContext) -> bool {
         && ctx.is_gdm_reauth()
 }
 
-/// R4 — polkit's agent helper, full and `/proc/self/comm`-truncated spellings.
 fn polkit_agent(ctx: &CallerContext) -> bool {
     matches!(
         ctx.process().name(),
@@ -178,7 +172,6 @@ fn polkit_agent(ctx: &CallerContext) -> bool {
     )
 }
 
-/// R5 — kscreenlocker's worker, full and truncated spellings.
 fn kscreenlocker_worker(ctx: &CallerContext) -> bool {
     matches!(
         ctx.process().name(),
@@ -189,7 +182,7 @@ fn kscreenlocker_worker(ctx: &CallerContext) -> bool {
 /// R6 — hyprlock.
 ///
 /// Accepted risk: the host answers from a worker `std::thread` with a
-/// mutex/condvar — a genuine concurrent race, accepted with an unsynchronised
+/// mutex/condvar — a genuine concurrent race — and an unsynchronised
 /// `resetConversation`/`checkWaiting`.
 fn hyprlock(ctx: &CallerContext) -> bool {
     matches!(ctx.process().name(), Some("hyprlock"))
@@ -220,23 +213,21 @@ fn polkit_service_without_proc(ctx: &CallerContext) -> bool {
         && ctx.service().is_some_and(|service| service.is("polkit-1"))
 }
 
-/// R10 — the sequential default. Unconditional, and last.
 fn default_sequential(_ctx: &CallerContext) -> bool {
     true
 }
 
 /// One rule's audit record: its symbolic name, why it exists, and the in-tree
-/// evidence for the behaviour it preserves. Test-only by construction: a record
-/// only the tests read is not production data, so the shipped table carries no
-/// `dead_code` exemption.
+/// evidence for the behaviour it preserves. Test-only by construction, so the
+/// shipped table carries no `dead_code` exemption.
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) struct Audit {
     /// The rule's symbolic name (`dm_login_bypass`, …), which must be the row's
     /// own predicate: its citation has to land on `fn <name>`.
     pub(super) name: &'static str,
-    /// Why the rule exists, in one sentence. The predicate's doc comment keeps
-    /// the long form, including every accepted risk.
+    /// Why the rule exists, in one sentence. An accepted risk stays on the
+    /// predicate's own doc comment (`hyprlock`, `xsecurelock`).
     pub(super) why: &'static str,
     /// `file:line` citations the rule must be able to defend. Entries prefixed
     /// `external:` cite something outside this tree and are exempt from
@@ -244,10 +235,10 @@ pub(super) struct Audit {
     pub(super) evidence: &'static [&'static str],
 }
 
-/// `id`'s audit record. The `match` is exhaustive over `RuleId` with no wildcard,
-/// so a rule added to the enum does not compile until its record is written; the
-/// other direction — a record whose row was deleted from `RULES` — is
-/// `audit_covers_rules`.
+/// `id`'s audit record. The `match` is exhaustive over `RuleId` with no
+/// wildcard, so a rule added to the enum does not compile until its record is
+/// written; the other direction — a record whose row was deleted from `RULES`
+/// — is `audit_covers_rules`.
 #[cfg(test)]
 pub(super) fn audit(id: RuleId) -> Audit {
     match id {
@@ -267,7 +258,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "the login manager has to populate `PAM_AUTHTOK` for the session \
                   keyring, and a grant without it is useless",
             evidence: &[
-                "client-pam/src/policy/table.rs:156",
+                "client-pam/src/policy/table.rs:152",
                 "client-pam/src/outcome.rs:59",
             ],
         },
@@ -276,7 +267,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "a GDM reauthentication is driven by the session worker, whose \
                   conversation stays answerable while a worker thread waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:163",
+                "client-pam/src/policy/table.rs:158",
                 "client-pam/src/context.rs:80",
             ],
         },
@@ -285,7 +276,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "polkit's agent helper feeds its conversation from a separate \
                   process, so it can be answered while the caller waits",
             evidence: &[
-                "client-pam/src/policy/table.rs:174",
+                "client-pam/src/policy/table.rs:168",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -294,7 +285,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "kscreenlocker 6.8's worker answers on Qt's D-Bus daemon thread, so \
                   the conversation survives the calling thread blocking",
             evidence: &[
-                "client-pam/src/policy/table.rs:182",
+                "client-pam/src/policy/table.rs:175",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -303,7 +294,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "hyprlock answers from a worker thread; its unsynchronised \
                   `resetConversation`/`checkWaiting` race is the accepted risk",
             evidence: &[
-                "client-pam/src/policy/table.rs:194",
+                "client-pam/src/policy/table.rs:187",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -312,7 +303,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "xsecurelock's helper answers from its own thread pool, at the cost \
                   of up to three rings when `CallPAMWithRetries` re-runs the module",
             evidence: &[
-                "client-pam/src/policy/table.rs:202",
+                "client-pam/src/policy/table.rs:195",
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
@@ -321,7 +312,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "these hosts collected the password before `pam_authenticate`, so \
                   the phone must not be rung and the token is handed on instead",
             evidence: &[
-                "client-pam/src/policy/table.rs:207",
+                "client-pam/src/policy/table.rs:200",
                 "client-pam/src/mechanism/handoff.rs:25",
             ],
         },
@@ -330,7 +321,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "polkit with an unreadable `/proc` cannot be shown to answer \
                   concurrently, so it stays on the threaded conversation",
             evidence: &[
-                "client-pam/src/policy/table.rs:218",
+                "client-pam/src/policy/table.rs:211",
                 "client-pam/src/context.rs:164",
             ],
         },
@@ -339,7 +330,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
             why: "every other caller is driven sequentially on the calling thread, \
                   which is slower but can never wedge the host's event loop",
             evidence: &[
-                "client-pam/src/policy/table.rs:224",
+                "client-pam/src/policy/table.rs:216",
                 "client-pam/src/mechanism/sequential.rs:1",
             ],
         },

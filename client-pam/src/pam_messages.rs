@@ -1,9 +1,8 @@
 //! Localized user-facing PAM messages.
 //!
-//! Same Fluent (FTL) engine, locale detection and English fallback as the GUI,
-//! with the bundles embedded at compile time and every key resolved in `new` so
-//! the accessors are plain `&str`. Parse errors are logged, never fatal: a PAM
-//! module must not panic.
+//! The GUI's Fluent (FTL) engine and locale detection, with the bundles embedded at compile time
+//! and every key resolved in `new` so the accessors are plain `&str`. A parse error is logged,
+//! never fatal: a PAM module must not panic.
 
 use fluent::{FluentBundle, FluentResource};
 use std::sync::Arc;
@@ -145,7 +144,6 @@ pub fn detect_locale() -> &'static str {
     shared::l10n::detect_locale(locales_codegen::AVAILABLE_LOCALES)
 }
 
-/// The user's locale if the GUI persisted one, else the environment's.
 fn resolve_locale(username: &str) -> String {
     if let Some(loc) = load_user_locale(username) {
         return loc;

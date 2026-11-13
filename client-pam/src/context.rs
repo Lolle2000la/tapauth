@@ -50,10 +50,8 @@ impl CallerContext {
         }
     }
 
-    /// Build a context from already-resolved facts.
-    ///
-    /// Test-only, so no production caller can fabricate an identity: `capture`
-    /// is the only way in.
+    /// Test-only, so no production caller can fabricate an identity: `capture` is
+    /// the only way in.
     #[cfg(test)]
     pub(crate) fn from_parts(
         service: Option<&str>,
@@ -88,11 +86,10 @@ impl CallerContext {
 
 /// A PAM service name, in the two forms the policy compares.
 ///
-/// `original` is the bytes libpam returned and is the form the verdict cache
-/// keys on, so `sudo` and `SUDO` stay distinct. `ascii_lower` serves the
-/// case-insensitive comparisons only, folded with `to_ascii_lowercase` — never
-/// `str::to_lowercase`, which maps U+212A KELVIN SIGN to `k` and would make a
-/// non-display-manager service (`\u{212a}dm`) match the `kdm` prefix.
+/// `original` is the bytes libpam returned and is the verdict cache's key, so
+/// `sudo` and `SUDO` stay distinct. `ascii_lower` serves the case-insensitive
+/// comparisons only, folded with `to_ascii_lowercase` — never `str::to_lowercase`,
+/// which maps U+212A KELVIN SIGN to `k` and would make `\u{212a}dm` match `kdm`.
 #[derive(Clone)]
 pub(crate) struct ServiceName {
     original: Box<str>,
@@ -173,9 +170,8 @@ pub(crate) fn identity_from_proc() -> ProcessIdentity {
 
 /// Resolve an identity from the two `/proc` sources.
 ///
-/// Pure: the caller does the reads, this function does the interpretation, so
-/// the `(deleted)` strip, the empty-name rejection and the `exe`-before-`comm`
-/// precedence are unit-testable.
+/// Pure, so the `(deleted)` strip, the empty-name rejection and the
+/// `exe`-before-`comm` precedence are unit-testable without a `/proc` read.
 pub(crate) fn classify_identity(exe: Option<&Path>, comm: Option<&str>) -> ProcessIdentity {
     if let Some(exe) = exe {
         if let Some(name) = exe.file_name() {
@@ -200,8 +196,8 @@ pub(crate) fn classify_identity(exe: Option<&Path>, comm: Option<&str>) -> Proce
 ///
 /// Presence only (`var_os(..).is_some()`), so a set variable holding `0` counts;
 /// there is no value parse to get wrong. `from_env` is pure and `capture` is its
-/// only caller, so the interpretation is testable without `set_var` (which would
-/// race every other test in this binary that reads the environment).
+/// only caller, so the interpretation is testable without `set_var`, which would
+/// race every other test in this binary that reads the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GdmReauth {
     Present,
@@ -229,12 +225,10 @@ impl GdmReauth {
 mod tests {
     use super::*;
 
-    /// `GDM_SESSION_FOR_REAUTH` is read for its *presence* only, so a set
-    /// variable holding `0` or `""` is as present as one holding `1`.
-    ///
-    /// The value is passed in, so this pins the interpretation without
-    /// `set_var`; the read itself is covered by the `gdm-password login`/`reauth`
-    /// e2e shapes, the two shapes that differ only in that variable.
+    /// `GDM_SESSION_FOR_REAUTH` is read for its *presence* only, so a set variable
+    /// holding `0` or `""` is as present as one holding `1`. The value is passed
+    /// in, so this pins the interpretation without `set_var`; the read itself is
+    /// covered by the `gdm-password login`/`reauth` e2e shapes.
     #[test]
     fn gdm_reauth_env_parsing() {
         let cases: &[(Option<&OsStr>, GdmReauth)] = &[
@@ -248,11 +242,9 @@ mod tests {
         }
     }
 
-    /// The kernel's `" (deleted)"` suffix is stripped from an `exe` basename.
-    ///
     /// The defect this catches: the strip dropped, so an upgraded or swapped
-    /// binary (`swaylock (deleted)`) no longer matches R8, falls through to R10
-    /// and rings the phone for a host that already collected the password.
+    /// binary (`swaylock (deleted)`) no longer matches R8, falls through to R10 and
+    /// rings the phone for a host that already collected the password.
     #[test]
     fn strip_deleted_suffix() {
         assert_eq!(
@@ -277,14 +269,10 @@ mod tests {
         );
     }
 
-    /// The `comm` fallback is trimmed, and an empty-after-trim name is
-    /// `Unknown`.
-    ///
-    /// The defect this catches: `trim()` dropped, so `/proc/self/comm`'s
-    /// trailing newline becomes part of the name, no rule matches the truncated
-    /// spelling and a threaded host silently becomes Sequential; and a blank
-    /// `comm` accepted as `Comm("")`, claiming a provenance for a name no rule
-    /// can match.
+    /// The defect this catches: `trim()` dropped, so `/proc/self/comm`'s trailing
+    /// newline becomes part of the name, no rule matches the truncated spelling and
+    /// a threaded host silently becomes Sequential; or a blank `comm` accepted as
+    /// `Comm("")`, claiming a provenance for a name no rule can match.
     #[test]
     fn comm_fallback_trims_and_rejects_empty() {
         let trimmed = classify_identity(None, Some("  kscreenlocker_w \n"));
@@ -309,11 +297,9 @@ mod tests {
         assert_eq!(classify_identity(None, Some("")), ProcessIdentity::Unknown);
     }
 
-    /// `exe` wins over `comm` when both are readable.
-    ///
-    /// The defect this catches: `comm` consulted before `exe` (or `exe` treated
-    /// as a fallback), so a process whose truncated `comm` spelling is a
-    /// near-miss is classified from the wrong name.
+    /// The defect this catches: `comm` consulted before `exe` (or `exe` treated as
+    /// a fallback), so a process whose truncated `comm` spelling is a near-miss is
+    /// classified from the wrong name.
     #[test]
     fn exe_wins_over_comm() {
         assert_eq!(
@@ -325,19 +311,16 @@ mod tests {
             classify_identity(Some(Path::new("/usr/bin/swaylock (deleted)")), Some("sh")),
             ProcessIdentity::Exe("swaylock".into())
         );
-        // And `comm` is the answer only when `exe` produced nothing.
         assert_eq!(
             classify_identity(Some(Path::new("/")), Some("sh")),
             ProcessIdentity::Comm("sh".into())
         );
     }
 
-    /// A GDM reauthentication needs the service half as well as the flag.
-    ///
     /// The defect this catches: `is_gdm_reauth` testing only
-    /// `GDM_SESSION_FOR_REAUTH`, so the variable alone exempts any display
-    /// manager from R2 — an `sddm` login with the variable set would participate
-    /// instead of populating `PAM_AUTHTOK`, leaving its keyring locked.
+    /// `GDM_SESSION_FOR_REAUTH`, so the variable alone exempts any display manager
+    /// from R2 — an `sddm` login with the variable set would participate instead of
+    /// populating `PAM_AUTHTOK`, leaving its keyring locked.
     #[test]
     fn gdm_reauth_requires_service() {
         let worker = || ProcessIdentity::Exe("gdm-session-worker".into());
@@ -369,7 +352,6 @@ mod tests {
              keyring bypass, not a participation"
         );
 
-        // An unresolved service can never be a reauthentication either.
         let unknown = CallerContext::from_parts(None, worker(), GdmReauth::Present);
         assert!(!unknown.is_gdm_reauth());
     }

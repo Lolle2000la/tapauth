@@ -1,9 +1,5 @@
-//! The orchestration's behaviour: the order of the effects, both decision phases, the skip's
-//! silence and the verdict → code matrix.
-//!
-//! These tests drive `orchestrate` through `OrchestrationIo` and `Effects`, so each one counts
-//! a call instead of asserting a promise. The 500 ms reuse corpus lives beside this module in
-//! `reuse`.
+//! The orchestration's behaviour: the ordering tests count calls through `OrchestrationIo` and
+//! `Effects` instead of asserting promises. The 500 ms reuse corpus lives in `reuse`.
 
 use super::*;
 use crate::ipc_client::IpcClient;
@@ -18,15 +14,10 @@ fn test_logging_init() {
     logging::init_logging();
 }
 
-// ------------------------------------------------------------------
-// The ordering and single-read guarantees of `authenticate`
-// ------------------------------------------------------------------
-
 /// The four calls `classify` must precede, counted.
 ///
-/// The context is passed to `orchestrate` already captured, so these tests need no PAM handle
-/// and no daemon: whatever the body does after the four calls, the counters are decided before
-/// it.
+/// The context reaches `orchestrate` already captured, so these tests need no PAM handle and no
+/// daemon: whatever the body does after the four calls, the counters are decided before it.
 static CONFIG_CALLS: AtomicUsize = AtomicUsize::new(0);
 static USER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CONVERSATION_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -101,13 +92,10 @@ fn inert_io() -> OrchestrationIo {
     }
 }
 
-/// R1 refuses a remote call before anything reaches the daemon.
-///
 /// The defect this catches: a skip decided late enough to dial the socket, or one that sends
-/// the request and only then refuses — the phone must not be rung for a login nobody is sitting
-/// at, and the daemon must not see a request for it. The counters are the assertion: an outcome
-/// equality cannot tell a refusal that never connected from one that returned the same code
-/// after a full transaction.
+/// the request and only then refuses. The counters are the assertion: an outcome equality cannot
+/// tell a refusal that never connected from one that returned the same code after a full
+/// transaction.
 #[test]
 fn remote_skip_never_reaches_the_daemon() {
     for service in ["sshd", "sshd-session"] {
@@ -160,12 +148,10 @@ fn remote_skip_never_reaches_the_daemon() {
     }
 }
 
-/// Every verdict `run` can return before a conversation exists is silent.
-///
 /// The defect this catches: a message added to one of these reasons (say a `PAM_TEXT_INFO` for
-/// the keyring bypass). Those paths return before `PamConversation::new`, so there is nothing
-/// to emit through, and the message would be dropped silently instead of the omission being a
-/// compile-time or test-time decision.
+/// the keyring bypass). Those paths return before `PamConversation::new`, so there is nothing to
+/// emit through and the message would vanish silently instead of the omission being decided
+/// here.
 #[test]
 fn outcomes_that_precede_the_conversation_are_silent() {
     let msgs = pam_messages::load_for_user("pre-conversation-test-user");
@@ -208,9 +194,6 @@ fn side_effects_of(ctx: &CallerContext) -> [usize; 4] {
     ]
 }
 
-/// `classify` runs before `PamConfig::load`, `get_user`, `PamConversation::new` and
-/// `PamMessages::load_for_user`, so a skip costs none of them.
-///
 /// The defect this catches: moving `classify` below any of the four — the natural place is
 /// "after the config read", where the timeouts are known. Nothing else fails then: a
 /// display-manager login would still return `PAM_AUTHINFO_UNAVAIL`, it would just pay a config
@@ -240,11 +223,6 @@ fn classify_before_side_effects() {
         "a participating call must reach every one of the four calls"
     );
 }
-
-// ------------------------------------------------------------------
-// A configured (renamed) remote service is refused after the config
-// read and before every other side effect.
-// ------------------------------------------------------------------
 
 /// The four side effects the configured-refusal test counts, on their own statics so the two
 /// tests cannot race.
@@ -353,16 +331,12 @@ fn run_renamed(ctx: &CallerContext, load_config: fn() -> PamConfig) -> RenamedRu
     }
 }
 
-/// A service name added to `pam_refused_services` is refused exactly like a built-in one: R1's
-/// verdict, after the config read, before every other side effect.
-///
 /// The defect this catches, in both directions: without the enforcement point a renamed
 /// `PAMServiceName` is classified R10 and a remote login rings the phone and waits out the GUI
 /// timeout (the counters would be non-zero and the verdict `DaemonUnreachable`); an enforcement
 /// point that runs before the config read cannot see the configured list at all, and one placed
 /// after the username lookup, the conversation or the messages would still pay them — and would
-/// emit through a live `HostIo`, which is why the verdict's notice is asserted `None` here (the
-/// refusal returns before a `HostIo` exists).
+/// emit through a live `HostIo`, which is why the verdict's notice is asserted `None` here.
 #[test]
 fn a_configured_renamed_service_is_refused_after_the_config_read() {
     let ctx = context(Some("sshd-renamed"), Some("sshd"));
@@ -473,15 +447,14 @@ fn skip_io() -> OrchestrationIo {
     }
 }
 
-/// A skip never reaches the handoff, which is asserted on the token read itself.
-///
-/// The two no-daemon paths are not one category: R1 and R2 skip the handle entirely (no plan,
-/// no deadline, no conversation), while R8's pre-collected handoff *must* touch it — it calls
-/// `pam_get_authtok` on the calling thread and leaves `PAM_AUTHTOK` for the next module. The
-/// defect this catches: a skip routed through the participation path, so a display-manager
+/// The defect this catches: a skip routed through the participation path, so a display-manager
 /// login or a remote call reads the token (and answers `PasswordHandoff` instead of its own
 /// reason). The read is counted where it happens, through the reader `transaction::HostIo`
 /// carries, not inferred from the absence of a conversation.
+///
+/// R1 and R2 skip the handle entirely (no plan, no deadline, no conversation), while R8's
+/// pre-collected handoff *must* touch it — it calls `pam_get_authtok` on the calling thread and
+/// leaves `PAM_AUTHTOK` for the next module.
 #[test]
 fn skip_never_hands_off() {
     for (service, process, expected) in [
@@ -576,8 +549,8 @@ fn skip_never_hands_off() {
 /// Emit `outcome`'s one message through the crate's one emission site, then take its code.
 ///
 /// The emission site is [`HostIo::emit`], so the host built here is the one `orchestrate`
-/// builds. The conversation is the dummy one, so the emission itself is a no-op — the pair
-/// these tests pin is the verdict and the code.
+/// builds; the dummy conversation makes the emission itself a no-op, so the pair these tests pin
+/// is the verdict and the code.
 fn emit_then_code(
     conv: &pam_sys::PamConversation<'_>,
     msgs: &pam_messages::PamMessages,
@@ -639,16 +612,14 @@ fn test_map_pam_outcome_matrix() {
         );
     }
 
-    // The daemon answered but could not process the attempt.
     assert_eq!(
         map(resp_for(shared::ipc::pb::PamOutcome::Error, "boom")),
         pam_sys::PAM_AUTH_ERR
     );
 }
 
-/// The `outcome` field is a raw `i32` on the wire, so a peer can put any value in it. Unknown
-/// values must fail closed (`Error` → `PAM_AUTH_ERR`) rather than decode to
-/// `PamOutcome::default()` = `SUCCESS`.
+/// The `outcome` field is a raw `i32` on the wire, so a peer can put any value in it; unknown
+/// values must fail closed rather than decode to `PamOutcome::default()` = `SUCCESS`.
 #[test]
 fn test_unknown_outcome_raw_values_fail_closed() {
     use crate::outcome::DenyVia;
@@ -690,8 +661,8 @@ fn test_unknown_outcome_raw_values_fail_closed() {
     }
 }
 
-/// Wire-level version of the test above: hand-encode a `PamAuthenticateResponse` whose
-/// `outcome` field is an unknown value, decode it with prost and drive the real PAM mapping.
+/// Wire-level counterpart of the test above: hand-encode the unknown value, decode it with prost
+/// and drive the real PAM mapping.
 ///
 /// Layout (proto3): `outcome` is field 1, varint, so the tag byte is `(1 << 3) | 0 == 0x08`,
 /// followed by the value's base-128 varint. `detail` and `challenge` are empty and therefore
@@ -739,12 +710,10 @@ fn test_undecodable_wire_outcome_never_grants() {
     }
 }
 
-/// Regression test for the `PAM_IGNORE` authentication bypass.
-///
-/// Linux-PAM records no failure for `PAM_IGNORE`, so in a stack shaped like `auth required
-/// pam_tapauth.so` + `auth optional pam_permit` + `auth required pam_env` the `optional`
-/// module's success vote grants the whole stack without any phone approval. No daemon outcome
-/// may map to `PAM_IGNORE`.
+/// Regression test for the `PAM_IGNORE` authentication bypass: Linux-PAM records no failure for
+/// `PAM_IGNORE`, so in a stack shaped like `auth required pam_tapauth.so` + `auth optional
+/// pam_permit` + `auth required pam_env` the `optional` module's success vote grants the whole
+/// stack without any phone approval. No daemon outcome may map to `PAM_IGNORE`.
 #[test]
 fn test_no_pam_outcome_maps_to_pam_ignore() {
     let conv = unsafe { pam_sys::PamConversation::dummy() };

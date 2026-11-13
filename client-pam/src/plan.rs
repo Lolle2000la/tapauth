@@ -39,12 +39,13 @@ impl Deadline {
     }
 }
 
-/// Which `PAM_TEXT_INFO` the user is shown, and when.
+/// Which `PAM_TEXT_INFO` the user is shown, and when: `Wait` and
+/// `WaitSkipHint` go out before the request, `WaitThenPassword` after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Announcement {
-    /// The threaded wait: emitted before the request.
+    /// The threaded wait.
     Wait,
-    /// The terminal wait: emitted before the request.
+    /// The terminal wait.
     WaitSkipHint,
     /// The no-terminal sequential wait: emitted *after* the request is on the
     /// wire, because such a host reveals its password entry only once a PAM
@@ -125,11 +126,11 @@ mod tests {
 
     /// Every `Plannable × has_tty` cell, and the three distinct plans it produces.
     ///
-    /// The defect this catches: a cell with the wrong announcement (the terminal
-    /// wait emitted after the request, or none for the no-terminal host),
-    /// `PollForKey` for a conversation that must not open the terminal, and
-    /// `GuiBounded` on a host with a terminal, which would shorten a `sudo` wait
-    /// that has a working password field.
+    /// The defect this catches: a cell with the wrong announcement (the
+    /// terminal wait after the request, or none for the no-terminal host),
+    /// `PollForKey` on a conversation that must not open the terminal, and
+    /// `GuiBounded` on a host with a terminal, which would shorten a `sudo`
+    /// wait that has a working password field.
     #[test]
     fn plan_table() {
         let threaded = Plan {
@@ -168,9 +169,9 @@ mod tests {
         assert_eq!(distinct.len(), 3, "the table has exactly three cells");
     }
 
-    /// The `has_tty` value must not reach a threaded plan: with the probe or the
-    /// mode test moved before the plan, a threaded host that happens to have a
-    /// terminal gets the terminal announcement or a terminal-bounded deadline.
+    /// The defect this catches: a threaded host that happens to have a
+    /// terminal getting the terminal announcement or a terminal-bounded
+    /// deadline.
     #[test]
     fn threaded_plan_ignores_has_tty() {
         assert_eq!(
@@ -181,9 +182,9 @@ mod tests {
 
     /// `GuiBounded` is `min(gui, operation)`, in all four shapes.
     ///
-    /// The defect this catches: `min` written as `max` — every integration test in
-    /// the repository still passes, because the host-cases shape sets gui 2 s / op
-    /// 4 s and never discriminates the two — and the clamp applied to an
+    /// The defect this catches: `min` written as `max`, which every
+    /// integration test still passes — the host-cases shape sets gui 2 s / op
+    /// 4 s, so it never discriminates the two — and the clamp applied to an
     /// `Operation` host.
     #[test]
     fn gui_deadline_is_min() {
@@ -197,24 +198,22 @@ mod tests {
         let equal = config(30, 30);
         assert_eq!(Deadline::GuiBounded.resolve(&equal), 30);
 
-        // An operation timeout of zero bounds every host at zero, which is the
-        // "never wait" configuration.
+        // An operation timeout of zero bounds every host at zero: the "never wait"
+        // configuration.
         let zero = config(0, 30);
         assert_eq!(Deadline::GuiBounded.resolve(&zero), 0);
         assert_eq!(Deadline::Operation.resolve(&zero), 0);
     }
 
-    /// Seconds beyond `u32::MAX` saturate instead of wrapping.
-    ///
-    /// The defect this catches: an `as u32` cast without the saturation, which
-    /// turns a configured 2^32 seconds into an immediate zero-second deadline.
+    /// The defect this catches: an `as u32` cast without the saturation,
+    /// which turns a configured 2^32 seconds into an immediate zero-second
+    /// deadline.
     #[test]
     fn deadline_saturates_at_u32_max() {
         let huge = config(u64::MAX, u64::MAX);
         assert_eq!(Deadline::Operation.resolve(&huge), u32::MAX);
         assert_eq!(Deadline::GuiBounded.resolve(&huge), u32::MAX);
 
-        // One just past the limit, from the gui side only.
         let just_past = config(u64::MAX, u64::from(u32::MAX) + 1);
         assert_eq!(Deadline::GuiBounded.resolve(&just_past), u32::MAX);
 
