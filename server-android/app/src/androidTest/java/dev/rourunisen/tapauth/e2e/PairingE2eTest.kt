@@ -53,8 +53,16 @@ import org.junit.runner.RunWith
  * The derived SAS is logged, printed and written to filesDir so the host side can compare it
  * against the daemon's own value (bilateral anti-MITM verification).
  *
- * Every wait is bounded (30 s for the SAS, 60 s for the outcome) so a stuck handshake fails the
- * test with a descriptive assertion instead of hanging the E2E harness.
+ * Every wait is bounded so a stuck handshake fails the test with a descriptive assertion instead of
+ * hanging the E2E harness. Each bound must sit **above** the deadline of the state it awaits,
+ * otherwise the test expires first and reports its own timeout instead of the session's terminal
+ * reason — which is the only thing the harness can assert on:
+ *
+ * * `SAS_TIMEOUT_MS` outlives `PairingSession.RESPONSE_DEADLINE_MS` (30 s) plus the BLE head start,
+ *   so a phone that never accepts a `PairingResponse` reports `Pairing failed while waiting for the
+ *   derived SAS: …` rather than `Timed out after …`.
+ * * `OUTCOME_TIMEOUT_MS` outlives both `PairingSession.SAS_APPROVAL_TIMEOUT_MS` (180 s) and
+ *   `PairingSession.CONFIRM_TIMEOUT_MS` (120 s), so the same holds after the SAS decision.
  */
 @RunWith(AndroidJUnit4::class)
 class PairingE2eTest {
@@ -62,8 +70,24 @@ class PairingE2eTest {
     companion object {
         private const val TAG = "PairingE2eTest"
 
-        private const val SAS_TIMEOUT_MS = 30_000L
-        private const val OUTCOME_TIMEOUT_MS = 60_000L
+        /**
+         * Await for the phone's own SAS derivation.
+         *
+         * 45 s: strictly above the session's 30 s `RESPONSE_DEADLINE_MS` (the point at which it
+         * emits its terminal `Failed` update), with room for app start, the 250 ms BLE head start
+         * and the Main-thread delivery of that update. An await equal to the session deadline wins
+         * the way this test once did, hiding the session's own failure reason.
+         */
+        private const val SAS_TIMEOUT_MS = 45_000L
+
+        /**
+         * Await for the terminal outcome (rejection, cancellation, failure or completion).
+         *
+         * 200 s: above both `SAS_APPROVAL_TIMEOUT_MS` (180 s) and `CONFIRM_TIMEOUT_MS` (120 s), so
+         * a session that expires on its own is always observed as the terminal `Failed` it emitted
+         * instead of as this test's timeout.
+         */
+        private const val OUTCOME_TIMEOUT_MS = 200_000L
     }
 
     @Test

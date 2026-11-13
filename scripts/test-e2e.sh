@@ -1192,8 +1192,10 @@ WAIT_MISMATCH_LOG="${TEST_DIR}/wait_mismatch_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT_MISMATCH" > "$WAIT_MISMATCH_LOG" 2>&1 &
 WAIT_MISMATCH_PID=$!
 
-# Synchronous: the phone gives up after its own 30 s response deadline, so this
-# returns (failing) within about half a minute.
+# Synchronous: the phone rejects the mismatched `PairingResponse` and then waits out its own 30 s
+# response deadline, which is the terminal state `PairingE2eTest` observes (`Pairing failed while
+# waiting for the derived SAS: …`). The test's own await is 45 s — deliberately above that
+# deadline so it can never win the race — so this returns (failing) within about 45 s.
 AM_MISMATCH_LOG="${TEST_DIR}/am_mismatch_pairing.log"
 adb shell "am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
@@ -1310,8 +1312,13 @@ AM_CANCEL_PID=$!
 
 # Cancel once the phone actually shows its SAS (its `hold_sas_ms` window), so the
 # abort arrives while `awaitApproval` is still waiting for a decision.
+#
+# 100 polls at 0.5 s ≈ 50 s, which outlives the phone's own 30 s response race
+# (`PairingSession.RESPONSE_DEADLINE_MS`) plus app start. A window that expired
+# first would report "the phone never displayed a SAS" for a phone that was
+# simply still racing for the response.
 CANCEL_SAS_SEEN=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 100); do
     if adb logcat -d 2>/dev/null | grep -q 'ANDROID_DERIVED_SAS='; then
         CANCEL_SAS_SEEN=1
         break
@@ -1451,8 +1458,10 @@ echo "    Desktop Derived SAS: $SAS_CODE"
 # the phone has received and shown it, so the hold must start from the phone's own
 # announcement — otherwise the exercised window is `hold − Δ`, not the hold. The
 # logcat buffer was cleared at the start of 1b, so this cannot match an older run.
+# 100 polls at 0.5 s ≈ 50 s, above the phone's own 30 s response race plus app
+# start (see the Phase 1a-iii poll for the same bound).
 PHONE_SAS_SEEN=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 100); do
     if adb logcat -d 2>/dev/null | grep -q 'ANDROID_DERIVED_SAS='; then
         PHONE_SAS_SEEN=1
         break
