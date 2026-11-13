@@ -322,6 +322,8 @@ A renamed binary or an unknown host needs no edit: it falls to R10, unchanged be
 
 The module is not meant to be installed in sshd's stack. R1 makes it safe there in the sense that it refuses, but a refusal on a `required` line **denies** every remote login; on a `sufficient` line it is `ignore` and the stack decides. §2.8 records why the packaged profile reaches that stack on Debian/Ubuntu anyway.
 
+The same `sufficient` mechanics make the line's *position* load-bearing on `su`. The module authenticates the stack's `PAM_USER` (`pam_sys.rs`, `get_user` and `user_from_item`), and on `su` that item is the **target** account, not the caller. A line placed ahead of a `pam_wheel.so` restriction — the check an administrator enables to limit `su` to the wheel group — therefore lets a phone grant for `root` stand in for that check rather than supplement it. `install.sh` (`configure_pam`) anchors the `su` and `su-l` lines on `pam_env.so` and otherwise inserts at line 1, which puts the module ahead of that check on a `su` stack without the anchor. No test asserts the position, as with the `common-auth` ordering §8 records.
+
 ---
 
 ## 4. Behaviour inventory

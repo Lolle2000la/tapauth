@@ -166,7 +166,12 @@ mod tests {
                 distinct.push(plan);
             }
         }
-        assert_eq!(distinct.len(), 3, "the table has exactly three cells");
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the plan table's cells must produce exactly three distinct plans: threaded \
+             (has_tty ignored), sequential with a tty, sequential without a tty"
+        );
     }
 
     /// The defect this catches: a threaded host that happens to have a
