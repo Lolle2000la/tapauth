@@ -32,7 +32,7 @@ cd "$PROJECT_ROOT"
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║      TapAuth Full Real-Android End-to-End Test Suite          ║"
-echo "║      (TCP Pairing + UDP Network + BLE GATT Authentication)   ║"
+echo "║      (v2 UDP/BLE Pairing + UDP Network + BLE GATT Auth)       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -721,26 +721,290 @@ else
     echo "✅ tapauthd daemon is active (systemd socket activation)."
 fi
 
-# Step 5: Phase 1 - Real TCP Device Pairing
+# ── Phase 1 helpers: protocol-v2 pairing URL ──────────────────────────────────
+#
+# `start-pairing` prints the QR on a single `URL=` line, in the v2 form
+#
+#   tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=<udp port>][&ip4=…][&ip6=…]
+#
+# so every field has to be read as a query parameter. Splitting that line on `=`
+# (`cut -d'=' -f2`, what this phase used to do) truncates it at the first `=`
+# inside the URL and hands the phone a malformed QR, which the instrumentation
+# run then reports as an assertion failure the old harness ignored.
+
+# pair_url_param <url> <key>: first value of `key` in the query, empty if absent.
+pair_url_param() {
+    local url=$1 key=$2 query part
+    query="${url#*\?}"
+    if [ "$query" = "$url" ]; then
+        return 0
+    fi
+    local IFS='&'
+    for part in $query; do
+        if [ "${part%%=*}" = "$key" ]; then
+            printf '%s' "${part#*=}"
+            return 0
+        fi
+    done
+}
+
+# pair_url_set <url> <key> <value>: replace the first `key=…`, else append it.
+pair_url_set() {
+    local url=$1 key=$2 value=$3
+    local prefix query part out="" replaced=0
+    case "$url" in
+        *\?*) prefix="${url%%\?*}?"; query="${url#*\?}" ;;
+        *)    prefix="${url}?";      query="" ;;
+    esac
+    local IFS='&'
+    for part in $query; do
+        if [ "$replaced" = "0" ] && [ "${part%%=*}" = "$key" ]; then
+            out="${out:+$out&}${key}=${value}"
+            replaced=1
+        else
+            out="${out:+$out&}${part}"
+        fi
+    done
+    if [ "$replaced" = "0" ]; then
+        out="${out:+$out&}${key}=${value}"
+    fi
+    printf '%s' "${prefix}${out}"
+}
+
+# require_pair_url_v2 <url> <label> [require_udp_endpoint]
+#
+# Fails loudly (exit 1) unless the QR is a usable v2 pairing URL: `v=2`, a
+# 32-hex `sid`, a 64-hex non-zero `pk`. With `require_udp_endpoint=1` the QR must
+# also carry a UDP endpoint (`p` and `ip4`), which is what makes a run a *UDP*
+# pairing rather than a BLE one. Always echoes the reconstructed keys, so the
+# log shows exactly which URL the phone was given.
+require_pair_url_v2() {
+    local url=$1 label=$2 require_udp=${3:-0}
+    local v sid pk p ip4 ip6 err=""
+    v=$(pair_url_param "$url" v)
+    sid=$(pair_url_param "$url" sid)
+    pk=$(pair_url_param "$url" pk)
+    p=$(pair_url_param "$url" p)
+    ip4=$(pair_url_param "$url" ip4)
+    ip6=$(pair_url_param "$url" ip6)
+    if [ "$v" != "2" ]; then
+        err="v='$v' (expected '2')"
+    elif ! printf '%s' "$sid" | grep -Eq '^[0-9a-fA-F]{32}$'; then
+        err="sid='$sid' (expected 32 hex characters)"
+    elif printf '%s' "$pk" | grep -Eq '^0+$'; then
+        err="pk='$pk' is the all-zero key"
+    elif ! printf '%s' "$pk" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+        err="pk='$pk' (expected 64 hex characters)"
+    elif [ "$require_udp" = "1" ] && [ -z "$p" ]; then
+        err="p is empty (the QR carries no ephemeral UDP pairing port)"
+    elif [ "$require_udp" = "1" ] && [ -z "$ip4" ]; then
+        err="ip4 is empty (the QR carries no IPv4 endpoint)"
+    fi
+    if [ -n "$err" ]; then
+        echo "❌ ERROR (${label}): not a usable v2 pairing URL: $err"
+        echo "   QR keys: v='$v' sid='$sid' pk='$pk' p='$p' ip4='$ip4' ip6='$ip6'"
+        exit 1
+    fi
+    echo "✅ ${label}: v2 QR keys v='$v' sid='$sid' pk='$pk' p='$p' ip4='$ip4' ip6='$ip6'"
+}
+
+# pair_url_for_emulator <url>: rewrite the QR's `ip4` to 10.0.2.2, the QEMU SLIRP
+# alias for the host, because the QR's LAN address is not routable from inside
+# the guest. This does not weaken the handshake: the endpoints are NOT part of
+# the pairing transcript, and the identity pin (`pk`) travels in the same URL and
+# is still verified by the phone. `p`/`sid`/`pk`/`ip6` are left untouched, and a
+# BLE-only QR (no `ip4`) is returned unchanged instead of gaining a bogus one.
+pair_url_for_emulator() {
+    local url=$1
+    if [ -n "$(pair_url_param "$url" ip4)" ]; then
+        pair_url_set "$url" ip4 "10.0.2.2"
+    else
+        printf '%s' "$url"
+    fi
+}
+
+# instrument_ok <am-log>: true only when the runner itself reported success.
+# `am instrument`'s exit status is not trustworthy, so the verdict is read from
+# its output — the same distrust scripts/ci/run-all-e2e.sh applies.
+instrument_ok() {
+    local log=$1
+    if [ ! -f "$log" ]; then
+        return 1
+    fi
+    if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed' "$log"; then
+        return 1
+    fi
+    grep -q 'OK (' "$log"
+}
+
+# assert_instrument_ok <am-log> <label>: fail, dumping the log, unless the run
+# actually passed. Never replace this with `wait "$AM_PID"`: a crashed or
+# assertion-failing run must not be able to look like a pass.
+assert_instrument_ok() {
+    local log=$1 label=$2
+    if instrument_ok "$log"; then
+        echo "✅ ${label}: instrumentation reported OK"
+        return 0
+    fi
+    echo "❌ ERROR (${label}): instrumentation did not report a passing run."
+    echo "---- ${log} ----"
+    cat "$log" || true
+    exit 1
+}
+
+# pending_daemon_surface <phase> <fact>...: a phase whose desktop command lines
+# are not settled yet must fail loudly and name what is missing. Never `|| true`
+# past one of these — a phase that cannot drive the daemon is exactly the vacuous
+# pass this rewrite removes.
+pending_daemon_surface() {
+    local phase=$1
+    shift
+    echo ""
+    echo "❌ ERROR (${phase}): PENDING-DAEMON-SURFACE — the daemon's protocol-v2"
+    echo "   pairing command surface is not final, so this phase cannot be driven."
+    echo "   Fill in the marked block in scripts/test-e2e.sh once these are answered"
+    echo "   (tapauthd/src/bin/tapauth-ipc-cli.rs, tapauthd/src/admin_handler.rs):"
+    local n=0 fact
+    for fact in "$@"; do
+        n=$((n + 1))
+        echo "     ${n}. ${fact}"
+    done
+    echo ""
+    exit 1
+}
+
+# phase_marker <am-log> <marker>: true when <marker> appears in the phase's
+# instrumentation output OR in logcat. Several observables (the rejected-SAS
+# outcome, "SAS reached the phone over BLE", "Pairing completed and persisted")
+# are reported with Log.i, and `am instrument`'s stream carries the test's stdout,
+# not logcat — so a run that only greps the instrumentation log would look like a
+# failure forever. Every phase clears the buffer with `adb logcat -c` before it
+# runs, so the logcat half cannot match a line from an earlier phase or run.
+phase_marker() {
+    local am_log=$1 marker=$2
+    if [ -f "$am_log" ] && grep -qF "$marker" "$am_log"; then
+        return 0
+    fi
+    adb logcat -d 2>/dev/null | grep -qF "$marker"
+}
+
+# servers_count <label>: the daemon's paired-device count as a validated integer.
+#
+# A bare `$(get-servers | grep 'COUNT=' | cut -f2)` is empty whenever the CLI or
+# the daemon fails, and `[ "" -ne 0 ]` / `[ "" -lt 1 ]` are errors (status 2) that
+# an `if` reads as false — so an empty count silently satisfied both the "must be
+# 0" and the "must be at least 1" assertions. This exits instead.
+servers_count() {
+    local label=$1 raw count
+    if ! raw=$("$CLI_BIN" get-servers 2>&1); then
+        echo "❌ ERROR (${label}): get-servers failed:" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
+    count=$(printf '%s\n' "$raw" | sed -n 's/^COUNT=\([0-9][0-9]*\)$/\1/p' | head -n1)
+    if [ -z "$count" ]; then
+        echo "❌ ERROR (${label}): get-servers produced no COUNT= line:" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
+    printf '%s' "$count"
+}
+
+# clear_logcat <label>: empty the logcat ring buffer, or fail.
+#
+# Every Phase 1 staleness claim rests on this having happened, so a rejected
+# `logcat -c` (adb hiccup, locked device) must not be swallowed the way
+# `2>/dev/null || true` swallows it — that would let a line from an earlier phase
+# or an earlier run satisfy a marker this phase is supposed to prove.
+clear_logcat() {
+    local label=$1 out
+    if ! out=$(adb logcat -c 2>&1); then
+        echo "❌ ERROR (${label}): 'adb logcat -c' failed:" >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+    if printf '%s' "$out" | grep -qi 'failed'; then
+        echo "❌ ERROR (${label}): 'adb logcat -c' reported a failure:" >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+}
+
+# pairing_sas_match <desktop-sas> <am-log> <label>: bilateral SAS comparison.
+# Three independent channels, in the order the pre-rewrite phase used: the
+# instrumentation's stdout, the file the test writes under filesDir, and the
+# logcat line it logs. The logcat read is only trustworthy because each phase
+# clears the buffer with `adb logcat -c` before its run, so a stale line from an
+# earlier phase cannot satisfy it.
+pairing_sas_match() {
+    local desktop=$1 am_log=$2 label=$3 android_sas
+    android_sas=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$am_log" | head -n1 | cut -d'=' -f2 || true)
+    if [ -z "$android_sas" ]; then
+        android_sas=$(adb shell run-as "$APP_PKG" cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
+    fi
+    if [ -z "$android_sas" ]; then
+        android_sas=$(adb logcat -d | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
+    fi
+    echo "    Android Derived SAS: $android_sas"
+    if [ -n "$desktop" ] && [ -n "$android_sas" ] && [ "$android_sas" = "$desktop" ]; then
+        echo "✅ ${label}: SAS Anti-MITM verification PASSED, both sides derived $desktop"
+    else
+        echo "❌ ERROR (${label}): SAS Anti-MITM verification mismatch! Desktop=$desktop, Android=$android_sas"
+        cat "$am_log" || true
+        exit 1
+    fi
+}
+
+# Step 5: Phase 1 - Protocol v2 unified pairing (UDP + BLE)
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  PHASE 1: Real TCP Pairing & SAS Anti-MITM Verification       ║"
+echo "║  PHASE 1: Protocol v2 Pairing (UDP + BLE) & SAS Anti-MITM     ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-echo "==> Step 1a: Negative pairing test (SAS mismatch / user rejection)..."
-START_NEG_OUTPUT=$("$CLI_BIN" start-pairing)
+# Per-phase status for the summary matrix. A phase sets its flag only after it
+# has asserted something, so the matrix can print NOT RUN for a phase that never
+# got that far instead of the hardcoded PASSED it used to print.
+PHASE1_NEG_OK=0
+PHASE1_UDP_OK=0
+PHASE1_BLE_OK=0
+
+echo "==> Step 1a: Negative pairing (SAS rejection + QR pk mismatch)..."
+
+# Clear the log buffer: the phone reports the observables this phase asserts on
+# with Log.i (logcat only), and a stale line from an earlier run must not be able
+# to satisfy any of them.
+clear_logcat "Phase 1a"
+
+# ── 1a-i: the phone rejects the SAS ──────────────────────────────────────────
+if ! START_NEG_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1a-i): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_NEG_OUTPUT"
+    exit 1
+fi
 PORT_NEG=$(echo "$START_NEG_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_NEG=$(echo "$START_NEG_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+echo "    Pairing Port: $PORT_NEG"
+# No UDP endpoint is demanded here: a negative case is equally valid over BLE, so
+# this sub-case only requires that the QR is a well-formed v2 URL.
+require_pair_url_v2 "$PAIR_URL_NEG" "Phase 1a-i QR"
+PAIR_URL_NEG=$(pair_url_for_emulator "$PAIR_URL_NEG")
+echo "    Pairing URL (emulator view): $PAIR_URL_NEG"
+
 WAIT_NEG_LOG="${TEST_DIR}/wait_neg_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT_NEG" > "$WAIT_NEG_LOG" 2>&1 &
 WAIT_NEG_PID=$!
 
+# The whole device command is passed as ONE quoted string: `adb shell` re-parses
+# its command line on the device, and the QR contains `&` — unquoted, the device
+# shell would split the URL there and background half the command. The host-side
+# double quotes let `$PAIR_URL_NEG` expand here, and the device sees it
+# single-quoted, so `&`, `?` and `=` reach `am` intact.
 AM_NEG_LOG="${TEST_DIR}/am_neg_pairing.log"
-adb shell am instrument -w \
+adb shell "am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
-    -e pairing_host 10.0.2.2 \
-    -e pairing_port "$PORT_NEG" \
+    -e pairing_url '$PAIR_URL_NEG' \
     -e reject_sas true \
-    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_NEG_LOG" 2>&1 || true
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_NEG_LOG" 2>&1 || true
 
 wait "$WAIT_NEG_PID" || true
 
@@ -749,36 +1013,226 @@ set +e
 COMPLETE_NEG_EXIT=$?
 set -e
 
-NEG_SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
-if [ "$COMPLETE_NEG_EXIT" -ne 0 ] && [ "$NEG_SERVERS_COUNT" -eq 0 ]; then
-    echo "✅ Negative pairing test PASSED: SAS rejection aborted the handshake (complete-pairing exit $COMPLETE_NEG_EXIT), 0 paired devices stored."
-else
-    echo "❌ ERROR: negative pairing did not abort cleanly (complete-pairing exit=$COMPLETE_NEG_EXIT, devices=$NEG_SERVERS_COUNT)!"
+NEG_SERVERS_COUNT=$(servers_count "Phase 1a-i")
+
+# The pre-rewrite phase "passed" on `complete-pairing != 0` plus `0 devices`,
+# which is also what happens when the phone never reached the daemon at all.
+# Every condition below is unreachable unless the handshake really ran:
+#   (a) the runner itself reported OK, so no assertion failure was swallowed,
+#   (b) the phone logged the rejected-SAS outcome, which it can only do after
+#       receiving and cryptographically verifying the daemon's PairingResponse,
+#   (c) the daemon derived a SAS, i.e. it processed the phone's PairingInit —
+#       a daemon-side signal that does not depend on `get-servers` at all,
+#   (d) the desktop's completion step failed, and
+#   (e) nothing was stored.
+NEG_OK=1
+NEG_SAS=$(grep 'SAS=' "$WAIT_NEG_LOG" | head -n1 | cut -d'=' -f2 || true)
+if ! instrument_ok "$AM_NEG_LOG"; then
+    echo "❌ ERROR (Phase 1a-i): the SAS-rejection instrumentation run did not report OK."
+    NEG_OK=0
+fi
+if ! phase_marker "$AM_NEG_LOG" 'Negative pairing test passed: SAS rejected, no device stored.'; then
+    echo "❌ ERROR (Phase 1a-i): the phone never reported the rejected-SAS outcome."
+    NEG_OK=0
+fi
+if [ -z "$NEG_SAS" ]; then
+    echo "❌ ERROR (Phase 1a-i): the daemon never derived a SAS (no 'SAS=' in ${WAIT_NEG_LOG})."
+    NEG_OK=0
+fi
+if [ "$COMPLETE_NEG_EXIT" -eq 0 ]; then
+    echo "❌ ERROR (Phase 1a-i): complete-pairing succeeded after the phone rejected the SAS."
+    NEG_OK=0
+fi
+if [ "$NEG_SERVERS_COUNT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-i): $NEG_SERVERS_COUNT device(s) stored despite a rejected SAS."
+    NEG_OK=0
+fi
+if [ "$NEG_OK" != "1" ]; then
+    echo "---- ${AM_NEG_LOG} ----"
+    cat "$AM_NEG_LOG" || true
+    echo "---- ${WAIT_NEG_LOG} ----"
+    cat "$WAIT_NEG_LOG" || true
+    echo "---- ${TEST_DIR}/complete_neg_pairing.log ----"
     cat "${TEST_DIR}/complete_neg_pairing.log" || true
+    echo "---- logcat (PairingSession) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
     exit 1
 fi
+echo "✅ Phase 1a-i PASSED: the phone rejected SAS '$NEG_SAS' after verifying the desktop's PairingResponse, the desktop saw the abort (complete-pairing exit $COMPLETE_NEG_EXIT) and 0 devices were stored."
 
-echo "==> Step 1b: Legitimate pairing handshake..."
-START_OUTPUT=$("$CLI_BIN" start-pairing)
+# ── 1a-ii: the phone pins the QR `pk` and aborts on a mismatch ───────────────
+#
+# This is the PairingAbortReason::KEY_MISMATCH path: the v2 QR is the only place
+# the phone learns the desktop's ephemeral X25519 key, so it rejects any
+# PairingResponse whose client key differs from `pk`. The rejection is a logcat
+# line ("PairingSession: PairingResponse rejected: …") and not an exception the
+# instrumentation surfaces — the test simply never sees an AwaitingSas update and
+# runs into its own timeout, so this sub-case EXPECTS the run to fail.
+clear_logcat "Phase 1a-ii"
+
+if ! START_MISMATCH_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1a-ii): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_MISMATCH_OUTPUT"
+    exit 1
+fi
+PORT_MISMATCH=$(echo "$START_MISMATCH_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_MISMATCH=$(echo "$START_MISMATCH_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+echo "    Pairing Port: $PORT_MISMATCH"
+# require_udp_endpoint=1: the pin is only exercisable where the phone actually
+# reaches this daemon, so a QR with no `p`/`ip4` would let the run fail for the
+# wrong reason (no endpoint) and still look like a correct rejection.
+require_pair_url_v2 "$PAIR_URL_MISMATCH" "Phase 1a-ii QR" 1
+# A different but well-formed, non-zero 64-hex X25519 public key.
+PAIR_URL_MISMATCH=$(pair_url_set "$PAIR_URL_MISMATCH" pk "$(printf '%064d' 1)")
+PAIR_URL_MISMATCH=$(pair_url_for_emulator "$PAIR_URL_MISMATCH")
+echo "    Mismatched URL pk: $(pair_url_param "$PAIR_URL_MISMATCH" pk)"
+echo "    Pairing URL (emulator view): $PAIR_URL_MISMATCH"
+
+WAIT_MISMATCH_LOG="${TEST_DIR}/wait_mismatch_pairing.log"
+"$CLI_BIN" wait-for-pairing "$PORT_MISMATCH" > "$WAIT_MISMATCH_LOG" 2>&1 &
+WAIT_MISMATCH_PID=$!
+
+AM_MISMATCH_LOG="${TEST_DIR}/am_mismatch_pairing.log"
+adb shell "am instrument -w \
+    -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
+    -e pairing_url '$PAIR_URL_MISMATCH' \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_MISMATCH_LOG" 2>&1 || true
+
+# The phone aborts, so the desktop never gets a confirm: `wait-for-pairing` would
+# block for its full IPC deadline. Poll its log instead, then stop it.
+for _ in $(seq 1 30); do
+    if grep -q 'SAS=' "$WAIT_MISMATCH_LOG" 2>/dev/null; then break; fi
+    sleep 0.5
+done
+kill "$WAIT_MISMATCH_PID" 2>/dev/null || true
+wait "$WAIT_MISMATCH_PID" 2>/dev/null || true
+
+# Best-effort teardown: the daemon still holds this pairing session, and the
+# following `start-pairing` would be refused. Its result is deliberately NOT
+# asserted — on this path the desktop never saw a PairingConfirmServer, so the
+# only settled outcome is "it must not be left dangling".
+# PENDING-DAEMON-SURFACE: replace with CancelPairing <port> <sid> once its CLI exists
+"$CLI_BIN" complete-pairing "$PORT_MISMATCH" > "${TEST_DIR}/complete_mismatch_pairing.log" 2>&1 || true
+
+LOGCAT_MISMATCH=$(adb logcat -d 2>/dev/null || true)
+MISMATCH_SAS=$(grep 'SAS=' "$WAIT_MISMATCH_LOG" | head -n1 | cut -d'=' -f2 || true)
+MISMATCH_SERVERS_COUNT=$(servers_count "Phase 1a-ii")
+
+MISMATCH_OK=1
+if ! printf '%s\n' "$LOGCAT_MISMATCH" | grep -q 'PairingResponse rejected: challenge does not match the session'; then
+    echo "❌ ERROR (Phase 1a-ii): the phone did not reject the mismatched PairingResponse."
+    MISMATCH_OK=0
+fi
+# `Starting E2E pairing:` is a Log.i, so it lands in logcat and only reaches the
+# `am instrument` stream through the runner's stdout chunking — accept either.
+if ! grep -q 'Starting E2E pairing:' "$AM_MISMATCH_LOG" \
+    && ! printf '%s\n' "$LOGCAT_MISMATCH" | grep -q 'Starting E2E pairing:'; then
+    echo "❌ ERROR (Phase 1a-ii): the instrumentation run never started the pairing flow."
+    MISMATCH_OK=0
+fi
+if ! grep -qE 'Timed out after|No response from the desktop|Pairing failed while waiting for the derived SAS' "$AM_MISMATCH_LOG"; then
+    echo "❌ ERROR (Phase 1a-ii): expected the run to fail on the missing response, but it did not."
+    MISMATCH_OK=0
+fi
+if [ -z "$MISMATCH_SAS" ]; then
+    echo "❌ ERROR (Phase 1a-ii): the daemon never derived a SAS (no 'SAS=' in ${WAIT_MISMATCH_LOG})."
+    MISMATCH_OK=0
+fi
+if [ "$MISMATCH_SERVERS_COUNT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-ii): $MISMATCH_SERVERS_COUNT device(s) stored despite a pk mismatch."
+    MISMATCH_OK=0
+fi
+if [ "$MISMATCH_OK" != "1" ]; then
+    echo "---- ${AM_MISMATCH_LOG} ----"
+    cat "$AM_MISMATCH_LOG" || true
+    echo "---- ${WAIT_MISMATCH_LOG} ----"
+    cat "$WAIT_MISMATCH_LOG" || true
+    echo "---- logcat (PairingSession) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+echo "✅ Phase 1a-ii PASSED: the phone dropped a PairingResponse that did not match the QR pk (KEY_MISMATCH), the desktop derived SAS '$MISMATCH_SAS', and 0 devices were stored."
+PHASE1_NEG_OK=1
+
+echo "==> Step 1b: Legitimate UDP pairing over QEMU SLIRP (10.0.2.2)..."
+
+# ══ PENDING-DAEMON-SURFACE (Phase 1b) — resolved before anything is started ══
+#
+# This fails the run first, before any pairing session is opened: the staged
+# implementation underneath needs the desktop's SAS-approval / finalisation
+# command lines, which are not final yet and are therefore not guessed. Facts
+# this phase needs:
+#   1. `start-pairing` v2 output: does it print `SESSION_ID=`? exact lines; is
+#      `URL=` a v=2 URL carrying `sid` and `pk`?
+#   2. Does `start-pairing` bind the ephemeral UDP socket on `[::]:0`, and does
+#      `p` carry that *UDP* port (not the old TCP pairing port)?
+#   3. How the desktop approves the SAS: the same `complete-pairing <port>`, a
+#      new `approve-sas`, or two separate steps; and does it block until the
+#      phone's PairingConfirmServer arrives?
+#   4. `wait-for-pairing` on the negative path: does it still print `SAS=` when
+#      the phone aborts with USER_REJECTED_SAS, and what is its exit code?
+#   5. `complete-pairing` output/exit code on success vs on abort, and whether
+#      it is the approval or the finalisation step (if two steps: both lines).
+#   6. Which command completes/finalises pairing and what it prints — it must
+#      yield SERVER_HEX, which Phase 6 feeds to `remove-device`.
+#   7. Confirm the daemon accepts a QR whose `ip4` the harness rewrites to
+#      10.0.2.2 (the endpoint is not in the transcript).
+#   8. The exact daemon log lines for session start (with sid), PairingInit
+#      received, PairingResponse sent, abort + reason, and completion.
+#   9. `CancelPairing` / desktop-initiated rejection: CLI command name, args,
+#      output, and the abort-reason field/value.
+#  10. Whether the abort reason reaches the desktop CLI output at all, and the
+#      exact `REASON=` value for USER_REJECTED_SAS and KEY_MISMATCH.
+pending_daemon_surface "Phase 1b" \
+    "start-pairing v2 output: exact lines; does it print SESSION_ID=, and is URL= a v=2 URL with sid+pk?" \
+    "Does start-pairing bind [::]:0 UDP, and does p carry that UDP port rather than a TCP port?" \
+    "Desktop SAS approval: complete-pairing <port>, a new approve-sas, or two steps; does it block for PairingConfirmServer?" \
+    "wait-for-pairing on the USER_REJECTED_SAS abort: does it still print SAS=, and with what exit code?" \
+    "complete-pairing output/exit code on success vs abort; approval or finalisation; exact commands." \
+    "Which command completes/finalises pairing and what it prints (must yield SERVER_HEX for Phase 6 remove-device)?" \
+    "Confirmation that a QR whose ip4 was rewritten to 10.0.2.2 is accepted (endpoint not in the transcript)." \
+    "Exact daemon log lines: session start (with sid), PairingInit, PairingResponse, abort+reason, completion." \
+    "CancelPairing / desktop-initiated rejection: CLI command, args, output, abort-reason field/value." \
+    "Is the abort reason surfaced in the desktop CLI output; exact REASON= for USER_REJECTED_SAS and KEY_MISMATCH?"
+
+# ── Staged implementation: intentionally unreachable until the facts above are
+#    answered (the call above exits 1). The logcat clear must stay the first
+#    action here so pairing_sas_match's logcat channel cannot see a stale line.
+clear_logcat "Phase 1b"
+
+if ! START_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1b): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_OUTPUT"
+    exit 1
+fi
 PORT=$(echo "$START_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
-PAIR_URL=$(echo "$START_OUTPUT" | grep 'URL=' | cut -d'=' -f2)
+PAIR_URL=$(echo "$START_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
 
 echo "    Pairing Port: $PORT"
+# require_udp_endpoint=1: this phase is the UDP one, so a QR without `p`/`ip4`
+# would prove nothing about UDP delivery.
+require_pair_url_v2 "$PAIR_URL" "Phase 1b QR" 1
+PAIR_URL=$(pair_url_for_emulator "$PAIR_URL")
 echo "    Pairing URL:  $PAIR_URL"
+echo "    QR keys (emulator view): v='$(pair_url_param "$PAIR_URL" v)' sid='$(pair_url_param "$PAIR_URL" sid)' pk='$(pair_url_param "$PAIR_URL" pk)' p='$(pair_url_param "$PAIR_URL" p)' ip4='$(pair_url_param "$PAIR_URL" ip4)' ip6='$(pair_url_param "$PAIR_URL" ip6)'"
 
 # Wait for pairing in background
 WAIT_LOG="${TEST_DIR}/wait_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT" > "$WAIT_LOG" 2>&1 &
 WAIT_PID=$!
 
-# Trigger Android PairingClient via Instrumentation Test in background
+# Trigger the Android PairingClient via the instrumentation test in background
 echo "==> Triggering PairingClient inside Android Emulator..."
 AM_LOG="${TEST_DIR}/am_pairing.log"
-adb shell am instrument -w \
+adb shell "am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
-    -e pairing_host 10.0.2.2 \
-    -e pairing_port "$PORT" \
-    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_LOG" 2>&1 &
+    -e pairing_url '$PAIR_URL' \
+    -e pairing_username '${TAPAUTH_E2E_PAIRING_USERNAME:-$TEST_USER}' \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_LOG" 2>&1 &
 AM_PID=$!
 
 wait "$WAIT_PID" || {
@@ -790,43 +1244,55 @@ wait "$WAIT_PID" || {
 SAS_CODE=$(grep 'SAS=' "$WAIT_LOG" | cut -d'=' -f2)
 echo "    Desktop Derived SAS: $SAS_CODE"
 
-echo "==> Completing pairing handshake..."
-COMPLETE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT")
-SERVER_HEX=$(echo "$COMPLETE_OUTPUT" | grep 'SERVER_HEX=' | cut -d'=' -f2)
-echo "✅ Device pairing finalized successfully! Server Key: $SERVER_HEX"
-
-# Wait for Android pairing test to finish successfully
-wait "$AM_PID" || {
-    echo "❌ Android pairing instrumentation test failed. Log:"
-    cat "$AM_LOG"
+# The pause between "both sides displayed the SAS" and "the desktop approves"
+# exists to exercise the phone's keepalive path. QEMU SLIRP keeps a UDP mapping
+# for only ~4 s, and the phone rewrites an idle one every 1000 ms — a pause
+# shorter than 5 s would never let the mapping go stale, so it would not test the
+# keepalive at all. NOTE: the phone starts those keepalives only *after* its own
+# SAS approval, so this must sit in the phone's awaiting-confirm window; sleeping
+# earlier (before the phone has displayed its SAS) would exercise nothing.
+PHONE_SAS_SEEN=0
+for _ in $(seq 1 60); do
+    if adb logcat -d 2>/dev/null | grep -q 'ANDROID_DERIVED_SAS='; then
+        PHONE_SAS_SEEN=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$PHONE_SAS_SEEN" != "1" ]; then
+    echo "❌ ERROR (Phase 1b): the phone never displayed its derived SAS, so the pause cannot test the keepalive."
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    cat "$AM_LOG" || true
     exit 1
-}
-cat "$AM_LOG"
-
-# Verify SAS matching between Desktop and Android
-ANDROID_SAS=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$AM_LOG" | head -n1 | cut -d'=' -f2 || true)
-if [ -z "$ANDROID_SAS" ]; then
-    ANDROID_SAS=$(adb shell run-as "$APP_PKG" cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
 fi
-if [ -z "$ANDROID_SAS" ]; then
-    ANDROID_SAS=$(adb logcat -d | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
-fi
-echo "    Android Derived SAS: $ANDROID_SAS"
+PAIRING_SAS_PAUSE_SECS="${TAPAUTH_E2E_SAS_PAUSE_SECS:-6}"
+echo "    Holding the handshake at SAS confirmation for ${PAIRING_SAS_PAUSE_SECS}s (SLIRP UDP mapping keepalive)..."
+sleep "$PAIRING_SAS_PAUSE_SECS"
 
-if [ -n "$SAS_CODE" ] && [ -n "$ANDROID_SAS" ] && [ "$ANDROID_SAS" = "$SAS_CODE" ]; then
-    echo "✅ SAS Anti-MITM Verification PASSED! Both sides derived identical code: $SAS_CODE"
+# ── Staged post-approval assertions (unreachable: the phase fails at its
+#    PENDING-DAEMON-SURFACE block at the top of 1b) ─────────────────────────
+# PENDING-DAEMON-SURFACE: the completion command must set SERVER_HEX (Phase 6
+# feeds it to `remove-device`).
+wait "$AM_PID" || true
+assert_instrument_ok "$AM_LOG" "Phase 1b"
+
+if phase_marker "$AM_LOG" 'Pairing completed and persisted'; then
+    echo "✅ Phase 1b: the phone persisted the paired device."
 else
-    echo "❌ ERROR: SAS Anti-MITM verification mismatch! Desktop=$SAS_CODE, Android=$ANDROID_SAS"
+    echo "❌ ERROR (Phase 1b): the phone never logged 'Pairing completed and persisted'."
+    cat "$AM_LOG" || true
     exit 1
 fi
+
+pairing_sas_match "$SAS_CODE" "$AM_LOG" "Phase 1b"
 
 # Verify paired servers in daemon
-SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
+SERVERS_COUNT=$(servers_count "Phase 1b")
 if [ "$SERVERS_COUNT" -lt 1 ]; then
     echo "❌ ERROR: No paired servers recorded in daemon state."
     exit 1
 fi
-echo "✅ Verified 1 paired Android device registered."
+echo "✅ Verified 1 paired Android device registered (SERVER_HEX=$SERVER_HEX)."
 
 # Verify on-disk security properties of the real state directory (systemd mode)
 if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
@@ -850,6 +1316,74 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
         exit 1
     fi
 fi
+PHASE1_UDP_OK=1
+
+echo "==> Step 1c: BLE-only pairing over the Bumble /dev/vhci bridge..."
+#
+# A v2 QR carrying none of `p`/`ip4`/`ip6` describes a BLE-only pairing: the
+# phone has no address to send PairingInit to, so it scans for the GATT service
+# and writes the init to the characteristic instead. The Bumble bridge and its
+# /dev/vhci adapter were already brought up in Step 3, and that adapter is what
+# the daemon advertises on.
+clear_logcat "Phase 1c"
+
+# ══ PENDING-DAEMON-SURFACE (Phase 1c) ═══════════════════════════════════════
+#
+# How to make the daemon hand out a BLE-only QR, and the same approval questions
+# as Phase 1b, are unsettled. Facts this block needs:
+#   1. How to request a BLE-only pairing: a QR without `p`/`ip4`/`ip6`, a flag on
+#      `start-pairing`, or must UDP be disabled for the session?
+#   2. The exact daemon log line proving the pairing advertisement is up on the
+#      vhci adapter (so 1c proves BLE was used rather than silently falling back
+#      to UDP).
+#   3. The exact daemon log lines for session start (with sid), PairingInit
+#      received, PairingResponse sent, abort + reason, and completion.
+#   4. The desktop approval/finalisation command lines (see the Phase 1b block,
+#      items 3-5) for this session too.
+# This block must start the session, launch `wait-for-pairing` into
+# WAIT_BLE_LOG, launch the instrumentation into AM_BLE_LOG with the BLE-only
+# `pairing_url` (and `pairing_username`), approve, and set SAS_BLE; the
+# assertions after it are already settled. Wrap its `start-pairing` in the same
+# explicit failure handler 1a/1b use, and keep the logcat clear first.
+pending_daemon_surface "Phase 1c" \
+    "How to request a BLE-only pairing (QR without p/ip4/ip6, a start-pairing flag, or UDP disabled for the session)?" \
+    "Exact daemon log line proving the pairing advertisement is up on the vhci adapter." \
+    "Exact daemon log lines: session start (with sid), PairingInit, PairingResponse, abort+reason, completion." \
+    "Desktop approval/finalisation command lines for this session (Phase 1b facts 3-5)."
+
+# ── Settled assertions (unreachable until the block above is implemented) ────
+wait "$AM_BLE_PID" || true
+assert_instrument_ok "$AM_BLE_LOG" "Phase 1c"
+
+if phase_marker "$AM_BLE_LOG" 'SAS reached the phone over BLE'; then
+    echo "✅ Phase 1c: the phone received the SAS over BLE."
+else
+    echo "❌ ERROR (Phase 1c): the phone did not report the SAS over BLE — this phase must not pass over UDP."
+    cat "$AM_BLE_LOG" || true
+    exit 1
+fi
+
+if phase_marker "$AM_BLE_LOG" 'Pairing completed and persisted'; then
+    echo "✅ Phase 1c: the phone persisted the paired device."
+else
+    echo "❌ ERROR (Phase 1c): the phone never logged 'Pairing completed and persisted'."
+    cat "$AM_BLE_LOG" || true
+    exit 1
+fi
+
+pairing_sas_match "$SAS_BLE" "$AM_BLE_LOG" "Phase 1c"
+
+# Only "at least one" is meaningful here: re-pairing the same emulator reuses its
+# persistent identity key, so the daemon overwrites the previous entry instead of
+# adding a second one and COUNT stays 1. The real 1c proof is the phone's
+# "SAS reached the phone over BLE" marker above, not a device count.
+SERVERS_COUNT=$(servers_count "Phase 1c")
+if [ "$SERVERS_COUNT" -lt 1 ]; then
+    echo "❌ ERROR (Phase 1c): no paired device recorded after the BLE-only pairing, daemon reports $SERVERS_COUNT."
+    exit 1
+fi
+echo "✅ Verified the paired device is present ($SERVERS_COUNT) after the BLE-only pairing."
+PHASE1_BLE_OK=1
 
 # Step 5b: Ensure runtime permissions and start Android app/background services
 echo "==> Starting Android foreground services for authentication..."
@@ -1455,6 +1989,13 @@ echo "╔═══════════════════════�
 echo "║  PHASE 6: Device Removal / Un-pairing Lifecycle               ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
+if [ -z "$SERVER_HEX" ]; then
+    echo "❌ ERROR (Phase 6): SERVER_HEX is empty, so there is no paired device to remove."
+    echo "   Phase 1b must set it from the pairing completion step; without it this"
+    echo "   phase would call 'remove-device \"\"' and prove nothing."
+    "$CLI_BIN" get-servers || true
+    exit 1
+fi
 echo "==> Removing paired device $SERVER_HEX..."
 "$CLI_BIN" remove-device "$SERVER_HEX"
 
@@ -1584,7 +2125,21 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  E2E TEST MATRIX SUMMARY                                      ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
-echo "║  Phase 1: Real TCP Pairing & SAS Anti-MITM:      PASSED       ║"
+if [ "$PHASE1_NEG_OK" = "1" ]; then
+echo "║  Phase 1a: Pairing negatives (SAS + pk pin):     PASSED       ║"
+else
+echo "║  Phase 1a: Pairing negatives (SAS + pk pin):     NOT RUN      ║"
+fi
+if [ "$PHASE1_UDP_OK" = "1" ]; then
+echo "║  Phase 1b: v2 UDP pairing (QEMU SLIRP):          PASSED       ║"
+else
+echo "║  Phase 1b: v2 UDP pairing (QEMU SLIRP):          NOT RUN      ║"
+fi
+if [ "$PHASE1_BLE_OK" = "1" ]; then
+echo "║  Phase 1c: v2 BLE-only pairing (vhci):           PASSED       ║"
+else
+echo "║  Phase 1c: v2 BLE-only pairing (vhci):           NOT RUN      ║"
+fi
 echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
 if [ "$MULTICAST_VERIFIED" = "1" ]; then
 echo "║  Phase 2: Custom multicast groups (v4 + v6):     PASSED       ║"
