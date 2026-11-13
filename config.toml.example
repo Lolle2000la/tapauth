@@ -11,7 +11,7 @@
 pam_operation_timeout_secs = 120
 
 # Timeout for graphical PAM contexts whose conversation TapAuth cannot drive
-# (the sequential path: a host the rule table in `client-pam/src/policy.rs` does
+# (the sequential path: a host the rule table in `client-pam/src/policy/table.rs` does
 # not classify as threaded, or an unrecognised host). In those contexts the wait
 # is capped at this duration before falling through to password entry.
 # Graphical hosts whose conversation can be driven from a worker thread are
@@ -58,7 +58,7 @@ enable_ble = true
 # TPM 2.0 Support
 # Enable TPM (Trusted Platform Module) for secure key storage.
 # When enabled, Ed25519 private keys are sealed with the TPM's Storage Root Key (SRK).
-# This provides hardware-backed key protection - keys cannot be extracted even with root access.
+# The sealed blob cannot be used on another machine - but root here can unseal it into daemon memory to sign.
 # 
 # Requirements:
 #   - TPM 2.0 hardware available on the system
