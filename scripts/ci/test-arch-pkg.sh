@@ -342,17 +342,17 @@ assert_removed() {
 # ---------------------------------------------------------------------------
 if [ "$SKIP_BUILD" = false ]; then
     step "Installing Arch build dependencies"
-    pacman -Sy --noconfirm --needed sudo cargo rust protobuf clang pam dbus \
+    # Arch does not support partial upgrades: upgrade the system while installing.
+    pacman -Syu --noconfirm --needed sudo cargo rust protobuf clang pam dbus \
         systemd git tar binutils findutils sed grep
 
     step "Building Arch packages into ${PKG_DIR}"
     bash "${WORKSPACE_DIR}/scripts/ci/build-arch-packages.sh" --output-dir "${PKG_DIR}"
 else
     step "Installing minimal tooling (--skip-build)"
-    # Refresh the databases so a later dependency resolution during pacman -U
-    # does not fail on a stale sync database.
-    pacman -Sy --noconfirm || skip "pacman -Sy failed; continuing with existing databases"
-    pacman -S --noconfirm --needed grep sed findutils
+    # Arch does not support partial upgrades, so upgrade and install in one transaction;
+    # tolerated because the old system still works for the pacman -U below.
+    pacman -Syu --noconfirm --needed grep sed findutils || skip "pacman -Syu failed; continuing with existing databases"
 fi
 
 # ---------------------------------------------------------------------------

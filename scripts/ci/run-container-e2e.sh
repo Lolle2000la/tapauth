@@ -51,8 +51,19 @@ case "$DISTRO" in
 
     arch)
         echo "==> Installing Arch Linux runtime requirements..."
-        pacman -Sy --noconfirm python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux
-        pacman -Sy --noconfirm polkit
+        # Arch does not support partial upgrades: upgrade the system while installing.
+        # Retried: a mirror DNS blip fails the sync before anything is installed.
+        for attempt in 1 2 3; do
+            if pacman -Syu --noconfirm --needed python python-cryptography python-protobuf qrencode dbus procps-ng iproute2 gcc pam android-tools bluez bluez-utils util-linux polkit; then
+                break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+                echo "!!! pacman -Syu failed after 3 attempts" >&2
+                exit 1
+            fi
+            echo "==> pacman -Syu failed (attempt ${attempt}/3), retrying in 5s..." >&2
+            sleep 5
+        done
 
         # Arch ships no `pamtester` package (AUR-only), so compile the minimal
         # stand-in from scripts/ci/pamtester.c. The Ubuntu host and Fedora
