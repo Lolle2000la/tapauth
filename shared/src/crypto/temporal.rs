@@ -74,23 +74,6 @@ pub fn generate_ble_temporal_id_with_alg(
     Ok(identifier)
 }
 
-/// Generate temporal identifier for a given time window (HMAC-SHA256, the
-/// SHA-256 default).
-pub fn generate_temporal_identifier(
-    csk: &ClientSymmetricKey,
-    time_window: u64,
-) -> Result<[u8; 16], CryptoError> {
-    generate_temporal_id_with_alg(csk, time_window, HashAlgorithm::Sha256)
-}
-
-/// Generate temporal identifier for BLE advertisement (10 bytes to fit in 31-byte BLE limit)
-pub fn generate_temporal_identifier_ble(
-    csk: &ClientSymmetricKey,
-    time_window: u64,
-) -> Result<[u8; 10], CryptoError> {
-    generate_ble_temporal_id_with_alg(csk, time_window, HashAlgorithm::Sha256)
-}
-
 /// Generate temporal identifier for the current time window with the negotiated
 /// hash algorithm.
 pub fn generate_current_temporal_identifier_with_alg(
@@ -107,42 +90,6 @@ pub fn generate_current_ble_temporal_identifier_with_alg(
     alg: HashAlgorithm,
 ) -> Result<[u8; 10], CryptoError> {
     generate_ble_temporal_id_with_alg(csk, current_time_window()?, alg)
-}
-
-/// Generate temporal identifier for current time window
-pub fn generate_current_temporal_identifier(
-    csk: &ClientSymmetricKey,
-) -> Result<[u8; 16], CryptoError> {
-    generate_current_temporal_identifier_with_alg(csk, HashAlgorithm::Sha256)
-}
-
-/// Generate temporal identifier for BLE advertisement (current window, 10 bytes)
-pub fn generate_current_temporal_identifier_ble(
-    csk: &ClientSymmetricKey,
-) -> Result<[u8; 10], CryptoError> {
-    generate_current_ble_temporal_identifier_with_alg(csk, HashAlgorithm::Sha256)
-}
-
-/// Generate temporal identifier for previous time window
-pub fn generate_previous_temporal_identifier(
-    csk: &ClientSymmetricKey,
-) -> Result<[u8; 16], CryptoError> {
-    let window = current_time_window()?;
-    if window == 0 {
-        return Err(CryptoError::KeyDerivationFailed);
-    }
-    generate_temporal_identifier(csk, window - 1)
-}
-
-/// Generate temporal identifier for BLE advertisement (previous window, 10 bytes)
-pub fn generate_previous_temporal_identifier_ble(
-    csk: &ClientSymmetricKey,
-) -> Result<[u8; 10], CryptoError> {
-    let window = current_time_window()?;
-    if window == 0 {
-        return Err(CryptoError::KeyDerivationFailed);
-    }
-    generate_temporal_identifier_ble(csk, window - 1)
 }
 
 /// Verify a temporal identifier against the current and previous window using
@@ -181,22 +128,6 @@ pub fn verify_ble_temporal_identifier_with_alg(
         return Err(CryptoError::KeyDerivationFailed);
     }
     Ok(*identifier == generate_ble_temporal_id_with_alg(csk, window - 1, alg)?)
-}
-
-/// Verify if a temporal identifier matches current or previous window
-pub fn verify_temporal_identifier(
-    csk: &ClientSymmetricKey,
-    identifier: &[u8; 16],
-) -> Result<bool, CryptoError> {
-    verify_temporal_identifier_with_alg(csk, identifier, HashAlgorithm::Sha256)
-}
-
-/// Verify if a BLE temporal identifier (10 bytes) matches current or previous window
-pub fn verify_temporal_identifier_ble(
-    csk: &ClientSymmetricKey,
-    identifier: &[u8; 10],
-) -> Result<bool, CryptoError> {
-    verify_ble_temporal_identifier_with_alg(csk, identifier, HashAlgorithm::Sha256)
 }
 
 /// Compute the 10-byte BLE pairing advertisement identifier:
@@ -238,49 +169,84 @@ mod tests {
         assert!(window > 26_000_000);
     }
 
+    /// The SHA-256 temporal identifier is exactly
+    /// `HMAC-SHA256(csk, be64(window))` truncated to 16 bytes (and to 10 for the
+    /// BLE form), deterministic and keyed — it is the only construction the
+    /// negotiated path has.
+    /// The defect this catches: a different truncation, a little-endian window
+    /// encoding, a non-keyed digest, or the identifier not depending on the CSK.
     #[test]
-    fn test_temporal_identifier_generation() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-        let window = current_time_window().unwrap();
-
-        let id1 = generate_temporal_identifier(&csk, window).unwrap();
-        let id2 = generate_temporal_identifier(&csk, window).unwrap();
-
-        // Same window should produce same identifier
-        assert_eq!(id1, id2);
-
-        // Different window should produce different identifier
-        let id3 = generate_temporal_identifier(&csk, window + 1).unwrap();
-        assert_ne!(id1, id3);
-    }
-
-    /// The SHA-256 default wrappers must produce exactly what the explicit
-    /// `_with_alg(.., Sha256)` path produces — v1 wire output is unchanged.
-    /// The defect this catches: the wrapper drifting to a different truncation,
-    /// input encoding (e.g. LE window) or MAC construction than the negotiated path.
-    #[test]
-    fn test_sha256_defaults_match_with_alg() {
+    fn test_sha256_temporal_identifiers() {
         let csk = ClientSymmetricKey::from_bytes([7u8; 32]);
         let window = 41_000_000u64;
 
+        let id16 = generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
+        assert_eq!(id16.len(), 16);
         assert_eq!(
-            generate_temporal_identifier(&csk, window).unwrap(),
-            generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap()
-        );
-        assert_eq!(
-            generate_temporal_identifier_ble(&csk, window).unwrap(),
-            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap()
+            id16,
+            generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap(),
+            "must be deterministic"
         );
 
-        // And it really is HMAC-SHA256(csk, be64(window)) truncated to 16 bytes.
         let mut mac = HmacSha256::new_from_slice(csk.as_bytes()).unwrap();
         mac.update(&window.to_be_bytes());
         let expected = mac.finalize().into_bytes();
-        assert_eq!(
-            generate_temporal_identifier(&csk, window)
+        assert_eq!(id16.as_slice(), expected.get(..16).unwrap());
+
+        let id10 = generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
+        assert_eq!(id10.len(), 10);
+        assert_eq!(id10.as_slice(), expected.get(..10).unwrap());
+
+        // A different window and a different CSK both change the identifier.
+        assert_ne!(
+            id16,
+            generate_temporal_id_with_alg(&csk, window + 1, HashAlgorithm::Sha256).unwrap()
+        );
+        let other_csk = ClientSymmetricKey::from_bytes([8u8; 32]);
+        assert_ne!(
+            id16,
+            generate_temporal_id_with_alg(&other_csk, window, HashAlgorithm::Sha256).unwrap()
+        );
+    }
+
+    /// SHA-256 verification accepts the current and previous window's identifier
+    /// and rejects an older one.
+    /// The defect this catches: a replay window wider than 60 s (an old identifier
+    /// still verifying) or a window that drops the tolerated previous one (a client
+    /// clock one window behind is locked out).
+    #[test]
+    fn test_sha256_verification_window() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let window = current_time_window().unwrap();
+        assert!(window > 1, "system clock may be broken");
+
+        let current = generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
+        assert!(
+            verify_temporal_identifier_with_alg(&csk, &current, HashAlgorithm::Sha256).unwrap()
+        );
+
+        let previous =
+            generate_temporal_id_with_alg(&csk, window - 1, HashAlgorithm::Sha256).unwrap();
+        assert!(
+            verify_temporal_identifier_with_alg(&csk, &previous, HashAlgorithm::Sha256).unwrap()
+        );
+
+        let stale = generate_temporal_id_with_alg(&csk, window - 2, HashAlgorithm::Sha256).unwrap();
+        assert!(!verify_temporal_identifier_with_alg(&csk, &stale, HashAlgorithm::Sha256).unwrap());
+
+        // The BLE form follows the same window.
+        let ble_current =
+            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
+        assert!(
+            verify_ble_temporal_identifier_with_alg(&csk, &ble_current, HashAlgorithm::Sha256)
                 .unwrap()
-                .as_slice(),
-            expected.get(..16).unwrap()
+        );
+
+        // A wrong CSK never matches.
+        let other_csk = ClientSymmetricKey::from_bytes([8u8; 32]);
+        assert!(
+            !verify_temporal_identifier_with_alg(&other_csk, &current, HashAlgorithm::Sha256)
+                .unwrap()
         );
     }
 
@@ -371,82 +337,6 @@ mod tests {
             verify_ble_temporal_identifier_with_alg(&csk, &ble_current, HashAlgorithm::Blake3)
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn test_temporal_identifier_verification() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-        let current_id = generate_current_temporal_identifier(&csk).unwrap();
-
-        // Current identifier should verify
-        assert!(verify_temporal_identifier(&csk, &current_id).unwrap());
-
-        // Random identifier should not verify
-        let random_id = [0u8; 16];
-        assert!(!verify_temporal_identifier(&csk, &random_id).unwrap());
-    }
-
-    #[test]
-    fn test_previous_identifier_verification() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-
-        let window = current_time_window().unwrap();
-        assert!(
-            window > 0,
-            "time window is zero - system clock may be broken"
-        );
-
-        let previous_id = generate_previous_temporal_identifier(&csk).unwrap();
-
-        // Previous identifier should also verify
-        assert!(verify_temporal_identifier(&csk, &previous_id).unwrap());
-    }
-
-    #[test]
-    fn test_different_csk_produces_different_identifier() {
-        let csk1 = ClientSymmetricKey::generate().unwrap();
-        let csk2 = ClientSymmetricKey::generate().unwrap();
-        let window = current_time_window().unwrap();
-
-        let id1 = generate_temporal_identifier(&csk1, window).unwrap();
-        let id2 = generate_temporal_identifier(&csk2, window).unwrap();
-
-        // Different keys should produce different identifiers
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_temporal_identifier_length() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-        let id = generate_current_temporal_identifier(&csk).unwrap();
-
-        // Should be exactly 16 bytes
-        assert_eq!(id.len(), 16);
-    }
-
-    #[test]
-    fn test_verify_wrong_key_fails() {
-        let csk1 = ClientSymmetricKey::generate().unwrap();
-        let csk2 = ClientSymmetricKey::generate().unwrap();
-
-        let id = generate_current_temporal_identifier(&csk1).unwrap();
-
-        // Verification with wrong key should fail
-        assert!(!verify_temporal_identifier(&csk2, &id).unwrap());
-    }
-
-    #[test]
-    fn test_old_identifier_does_not_verify() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-        let current_window = current_time_window().unwrap();
-
-        // Generate identifier from 2 windows ago
-        if current_window > 1 {
-            let old_id = generate_temporal_identifier(&csk, current_window - 2).unwrap();
-
-            // Should not verify (only current and previous are accepted)
-            assert!(!verify_temporal_identifier(&csk, &old_id).unwrap());
-        }
     }
 
     /// The BLE pairing advertisement identifier is a plain SHA-256 (not keyed),

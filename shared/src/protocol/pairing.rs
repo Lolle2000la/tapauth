@@ -19,12 +19,13 @@
 //!
 //! * [`ServerPairingState`] — the **desktop**. Owns the ephemeral `x_C`/`X_C`
 //!   advertised in the QR code, the static `Ed_C`, the session id, the cached
-//!   `PairingResponse` and the negotiated keys. It answers `PairingInit`, decrypts
-//!   the `PairingConfirmClient` provisioning payload and builds the
-//!   `PairingConfirmServer` completion proof.
+//!   `PairingResponse` and the negotiated keys. It answers `PairingInit`, builds
+//!   the `PairingConfirmClient` provisioning payload and verifies the
+//!   `PairingConfirmServer` completion proof against `Ed_S`.
 //! * [`ClientPairingSession`] — the **phone**. Owns the ephemeral `x_S`/`X_S`
-//!   and the static `Ed_S` (`PairingInit`). It verifies the QR commitment, the
-//!   desktop's transcript signature and the completion proof, and shows the SAS.
+//!   and the static `Ed_S` (`PairingInit`). It verifies the QR commitment and the
+//!   desktop's transcript signature, decrypts the provisioning payload, signs the
+//!   completion proof with `Ed_S`, and shows the SAS.
 //!
 //! ## Flow
 //!
@@ -38,12 +39,12 @@
 //! 4. Phone [`ClientPairingSession::verify_response`] → constant-time QR key
 //!    comparison, algorithm check, `Ed_C` signature check, key derivation. Both
 //!    users now compare the SAS out of band.
-//! 5. Desktop [`ServerPairingState::process_confirm_client`] decrypts the
-//!    provisioned `{csk, username, client_hostname}` under `K_c2s`; the phone built
-//!    it with [`ClientPairingSession::create_confirm_client`].
-//! 6. Desktop encrypts its completion proof under `K_s2c`
-//!    ([`ServerPairingState::create_confirm_server`]), the phone verifies it
-//!    ([`ClientPairingSession::verify_confirm_server`]).
+//! 5. Desktop [`ServerPairingState::create_confirm_client`] encrypts the
+//!    provisioned `{csk, username, client_hostname}` under `K_c2s`; the phone
+//!    decrypts it with [`ClientPairingSession::process_confirm_client`].
+//! 6. Phone [`ClientPairingSession::create_confirm_server`] signs the completion
+//!    proof with `Ed_S` and encrypts it under `K_s2c`; the desktop verifies it
+//!    with [`ServerPairingState::verify_confirm_server`].
 //!
 //! Every handshake field (both ephemeral keys, both identity keys, both device
 //! names, the advertised algorithm lists and the selected algorithms) enters `H`,
@@ -54,19 +55,9 @@
 //!
 //! * `PairingResponse.client_signature` — `Ed_C`, the **desktop's static key**,
 //!   verified by the phone.
-//! * `PairingCompletePayload.server_signature` — also `Ed_C`, verified by the
-//!   phone. The field name is historical: the proto calls the phone the "server",
-//!   but the completion proof travels desktop → phone in this implementation (see
-//!   the direction note on [`ServerPairingState::create_confirm_server`]).
-//!
-//! ## Direction note (deliberate departure from the prose specs)
-//!
-//! `proto/auth_protocol.proto` and `initial-key-exchange.md` Step 6 describe
-//! `PairingConfirmServer` as *phone → desktop*, signed by `Ed_S` and verified by
-//! the desktop. This implementation follows the integration contract the daemon
-//! consumes instead: the **desktop** builds the proof with its own `Ed_C` and the
-//! **phone** verifies it. The wire message, its AAD and its context string are
-//! unchanged — only the direction and the signing key differ.
+//! * `PairingCompletePayload.server_signature` — `Ed_S`, the **phone's static
+//!   key**, verified by the desktop. The signature proves possession of `Ed_S`
+//!   and receipt of the exact `CSK`.
 //!
 //! ## Caller responsibilities
 //!
@@ -83,6 +74,7 @@
 //!   the create methods).
 
 use prost::Message as ProstMessage;
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{
     compute_pairing_abort_tag, compute_pairing_transcript_hash, decrypt_with_key,
@@ -104,8 +96,7 @@ pub const PAIRING_DEVICE_NAME_MAX_BYTES: usize = 64;
 pub const PAIRING_CLIENT_SIG_CONTEXT: &[u8] = b"tapauth-pair-client-sig-v2";
 
 /// Signature context prefix of `PairingCompletePayload.server_signature`
-/// (signed by the desktop's `Ed_C`; see the direction note on
-/// [`ServerPairingState::create_confirm_server`]).
+/// (signed by the phone's static `Ed_S`).
 pub const PAIRING_SERVER_SIG_CONTEXT: &[u8] = b"tapauth-pair-server-sig-v2";
 
 /// AEAD associated-data prefix of `PairingConfirmClient.encrypted_payload` (key `K_c2s`).
@@ -203,6 +194,9 @@ pub struct ServerPairingState {
     /// Encoding of the first accepted `PairingInit`, for idempotent retries.
     accepted_init: Option<Vec<u8>>,
     response: Option<PairingResponse>,
+    /// `Ed_S`, captured from the accepted `PairingInit` (and bound into `H`); the
+    /// key the phone's completion proof is verified under.
+    server_ed25519_public_key: Option<[u8; 32]>,
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
     negotiated: Option<NegotiatedAlgorithms>,
@@ -268,6 +262,7 @@ impl ServerPairingState {
             client_device_name: truncate_utf8(client_device_name, PAIRING_DEVICE_NAME_MAX_BYTES),
             accepted_init: None,
             response: None,
+            server_ed25519_public_key: None,
             transcript_hash: None,
             keys: None,
             negotiated: None,
@@ -368,6 +363,7 @@ impl ServerPairingState {
 
         self.accepted_init = Some(encoded_init);
         self.response = Some(response);
+        self.server_ed25519_public_key = Some(server_ed25519_public_key);
         self.transcript_hash = Some(transcript_hash);
         self.keys = Some(keys);
         self.negotiated = Some(negotiated);
@@ -397,59 +393,78 @@ impl ServerPairingState {
         self.keys.as_ref().map(|keys| keys.sas.as_str())
     }
 
-    /// Decrypt the provisioning payload sent by the phone.
+    /// Build the provisioning payload for the phone (`PairingConfirmClient`).
     ///
-    /// Returns `csk`/`username`/`client_hostname`; the caller checks that `csk`
-    /// is 32 bytes (enforced here) and persists both.
-    pub fn process_confirm_client(
-        &mut self,
-        confirm: &PairingConfirmClient,
-    ) -> Result<PairingProvisionPayload, ProtocolError> {
-        let (keys, transcript_hash, negotiated) =
-            session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
-        let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
-        let plaintext = decrypt_with_key(
-            negotiated.symmetric_algorithm,
-            &keys.k_c2s,
-            &confirm.encrypted_payload,
-            &aad,
-        )?;
-        let payload = PairingProvisionPayload::decode(plaintext.as_slice())?;
-        if payload.csk.len() != 32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-        Ok(payload)
-    }
-
-    /// Build the completion proof after the user confirmed the SAS on both screens.
-    ///
-    /// **Direction departure (deliberate).** The proto and
-    /// `initial-key-exchange.md` Step 6 describe `PairingConfirmServer` as
-    /// phone → desktop, signed by `Ed_S`. This implementation sends it
-    /// desktop → phone and signs it with the desktop's **static `Ed_C`** instead,
-    /// which is why the field is verified under `response.client_ed25519_public_key`
-    /// on the receiving side. The context string, the AAD and the signed transcript
-    /// are exactly the documented ones.
+    /// **Desktop → phone** (initial-key-exchange.md Step 5): encodes
+    /// `PairingProvisionPayload { csk, username, client_hostname }` and
+    /// AEAD-encrypts it under `K_c2s` with
+    /// `AAD = "tapauth-pair-v2-provision" || H`, so neither the CSK nor the
+    /// username/hostname travels in cleartext.
     ///
     /// Each call draws a fresh nonce: a retransmission must re-send the same
-    /// [`PairingConfirmServer`], not call this again.
-    pub fn create_confirm_server(
+    /// [`PairingConfirmClient`], not call this again.
+    pub fn create_confirm_client(
         &self,
         csk: &[u8; 32],
-    ) -> Result<PairingConfirmServer, ProtocolError> {
+        username: &str,
+        client_hostname: &str,
+    ) -> Result<PairingConfirmClient, ProtocolError> {
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
-        let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
-        let server_signature = sign_ed25519(&self.client_identity, &signed);
-        let payload = PairingCompletePayload { server_signature };
-        let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, transcript_hash);
-        let encrypted_complete = encrypt_with_key(
+        let payload = PairingProvisionPayload {
+            csk: csk.to_vec(),
+            username: username.to_string(),
+            client_hostname: client_hostname.to_string(),
+        };
+        let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
+        let encrypted_payload = encrypt_with_key(
             negotiated.symmetric_algorithm,
-            &keys.k_s2c,
+            &keys.k_c2s,
             &payload.encode_to_vec(),
             &aad,
         )?;
-        Ok(PairingConfirmServer { encrypted_complete })
+        Ok(PairingConfirmClient { encrypted_payload })
+    }
+
+    /// Verify the phone's completion proof for the CSK we provisioned.
+    ///
+    /// **Phone → desktop** (initial-key-exchange.md Step 6): decrypts
+    /// `encrypted_complete` under `K_s2c` with
+    /// `AAD = "tapauth-pair-v2-complete" || H`, decodes
+    /// `PairingCompletePayload`, requires a 64-byte signature, then verifies
+    /// `verify_ed25519(Ed_S, "tapauth-pair-server-sig-v2" || H || csk, signature)`.
+    /// `Ed_S` is the `server_ed25519_public_key` captured from the accepted
+    /// `PairingInit` — never this desktop's own `Ed_C`.
+    pub fn verify_confirm_server(
+        &self,
+        confirm: &PairingConfirmServer,
+        csk: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        let (keys, transcript_hash, negotiated) =
+            session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
+        let server_ed25519_public_key = self
+            .server_ed25519_public_key
+            .ok_or(ProtocolError::MissingField("server_ed25519_public_key"))?;
+
+        let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, transcript_hash);
+        let plaintext = decrypt_with_key(
+            negotiated.symmetric_algorithm,
+            &keys.k_s2c,
+            &confirm.encrypted_complete,
+            &aad,
+        )?;
+        let payload = PairingCompletePayload::decode(plaintext.as_slice())?;
+        if payload.server_signature.len() != 64 {
+            return Err(ProtocolError::InvalidMessageFormat);
+        }
+
+        let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
+        verify_ed25519(
+            &server_ed25519_public_key,
+            &signed,
+            &payload.server_signature,
+        )
+        .map_err(|_| ProtocolError::InvalidSignature)
     }
 
     /// Build an abort, authenticated with `K_c2s` when the keys already exist.
@@ -500,8 +515,6 @@ pub struct ClientPairingSession {
     advertised_hash: Vec<HashAlgorithm>,
     advertised_signature: Vec<SignatureAlgorithm>,
     init: Option<PairingInit>,
-    /// `Ed_C`, learned from the verified `PairingResponse`.
-    client_ed25519_public_key: Option<[u8; 32]>,
     negotiated: Option<NegotiatedAlgorithms>,
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
@@ -525,7 +538,6 @@ impl ClientPairingSession {
             advertised_hash: SUPPORTED_HASH_ALGORITHMS.to_vec(),
             advertised_signature: SUPPORTED_SIGNATURE_ALGORITHMS.to_vec(),
             init: None,
-            client_ed25519_public_key: None,
             negotiated: None,
             transcript_hash: None,
             keys: None,
@@ -585,7 +597,7 @@ impl ClientPairingSession {
             .as_slice()
             .try_into()
             .map_err(|_| ProtocolError::ChallengeMismatch)?;
-        if !constant_time_eq(&client_x25519_public_key, expected_qr_pk) {
+        if !bool::from(client_x25519_public_key.ct_eq(expected_qr_pk)) {
             return Err(ProtocolError::ChallengeMismatch);
         }
 
@@ -648,7 +660,6 @@ impl ClientPairingSession {
             .diffie_hellman(&client_x25519_public_key)?;
         let keys = derive_pairing_keys_and_sas(&shared_secret, &transcript_hash)?;
 
-        self.client_ed25519_public_key = Some(client_ed25519_public_key);
         self.negotiated = Some(negotiated);
         self.transcript_hash = Some(transcript_hash);
         self.keys = Some(keys);
@@ -670,69 +681,60 @@ impl ClientPairingSession {
         self.keys.as_ref().map(|keys| keys.sas.as_str())
     }
 
-    /// Encrypt the provisioning payload (`{csk, username, client_hostname}`) under
-    /// `K_c2s`.
+    /// Decrypt the desktop's provisioning payload (`PairingConfirmClient`).
     ///
-    /// Each call draws a fresh nonce: a retransmission must re-send the same
-    /// [`PairingConfirmClient`], not call this again.
-    pub fn create_confirm_client(
+    /// **Desktop → phone** (initial-key-exchange.md Step 5): decrypts
+    /// `encrypted_payload` under `K_c2s` with
+    /// `AAD = "tapauth-pair-v2-provision" || H` and decodes
+    /// `PairingProvisionPayload`. Returns `csk`/`username`/`client_hostname`; the
+    /// caller persists them and requires `csk` to be 32 bytes (enforced here).
+    pub fn process_confirm_client(
         &self,
-        csk: &[u8; 32],
-        username: &str,
-        client_hostname: &str,
-    ) -> Result<PairingConfirmClient, ProtocolError> {
+        confirm: &PairingConfirmClient,
+    ) -> Result<PairingProvisionPayload, ProtocolError> {
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
-        let payload = PairingProvisionPayload {
-            csk: csk.to_vec(),
-            username: username.to_string(),
-            client_hostname: client_hostname.to_string(),
-        };
         let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
-        let encrypted_payload = encrypt_with_key(
+        let plaintext = decrypt_with_key(
             negotiated.symmetric_algorithm,
             &keys.k_c2s,
+            &confirm.encrypted_payload,
+            &aad,
+        )?;
+        let payload = PairingProvisionPayload::decode(plaintext.as_slice())?;
+        if payload.csk.len() != 32 {
+            return Err(ProtocolError::InvalidMessageFormat);
+        }
+        Ok(payload)
+    }
+
+    /// Build the completion proof after the user confirmed the SAS on both screens.
+    ///
+    /// **Phone → desktop** (initial-key-exchange.md Step 6): signs
+    /// `"tapauth-pair-server-sig-v2" || H || csk` with this phone's static `Ed_S`
+    /// (proving possession of `Ed_S` and exact receipt of `csk`) and AEAD-encrypts
+    /// `PairingCompletePayload { server_signature }` under `K_s2c` with
+    /// `AAD = "tapauth-pair-v2-complete" || H`.
+    ///
+    /// Each call draws a fresh nonce: a retransmission must re-send the same
+    /// [`PairingConfirmServer`], not call this again.
+    pub fn create_confirm_server(
+        &self,
+        csk: &[u8; 32],
+    ) -> Result<PairingConfirmServer, ProtocolError> {
+        let (keys, transcript_hash, negotiated) =
+            session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
+        let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
+        let server_signature = sign_ed25519(&self.server_identity, &signed);
+        let payload = PairingCompletePayload { server_signature };
+        let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, transcript_hash);
+        let encrypted_complete = encrypt_with_key(
+            negotiated.symmetric_algorithm,
+            &keys.k_s2c,
             &payload.encode_to_vec(),
             &aad,
         )?;
-        Ok(PairingConfirmClient { encrypted_payload })
-    }
-
-    /// Verify the desktop's completion proof for the CSK we provisioned.
-    ///
-    /// The proof is `Ed_C`'s signature over `"tapauth-pair-server-sig-v2" || H || csk`,
-    /// verified with the `Ed_C` cached from the verified `PairingResponse` — so the
-    /// phone must not call this before [`ClientPairingSession::verify_response`].
-    pub fn verify_confirm_server(
-        &self,
-        confirm: &PairingConfirmServer,
-        csk: &[u8; 32],
-    ) -> Result<(), ProtocolError> {
-        let (keys, transcript_hash, negotiated) =
-            session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
-        let client_ed25519_public_key = self
-            .client_ed25519_public_key
-            .ok_or(ProtocolError::MissingField("client_ed25519_public_key"))?;
-
-        let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, transcript_hash);
-        let plaintext = decrypt_with_key(
-            negotiated.symmetric_algorithm,
-            &keys.k_s2c,
-            &confirm.encrypted_complete,
-            &aad,
-        )?;
-        let payload = PairingCompletePayload::decode(plaintext.as_slice())?;
-        if payload.server_signature.len() != 64 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
-        verify_ed25519(
-            &client_ed25519_public_key,
-            &signed,
-            &payload.server_signature,
-        )
-        .map_err(|_| ProtocolError::InvalidSignature)
+        Ok(PairingConfirmServer { encrypted_complete })
     }
 
     /// Build an abort, authenticated with `K_s2c` when the keys already exist.
@@ -811,18 +813,6 @@ fn complete_signature_message(
     data.extend_from_slice(transcript_hash);
     data.extend_from_slice(csk);
     data
-}
-
-/// Byte-wise equality without an early exit, for the QR key commitment.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        difference |= a ^ b;
-    }
-    std::hint::black_box(difference) == 0
 }
 
 /// Parse a 32-byte protobuf `bytes` field, distinguishing "absent" from "wrong length".
@@ -1091,23 +1081,145 @@ mod tests {
         assert_eq!(desktop_sas, phone_sas);
 
         let csk = [0x42u8; 32];
-        let confirm_client = phone
+        let confirm_client = desktop
             .create_confirm_client(&csk, "luca", "thinkpad")
             .unwrap();
-        let payload = desktop.process_confirm_client(&confirm_client).unwrap();
+        let payload = phone.process_confirm_client(&confirm_client).unwrap();
         assert_eq!(payload.csk, csk.to_vec());
         assert_eq!(payload.username, "luca");
         assert_eq!(payload.client_hostname, "thinkpad");
 
-        let confirm_server = desktop.create_confirm_server(&csk).unwrap();
-        phone.verify_confirm_server(&confirm_server, &csk).unwrap();
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
         // The proof pins the exact CSK: a different one must not verify.
         assert!(matches!(
-            phone
+            desktop
                 .verify_confirm_server(&confirm_server, &[0x43u8; 32])
                 .unwrap_err(),
             ProtocolError::InvalidSignature
         ));
+    }
+
+    /// The completion proof must be `Ed_S`'s signature, not `Ed_C`'s.
+    /// The defect this catches: the phone signing with the wrong identity key
+    /// (e.g. a proof built on the desktop's `Ed_C`, as the inverted flow did),
+    /// which the desktop would then verify against the wrong key.
+    #[test]
+    fn completion_proof_is_signed_by_ed_s_not_ed_c() {
+        let (desktop, phone) = established();
+        let csk = [0x42u8; 32];
+        let confirm = phone.create_confirm_server(&csk).unwrap();
+
+        // Open the proof with the phone's own `K_s2c`, exactly as the desktop does.
+        let keys = phone.keys.as_ref().unwrap();
+        let transcript_hash = phone.transcript_hash.unwrap();
+        let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
+        let plaintext = decrypt_with_key(
+            SymmetricAlgorithm::Aes256Gcm,
+            &keys.k_s2c,
+            &confirm.encrypted_complete,
+            &aad,
+        )
+        .unwrap();
+        let payload = PairingCompletePayload::decode(plaintext.as_slice()).unwrap();
+        assert_eq!(payload.server_signature.len(), 64);
+
+        let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, &transcript_hash, &csk);
+        // Under the phone's `Ed_S` (the key captured from `PairingInit`) it verifies.
+        verify_ed25519(
+            &phone_identity().verifying_key_bytes(),
+            &signed,
+            &payload.server_signature,
+        )
+        .unwrap();
+        // Under the desktop's own `Ed_C` it must not.
+        assert!(verify_ed25519(
+            &desktop.client_ed25519_public_key(),
+            &signed,
+            &payload.server_signature
+        )
+        .is_err());
+        // Which is exactly what the desktop-side check concludes.
+        assert_eq!(
+            desktop.client_ed25519_public_key(),
+            desktop_identity().verifying_key_bytes()
+        );
+        assert!(desktop.verify_confirm_server(&confirm, &csk).is_ok());
+
+        // A proof built by a session with a different identity cannot pass for this
+        // pairing: the desktop only trusts the `Ed_S` bound into `H`.
+        let foreign_session_id = [0x99u8; PAIRING_SESSION_ID_LEN];
+        let mut foreign_desktop = seeded_desktop(foreign_session_id);
+        let mut foreign_phone = ClientPairingSession::new(
+            foreign_session_id,
+            Ed25519KeyPair::from_signing_key_bytes(&[0xC3; 32]).unwrap(),
+            "pixel",
+        )
+        .unwrap();
+        let foreign_init = foreign_phone.create_init().unwrap();
+        let foreign_response = foreign_desktop.handle_init(&foreign_init).unwrap().clone();
+        foreign_phone
+            .verify_response(
+                &foreign_response,
+                &foreign_desktop.client_x25519_public_key(),
+            )
+            .unwrap();
+        let foreign_confirm = foreign_phone.create_confirm_server(&csk).unwrap();
+        assert!(desktop
+            .verify_confirm_server(&foreign_confirm, &csk)
+            .is_err());
+    }
+
+    /// The provisioning payload must travel under `K_c2s` only: the phone's own
+    /// `K_s2c` (any wrong directional key) must not open it, and a tampered
+    /// ciphertext byte must be rejected rather than decrypted to garbage.
+    /// The defect this catches: the payload encrypted under the wrong directional
+    /// key, or accepted without AEAD authentication (e.g. a plaintext or unsealed
+    /// `encrypted_payload`).
+    #[test]
+    fn provision_payload_is_sealed_under_k_c2s_only() {
+        let (desktop, phone) = established();
+        let csk = [0x42u8; 32];
+        let confirm = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+
+        // The phone opens it with `K_c2s`.
+        let payload = phone.process_confirm_client(&confirm).unwrap();
+        assert_eq!(payload.csk, csk.to_vec());
+        assert_eq!(payload.username, "luca");
+        assert_eq!(payload.client_hostname, "thinkpad");
+
+        // The same bytes do not open under the reverse-direction key or a different AAD.
+        let keys = phone.keys.as_ref().unwrap();
+        let transcript_hash = phone.transcript_hash.unwrap();
+        let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, &transcript_hash);
+        assert!(matches!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Aes256Gcm,
+                &keys.k_s2c,
+                &confirm.encrypted_payload,
+                &aad
+            ),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        let wrong_aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
+        assert!(matches!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Aes256Gcm,
+                &keys.k_c2s,
+                &confirm.encrypted_payload,
+                &wrong_aad
+            ),
+            Err(CryptoError::DecryptionFailed)
+        ));
+
+        // A single flipped ciphertext byte is rejected by the AEAD tag.
+        let mut tampered = confirm.clone();
+        tampered.encrypted_payload[0] ^= 0x01;
+        assert!(phone.process_confirm_client(&tampered).is_err());
     }
 
     // --- 2. QR key commitment --------------------------------------------
@@ -1135,9 +1247,15 @@ mod tests {
         assert!(phone.sas().is_none());
         assert!(phone.transcript_hash().is_none());
         assert!(phone.negotiated().is_none());
-        // No keys were derived, so nothing can be provisioned.
+        // No keys were derived, so nothing can be built or opened.
         assert!(matches!(
-            phone.create_confirm_client(&[0u8; 32], "luca", "thinkpad"),
+            phone.create_confirm_server(&[0u8; 32]),
+            Err(ProtocolError::MissingField("pairing_session_keys"))
+        ));
+        assert!(matches!(
+            phone.process_confirm_client(&PairingConfirmClient {
+                encrypted_payload: vec![0u8; 44],
+            }),
             Err(ProtocolError::MissingField("pairing_session_keys"))
         ));
     }

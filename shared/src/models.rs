@@ -49,26 +49,6 @@ pub mod pairing {
         MissingField(&'static str),
     }
 
-    /// Generate a v1 pairing URL for QR code
-    pub fn generate_pairing_url(
-        public_key_hex: &str,
-        port: u16,
-        ipv4: Option<Ipv4Addr>,
-        ipv6: Option<Ipv6Addr>,
-    ) -> String {
-        let mut url = format!("tapauth://pair?v=1&pk={}&p={}", public_key_hex, port);
-
-        if let Some(ip) = ipv4 {
-            url.push_str(&format!("&ip4={}", ip));
-        }
-
-        if let Some(ip) = ipv6 {
-            url.push_str(&format!("&ip6={}", ip));
-        }
-
-        url
-    }
-
     /// Generate a v2 pairing URL for QR code:
     ///
     /// ```text
@@ -105,20 +85,26 @@ pub mod pairing {
         url
     }
 
-    /// Parse a pairing URL
+    /// A parsed v2 pairing URL.
     #[derive(Debug, Clone)]
     pub struct PairingInfo {
+        /// Protocol pairing version; always 2 (every other version is rejected).
         pub version: u32,
-        /// v2 session id (`sid`); `None` for a v1 URL.
-        pub session_id: Option<[u8; 16]>,
+        /// v2 session id (`sid`), 16 raw bytes.
+        pub session_id: [u8; 16],
         pub public_key_hex: String,
-        /// v1 requires the UDP port; v2 may omit it for BLE-only pairing.
+        /// UDP pairing port; `None` for a BLE-only pairing session.
         pub port: Option<u16>,
         pub ipv4: Option<Ipv4Addr>,
         pub ipv6: Option<Ipv6Addr>,
     }
 
     impl PairingInfo {
+        /// Parse a `tapauth://pair?v=2&sid=…&pk=…` URL.
+        ///
+        /// Only `v=2` is accepted: anything else is
+        /// [`PairingInfoError::InvalidVersion`]. The `sid` is required and must be
+        /// 32 hex characters; `p`/`ip4`/`ip6` stay optional for a BLE-only session.
         pub fn parse(url: &str) -> Result<Self, PairingInfoError> {
             if !url.starts_with("tapauth://pair?") {
                 return Err(PairingInfoError::InvalidScheme);
@@ -155,33 +141,21 @@ pub mod pairing {
             }
 
             let version = version.ok_or(PairingInfoError::MissingField("version"))?;
+            if version != 2 {
+                return Err(PairingInfoError::InvalidVersion);
+            }
+            let session_id = session_id.ok_or(PairingInfoError::MissingField("session id"))?;
             let public_key_hex =
                 public_key_hex.ok_or(PairingInfoError::MissingField("public key"))?;
 
-            match version {
-                // v1 carries no session id and always carries the UDP port.
-                1 => Ok(Self {
-                    version,
-                    session_id: None,
-                    public_key_hex,
-                    port: Some(port.ok_or(PairingInfoError::MissingField("port"))?),
-                    ipv4,
-                    ipv6,
-                }),
-                // v2 always carries the session id; the transport fields are
-                // optional because a BLE-only session has neither.
-                2 => Ok(Self {
-                    version,
-                    session_id: Some(
-                        session_id.ok_or(PairingInfoError::MissingField("session id"))?,
-                    ),
-                    public_key_hex,
-                    port,
-                    ipv4,
-                    ipv6,
-                }),
-                _ => Err(PairingInfoError::InvalidVersion),
-            }
+            Ok(Self {
+                version,
+                session_id,
+                public_key_hex,
+                port,
+                ipv4,
+                ipv6,
+            })
         }
     }
 
@@ -206,93 +180,64 @@ pub mod pairing {
 mod tests {
     use super::*;
 
+    /// The v2 URL is the only shape this type carries; a v1 URL (`v=1`, no `sid`)
+    /// must be refused, never silently parsed as a session without a session id.
+    /// The defect this catches: a v1 URL being accepted (as `MissingField("port")`
+    /// compatibility, or with `session_id: None`), which would hand the phone an
+    /// unbound pairing session.
     #[test]
-    fn test_pairing_url_generation() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        let url = pairing::generate_pairing_url(
-            "aabbccdd",
-            12345,
-            Some(Ipv4Addr::new(192, 168, 1, 100)),
-            Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-        );
-
-        assert!(url.starts_with("tapauth://pair?"));
-        assert!(url.contains("pk=aabbccdd"));
-        assert!(url.contains("p=12345"));
-        assert!(url.contains("ip4=192.168.1.100"));
+    fn test_pairing_url_rejects_any_version_but_two() {
+        for url in [
+            "tapauth://pair?v=1&pk=aabbccdd&p=12345",
+            "tapauth://pair?v=1&sid=00000000000000000000000000000000&pk=aabbccdd",
+            "tapauth://pair?v=3&sid=00000000000000000000000000000000&pk=aabbccdd",
+            "tapauth://pair?v=0&sid=00000000000000000000000000000000&pk=aabbccdd",
+        ] {
+            match pairing::PairingInfo::parse(url) {
+                Err(pairing::PairingInfoError::InvalidVersion) => {}
+                other => panic!("expected InvalidVersion for {:?}, got {:?}", url, other),
+            }
+        }
     }
 
+    /// A v2 URL still requires the version, the session id and the public key.
+    /// The defect this catches: any one of those defaulting to an empty value
+    /// instead of failing the scan.
     #[test]
-    fn test_pairing_url_parsing() {
-        let url = "tapauth://pair?v=1&pk=aabbccdd&p=12345&ip4=192.168.1.100";
-        let info = pairing::PairingInfo::parse(url).unwrap();
+    fn test_pairing_url_v2_missing_required_fields() {
+        match pairing::PairingInfo::parse("tapauth://pair?sidaabbccdd&pk=abc") {
+            Err(pairing::PairingInfoError::InvalidQuery) => {}
+            other => panic!("expected InvalidQuery, got {:?}", other),
+        }
 
-        assert_eq!(info.version, 1);
-        assert_eq!(info.public_key_hex, "aabbccdd");
-        assert_eq!(info.port, Some(12345));
-        assert!(info.ipv4.is_some());
-    }
+        match pairing::PairingInfo::parse("tapauth://pair?v=2&sid=00000000000000000000000000000000")
+        {
+            Err(pairing::PairingInfoError::MissingField("public key")) => {}
+            other => panic!("expected MissingField(\"public key\"), got {:?}", other),
+        }
 
-    #[test]
-    fn test_pairing_url_missing_required_fields() {
-        // Missing public key
-        let url1 = "tapauth://pair?v=1&p=12345";
-        assert!(pairing::PairingInfo::parse(url1).is_err());
+        match pairing::PairingInfo::parse("tapauth://pair?pk=aabbccdd") {
+            Err(pairing::PairingInfoError::MissingField("version")) => {}
+            other => panic!("expected MissingField(\"version\"), got {:?}", other),
+        }
 
-        // Missing port
-        let url2 = "tapauth://pair?v=1&pk=aabbccdd";
-        assert!(pairing::PairingInfo::parse(url2).is_err());
-
-        // Missing version
-        let url3 = "tapauth://pair?pk=aabbccdd&p=12345";
-        assert!(pairing::PairingInfo::parse(url3).is_err());
-    }
-
-    #[test]
-    fn test_pairing_url_with_ipv6() {
-        use std::net::Ipv6Addr;
-
-        let url = pairing::generate_pairing_url(
-            "test123",
-            8080,
-            None,
-            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-        );
-
-        assert!(url.contains("pk=test123"));
-        assert!(url.contains("p=8080"));
-        assert!(url.contains("ip6="));
-    }
-
-    #[test]
-    fn test_pairing_url_round_trip() {
-        use std::net::Ipv4Addr;
-
-        let original_key = "fedcba9876543210";
-        let original_port = 9999;
-        let original_ip = Ipv4Addr::new(10, 0, 0, 1);
-
-        let url =
-            pairing::generate_pairing_url(original_key, original_port, Some(original_ip), None);
-        let parsed = pairing::PairingInfo::parse(&url).unwrap();
-
-        assert_eq!(parsed.public_key_hex, original_key);
-        assert_eq!(parsed.port, Some(original_port));
-        assert_eq!(parsed.ipv4, Some(original_ip));
-        assert_eq!(parsed.session_id, None);
+        match pairing::PairingInfo::parse("tapauth://pair?v=2&pk=aabbccdd") {
+            Err(pairing::PairingInfoError::MissingField("session id")) => {}
+            other => panic!("expected MissingField(\"session id\"), got {:?}", other),
+        }
     }
 
     #[test]
     fn test_pairing_url_invalid_scheme() {
-        let url = "http://pair?v=1&pk=aabbccdd&p=12345";
+        let url = "http://pair?v=2&sid=00000000000000000000000000000000&pk=aabbccdd";
         assert!(pairing::PairingInfo::parse(url).is_err());
     }
 
     #[test]
     fn test_pairing_url_duplicate_parameters() {
         // Last value should win for duplicate parameters
-        let url = "tapauth://pair?v=1&pk=first_key&p=12345&pk=second_key";
+        let url = "tapauth://pair?v=2&sid=00000000000000000000000000000000&pk=first_key&p=12345\
+                   &pk=second_key";
         let info = pairing::PairingInfo::parse(url).unwrap();
         assert_eq!(info.public_key_hex, "second_key");
     }
@@ -300,7 +245,8 @@ mod tests {
     #[test]
     fn test_pairing_url_unknown_parameters_ignored() {
         // Unknown parameters should be silently ignored
-        let url = "tapauth://pair?v=1&pk=abc&p=12345&extra=ignored&random=stuff";
+        let url = "tapauth://pair?v=2&sid=00000000000000000000000000000000&pk=abc&p=12345\
+                   &extra=ignored&random=stuff";
         let info = pairing::PairingInfo::parse(url).unwrap();
         assert_eq!(info.public_key_hex, "abc");
         assert_eq!(info.port, Some(12345));
@@ -308,28 +254,16 @@ mod tests {
 
     #[test]
     fn test_pairing_url_malformed_ipv4() {
-        let url = "tapauth://pair?v=1&pk=abc&p=12345&ip4=not_an_ip";
+        let url =
+            "tapauth://pair?v=2&sid=00000000000000000000000000000000&pk=abc&p=12345&ip4=not_an_ip";
         assert!(pairing::PairingInfo::parse(url).is_err());
     }
 
     #[test]
     fn test_pairing_url_malformed_ipv6() {
-        let url = "tapauth://pair?v=1&pk=abc&p=12345&ip6=not_an_ip";
+        let url =
+            "tapauth://pair?v=2&sid=00000000000000000000000000000000&pk=abc&p=12345&ip6=not_an_ip";
         assert!(pairing::PairingInfo::parse(url).is_err());
-    }
-
-    /// A v1 QR code still parses, with no session id, after the v2 change.
-    /// The defect this catches: v1 URLs rejected (`MissingField("session id")`)
-    /// during a rollout, which would make every already-printed QR code fail.
-    #[test]
-    fn test_pairing_url_v1_has_no_session_id() {
-        let url = "tapauth://pair?v=1&pk=aabbccdd&p=12345";
-        let info = pairing::PairingInfo::parse(url).unwrap();
-        assert_eq!(info.version, 1);
-        assert_eq!(info.session_id, None);
-        assert_eq!(info.port, Some(12345));
-        assert_eq!(info.ipv4, None);
-        assert_eq!(info.ipv6, None);
     }
 
     /// v2 round-trip with a UDP pairing port and both addresses.
@@ -363,7 +297,7 @@ mod tests {
 
         let parsed = pairing::PairingInfo::parse(&url).unwrap();
         assert_eq!(parsed.version, 2);
-        assert_eq!(parsed.session_id, Some(session_id));
+        assert_eq!(parsed.session_id, session_id);
         assert_eq!(parsed.public_key_hex, public_key);
         assert_eq!(parsed.port, Some(40000));
         assert_eq!(parsed.ipv4, Some(ipv4));
@@ -384,7 +318,7 @@ mod tests {
         );
 
         let parsed = pairing::PairingInfo::parse(&url).unwrap();
-        assert_eq!(parsed.session_id, Some(session_id));
+        assert_eq!(parsed.session_id, session_id);
         assert_eq!(parsed.port, None);
         assert_eq!(parsed.ipv4, None);
         assert_eq!(parsed.ipv6, None);
@@ -426,7 +360,7 @@ mod tests {
         let url = "tapauth://pair?v=2&sid=00000000000000000000000000000000&pk=abc\
                    &sid=11111111111111111111111111111111";
         let parsed = pairing::PairingInfo::parse(url).unwrap();
-        assert_eq!(parsed.session_id, Some([0x11u8; 16]));
+        assert_eq!(parsed.session_id, [0x11u8; 16]);
     }
 
     /// The pairing channel UUID must be the one both transports open

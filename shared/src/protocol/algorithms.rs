@@ -12,8 +12,8 @@
 //! produce the proto spelling; the three enums are therefore excluded from that
 //! blanket derive (see `build.rs`) and implemented by hand.
 //!
-//! Deserialising accepts either the canonical name string or an integer, so a
-//! config written by a peer that stored the numeric value still loads.
+//! Deserialising accepts the canonical name string only. An integer is rejected:
+//! it was a v1 compatibility affordance and there is no writer that produces one.
 
 use std::fmt;
 
@@ -22,18 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::protocol::pb::{HashAlgorithm, SignatureAlgorithm, SymmetricAlgorithm};
 
-/// Narrow a JSON integer into the `i32` proto enum domain and convert it.
-///
-/// Shared by the `visit_i64` / `visit_u64` paths of [`AlgorithmVisitor`], so all
-/// three enums share one range-check implementation.
-fn alg_from_i32<T>(value: i32) -> Result<T, prost::UnknownEnumValue>
-where
-    T: TryFrom<i32, Error = prost::UnknownEnumValue>,
-{
-    T::try_from(value)
-}
-
-/// Visitor accepting either a proto enum name string or an integer value.
+/// Visitor accepting a proto enum name string and rejecting everything else.
 struct AlgorithmVisitor<T> {
     /// `as_str_name`-inverse of the enum being deserialised (`from_str_name`).
     from_name: fn(&str) -> Option<T>,
@@ -41,18 +30,11 @@ struct AlgorithmVisitor<T> {
     name: &'static str,
 }
 
-impl<'de, T> Visitor<'de> for AlgorithmVisitor<T>
-where
-    T: TryFrom<i32, Error = prost::UnknownEnumValue>,
-{
+impl<'de, T> Visitor<'de> for AlgorithmVisitor<T> {
     type Value = T;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "a {} proto name string or an integer value",
-            self.name
-        )
+        write!(formatter, "a {} proto name string", self.name)
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -67,26 +49,20 @@ where
     where
         E: de::Error,
     {
-        let narrowed = i32::try_from(value).map_err(|_| {
-            E::custom(format_args!(
-                "{} value {} does not fit in an i32",
-                self.name, value
-            ))
-        })?;
-        alg_from_i32(narrowed).map_err(E::custom)
+        Err(E::custom(format_args!(
+            "{} expects a proto name string, got the integer {}",
+            self.name, value
+        )))
     }
 
     fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        let narrowed = i64::try_from(value).map_err(|_| {
-            E::custom(format_args!(
-                "{} value {} does not fit in an i32",
-                self.name, value
-            ))
-        })?;
-        self.visit_i64(narrowed)
+        Err(E::custom(format_args!(
+            "{} expects a proto name string, got the integer {}",
+            self.name, value
+        )))
     }
 }
 

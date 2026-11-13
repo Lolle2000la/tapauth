@@ -7,6 +7,7 @@
 //! ignored by the inner decode that follows.
 
 use prost::Message as ProstMessage;
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{sign_ed25519, verify_ed25519, CryptoError, Ed25519KeyPair};
 use crate::protocol::packet::{wrap_auth_denial, wrap_auth_grant};
@@ -258,32 +259,19 @@ pub fn verify_auth_denial(
 }
 
 /// Require the inner `challenge` field to be exactly 32 bytes and equal `expected`.
+///
+/// The length check comes first because `ct_eq` only compares equal-length
+/// slices; the length itself is not secret (both sides are fixed-length 32-byte
+/// challenges on the paths that use it).
 fn verify_challenge_field(field: &[u8], expected: &[u8; 32]) -> Result<(), ProtocolError> {
     if field.len() != expected.len() {
         return Err(ProtocolError::ChallengeMismatch);
     }
-    if constant_time_eq(field, expected) {
+    if bool::from(field.ct_eq(expected.as_slice())) {
         Ok(())
     } else {
         Err(ProtocolError::ChallengeMismatch)
     }
-}
-
-/// Constant-time byte-slice comparison: no early return on the first differing byte.
-///
-/// `subtle` is not a dependency of this crate, so this is the manual equivalent; the
-/// length comparison is not secret (both sides are fixed-length 32-byte challenges on
-/// the paths that use it).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Sanitize untrusted contextual metadata for display on the Server prompt.

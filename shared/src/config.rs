@@ -860,9 +860,12 @@ mod tests {
         assert_eq!(server.allowed_users, vec!["alice".to_string()]);
     }
 
-    /// An explicit name string and a raw integer both deserialise.
+    /// Only the canonical name string deserialises; the numeric form is rejected.
+    /// The defect this catches: an integer silently loading as the "same"
+    /// algorithm, which would keep a legacy numeric spelling alive in the config
+    /// contract (and let an out-of-range value be coerced instead of refused).
     #[test]
-    fn test_signature_algorithm_accepts_name_and_integer() {
+    fn test_signature_algorithm_accepts_name_only() {
         let by_name = r#"{
             "name": "Phone",
             "public_key": "abc",
@@ -880,16 +883,15 @@ mod tests {
             "paired_at": "2024-01-01T00:00:00Z",
             "signature_algorithm": 1
         }"#;
-        let server: PairedServer = serde_json::from_str(by_integer).unwrap();
-        assert_eq!(server.signature_algorithm, SignatureAlgorithm::Ed25519);
+        assert!(serde_json::from_str::<PairedServer>(by_integer).is_err());
 
-        // An unknown integer is rejected, not silently defaulted.
+        // An unknown name is rejected, not silently defaulted.
         let bogus = r#"{
             "name": "Phone",
             "public_key": "abc",
             "allowed_users": [],
             "paired_at": "2024-01-01T00:00:00Z",
-            "signature_algorithm": 99
+            "signature_algorithm": "ED25519_TYPO"
         }"#;
         assert!(serde_json::from_str::<PairedServer>(bogus).is_err());
     }
@@ -937,9 +939,10 @@ mod tests {
         let parsed: CskMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, metadata);
 
-        // Integer values are accepted too.
-        let from_ints: CskMetadata =
-            serde_json::from_str(r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#).unwrap();
-        assert_eq!(from_ints, metadata);
+        // Integer values are rejected: the name is the only on-disk spelling.
+        assert!(serde_json::from_str::<CskMetadata>(
+            r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#
+        )
+        .is_err());
     }
 }

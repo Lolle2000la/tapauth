@@ -177,10 +177,6 @@ mod tests {
     const CHACHA: SymmetricAlgorithm = SymmetricAlgorithm::Chacha20Poly1305;
     const SHA256: HashAlgorithm = HashAlgorithm::Sha256;
 
-    /// Mirrors `models::ble::MAX_GATT_PAYLOAD_BYTES`: a 517-byte ATT MTU leaves 514 bytes
-    /// minus the 3-byte GATT Write Without Response header = 512 bytes of payload.
-    const GATT_PAYLOAD_BUDGET_BYTES: usize = 512;
-
     /// The payload type a [`DecodedPayload`] was decoded from.
     fn decoded_payload_type(decoded: &DecodedPayload) -> i32 {
         match decoded {
@@ -392,8 +388,9 @@ mod tests {
         let measured = encoded.len();
 
         assert!(
-            measured <= GATT_PAYLOAD_BUDGET_BYTES,
-            "signed EncryptedPacket is {measured} bytes, BLE GATT budget is {GATT_PAYLOAD_BUDGET_BYTES}"
+            measured <= crate::models::ble::MAX_GATT_PAYLOAD_BYTES,
+            "signed EncryptedPacket is {measured} bytes, BLE GATT budget is {}",
+            crate::models::ble::MAX_GATT_PAYLOAD_BYTES
         );
         // The exact measured size: 341-byte AuthenticationRequest payload -> 416-byte
         // signed WrapperMessage (14B domain + 3 be32 words are only in the signature
