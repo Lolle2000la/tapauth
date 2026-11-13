@@ -62,7 +62,7 @@ cd server-android && ./gradlew connectedE2eAndroidTest
 ## Rust Conventions
 - **Module layout**: a module is `foo.rs`, plus a `foo/` directory for its children — not `foo/mod.rs`. No crate in the workspace has one today and that is the intended state; the only exception is a test setup that genuinely requires `mod.rs`, and then the commit message must say why.
 - **Moving or renaming a module**: use `git mv` so history follows, and update the module lists in `client-pam/src/source_guards.rs` in the same commit. The scans cover exactly what those lists name, so a stale entry silently narrows them; the walker resolves only the flat `NAME.rs` form, so a module left at `NAME/mod.rs` drops out of every scan. `the_walker_separates_test_modules_from_production` asserts the lists match the tree.
-- **Naming**: name code after the thing it describes, not a design document's numbering — hence the `RuleId` variants are `RemoteRefuse`, `DmLoginBypass`, `PreCollectedLocks`, and the row-number mapping stays in the design document.
+- **Naming**: name code after the thing it describes, not a design document's numbering — hence the `RuleId` variants are `RemoteRefuse`, `DmLoginBypass`, `PreCollectedLocks`.
 
 ## Feature Flags (critical)
 
@@ -146,7 +146,7 @@ cargo build --manifest-path client-pam/Cargo.toml
   - **Sequential** (everything the table does not name, which includes hosts that post the conversation answer back to the thread that called `pam_authenticate` and hosts that park in a condition variable with no cancellation point, so a threaded reply could never be abandoned and the lock screen would freeze): the conversation is **never** driven while waiting; the module waits for the daemon on the calling thread, then falls through to password. The wait is `pam_gui_timeout_secs` (default 30s) clamped to `pam_operation_timeout_secs` **only for a `Sequential` host without a tty**; a sequential host with a terminal (the `sudo`/`su` case) is bounded by `pam_operation_timeout_secs` alone. Driving the conversation from a thread on these hosts deadlocks their event loop (see `mechanism/sequential.rs`)
   - **Display-manager bypass**: the module returns `PAM_AUTHINFO_UNAVAIL` unexamined for the services the table marks as display managers, so the login manager still populates `PAM_AUTHTOK` and the keyring unlocks. A GDM **reauthentication** is exempt (`gdm-password` + `GDM_SESSION_FOR_REAUTH`): unlock runs no session/setcred phase, so the keyring reason does not apply. A missing or renamed variable degrades to the bypass/sequential default, never to a deadlock
   - **Remote refusal** (`RemoteRefuse`, `FailureDirection::RefuseRemote`): `SkipPolicy::RemoteAuthentication` skips the call as `PAM_AUTHINFO_UNAVAIL` for a service in the built-in list (`sshd`, `sshd-session`) or one a deployment added to `pam_refused_services`, whatever the process. `classify` runs before the config read and sees only the built-ins, so the configured names are applied by the second decision phase (`client-pam/src/policy/refine.rs`), which can only add a skip — never remove one, reclassify one, or change the mechanism or deadline
-- Conversation policy (how the module rings, waits, hands off or skips, with the rule table): docs/design-documents/pam-conversation-policy.md
+- PAM conversation policy (`client-pam` reference: flow selection, the three flows, deadlines, return codes): docs/design-documents/pam-conversation-policy.md
 
 ### Authentication "Race" Flow
 1. `client-pam` sends IPC request to `tapauthd`

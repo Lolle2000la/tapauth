@@ -385,3 +385,68 @@ The key is `(username, service)` compared with plain string equality, so `sudo` 
 `record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from.
 
 A forked child inherits neither: the `pthread_atfork` child handler writes a fresh empty record over the inherited slot, so the child starts with no conclusion and no held lock.
+
+## Configuration that affects the conversation
+
+| Key | Default | Effect |
+| :--- | :--- | :--- |
+| `pam_operation_timeout_secs` | 120 | the deadline for threaded hosts and for a sequential host with a terminal; also sent to the daemon |
+| `pam_gui_timeout_secs` | 30 | the deadline for a sequential host without a terminal, clamped to the operation timeout |
+| `pam_refused_services` | none beyond the built-ins | adds service names to the remote refusal |
+
+`PamConfig::load` reads them once per call; a missing or unparsable config falls back to the defaults.
+
+`pam_refused_services` is add-only. `effective_refused_services` starts from `["sshd", "sshd-session"]`, trims each configured name, drops invalid entries (empty, non-ASCII, over 255 bytes, containing `/`, whitespace or control characters), deduplicates case-insensitively, and can never remove a built-in.
+
+`use_tpm` does not affect this module: it selects key storage inside `shared`.
+
+## Adding a host or a flow
+
+Adding a host:
+
+1. Add the predicate in `policy/table.rs`, accepting both the full process name and its 15-byte `comm` truncation.
+2. Add the `RuleId` variant with its `ALL` and `as_str` arms in `policy.rs`, and the row in `RULES`.
+3. Add the audit arm in `policy/table.rs`: name, why, and the evidence citation.
+4. Add a row to `client-pam/tests/fixtures/callers.csv` with `expected_rule` and `expected_policy`.
+5. Add the process key to the `rules_are_process_disjoint` set.
+6. Add an `EXPECTED_TTY` entry in `policy.rs` when the flow is threaded or sequential.
+7. For an e2e-covered host, add its `case` arm to `scripts/ci/test-pam-conv-thread.sh` and set `e2e=1`.
+
+Skipping a step fails a named test: a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, a missing audit arm trips `audit_covers_rules`, a duplicated or drifting process key trips `rules_are_process_disjoint`, and an `e2e=1` row without an arm fails the harness.
+
+A display manager is not a new rule: add a `DM_PREFIXES` entry (and its array length) plus one corpus row per prefix.
+
+Adding a flow:
+
+1. Add the `Conversation` variant in `policy.rs` and the cell in `class_permits`; `class_permits_matches_its_expectation` pins the whole matrix.
+2. Add the `Plannable::plan` row for each terminal shape; `plan_table` pins it.
+3. Add `mechanism/<name>.rs` returning a `MechanismEnd`, and dispatch it from `transaction/run.rs`.
+4. Add the module to the production list in `source_guards.rs`; `the_walker_separates_test_modules_from_production` fails otherwise.
+5. Add a corpus row for each host that selects the flow.
+
+The `FailureDirection` of a rule decides which conversations it may select, so choose it before writing the predicate:
+
+| Direction | Permits | Use when |
+| :--- | :--- | :--- |
+| `DeadlockAvoidance` | threaded or sequential | the host's conversation is answerable, or must not be driven |
+| `AlwaysRing` | threaded | the host can be rung on a worker while it waits |
+| `NeverRing` | pre-collected | the host read the password before calling |
+| `Keyring` | skips only | the login manager must populate `PAM_AUTHTOK` |
+| `RefuseRemote` | skips only | a remote login must never be completed by the phone |
+
+## Known gaps
+
+- An undeclared service rename is not detected: `PAM_RHOST` is not read, so the call falls through to `DefaultSequential` and the phone is rung for a remote login. `svc_sshd_near_miss` pins the behaviour.
+- musl is only `cargo check`ed; `pthread_atfork` and the record's mutex are unverified there.
+- `cache_lookup_precedes_daemon_contact` compares source byte offsets, so it passes even when the lookup sits behind a branch that never runs. The e2e duplicate shapes are the real coverage.
+- The `pthread_atfork` registration-failure branch is not exercised.
+- `RuleId::ALL` completeness is not compile-enforced: a rule missing from both `ALL` and `RULES` stays green.
+- A panic between `pthread_create` and the join leaks the worker; `guard()` does not close it.
+- `pthread_cancel` can deadlock a host that holds an internal libc lock. Accepted: isolating the conversation would need a helper process.
+- No unit test names `PamOutcome::Timeout` or `DaemonTimedOut`; the daemon-timeout e2e exists only for a threaded host.
+- The host-cases suite (`scripts/ci/test-pam-host-cases.sh`) needs root to write `/etc/pam.d`; a non-root run reports one skip per case and fails.
+- Nothing asserts where the `su` line sits relative to `pam_wheel.so`.
+- The Debian packaged `common-auth` stack is only string-checked; no test drives it.
+- No test covers a daemon-side deduplication of two identical requests.
+- The Fedora/Arch shared stack (`system-auth`, `password-auth`) is not verified to reach sshd.
+- No mutation or fuzz gate covers rule ordering.

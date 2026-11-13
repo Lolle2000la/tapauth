@@ -303,7 +303,7 @@ caller (`classify` in `client-pam/src/policy.rs`, table in
 `client-pam/src/policy/table.rs`); the decision can be asserted from the corpus,
 but *executing* it cannot: that needs a real libpam stack, a dynamically loaded
 `pam_tapauth.so`, and a process whose `/proc/self/exe` basename is on the table.
-The design behind the table is in
+The rules behind the table are documented in
 [`docs/design-documents/pam-conversation-policy.md`](../design-documents/pam-conversation-policy.md).
 
 It runs **unprivileged** and needs Linux-PAM ≥ 1.5 (`pam_start_confdir`, so it
