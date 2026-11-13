@@ -7,7 +7,9 @@
 
 mod admin_handler;
 mod auth_handler;
+mod caller_context;
 mod logging;
+mod pairing;
 mod peer_identity;
 mod transport;
 
@@ -328,7 +330,8 @@ async fn handle_conn(
     if let Ok(envelope) = ipc::IpcEnvelope::decode(req_bytes.as_slice()) {
         match envelope.msg {
             Some(ipc::ipc_envelope::Msg::PamAuthenticate(auth_req)) => {
-                let response = handle_pam_authenticate(auth_req, &daemon, &server_state).await;
+                let response =
+                    handle_pam_authenticate(auth_req, &daemon, &server_state, caller_pid).await;
                 return write_response(&mut stream, &envelope_pam_response(response), "PAM").await;
             }
             Some(ipc::ipc_envelope::Msg::PamCancel(cancel_req)) => {
@@ -371,6 +374,7 @@ async fn handle_pam_authenticate(
     req: ipc::PamAuthenticateRequest,
     daemon: &Arc<DaemonState>,
     server_state: &Arc<ServerState>,
+    caller_pid: i32,
 ) -> ipc::PamAuthenticateResponse {
     const DEDUP_WINDOW: Duration = Duration::from_secs(1);
     let now = Instant::now();
@@ -403,8 +407,14 @@ async fn handle_pam_authenticate(
     recent_requests.insert(req.username.clone(), RecentAuthRequest { timestamp: now });
     drop(recent_requests);
 
+    // Resolve the display context from the kernel's view of the caller now: the
+    // process may be gone by the time the Server answers. The self-reported
+    // fields of `req` are only a fallback (see `caller_context`).
+    let caller = caller_context::CallerContext::resolve(caller_pid, &req);
+    let tty_present = req.tty_present;
+
     let timeout = Some(req.timeout_seconds);
-    match AuthSession::new(daemon.clone(), req.username.clone()) {
+    match AuthSession::new(daemon.clone(), req.username.clone(), caller, tty_present) {
         Ok(sess) => match sess
             .handle_authenticate(
                 timeout,

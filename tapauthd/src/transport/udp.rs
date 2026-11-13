@@ -2,12 +2,15 @@
 
 use super::{ReceiveResult, Transport};
 use crate::auth_handler::AuthHandlerError as AuthError;
+use prost::Message;
+use shared::config::CskMetadata;
 use shared::network::{
     is_ipv6_available, send_udp_multicast_all_interfaces, send_udp_multicast_v4_all_interfaces,
     try_receive_udp_packet, IPV4_MULTICAST_ADDR, IPV6_MULTICAST_ADDR,
 };
 use shared::protocol::pb::EncryptedPacket;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// UDP transport using multicast on both address families.
@@ -17,6 +20,13 @@ use std::time::Duration;
 pub struct UdpTransport {
     socket: Arc<tokio::net::UdpSocket>,
     port: u16,
+    /// Source address of the most recent response accepted by
+    /// [`Transport::receive_response`].
+    ///
+    /// v2 sends the confirmation unicast to the peer that answered instead of
+    /// multicasting it to every device on the link, and copies a cancel there
+    /// too. `None` until a peer has replied.
+    last_peer_addr: Mutex<Option<SocketAddr>>,
 }
 
 impl UdpTransport {
@@ -26,7 +36,38 @@ impl UdpTransport {
     /// * `socket` - Shared reference to an existing UDP socket
     /// * `port` - The UDP port the socket is bound to
     pub fn from_socket(socket: Arc<tokio::net::UdpSocket>, port: u16) -> Self {
-        Self { socket, port }
+        Self {
+            socket,
+            port,
+            last_peer_addr: Mutex::new(None),
+        }
+    }
+
+    /// The peer recorded by [`Transport::receive_response`], if any.
+    ///
+    /// A poisoned lock is recovered: the guarded value is a plain
+    /// `Option<SocketAddr>`, so poison cannot leave it torn.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        *self
+            .last_peer_addr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record `addr` as the peer that produced the winning response.
+    fn record_peer_addr(&self, addr: SocketAddr) {
+        *self
+            .last_peer_addr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(addr);
+    }
+
+    /// Send `bytes` to a single address, logging rather than failing: the
+    /// devices may still be reachable over BLE.
+    async fn unicast(&self, bytes: &[u8], addr: SocketAddr, what: &str) {
+        if let Err(e) = self.socket.send_to(bytes, addr).await {
+            tracing::warn!("Failed to send {} to {}: {}", what, addr, e);
+        }
     }
 
     /// Send `packet` to the IPv4 and IPv6 discovery groups on every suitable
@@ -81,7 +122,6 @@ fn send_to_emulator_if_dev_mode(packet: &EncryptedPacket) {
         static DEV_SOCK: std::sync::OnceLock<Option<std::net::UdpSocket>> =
             std::sync::OnceLock::new();
         if let Some(sock) = DEV_SOCK.get_or_init(|| std::net::UdpSocket::bind("0.0.0.0:0").ok()) {
-            use prost::Message;
             let data = packet.encode_to_vec();
             let _ = sock.send_to(&data, target);
             tracing::debug!(
@@ -103,21 +143,50 @@ impl Transport for UdpTransport {
         Ok(())
     }
 
-    async fn receive_response(&self, timeout: Duration) -> Result<ReceiveResult, AuthError> {
+    async fn receive_response(
+        &self,
+        timeout: Duration,
+        _csk_meta: &CskMetadata,
+    ) -> Result<ReceiveResult, AuthError> {
         match try_receive_udp_packet(&self.socket, timeout).await? {
             Some((packet, addr)) => {
                 // Filter out local addresses (already done in receive_udp_packet)
+                // The first accepted response is the winner: the handler verifies
+                // it and returns without waiting again, so this is the peer the
+                // confirmation is unicast back to.
+                self.record_peer_addr(addr);
                 Ok(ReceiveResult::Response(packet, addr))
             }
             None => Ok(ReceiveResult::Timeout),
         }
     }
 
-    async fn send_confirmation(&self, packet: &EncryptedPacket) -> Result<(), AuthError> {
+    async fn send_confirmation(
+        &self,
+        packet: &EncryptedPacket,
+        _csk_meta: &CskMetadata,
+    ) -> Result<(), AuthError> {
         #[cfg(any(feature = "dev-udp-loopback", test))]
         send_to_emulator_if_dev_mode(packet);
 
-        self.send_to_multicast_groups(packet).await;
+        let Some(peer_addr) = self.peer_addr() else {
+            // No response has been accepted yet, so there is no peer to confirm
+            // to; multicasting here would confirm to every device on the link.
+            tracing::warn!("No peer address recorded; confirmation not sent");
+            return Ok(());
+        };
+
+        let bytes = packet.encode_to_vec();
+        self.unicast(&bytes, peer_addr, "confirmation").await;
+
+        // A loopback peer keeps the port it answered from: the QEMU SLIRP NAT
+        // hands out an ephemeral port for the reply and forwards it to the
+        // emulated phone, so rewriting the port would send the confirmation
+        // somewhere nobody listens.
+        if !peer_addr.ip().is_loopback() && peer_addr.port() != self.port {
+            let service_addr = SocketAddr::new(peer_addr.ip(), self.port);
+            self.unicast(&bytes, service_addr, "confirmation").await;
+        }
         Ok(())
     }
 
@@ -126,6 +195,13 @@ impl Transport for UdpTransport {
         send_to_emulator_if_dev_mode(packet);
 
         self.send_to_multicast_groups(packet).await;
+
+        // A device that already answered the request has left the multicast
+        // group, so the cancel also goes directly to the recorded peer.
+        if let Some(peer_addr) = self.peer_addr() {
+            let bytes = packet.encode_to_vec();
+            self.unicast(&bytes, peer_addr, "cancel").await;
+        }
         Ok(())
     }
 }
