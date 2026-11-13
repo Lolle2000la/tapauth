@@ -526,8 +526,8 @@ fn production_paths() -> &'static std::collections::HashSet<std::path::PathBuf> 
 /// Split the module tree rooted at `root` into (production files, files that only a
 /// `#[cfg(test)] mod` declares).
 ///
-/// `lib.rs` is the root and every `mod NAME;` is followed to `NAME.rs` or
-/// `NAME/mod.rs`, so the walk mirrors the compiler, not a directory listing. The gate
+/// `lib.rs` is the root and every `mod NAME;` is followed to the flat `NAME.rs`
+/// file form, so the walk mirrors the compiler, not a directory listing. The gate
 /// is inherited by everything a test-gated declaration declares, which keeps
 /// `src/**/tests/*.rs` out of the production set.
 fn module_tree(root: &std::path::Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
@@ -629,22 +629,18 @@ fn module_declarations(source: &str) -> Vec<(String, bool)> {
 
 /// The file a `mod NAME;` declaration in `declaring` refers to.
 ///
-/// `lib.rs` and `mod.rs` declare siblings in their own directory; any other
-/// file declares children under a directory named after it.
+/// `lib.rs` declares siblings in its own directory; any other file declares
+/// children under a directory named after it.
 fn module_file(declaring: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     let stem = declaring.file_stem()?.to_str()?;
     let parent = declaring.parent()?;
-    let base = if stem == "lib" || stem == "mod" {
+    let base = if stem == "lib" {
         parent.to_path_buf()
     } else {
         parent.join(stem)
     };
     let flat = base.join(format!("{name}.rs"));
-    if flat.is_file() {
-        return Some(flat);
-    }
-    let nested = base.join(name).join("mod.rs");
-    nested.is_file().then_some(nested)
+    flat.is_file().then_some(flat)
 }
 
 /// A source file's path relative to `src`, e.g. `outcome.rs` or
@@ -1003,7 +999,7 @@ fn only_outcome_rs_returns_pam_constants() {
 /// The grant constructors, and any hand-built `Outcome::Granted`, as findings
 /// for the file `rel`.
 ///
-/// `outcome.rs` defines both constructors; the orchestration (`pam_logic/mod.rs`)
+/// `outcome.rs` defines both constructors; the orchestration (`pam_logic.rs`)
 /// and the transaction's concluding half (`transaction/lifecycle.rs`) are the only
 /// code allowed to call them. Anything else calling either, or building
 /// `Outcome::Granted` by hand, is a second way to mint a grant.
