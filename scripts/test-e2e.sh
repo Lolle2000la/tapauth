@@ -1606,6 +1606,17 @@ AM_BLE_PID=$!
 wait "$WAIT_BLE_PID" || {
     echo "❌ wait-for-pairing failed (BLE). Log:"
     cat "$WAIT_BLE_LOG"
+    # The phone-side evidence matters here: the daemon only knows it never saw a
+    # PairingInit, while the phone knows whether it scanned, connected or failed
+    # for an adapter/permission reason. Without this dump a BLE regression looks
+    # like a daemon hang.
+    echo "---- ${AM_BLE_LOG} ----"
+    cat "$AM_BLE_LOG" || true
+    echo "---- logcat (PairingSession / BlePairingClient / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'BlePairingClient:*' 'PairingE2eTest:*' \
+        2>/dev/null | tail -n 60 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
     exit 1
 }
 SAS_BLE=$(grep 'SAS=' "$WAIT_BLE_LOG" | cut -d'=' -f2)
