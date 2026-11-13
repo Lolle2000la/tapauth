@@ -215,11 +215,6 @@ jobs:
     name: Musl Target Build Check (client-pam)
     runs-on: ubuntu-latest
 
-    # Cheap cross-target interface check, deliberately its own job so it never
-    # delays the main build-and-test feedback. `cargo check` only runs the
-    # front-end (no linking), so a musl C toolchain is not needed: what this
-    # catches is a dependency that is unavailable or unbuildable for
-    # x86_64-unknown-linux-musl. It does NOT prove the cdylib links under musl.
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -242,8 +237,6 @@ jobs:
       - name: Add the musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      # `shared` is checked first: client-pam depends on it, and its build.rs
-      # generates the protobuf modules for this target too.
       - name: Check shared and client PAM module for the musl target
         run: |
           cargo check -p shared --target x86_64-unknown-linux-musl
