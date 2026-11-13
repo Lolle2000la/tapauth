@@ -5,7 +5,7 @@ use jni::strings::JNIString;
 use jni::sys::jobjectArray;
 use jni::{EnvUnowned as JNIEnv, Outcome};
 
-use super::conversions::{string_to_jstring, vec_to_jbytearray};
+use super::conversions::vec_to_jbytearray;
 use super::exceptions::{throw_illegal_state, throw_out_of_memory};
 
 /// Get the Java byte array class `[B`.
@@ -182,32 +182,6 @@ pub fn make_keypair_array(
     let result_array = new_object_array(env, 2, "[B")?;
     set_object_array_element(env, result_array, 0, &private_array)?;
     set_object_array_element(env, result_array, 1, &public_array)?;
-
-    Some(result_array)
-}
-
-/// Create a two-element `Object[]` containing `[byte[], String]`.
-///
-/// Used for returning (bytes, string) tuples from parsing functions.
-///
-/// ## Returns
-///
-/// `Some(jobjectArray)` on success, `None` if any allocation fails.
-///
-/// ## Errors
-///
-/// Throws `IllegalStateException` or `OutOfMemoryError` on failure.
-pub fn make_bytes_string_array(
-    env: &mut JNIEnv,
-    bytes: &[u8],
-    string: &str,
-) -> Option<jobjectArray> {
-    let byte_array = vec_to_jbytearray(env, bytes)?;
-    let java_string = string_to_jstring(env, string)?;
-
-    let result_array = new_object_array(env, 2, "java/lang/Object")?;
-    set_object_array_element(env, result_array, 0, &byte_array)?;
-    set_object_array_element(env, result_array, 1, &java_string)?;
 
     Some(result_array)
 }
