@@ -17,7 +17,7 @@ The module authenticates the stack's `PAM_USER`. On `su` that is the target acco
 
 ## Code map
 
-Every file under `client-pam/src`, production and test-only. "May import" lists the crate-internal modules each file names; the arrows below run from the entry point to the leaves.
+Every non-test module under `client-pam/src`, plus the test-only `source_guards.rs`; the three `tests` modules are omitted. "May import" lists the crate-internal modules each file names. The graph below is an overview of call direction, not a complete import list — the table is.
 
 | File | Responsibility | May import |
 | :--- | :--- | :--- |
@@ -140,7 +140,8 @@ flowchart TD
     D --> E{refine refuses service?}
     E -- yes --> K
     E -- no --> F[username, conversation, messages]
-    F -- lookup fails --> Z[PAM_USER_UNKNOWN or PAM_AUTH_ERR]
+    F -- username lookup fails --> Z[PAM_USER_UNKNOWN]
+    F -- conversation lookup fails --> Y[PAM_AUTH_ERR]
     F --> G{pre-collected?}
     G -- yes --> H[pam_get_authtok]
     H --> K
@@ -148,7 +149,9 @@ flowchart TD
     I -- yes --> J[replay recorded code]
     J --> R[return that code]
     I -- no --> L[probe tty, plan, resolve deadline]
-    L --> M[connect and send request]
+    L --> N2{request id ok?}
+    N2 -- no --> Y
+    N2 -- yes --> M[connect and send request]
     M -- connect or send fails --> K
     M --> N[arm, run mechanism]
     N --> O[conclude]
@@ -179,7 +182,7 @@ The order matters and is asserted by tests, not by the type system: `classify` r
 
 Process names are the basename of `/proc/self/exe`, falling back to `/proc/self/comm`; every process rule accepts both the full name and the 15-byte `comm` truncation (`gdm-session-wor`, `polkit-agent-he`, `kscreenlocker_w`). GDM reauthentication requires both `GDM_SESSION_FOR_REAUTH` and the `gdm-password` service — `gdm3-password` is not exempt, it takes the bypass.
 
-`sudo` and `su` match no row: they fall to `DefaultSequential`, and because both have a terminal they use the operation deadline.
+`sudo` and `su` match no row: they fall to `DefaultSequential`. With a controlling terminal — the usual case — the operation deadline applies; a tty-less call (`sudo -S` fed from a pipe, a cron job, a unit) finds no `/dev/tty` and takes the clamped `pam_gui_timeout_secs` deadline.
 
 ```mermaid
 flowchart TD
@@ -187,7 +190,7 @@ flowchart TD
     B -- yes --> R[skip: PAM_AUTHINFO_UNAVAIL]
     B -- no --> C{display-manager service and not GDM reauth?}
     C -- yes --> S[skip: PAM_AUTHINFO_UNAVAIL]
-    C -- no --> D{gdm-session-worker with gdm-password?}
+    C -- no --> D{gdm-session-worker, gdm-password and the GDM flag?}
     D -- yes --> T[threaded]
     D -- no --> E{polkit-agent-helper-1?}
     E -- yes --> T
@@ -246,7 +249,7 @@ sequenceDiagram
     end
 ```
 
-A response from the daemon is the verdict whatever the loop exit was; the worker is cancelled and joined before the module returns.
+A response that the loop reads is the verdict; the worker is cancelled and joined before the module returns.
 
 | | |
 | :--- | :--- |
@@ -279,7 +282,7 @@ sequenceDiagram
         Module->>Daemon: PamCancelRequest tty-skip
         Module-->>Host: PAM_AUTHINFO_UNAVAIL
     else IPC fails without a terminal
-        Module->>Daemon: PamCancelRequest gui-ipc-error
+        Module->>Daemon: PamCancelRequest gui-ipc-error on a fresh connection
         Module-->>Host: PAM_AUTHINFO_UNAVAIL
     else deadline expires
         Module-->>Host: PAM_AUTHINFO_UNAVAIL
@@ -290,8 +293,8 @@ sequenceDiagram
 | :--- | :--- |
 | Selected by | `DefaultSequential` |
 | Threads | everything on the calling thread; `pam_conv` is never touched |
-| Daemon sees | the request; a cancel on terminal Enter (`tty-skip`) or, without a terminal, on an IPC failure (`gui-ipc-error`); no cancel on timeout |
-| User sees | a wait notice; with a terminal, Enter skips at once; without one, nothing until the deadline, then the stack's password prompt |
+| Daemon sees | the request; a cancel on terminal Enter (`tty-skip`), or without a terminal on an IPC failure (`gui-ipc-error`, sent on a fresh connection); no cancel on timeout |
+| User sees | a wait notice; with a terminal, Enter skips at once; without one, nothing until the deadline or an IPC failure, then the stack's password prompt |
 | Phone never answers | the deadline expires, `PAM_AUTHINFO_UNAVAIL`, and the next module prompts for a password |
 
 The terminal and no-terminal shapes are one loop driven by `Profile`; the profile only decides whether an IPC failure is reported as a lost connection or as an error, and whether a poll error ends the wait.
@@ -331,7 +334,7 @@ On these hosts the phone is not a credential: nothing is rung and nothing is ver
 
 The display-manager bypass exempts a GDM reauthentication (`gdm-password` plus `GDM_SESSION_FOR_REAUTH`), because an unlock runs no session or setcred phase and the keyring reason does not apply there.
 
-The remote refusal covers the built-in names before the config read and any `pam_refused_services` entry immediately after it. A deployment that renames the service must declare the new name; `PAM_RHOST` is not read, so an undeclared rename is not detected.
+The remote refusal covers the built-in names before the config read and any `pam_refused_services` entry immediately after it. A deployment that renames the service must declare the new name.
 
 ## Timeouts and deadlines
 
@@ -344,7 +347,7 @@ The remote refusal covers the built-in names before the config read and any `pam
 
 `Plannable::plan` picks the variant from the `Plannable` shape and `has_tty`; `Deadline::resolve` in `plan.rs` turns it into seconds and saturates at `u32::MAX`. `transaction/run.rs` adds those seconds to the current instant and sends the same value to the daemon, so both sides expire together.
 
-The clamp is `pam_gui_timeout_secs.min(pam_operation_timeout_secs)` and applies only to a sequential host that finds no terminal. Every sequential host attempts the probe (`Plannable::tty_use` is `PollForKey` for both sequential shapes and `DoNotOpen` for threaded); a host without a terminal gets `None` back, and only then does its plan become `GuiBounded`.
+The clamp is `pam_gui_timeout_secs.min(pam_operation_timeout_secs)` and applies only to a sequential host that finds no terminal. Every sequential host attempts the probe (`Plannable::tty_use` is `PollForKey` for `Sequential` and `DoNotOpen` for `Threaded`, decided before any terminal is known); a host without a terminal gets `None` back, and only then does its plan become `GuiBounded`.
 
 On expiry the mechanism returns `MechanismEnd::Reason(UnavailableReason::TimedOut)`, no cancel is sent, and the module returns `PAM_AUTHINFO_UNAVAIL` after one `timed_out` message. A timeout the daemon reports itself is `UnavailableReason::DaemonTimedOut`: the same code, no message.
 
@@ -355,7 +358,7 @@ On expiry the mechanism returns `MechanismEnd::Reason(UnavailableReason::TimedOu
 | `Granted` | `PAM_SUCCESS` | the phone granted this call, or this process's own grant was replayed |
 | `Denied` | `PAM_PERM_DENIED` | the user denied on the phone |
 | `Unavailable` | `PAM_AUTHINFO_UNAVAIL` | the module could not ask: a skip, a timeout, no daemon, no paired device, or the password handoff |
-| `Error` | `PAM_AUTH_ERR` | `PamConversation::new` failed, request-id generation failed, the daemon returned an outcome this build does not know, or `guard()` caught a panic |
+| `Error` | `PAM_AUTH_ERR` | `PamConversation::new` failed, request-id generation failed, the daemon answered `PamOutcome::Error` or a value this build does not know, `pipe2` or `pthread_create` failed, or `guard()` caught a panic |
 | `UserUnknown` | `PAM_USER_UNKNOWN` | the username lookup failed |
 
 Only two constructors can produce a grant: `Outcome::granted_from_daemon` (a `PamOutcome::Success` this call received, `GrantVia::PhoneTap`) and `Outcome::replayed` (a copy of this process's own record, `GrantVia::VerdictReplay`). `granted_only_from_daemon` scans for any other construction.
@@ -394,7 +397,7 @@ flowchart TD
 
 The key is `(username, service)` compared with plain string equality, so `sudo` and `SUDO` are distinct services. The window is `VERDICT_REUSE_WINDOW` (500 ms) measured from `concluded_at`; the anchor is the module's return path, not the moment the phone answered.
 
-`record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from. Everything the daemon answered is recorded, including a timeout and a protocol error: the record holds the verdict, not just a grant, so a later call inside the window receives the same code without ringing the phone.
+`record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from. Every call that armed a request is recorded, including the module's own timeout and a pre-answer IPC failure: the record holds the verdict, not just a grant, so a later call inside the window receives the same code without ringing the phone.
 
 A forked child inherits neither: the `pthread_atfork` child handler writes a fresh empty record over the inherited slot, so the child starts with no conclusion and no held lock.
 
@@ -418,13 +421,14 @@ Adding a host:
 
 1. Add the predicate in `policy/table.rs`, accepting both the full process name and its 15-byte `comm` truncation.
 2. Add the `RuleId` variant with its `ALL` and `as_str` arms in `policy.rs`, and the row in `RULES` with its `FailureDirection` and `Decision`.
-3. Add the audit arm in `policy/table.rs`: name, why, and the evidence citation.
-4. Add a row to `client-pam/tests/fixtures/callers.csv` with `expected_rule` and `expected_policy`.
-5. Add the process key to the `rules_are_process_disjoint` set.
-6. Add an `EXPECTED_TTY` entry in `policy.rs` when the flow is threaded or sequential.
-7. For an e2e-covered host, add its `case` arm to `scripts/ci/test-pam-conv-thread.sh` and set `e2e=1`.
+3. Re-point the `client-pam/src/policy/table.rs:<line>` citations in the audit records below the insertion; `evidence_citations_resolve` fails until each cited line declares its rule's predicate.
+4. Add the audit arm in `policy/table.rs`: name, why, and the evidence citation.
+5. Add a row to `client-pam/tests/fixtures/callers.csv` with `expected_rule` and `expected_policy`.
+6. Add the process key to the `rules_are_process_disjoint` set.
+7. Add an `EXPECTED_TTY` entry in `policy.rs` when the flow is threaded or sequential.
+8. For an e2e-covered host, add its `case` arm to `scripts/ci/test-pam-conv-thread.sh` and set `e2e=1`.
 
-Every step except 5 fails a named test: a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, a missing audit arm trips `audit_covers_rules`, and an `e2e=1` row without an arm fails the harness. The `rules_are_process_disjoint` key set is the one edit nothing fails loudly on, so update it by hand.
+Every step except 6 fails a test or the compiler: a `RuleId` without its audit arm does not compile, a mis-cited record trips `evidence_citations_resolve`, a rule without a corpus row trips `corpus_covers_every_rule`, a corpus row whose decision disagrees trips `corpus_characterises_the_decision_table`, and an `e2e=1` row without an arm fails the harness. The `rules_are_process_disjoint` key set is the one edit nothing fails loudly on, so update it by hand.
 
 A display manager is not a new rule: add a `DM_PREFIXES` entry (and its array length) plus one corpus row per prefix.
 
