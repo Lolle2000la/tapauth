@@ -32,11 +32,12 @@
 //! ## Exception Handling
 //!
 //! - `IllegalArgumentException`: malformed caller input — wrong key/challenge/session
-//!   lengths, a null array, an unsupported protocol version or algorithm id, an
+//!   lengths, a null array, an unsupported caller-chosen negotiation algorithm id, an
 //!   unknown pairing handle, or a `PairingPacket` for another session.
 //! - `GeneralSecurityException`: an Ed25519 signature that does not verify, an AEAD
-//!   tag/AAD failure, an algorithm downgrade, a tampered temporal identifier, or a
-//!   signed message of the wrong payload type.
+//!   tag/AAD failure, an algorithm downgrade, an unsupported protocol version or a
+//!   persisted per-Client `SignatureAlgorithm` id this build cannot verify, a tampered
+//!   temporal identifier, or a signed message of the wrong payload type.
 //! - `IOException`: bytes that are not a decodable protobuf message.
 //! - `IllegalStateException`: VM/JNI interop errors and internal state failures.
 //!
@@ -304,10 +305,11 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
 ///
 /// ## Errors
 ///
-/// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
+/// - `IllegalArgumentException`: wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
-/// - `GeneralSecurityException`: bad signature, wrong payload type, wrong wrapper
-///   version, or an `expectedSignatureAlgorithm` this build cannot verify
+/// - `GeneralSecurityException`: `protocolVersion != 2`, bad signature, wrong payload
+///   type, wrong wrapper version, or an `expectedSignatureAlgorithm` this build cannot
+///   verify
 /// - `IllegalStateException`: `ParsedAuthRequest` cannot be constructed
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyAuthRequest(
@@ -380,10 +382,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 ///
 /// ## Errors
 ///
-/// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
+/// - `IllegalArgumentException`: wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
-/// - `GeneralSecurityException`: bad signature, wrong payload type, or an
-///   `expectedSignatureAlgorithm` this build cannot verify
+/// - `GeneralSecurityException`: `protocolVersion != 2`, bad signature, wrong payload
+///   type, or an `expectedSignatureAlgorithm` this build cannot verify
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyGrantConfirmation(
     mut env: JNIEnv,
@@ -429,10 +431,10 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 ///
 /// ## Errors
 ///
-/// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
+/// - `IllegalArgumentException`: wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
-/// - `GeneralSecurityException`: bad signature, wrong payload type, or an
-///   `expectedSignatureAlgorithm` this build cannot verify
+/// - `GeneralSecurityException`: `protocolVersion != 2`, bad signature, wrong payload
+///   type, or an `expectedSignatureAlgorithm` this build cannot verify
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyAuthCancel(
     mut env: JNIEnv,

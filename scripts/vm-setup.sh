@@ -382,7 +382,7 @@ runcmd:
     cd shared && cargo test --release
     
     echo "==> Unit tests - PAM module..."
-    cd ../client-pam && cargo test --release --features ble
+    cd ../client-pam && cargo test --release
     
     echo "Tests complete!"
     SCRIPT

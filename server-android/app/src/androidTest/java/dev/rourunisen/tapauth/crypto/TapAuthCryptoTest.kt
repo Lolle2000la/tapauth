@@ -479,11 +479,14 @@ class TapAuthCryptoTest {
         val wrapper = ByteArray(12) { 0x00 }
 
         // Both checks run before the wrapper is even decoded, so the caller's pinned values can
-        // never be talked down by a peer.
-        assertThrows(IllegalArgumentException::class.java) {
+        // never be talked down by a peer. Both values come from the paired Client's persisted
+        // record (`PairedDevice.protocolVersion` / `.signatureAlgorithm`), so an id this build
+        // cannot speak means the stored pairing is unusable: a security failure, never an
+        // argument error the caller could correct.
+        assertThrows(GeneralSecurityException::class.java) {
             TapAuthCrypto.parseAndVerifyAuthRequest(wrapper, server[1], 1, ED25519)
         }
-        assertThrows(IllegalArgumentException::class.java) {
+        assertThrows(GeneralSecurityException::class.java) {
             TapAuthCrypto.parseAndVerifyAuthRequest(wrapper, server[1], PROTOCOL_V2, 99)
         }
     }

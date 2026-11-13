@@ -74,14 +74,56 @@ Both return the packet **already signed and AEAD-encrypted**; Kotlin must not wr
 
 ### 1.8 Exceptions
 
+The class is not cosmetic: Kotlin's call sites catch `GeneralSecurityException` to
+reject a peer's message (log and drop, keep the pairing) and reserve
+`IllegalArgumentException` for a value it built wrongly itself. A value the caller
+only *reads from persisted pairing state* is therefore a security failure, never an
+argument error — it cannot be validated at the call site, and it means the stored
+pairing is unusable.
+
 | `JniError` (`ops.rs`) | Thrown Java class | Raised for |
 | :--- | :--- | :--- |
-| `Argument` | `java.lang.IllegalArgumentException` | Wrong lengths, unsupported version or algorithm id, unknown handle, foreign-session `PairingPacket` |
-| `Security` | `java.security.GeneralSecurityException` | Bad Ed25519 signature, AEAD/AAD failure, algorithm downgrade, QR-`pk` mismatch |
+| `Argument` | `java.lang.IllegalArgumentException` | Malformed input the Kotlin caller builds: wrong key/challenge/session lengths, a null array, an unsupported caller-chosen negotiation algorithm id (`SymmetricAlgorithm` / `HashAlgorithm`), an unknown pairing handle, a `PairingPacket` for another session, an unknown `PairingAbortReason` id |
+| `Security` | `java.security.GeneralSecurityException` | Anything that makes the peer or the stored pairing untrustworthy: bad Ed25519 signature, AEAD/AAD failure, algorithm downgrade, an unsupported **persisted** `protocolVersion` or `SignatureAlgorithm` id, QR-`pk` mismatch, wrong payload type or wrapper version |
 | `Io` | `java.io.IOException` | Bytes that are not a decodable protobuf message |
 | `State` | `java.lang.IllegalStateException` | VM/JNI failure, poisoned session table, DTO construction failure |
 
 After throwing, a function returns `0`, `false` or `null` and makes no further JNI calls; Kotlin checks the return value and handles the exception.
+
+### 1.9 Exception Per Entry Point
+
+One row per failure mode a Kotlin caller can actually hit; the Rust throw site is in
+`shared/src/jni_api/ops.rs`.
+
+| Entry point | Failure mode | Throws |
+| :--- | :--- | :--- |
+| `decryptEncryptedPacket` | `EncryptedPacket` is not decodable | `IOException` |
+| `decryptEncryptedPacket` | `temporal_identifier` is not 16 bytes | `IllegalArgumentException` |
+| `decryptEncryptedPacket` | `expectedSymAlg` is not a supported id | `IllegalArgumentException` |
+| `decryptEncryptedPacket` | `encryption_algorithm` ≠ the pinned algorithm, or the AEAD tag/AAD fails | `GeneralSecurityException` |
+| `extractTemporalIdentifier` | packet is not decodable / identifier is not 16 bytes | `IOException` / `IllegalArgumentException` |
+| `determineMessageType` | wrapper is not decodable | `IOException` |
+| `parseAndVerifyAuthRequest`, `parseAndVerifyGrantConfirmation`, `parseAndVerifyAuthCancel` | wrapper is not decodable | `IOException` |
+| same three | `protocolVersion` ≠ 2 | `GeneralSecurityException` |
+| same three | `expectedSignatureAlgorithm` is not an id this build implements | `GeneralSecurityException` |
+| same three | bad Ed25519 signature, wrapper `version` ≠ 2, wrong `payload_type`, payload is the wrong message | `GeneralSecurityException` |
+| same three | `challenge` is not 32 bytes | `IllegalArgumentException` |
+| `createGrantWrapperMessage`, `createDenialWrapperMessage` | challenge/CSK length or an unsupported symmetric/hash id | `IllegalArgumentException` |
+| `generateTemporalIdentifier`, `generateBleTemporalIdentifier` | unsupported hash id, negative window | `IllegalArgumentException` |
+| `verifyTemporalIdentifier` | unsupported hash id, identifier neither 16 nor 10 bytes | `IllegalArgumentException` |
+| `deriveBlePairingAdvId` | `sessionId` is not 16 bytes | `IllegalArgumentException` |
+| `pairingServerSessionCreate` | session id not 16 bytes, private key not 32 bytes | `IllegalArgumentException` |
+| every handle entry point except `pairingServerSessionFree` | unknown handle, or a `PairingPacket` whose `session_id` is another session's | `IllegalArgumentException` |
+| `pairingServerSessionFree` | unknown handle (already freed, or never created) | `IllegalArgumentException` |
+| `pairingVerifyResponse` | packet not decodable, not a `PairingResponse`, or `expectedQrPk` not 32 bytes | `IllegalArgumentException` |
+| `pairingVerifyResponse` | QR-`pk` mismatch, bad signature, algorithm mismatch/downgrade | `GeneralSecurityException` |
+| `pairingProcessConfirmClient` | packet not decodable, not a `PairingConfirmClient`, provisioned CSK not 32 bytes | `IllegalArgumentException` |
+| `pairingProcessConfirmClient` | AEAD/transcript failure on the provisioned payload | `GeneralSecurityException` |
+| `pairingCreateConfirmServer` | no session keys yet (no verified `PairingResponse`) | `GeneralSecurityException` |
+| `pairingVerifyAbort` | packet not decodable or not a `PairingAbort` | `IllegalArgumentException` |
+| `pairingVerifyAbort` | tag-less abort before any key exists | returns `false` (no throw) |
+| `pairingVerifyAbort` | tag-less or wrong-tag abort once keys exist | `GeneralSecurityException` |
+| any entry point | DTO construction / JNI/VM failure | `IllegalStateException` |
 
 ## 2. Data Classes Built by `NewObject`
 

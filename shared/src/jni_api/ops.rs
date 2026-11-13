@@ -60,7 +60,8 @@ pub(crate) const BLE_TEMPORAL_ID_LEN: usize = 10;
 /// `State` → `java.lang.IllegalStateException`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JniError {
-    /// Malformed caller input: wrong lengths, unsupported version or algorithm id.
+    /// Malformed caller input: wrong lengths, an unsupported caller-chosen
+    /// negotiation algorithm id, or an unknown handle.
     Argument(String),
     /// Signature, AEAD, algorithm-binding or protocol-integrity failure.
     Security(String),
@@ -168,9 +169,15 @@ pub(crate) struct VerifiedPairingResponse {
 // ---------------------------------------------------------------------------
 
 /// Require the caller's pinned protocol version to be v2.
+///
+/// `protocol_version` is the paired Client's **persisted** `protocolVersion`, the
+/// same record field [`signature_algorithm`] is drawn from, so an unsupported value
+/// is reported as a security failure rather than a caller-argument error: the stored
+/// pairing cannot be used, and Kotlin must reject the request instead of treating it
+/// as a programming mistake on its own side.
 fn check_protocol_version(protocol_version: i32) -> Result<(), JniError> {
     if protocol_version != PROTOCOL_VERSION_V2 as i32 {
-        return Err(JniError::Argument(format!(
+        return Err(JniError::Security(format!(
             "unsupported protocol version {protocol_version} (this build speaks only v{PROTOCOL_VERSION_V2})"
         )));
     }
@@ -1215,6 +1222,9 @@ mod tests {
     /// The caller's protocol version is pinned to v2.
     /// The defect this catches: a v1 (or future) frame accepted because the version
     /// argument is ignored, i.e. a compatibility branch sneaking back in.
+    /// It is a `Security` failure, not an `Argument` one: the value is the paired
+    /// Client's persisted `protocolVersion`, so a value this build cannot speak means
+    /// the stored pairing is unusable.
     #[test]
     fn parse_auth_request_rejects_other_protocol_versions() {
         let keypair = Ed25519KeyPair::generate().unwrap();
@@ -1229,7 +1239,7 @@ mod tests {
                         version,
                         ED25519
                     ),
-                    Err(JniError::Argument(_))
+                    Err(JniError::Security(message)) if message.contains("protocol version")
                 ),
                 "protocol version {version} must be refused"
             );
