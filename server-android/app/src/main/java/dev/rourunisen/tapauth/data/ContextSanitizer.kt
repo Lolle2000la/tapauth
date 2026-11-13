@@ -50,12 +50,19 @@ object ContextSanitizer {
         }
     }
 
-    /** Collapse every whitespace run to a single space and drop leading/trailing whitespace. */
+    /**
+     * Collapse every whitespace run to a single space and drop leading/trailing whitespace.
+     *
+     * Whitespace is classified as ASCII space or a Unicode space separator/line/paragraph
+     * separator, matching Rust's `char::is_whitespace` for the characters that reach here:
+     * `Char.isWhitespace` maps to `Character.isWhitespace`, which excludes `U+00A0`, `U+2007` and
+     * `U+202F`, so a non-breaking space would otherwise survive into the prompt.
+     */
     private fun collapseWhitespace(value: String): String {
         val out = StringBuilder(value.length)
         var pendingSpace = false
         for (c in value) {
-            if (c.isWhitespace()) {
+            if (isWhitespace(c)) {
                 pendingSpace = true
                 continue
             }
@@ -65,6 +72,11 @@ object ContextSanitizer {
         }
         return out.toString()
     }
+
+    /**
+     * `codePoint == 0x20 || Character.isSpaceChar(codePoint)`, per Rust's `char::is_whitespace`.
+     */
+    private fun isWhitespace(c: Char): Boolean = c.code == 0x20 || Character.isSpaceChar(c.code)
 
     private fun truncateUtf8(value: String, maxBytes: Int): String {
         if (value.toByteArray(Charsets.UTF_8).size <= maxBytes) return value

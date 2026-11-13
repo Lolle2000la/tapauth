@@ -892,9 +892,9 @@ class AuthenticationService : Service() {
                 processName = authRequest.processName,
                 commandPreview = authRequest.commandPreview,
                 ttyPresent = authRequest.ttyPresent,
-            ) { approved, signedChallenge, explicitDenial ->
+            ) { approved, challenge, explicitDenial ->
                 // Step 6: Create and send authentication grant
-                if (approved && signedChallenge != null) {
+                if (approved && challenge != null) {
                     Log.d(TAG, "Auth request approved, creating encrypted grant")
                     try {
                         // Get server private key for signing
@@ -905,19 +905,22 @@ class AuthenticationService : Service() {
                             "Signing grant with server public key (trunc): ${publicKey.take(8).joinToString("") { "%02x".format(it) }}…",
                         )
 
-                        // Create WrapperMessage containing AuthenticationGrant (now properly
-                        // signed)
+                        // Create WrapperMessage containing AuthenticationGrant. v2 signs only the
+                        // wrapper, and the grant carries the raw 32-byte challenge.
                         val grantWrapperMessage =
                             dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
-                                signedChallenge,
+                                challenge,
                                 privateKey,
                             )
 
-                        // Create proper EncryptedPacket per specification
+                        // Create proper EncryptedPacket per specification, with the algorithms
+                        // this pairing negotiated (the AAD binds both).
                         val encryptedPacketBytes =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 device.csk,
                                 grantWrapperMessage,
+                                device.symmetricAlgorithm,
+                                device.hashAlgorithm,
                             )
 
                         // Send initial response
@@ -972,11 +975,14 @@ class AuthenticationService : Service() {
                                 privateKey,
                             )
 
-                        // Create proper EncryptedPacket per specification
+                        // Create proper EncryptedPacket per specification, with the algorithms
+                        // this pairing negotiated (the AAD binds both).
                         val encryptedPacketBytes =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 device.csk,
                                 denialWrapperMessage,
+                                device.symmetricAlgorithm,
+                                device.hashAlgorithm,
                             )
 
                         // Send initial denial response

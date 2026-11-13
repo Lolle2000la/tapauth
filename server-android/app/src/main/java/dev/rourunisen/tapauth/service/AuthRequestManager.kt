@@ -12,6 +12,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.KeypairRepository
@@ -67,7 +68,7 @@ class AuthRequestManager private constructor() {
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
         val callback:
-            (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
+            (Boolean, ByteArray?, Boolean) -> Unit, // (approved, challenge, explicitDenial)
         val appContext: android.content.Context,
         val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
@@ -93,7 +94,7 @@ class AuthRequestManager private constructor() {
         processName: String = "",
         commandPreview: String = "",
         ttyPresent: Boolean = false,
-        callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
+        callback: (approved: Boolean, challenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
         val notificationId = notificationIdFor(challenge)
@@ -234,11 +235,22 @@ class AuthRequestManager private constructor() {
             val sessionTimeoutMs = config.sessionTimeoutSeconds * 1000
             val currentTime = System.currentTimeMillis()
             val timeElapsed = currentTime - timestamp
-            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
+            // `setTimeoutAfter(0)` means "no timeout", and the cleanup delay below would be
+            // skipped, leaving a permanent ongoing notification; a request already past its
+            // session deadline therefore gets the shortest real timeout instead.
+            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(1L)
 
             // §3.3: the primary header stays `username@hostname`; the secondary line below it is
             // the re-sanitized caller context, capped at two lines with an end ellipsis.
-            val secondaryLine = contextLine(authRequest)
+            val secondaryLine = AuthContextDisplay.contextLine(authRequest)
+            // The identity strings are peer-chosen (`client_hostname` comes from the provision
+            // payload), so the header is sanitized too rather than rendered verbatim.
+            val displayUsername =
+                ContextSanitizer.sanitize(username, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayHostname =
+                ContextSanitizer.sanitize(hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayDeviceName =
+                ContextSanitizer.sanitize(deviceName, AuthContextDisplay.IDENTITY_MAX_BYTES)
             val contentViews =
                 RemoteViews(
                         context.packageName,
@@ -247,7 +259,7 @@ class AuthRequestManager private constructor() {
                     .apply {
                         val titleId = dev.rourunisen.tapauth.R.id.notification_title
                         val contextId = dev.rourunisen.tapauth.R.id.notification_context
-                        setTextViewText(titleId, "$username@$hostname")
+                        setTextViewText(titleId, "$displayUsername@$displayHostname")
                         if (secondaryLine.isEmpty()) {
                             setViewVisibility(contextId, View.GONE)
                         } else {
@@ -266,7 +278,7 @@ class AuthRequestManager private constructor() {
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
-                    .setContentText("${deviceName}: ${username}@${hostname}")
+                    .setContentText("$displayDeviceName: $displayUsername@$displayHostname")
                     .setCustomContentView(contentViews)
                     // Clone so the collapsed and expanded views are distinct instances; both are
                     // this same two-row layout, so the summary never loses the context line.
@@ -338,16 +350,14 @@ class AuthRequestManager private constructor() {
 
             // Schedule state cleanup on timeout to mirror setTimeoutAfter
             try {
-                if (remainingTimeout > 0) {
-                    scope.launch {
-                        try {
-                            delay(remainingTimeout + 250)
-                            if (pendingRequests.containsKey(requestId)) {
-                                Log.d(TAG, "Timeout reached; cancelling pending request $requestId")
-                                cancelRequest(requestId)
-                            }
-                        } catch (_: Exception) {}
-                    }
+                scope.launch {
+                    try {
+                        delay(remainingTimeout + 250)
+                        if (pendingRequests.containsKey(requestId)) {
+                            Log.d(TAG, "Timeout reached; cancelling pending request $requestId")
+                            cancelRequest(requestId)
+                        }
+                    } catch (_: Exception) {}
                 }
             } catch (_: Exception) {}
         } catch (e: Exception) {
@@ -367,7 +377,7 @@ class AuthRequestManager private constructor() {
     fun handleResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
         val pending = pendingRequests.remove(requestId)
@@ -395,7 +405,7 @@ class AuthRequestManager private constructor() {
             }
 
             // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
-            scope.launch { pending.callback(approved, signedChallenge, explicitDenial) }
+            scope.launch { pending.callback(approved, challenge, explicitDenial) }
             // Cancel the persistent notification
             try {
                 val notificationId = notificationIdFor(pending.authRequest.challenge)
@@ -622,55 +632,6 @@ class AuthRequestManager private constructor() {
         /** Delay in ms before debug auto-approval fires when no biometrics are enrolled. */
         const val DEBUG_AUTO_APPROVE_DELAY_MS = 1000L
 
-        /** Byte budget for the secondary context line under the notification header. */
-        const val CONTEXT_LINE_MAX_BYTES = 128
-
-        /** Byte budget for the context paragraph inside the biometric prompt. */
-        const val PROMPT_CONTEXT_MAX_BYTES = 256
-
-        private const val TTY_TAG = "tty"
-        private const val CONTEXT_SEPARATOR = " · "
-
-        /**
-         * Secondary context line rendered under the primary `username@hostname` header (§3.3).
-         *
-         * The Client's `command_preview`/`process_name`/`pam_service` are untrusted, so every part
-         * is re-sanitized with [ContextSanitizer] here and the assembled line is sanitized again —
-         * that bounds the whole line to [maxBytes] and re-adds the end ellipsis after the join.
-         *
-         * Degradation order: the command preview when present, otherwise `pamService ·
-         * processName`; the `tty` indicator is prepended so truncation cannot hide it. Returns ""
-         * when the Client sent no context at all, in which case the caller renders nothing extra.
-         */
-        fun contextLine(authRequest: AuthRequest, maxBytes: Int = CONTEXT_LINE_MAX_BYTES): String {
-            val command = ContextSanitizer.sanitize(authRequest.commandPreview, maxBytes)
-            val parts = ArrayList<String>(3)
-            if (command.isNotEmpty()) {
-                parts.add(command)
-            } else {
-                // Degrade to `pamService · processName` when the Client sent no command line.
-                val pamService = ContextSanitizer.sanitize(authRequest.pamService)
-                val processName = ContextSanitizer.sanitize(authRequest.processName)
-                if (pamService.isNotEmpty()) parts.add(pamService)
-                if (processName.isNotEmpty()) parts.add(processName)
-            }
-            if (parts.isEmpty()) return ""
-            if (authRequest.ttyPresent) parts.add(0, TTY_TAG)
-            return ContextSanitizer.sanitize(parts.joinToString(CONTEXT_SEPARATOR), maxBytes)
-        }
-
-        /**
-         * Description shown by both biometric prompts: one sanitized context paragraph followed by
-         * the device/transport line that was already there. Both the in-app prompt and the
-         * notification-launched one render exactly this string, so they cannot drift apart.
-         */
-        fun promptDescription(authRequest: AuthRequest): String {
-            val deviceLine =
-                "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}"
-            val contextText = contextLine(authRequest, PROMPT_CONTEXT_MAX_BYTES)
-            return if (contextText.isEmpty()) deviceLine else "$contextText\n\n$deviceLine"
-        }
-
         /**
          * E2E-build-only auto-approval used when no biometrics are enrolled.
          *
@@ -701,36 +662,32 @@ class AuthRequestManager private constructor() {
         }
 
         /**
-         * Signs the auth challenge using the device's private key and submits an approved response
-         * through AuthRequestManager.
+         * Submits an approved response for [authRequest] through AuthRequestManager.
+         *
+         * v2 signs only the WrapperMessage: Rust computes the single Ed25519 signature over the
+         * grant (via `createGrantWrapperMessage`), so the raw 32-byte challenge is what the
+         * callback must carry. Signing it here as well would replace the challenge with a 64-byte
+         * signature and every approval would fail verification.
          */
         fun approveRequest(context: Context, authRequest: AuthRequest) {
             try {
-                val keypairRepo = KeypairRepository(context)
-                val privateKey = keypairRepo.getPrivateKey()
                 Log.d(
                     TAG,
-                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                    "Approving challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
                 )
-                val signedChallenge =
-                    dev.rourunisen.tapauth.crypto.signData(
-                        privateKey,
-                        authRequest.challenge,
-                    )
-                Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = true,
-                        signedChallenge = signedChallenge,
+                        challenge = authRequest.challenge,
                     )
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to sign challenge", e)
+                Log.e(TAG, "Failed to submit approval", e)
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = false,
-                        signedChallenge = null,
+                        challenge = null,
                         explicitDenial = false,
                     )
             }

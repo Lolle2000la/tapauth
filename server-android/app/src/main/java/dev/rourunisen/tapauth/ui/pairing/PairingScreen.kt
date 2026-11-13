@@ -21,7 +21,11 @@ import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.network.PairingSession
 import dev.rourunisen.tapauth.network.PairingTransport
 import dev.rourunisen.tapauth.network.PairingUpdate
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+/** How long a deferred back-out waits for the session's terminal update before leaving anyway. */
+private const val EXIT_FALLBACK_MS = 1_500L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -45,6 +49,10 @@ fun PairingScreen(
         }
     // Terminal outcomes reach the host exactly once, no matter which path reports them first.
     var terminalReported by remember(pairingUrl, attempt) { mutableStateOf(false) }
+    // Set while a back-out waits for the abort to be written; the screen leaves on the terminal
+    // update (or the fallback below), never before.
+    var pendingExit by remember(pairingUrl, attempt) { mutableStateOf(false) }
+    var exited by remember(pairingUrl, attempt) { mutableStateOf(false) }
 
     val reportComplete: () -> Unit = {
         if (!terminalReported) {
@@ -74,17 +82,39 @@ fun PairingScreen(
 
     DisposableEffect(pairingUrl, attempt) { onDispose { session.close() } }
 
-    // Backing out after the SAS was shown counts as rejecting it, so the peer learns about the
-    // abort instead of sitting on a code nobody will confirm.
-    val leavePairing: () -> Unit = {
-        if (update is PairingUpdate.AwaitingSas) {
-            session.rejectSas()
+    // Leaving the screen disposes it, and disposal closes the session — so a back-out during the
+    // SAS must not navigate immediately or the reject's `PairingAbort(USER_REJECTED_SAS)` is
+    // cancelled before it is written and the desktop never learns. It records the decision, then
+    // leaves when the terminal update reports the abort is out; the fallback below guarantees the
+    // user can never be stuck here.
+    val navigateAway: () -> Unit = {
+        if (!exited) {
+            exited = true
             if (!terminalReported) {
                 terminalReported = true
                 onPairingFailed(context.getString(R.string.pairing_cancelled_message))
             }
+            onBack()
         }
-        onBack()
+    }
+
+    val leavePairing: () -> Unit = {
+        if (update is PairingUpdate.AwaitingSas && !pendingExit) {
+            pendingExit = true
+            session.rejectSas()
+        } else {
+            navigateAway()
+        }
+    }
+
+    if (pendingExit) {
+        LaunchedEffect(update) {
+            if (update is PairingUpdate.Cancelled || update is PairingUpdate.Failed) navigateAway()
+        }
+        LaunchedEffect(Unit) {
+            delay(EXIT_FALLBACK_MS)
+            navigateAway()
+        }
     }
 
     BackHandler(onBack = leavePairing)

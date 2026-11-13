@@ -29,7 +29,7 @@ class AuthActionReceiver : BroadcastReceiver() {
                 manager.handleResponse(
                     reqId,
                     approved = false,
-                    signedChallenge = null,
+                    challenge = null,
                     explicitDenial = true,
                 )
             }
@@ -77,7 +77,7 @@ class AuthActionReceiver : BroadcastReceiver() {
                             .handleResponse(
                                 authRequest.requestId,
                                 approved = false,
-                                signedChallenge = null,
+                                challenge = null,
                                 explicitDenial = true,
                             )
                     } catch (e: Exception) {

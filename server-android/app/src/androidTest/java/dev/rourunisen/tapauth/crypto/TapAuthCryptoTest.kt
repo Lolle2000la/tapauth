@@ -346,7 +346,13 @@ class TapAuthCryptoTest {
         val challenge = ByteArray(32) { (it + 32).toByte() }
 
         val wrapper = TapAuthCrypto.createGrantWrapperMessage(challenge, server.privateKey)
-        val packet = createEncryptedPacket(csk, wrapper)
+        val packet =
+            createEncryptedPacket(
+                csk,
+                wrapper,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
 
         val decrypted = decryptEncryptedPacket(packet, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
         assertArrayEquals("Round-tripped wrapper must be byte-identical", wrapper, decrypted)
@@ -363,7 +369,13 @@ class TapAuthCryptoTest {
         val wrongCsk = ByteArray(32) { (it + 1).toByte() }
         val wrapper = ByteArray(10) { 0x42 }
 
-        val packet = createEncryptedPacket(csk, wrapper)
+        val packet =
+            createEncryptedPacket(
+                csk,
+                wrapper,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
 
         assertThrows(GeneralSecurityException::class.java) {
             decryptEncryptedPacket(packet, wrongCsk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
@@ -378,7 +390,13 @@ class TapAuthCryptoTest {
                 ByteArray(32) { it.toByte() },
                 Ed25519Keypair.generate().privateKey,
             )
-        val packet = createEncryptedPacket(csk, wrapper)
+        val packet =
+            createEncryptedPacket(
+                csk,
+                wrapper,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
 
         val temporalId = TapAuthCrypto.extractTemporalIdentifier(packet)
         val offset = indexOfSubsequence(packet, temporalId)
@@ -403,7 +421,13 @@ class TapAuthCryptoTest {
     fun testDecryptEncryptedPacketRejectsAlgorithmDowngrade() {
         val csk = ByteArray(32) { it.toByte() }
         val wrapper = ByteArray(10) { 0x42 }
-        val packet = createEncryptedPacket(csk, wrapper)
+        val packet =
+            createEncryptedPacket(
+                csk,
+                wrapper,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
 
         val algorithmOffset = encryptionAlgorithmOffset(packet)
         assertEquals(
@@ -427,7 +451,13 @@ class TapAuthCryptoTest {
     fun testParseEncryptedPacketStructureMatchesExtractedIdentifier() {
         val csk = ByteArray(32) { it.toByte() }
         val wrapper = ByteArray(10) { 0x42 }
-        val packet = createEncryptedPacket(csk, wrapper)
+        val packet =
+            createEncryptedPacket(
+                csk,
+                wrapper,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
 
         val info = TapAuthCrypto.parseEncryptedPacketStructure(packet)
 
@@ -566,8 +596,10 @@ class TapAuthCryptoTest {
                 server.privateKey,
             )
 
-        // Valid signature, wrong payload type: the parser must not hand back a "confirmation".
-        assertThrows(Exception::class.java) {
+        // Valid signature, wrong payload type: the parser must not hand back a "confirmation", and
+        // the rejection must be the documented "this is not a GrantConfirmation" IOException rather
+        // than an arbitrary failure such as a parser NPE.
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.parseAndVerifyGrantConfirmation(denial, server.publicKey, PROTOCOL_V2)
         }
     }
@@ -579,11 +611,12 @@ class TapAuthCryptoTest {
 
         // No JNI entry builds an AuthenticationRequest or AuthenticationCancel wrapper (the Client
         // role's request builder lives in shared/src/protocol/messages.rs and is not exported), so
-        // these two parsers can only be proved to reject a signature-valid wrapper of another type.
-        assertThrows(Exception::class.java) {
+        // these two parsers can only be proved to reject a signature-valid wrapper of another type,
+        // as the documented "not an AuthenticationRequest/Cancel" IOException.
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.parseAndVerifyAuthRequest(grant, server.publicKey, PROTOCOL_V2)
         }
-        assertThrows(Exception::class.java) {
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.parseAndVerifyAuthCancel(grant, server.publicKey, PROTOCOL_V2)
         }
     }
@@ -592,7 +625,7 @@ class TapAuthCryptoTest {
     fun testParseAndVerifyAuthRequestRejectsGarbage() {
         val server = Ed25519Keypair.generate()
 
-        assertThrows(Exception::class.java) {
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.parseAndVerifyAuthRequest(
                 ByteArray(12) { 0xFF.toByte() },
                 server.publicKey,
@@ -733,8 +766,10 @@ class TapAuthCryptoTest {
     fun testPairingVerifyResponseRejectsGarbage() {
         val fixture = PairingFixture()
 
-        // No JNI entry builds a valid PairingResponse, so only the rejection path is reachable.
-        assertThrows(Exception::class.java) {
+        // No JNI entry builds a valid PairingResponse, so only the rejection path is reachable. A
+        // packet that is not a PairingPacket at all is the documented IOException, not just "any
+        // exception".
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.pairingVerifyResponse(
                 fixture.sessionId,
                 ByteArray(64) { 0xFF.toByte() },
@@ -750,7 +785,7 @@ class TapAuthCryptoTest {
 
         // Our own PairingInit is a well-formed PairingPacket of the wrong role: accepting it as the
         // Client's response would derive keys from the Server's own ephemeral key.
-        assertThrows(Exception::class.java) {
+        assertThrows(IOException::class.java) {
             TapAuthCrypto.pairingVerifyResponse(
                 fixture.sessionId,
                 fixture.initPacket,
@@ -766,6 +801,7 @@ class TapAuthCryptoTest {
 
         val packet =
             TapAuthCrypto.pairingEncryptProvision(
+                fixture.sessionId,
                 fixture.kC2s,
                 fixture.transcriptHash,
                 fixture.csk,
@@ -792,6 +828,7 @@ class TapAuthCryptoTest {
         // A second encryption with the same inputs (fresh nonce) must decrypt identically.
         val secondPacket =
             TapAuthCrypto.pairingEncryptProvision(
+                fixture.sessionId,
                 fixture.kC2s,
                 fixture.transcriptHash,
                 fixture.csk,
@@ -821,6 +858,7 @@ class TapAuthCryptoTest {
         val fixture = PairingFixture()
         val packet =
             TapAuthCrypto.pairingEncryptProvision(
+                fixture.sessionId,
                 fixture.kC2s,
                 fixture.transcriptHash,
                 fixture.csk,
@@ -857,6 +895,7 @@ class TapAuthCryptoTest {
 
         val packet =
             TapAuthCrypto.pairingCreateConfirmServer(
+                fixture.sessionId,
                 fixture.kS2c,
                 fixture.transcriptHash,
                 fixture.serverEd25519.privateKey,
@@ -877,6 +916,7 @@ class TapAuthCryptoTest {
         val otherCsk = ByteArray(32) { (it * 3 + 1).toByte() }
         val otherPacket =
             TapAuthCrypto.pairingCreateConfirmServer(
+                fixture.sessionId,
                 fixture.kS2c,
                 fixture.transcriptHash,
                 fixture.serverEd25519.privateKey,
@@ -899,6 +939,7 @@ class TapAuthCryptoTest {
         val fixture = PairingFixture()
         val packet =
             TapAuthCrypto.pairingCreateConfirmServer(
+                fixture.sessionId,
                 fixture.kS2c,
                 fixture.transcriptHash,
                 fixture.serverEd25519.privateKey,
@@ -921,6 +962,7 @@ class TapAuthCryptoTest {
         val fixture = PairingFixture()
         val packet =
             TapAuthCrypto.pairingCreateConfirmServer(
+                fixture.sessionId,
                 fixture.kS2c,
                 fixture.transcriptHash,
                 fixture.serverEd25519.privateKey,
@@ -954,6 +996,7 @@ class TapAuthCryptoTest {
 
         val rejected =
             TapAuthCrypto.pairingCreateAbort(
+                fixture.sessionId,
                 fixture.kC2s,
                 fixture.transcriptHash,
                 TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
@@ -966,6 +1009,7 @@ class TapAuthCryptoTest {
 
         val mismatch =
             TapAuthCrypto.pairingCreateAbort(
+                fixture.sessionId,
                 fixture.kS2c,
                 fixture.transcriptHash,
                 TapAuthCrypto.PAIRING_ABORT_KEY_MISMATCH,
@@ -978,10 +1022,50 @@ class TapAuthCryptoTest {
     }
 
     @Test
+    fun testPairingAbortRejectsTheOppositeDirectionKey() {
+        val fixture = PairingFixture()
+
+        // `K_c2s` carries Client -> Server aborts, `K_s2c` Server -> Client ones
+        // (`cryptography-specification.md` §2.2). A swapped direction must not verify.
+        val fromClient =
+            TapAuthCrypto.pairingCreateAbort(
+                fixture.sessionId,
+                fixture.kC2s,
+                fixture.transcriptHash,
+                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
+            )
+        val fromServer =
+            TapAuthCrypto.pairingCreateAbort(
+                fixture.sessionId,
+                fixture.kS2c,
+                fixture.transcriptHash,
+                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
+            )
+
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.pairingVerifyAbort(fixture.kS2c, fixture.transcriptHash, fromClient)
+        }
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.pairingVerifyAbort(fixture.kC2s, fixture.transcriptHash, fromServer)
+        }
+        // Each still verifies under its own direction, so the rejection above is the direction and
+        // not a broken packet.
+        assertEquals(
+            TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
+            TapAuthCrypto.pairingVerifyAbort(fixture.kC2s, fixture.transcriptHash, fromClient),
+        )
+        assertEquals(
+            TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
+            TapAuthCrypto.pairingVerifyAbort(fixture.kS2c, fixture.transcriptHash, fromServer),
+        )
+    }
+
+    @Test
     fun testPairingVerifyAbortRejectsTamperedTagAndWrongTranscript() {
         val fixture = PairingFixture()
         val abort =
             TapAuthCrypto.pairingCreateAbort(
+                fixture.sessionId,
                 fixture.kC2s,
                 fixture.transcriptHash,
                 TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
@@ -1092,20 +1176,26 @@ private class PairingFixture {
     val transcriptHash: ByteArray = ByteArray(32) { (it * 13 + 1).toByte() }
 
     /**
-     * Raw ECDH secret between the two ephemeral X25519 keys, used as both `K_c2s` and `K_s2c`.
+     * Raw ECDH secret between the two ephemeral X25519 keys.
      *
-     * Production derives the two directional keys from this secret through
+     * Production derives `K_c2s` and `K_s2c` from this secret through
      * `derive_pairing_keys_and_sas(secret, H)`, which the JNI exposes only through
      * `pairingVerifyResponse` — unreachable without a real `PairingResponse`. Using the secret
      * itself still exercises the AEAD / AAD wiring around the directional keys; the HKDF split is
-     * covered by the Rust unit tests, and key-direction confusion is covered by the wrong-key
-     * assertions instead.
+     * covered by the Rust unit tests.
      */
     val sharedSecret: ByteArray =
         TapAuthCrypto.keyExchange(clientX25519.privateKey, serverX25519.publicKey)
 
-    val kC2s: ByteArray = sharedSecret
-    val kS2c: ByteArray = sharedSecret
+    /**
+     * Directional keys, kept **distinct** because production derives two different HKDF expansions.
+     *
+     * Equal keys would let a swapped direction pass unnoticed: `PairingSession` tags an outgoing
+     * abort with `K_s2c` and verifies an incoming one with `K_c2s`, so
+     * [testPairingAbortRejectsTheOppositeDirectionKey] relies on the two diverging.
+     */
+    val kC2s: ByteArray = sharedSecret.withXorAt(0, 0x01)
+    val kS2c: ByteArray = sharedSecret.withXorAt(0, 0x02)
 }
 
 /** Index of [needle] inside this array, or -1. */

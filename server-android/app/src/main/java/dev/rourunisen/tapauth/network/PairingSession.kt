@@ -9,7 +9,6 @@ import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import dev.rourunisen.tapauth.data.PairingUrl
-import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.security.GeneralSecurityException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -79,7 +78,8 @@ sealed class PairingUpdate {
  * instead of a QR URL and therefore has no `pk` to pin. In that case an all-zero 32-byte
  * `expectedClientX25519PublicKey` is passed to [TapAuthCrypto.pairingVerifyResponse], and Rust must
  * interpret an all-zero expected key as "QR pk unavailable, skip the constant-time comparison".
- * This state is unreachable from [PairingUrl.parse], which requires a 64-hex `pk`.
+ * This state is unreachable from [PairingUrl.parse], which requires a 64-hex `pk` and rejects the
+ * all-zero sentinel outright.
  *
  * ### Threading
  *
@@ -99,9 +99,6 @@ class PairingSession(
     companion object {
         private const val TAG = "PairingSession"
 
-        /** `PairingPacket.version` for protocol v2. */
-        private const val PAIRING_VERSION = 2
-
         private const val SESSION_ID_BYTES = 16
         private const val CLIENT_X25519_KEY_BYTES = 32
 
@@ -113,6 +110,12 @@ class PairingSession(
 
         /** `PairingInit.server_device_name` is capped at 64 UTF-8 bytes by the proto. */
         private const val MAX_SERVER_NAME_BYTES = 64
+
+        /**
+         * Cap for the peer-chosen `client_hostname` before it is persisted as
+         * [PairedDevice.displayName] and rendered in the biometric prompt.
+         */
+        private const val MAX_CLIENT_NAME_BYTES = 64
 
         private const val DEFAULT_SERVER_NAME = "Android Device"
 
@@ -148,6 +151,15 @@ class PairingSession(
 
         /** How long the phone waits for `PairingConfirmClient` after the user approved the SAS. */
         private const val CONFIRM_TIMEOUT_MS = 120_000L
+
+        /**
+         * How long the SAS screen may stay up unanswered before the session expires.
+         *
+         * This is the pairing-session lifetime rather than a UI deadline: the user has already
+         * scanned the QR code, so the ephemeral X25519 key, the GATT link and the UDP socket stay
+         * bound to a live session until they answer or this bound fires.
+         */
+        private const val SAS_APPROVAL_TIMEOUT_MS = 180_000L
 
         /** `PairingConfirmServer` retransmissions over UDP, relative to the first send. */
         private const val CONFIRM_RETRANSMIT_1_MS = 100L
@@ -190,8 +202,15 @@ class PairingSession(
 
     @Volatile private var onUpdate: ((PairingUpdate) -> Unit)? = null
 
-    /** Verified session state of the winning transport, kept for [zeroizeEphemeralState]. */
-    @Volatile private var activeSession: Candidate? = null
+    /**
+     * Every verified `PairingResponse` this session derived a key from.
+     *
+     * A [Candidate] normally reaches [zeroizeEphemeralState] through the winning transport, but a
+     * loser — or a winner whose hand-off races a `close()` — can be dropped before anything else
+     * holds a reference to it. Registering them here makes "zeroized on every exit path" structural
+     * instead of a per-branch argument.
+     */
+    private val candidates = mutableListOf<Candidate>()
 
     /**
      * A frame that arrived while the SAS screen was up and was not an abort. It cannot be consumed
@@ -207,11 +226,14 @@ class PairingSession(
 
     /**
      * Main-thread dispatcher for [onUpdate], or null on a plain JVM (unit tests) where no Main
-     * dispatcher is installed.
+     * dispatcher module is installed.
+     *
+     * `Dispatchers.Main.immediate` does **not** throw without a Main provider — it hands back a
+     * `MissingMainCoroutineDispatcher` whose *dispatch* throws — so the only honest probe is a
+     * trivial dispatch. [resolveMainDispatcher] performs it once and memoizes the answer.
      */
-    private val mainDispatcher: CoroutineDispatcher? by lazy {
-        runCatching { Dispatchers.Main.immediate }.getOrNull()
-    }
+    @Volatile private var mainDispatcherResolved = false
+    @Volatile private var mainDispatcher: CoroutineDispatcher? = null
 
     /**
      * Run the pairing session, reporting progress through [onUpdate].
@@ -261,7 +283,6 @@ class PairingSession(
 
             val locked = raceForResponse(init) ?: return
             val session = locked.session
-            activeSession = session
 
             emit(PairingUpdate.AwaitingSas(session.sas, locked.transport))
 
@@ -274,6 +295,10 @@ class PairingSession(
                 }
                 is Approval.Aborted -> {
                     emitFailure(abortMessage(approval.reason))
+                    return
+                }
+                is Approval.Expired -> {
+                    emitFailure(abortMessage(REASON_SESSION_EXPIRED))
                     return
                 }
                 is Approval.Cancelled -> {
@@ -401,6 +426,7 @@ class PairingSession(
         val link = UdpPairingLink(PairingClient(pairingUrl))
         registerLink(link)
         var won = false
+        var accepted: Candidate? = null
         try {
             try {
                 link.open()
@@ -418,12 +444,18 @@ class PairingSession(
                 }
                 val packet = link.receive(RECEIVE_SLICE_MS) ?: continue
                 val session = acceptResponse(packet) ?: continue
+                accepted = session
                 won = outcome.complete(Locked(PairingTransport.UDP, link, session))
                 if (!won) Log.d(TAG, "UDP response arrived after another transport won")
                 return
             }
         } finally {
-            if (!won) link.close()
+            if (!won) {
+                // The race, a `close()`, or a sibling win ends this candidate: its derived keys
+                // must not be left to the garbage collector.
+                zeroizeCandidate(accepted)
+                link.close()
+            }
         }
     }
 
@@ -432,6 +464,7 @@ class PairingSession(
         val link = BlePairingLink(client)
         registerLink(link)
         var won = false
+        var accepted: Candidate? = null
         try {
             val advertisementId =
                 TapAuthCrypto.deriveBlePairingAdvId(sessionId, expectedClientX25519PublicKey)
@@ -447,12 +480,17 @@ class PairingSession(
             while (true) {
                 val packet = link.receive(RECEIVE_SLICE_MS) ?: continue
                 val session = acceptResponse(packet) ?: continue
+                accepted = session
                 won = outcome.complete(Locked(PairingTransport.BLE, link, session))
                 if (!won) Log.d(TAG, "BLE response arrived after UDP won")
                 return
             }
         } finally {
-            if (!won) link.close()
+            if (!won) {
+                // As for the UDP candidate: no losing transport keeps `K_c2s`/`K_s2c` alive.
+                zeroizeCandidate(accepted)
+                link.close()
+            }
         }
     }
 
@@ -515,16 +553,27 @@ class PairingSession(
                 hashAlgorithm = hash,
                 signatureAlgorithm = signature,
             )
+        registerCandidate(candidate)
         Log.i(TAG, "PairingResponse accepted, SAS ${candidate.sas}")
         return candidate
+    }
+
+    /** Track a candidate's key material so [zeroizeEphemeralState] covers every exit path. */
+    private fun registerCandidate(candidate: Candidate) {
+        synchronized(candidates) { candidates.add(candidate) }
     }
 
     /**
      * Wait for the user's SAS decision, still watching the locked transport so an authenticated
      * `PairingAbort` from the desktop (it aborts when its own user rejects) is honoured.
+     *
+     * Bounded by [SAS_APPROVAL_TIMEOUT_MS]: a user who walks away after scanning must not leave the
+     * GATT link, the UDP socket and this coroutine alive forever. Expiry aborts the session with
+     * `SESSION_EXPIRED` so the desktop learns why, exactly like the other phases.
      */
     private suspend fun awaitApproval(locked: Locked): Approval {
-        while (true) {
+        val deadline = System.currentTimeMillis() + SAS_APPROVAL_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
             if (closed.get()) return Approval.Cancelled
             if (userDecision.isCompleted) {
                 return when (userDecision.await()) {
@@ -540,6 +589,9 @@ class PairingSession(
             }
             if (stashedPacket == null) stashedPacket = packet
         }
+        Log.i(TAG, "SAS approval timed out after ${SAS_APPROVAL_TIMEOUT_MS}ms")
+        sendAbort(locked, REASON_SESSION_EXPIRED)
+        return Approval.Expired
     }
 
     /**
@@ -551,7 +603,11 @@ class PairingSession(
     private suspend fun awaitProvision(locked: Locked): ProvisionOutcome {
         val session = locked.session
         val keepalive =
-            if (locked.transport == PairingTransport.UDP) buildKeepalivePacket() else null
+            if (locked.transport == PairingTransport.UDP) {
+                TapAuthCrypto.pairingCreateKeepalive(sessionId)
+            } else {
+                null
+            }
         var nextKeepalive = 0L
         val deadline = System.currentTimeMillis() + CONFIRM_TIMEOUT_MS
 
@@ -607,17 +663,21 @@ class PairingSession(
     private suspend fun finishPairing(locked: Locked, provision: Provision): ProvisionOutcome {
         val session = locked.session
 
-        val device = persistDevice(session, provision)
-
         val ed25519Private =
             serverEd25519Private ?: throw IllegalStateException("Server Ed25519 key was cleared")
+        // Build the confirmation before persisting: a failure here must not leave a device record
+        // for a pairing the desktop never accepted.
         val confirmServer =
             TapAuthCrypto.pairingCreateConfirmServer(
+                sessionId,
                 session.kS2c,
                 session.transcriptHash,
                 ed25519Private,
                 provision.csk,
             )
+
+        val device = persistDevice(session, provision)
+
         when (locked.transport) {
             // 3× at 0 ms / 100 ms / 250 ms so a lost datagram does not leave the desktop pairing.
             PairingTransport.UDP -> {
@@ -644,6 +704,9 @@ class PairingSession(
      * `deviceId` is the hex of the Client's Ed25519 public key: stable across re-pairings, so a
      * second pairing by another user of the same desktop appends to `allowedUsers` instead of
      * creating a second record that could never be matched by signature.
+     *
+     * `displayName` comes from the peer-supplied `client_hostname`, so it is sanitized here before
+     * it is persisted and later rendered in the biometric approval prompt.
      */
     private suspend fun persistDevice(session: Candidate, provision: Provision): PairedDevice {
         val deviceId = session.clientEd25519PublicKey.toHex()
@@ -655,7 +718,7 @@ class PairingSession(
             if (username.isNotBlank() && username !in this) add(username)
         }
         val displayName =
-            provision.clientHostname.ifBlank {
+            ContextSanitizer.sanitize(provision.clientHostname, MAX_CLIENT_NAME_BYTES).ifBlank {
                 existing?.displayName?.ifBlank { null } ?: DEFAULT_CLIENT_NAME
             }
 
@@ -688,6 +751,7 @@ class PairingSession(
         val abort =
             try {
                 TapAuthCrypto.pairingCreateAbort(
+                    sessionId,
                     locked.session.kS2c,
                     locked.session.transcriptHash,
                     reason,
@@ -722,26 +786,6 @@ class PairingSession(
             null
         }
 
-    /**
-     * Serialize `PairingPacket{version: 2, session_id, keepalive: {}}`.
-     *
-     * Every other packet variant is built by Rust, but the JNI surface has no builder for
-     * `PairingKeepalive` and its payload is empty, so this is the one frame encoded here from the
-     * `proto/auth_protocol.proto` field numbers (1 = version, 2 = session_id, 8 = keepalive). There
-     * are no fields to drift; move it into JNI as `pairingCreateKeepalive` once that entry exists.
-     */
-    private fun buildKeepalivePacket(): ByteArray {
-        val out = ByteArrayOutputStream(4 + sessionId.size + 2)
-        out.write(FIELD_TAG_VERSION) // field 1, varint
-        out.write(PAIRING_VERSION)
-        out.write(FIELD_TAG_SESSION_ID) // field 2, length-delimited
-        out.write(sessionId.size)
-        out.write(sessionId)
-        out.write(FIELD_TAG_KEEPALIVE) // field 8, length-delimited, empty message
-        out.write(0)
-        return out.toByteArray()
-    }
-
     private fun registerLink(link: PairingLink) {
         synchronized(links) { links.add(link) }
     }
@@ -771,19 +815,59 @@ class PairingSession(
         initPacket = null
         acceptedResponsePacket?.fill(0)
         acceptedResponsePacket = null
-        activeSession?.kC2s?.fill(0)
-        activeSession?.kS2c?.fill(0)
-        activeSession = null
+        val derived = synchronized(candidates) { candidates.toList().also { candidates.clear() } }
+        for (candidate in derived) zeroizeCandidate(candidate)
+    }
+
+    /**
+     * Zeroize one transport's derived keys.
+     *
+     * Called immediately for the losing candidate and again for every registered candidate on
+     * teardown, so no dropped [Candidate] reaches the garbage collector with `K_c2s`/`K_s2c`
+     * intact. Idempotent, because the loser is registered as well as zeroized on loss.
+     */
+    private fun zeroizeCandidate(candidate: Candidate?) {
+        candidate?.kC2s?.fill(0)
+        candidate?.kS2c?.fill(0)
     }
 
     private suspend fun emit(update: PairingUpdate) {
         val callback = onUpdate ?: return
-        val dispatcher = mainDispatcher
+        val dispatcher = resolveMainDispatcher()
         if (dispatcher == null) {
             callback(update)
         } else {
             withContext(dispatcher) { callback(update) }
         }
+    }
+
+    /**
+     * The Main dispatcher, or null when this JVM has none — probed by dispatching, memoized so the
+     * probe costs one dispatch per session.
+     *
+     * On Android Main always exists, so updates are always delivered on the main thread there. A
+     * plain JVM (unit tests) has no Main provider, and delivering inline keeps the update that
+     * reports the failure from being the one that is lost.
+     */
+    private suspend fun resolveMainDispatcher(): CoroutineDispatcher? {
+        if (mainDispatcherResolved) return mainDispatcher
+        val candidate = Dispatchers.Main.immediate
+        val usable =
+            try {
+                withContext(candidate) {}
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.d(
+                    TAG,
+                    "No Main dispatcher (${e.javaClass.simpleName}); delivering updates inline",
+                )
+                false
+            }
+        mainDispatcher = if (usable) candidate else null
+        mainDispatcherResolved = true
+        return mainDispatcher
     }
 
     private suspend fun emitFailure(message: String) {
@@ -850,6 +934,9 @@ class PairingSession(
         data class Aborted(val reason: Int) : Approval()
 
         data object Cancelled : Approval()
+
+        /** Nobody answered within [SAS_APPROVAL_TIMEOUT_MS]; the abort has already been sent. */
+        data object Expired : Approval()
     }
 
     private sealed class ProvisionOutcome {
@@ -862,15 +949,6 @@ class PairingSession(
         data object Cancelled : ProvisionOutcome()
     }
 }
-
-/** `PairingPacket.version` field 1, varint wire type. */
-private const val FIELD_TAG_VERSION = 0x08
-
-/** `PairingPacket.session_id` field 2, length-delimited wire type. */
-private const val FIELD_TAG_SESSION_ID = 0x12
-
-/** `PairingPacket.keepalive` field 8, length-delimited wire type. */
-private const val FIELD_TAG_KEEPALIVE = 0x42
 
 /** Uniform view over either transport, so the session logic is written once. */
 private interface PairingLink {

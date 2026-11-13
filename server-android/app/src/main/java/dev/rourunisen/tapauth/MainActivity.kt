@@ -45,7 +45,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
 import dev.rourunisen.tapauth.ui.devices.DeviceListScreen
@@ -127,7 +129,7 @@ class MainActivity : FragmentActivity() {
                                     handleAuthResponse(
                                         authRequest.requestId,
                                         approved = false,
-                                        signedChallenge = null,
+                                        challenge = null,
                                         explicitDenial = true,
                                     )
                                     currentAuthRequest = null
@@ -270,7 +272,7 @@ class MainActivity : FragmentActivity() {
                 TAG,
                 "Biometric authentication not available (strong=$canAuthStrong)",
             )
-            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+            handleAuthResponse(authRequest.requestId, approved = false, challenge = null)
         }
     }
 
@@ -278,10 +280,15 @@ class MainActivity : FragmentActivity() {
         val promptInfo =
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle("Authentication Request")
-                .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
+                .setSubtitle(
+                    "Approve login for " +
+                        "${ContextSanitizer.sanitize(authRequest.username, AuthContextDisplay.IDENTITY_MAX_BYTES)}" +
+                        "@" +
+                        "${ContextSanitizer.sanitize(authRequest.hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)}",
+                )
                 // Same sanitized context paragraph + device/transport line as the
-                // notification-launched prompt (AuthRequestManager.promptDescription).
-                .setDescription(AuthRequestManager.promptDescription(authRequest))
+                // notification-launched prompt (AuthContextDisplay.promptDescription).
+                .setDescription(AuthContextDisplay.promptDescription(authRequest))
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                 .build()
@@ -292,11 +299,11 @@ class MainActivity : FragmentActivity() {
     private fun handleAuthResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
         val authRequestManager = AuthRequestManager.getInstance()
-        authRequestManager.handleResponse(requestId, approved, signedChallenge, explicitDenial)
+        authRequestManager.handleResponse(requestId, approved, challenge, explicitDenial)
     }
 
     /**

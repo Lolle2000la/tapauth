@@ -100,6 +100,23 @@ class PairingUrlTest {
     }
 
     @Test
+    fun testAllZeroPublicKeyRejected() {
+        // An all-zero `pk` is the "skip the constant-time QR comparison" sentinel that
+        // `pairingVerifyResponse` understands, so a scanned QR must not be able to request it.
+        val allZeroPk = "0".repeat(64)
+
+        assertNull(PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$allZeroPk"))
+        assertNull(
+            PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$allZeroPk&p=36692"),
+        )
+
+        // A single non-zero nibble is a real key again, so the rejection is exactly the sentinel.
+        assertNotNull(
+            PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=${"0".repeat(63)}1&p=36692"),
+        )
+    }
+
+    @Test
     fun testAbsentPortYieldsNullPort() {
         // BLE-only pairing: no UDP endpoint in the QR code.
         val parsed = PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey")

@@ -286,9 +286,25 @@ class BlePairingClient(private val context: Context) {
     fun close() {
         if (closed) return
         closed = true
+        // `scanForDevice`'s `finally` only runs when its own await finishes; a `close()` that races
+        // the scan must not leave the radio scanning for the rest of the timeout.
+        stopActiveScan()
         releaseTransport()
         packets.close()
         Log.d(TAG, "BLE pairing transport closed")
+    }
+
+    /**
+     * Stop an in-flight scan, if there is one.
+     *
+     * Guarded on [scanResult] so an already-stopped scanner is never touched, and `stopScan`
+     * swallows a revoked-permission `SecurityException`. The deferred is left for `scanForDevice`'s
+     * `finally` to clear, so this cannot leave its awaiter hanging without a result.
+     */
+    private fun stopActiveScan() {
+        if (scanResult == null) return
+        val scanner = bluetoothAdapter()?.bluetoothLeScanner ?: return
+        stopScan(scanner)
     }
 
     private suspend fun prepare(scanner: BluetoothLeScanner, advertisementId: ByteArray): Boolean {
@@ -305,10 +321,21 @@ class BlePairingClient(private val context: Context) {
                 Log.w(TAG, "connectGatt denied: ${e.message}")
                 null
             }
-        if (activeGatt == null) return false
+        if (activeGatt == null) {
+            connectedDeferred = null
+            return false
+        }
         gatt = activeGatt
 
-        if (connected.await() != true) return false
+        // Clear the completer once the link is settled, so a later disconnection cannot complete a
+        // deferred that belongs to this finished operation.
+        val isConnected =
+            try {
+                connected.await()
+            } finally {
+                connectedDeferred = null
+            }
+        if (isConnected != true) return false
 
         // Everything after the link is up is one serialized GATT sequence: Android drops
         // concurrent BluetoothGatt operations, and a [send] racing this sequence must wait.
@@ -387,33 +414,35 @@ class BlePairingClient(private val context: Context) {
     private suspend fun requestMtu(activeGatt: BluetoothGatt): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         mtuDeferred = deferred
-        val started =
-            try {
-                activeGatt.requestMtu(TARGET_MTU)
-            } catch (e: SecurityException) {
-                false
-            }
-        if (!started) {
+        try {
+            val started =
+                try {
+                    activeGatt.requestMtu(TARGET_MTU)
+                } catch (e: SecurityException) {
+                    false
+                }
+            if (!started) return false
+            return deferred.await()
+        } finally {
             mtuDeferred = null
-            return false
         }
-        return deferred.await()
     }
 
     private suspend fun discoverServices(activeGatt: BluetoothGatt): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         servicesDeferred = deferred
-        val started =
-            try {
-                activeGatt.discoverServices()
-            } catch (e: SecurityException) {
-                false
-            }
-        if (!started) {
+        try {
+            val started =
+                try {
+                    activeGatt.discoverServices()
+                } catch (e: SecurityException) {
+                    false
+                }
+            if (!started) return false
+            return deferred.await()
+        } finally {
             servicesDeferred = null
-            return false
         }
-        return deferred.await()
     }
 
     private suspend fun enableNotifications(
@@ -437,26 +466,27 @@ class BlePairingClient(private val context: Context) {
         }
         val deferred = CompletableDeferred<Boolean>()
         descriptorDeferred = deferred
-        val started =
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    activeGatt.writeDescriptor(
-                        descriptor,
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
-                    ) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    @Suppress("DEPRECATION")
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION") activeGatt.writeDescriptor(descriptor)
+        try {
+            val started =
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        activeGatt.writeDescriptor(
+                            descriptor,
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+                        ) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        @Suppress("DEPRECATION") activeGatt.writeDescriptor(descriptor)
+                    }
+                } catch (e: SecurityException) {
+                    false
                 }
-            } catch (e: SecurityException) {
-                false
-            }
-        if (!started) {
+            if (!started) return false
+            return deferred.await()
+        } finally {
             descriptorDeferred = null
-            return false
         }
-        return deferred.await()
     }
 
     private fun deliver(characteristic: BluetoothGattCharacteristic, value: ByteArray) {

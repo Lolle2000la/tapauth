@@ -30,7 +30,7 @@ data class PairingUrl(
 
         /**
          * Parse a scanned URL, returning null for anything that is not a well-formed v2 pairing URL
-         * (wrong scheme, `v != 2`, malformed `sid`/`pk`, or an out-of-range `p`).
+         * (wrong scheme, `v != 2`, malformed `sid`/`pk`, an all-zero `pk`, or an out-of-range `p`).
          */
         fun parse(url: String): PairingUrl? {
             if (!url.startsWith(PREFIX)) return null
@@ -52,6 +52,10 @@ data class PairingUrl(
 
             val publicKey = params["pk"] ?: return null
             if (!isHex(publicKey, PUBLIC_KEY_HEX_LENGTH)) return null
+            // An all-zero `pk` is the documented "skip the constant-time QR comparison" sentinel in
+            // `pairingVerifyResponse`. A scanned QR code must never be able to request it, or a
+            // hostile sticker would disable the only pre-SAS MitM defence.
+            if (publicKey.all { it == '0' }) return null
 
             val port =
                 if (params.containsKey("p")) {

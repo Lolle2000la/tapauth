@@ -142,6 +142,9 @@ class BleGattService : Service() {
      * A BluetoothGatt stack allows only ONE asynchronous operation in flight per connection, so
      * every async call routes through [runGattOperation], which holds [GattConnectionState.lock]
      * while it awaits the matching callback.
+     *
+     * A torn-down handle keeps its entry with [GattConnectionState.closed] set, so its identity
+     * cannot be mistaken for a live connection again; [onDestroy] clears the map.
      */
     private val gattConnections =
         java.util.concurrent.ConcurrentHashMap<BluetoothGatt, GattConnectionState>()
@@ -164,7 +167,11 @@ class BleGattService : Service() {
 
     private class GattOperationResult(val success: Boolean, val value: ByteArray? = null)
 
-    private class PendingGattOperation(val kind: GattOperationKind) {
+    private class PendingGattOperation(
+        val kind: GattOperationKind,
+        /** Characteristic the op targets, so a late callback for another one cannot satisfy it. */
+        val characteristicUuid: UUID? = null,
+    ) {
         val result = CompletableDeferred<GattOperationResult>()
     }
 
@@ -178,6 +185,13 @@ class BleGattService : Service() {
          * Completed only once the notification has been verified, cleared when retransmission ends.
          */
         @Volatile var confirmationNotification: CompletableDeferred<ByteArray>? = null
+
+        /**
+         * Set once the GATT handle is torn down. State is never re-created for such a handle: a
+         * coroutine resumed after teardown must fail instead of installing a live-looking entry for
+         * a closed handle that nothing would ever remove.
+         */
+        @Volatile var closed: Boolean = false
     }
 
     // BroadcastReceiver for handling cancellation requests
@@ -265,8 +279,12 @@ class BleGattService : Service() {
                             }
                         }
 
-                        // The handle is closed below, so nothing may wait on it any more.
-                        gattConnections.remove(gatt)
+                        // The handle is closed below, so nothing may wait on it any more, and no
+                        // state may be re-created for it afterwards (a coroutine that resumes late
+                        // would otherwise install a fresh entry for a closed handle that is never
+                        // removed). The closed entry itself is kept as that tombstone.
+                        gattConnections.computeIfAbsent(gatt) { GattConnectionState() }.closed =
+                            true
                         connectionDevices.remove(gatt)
                         gatt.close()
                     }
@@ -302,6 +320,7 @@ class BleGattService : Service() {
                     gatt,
                     GattOperationKind.DESCRIPTOR_WRITE,
                     GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                    descriptor.characteristic.uuid,
                 )
             }
 
@@ -318,6 +337,7 @@ class BleGattService : Service() {
                         success = status == BluetoothGatt.GATT_SUCCESS,
                         value = value,
                     ),
+                    characteristic.uuid,
                 )
             }
 
@@ -345,6 +365,7 @@ class BleGattService : Service() {
                     gatt,
                     GattOperationKind.WRITE,
                     GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                    characteristic.uuid,
                 )
             }
 
@@ -742,8 +763,14 @@ class BleGattService : Service() {
 
     // ===== Serialized GATT operation queue =====
 
-    private fun connectionState(gatt: BluetoothGatt): GattConnectionState =
-        gattConnections.getOrPut(gatt) { GattConnectionState() }
+    /**
+     * State for [gatt], or null when that handle has been torn down.
+     *
+     * `computeIfAbsent` is atomic per key, so a state created here is always the one teardown will
+     * mark closed — a late caller can never resurrect a fresh entry for a closed handle.
+     */
+    private fun connectionState(gatt: BluetoothGatt): GattConnectionState? =
+        gattConnections.computeIfAbsent(gatt) { GattConnectionState() }.takeUnless { it.closed }
 
     /**
      * Run one asynchronous [BluetoothGatt] operation and await its callback.
@@ -752,16 +779,29 @@ class BleGattService : Service() {
      * connection. Callbacks only complete the deferred: they must never queue another op here or
      * they would wait for the mutex held by the op that is waiting for them.
      *
+     * @param kind the op kind whose callback completes this operation
+     * @param characteristicUuid the characteristic the op targets, required to match in the
+     *   callback so a late callback for another characteristic cannot satisfy it
      * @param start issues the stack call; returning false means no callback will follow.
      */
     private suspend fun runGattOperation(
         gatt: BluetoothGatt,
         kind: GattOperationKind,
+        characteristicUuid: UUID? = null,
         start: () -> Boolean,
     ): GattOperationResult {
-        val connection = connectionState(gatt)
+        val connection =
+            connectionState(gatt)
+                ?: run {
+                    Log.d(TAG, "GATT ${kind.name.lowercase()} skipped: connection is closed")
+                    return GattOperationResult(false)
+                }
         return connection.lock.withLock {
-            val pending = PendingGattOperation(kind)
+            if (connection.closed) {
+                Log.d(TAG, "GATT ${kind.name.lowercase()} skipped: connection was torn down")
+                return@withLock GattOperationResult(false)
+            }
+            val pending = PendingGattOperation(kind, characteristicUuid)
             connection.pending = pending
             try {
                 if (!start()) {
@@ -788,14 +828,26 @@ class BleGattService : Service() {
         }
     }
 
-    /** Complete the in-flight op of [kind], if the connection is still waiting on one. */
+    /**
+     * Complete the in-flight op of [kind] on [characteristicUuid], if the connection is still
+     * waiting on exactly that op.
+     *
+     * Matching on the kind alone would let a timed-out read of one characteristic satisfy the
+     * callback of another (for example a stale `CLIENT_COMMAND` read completing the confirmation
+     * `READ`), so the characteristic has to match too.
+     */
     private fun completeGattOperation(
         gatt: BluetoothGatt,
         kind: GattOperationKind,
         result: GattOperationResult,
+        characteristicUuid: UUID? = null,
     ) {
         val pending = gattConnections[gatt]?.pending
-        if (pending != null && pending.kind == kind) {
+        if (
+            pending != null &&
+                pending.kind == kind &&
+                pending.characteristicUuid == characteristicUuid
+        ) {
             pending.result.complete(result)
         } else {
             Log.d(TAG, "Ignoring stray GATT callback for ${kind.name.lowercase()}")
@@ -829,7 +881,11 @@ class BleGattService : Service() {
         descriptor: BluetoothGattDescriptor,
         value: ByteArray,
     ): Boolean =
-        runGattOperation(gatt, GattOperationKind.DESCRIPTOR_WRITE) {
+        runGattOperation(
+                gatt,
+                GattOperationKind.DESCRIPTOR_WRITE,
+                descriptor.characteristic.uuid,
+            ) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
                 } else {
@@ -845,7 +901,7 @@ class BleGattService : Service() {
         characteristic: BluetoothGattCharacteristic,
         value: ByteArray,
     ): Boolean =
-        runGattOperation(gatt, GattOperationKind.WRITE) {
+        runGattOperation(gatt, GattOperationKind.WRITE, characteristic.uuid) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeCharacteristic(
                         characteristic,
@@ -864,7 +920,9 @@ class BleGattService : Service() {
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
     ): ByteArray? =
-        runGattOperation(gatt, GattOperationKind.READ) { gatt.readCharacteristic(characteristic) }
+        runGattOperation(gatt, GattOperationKind.READ, characteristic.uuid) {
+                gatt.readCharacteristic(characteristic)
+            }
             .let { if (it.success) it.value else null }
 
     /**
@@ -1308,26 +1366,30 @@ class BleGattService : Service() {
                 processName = authRequest.processName,
                 commandPreview = authRequest.commandPreview,
                 ttyPresent = authRequest.ttyPresent,
-            ) { approved, signedChallenge, explicitDenial ->
+            ) { approved, challenge, explicitDenial ->
                 // Create and send encrypted grant/denial
-                if (approved && signedChallenge != null) {
+                if (approved && challenge != null) {
                     Log.d(TAG, "BLE auth request approved, creating encrypted grant")
                     try {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
 
-                        // Create WrapperMessage containing AuthenticationGrant
+                        // Create WrapperMessage containing AuthenticationGrant. v2 signs only the
+                        // wrapper, and the grant carries the raw 32-byte challenge.
                         val wrapperMessage =
                             dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
-                                signedChallenge,
+                                challenge,
                                 privateKey,
                             )
 
-                        // Create proper EncryptedPacket per specification
+                        // Create proper EncryptedPacket per specification, with the algorithms
+                        // this pairing negotiated (the AAD binds both).
                         val encryptedPacket =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 matchedDevice.csk,
                                 wrapperMessage,
+                                matchedDevice.symmetricAlgorithm,
+                                matchedDevice.hashAlgorithm,
                             )
 
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes, matchedDevice)
@@ -1355,11 +1417,14 @@ class BleGattService : Service() {
                                 privateKey,
                             )
 
-                        // Create proper EncryptedPacket per specification
+                        // Create proper EncryptedPacket per specification, with the algorithms
+                        // this pairing negotiated (the AAD binds both).
                         val encryptedPacket =
                             dev.rourunisen.tapauth.crypto.createEncryptedPacket(
                                 matchedDevice.csk,
                                 wrapperMessage,
+                                matchedDevice.symmetricAlgorithm,
+                                matchedDevice.hashAlgorithm,
                             )
 
                         sendResponseToClient(gatt, encryptedPacket, challengeBytes, matchedDevice)
@@ -1430,9 +1495,21 @@ class BleGattService : Service() {
 
         // The write is a queued GATT op, so it must run in a coroutine rather than on the caller.
         serviceScope.launch {
+            val connection = connectionState(gatt)
+            val awaitingConfirmation = challenge != null && confirmationChar != null
+
+            // Arm the confirmation waiter BEFORE the response write: the Client notifies its
+            // GrantConfirmation as soon as the write is acknowledged, so a waiter armed afterwards
+            // would drop that first notification and the phone would retransmit for the full 10 s.
+            // The retransmission loop below clears it in its `finally`.
+            if (awaitingConfirmation) {
+                connection?.confirmationNotification = CompletableDeferred()
+            }
+
             if (!writeCharacteristicQueued(gatt, responseChar, response)) {
                 Log.w(TAG, "Failed to write response to ${gatt.device.address}")
                 // Disconnect immediately on write failure
+                connection?.confirmationNotification = null
                 disconnectGatt(gatt)
                 return@launch
             }
@@ -1453,6 +1530,7 @@ class BleGattService : Service() {
                 } finally {
                     // ALWAYS disconnect after retransmission completes (success or failure)
                     Log.d(TAG, "Retransmission complete, disconnecting GATT")
+                    connection?.confirmationNotification = null
                     disconnectGatt(gatt)
                 }
             } else {
@@ -1483,16 +1561,24 @@ class BleGattService : Service() {
         val maxDuration = 10_000L // 10 seconds max retransmission
         var attempt = 0
 
-        // Completed by onCharacteristicChanged once the notification verifies; armed before the
-        // first tick so a confirmation that arrives while we sleep is not missed.
+        // The waiter was armed by [sendResponseToClient] before the first response write; this
+        // loop re-arms it per round and clears it when retransmission ends.
         val connection = connectionState(gatt)
-        connection.confirmationNotification = CompletableDeferred()
 
         try {
             withContext(Dispatchers.IO) {
                 while (
                     android.os.SystemClock.elapsedRealtime() - startTime < maxDuration && isActive
                 ) {
+                    // Re-arm per round: a completed waiter keeps returning its value, so a
+                    // confirmation for another challenge would shadow the read fallback for the
+                    // rest of the window. The awaited value is still checked against the in-flight
+                    // challenge below, so a stale answer is never accepted.
+                    val waiter = connection?.confirmationNotification
+                    if (connection != null && (waiter == null || waiter.isCompleted)) {
+                        connection.confirmationNotification = CompletableDeferred()
+                    }
+
                     delay(500) // 500ms interval per spec
                     attempt++
 
@@ -1552,7 +1638,7 @@ class BleGattService : Service() {
                 Log.d(TAG, "BLE retransmission ended after $attempt attempts")
             }
         } finally {
-            connection.confirmationNotification = null
+            connection?.confirmationNotification = null
         }
     }
 
@@ -1718,6 +1804,9 @@ class BleGattService : Service() {
         }
         activeConnectionsByChallenge.clear()
         connectingOrConnectedDevices.clear()
+        // Closed-handle tombstones live here too; the service is going away, so drop them.
+        gattConnections.clear()
+        connectionDevices.clear()
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)

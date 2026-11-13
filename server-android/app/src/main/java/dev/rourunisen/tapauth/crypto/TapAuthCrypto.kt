@@ -135,16 +135,29 @@ object TapAuthCrypto {
     external fun determineMessageType(wrapperMessageBytes: ByteArray): String
 
     /**
-     * Create an EncryptedPacket from a WrapperMessage payload
+     * Create an EncryptedPacket from a WrapperMessage payload.
      *
-     * The AEAD associated data binds `encryption_algorithm` and `temporal_identifier`, so both
-     * fields must already be final when this is called.
+     * Both algorithms are inputs so the packet can express what the pairing negotiated: the
+     * rotating temporal identifier is derived with [hashAlgorithm], and the AEAD associated data
+     * binds `encryption_algorithm` (`"tapauth-pkt-v2" || be32(encryption_algorithm) ||
+     * be16(temporal_identifier.len()) || temporal_identifier`), so [symmetricAlgorithm],
+     * [hashAlgorithm] and the identifier must all be final before this is called. Rust owns the
+     * packet layout; Kotlin only supplies the negotiated pair.
      *
      * @param csk Client Symmetric Key (32 bytes)
      * @param wrapperMessageBytes Serialized WrapperMessage protobuf
+     * @param symmetricAlgorithm The paired device's `SymmetricAlgorithm` (e.g.
+     *   [SYMMETRIC_AES_256_GCM]); also written to `EncryptedPacket.encryption_algorithm`
+     * @param hashAlgorithm The paired device's `HashAlgorithm` (e.g. [HASH_SHA256]), used to derive
+     *   the temporal identifier the AAD binds
      * @return Serialized EncryptedPacket protobuf bytes
      */
-    external fun createEncryptedPacket(csk: ByteArray, wrapperMessageBytes: ByteArray): ByteArray
+    external fun createEncryptedPacket(
+        csk: ByteArray,
+        wrapperMessageBytes: ByteArray,
+        symmetricAlgorithm: Int,
+        hashAlgorithm: Int,
+    ): ByteArray
 
     /**
      * Decrypt an EncryptedPacket to get the WrapperMessage.
@@ -175,9 +188,14 @@ object TapAuthCrypto {
      *
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
-     * @param protocolVersion Protocol version recorded for the paired device
+     * @param protocolVersion Protocol version recorded for the paired device. Verification is
+     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
+     *   there is no v1 verification path. A legacy record is kept by
+     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
+     *   re-paired; nothing purges it automatically.
      * @return The verified request, including the signed context fields
-     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid
+     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
+     *   [protocolVersion] is not 2
      */
     external fun parseAndVerifyAuthRequest(
         wrapperBytes: ByteArray,
@@ -190,9 +208,14 @@ object TapAuthCrypto {
      *
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
-     * @param protocolVersion Protocol version recorded for the paired device
+     * @param protocolVersion Protocol version recorded for the paired device. Verification is
+     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
+     *   there is no v1 verification path. A legacy record is kept by
+     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
+     *   re-paired; nothing purges it automatically.
      * @return The verified confirmation
-     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid
+     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
+     *   [protocolVersion] is not 2
      */
     external fun parseAndVerifyGrantConfirmation(
         wrapperBytes: ByteArray,
@@ -205,9 +228,14 @@ object TapAuthCrypto {
      *
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
-     * @param protocolVersion Protocol version recorded for the paired device
+     * @param protocolVersion Protocol version recorded for the paired device. Verification is
+     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
+     *   there is no v1 verification path. A legacy record is kept by
+     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
+     *   re-paired; nothing purges it automatically.
      * @return The verified cancel
-     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid
+     * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
+     *   [protocolVersion] is not 2
      */
     external fun parseAndVerifyAuthCancel(
         wrapperBytes: ByteArray,
@@ -313,6 +341,9 @@ object TapAuthCrypto {
     //
     // Every packet argument and packet return is a whole serialized `PairingPacket` (Rust owns
     // protobuf); Kotlin only passes bytes and inspects the documented return slots.
+    // `proto/auth_protocol.proto` requires every `PairingPacket` to carry `version = 2` and the
+    // QR code's `session_id`, and the daemon drops a frame whose `session_id` does not match the
+    // QR (`ble-gatt-specification.md` §1), so each builder takes the session id explicitly.
     //
     // Return-slot contract — this comment is the single source of truth for slot order and is
     // mirrored by `network/PairingSession.kt`, which reads the slots positionally:
@@ -325,6 +356,7 @@ object TapAuthCrypto {
     //   pairingDecryptProvision-> [0]=csk (32B), [1]=username (UTF-8), [2]=clientHostname (UTF-8)
     //   pairingCreateConfirmServer -> one PairingPacket{confirm_server}
     //   pairingCreateAbort     -> one PairingPacket{abort}
+    //   pairingCreateKeepalive -> one PairingPacket{keepalive}
     //   pairingVerifyAbort     -> PairingAbortReason value; throws GeneralSecurityException if the
     //                             auth tag does not verify
 
@@ -413,9 +445,12 @@ object TapAuthCrypto {
     /**
      * Client-role step: build the encrypted `PairingConfirmClient` provision payload.
      *
-     * @return Serialized `PairingPacket` carrying `PairingConfirmClient`
+     * @param sessionId 16-byte pairing session id from the QR code
+     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
+     *   `PairingConfirmClient`
      */
     external fun pairingEncryptProvision(
+        sessionId: ByteArray,
         kC2s: ByteArray,
         transcriptHash: ByteArray,
         csk: ByteArray,
@@ -454,9 +489,12 @@ object TapAuthCrypto {
     /**
      * Server-role step: build the signed and encrypted `PairingConfirmServer`.
      *
-     * @return Serialized `PairingPacket` carrying `PairingConfirmServer`
+     * @param sessionId 16-byte pairing session id from the QR code
+     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
+     *   `PairingConfirmServer`
      */
     external fun pairingCreateConfirmServer(
+        sessionId: ByteArray,
         kS2c: ByteArray,
         transcriptHash: ByteArray,
         serverEd25519PrivateKey: ByteArray,
@@ -466,16 +504,31 @@ object TapAuthCrypto {
     /**
      * Build an authenticated `PairingAbort` for either direction.
      *
+     * @param sessionId 16-byte pairing session id from the QR code
      * @param kDir `K_c2s` or `K_s2c`, whichever the abort travels under
      * @param transcriptHash 32-byte transcript hash `H`
      * @param reason A `PairingAbortReason` value (e.g. [PAIRING_ABORT_USER_REJECTED_SAS])
-     * @return Serialized `PairingPacket` carrying `PairingAbort`
+     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
+     *   `PairingAbort`
      */
     external fun pairingCreateAbort(
+        sessionId: ByteArray,
         kDir: ByteArray,
         transcriptHash: ByteArray,
         reason: Int,
     ): ByteArray
+
+    /**
+     * Build the empty `PairingKeepalive` frame that keeps an idle pairing transport alive.
+     *
+     * The payload is empty, but the envelope is not: Rust encodes it so Kotlin never hand-writes
+     * protobuf.
+     *
+     * @param sessionId 16-byte pairing session id from the QR code
+     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
+     *   `PairingKeepalive`
+     */
+    external fun pairingCreateKeepalive(sessionId: ByteArray): ByteArray
 
     /**
      * Verify an incoming `PairingAbort` auth tag and return its reason.
@@ -647,9 +700,21 @@ fun createDenialWrapperMessage(
     return TapAuthCrypto.createDenialWrapperMessage(challenge, reason, serverPrivateKey)
 }
 
-/** Create an EncryptedPacket from a WrapperMessage */
-fun createEncryptedPacket(csk: ByteArray, wrapperMessage: ByteArray): ByteArray {
-    return TapAuthCrypto.createEncryptedPacket(csk, wrapperMessage)
+/**
+ * Create an EncryptedPacket from a WrapperMessage, using the paired device's negotiated algorithms
+ */
+fun createEncryptedPacket(
+    csk: ByteArray,
+    wrapperMessage: ByteArray,
+    symmetricAlgorithm: Int,
+    hashAlgorithm: Int,
+): ByteArray {
+    return TapAuthCrypto.createEncryptedPacket(
+        csk,
+        wrapperMessage,
+        symmetricAlgorithm,
+        hashAlgorithm,
+    )
 }
 
 /** Decrypt an EncryptedPacket to get the WrapperMessage */

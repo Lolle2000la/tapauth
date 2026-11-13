@@ -34,6 +34,29 @@ class ContextSanitizerTest {
     }
 
     @Test
+    fun testNonBreakingSpaceIsWhitespace() {
+        // U+00A0 is not `Char.isWhitespace`, but Rust's `char::is_whitespace` collapses it.
+        assertEquals(
+            "sudo apt install",
+            ContextSanitizer.sanitize("sudo\u00A0apt\u00A0\u00A0install"),
+        )
+        assertEquals(
+            "sudo apt",
+            ContextSanitizer.sanitize("\u00A0sudo\u00A0apt\u00A0"),
+        )
+    }
+
+    @Test
+    fun testNarrowNoBreakSpaceIsWhitespace() {
+        // U+202F, and the neighbouring U+2007 figure space, are space separators too.
+        assertEquals(
+            "systemctl restart tapauthd",
+            ContextSanitizer.sanitize("systemctl\u202Frestart\u2007tapauthd"),
+        )
+        assertEquals("", ContextSanitizer.sanitize("\u00A0\u202F\u2007"))
+    }
+
+    @Test
     fun testShortInputUnchanged() {
         assertEquals("sudo", ContextSanitizer.sanitize("sudo"))
         assertEquals(
