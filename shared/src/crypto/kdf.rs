@@ -2,7 +2,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::CryptoError;
 use crate::protocol::pb::{HashAlgorithm, SignatureAlgorithm, SymmetricAlgorithm};
@@ -114,6 +114,11 @@ pub struct PairingSessionKeys {
 /// 1. reject an all-zero shared secret (constant-time compare) with
 ///    [`CryptoError::InvalidKeyLength`];
 /// 2. `HKDF-Extract(salt = H, IKM = Z)` and expand the three `info` strings.
+///
+/// The extracted PRK lives in a [`Zeroizing`] buffer, so the only copy this
+/// function owns is cleared on return (cryptography-specification.md §4). The
+/// extract/expand pair is byte-for-byte the same as `Hkdf::new` +
+/// `expand`: `from_prk` is exactly the HMAC key `Hkdf::extract` hands back.
 pub fn derive_pairing_keys_and_sas(
     shared_secret: &[u8; 32],
     transcript_hash: &[u8; 32],
@@ -124,7 +129,14 @@ pub fn derive_pairing_keys_and_sas(
         return Err(CryptoError::InvalidKeyLength);
     }
 
-    let hk = Hkdf::<Sha256>::new(Some(transcript_hash), shared_secret);
+    let (mut extracted_prk, _) = Hkdf::<Sha256>::extract(Some(transcript_hash), shared_secret);
+    let mut prk = Zeroizing::new([0u8; 32]);
+    prk.copy_from_slice(extracted_prk.as_slice());
+    // The library's own return buffer is not zeroized on drop; clear it here so
+    // no copy of the PRK outlives the derivation.
+    extracted_prk.as_mut_slice().zeroize();
+
+    let hk = Hkdf::<Sha256>::from_prk(&*prk).map_err(|_| CryptoError::KeyDerivationFailed)?;
 
     let mut k_c2s = [0u8; 32];
     hk.expand(HKDF_INFO_C2S, &mut k_c2s)
@@ -477,6 +489,48 @@ mod tests {
             }
         }
         assert!(saw_different_sas, "the SAS must track the transcript hash");
+    }
+
+    /// The derivation must be *exactly* RFC 5869 HKDF-SHA256 salted with `H`, so
+    /// this test recomputes the PRK and both expansions with `hmac` directly and
+    /// compares byte for byte.
+    /// The defect this catches: any change to the key schedule — a different
+    /// salt/IKM order, a different `info` string, or an extract step replaced by
+    /// `from_prk` on something that is not the extracted PRK — which would
+    /// silently break interoperability with an already-paired peer.
+    #[test]
+    fn test_pairing_keys_match_rfc5869_by_hand() {
+        let z = [0x5Au8; 32];
+        let transcript_hash = [0xC3u8; 32];
+
+        // PRK = HMAC-SHA256(key = salt = H, msg = IKM = Z)
+        let mut extract = HmacSha256::new_from_slice(&transcript_hash).unwrap();
+        extract.update(&z);
+        let prk = extract.finalize().into_bytes();
+
+        // K(i) = HMAC-SHA256(PRK, K(i-1) || info || i), for output <= 32 bytes
+        // only one block is needed.
+        let expand = |info: &[u8]| {
+            let mut mac = HmacSha256::new_from_slice(&prk).unwrap();
+            mac.update(info);
+            mac.update(&[0x01]);
+            mac.finalize().into_bytes()
+        };
+
+        let k_c2s = expand(HKDF_INFO_C2S);
+        let k_s2c = expand(HKDF_INFO_S2C);
+        let sas_bytes = expand(HKDF_INFO_SAS);
+
+        let derived = derive_pairing_keys_and_sas(&z, &transcript_hash).unwrap();
+        assert_eq!(*derived.k_c2s, *k_c2s.as_slice(), "K_c2s must be RFC 5869");
+        assert_eq!(*derived.k_s2c, *k_s2c.as_slice(), "K_s2c must be RFC 5869");
+
+        let sas_number =
+            u64::from_be_bytes(sas_bytes.get(..8).unwrap().try_into().unwrap()) % 1_000_000;
+        assert_eq!(
+            derived.sas,
+            format!("{:03}-{:03}", sas_number / 1000, sas_number % 1000)
+        );
     }
 
     /// Build a transcript whose fields are all derived from `fill`.

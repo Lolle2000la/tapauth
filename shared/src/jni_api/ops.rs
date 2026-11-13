@@ -235,12 +235,18 @@ pub(crate) fn decrypt_packet_bytes(
 ///
 /// The Ed25519 signature is checked over the raw `payload` bytes **before** the inner
 /// protobuf is decoded, so a forged envelope never reaches a decoder.
+///
+/// `expected_signature_algorithm` is the paired Client's **persisted**
+/// `signature_algorithm` (security-hardening.md §2.1), not a constant: a value this
+/// build does not implement is refused before any verification runs.
 pub(crate) fn parse_auth_request_verified(
     wrapper_bytes: &[u8],
     client_ed25519_public_key: &[u8; 32],
     protocol_version: i32,
+    expected_signature_algorithm: i32,
 ) -> Result<VerifiedAuthRequest, JniError> {
     check_protocol_version(protocol_version)?;
+    let expected_signature_algorithm = signature_algorithm(expected_signature_algorithm)?;
     let wrapper = decode_wrapper(wrapper_bytes)?;
     check_wrapper_version(&wrapper)?;
     require_payload_type(&wrapper, PayloadType::AuthRequest)?;
@@ -248,7 +254,7 @@ pub(crate) fn parse_auth_request_verified(
     let decoded = verify_and_decode_payload(
         &wrapper,
         client_ed25519_public_key,
-        SignatureAlgorithm::Ed25519 as i32,
+        expected_signature_algorithm,
     )?;
 
     match decoded {
@@ -274,8 +280,10 @@ fn verified_challenge(
     client_ed25519_public_key: &[u8; 32],
     protocol_version: i32,
     expected: PayloadType,
+    expected_signature_algorithm: i32,
 ) -> Result<[u8; CHALLENGE_LEN], JniError> {
     check_protocol_version(protocol_version)?;
+    let expected_signature_algorithm = signature_algorithm(expected_signature_algorithm)?;
     let wrapper = decode_wrapper(wrapper_bytes)?;
     check_wrapper_version(&wrapper)?;
     require_payload_type(&wrapper, expected)?;
@@ -283,7 +291,7 @@ fn verified_challenge(
     let decoded = verify_and_decode_payload(
         &wrapper,
         client_ed25519_public_key,
-        SignatureAlgorithm::Ed25519 as i32,
+        expected_signature_algorithm,
     )?;
 
     let challenge = match decoded {
@@ -301,12 +309,14 @@ pub(crate) fn parse_grant_confirmation_verified(
     wrapper_bytes: &[u8],
     client_ed25519_public_key: &[u8; 32],
     protocol_version: i32,
+    expected_signature_algorithm: i32,
 ) -> Result<[u8; CHALLENGE_LEN], JniError> {
     verified_challenge(
         wrapper_bytes,
         client_ed25519_public_key,
         protocol_version,
         PayloadType::GrantConfirmation,
+        expected_signature_algorithm,
     )
 }
 
@@ -315,12 +325,14 @@ pub(crate) fn parse_auth_cancel_verified(
     wrapper_bytes: &[u8],
     client_ed25519_public_key: &[u8; 32],
     protocol_version: i32,
+    expected_signature_algorithm: i32,
 ) -> Result<[u8; CHALLENGE_LEN], JniError> {
     verified_challenge(
         wrapper_bytes,
         client_ed25519_public_key,
         protocol_version,
         PayloadType::AuthCancel,
+        expected_signature_algorithm,
     )
 }
 
@@ -387,6 +399,24 @@ fn hash_algorithm(value: i32) -> Result<HashAlgorithm, JniError> {
         Ok(HashAlgorithm::Blake3) => Ok(HashAlgorithm::Blake3),
         _ => Err(JniError::Argument(format!(
             "unsupported hash algorithm id {value}"
+        ))),
+    }
+}
+
+/// Resolve the paired Client's persisted `SignatureAlgorithm` id and return it as
+/// the id to pin verification to.
+///
+/// `UNSPECIFIED` (0) and any value this build does not implement are refused: the
+/// signature algorithm is a per-server persisted property
+/// (security-hardening.md §2.1), so accepting "whatever the wrapper claims" would
+/// hand the choice of verification algorithm back to the peer. This is reported as
+/// a security failure, not a caller-argument error, because the value comes from
+/// persisted per-Client state and a wrong one means the stored pairing is unusable.
+fn signature_algorithm(value: i32) -> Result<i32, JniError> {
+    match SignatureAlgorithm::try_from(value) {
+        Ok(SignatureAlgorithm::Ed25519) => Ok(SignatureAlgorithm::Ed25519 as i32),
+        _ => Err(JniError::Security(format!(
+            "unsupported signature algorithm id {value} for this paired client"
         ))),
     }
 }
@@ -829,7 +859,8 @@ mod tests {
 
             // The decrypted bytes still verify, so the pipeline is intact end to end.
             let verified =
-                parse_auth_request_verified(&plaintext, &keypair.verifying_key_bytes(), 2).unwrap();
+                parse_auth_request_verified(&plaintext, &keypair.verifying_key_bytes(), 2, ED25519)
+                    .unwrap();
             assert_eq!(verified.challenge, [0x21; 32]);
         }
     }
@@ -952,7 +983,8 @@ mod tests {
         let bytes = signed_request(&keypair, request);
 
         let parsed =
-            parse_auth_request_verified(&bytes, &keypair.verifying_key_bytes(), 2).unwrap();
+            parse_auth_request_verified(&bytes, &keypair.verifying_key_bytes(), 2, ED25519)
+                .unwrap();
         assert_eq!(parsed.challenge, [0x51; 32]);
         assert_eq!(parsed.username, "luca");
         assert_eq!(parsed.hostname, "thinkpad");
@@ -974,7 +1006,7 @@ mod tests {
         let bytes = signed_request(&signer, context_request([0x61; 32]));
 
         assert!(matches!(
-            parse_auth_request_verified(&bytes, &other.verifying_key_bytes(), 2),
+            parse_auth_request_verified(&bytes, &other.verifying_key_bytes(), 2, ED25519),
             Err(JniError::Security(message)) if message.contains("signature")
         ));
     }
@@ -995,7 +1027,8 @@ mod tests {
             parse_auth_request_verified(
                 &wrapper.encode_to_vec(),
                 &keypair.verifying_key_bytes(),
-                2
+                2,
+                ED25519
             ),
             Err(JniError::Security(_))
         ));
@@ -1018,6 +1051,7 @@ mod tests {
             &wrapper.encode_to_vec(),
             &keypair.verifying_key_bytes(),
             2,
+            ED25519,
         ) {
             Err(JniError::Security(message)) => {
                 assert!(
@@ -1039,7 +1073,7 @@ mod tests {
         request.challenge = vec![0x64; 31];
         let bytes = signed_request(&keypair, request);
 
-        match parse_auth_request_verified(&bytes, &keypair.verifying_key_bytes(), 2) {
+        match parse_auth_request_verified(&bytes, &keypair.verifying_key_bytes(), 2, ED25519) {
             Err(JniError::Argument(message)) => {
                 assert!(
                     message.contains("challenge"),
@@ -1061,7 +1095,12 @@ mod tests {
         for version in [0, 1, 3] {
             assert!(
                 matches!(
-                    parse_auth_request_verified(&bytes, &keypair.verifying_key_bytes(), version),
+                    parse_auth_request_verified(
+                        &bytes,
+                        &keypair.verifying_key_bytes(),
+                        version,
+                        ED25519
+                    ),
                     Err(JniError::Argument(_))
                 ),
                 "protocol version {version} must be refused"
@@ -1075,7 +1114,8 @@ mod tests {
             parse_auth_request_verified(
                 &wrapper.encode_to_vec(),
                 &keypair.verifying_key_bytes(),
-                2
+                2,
+                ED25519
             ),
             Err(JniError::Security(_))
         ));
@@ -1102,6 +1142,7 @@ mod tests {
             &wrapper.encode_to_vec(),
             &keypair.verifying_key_bytes(),
             2,
+            ED25519,
         ) {
             Err(JniError::Security(message)) => {
                 assert!(
@@ -1110,6 +1151,79 @@ mod tests {
                 );
             }
             other => panic!("expected a signature failure, got {other:?}"),
+        }
+    }
+
+    /// The three parse entry points must verify against the caller-supplied,
+    /// per-Client `signature_algorithm`, and refuse an id this build cannot verify.
+    /// The defect this catches: verification pinned to a hard-coded `ED25519`
+    /// constant, so the persisted per-server algorithm is never consulted and any
+    /// value Kotlin passes (including `UNSPECIFIED`) is silently accepted as ED25519.
+    #[test]
+    fn parse_entry_points_pin_the_caller_supplied_signature_algorithm() {
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let public_key = keypair.verifying_key_bytes();
+        let challenge = [0x73u8; 32];
+        let request_bytes = signed_request(&keypair, context_request(challenge));
+
+        let mut confirmation = wrap_grant_confirmation(GrantConfirmation {
+            challenge: challenge.to_vec(),
+        });
+        crate::protocol::messages::sign_wrapper_message(&mut confirmation, &keypair).unwrap();
+        let confirmation_bytes = confirmation.encode_to_vec();
+
+        let mut cancel = wrap_auth_cancel(AuthenticationCancel {
+            challenge: challenge.to_vec(),
+        });
+        crate::protocol::messages::sign_wrapper_message(&mut cancel, &keypair).unwrap();
+        let cancel_bytes = cancel.encode_to_vec();
+
+        // The persisted value (ED25519) succeeds on all three entry points.
+        assert_eq!(
+            parse_auth_request_verified(&request_bytes, &public_key, 2, ED25519)
+                .unwrap()
+                .challenge,
+            challenge
+        );
+        assert_eq!(
+            parse_grant_confirmation_verified(&confirmation_bytes, &public_key, 2, ED25519)
+                .unwrap(),
+            challenge
+        );
+        assert_eq!(
+            parse_auth_cancel_verified(&cancel_bytes, &public_key, 2, ED25519).unwrap(),
+            challenge
+        );
+
+        // `UNSPECIFIED` (0) and an unknown id (99) are refused on every entry
+        // point, before any signature check.
+        for algorithm in [0, 99] {
+            assert!(
+                matches!(
+                    parse_auth_request_verified(&request_bytes, &public_key, 2, algorithm),
+                    Err(JniError::Security(message)) if message.contains("signature algorithm")
+                ),
+                "signature algorithm {algorithm} must be refused for AuthRequest"
+            );
+            assert!(
+                matches!(
+                    parse_grant_confirmation_verified(
+                        &confirmation_bytes,
+                        &public_key,
+                        2,
+                        algorithm
+                    ),
+                    Err(JniError::Security(message)) if message.contains("signature algorithm")
+                ),
+                "signature algorithm {algorithm} must be refused for GrantConfirmation"
+            );
+            assert!(
+                matches!(
+                    parse_auth_cancel_verified(&cancel_bytes, &public_key, 2, algorithm),
+                    Err(JniError::Security(message)) if message.contains("signature algorithm")
+                ),
+                "signature algorithm {algorithm} must be refused for AuthCancel"
+            );
         }
     }
 
@@ -1140,31 +1254,37 @@ mod tests {
         let cancel_bytes = cancel.encode_to_vec();
 
         assert_eq!(
-            parse_grant_confirmation_verified(&confirmation_bytes, &public_key, 2).unwrap(),
+            parse_grant_confirmation_verified(&confirmation_bytes, &public_key, 2, ED25519)
+                .unwrap(),
             challenge
         );
         assert_eq!(
-            parse_auth_cancel_verified(&cancel_bytes, &public_key, 2).unwrap(),
+            parse_auth_cancel_verified(&cancel_bytes, &public_key, 2, ED25519).unwrap(),
             challenge
         );
 
         assert!(matches!(
-            parse_grant_confirmation_verified(&cancel_bytes, &public_key, 2),
+            parse_grant_confirmation_verified(&cancel_bytes, &public_key, 2, ED25519),
             Err(JniError::Security(message)) if message.contains("payload type")
         ));
         assert!(matches!(
-            parse_auth_cancel_verified(&confirmation_bytes, &public_key, 2),
+            parse_auth_cancel_verified(&confirmation_bytes, &public_key, 2, ED25519),
             Err(JniError::Security(message)) if message.contains("payload type")
         ));
 
         // Wrong signer is refused on both paths.
         let other = Ed25519KeyPair::generate().unwrap();
         assert!(matches!(
-            parse_grant_confirmation_verified(&confirmation_bytes, &other.verifying_key_bytes(), 2),
+            parse_grant_confirmation_verified(
+                &confirmation_bytes,
+                &other.verifying_key_bytes(),
+                2,
+                ED25519,
+            ),
             Err(JniError::Security(_))
         ));
         assert!(matches!(
-            parse_auth_cancel_verified(&cancel_bytes, &other.verifying_key_bytes(), 2),
+            parse_auth_cancel_verified(&cancel_bytes, &other.verifying_key_bytes(), 2, ED25519,),
             Err(JniError::Security(_))
         ));
     }
@@ -1372,6 +1492,7 @@ mod tests {
             Ed25519KeyPair::generate().unwrap(),
             "thinkpad",
             36_692,
+            None,
             None,
             None,
         )

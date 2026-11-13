@@ -291,6 +291,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
 /// * `wrapperBytes` - decrypted serialized `WrapperMessage`
 /// * `clientEd25519Pub` - 32-byte public key of the paired Client
 /// * `protocolVersion` - must be `2`
+/// * `expectedSignatureAlgorithm` - the paired Client's persisted
+///   `SignatureAlgorithm` id (`1` = ED25519); never derived from the message
 ///
 /// ## Returns
 ///
@@ -303,7 +305,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_extractT
 /// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
 /// - `GeneralSecurityException`: bad signature, wrong payload type, wrong wrapper
-///   version
+///   version, or an `expectedSignatureAlgorithm` this build cannot verify
 /// - `IllegalStateException`: `ParsedAuthRequest` cannot be constructed
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyAuthRequest(
@@ -312,6 +314,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
     wrapper_bytes: JByteArray,
     client_ed25519_pub: JByteArray,
     protocol_version: jint,
+    expected_signature_algorithm: jint,
 ) -> jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let public_key = match read_ed25519_public_key(&mut env, client_ed25519_pub) {
@@ -323,14 +326,18 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
             None => return std::ptr::null_mut(),
         };
 
-        let parsed =
-            match ops::parse_auth_request_verified(&wrapper_bytes, &public_key, protocol_version) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    throw(&mut env, &err);
-                    return std::ptr::null_mut();
-                }
-            };
+        let parsed = match ops::parse_auth_request_verified(
+            &wrapper_bytes,
+            &public_key,
+            protocol_version,
+            expected_signature_algorithm,
+        ) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                throw(&mut env, &err);
+                return std::ptr::null_mut();
+            }
+        };
 
         let timestamp_unix_seconds = match i64::try_from(parsed.timestamp_unix_seconds) {
             Ok(timestamp) => timestamp,
@@ -373,7 +380,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 ///
 /// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
-/// - `GeneralSecurityException`: bad signature or wrong payload type
+/// - `GeneralSecurityException`: bad signature, wrong payload type, or an
+///   `expectedSignatureAlgorithm` this build cannot verify
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyGrantConfirmation(
     mut env: JNIEnv,
@@ -381,6 +389,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
     wrapper_bytes: JByteArray,
     client_ed25519_pub: JByteArray,
     protocol_version: jint,
+    expected_signature_algorithm: jint,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let public_key = match read_ed25519_public_key(&mut env, client_ed25519_pub) {
@@ -394,7 +403,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 
         fixed_bytes_or_throw(
             &mut env,
-            ops::parse_grant_confirmation_verified(&wrapper_bytes, &public_key, protocol_version),
+            ops::parse_grant_confirmation_verified(
+                &wrapper_bytes,
+                &public_key,
+                protocol_version,
+                expected_signature_algorithm,
+            ),
         )
     })) {
         Ok(result) => result,
@@ -415,7 +429,8 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 ///
 /// - `IllegalArgumentException`: `protocolVersion != 2`, wrong key/challenge length
 /// - `IOException`: `wrapperBytes` is not a decodable `WrapperMessage`
-/// - `GeneralSecurityException`: bad signature or wrong payload type
+/// - `GeneralSecurityException`: bad signature, wrong payload type, or an
+///   `expectedSignatureAlgorithm` this build cannot verify
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAndVerifyAuthCancel(
     mut env: JNIEnv,
@@ -423,6 +438,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
     wrapper_bytes: JByteArray,
     client_ed25519_pub: JByteArray,
     protocol_version: jint,
+    expected_signature_algorithm: jint,
 ) -> jbyteArray {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let public_key = match read_ed25519_public_key(&mut env, client_ed25519_pub) {
@@ -436,7 +452,12 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_parseAnd
 
         fixed_bytes_or_throw(
             &mut env,
-            ops::parse_auth_cancel_verified(&wrapper_bytes, &public_key, protocol_version),
+            ops::parse_auth_cancel_verified(
+                &wrapper_bytes,
+                &public_key,
+                protocol_version,
+                expected_signature_algorithm,
+            ),
         )
     })) {
         Ok(result) => result,

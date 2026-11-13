@@ -13,15 +13,23 @@ use crate::crypto::{sign_ed25519, verify_ed25519, CryptoError, Ed25519KeyPair};
 use crate::protocol::packet::{wrap_auth_denial, wrap_auth_grant};
 use crate::protocol::pb::*;
 
-#[cfg(debug_assertions)]
-use sha2::{Digest, Sha256};
-
 /// Protocol version stored in `WrapperMessage.version` for the v2 framing.
 pub const PROTOCOL_VERSION_V2: u32 = 2;
 
 /// Domain separation tag prepended to every `WrapperMessage` signing transcript.
 const WRAPPER_SIGNING_DOMAIN: &[u8] = b"tapauth-sig-v2";
 
+/// Maximum byte length of `AuthenticationRequest.username`.
+///
+/// A username that exceeds this is **rejected**, never truncated: the phone would
+/// otherwise display (and the PAM module would otherwise authorize) an account
+/// that is not the one being authenticated.
+pub const USERNAME_MAX_BYTES: usize = 32;
+/// Maximum byte length of `AuthenticationRequest.hostname`.
+///
+/// A hostname is display-only, so an over-long one is sanitized and truncated
+/// instead of rejected — see [`create_auth_request_with_context`].
+pub const HOSTNAME_MAX_BYTES: usize = 64;
 /// Maximum byte length of `AuthenticationRequest.pam_service`.
 pub const PAM_SERVICE_MAX_BYTES: usize = 32;
 /// Maximum byte length of `AuthenticationRequest.process_name`.
@@ -31,20 +39,6 @@ pub const COMMAND_PREVIEW_MAX_BYTES: usize = 128;
 
 /// Truncation marker appended inside the byte budget when a context string is cut.
 const ELLIPSIS: char = '\u{2026}';
-
-pub fn sha256_hex(data: &[u8]) -> String {
-    #[cfg(debug_assertions)]
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hex::encode(hasher.finalize())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = data;
-        "<stripped>".to_string()
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -158,8 +152,10 @@ pub enum DecodedPayload {
 
 /// Decode `wrapper.payload` according to `wrapper.payload_type`.
 ///
-/// Does **not** verify anything — use [`verify_and_decode_payload`] on the wire path.
-pub fn decode_payload(wrapper: &WrapperMessage) -> Result<DecodedPayload, ProtocolError> {
+/// Does **not** verify anything, which is why it is crate-private: the only
+/// public entry point is [`verify_and_decode_payload`], which verifies the wrapper
+/// signature before the inner decode.
+pub(crate) fn decode_payload(wrapper: &WrapperMessage) -> Result<DecodedPayload, ProtocolError> {
     let payload = wrapper.payload.as_slice();
     let payload_type = wrapper.payload_type;
 
@@ -373,7 +369,16 @@ pub fn create_auth_request_with_challenge(
 /// `pam_service`, `process_name` and `command_preview` are sanitized and truncated to
 /// [`PAM_SERVICE_MAX_BYTES`], [`PROCESS_NAME_MAX_BYTES`] and
 /// [`COMMAND_PREVIEW_MAX_BYTES`] respectively, so the signed payload stays inside the
-/// BLE GATT budget.
+/// BLE GATT budget ([`crate::models::ble::MAX_GATT_PAYLOAD_BYTES`]).
+///
+/// `hostname` is bounded the same way, with [`HOSTNAME_MAX_BYTES`].
+///
+/// `username` is the exception: it is **rejected** with
+/// [`ProtocolError::InvalidMessageFormat`] when it exceeds [`USERNAME_MAX_BYTES`]
+/// instead of being sanitized or truncated. The username is the account the Server
+/// (phone) shows and the one the Client authorizes, so a truncated value would name
+/// a different account than the one being authenticated; a caller that cannot name
+/// the account in 32 bytes has a defect, not a long hostname.
 pub fn create_auth_request_with_context(
     username: &str,
     hostname: &str,
@@ -386,6 +391,9 @@ pub fn create_auth_request_with_context(
     if challenge.len() != 32 {
         return Err(ProtocolError::InvalidMessageFormat);
     }
+    if username.len() > USERNAME_MAX_BYTES {
+        return Err(ProtocolError::InvalidMessageFormat);
+    }
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -395,7 +403,7 @@ pub fn create_auth_request_with_context(
     Ok(AuthenticationRequest {
         challenge: challenge.to_vec(),
         username: username.to_string(),
-        hostname: hostname.to_string(),
+        hostname: sanitize_context_string(hostname, HOSTNAME_MAX_BYTES),
         timestamp_unix_seconds: timestamp,
         pam_service: sanitize_context_string(pam_service, PAM_SERVICE_MAX_BYTES),
         process_name: sanitize_context_string(process_name, PROCESS_NAME_MAX_BYTES),
@@ -925,6 +933,81 @@ mod tests {
     }
 
     #[test]
+    fn test_username_and_hostname_budget() {
+        // A username that cannot fit is refused, never truncated: the defect this
+        // catches is a 200-byte username silently cut to 32 bytes, i.e. the phone
+        // authorizing (and displaying) a different account than the one asking.
+        let long_username = "u".repeat(200);
+        assert!(matches!(
+            create_auth_request_with_context(&long_username, "host", &[1u8; 32], "", "", "", false),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+        // Just over the cap is already refused; exactly at the cap is accepted.
+        assert!(matches!(
+            create_auth_request_with_challenge(
+                &"u".repeat(USERNAME_MAX_BYTES + 1),
+                "host",
+                &[1u8; 32]
+            ),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+        let at_cap = "u".repeat(USERNAME_MAX_BYTES);
+        let request = create_auth_request_with_challenge(&at_cap, "host", &[1u8; 32]).unwrap();
+        assert_eq!(request.username, at_cap);
+        assert_eq!(request.username.len(), USERNAME_MAX_BYTES);
+
+        // A multi-byte username is measured in UTF-8 bytes, not characters: 16
+        // three-byte characters are 48 bytes and must be refused.
+        let multibyte = "\u{20ac}".repeat(16);
+        assert_eq!(multibyte.chars().count(), 16);
+        assert!(multibyte.len() > USERNAME_MAX_BYTES);
+        assert!(matches!(
+            create_auth_request_with_challenge(&multibyte, "host", &[1u8; 32]),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+
+        // A 200-byte hostname is display-only: it is sanitized and truncated to the
+        // budget, and the signed packet still fits the BLE GATT attribute.
+        let long_hostname = "h".repeat(200);
+        let request = create_auth_request_with_context(
+            "luca",
+            &long_hostname,
+            &[0x5Au8; 32],
+            "sudo",
+            "sudo",
+            &"c".repeat(COMMAND_PREVIEW_MAX_BYTES),
+            true,
+        )
+        .unwrap();
+        assert!(request.hostname.len() <= HOSTNAME_MAX_BYTES);
+        assert_eq!(
+            request.hostname.len(),
+            HOSTNAME_MAX_BYTES,
+            "the hostname must use the whole budget, ellipsis included"
+        );
+        // The ellipsis marks the cut instead of pretending the name is complete.
+        assert!(request.hostname.ends_with(ELLIPSIS));
+        assert!(long_hostname.starts_with(request.hostname.trim_end_matches(ELLIPSIS)));
+
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let csk = crate::crypto::ClientSymmetricKey::generate().unwrap();
+        let mut wrapper = crate::protocol::packet::wrap_auth_request(request);
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+        let packet = crate::protocol::packet::create_encrypted_packet_with_csk_nonce(
+            &csk,
+            SymmetricAlgorithm::Aes256Gcm,
+            HashAlgorithm::Sha256,
+            &wrapper,
+        )
+        .unwrap();
+        let measured = packet.encode_to_vec().len();
+        assert!(
+            measured <= crate::models::ble::MAX_GATT_PAYLOAD_BYTES,
+            "an over-long hostname must not push the packet past the GATT budget: {measured}"
+        );
+    }
+
+    #[test]
     fn test_timestamp_validation() {
         let challenge = [1u8; 32];
         let mut request = create_auth_request_with_challenge("user", "host", &challenge).unwrap();
@@ -965,25 +1048,5 @@ mod tests {
         let mut req_minus_61 = request.clone();
         req_minus_61.timestamp_unix_seconds = now.saturating_sub(61);
         assert!(!is_request_timestamp_valid(&req_minus_61));
-    }
-
-    #[test]
-    fn test_sha256_hex_debug() {
-        let data = b"test data";
-        let result = sha256_hex(data);
-
-        // In debug, should be a 64-char hex string
-        #[cfg(debug_assertions)]
-        {
-            assert_eq!(result.len(), 64);
-            // All characters should be valid hex
-            assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
-        }
-
-        // In release, should return the stripped placeholder
-        #[cfg(not(debug_assertions))]
-        {
-            assert_eq!(result, "<stripped>");
-        }
     }
 }

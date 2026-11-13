@@ -51,6 +51,33 @@
 //! which salts the HKDF that derives the directional keys and the SAS. Tampering
 //! with any of them changes the SAS visibly or breaks a signature.
 //!
+//! ## Client-wide algorithms (pinning)
+//!
+//! The symmetric and hash algorithms are properties of the **client-wide `CSK`**,
+//! not of an individual pairing: one multicast broadcast must stay decryptable by
+//! every already-paired server (cryptography-specification.md §1.3). When a `CSK`
+//! already exists, the caller must therefore pass its persisted algorithms — read
+//! from `ClientConfigManager::load_csk_metadata` — as [`PinnedAlgorithms`] to
+//! [`ServerPairingState::start`]. A pinned algorithm is then *required* in the
+//! peer's `supported_*` list: a peer that does not offer it is refused with
+//! [`ProtocolError::UnsupportedAlgorithm`] instead of silently negotiating a pair
+//! that would make the existing broadcast undecryptable for its servers.
+//!
+//! Pass `None` for the first pairing (no `CSK` yet) and after `RotateCsk`, which
+//! invalidates every pairing and is the only way to change the client-wide
+//! algorithms. The signature algorithm is per-server, so it is always negotiated
+//! and can never be pinned.
+//!
+//! ## Key lifetime
+//!
+//! [`ServerPairingState::conclude`] and [`ClientPairingSession::conclude`] drop
+//! the derived keys and the transcript hash as soon as pairing completes (or is
+//! aborted), per cryptography-specification.md §4. After `conclude` the state
+//! still reports [`ServerPairingState::negotiated`] but every operation that needs
+//! keys fails with [`ProtocolError::MissingField`]`("pairing_session_keys")` and
+//! [`ServerPairingState::sas`]/[`ServerPairingState::transcript_hash`] return
+//! `None`.
+//!
 //! ## Who signs what
 //!
 //! * `PairingResponse.client_signature` — `Ed_C`, the **desktop's static key**,
@@ -75,6 +102,7 @@
 
 use prost::Message as ProstMessage;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::crypto::{
     compute_pairing_abort_tag, compute_pairing_transcript_hash, decrypt_with_key,
@@ -137,6 +165,15 @@ pub struct NegotiatedAlgorithms {
     pub signature_algorithm: SignatureAlgorithm,
 }
 
+/// The algorithms a client-wide CSK is already committed to. A client that
+/// already holds a CSK must re-pair only with peers that support them,
+/// because one multicast broadcast must stay decryptable by every paired server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedAlgorithms {
+    pub symmetric_algorithm: SymmetricAlgorithm,
+    pub hash_algorithm: HashAlgorithm,
+}
+
 /// Encode a [`PairingPacket`] for a UDP datagram payload or a BLE GATT value.
 ///
 /// Rejects a version other than [`PROTOCOL_VERSION_V2`] and a `session_id` that
@@ -166,6 +203,17 @@ pub fn pairing_session_id(
         .as_slice()
         .try_into()
         .map_err(|_| ProtocolError::InvalidMessageFormat)
+}
+
+/// The address information a pairing session publishes in its QR code.
+///
+/// These values never enter the transcript; they only build the
+/// `tapauth://pair?v=2&...` URL, and may all be absent for BLE-only pairing.
+#[derive(Debug, Clone, Copy, Default)]
+struct PairingEndpoint {
+    udp_port: u16,
+    ipv4: Option<std::net::Ipv4Addr>,
+    ipv6: Option<std::net::Ipv6Addr>,
 }
 
 /// What the desktop needs to show/emit after [`ServerPairingState::start`].
@@ -200,6 +248,8 @@ pub struct ServerPairingState {
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
     negotiated: Option<NegotiatedAlgorithms>,
+    /// The active CSK's algorithms, which negotiation must reproduce.
+    pinned: Option<PinnedAlgorithms>,
 }
 
 impl ServerPairingState {
@@ -207,15 +257,17 @@ impl ServerPairingState {
     /// id and QR URL.
     ///
     /// `udp_port`, `ipv4` and `ipv6` only feed the QR URL (they may be absent for
-    /// BLE-only pairing). The CSK does not exist yet at this point, so no
-    /// algorithm is pinned here — negotiation happens in
-    /// [`ServerPairingState::handle_init`].
+    /// BLE-only pairing). Negotiation happens in
+    /// [`ServerPairingState::handle_init`]; `pinned` carries the algorithms an
+    /// existing `CSK` is already committed to (see the module docs), and must be
+    /// `None` for a first pairing.
     pub fn start(
         client_identity: Ed25519KeyPair,
         client_device_name: &str,
         udp_port: u16,
         ipv4: Option<std::net::Ipv4Addr>,
         ipv6: Option<std::net::Ipv6Addr>,
+        pinned: Option<PinnedAlgorithms>,
     ) -> Result<(Self, StartedPairing), ProtocolError> {
         let mut session_id = [0u8; PAIRING_SESSION_ID_LEN];
         getrandom::fill(&mut session_id)
@@ -226,9 +278,12 @@ impl ServerPairingState {
             x25519_keypair,
             client_identity,
             client_device_name,
-            udp_port,
-            ipv4,
-            ipv6,
+            PairingEndpoint {
+                udp_port,
+                ipv4,
+                ipv6,
+            },
+            pinned,
         ))
     }
 
@@ -241,18 +296,17 @@ impl ServerPairingState {
         x25519_keypair: X25519KeyPair,
         client_identity: Ed25519KeyPair,
         client_device_name: &str,
-        udp_port: u16,
-        ipv4: Option<std::net::Ipv4Addr>,
-        ipv6: Option<std::net::Ipv6Addr>,
+        endpoint: PairingEndpoint,
+        pinned: Option<PinnedAlgorithms>,
     ) -> (Self, StartedPairing) {
         let client_x25519_public_key = x25519_keypair.public_key_bytes();
         let pairing_adv_id = derive_ble_pairing_adv_id(&session_id, &client_x25519_public_key);
         let qr_url = generate_pairing_url_v2(
             &session_id,
             &hex::encode(client_x25519_public_key),
-            Some(udp_port),
-            ipv4,
-            ipv6,
+            Some(endpoint.udp_port),
+            endpoint.ipv4,
+            endpoint.ipv6,
         );
 
         let state = Self {
@@ -266,6 +320,7 @@ impl ServerPairingState {
             transcript_hash: None,
             keys: None,
             negotiated: None,
+            pinned,
         };
         let started = StartedPairing {
             session_id,
@@ -319,7 +374,12 @@ impl ServerPairingState {
         let supported_symmetric = symmetric_algorithms(&init.supported_symmetric_algorithms)?;
         let supported_hash = hash_algorithms(&init.supported_hash_algorithms)?;
         let supported_signature = signature_algorithms(&init.supported_signature_algorithms)?;
-        let negotiated = negotiate(&supported_symmetric, &supported_hash, &supported_signature)?;
+        let negotiated = negotiate(
+            &supported_symmetric,
+            &supported_hash,
+            &supported_signature,
+            self.pinned,
+        )?;
 
         let client_x25519_public_key = self.x25519_keypair.public_key_bytes();
         let client_ed25519_public_key = self.client_identity.verifying_key_bytes();
@@ -343,10 +403,12 @@ impl ServerPairingState {
         };
         let transcript_hash = compute_pairing_transcript_hash(&transcript);
 
-        let shared_secret = self
-            .x25519_keypair
-            .diffie_hellman(&server_x25519_public_key)?;
+        let shared_secret = Zeroizing::new(
+            self.x25519_keypair
+                .diffie_hellman(&server_x25519_public_key)?,
+        );
         let keys = derive_pairing_keys_and_sas(&shared_secret, &transcript_hash)?;
+        drop(shared_secret);
 
         let signed = context_with_hash(PAIRING_CLIENT_SIG_CONTEXT, &transcript_hash);
         let client_signature = sign_ed25519(&self.client_identity, &signed);
@@ -376,6 +438,23 @@ impl ServerPairingState {
     /// The cached `PairingResponse` to re-send for a retried `PairingInit`.
     pub fn response(&self) -> Option<&PairingResponse> {
         self.response.as_ref()
+    }
+
+    /// Drop the session keys and the transcript hash.
+    ///
+    /// Call this once the pairing has completed ([`ServerPairingState::verify_confirm_server`]
+    /// returned `Ok`) or as soon as it is aborted, so `K_c2s`/`K_s2c`/`H` do not
+    /// linger in memory (cryptography-specification.md §4). Afterwards
+    /// [`ServerPairingState::sas`] and [`ServerPairingState::transcript_hash`] return
+    /// `None`, [`ServerPairingState::negotiated`] still answers, and every operation
+    /// that needs keys fails with [`ProtocolError::MissingField`]`("pairing_session_keys")`.
+    ///
+    /// The ephemeral `x_C` is not dropped (its public half is still exposed by
+    /// [`ServerPairingState::client_x25519_public_key`]); it is zeroized when the
+    /// state itself is dropped.
+    pub fn conclude(&mut self) {
+        self.keys = None;
+        self.transcript_hash = None;
     }
 
     /// The negotiated algorithms, once `PairingInit` has been handled.
@@ -529,9 +608,27 @@ impl ClientPairingSession {
         server_identity: Ed25519KeyPair,
         server_device_name: &str,
     ) -> Result<Self, ProtocolError> {
-        Ok(Self {
+        Ok(Self::build(
             session_id,
-            x25519_keypair: X25519KeyPair::generate()?,
+            X25519KeyPair::generate()?,
+            server_identity,
+            server_device_name,
+        ))
+    }
+
+    /// Assemble the session around an already-chosen ephemeral `X_S`.
+    ///
+    /// Split out of [`ClientPairingSession::new`] so a test can pin `X_S` and get a
+    /// deterministic `Z`, `H` and SAS (see `transcript_hash_binds_every_negotiated_field`).
+    fn build(
+        session_id: [u8; PAIRING_SESSION_ID_LEN],
+        x25519_keypair: X25519KeyPair,
+        server_identity: Ed25519KeyPair,
+        server_device_name: &str,
+    ) -> Self {
+        Self {
+            session_id,
+            x25519_keypair,
             server_identity,
             server_device_name: truncate_utf8(server_device_name, PAIRING_DEVICE_NAME_MAX_BYTES),
             advertised_symmetric: SUPPORTED_SYMMETRIC_ALGORITHMS.to_vec(),
@@ -541,7 +638,7 @@ impl ClientPairingSession {
             negotiated: None,
             transcript_hash: None,
             keys: None,
-        })
+        }
     }
 
     /// The session id every frame of this pairing must carry.
@@ -655,10 +752,12 @@ impl ClientPairingSession {
         )
         .map_err(|_| ProtocolError::InvalidSignature)?;
 
-        let shared_secret = self
-            .x25519_keypair
-            .diffie_hellman(&client_x25519_public_key)?;
+        let shared_secret = Zeroizing::new(
+            self.x25519_keypair
+                .diffie_hellman(&client_x25519_public_key)?,
+        );
         let keys = derive_pairing_keys_and_sas(&shared_secret, &transcript_hash)?;
+        drop(shared_secret);
 
         self.negotiated = Some(negotiated);
         self.transcript_hash = Some(transcript_hash);
@@ -679,6 +778,17 @@ impl ClientPairingSession {
     /// The SAS to display (`"123-456"`), once the response has been verified.
     pub fn sas(&self) -> Option<&str> {
         self.keys.as_ref().map(|keys| keys.sas.as_str())
+    }
+
+    /// Drop the session keys and the transcript hash.
+    ///
+    /// Call this once [`ClientPairingSession::create_confirm_server`] has been sent
+    /// after the user confirmed the SAS, or as soon as the pairing is aborted, so
+    /// `K_c2s`/`K_s2c`/`H` do not linger in memory (cryptography-specification.md §4).
+    /// Same post-conditions as [`ServerPairingState::conclude`].
+    pub fn conclude(&mut self) {
+        self.keys = None;
+        self.transcript_hash = None;
     }
 
     /// Decrypt the desktop's provisioning payload (`PairingConfirmClient`).
@@ -862,15 +972,41 @@ fn pick_first<T: Copy + PartialEq>(ours: &[T], theirs: &[T]) -> Option<T> {
 }
 
 /// Intersect all three lists, requiring a non-empty intersection for each.
+///
+/// A pinned (client-wide) algorithm must be present in the peer's list *and* be
+/// one this build implements; otherwise negotiation fails instead of selecting a
+/// pair the existing `CSK` is not using. The signature algorithm is per-server and
+/// is never pinned.
 fn negotiate(
     symmetric: &[SymmetricAlgorithm],
     hash: &[HashAlgorithm],
     signature: &[SignatureAlgorithm],
+    pinned: Option<PinnedAlgorithms>,
 ) -> Result<NegotiatedAlgorithms, ProtocolError> {
-    let symmetric_algorithm = pick_first(SUPPORTED_SYMMETRIC_ALGORITHMS, symmetric)
-        .ok_or(ProtocolError::UnsupportedAlgorithm)?;
-    let hash_algorithm =
-        pick_first(SUPPORTED_HASH_ALGORITHMS, hash).ok_or(ProtocolError::UnsupportedAlgorithm)?;
+    let symmetric_algorithm = match pinned {
+        Some(pinned) => {
+            if !SUPPORTED_SYMMETRIC_ALGORITHMS.contains(&pinned.symmetric_algorithm)
+                || !symmetric.contains(&pinned.symmetric_algorithm)
+            {
+                return Err(ProtocolError::UnsupportedAlgorithm);
+            }
+            pinned.symmetric_algorithm
+        }
+        None => pick_first(SUPPORTED_SYMMETRIC_ALGORITHMS, symmetric)
+            .ok_or(ProtocolError::UnsupportedAlgorithm)?,
+    };
+    let hash_algorithm = match pinned {
+        Some(pinned) => {
+            if !SUPPORTED_HASH_ALGORITHMS.contains(&pinned.hash_algorithm)
+                || !hash.contains(&pinned.hash_algorithm)
+            {
+                return Err(ProtocolError::UnsupportedAlgorithm);
+            }
+            pinned.hash_algorithm
+        }
+        None => pick_first(SUPPORTED_HASH_ALGORITHMS, hash)
+            .ok_or(ProtocolError::UnsupportedAlgorithm)?,
+    };
     let signature_algorithm = pick_first(SUPPORTED_SIGNATURE_ALGORITHMS, signature)
         .ok_or(ProtocolError::UnsupportedAlgorithm)?;
     Ok(NegotiatedAlgorithms {
@@ -952,12 +1088,19 @@ mod tests {
     }
 
     fn start_desktop() -> (ServerPairingState, StartedPairing) {
+        start_desktop_with_pins(None)
+    }
+
+    fn start_desktop_with_pins(
+        pinned: Option<PinnedAlgorithms>,
+    ) -> (ServerPairingState, StartedPairing) {
         ServerPairingState::start(
             desktop_identity(),
             "thinkpad",
             36692,
             Some(Ipv4Addr::new(192, 168, 1, 10)),
             None,
+            pinned,
         )
         .unwrap()
     }
@@ -970,11 +1113,25 @@ mod tests {
             X25519KeyPair::from_secret_bytes([0x11; 32]),
             desktop_identity(),
             "thinkpad",
-            36692,
-            None,
+            PairingEndpoint {
+                udp_port: 36692,
+                ipv4: None,
+                ipv6: None,
+            },
             None,
         )
         .0
+    }
+
+    /// The phone counterpart of [`seeded_desktop`]: a fixed `X_S`, so `Z`, `H` and
+    /// the SAS are the same on every run.
+    fn seeded_phone(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ClientPairingSession {
+        ClientPairingSession::build(
+            session_id,
+            X25519KeyPair::from_secret_bytes([0x22; 32]),
+            phone_identity(),
+            "pixel",
+        )
     }
 
     /// Desktop + phone with `PairingInit` sent and `PairingResponse` received, but
@@ -1584,7 +1741,11 @@ mod tests {
         // Baseline pairing on a desktop whose key material can be reproduced.
         let mut desktop = seeded_desktop(session_id);
         let qr_pk = desktop.client_x25519_public_key();
-        let mut phone = ClientPairingSession::new(session_id, phone_identity(), "pixel").unwrap();
+        // ...and a phone whose ephemeral `X_S` is fixed too: `Z`, `H` and the SAS are
+        // then a fixed property of this fixture rather than a per-run draw, so the
+        // "the SAS must change" assertions below cannot flake on a 1-in-10^6
+        // SAS collision.
+        let mut phone = seeded_phone(session_id);
         let init = phone.create_init().unwrap();
         let response = desktop.handle_init(&init).unwrap().clone();
         phone.verify_response(&response, &qr_pk).unwrap();
@@ -1645,6 +1806,343 @@ mod tests {
         }
     }
 
+    // --- 8. Client-wide algorithm pinning --------------------------------
+
+    /// Pair a desktop started with `pinned` against a phone that advertises
+    /// `advertised`, and return the desktop's negotiation result.
+    fn pair_with_pins(
+        pinned: Option<PinnedAlgorithms>,
+        advertised_symmetric: Vec<SymmetricAlgorithm>,
+        advertised_hash: Vec<HashAlgorithm>,
+    ) -> (
+        Result<(ServerPairingState, ClientPairingSession), ProtocolError>,
+        [u8; 32],
+    ) {
+        // Fixed key material: the negotiation outcome, not the keys, is the subject.
+        let session_id = [0x7Eu8; PAIRING_SESSION_ID_LEN];
+        let (mut desktop, started) = ServerPairingState::build(
+            session_id,
+            X25519KeyPair::from_secret_bytes([0x11; 32]),
+            desktop_identity(),
+            "thinkpad",
+            PairingEndpoint::default(),
+            pinned,
+        );
+        let mut phone = ClientPairingSession::new(started.session_id, phone_identity(), "pixel")
+            .expect("phone session");
+        phone.advertised_symmetric = advertised_symmetric;
+        phone.advertised_hash = advertised_hash;
+        let init = phone.create_init().expect("init");
+        let response = match desktop.handle_init(&init) {
+            Ok(response) => response.clone(),
+            Err(err) => return (Err(err), started.client_x25519_public_key),
+        };
+        let outcome = phone
+            .verify_response(&response, &started.client_x25519_public_key)
+            .map(|()| (desktop, phone));
+        (outcome, started.client_x25519_public_key)
+    }
+
+    /// A pinned algorithm must be selected even though the baseline (AES-256-GCM)
+    /// is also on offer, because the client-wide CSK is already committed to it.
+    /// The defect this catches: negotiation ignoring the pins and picking the
+    /// baseline-first algorithm, which would silently produce a pairing whose
+    /// broadcast every already-paired server fails to decrypt.
+    #[test]
+    fn pinned_algorithms_win_over_the_baseline() {
+        let pinned = PinnedAlgorithms {
+            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+            hash_algorithm: HashAlgorithm::Sha256,
+        };
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(pinned),
+            vec![
+                SymmetricAlgorithm::Aes256Gcm,
+                SymmetricAlgorithm::Chacha20Poly1305,
+            ],
+            vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
+        );
+        let (desktop, phone) = outcome.expect("a pinned algorithm the peer offers must pair");
+
+        let expected = NegotiatedAlgorithms {
+            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+            hash_algorithm: HashAlgorithm::Sha256,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        };
+        assert_eq!(desktop.negotiated(), Some(expected));
+        assert_eq!(phone.negotiated(), Some(expected));
+        assert_eq!(
+            desktop.response().unwrap().selected_symmetric_algorithm,
+            SymmetricAlgorithm::Chacha20Poly1305 as i32
+        );
+
+        // The whole pairing still completes under the pinned algorithm.
+        let csk = [0x42u8; 32];
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        assert_eq!(
+            phone.process_confirm_client(&confirm_client).unwrap().csk,
+            csk.to_vec()
+        );
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+        assert_eq!(desktop.sas(), phone.sas());
+
+        // A pinned hash also cannot be overridden by the peer's order.
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+                hash_algorithm: HashAlgorithm::Blake3,
+            }),
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
+        );
+        let (desktop, _phone) = outcome.unwrap();
+        assert_eq!(
+            desktop.negotiated().unwrap().hash_algorithm,
+            HashAlgorithm::Blake3
+        );
+    }
+
+    /// A peer that does not offer the pinned symmetric algorithm cannot be paired,
+    /// and the refusal must not leave a half-established session behind.
+    /// The defect this catches: falling back to a negotiated algorithm the CSK is
+    /// not using (the "pair a second phone at the wrong algorithm" bug).
+    #[test]
+    fn pinned_symmetric_algorithm_absent_from_the_peer_is_refused() {
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Sha256,
+            }),
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Sha256],
+        );
+        match outcome {
+            Err(ProtocolError::UnsupportedAlgorithm) => {}
+            Err(other) => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+            Ok(_) => panic!("a peer without the pinned symmetric algorithm must be refused"),
+        }
+
+        // Same for the hash algorithm: SHA-256/SHA-256 pinned, BLAKE3-only peer.
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+                hash_algorithm: HashAlgorithm::Sha256,
+            }),
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Blake3],
+        );
+        match outcome {
+            Err(ProtocolError::UnsupportedAlgorithm) => {}
+            Err(other) => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+            Ok(_) => panic!("a peer without the pinned hash algorithm must be refused"),
+        }
+
+        // The refusal leaves the desktop state untouched: no response, no keys.
+        let session_id = [0x7Fu8; PAIRING_SESSION_ID_LEN];
+        let (mut desktop, started) = ServerPairingState::build(
+            session_id,
+            X25519KeyPair::from_secret_bytes([0x11; 32]),
+            desktop_identity(),
+            "thinkpad",
+            PairingEndpoint::default(),
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Sha256,
+            }),
+        );
+        let mut phone =
+            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+        phone.advertised_symmetric = vec![SymmetricAlgorithm::Aes256Gcm];
+        let init = phone.create_init().unwrap();
+        assert!(matches!(
+            desktop.handle_init(&init).unwrap_err(),
+            ProtocolError::UnsupportedAlgorithm
+        ));
+        assert!(desktop.response().is_none());
+        assert!(desktop.negotiated().is_none());
+        assert!(desktop.keys.is_none());
+    }
+
+    /// Without pins, negotiation keeps the baseline-first behaviour that lets an
+    /// older peer intersect on AES-256-GCM + SHA-256.
+    #[test]
+    fn unpinned_negotiation_keeps_the_baseline() {
+        let (outcome, _qr_pk) = pair_with_pins(
+            None,
+            vec![
+                SymmetricAlgorithm::Chacha20Poly1305,
+                SymmetricAlgorithm::Aes256Gcm,
+            ],
+            vec![HashAlgorithm::Blake3, HashAlgorithm::Sha256],
+        );
+        let (desktop, phone) = outcome.unwrap();
+        let expected = NegotiatedAlgorithms {
+            symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+            hash_algorithm: HashAlgorithm::Sha256,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        };
+        assert_eq!(desktop.negotiated(), Some(expected));
+        assert_eq!(phone.negotiated(), Some(expected));
+    }
+
+    // --- 9. Key lifetime -------------------------------------------------
+
+    /// After `conclude`, both state machines must refuse to touch the retained
+    /// session material: the SAS and `H` are gone and every keyed operation fails.
+    /// The defect this catches: `conclude` that only drops the SAS (leaving
+    /// `K_c2s`/`K_s2c` usable, so a concluded session can still emit or accept
+    /// confirm messages) or one that clears `negotiated()` as well.
+    #[test]
+    fn conclude_drops_keys_and_transcript_but_keeps_the_negotiation() {
+        let (mut desktop, mut phone) = established();
+        let expected = desktop.negotiated().unwrap();
+        let csk = [0x42u8; 32];
+
+        // A genuine confirm round-trips before concluding, so the errors below are
+        // caused by `conclude` and not by a broken fixture.
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        phone.process_confirm_client(&confirm_client).unwrap();
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+
+        desktop.conclude();
+        phone.conclude();
+
+        // Negotiated algorithms survive (they are persisted metadata, not key material).
+        assert_eq!(desktop.negotiated(), Some(expected));
+        assert_eq!(phone.negotiated(), Some(expected));
+        // Keys and transcript hash do not.
+        assert!(desktop.sas().is_none());
+        assert!(phone.sas().is_none());
+        assert!(desktop.transcript_hash().is_none());
+        assert!(phone.transcript_hash().is_none());
+
+        assert!(matches!(
+            desktop.create_confirm_client(&csk, "luca", "thinkpad"),
+            Err(ProtocolError::MissingField("pairing_session_keys"))
+        ));
+        assert!(matches!(
+            desktop.verify_confirm_server(&confirm_server, &csk),
+            Err(ProtocolError::MissingField("pairing_session_keys"))
+        ));
+        assert!(matches!(
+            phone.create_confirm_server(&csk),
+            Err(ProtocolError::MissingField("pairing_session_keys"))
+        ));
+        assert!(matches!(
+            phone.process_confirm_client(&confirm_client),
+            Err(ProtocolError::MissingField("pairing_session_keys"))
+        ));
+    }
+
+    // --- 10. ChaCha20-Poly1305 pairing -----------------------------------
+
+    /// A pairing that negotiates ChaCha20-Poly1305 must seal *both* confirm
+    /// messages with it. The test proves the algorithm actually reached the AEAD by
+    /// opening the ciphertext with the same key under ChaCha (it works) and under
+    /// AES-256-GCM (it must not).
+    /// The defect this catches: confirm paths that ignore
+    /// `negotiated.symmetric_algorithm` and always use AES-256-GCM, which no peer
+    /// that negotiated ChaCha could ever decrypt.
+    #[test]
+    fn chacha20_poly1305_pairing_seals_both_confirm_messages() {
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Sha256,
+            }),
+            vec![
+                SymmetricAlgorithm::Chacha20Poly1305,
+                SymmetricAlgorithm::Aes256Gcm,
+            ],
+            vec![HashAlgorithm::Sha256],
+        );
+        let (desktop, phone) = outcome.unwrap();
+        assert_eq!(
+            desktop.negotiated().unwrap().symmetric_algorithm,
+            SymmetricAlgorithm::Chacha20Poly1305
+        );
+        assert_eq!(
+            phone.negotiated().unwrap().symmetric_algorithm,
+            SymmetricAlgorithm::Chacha20Poly1305
+        );
+
+        let csk = [0x42u8; 32];
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        // The desktop's own keys are what both messages are opened with.
+        let keys = desktop.keys.as_ref().unwrap();
+        let transcript_hash = *desktop.transcript_hash().unwrap();
+
+        let provision_aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, &transcript_hash);
+        assert_eq!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Chacha20Poly1305,
+                &keys.k_c2s,
+                &confirm_client.encrypted_payload,
+                &provision_aad,
+            )
+            .unwrap(),
+            PairingProvisionPayload {
+                csk: csk.to_vec(),
+                username: "luca".to_string(),
+                client_hostname: "thinkpad".to_string(),
+            }
+            .encode_to_vec()
+        );
+        assert!(matches!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Aes256Gcm,
+                &keys.k_c2s,
+                &confirm_client.encrypted_payload,
+                &provision_aad,
+            ),
+            Err(CryptoError::DecryptionFailed)
+        ));
+
+        // The high-level path agrees, and the phone's completion proof is ChaCha too.
+        assert_eq!(
+            phone.process_confirm_client(&confirm_client).unwrap().csk,
+            csk.to_vec()
+        );
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        let complete_aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
+        assert_eq!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Chacha20Poly1305,
+                &desktop.keys.as_ref().unwrap().k_s2c,
+                &confirm_server.encrypted_complete,
+                &complete_aad,
+            )
+            .unwrap()
+            .len(),
+            64 + 2,
+        );
+        assert!(matches!(
+            decrypt_with_key(
+                SymmetricAlgorithm::Aes256Gcm,
+                &desktop.keys.as_ref().unwrap().k_s2c,
+                &confirm_server.encrypted_complete,
+                &complete_aad,
+            ),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+        assert_eq!(desktop.sas(), phone.sas());
+    }
+
     // --- Misc -------------------------------------------------------------
 
     #[test]
@@ -1691,7 +2189,8 @@ mod tests {
         assert!(long_name.starts_with(&truncated));
 
         let (mut desktop, started) =
-            ServerPairingState::start(desktop_identity(), &long_name, 36692, None, None).unwrap();
+            ServerPairingState::start(desktop_identity(), &long_name, 36692, None, None, None)
+                .unwrap();
         assert_eq!(desktop.client_device_name.len(), 63);
 
         let mut phone =

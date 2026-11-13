@@ -15,6 +15,12 @@ use crate::crypto::{
 };
 use crate::protocol::pb::*;
 
+/// Length in bytes of the `EncryptedPacket.temporal_identifier` on every transport.
+///
+/// The BLE GATT specification fixes the post-connection identifier at the full
+/// 16 bytes (only the advertisement uses the truncated 10-byte form).
+pub const TEMPORAL_IDENTIFIER_LEN: usize = 16;
+
 /// Serialize, encrypt and package an already-signed `WrapperMessage` into an `EncryptedPacket`.
 ///
 /// The caller is expected to have signed `wrapper` with
@@ -47,7 +53,10 @@ pub fn create_encrypted_packet_with_csk_nonce(
 /// Decrypt an `EncryptedPacket` and recover the signed `WrapperMessage`.
 ///
 /// Rejects a packet whose `encryption_algorithm` differs from
-/// `expected_symmetric_algorithm` **before** touching the ciphertext, and decrypts with
+/// `expected_symmetric_algorithm` **before** touching the ciphertext, and one whose
+/// `temporal_identifier` is not exactly [`TEMPORAL_IDENTIFIER_LEN`] bytes (the
+/// BLE GATT specification fixes the on-air identifier at the full 16 bytes; a short
+/// one is a malformed frame, not a shorter identifier). It then decrypts with
 /// `AAD = encrypted_packet_aad(packet.encryption_algorithm, &packet.temporal_identifier)`,
 /// so a tampered header fails authentication instead of being silently accepted.
 pub fn decrypt_encrypted_packet_with_csk_nonce(
@@ -57,6 +66,9 @@ pub fn decrypt_encrypted_packet_with_csk_nonce(
 ) -> Result<WrapperMessage, ProtocolError> {
     if packet.encryption_algorithm != expected_symmetric_algorithm as i32 {
         return Err(ProtocolError::AlgorithmMismatch);
+    }
+    if packet.temporal_identifier.len() != TEMPORAL_IDENTIFIER_LEN {
+        return Err(ProtocolError::InvalidMessageFormat);
     }
 
     let aad = encrypted_packet_aad(packet.encryption_algorithm, &packet.temporal_identifier);
@@ -129,6 +141,21 @@ pub fn wrap_auth_cancel(cancel: AuthenticationCancel) -> WrapperMessage {
 /// Extract the inner `challenge` field, dispatching on `wrapper.payload_type`.
 ///
 /// Returns `None` for an unknown/absent payload type or a payload that does not decode.
+///
+/// # Security
+///
+/// This decodes an **unverified** wrapper: it neither checks the signature nor the
+/// payload type against a caller expectation, so its output is attacker-controlled
+/// until the wrapper has been verified. Only call it on a `WrapperMessage` that has
+/// already been authenticated with
+/// [`verify_wrapper_signature`](super::messages::verify_wrapper_signature) — or, on
+/// the wire path, that came out of
+/// [`verify_and_decode_payload`](super::messages::verify_and_decode_payload), which
+/// verifies before decoding.
+///
+/// No authorization decision (grant, denial, cancel, "this challenge is answered")
+/// may be taken from this function's output; use `verify_auth_grant` /
+/// `verify_auth_denial` or `verify_and_decode_payload` for those.
 pub fn extract_challenge(wrapper: &WrapperMessage) -> Option<Vec<u8>> {
     let payload = wrapper.payload.as_slice();
     let payload_type = wrapper.payload_type;
@@ -459,249 +486,128 @@ mod tests {
 )]
 mod protobuf_tests {
     use super::*;
+    use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
+    use crate::protocol::messages::{create_auth_request_with_challenge, decode_payload};
     use prost::Message;
 
+    const AES: SymmetricAlgorithm = SymmetricAlgorithm::Aes256Gcm;
+    const SHA256: HashAlgorithm = HashAlgorithm::Sha256;
+
+    /// A non-16-byte `temporal_identifier` must be refused by the decrypt path.
+    /// The defect this catches: a decrypt that authenticates whatever length the
+    /// peer sent, so a 5-byte identifier is accepted as a valid frame even though
+    /// the specification fixes it at 16 bytes (which would also let a peer pick
+    /// from a much smaller identifier space).
     #[test]
-    fn test_encrypted_packet_temporal_identifier_correct_length() {
-        // Create a test EncryptedPacket with exactly 16 bytes
-        let temporal_id = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let packet = EncryptedPacket {
-            temporal_identifier: temporal_id.clone(),
-            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-            ciphertext: vec![0xAA, 0xBB, 0xCC, 0xDD],
-        };
+    fn test_decrypt_rejects_non_16_byte_temporal_identifier() {
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let request = create_auth_request_with_challenge("user", "host", &[0x11u8; 32]).unwrap();
+        let mut wrapper = wrap_auth_request(request);
+        crate::protocol::messages::sign_wrapper_message(
+            &mut wrapper,
+            &Ed25519KeyPair::generate().unwrap(),
+        )
+        .unwrap();
 
-        // Encode the packet
-        let mut buf = Vec::new();
-        packet.encode(&mut buf).unwrap();
-
-        // Decode using prost to verify we get the same temporal_identifier
-        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
-        assert_eq!(decoded.temporal_identifier, temporal_id);
-        assert_eq!(decoded.temporal_identifier.len(), 16);
-    }
-
-    #[test]
-    fn test_encrypted_packet_short_temporal_identifier_is_preserved() {
-        // Create packet with wrong length temporal_identifier (should be 16 bytes)
-        let packet = EncryptedPacket {
-            temporal_identifier: vec![1, 2, 3, 4, 5], // Only 5 bytes
-            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-            ciphertext: vec![0xAA, 0xBB],
-        };
-
-        let mut buf = Vec::new();
-        packet.encode(&mut buf).unwrap();
-
-        // Prost doesn't validate length - just checks it decodes
-        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
-        assert_eq!(decoded.temporal_identifier.len(), 5); // Prost allows it
-    }
-
-    #[test]
-    fn test_encrypted_packet_field_order_independent() {
-        // Verify that prost correctly handles fields regardless of encoding order
-        let temporal_id = vec![0xFF; 16];
-        let ciphertext = vec![0xDE, 0xAD, 0xBE, 0xEF];
-
-        let packet = EncryptedPacket {
-            temporal_identifier: temporal_id.clone(),
-            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-            ciphertext: ciphertext.clone(),
-        };
-
-        let mut buf = Vec::new();
-        packet.encode(&mut buf).unwrap();
-
-        // Decode and verify all fields are correct
-        let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
-        assert_eq!(decoded.temporal_identifier, temporal_id);
+        let genuine = create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+        assert_eq!(genuine.temporal_identifier.len(), TEMPORAL_IDENTIFIER_LEN);
         assert_eq!(
-            decoded.encryption_algorithm,
-            SymmetricAlgorithm::Aes256Gcm as i32
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &genuine).unwrap(),
+            wrapper
         );
-        assert_eq!(decoded.ciphertext, ciphertext);
-    }
 
-    #[test]
-    fn test_encrypted_packet_with_various_ciphertext_lengths() {
-        // Test that encoding/decoding works regardless of ciphertext size
-        let temporal_id = vec![0x42; 16];
-
-        for ciphertext_len in [0, 1, 100, 1000, 10000] {
-            let ciphertext = vec![0xAB; ciphertext_len];
-
-            let packet = EncryptedPacket {
-                temporal_identifier: temporal_id.clone(),
-                encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-                ciphertext,
-            };
-
-            let mut buf = Vec::new();
-            packet.encode(&mut buf).unwrap();
-
-            let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
-            assert_eq!(
-                decoded.temporal_identifier, temporal_id,
-                "Failed for ciphertext length {}",
-                ciphertext_len
+        for len in [0usize, 5, 15, 17, 32] {
+            let mut resized = genuine.clone();
+            resized.temporal_identifier = vec![0xAB; len];
+            let error = decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &resized).unwrap_err();
+            assert!(
+                matches!(error, ProtocolError::InvalidMessageFormat),
+                "a {len}-byte temporal identifier must be refused, got {error:?}"
             );
         }
     }
 
-    #[test]
-    fn test_encrypted_packet_all_byte_values() {
-        // Ensure encoding/decoding works with any byte values in temporal_id
-        for byte_val in [0x00, 0x01, 0x7F, 0x80, 0xFF] {
-            let temporal_id = vec![byte_val; 16];
-
-            let packet = EncryptedPacket {
-                temporal_identifier: temporal_id.clone(),
-                encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
-                ciphertext: vec![0x00],
-            };
-
-            let mut buf = Vec::new();
-            packet.encode(&mut buf).unwrap();
-
-            let decoded = EncryptedPacket::decode(&buf[..]).unwrap();
-            assert_eq!(
-                decoded.temporal_identifier, temporal_id,
-                "Failed for byte value 0x{:02X}",
-                byte_val
-            );
-        }
-    }
-
+    /// `wrap_auth_request` must tag the payload as an `AUTH_REQUEST` and carry the
+    /// request's serialized bytes as the signed payload.
+    /// The defect this catches: a builder that sets the wrong `PayloadType` or
+    /// re-serializes a different struct than the one handed to it.
     #[test]
     fn test_wrapper_message_auth_request_type() {
-        let request = AuthenticationRequest {
-            challenge: vec![0xAA; 32],
-            username: "testuser".to_string(),
-            hostname: "testhost".to_string(),
-            timestamp_unix_seconds: 1234567890,
-            pam_service: String::new(),
-            process_name: String::new(),
-            command_preview: String::new(),
-            tty_present: false,
-        };
+        let request =
+            create_auth_request_with_challenge("testuser", "testhost", &[0xAAu8; 32]).unwrap();
+        let wrapper = wrap_auth_request(request.clone());
 
-        let wrapper = WrapperMessage {
-            version: PROTOCOL_VERSION_V2,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            payload_type: PayloadType::AuthRequest as i32,
-            payload: request.encode_to_vec(),
-            signature: vec![0xBB; 64],
-        };
-
-        let mut buf = Vec::new();
-        wrapper.encode(&mut buf).unwrap();
-
-        // Parse and verify type
-        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert_eq!(parsed.payload_type, PayloadType::AuthRequest as i32);
+        assert_eq!(wrapper.payload_type, PayloadType::AuthRequest as i32);
+        assert_eq!(wrapper.version, PROTOCOL_VERSION_V2);
         assert_eq!(
-            AuthenticationRequest::decode(parsed.payload.as_slice()).unwrap(),
+            AuthenticationRequest::decode(wrapper.payload.as_slice()).unwrap(),
             request
         );
+
+        // ...and the decoded payload is dispatched back as an AuthRequest.
+        match decode_payload(&wrapper).unwrap() {
+            crate::protocol::messages::DecodedPayload::AuthRequest(decoded) => {
+                assert_eq!(decoded, request);
+            }
+            other => panic!("expected AuthRequest, got {other:?}"),
+        }
     }
 
+    /// `wrap_grant_confirmation` must tag the payload as a `GRANT_CONFIRMATION`
+    /// and carry the confirmation's bytes.
     #[test]
     fn test_wrapper_message_grant_confirmation_type() {
         let confirmation = GrantConfirmation {
             challenge: vec![0xCC; 32],
         };
+        let wrapper = wrap_grant_confirmation(confirmation.clone());
 
-        let wrapper = WrapperMessage {
-            version: PROTOCOL_VERSION_V2,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            payload_type: PayloadType::GrantConfirmation as i32,
-            payload: confirmation.encode_to_vec(),
-            signature: vec![0xBB; 64],
-        };
-
-        let mut buf = Vec::new();
-        wrapper.encode(&mut buf).unwrap();
-
-        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert_eq!(parsed.payload_type, PayloadType::GrantConfirmation as i32);
+        assert_eq!(wrapper.payload_type, PayloadType::GrantConfirmation as i32);
         assert_eq!(
-            GrantConfirmation::decode(parsed.payload.as_slice()).unwrap(),
+            GrantConfirmation::decode(wrapper.payload.as_slice()).unwrap(),
             confirmation
         );
+        assert!(matches!(
+            decode_payload(&wrapper).unwrap(),
+            crate::protocol::messages::DecodedPayload::GrantConfirmation(_)
+        ));
     }
 
+    /// `wrap_auth_cancel` must tag the payload as an `AUTH_CANCEL` and carry the
+    /// cancel's bytes.
     #[test]
     fn test_wrapper_message_auth_cancel_type() {
         let cancel = AuthenticationCancel {
             challenge: vec![0xDD; 32],
         };
+        let wrapper = wrap_auth_cancel(cancel.clone());
 
-        let wrapper = WrapperMessage {
-            version: PROTOCOL_VERSION_V2,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            payload_type: PayloadType::AuthCancel as i32,
-            payload: cancel.encode_to_vec(),
-            signature: vec![0xCC; 64],
-        };
-
-        let mut buf = Vec::new();
-        wrapper.encode(&mut buf).unwrap();
-
-        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert_eq!(parsed.payload_type, PayloadType::AuthCancel as i32);
+        assert_eq!(wrapper.payload_type, PayloadType::AuthCancel as i32);
         assert_eq!(
-            AuthenticationCancel::decode(parsed.payload.as_slice()).unwrap(),
+            AuthenticationCancel::decode(wrapper.payload.as_slice()).unwrap(),
             cancel
         );
+        assert!(matches!(
+            decode_payload(&wrapper).unwrap(),
+            crate::protocol::messages::DecodedPayload::AuthCancel(_)
+        ));
     }
 
+    /// `GRANT_CONFIRMATION` and `AUTH_CANCEL` must stay distinct payload types: a
+    /// confirmation must not decode as a cancel or vice versa.
+    /// The defect this catches: both enums collapsing to one wire value (e.g. a
+    /// copy-paste in `payload_type`), which would let a cancel satisfy a grant wait.
     #[test]
-    fn test_wrapper_message_with_version() {
-        // Verify that version field doesn't interfere with message type detection
-        let request = AuthenticationRequest {
-            challenge: vec![0xEE; 32],
-            username: "user".to_string(),
-            hostname: "host".to_string(),
-            timestamp_unix_seconds: 1234567890,
-            pam_service: String::new(),
-            process_name: String::new(),
-            command_preview: String::new(),
-            tty_present: false,
-        };
+    fn test_confirmation_and_cancel_are_distinct_payload_types() {
+        let confirmation = wrap_grant_confirmation(GrantConfirmation {
+            challenge: vec![0x01; 32],
+        });
+        let cancel = wrap_auth_cancel(AuthenticationCancel {
+            challenge: vec![0x02; 32],
+        });
 
-        let wrapper = WrapperMessage {
-            version: 42, // Non-standard version
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            payload_type: PayloadType::AuthRequest as i32,
-            payload: request.encode_to_vec(),
-            signature: vec![0xFF; 64],
-        };
-
-        let mut buf = Vec::new();
-        wrapper.encode(&mut buf).unwrap();
-
-        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert_eq!(parsed.version, 42);
-        assert_eq!(parsed.payload_type, PayloadType::AuthRequest as i32);
-    }
-
-    #[test]
-    fn test_wrapper_message_unknown_type() {
-        // Empty wrapper message (no payload set)
-        let wrapper = WrapperMessage {
-            version: PROTOCOL_VERSION_V2,
-            signature_algorithm: SignatureAlgorithm::Ed25519 as i32,
-            payload_type: PayloadType::Unspecified as i32,
-            payload: Vec::new(),
-            signature: Vec::new(),
-        };
-
-        let mut buf = Vec::new();
-        wrapper.encode(&mut buf).unwrap();
-
-        let parsed = WrapperMessage::decode(&buf[..]).unwrap();
-        assert_eq!(parsed.payload_type, PayloadType::Unspecified as i32);
-        assert!(parsed.payload.is_empty());
+        assert_ne!(confirmation.payload_type, cancel.payload_type);
+        assert_eq!(confirmation.payload_type, 4);
+        assert_eq!(cancel.payload_type, 5);
     }
 }
