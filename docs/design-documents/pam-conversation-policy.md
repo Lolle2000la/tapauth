@@ -4,7 +4,7 @@
 
 ## What the module is
 
-The module is one `auth` line in a service's stack. Debian/Ubuntu ship a `pam-auth-update` profile whose only auth line is `sufficient pam_tapauth.so` (`packaging/debian.pam-config`); the `required` shape is what the `bypass` e2e covers.
+The module is one `auth` line in a service's stack. Debian/Ubuntu ship a `pam-auth-update` profile whose only auth line is `sufficient pam_tapauth.so` (`packaging/debian.pam-config`); merged into `common-auth` it sits beside the stock modules, so a fall-through reaches `pam_unix`. The `required` shape is what the `bypass` e2e covers.
 
 | Line | On `PAM_SUCCESS` | On any other code |
 | :--- | :--- | :--- |
