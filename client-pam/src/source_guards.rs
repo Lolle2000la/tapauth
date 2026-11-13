@@ -80,7 +80,7 @@ fn only_one_refine_call_site() {
     let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
     // The caller and the module that defines the phase: the count below cannot
     // tell "the call site moved" from "the scan stopped reading the file".
-    for required in ["pam_logic/mod.rs", "policy/refine.rs"] {
+    for required in ["pam_logic.rs", "policy/refine.rs"] {
         assert!(
             names.iter().any(|name| name == required),
             "the scan did not cover {required}: {names:?}"
@@ -96,7 +96,7 @@ fn only_one_refine_call_site() {
             call_sites.push(format!("{rel}:{line}: {text}"));
         }
         match rel.as_str() {
-            "pam_logic/mod.rs" => {
+            "pam_logic.rs" => {
                 // A scan truncated at an early `#[cfg(test)]` item would see
                 // neither the one call site nor the config read below.
                 assert_scan_reaches(&rel, &cleaned, &["fn orchestrate"]);
@@ -117,7 +117,7 @@ fn only_one_refine_call_site() {
     );
     let only = call_sites.first().map(String::as_str).unwrap_or_default();
     assert!(
-        only.starts_with("pam_logic/mod.rs:"),
+        only.starts_with("pam_logic.rs:"),
         "the single refinement must run from `orchestrate`, found {only}"
     );
 
@@ -809,21 +809,21 @@ fn the_walker_separates_test_modules_from_production() {
         "lib.rs",
         "logging.rs",
         "mechanism/handoff.rs",
-        "mechanism/mod.rs",
+        "mechanism.rs",
         "mechanism/sequential.rs",
         "mechanism/threaded.rs",
         "outcome.rs",
-        "pam_logic/mod.rs",
+        "pam_logic.rs",
         "pam_logic/wiring.rs",
         "pam_messages.rs",
         "pam_sys.rs",
         "plan.rs",
-        "policy/mod.rs",
+        "policy.rs",
         "policy/refine.rs",
         "policy/table.rs",
         "transaction/host_io.rs",
         "transaction/lifecycle.rs",
-        "transaction/mod.rs",
+        "transaction.rs",
         "transaction/run.rs",
     ] {
         assert!(
@@ -835,10 +835,10 @@ fn the_walker_separates_test_modules_from_production() {
     assert_eq!(
         test_only,
         vec![
-            "pam_logic/tests/mod.rs".to_owned(),
             "pam_logic/tests/reuse.rs".to_owned(),
+            "pam_logic/tests.rs".to_owned(),
             "source_guards.rs".to_owned(),
-            "transaction/tests/mod.rs".to_owned(),
+            "transaction/tests.rs".to_owned(),
         ],
         "these are the only files a `#[cfg(test)] mod` declares"
     );
@@ -859,7 +859,7 @@ fn the_walker_separates_test_modules_from_production() {
         "a `#[cfg(test)] mod` file must scan as empty production"
     );
     assert!(
-        production_source(&src_root().join("transaction/tests/mod.rs")).is_empty(),
+        production_source(&src_root().join("transaction/tests.rs")).is_empty(),
         "a test module in its own file must scan as empty production"
     );
     assert!(
@@ -944,12 +944,12 @@ fn only_outcome_rs_returns_pam_constants() {
     for required in [
         "outcome.rs",
         "lib.rs",
-        "pam_logic/mod.rs",
+        "pam_logic.rs",
         "pam_logic/wiring.rs",
         "transaction/run.rs",
         "transaction/lifecycle.rs",
         "transaction/host_io.rs",
-        "mechanism/mod.rs",
+        "mechanism.rs",
         "mechanism/threaded.rs",
         "mechanism/sequential.rs",
         "mechanism/handoff.rs",
@@ -1019,7 +1019,7 @@ fn grant_findings(rel: &str, cleaned: &str) -> Vec<String> {
             || text.contains("fn replayed");
         let allowed = match rel {
             "outcome.rs" => true,
-            "pam_logic/mod.rs" | "transaction/lifecycle.rs" => call,
+            "pam_logic.rs" | "transaction/lifecycle.rs" => call,
             _ => false,
         };
         if !allowed {
@@ -1044,11 +1044,11 @@ fn granted_only_from_daemon() {
     let names: Vec<String> = files.iter().map(|p| relative_to_src(p)).collect();
     for required in [
         "outcome.rs",
-        "pam_logic/mod.rs",
+        "pam_logic.rs",
         "pam_logic/wiring.rs",
         "transaction/run.rs",
         "transaction/lifecycle.rs",
-        "mechanism/mod.rs",
+        "mechanism.rs",
         "mechanism/threaded.rs",
         "mechanism/sequential.rs",
         "mechanism/handoff.rs",
@@ -1153,7 +1153,7 @@ fn granted_scan_detects_a_planted_construction() {
         "a mechanism must not build a grant or call a grant constructor: {mechanism:?}"
     );
 
-    let orchestration = grant_findings("pam_logic/mod.rs", &planted);
+    let orchestration = grant_findings("pam_logic.rs", &planted);
     assert_eq!(
         orchestration.len(),
         1,
@@ -1181,7 +1181,7 @@ fn test_module_source_contains_no_pam_ignore_return() {
     // An empty or relocated scan must not pass silently: these files carry the
     // mechanism exits, the verdict mapping and the orchestration.
     for required in [
-        "pam_logic/mod.rs",
+        "pam_logic.rs",
         "pam_logic/wiring.rs",
         "outcome.rs",
         "mechanism/sequential.rs",
@@ -1323,7 +1323,7 @@ fn reuse_suite_is_intact() {
     let names: Vec<String> = files.iter().map(|path| relative_to_src(path)).collect();
     for required in [
         "pam_logic/tests/reuse.rs",
-        "transaction/tests/mod.rs",
+        "transaction/tests.rs",
         "conclusion_cache.rs",
         "source_guards.rs",
     ] {
