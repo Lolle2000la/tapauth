@@ -90,6 +90,8 @@ async fn send_pam_auth(
     username: String,
     timeout_secs: u32,
     request_id: String,
+    pam_service: String,
+    process_name: String,
 ) -> Result<ipc::PamAuthenticateResponse, Box<dyn std::error::Error>> {
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(
@@ -98,6 +100,8 @@ async fn send_pam_auth(
                 tty_present: false,
                 timeout_seconds: timeout_secs,
                 request_id,
+                pam_service,
+                process_name,
             },
         )),
     };
@@ -126,6 +130,24 @@ async fn send_pam_cancel(
     }
 }
 
+/// Decode a pairing session id written as 32 hex characters (16 raw bytes),
+/// with or without a leading `0x`. The daemon compares it byte for byte against
+/// the running session, so a mistyped id must fail here rather than silently
+/// cancel nothing.
+fn parse_session_id(value: &str) -> Result<Vec<u8>, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.len() != 32 {
+        return Err(format!(
+            "session id must be 32 hex characters (16 bytes), got {}",
+            digits.len()
+        ));
+    }
+    hex::decode(digits).map_err(|e| format!("session id is not valid hex: {}", e))
+}
+
 fn outcome_name(outcome: i32) -> &'static str {
     match ipc::PamOutcome::try_from(outcome) {
         Ok(ipc::PamOutcome::Success) => "SUCCESS",
@@ -146,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  start-pairing");
         eprintln!("  wait-for-pairing <port>");
         eprintln!("  complete-pairing <port>");
+        eprintln!("  cancel-pairing --port <port> --session-id <hex>");
         eprintln!("  get-servers");
         eprintln!("  remove-device <public_key_hex>");
         eprintln!("  set-transports --ble <true|false> --network <true|false>");
@@ -170,6 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ipc::admin_response::Payload::StartPairing(p)) = resp.payload {
                 println!("PORT={}", p.port);
                 println!("URL={}", p.url);
+                // Printed for harnesses that later need to address this exact
+                // session to `cancel-pairing`.
+                println!("SESSION_ID={}", hex::encode(&p.session_id));
             }
         }
         "wait-for-pairing" => {
@@ -204,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ipc::CompletePairingRequest { port },
                 )),
             };
-            let resp = send_admin(req, Duration::from_secs(30)).await?;
+            let resp = send_admin(req, Duration::from_secs(120)).await?;
             if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
                 eprintln!("ERROR: {}", resp.error_message);
                 std::process::exit(1);
@@ -212,6 +238,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ipc::admin_response::Payload::CompletePairing(p)) = resp.payload {
                 println!("SERVER_HEX={}", p.server_hex);
             }
+        }
+        "cancel-pairing" => {
+            // Both flags are optional on the wire: `port = 0` and an empty
+            // session id mean "don't check that field", which is what the daemon
+            // does for a GUI that tears its screen down.
+            let mut port: u32 = 0;
+            let mut session_id: Vec<u8> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--port" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing value for --port");
+                            std::process::exit(1);
+                        }
+                        match args[i + 1].parse::<u16>() {
+                            Ok(value) => port = u32::from(value),
+                            Err(e) => {
+                                eprintln!("Invalid --port '{}': {}", args[i + 1], e);
+                                std::process::exit(1);
+                            }
+                        }
+                        i += 2;
+                    }
+                    "--session-id" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing value for --session-id");
+                            std::process::exit(1);
+                        }
+                        match parse_session_id(&args[i + 1]) {
+                            Ok(value) => session_id = value,
+                            Err(e) => {
+                                eprintln!("Invalid --session-id: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                        i += 2;
+                    }
+                    other => {
+                        eprintln!(
+                            "Unknown argument '{}'. Usage: tapauth-ipc-cli cancel-pairing \
+                             [--port <port>] [--session-id <hex>]",
+                            other
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let req = ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::CancelPairing(
+                    ipc::CancelPairingRequest { port, session_id },
+                )),
+            };
+            let resp = send_admin(req, Duration::from_secs(30)).await?;
+            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+                eprintln!("ERROR: {}", resp.error_message);
+                std::process::exit(1);
+            }
+            println!("CANCELLED=true");
         }
         "get-servers" => {
             let req = ipc::AdminRequest {
@@ -339,23 +425,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "pam-auth" => {
             if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs] [request_id]");
+                eprintln!(
+                    "Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs] [request_id] \
+                     [--pam-service <name>] [--process-name <name>]"
+                );
                 std::process::exit(1);
             }
             let user = args[2].clone();
-            let timeout_secs = if args.len() >= 4 {
-                args[3].parse::<u32>()?
-            } else {
-                30
+            // Positional arguments keep their historical meaning; the context
+            // flags are optional and default to empty (an unset context).
+            let mut positional: Vec<String> = Vec::new();
+            let mut pam_service = String::new();
+            let mut process_name = String::new();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--pam-service" => {
+                        pam_service = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--process-name" => {
+                        process_name = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    other => {
+                        positional.push(other.to_string());
+                        i += 1;
+                    }
+                }
+            }
+
+            let timeout_secs = match positional.first() {
+                Some(value) => value.parse::<u32>()?,
+                None => 30,
             };
-            let request_id = if args.len() >= 5 {
-                args[4].clone()
-            } else {
-                format!("test-{}", std::process::id())
-            };
+            let request_id = positional
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| format!("test-{}", std::process::id()));
             // Print the request id before blocking so orchestrators can cancel it.
             println!("REQUEST_ID={}", request_id);
-            let resp = send_pam_auth(user, timeout_secs, request_id).await?;
+            let resp =
+                send_pam_auth(user, timeout_secs, request_id, pam_service, process_name).await?;
             println!("OUTCOME={}", outcome_name(resp.outcome));
             println!("DETAIL={}", resp.detail);
             if resp.outcome != 0 {

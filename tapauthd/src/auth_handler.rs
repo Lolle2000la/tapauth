@@ -1,12 +1,18 @@
 //! Authentication request handler that creates on-demand transports and runs auth flow.
 
-use crate::transport::{ReceiveResult, Transport, UdpTransport};
+use crate::caller_context::CallerContext;
+use crate::transport::{ReceiveResult, Transport, UdpTransport, NOTIFY_SETTLE};
 use shared::{
-    config::{ClientConfigManager, PairedServer},
+    config::{ClientConfigManager, CskMetadata, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
     firewall::{FirewallGuard, Protocol as FwProtocol},
     network::get_session_timeout,
-    protocol::{messages::*, packet::*, pb::EncryptedPacket, ProtocolError},
+    protocol::{
+        messages::*,
+        packet::*,
+        pb::{EncryptedPacket, PayloadType, WrapperMessage},
+        ProtocolError,
+    },
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,7 +22,9 @@ use tokio::sync::{oneshot, Mutex};
 #[cfg(feature = "ble")]
 use crate::transport::BleTransport;
 #[cfg(feature = "ble")]
-use shared::crypto::generate_current_temporal_identifier_ble;
+use crate::transport::ServerVerifier;
+#[cfg(feature = "ble")]
+use shared::crypto::generate_current_ble_temporal_identifier_with_alg;
 
 use shared::ipc::pb as ipc;
 
@@ -91,6 +99,117 @@ struct AwaitAuthParams<'a> {
     ble_transport: &'a Option<Arc<crate::transport::BleTransport>>,
     udp_transport: &'a Arc<crate::transport::UdpTransport>,
     cancel_packet: &'a EncryptedPacket,
+}
+
+/// How long the `GrantConfirmation` task may hold the concluding transport
+/// before it releases it anyway.
+///
+/// The three sends, the two 150 ms pauses between them and the [`NOTIFY_SETTLE`]
+/// pause after the last one take ~500 ms; the rest is slack for a slow
+/// controller. It is a bound, not a schedule: the task owns the transport's
+/// lifetime, so a hung `notify` must not leave the GATT application and the
+/// advertisement registered.
+const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(2);
+
+/// Which transport delivered the answer that concluded the session.
+#[cfg(feature = "ble")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinningTransport {
+    Ble,
+    Udp,
+}
+
+/// What the *losing* transports still have to do once a session has concluded.
+///
+/// Pure data so the policy can be tested without a transport. The invariant
+/// every consumer relies on: the transport that concluded the session is never
+/// cancelled or released from here — its acknowledgement is still in flight, and
+/// [`AuthSession::send_confirmation_background`] owns its teardown.
+#[cfg(feature = "ble")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Teardown {
+    /// Multicast `AuthenticationCancel` over UDP.
+    cancel_udp: bool,
+    /// `send_cancel` on the BLE link before releasing it.
+    cancel_ble: bool,
+    /// Release the BLE link: disconnect the phone, drop the GATT application and
+    /// the advertisement.
+    finalize_ble: bool,
+}
+
+/// Teardown for a session that ended in a **grant**.
+///
+/// The winner is left alone: a UDP winner already answered over UDP, so it gets
+/// no second `AuthenticationCancel`, and a BLE winner keeps its whole lifetime —
+/// last notification included — in the confirmation task.
+#[cfg(feature = "ble")]
+fn success_teardown(winner: WinningTransport) -> Teardown {
+    Teardown {
+        cancel_udp: winner != WinningTransport::Udp,
+        cancel_ble: winner != WinningTransport::Ble,
+        finalize_ble: winner != WinningTransport::Ble,
+    }
+}
+
+/// Teardown for a session that ended without a grant.
+///
+/// The winning transport is left alone for the same reason as in
+/// [`success_teardown`] — a denial is acknowledged on the same link, and that
+/// acknowledgement is still in flight. The difference is UDP: no grant was
+/// delivered, so the cancel goes out whatever concluded the session, and the
+/// losing BLE link is only released (it has nothing to be told).
+#[cfg(feature = "ble")]
+fn denial_teardown(winner: WinningTransport) -> Teardown {
+    Teardown {
+        cancel_udp: true,
+        cancel_ble: false,
+        finalize_ble: winner != WinningTransport::Ble,
+    }
+}
+
+/// Immutable inputs shared by every transport task of one authentication attempt.
+///
+/// Grouping them keeps the per-attempt values (CSK, negotiated algorithms,
+/// challenge, and the servers authorized for *this* user) in one place, so no
+/// call site can accidentally fall back to the full paired-server set.
+struct AuthRunParams {
+    keypair: Ed25519KeyPair,
+    csk: ClientSymmetricKey,
+    /// The CSK's negotiated algorithm pair, read once per attempt.
+    csk_meta: CskMetadata,
+    challenge: [u8; 32],
+    /// The account this session authenticates.
+    username: String,
+    /// Paired servers permitted to answer for `username`, and only those.
+    allowed_servers: Arc<Vec<PairedServer>>,
+}
+
+/// What one wait for a Server response produced.
+///
+/// The distinction between an unheard request and a heard-but-unusable frame
+/// matters for retransmission: only [`WaitOutcome::Timeout`] means the request
+/// itself went unanswered, so only it may widen the interval. Any paired device
+/// can put a decryptable frame on the link, and treating that as a timeout would
+/// let it thin the requests aimed at the phone that is allowed to answer.
+enum WaitOutcome {
+    /// A response whose signature belongs to a Server authorized for this user.
+    Response(WrapperMessage, String),
+    /// Nothing arrived within the retry interval.
+    Timeout,
+    /// A decryptable frame arrived, but no Server authorized for this user signed
+    /// it. The interval stays where it is, and the request that frame interrupted
+    /// still gets its whole interval before the next one goes out: the frame
+    /// answered nothing, so it earns neither a wider interval nor an early
+    /// re-request.
+    Unattributable,
+}
+
+impl WaitOutcome {
+    /// Whether the request itself went unanswered, i.e. whether the next attempt
+    /// should wait longer than this one did.
+    fn retransmission_unanswered(&self) -> bool {
+        matches!(self, Self::Timeout)
+    }
 }
 
 /// Shared state for daemon - loaded once at startup
@@ -230,6 +349,17 @@ pub struct AuthSession {
     state: Arc<DaemonState>,
     username: String,
     challenge: [u8; 32],
+    /// Caller-derived display context (PAM service, process, command), resolved
+    /// from `SO_PEERCRED` and /proc when the request arrived.
+    caller: CallerContext,
+    /// Whether the PAM conversation had a terminal.
+    tty_present: bool,
+    /// The CSK's negotiated algorithm pair, read once for the whole attempt so
+    /// every packet builder and transport call agrees on it.
+    csk_meta: CskMetadata,
+    /// Paired servers allowed to authenticate `username`. Every response check
+    /// is made against this set, never against `state.paired_servers`.
+    allowed_servers: Arc<Vec<PairedServer>>,
     /// Transports enabled for this attempt (read from config when the
     /// attempt starts)
     transports: TransportsEnabled,
@@ -238,15 +368,31 @@ pub struct AuthSession {
 }
 
 impl AuthSession {
-    pub fn new(state: Arc<DaemonState>, username: String) -> Result<Self, std::io::Error> {
+    pub fn new(
+        state: Arc<DaemonState>,
+        username: String,
+        caller: CallerContext,
+        tty_present: bool,
+    ) -> Result<Self, std::io::Error> {
         let mut challenge = [0u8; 32];
         getrandom::fill(&mut challenge)
             .map_err(|e| std::io::Error::other(format!("random generation failed: {}", e)))?;
+
+        // One read per attempt: the negotiated algorithms are client-wide, and a
+        // failure here must fail the attempt rather than silently downgrade.
+        let csk_meta = state
+            .config_manager
+            .load_csk_metadata()
+            .map_err(|e| std::io::Error::other(format!("CSK metadata unreadable: {}", e)))?;
 
         Ok(Self {
             state,
             username,
             challenge,
+            caller,
+            tty_present,
+            csk_meta,
+            allowed_servers: Arc::new(Vec::new()),
             transports: TransportsEnabled {
                 network: true,
                 ble: cfg!(feature = "ble"),
@@ -254,6 +400,26 @@ impl AuthSession {
             cancel_registry: None,
             request_id: None,
         })
+    }
+
+    /// Resolve which paired Servers may answer for this session's user, and make
+    /// that the set the whole attempt verifies against.
+    ///
+    /// This is the only place `allowed_users` is applied to an attempt, so it is
+    /// also the only place a test has to drive to prove the filter reaches the
+    /// transports: the value it returns *and* the value it stores are the same
+    /// filtered set, and [`Self::run_params`] hands out the stored one.
+    ///
+    /// SECURITY: a phone paired for another account must be unable to grant *or*
+    /// deny a session for this user, so nothing below may fall back to
+    /// `DaemonState::paired_servers`.
+    fn authorize(
+        &mut self,
+        paired_servers: &HashMap<String, PairedServer>,
+    ) -> Arc<Vec<PairedServer>> {
+        let allowed_servers = Arc::new(servers_authorized_for(paired_servers, &self.username));
+        self.allowed_servers = allowed_servers.clone();
+        allowed_servers
     }
 
     /// Handle PamAuthenticateRequest - creates transports on-demand, runs auth flow
@@ -306,11 +472,12 @@ impl AuthSession {
             });
         }
 
-        // Filter servers that are allowed to authenticate this user
-        let allowed_servers: Vec<_> = paired_servers
-            .iter()
-            .filter(|(_, server)| server.is_user_allowed(&self.username))
-            .collect();
+        // Filter servers that are allowed to authenticate this user.
+        //
+        // SECURITY: this filtered set — not `state.paired_servers` — must reach
+        // every response check below. A phone paired for another account must be
+        // unable to grant *or* deny a session for `self.username`.
+        let allowed_servers = self.authorize(&paired_servers);
 
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
@@ -363,11 +530,16 @@ impl AuthSession {
             None
         };
 
-        // Create the authentication request
-        let request = create_auth_request_with_challenge(
+        // Create the authentication request, carrying the resolved caller
+        // context so the phone can show what is being approved.
+        let request = create_auth_request_with_context(
             &self.username,
             &self.state.hostname,
             &self.challenge,
+            &self.caller.pam_service,
+            &self.caller.process_name,
+            &self.caller.command_preview,
+            self.tty_present,
         )?;
         let mut wrapper = wrap_auth_request(request);
         // Safety: keypair is Some after health check
@@ -382,6 +554,8 @@ impl AuthSession {
                 .csk
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("csk checked in health check")),
+            self.csk_meta.symmetric_algorithm,
+            self.csk_meta.hash_algorithm,
             &wrapper,
         )?;
 
@@ -444,19 +618,18 @@ impl AuthSession {
         &mut self,
         packet: &EncryptedPacket,
     ) -> Result<(), AuthHandlerError> {
-        let temporal_id = generate_current_temporal_identifier_ble(
+        let temporal_id = generate_current_ble_temporal_identifier_with_alg(
             self.state
                 .csk
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("csk checked in health check")),
+            self.csk_meta.hash_algorithm,
         )?;
-        let timeout = get_session_timeout();
 
         tracing::info!("Starting parallel discovery over UDP and BLE");
 
         // Initialize transports
-        let (udp_transport, ble_transport) =
-            self.initialize_transports(temporal_id, timeout).await?;
+        let (udp_transport, ble_transport) = self.initialize_transports(temporal_id).await?;
 
         // Setup cancellation mechanism
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -490,7 +663,6 @@ impl AuthSession {
     async fn initialize_transports(
         &self,
         temporal_id: [u8; 10],
-        timeout: Duration,
     ) -> Result<
         (
             Arc<crate::transport::UdpTransport>,
@@ -502,27 +674,22 @@ impl AuthSession {
         let udp_transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
 
-        // Safety: keypair is Some after health check in handle_authenticate
-        let keypair = Arc::new(
-            self.state
-                .keypair
-                .as_ref()
-                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
-                .clone(),
-        );
+        // Safety: csk is Some after the health check in handle_authenticate
         let csk = self
             .state
             .csk
             .clone()
             .unwrap_or_else(|| unreachable!("csk checked in health check"));
-        let challenge = self.challenge;
 
         // Skip BLE entirely when disabled by configuration
         let ble_transport = if !self.transports.ble {
             tracing::debug!("BLE transport disabled by configuration");
             None
         } else {
-            match BleTransport::new(temporal_id, timeout, csk, keypair, challenge).await {
+            // The BLE transport verifies every response it hands back, so it gets
+            // the same filtered server set as the UDP path — never every pairing.
+            let verifiers = ServerVerifier::from_paired_servers(&self.allowed_servers_by_key());
+            match BleTransport::new(temporal_id, csk, verifiers).await {
                 Ok(ble) => Some(Arc::new(ble)),
                 Err(e) => {
                     tracing::warn!(
@@ -535,6 +702,17 @@ impl AuthSession {
         };
 
         Ok((Arc::new(udp_transport), ble_transport))
+    }
+
+    /// The authorized servers keyed by public key, the shape
+    /// [`ServerVerifier::from_paired_servers`] consumes (the key itself is
+    /// unused: one verifier is built per value).
+    #[cfg(feature = "ble")]
+    fn allowed_servers_by_key(&self) -> HashMap<String, PairedServer> {
+        self.allowed_servers
+            .iter()
+            .map(|server| (server.public_key.clone(), server.clone()))
+            .collect()
     }
 
     #[cfg(feature = "ble")]
@@ -559,6 +737,8 @@ impl AuthSession {
                 .csk
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("csk checked in health check")),
+            self.csk_meta.symmetric_algorithm,
+            self.csk_meta.hash_algorithm,
             &wrapper,
         )?)
     }
@@ -570,56 +750,50 @@ impl AuthSession {
         udp_transport: &Arc<crate::transport::UdpTransport>,
         packet: &EncryptedPacket,
     ) -> TransportHandles {
+        let run = Arc::new(self.run_params());
+
         let ble_handle = if let Some(ble) = ble_transport.clone() {
             let packet = packet.clone();
-            let csk = self
-                .state
-                .csk
-                .clone()
-                .unwrap_or_else(|| unreachable!("csk checked in health check"));
-            // Safety: keypair is Some after health check in handle_authenticate
-            let keypair = self
-                .state
-                .keypair
-                .as_ref()
-                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
-                .clone();
-            let challenge = self.challenge;
-            let servers = self.state.paired_servers.clone();
-            tokio::spawn(async move {
-                Self::authenticate_with_transport(ble, &packet, &csk, &keypair, &challenge, servers)
-                    .await
-            })
+            let run = run.clone();
+            tokio::spawn(async move { Self::authenticate_with_transport(ble, &packet, run).await })
         } else {
             tokio::spawn(async { Err(AuthHandlerError::TransportDisabled) })
         };
 
         let udp_handle = if self.transports.network {
             let packet = packet.clone();
-            let csk = self
-                .state
-                .csk
-                .clone()
-                .unwrap_or_else(|| unreachable!("csk checked in health check"));
-            // Safety: keypair is Some after health check in handle_authenticate
-            let keypair = self
-                .state
-                .keypair
-                .as_ref()
-                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
-                .clone();
-            let challenge = self.challenge;
-            let servers = self.state.paired_servers.clone();
             let udp = udp_transport.clone();
-            tokio::spawn(async move {
-                Self::authenticate_with_transport(udp, &packet, &csk, &keypair, &challenge, servers)
-                    .await
-            })
+            tokio::spawn(async move { Self::authenticate_with_transport(udp, &packet, run).await })
         } else {
             tokio::spawn(async { Err(AuthHandlerError::TransportDisabled) })
         };
 
         (ble_handle, udp_handle)
+    }
+
+    /// Snapshot the per-attempt inputs both transport tasks need.
+    ///
+    /// `allowed_servers` is the filtered set: the tasks never see
+    /// `state.paired_servers`.
+    fn run_params(&self) -> AuthRunParams {
+        AuthRunParams {
+            // Safety: keypair/csk are Some after the health check in handle_authenticate
+            keypair: self
+                .state
+                .keypair
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("keypair checked in health check"))
+                .clone(),
+            csk: self
+                .state
+                .csk
+                .clone()
+                .unwrap_or_else(|| unreachable!("csk checked in health check")),
+            csk_meta: self.csk_meta,
+            challenge: self.challenge,
+            username: self.username.clone(),
+            allowed_servers: self.allowed_servers.clone(),
+        }
     }
 
     /// Wait for the first transport to finish, for both transports to fail,
@@ -661,15 +835,25 @@ impl AuthSession {
                         Ok(Ok(())) => {
                             tracing::info!("BLE authentication succeeded");
                             udp_abort.abort();
-                            self.multicast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                                .await;
+                            self.multicast_cancel_on_success(
+                                WinningTransport::Ble,
+                                ble_transport,
+                                udp_transport,
+                                cancel_packet,
+                            )
+                            .await;
                             return Ok(());
                         }
                         Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                             tracing::warn!("BLE authentication explicitly denied by user");
                             udp_abort.abort();
-                            self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                                .await;
+                            self.cleanup_transports(
+                                WinningTransport::Ble,
+                                ble_transport,
+                                udp_transport,
+                                cancel_packet,
+                            )
+                            .await;
                             return Err(AuthHandlerError::ExplicitDenial);
                         }
                         Ok(Err(e)) => {
@@ -687,15 +871,25 @@ impl AuthSession {
                         Ok(Ok(())) => {
                             tracing::info!("UDP authentication succeeded");
                             ble_abort.abort();
-                            self.multicast_cancel_on_success(ble_transport, udp_transport, cancel_packet)
-                                .await;
+                            self.multicast_cancel_on_success(
+                                WinningTransport::Udp,
+                                ble_transport,
+                                udp_transport,
+                                cancel_packet,
+                            )
+                            .await;
                             return Ok(());
                         }
                         Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                             tracing::warn!("UDP authentication explicitly denied by user");
                             ble_abort.abort();
-                            self.cleanup_transports(ble_transport, udp_transport, cancel_packet)
-                                .await;
+                            self.cleanup_transports(
+                                WinningTransport::Udp,
+                                ble_transport,
+                                udp_transport,
+                                cancel_packet,
+                            )
+                            .await;
                             return Err(AuthHandlerError::ExplicitDenial);
                         }
                         Ok(Err(e)) => {
@@ -717,40 +911,86 @@ impl AuthSession {
         }
     }
 
+    /// Dismiss the other transport once one of them has concluded the session.
+    ///
+    /// The winning transport is skipped deliberately: its peer is the Server
+    /// that just authenticated this client, and a cancel there would tear down
+    /// the session that is still exchanging the `GrantConfirmation` (and, on
+    /// BLE, would notify the very server that won).
+    ///
+    /// A BLE winner is not even released here. `ble-gatt-specification.md` §2
+    /// item 3 (Client Confirmation Characteristic) requires the GATT link to stay
+    /// up until confirmation delivery succeeds or times out, so its whole
+    /// lifetime — last notification included — belongs to the task
+    /// [`Self::send_confirmation_background`] spawns; that task and nothing else
+    /// calls `finalize` on it. The decision itself is the [`success_teardown`]
+    /// table; this function only applies it.
     #[cfg(feature = "ble")]
     async fn multicast_cancel_on_success(
         &self,
+        winner: WinningTransport,
         ble_transport: &Option<Arc<crate::transport::BleTransport>>,
         udp_transport: &Arc<crate::transport::UdpTransport>,
         cancel_packet: &EncryptedPacket,
     ) {
-        if let Some(ble) = ble_transport {
-            let ble = ble.clone();
-            let cancel = cancel_packet.clone();
-            tokio::spawn(async move {
-                let _ = ble.send_cancel(&cancel).await;
-                let _ = ble.finalize().await;
-            });
-        }
-        if self.transports.network {
-            let _ = udp_transport.send_cancel(cancel_packet).await;
-        }
+        self.dismiss_losing_transports(
+            success_teardown(winner),
+            ble_transport,
+            udp_transport,
+            cancel_packet,
+        )
+        .await;
     }
 
+    /// Dismiss the losing transport when the session ended without a grant.
+    ///
+    /// `winner` is the transport that concluded the session (the one that
+    /// delivered the phone's denial). Its acknowledgement is still in flight, so
+    /// its teardown belongs to [`Self::send_confirmation_background`]'s task, for
+    /// the same reason as in [`Self::multicast_cancel_on_success`]. The decision
+    /// is the [`denial_teardown`] table; this function only applies it.
     #[cfg(feature = "ble")]
     async fn cleanup_transports(
         &self,
+        winner: WinningTransport,
+        ble_transport: &Option<Arc<crate::transport::BleTransport>>,
+        udp_transport: &Arc<crate::transport::UdpTransport>,
+        cancel_packet: &EncryptedPacket,
+    ) {
+        self.dismiss_losing_transports(
+            denial_teardown(winner),
+            ble_transport,
+            udp_transport,
+            cancel_packet,
+        )
+        .await;
+    }
+
+    /// Apply a [`Teardown`] decision to the transports that no longer own the
+    /// session.
+    #[cfg(feature = "ble")]
+    async fn dismiss_losing_transports(
+        &self,
+        teardown: Teardown,
         ble_transport: &Option<Arc<crate::transport::BleTransport>>,
         udp_transport: &Arc<crate::transport::UdpTransport>,
         cancel_packet: &EncryptedPacket,
     ) {
         if let Some(ble) = ble_transport {
-            let ble = ble.clone();
-            tokio::spawn(async move {
-                let _ = ble.finalize().await;
-            });
+            if teardown.cancel_ble || teardown.finalize_ble {
+                let ble = ble.clone();
+                let cancel = cancel_packet.clone();
+                tokio::spawn(async move {
+                    if teardown.cancel_ble {
+                        let _ = ble.send_cancel(&cancel).await;
+                    }
+                    if teardown.finalize_ble {
+                        let _ = ble.finalize().await;
+                    }
+                });
+            }
         }
-        if self.transports.network {
+        if teardown.cancel_udp && self.transports.network {
             let _ = udp_transport.send_cancel(cancel_packet).await;
         }
     }
@@ -806,40 +1046,21 @@ impl AuthSession {
         let transport =
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
         let transport_arc = Arc::new(transport);
-        let servers = self.state.paired_servers.clone();
-        // Safety: keypair is Some after health check in handle_authenticate
-        let keypair = self
-            .state
-            .keypair
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("keypair checked in health check"));
-        let csk = self
-            .state
-            .csk
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("csk checked in health check"));
-        Self::authenticate_with_transport(
-            transport_arc,
-            packet,
-            csk,
-            keypair,
-            &self.challenge,
-            servers,
-        )
-        .await
+        let run = Arc::new(self.run_params());
+        Self::authenticate_with_transport(transport_arc, packet, run).await
     }
 
     /// Authenticate using any Transport
     async fn authenticate_with_transport<T: Transport + Send + Sync + 'static>(
         transport: Arc<T>,
         packet: &EncryptedPacket,
-        csk: &ClientSymmetricKey,
-        keypair: &Ed25519KeyPair,
-        challenge: &[u8; 32],
-        paired_servers: Arc<HashMap<String, PairedServer>>,
+        run: Arc<AuthRunParams>,
     ) -> Result<(), AuthHandlerError> {
         let timeout = get_session_timeout();
         let start = Instant::now();
+        // When the request on the wire may be followed by another one. Set by
+        // every send, read only when a frame ends a wait early.
+        let mut next_send_at: Instant;
         let mut attempt = 0u32;
         let mut nonce_cache: HashSet<Vec<u8>> = HashSet::new();
 
@@ -854,30 +1075,15 @@ impl AuthSession {
                 let _ = transport.finalize().await;
                 return Err(e);
             }
+            let retry_interval = shared::network::get_client_retry_interval(attempt);
+            next_send_at = Instant::now() + retry_interval;
 
             // Wait for response
-            let retry_interval = shared::network::get_client_retry_interval(attempt);
-            match Self::wait_for_response(
-                &transport,
-                retry_interval,
-                csk,
-                &paired_servers,
-                &mut nonce_cache,
-            )
-            .await
+            match Self::wait_for_response(&transport, retry_interval, &run, &mut nonce_cache).await
             {
-                Ok(Some((wrapper, server_addr))) => {
+                Ok(WaitOutcome::Response(wrapper, server_addr)) => {
                     // Process the authenticated response
-                    match Self::process_auth_response(
-                        &wrapper,
-                        &transport,
-                        challenge,
-                        keypair,
-                        csk,
-                        &paired_servers,
-                        server_addr,
-                    )
-                    .await
+                    match Self::process_auth_response(&wrapper, &transport, &run, server_addr).await
                     {
                         Ok(result) => return result,
                         Err(ResponseError::InvalidMessage) => {
@@ -886,9 +1092,27 @@ impl AuthSession {
                         }
                     }
                 }
-                Ok(None) => {
-                    // Timeout - retry
-                    attempt += 1;
+                Ok(outcome) => {
+                    // Only a request nobody answered widens the interval. A frame
+                    // that arrived but is unattributable must not: any device on
+                    // the link can emit one, and letting it thin our requests
+                    // would slow down the phone that is allowed to answer.
+                    if outcome.retransmission_unanswered() {
+                        attempt += 1;
+                    } else {
+                        // ...and it does not buy a request either. The frame
+                        // ended this wait early, but the request it interrupted
+                        // still owns its interval: a device that holds the CSK
+                        // can emit one fresh frame after another, and re-sending
+                        // per frame would hand it one client request per frame
+                        // for the whole session. Nothing is lost by waiting —
+                        // the verdict is unchanged and the session keeps
+                        // waiting.
+                        if let Some(remaining) = next_send_at.checked_duration_since(Instant::now())
+                        {
+                            tokio::time::sleep(remaining).await;
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = transport.finalize().await;
@@ -901,13 +1125,15 @@ impl AuthSession {
     async fn wait_for_response<T: Transport + Send + Sync>(
         transport: &Arc<T>,
         retry_interval: Duration,
-        csk: &ClientSymmetricKey,
-        paired_servers: &HashMap<String, PairedServer>,
+        run: &AuthRunParams,
         nonce_cache: &mut HashSet<Vec<u8>>,
-    ) -> Result<Option<(shared::protocol::pb::WrapperMessage, String)>, AuthHandlerError> {
-        match transport.receive_response(retry_interval).await {
+    ) -> Result<WaitOutcome, AuthHandlerError> {
+        match transport
+            .receive_response(retry_interval, &run.csk_meta)
+            .await
+        {
             Err(e) => Err(e),
-            Ok(ReceiveResult::Timeout) => Ok(None),
+            Ok(ReceiveResult::Timeout) => Ok(WaitOutcome::Timeout),
             Ok(ReceiveResult::Response(response_packet, server_addr)) => {
                 let nonce_fingerprint = {
                     let mut data = response_packet.temporal_identifier.clone();
@@ -917,10 +1143,14 @@ impl AuthSession {
                 if !nonce_cache.insert(nonce_fingerprint) {
                     // NOTE: This exact log phrase is asserted by E2E test Phase 2d (nonce replay check).
                     tracing::warn!("Replayed packet detected from {}, ignoring", server_addr);
-                    return Ok(None);
+                    return Ok(WaitOutcome::Timeout);
                 }
 
-                let wrapper = match decrypt_encrypted_packet_with_csk_nonce(csk, &response_packet) {
+                let wrapper = match decrypt_encrypted_packet_with_csk_nonce(
+                    &run.csk,
+                    run.csk_meta.symmetric_algorithm,
+                    &response_packet,
+                ) {
                     Ok(wrapper) => wrapper,
                     Err(e) => {
                         // Audit log: an authenticated-looking packet failed AEAD verification.
@@ -938,173 +1168,968 @@ impl AuthSession {
                 let addr_str = server_addr.to_string();
                 tracing::debug!("Received message from {}", addr_str);
 
-                // Verify signature
-                if Self::verify_response_signature(&wrapper, paired_servers)? {
-                    Ok(Some((wrapper, addr_str)))
+                // Only an authorized Server's signature may take part in the
+                // decision below.
+                if Self::response_signature_authorized(&run.allowed_servers, &wrapper) {
+                    Ok(WaitOutcome::Response(wrapper, addr_str))
                 } else {
                     tracing::warn!(
-                        "Message signature verification failed from {}; continuing to wait for valid response",
+                        "Response from {} is not signed by a server authorized for this request; ignoring it",
                         addr_str
                     );
-                    Ok(None)
+                    Ok(WaitOutcome::Unattributable)
                 }
             }
         }
     }
 
-    fn verify_response_signature(
-        wrapper: &shared::protocol::pb::WrapperMessage,
-        paired_servers: &HashMap<String, PairedServer>,
-    ) -> Result<bool, AuthHandlerError> {
-        for server in paired_servers.values() {
-            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
-                if pub_key_bytes.len() == 32 {
-                    let mut pub_key = [0u8; 32];
-                    pub_key.copy_from_slice(&pub_key_bytes);
-                    if verify_wrapper_signature(wrapper, &pub_key).is_ok() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+    /// Whether any Server authorized for this user signed `wrapper`.
+    ///
+    /// Each candidate is checked with *its own* negotiated signature algorithm,
+    /// so a Server cannot claim an algorithm the pairing did not agree on.
+    fn response_signature_authorized(
+        allowed_servers: &[PairedServer],
+        wrapper: &WrapperMessage,
+    ) -> bool {
+        allowed_servers.iter().any(|server| {
+            server_public_key(server).is_some_and(|public_key| {
+                verify_wrapper_signature(wrapper, &public_key, server.signature_algorithm as i32)
+                    .is_ok()
+            })
+        })
     }
 
     async fn process_auth_response<T: Transport + Send + Sync + 'static>(
-        wrapper: &shared::protocol::pb::WrapperMessage,
+        wrapper: &WrapperMessage,
         transport: &Arc<T>,
-        challenge: &[u8; 32],
-        keypair: &Ed25519KeyPair,
-        csk: &ClientSymmetricKey,
-        paired_servers: &HashMap<String, PairedServer>,
+        run: &AuthRunParams,
         server_addr: String,
     ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
-        match &wrapper.payload {
-            Some(shared::protocol::pb::wrapper_message::Payload::AuthGrant(_)) => {
-                Self::handle_auth_grant(
-                    wrapper,
-                    transport,
-                    challenge,
-                    keypair,
-                    csk,
-                    paired_servers,
-                    server_addr,
-                )
-                .await
+        match classify_server_response(&run.allowed_servers, &run.challenge, wrapper) {
+            ServerResponseVerdict::Grant => {
+                tracing::info!("Authentication granted by server: {}", server_addr);
+                Self::send_confirmation_background(transport.clone(), run).await;
+                Ok(Ok(()))
             }
-            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(_)) => {
-                Self::handle_auth_denial(wrapper, transport, challenge, keypair, csk, server_addr)
-                    .await
+            ServerResponseVerdict::Denial => {
+                tracing::info!(
+                    "Authentication explicitly denied by server: {}",
+                    server_addr
+                );
+                Self::send_confirmation_background(transport.clone(), run).await;
+                Ok(Err(AuthHandlerError::ExplicitDenial))
             }
-            _ => {
-                tracing::debug!("Unexpected message type, waiting for valid response");
+            ServerResponseVerdict::Unattributed => {
+                // `wait_for_response` already attributed this wrapper's signature
+                // to a server authorized for this user, so anything that still
+                // cannot be attributed is a response for a *different* session
+                // (a replayed or injected grant) or not a decision at all.
+                if wrapper.payload_type == PayloadType::AuthGrant as i32 {
+                    // NOTE: This exact log phrase is asserted by E2E test Phase 2d
+                    // (a captured grant from an old session must not be accepted).
+                    tracing::warn!(
+                        "Grant challenge verification failed; continuing to wait for valid response"
+                    );
+                } else if wrapper.payload_type == PayloadType::AuthDenial as i32 {
+                    tracing::warn!(
+                        "Denial from {} does not answer the session for user {}; continuing to wait",
+                        server_addr,
+                        run.username
+                    );
+                } else {
+                    tracing::debug!("Unexpected message type, waiting for valid response");
+                }
                 Err(ResponseError::InvalidMessage)
             }
         }
     }
 
-    async fn handle_auth_grant<T: Transport + Send + Sync + 'static>(
-        wrapper: &shared::protocol::pb::WrapperMessage,
-        transport: &Arc<T>,
-        challenge: &[u8; 32],
-        keypair: &Ed25519KeyPair,
-        csk: &ClientSymmetricKey,
-        paired_servers: &HashMap<String, PairedServer>,
-        server_addr: String,
-    ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
-        // Verify signed_challenge
-        let grant_valid = paired_servers.iter().any(|(_id, server)| {
-            if let Ok(pub_key_bytes) = hex::decode(&server.public_key) {
-                if pub_key_bytes.len() == 32 {
-                    let mut pub_key = [0u8; 32];
-                    pub_key.copy_from_slice(&pub_key_bytes);
-                    return verify_auth_grant(wrapper, challenge, &pub_key).is_ok();
-                }
-            }
-            false
-        });
-
-        if grant_valid {
-            tracing::info!("Authentication granted by server: {}", server_addr);
-            Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
-            Ok(Ok(()))
-        } else {
-            tracing::warn!(
-                "Grant challenge verification failed; continuing to wait for valid response"
-            );
-            Err(ResponseError::InvalidMessage)
-        }
-    }
-
-    async fn handle_auth_denial<T: Transport + Send + Sync + 'static>(
-        wrapper: &shared::protocol::pb::WrapperMessage,
-        transport: &Arc<T>,
-        challenge: &[u8; 32],
-        keypair: &Ed25519KeyPair,
-        csk: &ClientSymmetricKey,
-        server_addr: String,
-    ) -> Result<Result<(), AuthHandlerError>, ResponseError> {
-        let denial = match &wrapper.payload {
-            Some(shared::protocol::pb::wrapper_message::Payload::AuthDenial(d)) => d,
-            _ => return Err(ResponseError::InvalidMessage),
-        };
-        if denial.challenge.as_slice() != challenge.as_slice() {
-            tracing::warn!(
-                "AuthDenial challenge mismatch from {}, ignoring",
-                server_addr
-            );
-            return Err(ResponseError::InvalidMessage);
-        }
-        tracing::info!(
-            "Authentication explicitly denied by server: {}",
-            server_addr
-        );
-        Self::send_confirmation_background(transport.clone(), challenge, keypair, csk);
-        Ok(Err(AuthHandlerError::ExplicitDenial))
-    }
-
-    fn send_confirmation_background<T: Transport + Send + Sync + 'static>(
+    /// Send the `GrantConfirmation` on `transport` in the background, then
+    /// release `transport`.
+    ///
+    /// This function and the task it spawns are the **only** owners of the
+    /// concluding transport's teardown: every path out of here — including the
+    /// ones that cannot even build the confirmation — finalizes it exactly once,
+    /// so nothing else may tear the winner down (see
+    /// [`Self::multicast_cancel_on_success`]).
+    ///
+    /// The task notifies three times, then takes a [`NOTIFY_SETTLE`] pause, and
+    /// only then finalizes. On BLE that pause is what lets the last notification
+    /// reach the air: `CharacteristicNotifier::publish` returns once BlueZ has
+    /// accepted the value, and `finalize` disconnects the phone in the same
+    /// tick, so a release issued right after the third `send_confirmation`
+    /// drops the frame instead of transmitting it — the same pause
+    /// `publish_cancel` and `PairingBleSession::settle` take before their own
+    /// teardown. Function-call order alone does not put the value on the air.
+    ///
+    /// Both conclusions go through here — a grant and an explicit denial alike —
+    /// because both have an acknowledgement in flight: a denial is answered with
+    /// the same confirmation frame, and the phone that denied is the one whose
+    /// link must survive until it arrives.
+    async fn send_confirmation_background<T: Transport + Send + Sync + 'static>(
         transport: Arc<T>,
-        challenge: &[u8; 32],
-        keypair: &Ed25519KeyPair,
-        csk: &ClientSymmetricKey,
+        run: &AuthRunParams,
     ) {
-        let confirmation = match create_grant_confirmation(challenge) {
+        let confirmation = match create_grant_confirmation(&run.challenge) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to create confirmation: {}", e);
+                let _ = transport.finalize().await;
                 return;
             }
         };
 
         let mut conf_wrapper = wrap_grant_confirmation(confirmation);
-        if let Err(e) = sign_wrapper_message(&mut conf_wrapper, keypair) {
+        if let Err(e) = sign_wrapper_message(&mut conf_wrapper, &run.keypair) {
             tracing::error!("Failed to sign confirmation: {}", e);
+            let _ = transport.finalize().await;
             return;
         }
 
-        let conf_packet = match create_encrypted_packet_with_csk_nonce(csk, &conf_wrapper) {
+        let conf_packet = match create_encrypted_packet_with_csk_nonce(
+            &run.csk,
+            run.csk_meta.symmetric_algorithm,
+            run.csk_meta.hash_algorithm,
+            &conf_wrapper,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to encrypt confirmation: {}", e);
+                let _ = transport.finalize().await;
                 return;
             }
         };
 
+        let csk_meta = run.csk_meta;
         tokio::spawn(async move {
-            // Best-effort: up to 3 sends within ~450ms total
-            let _ = transport.send_confirmation(&conf_packet).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let _ = transport.send_confirmation(&conf_packet).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let _ = transport.send_confirmation(&conf_packet).await;
+            // Best-effort: up to 3 sends within ~500ms total. Bounded because
+            // this task now owns the transport: a BlueZ notification that never
+            // returns must not keep the advertisement and GATT application up.
+            let _ = tokio::time::timeout(CONFIRMATION_LIFETIME, async {
+                let _ = transport.send_confirmation(&conf_packet, &csk_meta).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = transport.send_confirmation(&conf_packet, &csk_meta).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = transport.send_confirmation(&conf_packet, &csk_meta).await;
+                // The last `notify` only means BlueZ accepted the value, not that
+                // the controller transmitted it. Disconnecting now would drop it,
+                // so give the link the same pause `publish_cancel` takes.
+                tokio::time::sleep(NOTIFY_SETTLE).await;
+            })
+            .await;
             let _ = transport.finalize().await;
         });
     }
+}
+
+/// The paired servers that may answer for `username`.
+///
+/// This is the single place the `allowed_users` filter is applied; everything
+/// that verifies a Server response consumes its output rather than
+/// `DaemonState::paired_servers`.
+fn servers_authorized_for(
+    paired_servers: &HashMap<String, PairedServer>,
+    username: &str,
+) -> Vec<PairedServer> {
+    paired_servers
+        .values()
+        .filter(|server| server.is_user_allowed(username))
+        .cloned()
+        .collect()
+}
+
+/// What a decrypted Server response means for this authentication session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerResponseVerdict {
+    /// A Server authorized for this user signed a matching `AuthenticationGrant`.
+    Grant,
+    /// A Server authorized for this user signed a matching `AuthenticationDenial`.
+    Denial,
+    /// Not an answer this client may act on: nobody signed it that is allowed to
+    /// answer for this user, or the challenge does not match, or it is not a
+    /// grant/denial at all.
+    Unattributed,
+}
+
+/// Decide what a decrypted Server response means for this session.
+///
+/// Pure — no I/O and no clock — so the authorization decision can be tested
+/// directly. Every check runs against `allowed_servers` only: a Server paired for
+/// a different account is not in that slice, so its grant cannot authenticate
+/// this user and its denial cannot cancel the prompt for it.
+fn classify_server_response(
+    allowed_servers: &[PairedServer],
+    challenge: &[u8; 32],
+    wrapper: &WrapperMessage,
+) -> ServerResponseVerdict {
+    let payload_type = wrapper.payload_type;
+
+    if payload_type == PayloadType::AuthGrant as i32 {
+        let granted = allowed_servers.iter().any(|server| {
+            server_public_key(server).is_some_and(|public_key| {
+                verify_auth_grant(
+                    wrapper,
+                    challenge,
+                    &public_key,
+                    server.signature_algorithm as i32,
+                )
+                .is_ok()
+            })
+        });
+        if granted {
+            return ServerResponseVerdict::Grant;
+        }
+    } else if payload_type == PayloadType::AuthDenial as i32 {
+        let denied = allowed_servers.iter().any(|server| {
+            server_public_key(server).is_some_and(|public_key| {
+                verify_auth_denial(
+                    wrapper,
+                    challenge,
+                    &public_key,
+                    server.signature_algorithm as i32,
+                )
+                .is_ok()
+            })
+        });
+        if denied {
+            return ServerResponseVerdict::Denial;
+        }
+    }
+
+    ServerResponseVerdict::Unattributed
+}
+
+/// Decode a paired server's Ed25519 public key.
+fn server_public_key(server: &PairedServer) -> Option<[u8; 32]> {
+    let bytes = hex::decode(&server.public_key).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&bytes);
+    Some(public_key)
 }
 
 /// Error type for response processing
 enum ResponseError {
     /// Invalid message that should be ignored (wait for another response)
     InvalidMessage,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+    use shared::protocol::pb::SignatureAlgorithm;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn paired_server(name: &str, keypair: &Ed25519KeyPair, allowed_users: &[&str]) -> PairedServer {
+        PairedServer {
+            name: name.to_string(),
+            public_key: hex::encode(keypair.verifying_key_bytes()),
+            allowed_users: allowed_users.iter().map(|user| user.to_string()).collect(),
+            paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        }
+    }
+
+    /// The production filter: the servers that may answer for `username`.
+    fn allowed_for(servers: &[PairedServer], username: &str) -> Vec<PairedServer> {
+        let map: HashMap<String, PairedServer> = servers
+            .iter()
+            .map(|server| (server.name.clone(), server.clone()))
+            .collect();
+        servers_authorized_for(&map, username)
+    }
+
+    /// Two paired phones, each bound to one account.
+    fn two_phones() -> (PairedServer, PairedServer, Ed25519KeyPair, Ed25519KeyPair) {
+        let phone_a = Ed25519KeyPair::generate().unwrap();
+        let phone_b = Ed25519KeyPair::generate().unwrap();
+        (
+            paired_server("phone-a", &phone_a, &["bob"]),
+            paired_server("phone-b", &phone_b, &["alice"]),
+            phone_a,
+            phone_b,
+        )
+    }
+
+    /// Phone B is paired for `alice`; the session authenticates `bob`, who is
+    /// only allowed on phone A. Phone B's grant must not authenticate `bob`, and
+    /// phone A's must.
+    ///
+    /// The defect this catches: response verification running against
+    /// `state.paired_servers` (every paired phone) instead of the
+    /// `allowed_users`-filtered set, which lets any paired device grant any
+    /// account on the host.
+    #[test]
+    fn second_phone_cannot_grant_or_deny_for_another_user() {
+        let (phone_a, phone_b, key_a, key_b) = two_phones();
+        let servers = vec![phone_a, phone_b];
+        let allowed = allowed_for(&servers, "bob");
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed.first().map(|s| s.name.as_str()), Some("phone-a"));
+
+        let challenge = [0x42u8; 32];
+
+        // Phone B signs a perfectly valid grant for this challenge.
+        let grant_from_b = create_signed_auth_grant(challenge, &key_b).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &challenge, &grant_from_b),
+            ServerResponseVerdict::Unattributed,
+            "phone B must not grant a session for bob"
+        );
+        assert!(
+            !AuthSession::response_signature_authorized(&allowed, &grant_from_b),
+            "phone B's signature must not pass the authorized-server filter"
+        );
+
+        // The same response from phone A is a grant.
+        let grant_from_a = create_signed_auth_grant(challenge, &key_a).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &challenge, &grant_from_a),
+            ServerResponseVerdict::Grant
+        );
+        assert!(AuthSession::response_signature_authorized(
+            &allowed,
+            &grant_from_a
+        ));
+
+        // The filter is per-user, not per-key: with `alice` as the subject,
+        // phone B is the authorized one and phone A is not.
+        let allowed_alice = allowed_for(&servers, "alice");
+        assert_eq!(
+            classify_server_response(&allowed_alice, &challenge, &grant_from_b),
+            ServerResponseVerdict::Grant
+        );
+        assert_eq!(
+            classify_server_response(&allowed_alice, &challenge, &grant_from_a),
+            ServerResponseVerdict::Unattributed
+        );
+    }
+
+    /// A denial from a phone that is not allowed to answer for the user must not
+    /// end that user's session: otherwise any paired device could veto logins
+    /// for accounts it is not bound to.
+    #[test]
+    fn denial_from_a_disallowed_phone_cannot_deny_another_users_session() {
+        let (phone_a, phone_b, key_a, key_b) = two_phones();
+        let servers = vec![phone_a, phone_b];
+        let allowed = allowed_for(&servers, "bob");
+        let challenge = [0x43u8; 32];
+
+        let denial_from_b = create_signed_auth_denial(challenge, "user rejected", &key_b).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &challenge, &denial_from_b),
+            ServerResponseVerdict::Unattributed,
+            "phone B must not deny a session for bob"
+        );
+
+        let denial_from_a = create_signed_auth_denial(challenge, "user rejected", &key_a).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &challenge, &denial_from_a),
+            ServerResponseVerdict::Denial
+        );
+    }
+
+    /// A response signed for a different session's challenge is not an answer to
+    /// this one, even from an authorized phone.
+    #[test]
+    fn response_for_a_foreign_challenge_is_not_attributed() {
+        let (phone_a, phone_b, key_a, _key_b) = two_phones();
+        let servers = vec![phone_a, phone_b];
+        let allowed = allowed_for(&servers, "bob");
+
+        let this_session = [0x10u8; 32];
+        let other_session = [0x11u8; 32];
+
+        let foreign_grant = create_signed_auth_grant(other_session, &key_a).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &this_session, &foreign_grant),
+            ServerResponseVerdict::Unattributed
+        );
+
+        let foreign_denial =
+            create_signed_auth_denial(other_session, "user rejected", &key_a).unwrap();
+        assert_eq!(
+            classify_server_response(&allowed, &this_session, &foreign_denial),
+            ServerResponseVerdict::Unattributed
+        );
+    }
+
+    /// Verification uses the algorithm negotiated at pairing time, taken from the
+    /// `PairedServer`, not a hardcoded Ed25519: a server whose pairing recorded
+    /// an unspecified algorithm cannot answer with an Ed25519 signature.
+    #[test]
+    fn declared_signature_algorithm_is_enforced_per_server() {
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let mut server = paired_server("phone", &keypair, &["bob"]);
+        server.signature_algorithm = SignatureAlgorithm::Unspecified;
+
+        let challenge = [0x44u8; 32];
+        let grant = create_signed_auth_grant(challenge, &keypair).unwrap();
+        assert_eq!(
+            classify_server_response(&[server], &challenge, &grant),
+            ServerResponseVerdict::Unattributed
+        );
+    }
+
+    /// A non-grant/denial payload (a replayed request, a confirmation) must never
+    /// be read as a decision.
+    #[test]
+    fn non_decision_payload_is_unattributed() {
+        let (phone_a, phone_b, key_a, _key_b) = two_phones();
+        let servers = vec![phone_a, phone_b];
+        let allowed = allowed_for(&servers, "bob");
+        let challenge = [0x45u8; 32];
+
+        let confirmation = create_grant_confirmation(&challenge).unwrap();
+        let mut wrapper = wrap_grant_confirmation(confirmation);
+        sign_wrapper_message(&mut wrapper, &key_a).unwrap();
+
+        assert_eq!(
+            classify_server_response(&allowed, &challenge, &wrapper),
+            ServerResponseVerdict::Unattributed
+        );
+        // The signature itself is valid for an authorized server, so only the
+        // payload-type check stands between a confirmation and a grant.
+        assert!(AuthSession::response_signature_authorized(
+            &allowed, &wrapper
+        ));
+    }
+
+    /// The transport tasks must be handed the authorized subset, never the full
+    /// paired-server map.
+    ///
+    /// The defect this catches: `run_params` (or its caller) reading
+    /// `state.paired_servers` again, which silently re-introduces the bypass even
+    /// though `handle_authenticate` filtered correctly.
+    #[tokio::test]
+    async fn run_params_carries_only_the_servers_authorized_for_the_user() {
+        let (phone_a, phone_b, _key_a, _key_b) = two_phones();
+        let mut paired = HashMap::new();
+        paired.insert("phone-a".to_string(), phone_a);
+        paired.insert("phone-b".to_string(), phone_b);
+
+        let state = Arc::new(DaemonState {
+            config_manager: Arc::new(ClientConfigManager::new()),
+            paired_servers: Arc::new(paired.clone()),
+            keypair: Some(Ed25519KeyPair::generate().unwrap()),
+            csk: Some(ClientSymmetricKey::generate().unwrap()),
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        });
+
+        let session = AuthSession {
+            allowed_servers: Arc::new(servers_authorized_for(&paired, "bob")),
+            state,
+            username: "bob".to_string(),
+            challenge: [0x46u8; 32],
+            caller: CallerContext {
+                pam_service: "sudo".to_string(),
+                process_name: "sudo".to_string(),
+                command_preview: "sudo -i".to_string(),
+            },
+            tty_present: true,
+            csk_meta: CskMetadata::default(),
+            transports: TransportsEnabled {
+                network: true,
+                ble: false,
+            },
+            cancel_registry: None,
+            request_id: None,
+        };
+
+        let run = session.run_params();
+        assert_eq!(
+            run.allowed_servers.len(),
+            1,
+            "the transport tasks must not receive every paired server"
+        );
+        assert_eq!(
+            run.allowed_servers.first().map(|s| s.name.as_str()),
+            Some("phone-a")
+        );
+        assert_eq!(run.username, "bob");
+        assert_eq!(run.challenge, [0x46u8; 32]);
+    }
+
+    /// The same `DaemonState` every test in this module shares: healthy keys, the
+    /// fixture's paired servers, and a loopback socket.
+    async fn test_state(paired: HashMap<String, PairedServer>) -> DaemonState {
+        DaemonState {
+            config_manager: Arc::new(ClientConfigManager::new()),
+            paired_servers: Arc::new(paired),
+            keypair: Some(Ed25519KeyPair::generate().unwrap()),
+            csk: Some(ClientSymmetricKey::generate().unwrap()),
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        }
+    }
+
+    fn caller() -> CallerContext {
+        CallerContext {
+            pam_service: "sudo".to_string(),
+            process_name: "sudo".to_string(),
+            command_preview: "sudo -i".to_string(),
+        }
+    }
+
+    /// The real session — built by the production constructor and authorized by
+    /// the production filter — must hand the transports only the phone paired for
+    /// *this* user, and no verification may consult the other one.
+    ///
+    /// The defect this catches: `AuthSession` storing `state.paired_servers`
+    /// instead of the `allowed_users`-filtered set (in `authorize` or in whatever
+    /// `handle_authenticate` calls instead of it), which lets the second phone
+    /// grant *or* deny another account's session and hands it a BLE verifier.
+    #[tokio::test]
+    async fn a_second_phone_never_reaches_verification_for_another_users_session() {
+        let (phone_a, phone_b, key_a, key_b) = two_phones();
+        let other_key = phone_b.public_key.clone();
+        let mut paired = HashMap::new();
+        paired.insert("phone-a".to_string(), phone_a);
+        paired.insert("phone-b".to_string(), phone_b);
+
+        let state = Arc::new(test_state(paired.clone()).await);
+        let mut session =
+            AuthSession::new(state, "bob".to_string(), caller(), true).expect("session");
+
+        // Production authorization, not a set this test assembled itself.
+        session.authorize(&paired);
+
+        assert_eq!(
+            session.allowed_servers.len(),
+            1,
+            "the session must hold exactly the phone paired for bob"
+        );
+        assert_eq!(
+            session.allowed_servers.first().map(|s| s.name.as_str()),
+            Some("phone-a")
+        );
+
+        #[cfg(feature = "ble")]
+        {
+            // The BLE transport builds one verifier per entry of this map, so it
+            // must carry phone-a's key and nothing else.
+            let by_key = session.allowed_servers_by_key();
+            assert_eq!(by_key.len(), 1);
+            assert!(
+                !by_key.contains_key(&other_key),
+                "phone-b must not get a BLE verifier for bob's session"
+            );
+        }
+
+        // What the transport tasks actually receive.
+        let run = session.run_params();
+        assert_eq!(run.allowed_servers.len(), 1);
+        assert_eq!(run.allowed_servers[0].name, "phone-a");
+        assert_eq!(run.username, "bob");
+
+        // ...and phone-b's grant for this very challenge does not pass either
+        // check the transport path makes with that set.
+        let grant_from_b = create_signed_auth_grant(run.challenge, &key_b).unwrap();
+        assert!(
+            !AuthSession::response_signature_authorized(&run.allowed_servers, &grant_from_b),
+            "phone-b's signature must not pass the filter run_params handed out"
+        );
+        assert_eq!(
+            classify_server_response(&run.allowed_servers, &run.challenge, &grant_from_b),
+            ServerResponseVerdict::Unattributed
+        );
+
+        // The allowed phone still works through the same set.
+        let grant_from_a = create_signed_auth_grant(run.challenge, &key_a).unwrap();
+        assert_eq!(
+            classify_server_response(&run.allowed_servers, &run.challenge, &grant_from_a),
+            ServerResponseVerdict::Grant
+        );
+    }
+
+    /// A transport that records the order of the calls it receives.
+    struct RecordingTransport {
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl Transport for RecordingTransport {
+        async fn send_request(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+
+        async fn receive_response(
+            &self,
+            _timeout: Duration,
+            _csk_meta: &CskMetadata,
+        ) -> Result<ReceiveResult, AuthHandlerError> {
+            Ok(ReceiveResult::Timeout)
+        }
+
+        async fn send_confirmation(
+            &self,
+            _packet: &EncryptedPacket,
+            _csk_meta: &CskMetadata,
+        ) -> Result<(), AuthHandlerError> {
+            self.events.lock().await.push("confirmation");
+            Ok(())
+        }
+
+        async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            self.events.lock().await.push("cancel");
+            Ok(())
+        }
+
+        async fn finalize(&self) -> Result<(), AuthHandlerError> {
+            self.events.lock().await.push("finalize");
+            Ok(())
+        }
+    }
+
+    /// The transport that concluded the session is released only after its last
+    /// confirmation send, and only after that send has had time to reach the
+    /// air.
+    ///
+    /// The defect this catches: any teardown ahead of the last `send`, which on
+    /// BLE (`finalize` → `do_shutdown` → `device.disconnect`) disconnects the
+    /// phone before the notification reaches it — the phone then retransmits its
+    /// grant for 10 s and reports failure — an early return that releases it not
+    /// at all, and a release issued immediately after the third `send`, which
+    /// drops the frame instead of transmitting it (the elapsed-time assertion
+    /// below: two 150 ms pauses plus the [`NOTIFY_SETTLE`] pause is 350 ms).
+    #[tokio::test]
+    async fn the_concluding_transport_is_released_only_after_its_last_confirmation() {
+        let transport = Arc::new(RecordingTransport {
+            events: Mutex::new(Vec::new()),
+        });
+        let run = AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk: ClientSymmetricKey::generate().unwrap(),
+            csk_meta: CskMetadata::default(),
+            challenge: [0x48u8; 32],
+            username: "bob".to_string(),
+            allowed_servers: Arc::new(Vec::new()),
+        };
+
+        let started = Instant::now();
+        AuthSession::send_confirmation_background(transport.clone(), &run).await;
+
+        // The three sends happen in the spawned task.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if transport.events.lock().await.last() == Some(&"finalize") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the confirmation task never released the transport"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            *transport.events.lock().await,
+            vec!["confirmation", "confirmation", "confirmation", "finalize"],
+            "the transport must outlive every confirmation send"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "the last notification was not given time to reach the air: released after {:?}, \
+             which is less than the 2 x 150 ms between the sends plus the {NOTIFY_SETTLE:?} settle",
+            started.elapsed()
+        );
+    }
+
+    /// The teardown table itself, for both winners and both conclusions.
+    ///
+    /// The defect this catches: `finalize_ble` or `cancel_ble` becoming `true`
+    /// for a BLE winner (the `winner != WinningTransport::Ble` guard dropped from
+    /// the caller's branch), which disconnects the phone that just granted or
+    /// denied while its last notification — and, on a denial, the
+    /// acknowledgement — is still in flight.
+    #[cfg(feature = "ble")]
+    #[test]
+    fn the_winning_transport_is_never_dismissed_by_the_losing_side() {
+        assert_eq!(
+            success_teardown(WinningTransport::Ble),
+            Teardown {
+                cancel_udp: true,
+                cancel_ble: false,
+                finalize_ble: false,
+            },
+            "a BLE winner keeps its link: the confirmation task owns its teardown"
+        );
+        assert_eq!(
+            denial_teardown(WinningTransport::Ble),
+            Teardown {
+                cancel_udp: true,
+                cancel_ble: false,
+                finalize_ble: false,
+            },
+            "a BLE winner keeps its link until its denial acknowledgement is out"
+        );
+
+        assert_eq!(
+            success_teardown(WinningTransport::Udp),
+            Teardown {
+                cancel_udp: false,
+                cancel_ble: true,
+                finalize_ble: true,
+            },
+            "a granted UDP winner is not re-cancelled, and the BLE loser is cancelled and released"
+        );
+        assert_eq!(
+            denial_teardown(WinningTransport::Udp),
+            Teardown {
+                cancel_udp: true,
+                cancel_ble: false,
+                finalize_ble: true,
+            },
+            "a UDP denial still cancels over UDP, and only releases the BLE loser"
+        );
+    }
+
+    /// A transport that hands back one canned frame, then times out.
+    struct ScriptedTransport {
+        frame: Mutex<Option<(EncryptedPacket, std::net::SocketAddr)>>,
+    }
+
+    impl Transport for ScriptedTransport {
+        async fn send_request(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+
+        async fn receive_response(
+            &self,
+            _timeout: Duration,
+            _csk_meta: &CskMetadata,
+        ) -> Result<ReceiveResult, AuthHandlerError> {
+            match self.frame.lock().await.take() {
+                Some((packet, addr)) => Ok(ReceiveResult::Response(packet, addr)),
+                None => Ok(ReceiveResult::Timeout),
+            }
+        }
+
+        async fn send_confirmation(
+            &self,
+            _packet: &EncryptedPacket,
+            _csk_meta: &CskMetadata,
+        ) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+
+        async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+    }
+
+    /// A decryptable frame from a phone that may not answer for this user is not
+    /// an unanswered request: the retransmission interval must stay where it is.
+    ///
+    /// The defect this catches: `wait_for_response` reporting "unattributable" as
+    /// a timeout (`Ok(None)`/`WaitOutcome::Timeout`), which makes the retry loop
+    /// double the interval on every frame any paired phone emits and thins the
+    /// requests aimed at the phone that is allowed to grant.
+    #[tokio::test]
+    async fn an_unattributable_frame_does_not_advance_the_retransmission_backoff() {
+        let (phone_a, phone_b, _key_a, key_b) = two_phones();
+        assert!(
+            !phone_b.is_user_allowed("bob"),
+            "phone-b must be paired for another account for this test to mean anything"
+        );
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let csk_meta = CskMetadata::default();
+        let challenge = [0x47u8; 32];
+
+        // Phone B, which is paired for alice, signs a perfectly valid grant for
+        // bob's session.
+        let grant_from_b = create_signed_auth_grant(challenge, &key_b).unwrap();
+        let packet = create_encrypted_packet_with_csk_nonce(
+            &csk,
+            csk_meta.symmetric_algorithm,
+            csk_meta.hash_algorithm,
+            &grant_from_b,
+        )
+        .unwrap();
+
+        let transport = Arc::new(ScriptedTransport {
+            frame: Mutex::new(Some((
+                packet,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            ))),
+        });
+        let run = AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk,
+            csk_meta,
+            challenge,
+            username: "bob".to_string(),
+            // Only phone-a may answer for bob; phone-b is the interloper.
+            allowed_servers: Arc::new(vec![phone_a]),
+        };
+        let mut nonce_cache = HashSet::new();
+
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, WaitOutcome::Unattributable),
+            "phone-b is paired but not allowed to answer for bob"
+        );
+        assert!(
+            !outcome.retransmission_unanswered(),
+            "an unattributable frame must not advance the backoff"
+        );
+
+        // The same wait with nothing left to deliver is a real timeout, and that
+        // one does advance it.
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, WaitOutcome::Timeout));
+        assert!(outcome.retransmission_unanswered());
+    }
+
+    /// A transport that answers every request with a fresh frame signed by a
+    /// phone that may not answer for this user, counting the requests it is
+    /// asked to send.
+    struct UnattributableFlood {
+        csk: ClientSymmetricKey,
+        grant: WrapperMessage,
+        sends: AtomicUsize,
+    }
+
+    /// How many requests the flood will answer before it gives up. Only a loop
+    /// that re-sends per frame ever reaches it; it exists so such a loop fails
+    /// the test instead of running to the 120 s session timeout.
+    const FLOOD_CAP: usize = 64;
+
+    impl Transport for UnattributableFlood {
+        async fn send_request(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            let sent = self.sends.fetch_add(1, Ordering::SeqCst);
+            if sent >= FLOOD_CAP {
+                // Bound a broken loop: once the count is already fatal there is
+                // no point spinning for the rest of the session timeout.
+                return Err(AuthHandlerError::BleError("flood cap reached".to_string()));
+            }
+            Ok(())
+        }
+
+        async fn receive_response(
+            &self,
+            _timeout: Duration,
+            csk_meta: &CskMetadata,
+        ) -> Result<ReceiveResult, AuthHandlerError> {
+            // A fresh nonce per frame, so the replay cache does not turn these
+            // into timeouts: this is what a paired device holding the CSK can
+            // put on the link.
+            let packet = create_encrypted_packet_with_csk_nonce(
+                &self.csk,
+                csk_meta.symmetric_algorithm,
+                csk_meta.hash_algorithm,
+                &self.grant,
+            )
+            .unwrap();
+            Ok(ReceiveResult::Response(
+                packet,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            ))
+        }
+
+        async fn send_confirmation(
+            &self,
+            _packet: &EncryptedPacket,
+            _csk_meta: &CskMetadata,
+        ) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+
+        async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
+            Ok(())
+        }
+    }
+
+    /// A paired device that holds the CSK must not buy one client request per
+    /// frame it emits.
+    ///
+    /// The defect this catches: the retry loop re-sending immediately after an
+    /// `Unattributable` frame instead of letting the current retransmission
+    /// interval elapse, which lets such a device drive the client's request rate
+    /// for the whole session timeout.
+    ///
+    /// The session runs on its own worker because the broken loop never awaits
+    /// anything that is pending: it would starve a current-thread runtime and
+    /// turn this measurement into a 120 s spin instead of a 550 ms one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattributable_frame_does_not_buy_an_extra_request() {
+        let (phone_a, _phone_b, _key_a, key_b) = two_phones();
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let csk_meta = CskMetadata::default();
+        let challenge = [0x49u8; 32];
+
+        let grant = create_signed_auth_grant(challenge, &key_b).unwrap();
+        let request = create_encrypted_packet_with_csk_nonce(
+            &csk,
+            csk_meta.symmetric_algorithm,
+            csk_meta.hash_algorithm,
+            &grant,
+        )
+        .unwrap();
+
+        let transport = Arc::new(UnattributableFlood {
+            csk: csk.clone(),
+            grant,
+            sends: AtomicUsize::new(0),
+        });
+        let run = Arc::new(AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk,
+            csk_meta,
+            challenge,
+            username: "bob".to_string(),
+            // Only phone-a may answer for bob; phone-b floods the session.
+            allowed_servers: Arc::new(vec![phone_a]),
+        });
+
+        let win = transport.clone();
+        let session = tokio::spawn(async move {
+            AuthSession::authenticate_with_transport(win, &request, run).await
+        });
+
+        // The session itself runs until its 120 s timeout; only this window is
+        // measured.
+        let window = Duration::from_millis(550);
+        tokio::time::sleep(window).await;
+        let sends = transport.sends.load(Ordering::SeqCst);
+        let still_waiting = !session.is_finished();
+        session.abort();
+
+        assert!(sends >= 1, "the loop must have sent at least one request");
+        assert!(
+            sends <= 3,
+            "{} requests in {:?}: an unattributable frame must not buy a request \
+             (200 ms retry interval, so only the sends at 0, 200 and 400 ms fit in the window)",
+            sends,
+            window
+        );
+        assert!(
+            still_waiting,
+            "the session concluded inside the window, so nothing was measured"
+        );
+    }
 }

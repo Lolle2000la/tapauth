@@ -43,10 +43,12 @@ pub enum ScreenMessage {
 
     // Pairing
     PairingStarted,
-    PairingComplete(String), // device_id or SAS
+    PairingSessionStarted(crate::ipc::PairingSession), // StartPairing succeeded
+    PairingComplete(String),                           // device_id or SAS
     PairingFailed(crate::ipc::GuiIpcError),
     PairingCancelled,
-    PairingSASConfirmed, // User confirmed SAS
+    PairingCancelledOnDaemon, // result of the fire-and-forget CancelPairing
+    PairingSASConfirmed,      // User confirmed SAS
 
     // Device List
     RemoveDevice(String), // device_id
@@ -82,9 +84,15 @@ impl Screen {
         match message {
             // Navigation messages
             ScreenMessage::NavigateToMainMenu => {
+                // Tearing the pairing screen down abandons any session the
+                // daemon is still waiting on, so cancel it there.
+                let cancel_task = match self {
+                    Screen::Pairing(screen) => screen.take_cancel_task(),
+                    _ => Task::none(),
+                };
                 let (screen, task) = MainMenuScreen::new(l10n.clone());
                 *self = Screen::MainMenu(screen);
-                task
+                Task::batch([task, cancel_task])
             }
             ScreenMessage::NavigateToPairing => {
                 *self = Screen::Pairing(PairingScreen::new(l10n.clone()));

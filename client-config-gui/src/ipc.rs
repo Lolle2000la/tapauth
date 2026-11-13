@@ -165,7 +165,22 @@ pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, GuiIpcEr
     }
 }
 
-pub async fn start_pairing() -> Result<(String, u16), GuiIpcError> {
+/// A pairing session opened by `StartPairing`.
+///
+/// `session_id` together with `port` identifies the session to the daemon, so
+/// an abandoned pairing attempt can be cancelled instead of holding its UDP
+/// socket and BLE advertisement until the daemon's own timeout.
+#[derive(Debug, Clone)]
+pub struct PairingSession {
+    /// The v2 `tapauth://pair?...` URL to render as a QR code.
+    pub url: String,
+    /// Ephemeral UDP pairing port the daemon listens on.
+    pub port: u16,
+    /// The 16-byte session identifier carried by the QR URL's `sid`.
+    pub session_id: Vec<u8>,
+}
+
+pub async fn start_pairing() -> Result<PairingSession, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::StartPairing(
             ipc::StartPairingRequest {},
@@ -179,9 +194,36 @@ pub async fn start_pairing() -> Result<(String, u16), GuiIpcError> {
     }
 
     match response.payload {
-        Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok((resp.url, resp.port as u16)),
+        Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok(PairingSession {
+            url: resp.url,
+            port: resp.port as u16,
+            session_id: resp.session_id,
+        }),
         _ => Err(GuiIpcError::UnexpectedResponse),
     }
+}
+
+/// Build the admin request that abandons the pairing session identified by
+/// `port` and `session_id` (see `proto/ipc.proto`'s `CancelPairingRequest`).
+fn cancel_pairing_request(port: u16, session_id: &[u8]) -> ipc::AdminRequest {
+    ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::CancelPairing(
+            ipc::CancelPairingRequest {
+                port: port as u32,
+                session_id: session_id.to_vec(),
+            },
+        )),
+    }
+}
+
+pub async fn cancel_pairing(port: u16, session_id: Vec<u8>) -> Result<(), GuiIpcError> {
+    let response = send_admin_request(cancel_pairing_request(port, &session_id)).await?;
+
+    if response.status != ipc::AdminStatus::AdminSuccess as i32 {
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
+    }
+
+    Ok(())
 }
 
 pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
@@ -356,5 +398,23 @@ pub async fn get_config() -> Result<ClientConfigValues, GuiIpcError> {
             enable_network: resp.enable_network,
         }),
         _ => Err(GuiIpcError::UnexpectedResponse),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_pairing_request_carries_the_port_and_session_id() {
+        let session_id: Vec<u8> = (0u8..16).collect();
+
+        match cancel_pairing_request(41234, &session_id).payload {
+            Some(ipc::admin_request::Payload::CancelPairing(request)) => {
+                assert_eq!(request.port, 41234);
+                assert_eq!(request.session_id, session_id);
+            }
+            other => panic!("expected a CancelPairing payload, got {other:?}"),
+        }
     }
 }
