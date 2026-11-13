@@ -21,7 +21,7 @@ The shortened temporal identifier is derived using the same HMAC-SHA256 process 
 
 This rotating identifier allows the Server (phone) to recognize a trusted Client is advertising without revealing any static information that could be used for tracking. The Server will scan for advertisements containing service data with the TapAuth Service UUID and match the temporal identifier against its paired clients, at which point it will initiate a connection.
 
-**Important**: The shortened 10-byte temporal identifier is used **only** for BLE advertisement discovery. Once the GATT connection is established, all subsequent communication uses the standard `EncryptedPacket` format with the full 16-byte temporal identifier as specified in `auth_protocol.proto`.
+**Important**: The shortened 10-byte temporal identifier is used **only** for BLE advertisement discovery. Once the GATT connection is established, all subsequent communication uses the standard `EncryptedPacket` format with the full 16-byte temporal identifier as specified in `proto/auth_protocol.proto`.
 
 ### Characteristics
 
@@ -34,7 +34,7 @@ Once a BLE connection is established, the TapAuth service shall expose three cha
 
 2. **Server Response Characteristic**
    * **UUID**: `ca6238be-c194-49b7-855b-58f41d3da626`
-   * **Properties**: `WRITE` (Write without response)
+   * **Properties**: `WRITE` (write with response, i.e. acknowledged writes — `write: true, write_without_response: false` in `tapauthd/src/transport/ble.rs`, so the Server (phone) can use GATT Prepare/Execute long writes to fragment a payload larger than the MTU)
    * **Purpose**: The Server (phone) writes the `EncryptedPacket` containing the `AuthenticationGrant` or `AuthenticationDenial` message to this characteristic on the Client. Per the authentication flow specification, the Server will retransmit the response every 500ms until a confirmation is received or timeout occurs.
 
 3. **Client Confirmation Characteristic**

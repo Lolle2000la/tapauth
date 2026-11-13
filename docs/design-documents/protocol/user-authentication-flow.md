@@ -11,8 +11,10 @@ flowchart TD
     B -- No --> D[Prompt user for authentication]
     D --> E{Does user grant authentication?}
     E -- Yes --> F[Send authentication grant to client]
-    E -- No --> G[Ignore request]
+    E -- No --> G[Send authentication denial to client]
 ```
+
+A user who declines is reported to the Client as an explicit denial (`AuthenticationDenial`, retransmitted like a grant), which the Client surfaces as its own "denied" outcome; only a timeout or error ends silently, with no message sent (`server-android/app/src/main/java/dev/rourunisen/tapauth/service/AuthenticationService.kt`, request callback `(approved, signedChallenge, explicitDenial)`).
 
 ## User flow from receiving authentication request to being logged in on client
 
