@@ -196,3 +196,192 @@ flowchart TD
 ```
 
 Config cannot reorder or replace any of this. `policy::refine` runs once after the config read and can only turn a participation into the `RemoteRefuse` skip for a name listed in `pam_refused_services`; an existing skip, a selected flow and a deadline are never changed. That second phase exists because `classify` sees the caller's facts only, before any config is loaded.
+
+## The three flows
+
+Each flow is one module under `client-pam/src/mechanism/`; all three answer the same PAM conversation, and the choice is made by the rule table before any of them runs.
+
+### Threaded
+
+The host's conversation stays answerable while a worker thread is blocked in it, so the password is collected off the main thread while the main thread waits for the phone.
+
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Module
+    participant Worker
+    participant Daemon
+    participant Phone
+
+    Host->>Module: pam_authenticate
+    Module->>Daemon: PamAuthenticateRequest
+    Module->>Worker: pthread_create, pam_get_authtok
+    Daemon->>Phone: ring
+    Note over Worker: password dialog on the worker; the main thread polls the daemon and a self-pipe
+    alt phone answers first
+        Phone-->>Daemon: grant or denial
+        Daemon-->>Module: PamAuthenticateResponse
+        Module->>Worker: cancel and join
+        Module-->>Host: PAM_SUCCESS or PAM_PERM_DENIED
+    else user submits a password
+        Worker->>Module: self-pipe
+        Module->>Daemon: PamCancelRequest gui-password-skip
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    else dialog is dismissed or fails
+        Worker->>Module: self-pipe
+        Module->>Daemon: PamCancelRequest gui-password-failed
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    else deadline expires
+        Module->>Worker: cancel and join
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    end
+```
+
+A response from the daemon is the verdict whatever the loop exit was; the worker is cancelled and joined before the module returns.
+
+| | |
+| :--- | :--- |
+| Selected by | `GdmReauthWorker`, `PolkitAgent`, `KscreenlockerWorker`, `Hyprlock`, `Xsecurelock`, `PolkitServiceWithoutProc` |
+| Threads | `pam_get_authtok` on a worker pthread; the calling thread polls the daemon fd and a self-pipe |
+| Daemon sees | the request; a cancel on the live connection when a password is submitted or the dialog fails; no cancel on timeout |
+| User sees | the host's password dialog and the phone prompt; the first answer wins |
+| Phone never answers | `pam_operation_timeout_secs` expires, the worker is cancelled and joined, `PAM_AUTHINFO_UNAVAIL` |
+
+### Sequential
+
+The host either posts the conversation answer back to the thread that called `pam_authenticate` or parks in a wait with no cancellation point, so a threaded reply could never be abandoned. The module therefore never drives the conversation while waiting: it waits on the calling thread, then falls through to the password module.
+
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Module
+    participant Daemon
+    participant Phone
+
+    Host->>Module: pam_authenticate
+    Module->>Daemon: PamAuthenticateRequest
+    Note over Module: waits on the calling thread; the conversation is not driven
+    Daemon->>Phone: ring
+    alt phone answers
+        Phone-->>Daemon: grant or denial
+        Daemon-->>Module: PamAuthenticateResponse
+        Module-->>Host: PAM_SUCCESS or PAM_PERM_DENIED
+    else user presses Enter on /dev/tty
+        Module->>Daemon: PamCancelRequest tty-skip
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    else deadline expires
+        Module-->>Host: PAM_AUTHINFO_UNAVAIL
+    end
+```
+
+| | |
+| :--- | :--- |
+| Selected by | `DefaultSequential` |
+| Threads | everything on the calling thread; `pam_conv` is never touched |
+| Daemon sees | the request; a cancel on terminal Enter (`tty-skip`) or, without a terminal, on an IPC failure (`gui-ipc-error`); no cancel on timeout |
+| User sees | a wait notice; with a terminal, Enter skips at once; without one, nothing until the deadline, then the stack's password prompt |
+| Phone never answers | the deadline expires, `PAM_AUTHINFO_UNAVAIL`, and the next module prompts for a password |
+
+The terminal and no-terminal shapes are one loop driven by `Profile`; the profile only decides whether an IPC failure is reported as a lost connection or as an error, and whether a poll error ends the wait.
+
+### Pre-collected
+
+The host read the password before calling `pam_authenticate`, and its conversation is a synchronous replay of it. The module reads that password with `pam_get_authtok` on the calling thread and returns at once.
+
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Module
+
+    Host->>Module: pam_authenticate
+    Module->>Module: pam_get_authtok on the calling thread
+    Note over Module: caches PAM_AUTHTOK for the next module; no daemon contact
+    Module-->>Host: PAM_AUTHINFO_UNAVAIL
+```
+
+| | |
+| :--- | :--- |
+| Selected by | `PreCollectedLocks` |
+| Threads | the calling thread; one `pam_get_authtok`, no IPC |
+| Daemon sees | nothing |
+| User sees | only the password prompt the host had already shown |
+| Phone never answers | it is never rung; the call returns `PAM_AUTHINFO_UNAVAIL` immediately |
+
+On these hosts the phone is not a credential: nothing is rung and nothing is verified, so a stack with no password module after `pam_tapauth.so` cannot unlock.
+
+## Skips
+
+| Skip | Returns | `sufficient` stack | `required` stack | Why it is safe |
+| :--- | :--- | :--- | :--- | :--- |
+| Display-manager bypass (`DmLoginBypass`) | `PAM_AUTHINFO_UNAVAIL` | next module prompts for a password | the stack fails | returns before the conversation is touched, so the login manager still populates `PAM_AUTHTOK` and the keyring unlocks |
+| Remote refusal (`RemoteRefuse`) | `PAM_AUTHINFO_UNAVAIL` | the next module decides, in practice a password login | the stack fails | returns before the daemon is contacted and before any credential or conversation work, so a phone grant cannot complete a remote login |
+| Pre-collected handoff (`PreCollectedLocks`) | `PAM_AUTHINFO_UNAVAIL` | the next module reads the cached `PAM_AUTHTOK` | the stack fails | `pam_get_authtok` caches the token for the next module and the daemon is never contacted, so nothing is rung or verified |
+
+The display-manager bypass exempts a GDM reauthentication (`gdm-password` plus `GDM_SESSION_FOR_REAUTH`), because an unlock runs no session or setcred phase and the keyring reason does not apply there.
+
+The remote refusal covers the built-in names before the config read and any `pam_refused_services` entry immediately after it. A deployment that renames the service must declare the new name; `PAM_RHOST` is not read, so an undeclared rename is not detected.
+
+## Timeouts and deadlines
+
+| Flow | Terminal | Deadline | Value |
+| :--- | :--- | :--- | :--- |
+| Threaded | either | `Deadline::Operation` | `pam_operation_timeout_secs` (120 s) |
+| Sequential | present | `Deadline::Operation` | `pam_operation_timeout_secs` (120 s) |
+| Sequential | absent | `Deadline::GuiBounded` | `pam_gui_timeout_secs` (30 s), clamped to the operation timeout |
+| Pre-collected | — | none | — |
+
+`Plannable::plan` picks the variant from the conversation and `has_tty`; `Deadline::resolve` in `plan.rs` turns it into seconds and saturates at `u32::MAX`. `transaction/run.rs` adds those seconds to the current instant and sends the same value to the daemon, so both sides expire together.
+
+The clamp is `pam_gui_timeout_secs.min(pam_operation_timeout_secs)` and applies only to a sequential host without a terminal. Only that shape probes `/dev/tty` (`TtyUse::PollForKey`); threaded and no-terminal sequential never open it.
+
+On expiry the mechanism returns `MechanismEnd::Reason(UnavailableReason::TimedOut)`, no cancel is sent, and the module returns `PAM_AUTHINFO_UNAVAIL` after one `timed_out` message. A timeout the daemon reports itself is `UnavailableReason::DaemonTimedOut`: the same code, no message.
+
+## Return codes
+
+| `Outcome` | Code | What it means to a stack author |
+| :--- | :--- | :--- |
+| `Granted` | `PAM_SUCCESS` | the phone granted this call, or this process's own grant was replayed |
+| `Denied` | `PAM_PERM_DENIED` | the user denied on the phone |
+| `Unavailable` | `PAM_AUTHINFO_UNAVAIL` | the module could not ask: a skip, a timeout, no daemon, no paired device, or the password handoff |
+| `Error` | `PAM_AUTH_ERR` | processing failed: conversation lookup, request id, daemon protocol |
+| `UserUnknown` | `PAM_USER_UNKNOWN` | the username lookup failed |
+
+Only two constructors can produce a grant: `Outcome::granted_from_daemon` (a `PamOutcome::Success` this call received, `GrantVia::PhoneTap`) and `Outcome::replayed` (a copy of this process's own record, `GrantVia::VerdictReplay`). `granted_only_from_daemon` scans for any other construction.
+
+A recorded conclusion answers a further call for the same username and the same service bytes within 500 ms, returning the recorded code without contacting the daemon. The replay carries its provenance (`Via::Replay`, and `GrantVia::VerdictReplay` or `DenyVia::VerdictReplay`) and is never re-recorded.
+
+## State that outlives a call
+
+One process-wide record lives in `conclusion_cache.rs`. A call either ends with a conclusion to store or ends unrecorded.
+
+```mermaid
+flowchart TD
+    A[pam_authenticate] --> B{skip or handoff?}
+    B -- yes --> U[unrecorded]
+    B -- no --> C{reuse hit?}
+    C -- yes --> D[concluded, Via::Replay]
+    D --> J[into_pam]
+    C -- no --> E{connect and send succeeded?}
+    E -- no --> U
+    E -- yes --> F[Armed]
+    F --> G[mechanism]
+    G --> H[concluded, Via::Daemon]
+    H --> I{service resolved?}
+    I -- yes --> K[record]
+    I -- no --> U
+    K --> J
+    U --> J
+```
+
+| Stored | |
+| :--- | :--- |
+| `username` | the name this call authenticated |
+| `service` | `ServiceName::original`, the bytes libpam returned, case preserved |
+| `outcome` | the whole verdict, including its provenance |
+| `concluded_at` | the instant the module records, immediately before it returns to the host |
+
+The key is `(username, service)` compared with plain string equality, so `sudo` and `SUDO` are distinct services. The window is `VERDICT_REUSE_WINDOW` (500 ms) measured from `concluded_at`; the anchor is the module's return path, not the moment the phone answered.
+
+`record` accepts only a `Via::Daemon` conclusion whose service resolved. Skips, the pre-collected handoff, a failure before the request was sent and an unresolved service store nothing, and a replay can never overwrite the record it came from.
+
+A forked child inherits neither: the `pthread_atfork` child handler writes a fresh empty record over the inherited slot, so the child starts with no conclusion and no held lock.
