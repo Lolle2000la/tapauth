@@ -138,12 +138,12 @@ fn remote_skip_never_reaches_the_daemon() {
                     crate::outcome::UnavailableReason::RemoteAuthentication
                 ))
             ),
-            "service {service}: R1 is an unrecorded RemoteAuthentication verdict"
+            "service {service}: `remote_refuse` is an unrecorded RemoteAuthentication verdict"
         );
         assert_eq!(
             finished.outcome().clone().into_pam(),
             pam_sys::PAM_AUTHINFO_UNAVAIL,
-            "service {service}: R1 must report the service as unavailable"
+            "service {service}: `remote_refuse` must report the service as unavailable"
         );
     }
 }
@@ -201,14 +201,14 @@ fn side_effects_of(ctx: &CallerContext) -> [usize; 4] {
 /// null user would come back as `PAM_USER_UNKNOWN` instead.
 #[test]
 fn classify_before_side_effects() {
-    // R1: a remote service name is refused before anything is read.
+    // `remote_refuse`: a remote service name is refused before anything is read.
     assert_eq!(
         side_effects_of(&context(Some("sshd"), Some("sshd"))),
         [0, 0, 0, 0],
         "a remote skip must not load config, user, conversation or messages"
     );
 
-    // R2: the display-manager bypass.
+    // `dm_login_bypass`: the display-manager bypass.
     assert_eq!(
         side_effects_of(&context(Some("sddm"), Some("sh"))),
         [0, 0, 0, 0],
@@ -332,9 +332,10 @@ fn run_renamed(ctx: &CallerContext, load_config: fn() -> PamConfig) -> RenamedRu
 }
 
 /// The defect this catches, in both directions: without the enforcement point a renamed
-/// `PAMServiceName` is classified R10 and a remote login rings the phone and waits out the GUI
-/// timeout (the counters would be non-zero and the verdict `DaemonUnreachable`); an enforcement
-/// point that runs before the config read cannot see the configured list at all, and one placed
+/// `PAMServiceName` is classified `default_sequential` and a remote login rings the phone and
+/// waits out the GUI timeout (the counters would be non-zero and the verdict
+/// `DaemonUnreachable`); an enforcement point that runs before the config read cannot see the
+/// configured list at all, and one placed
 /// after the username lookup, the conversation or the messages would still pay them — and would
 /// emit through a live `HostIo`, which is why the verdict's notice is asserted `None` here.
 #[test]
@@ -369,7 +370,7 @@ fn a_configured_renamed_service_is_refused_after_the_config_read() {
     assert_eq!(
         run.finished.outcome(),
         &Outcome::Unavailable(crate::outcome::UnavailableReason::RemoteAuthentication),
-        "a configured refusal keeps R1's verdict"
+        "a configured refusal keeps `remote_refuse`'s verdict"
     );
     assert_eq!(
         run.finished.outcome().clone().into_pam(),
@@ -384,7 +385,7 @@ fn a_configured_renamed_service_is_refused_after_the_config_read() {
 }
 
 /// The negative control: the same caller with no configured extras is a participating call
-/// (R10) and does reach `get_user`.
+/// (`default_sequential`) and does reach `get_user`.
 ///
 /// The defect this catches: a harness that counts nothing — the zeros above would then also
 /// pass for a `get_user` that is never wired in — and an enforcement point that refuses on the
@@ -398,7 +399,8 @@ fn a_renamed_service_without_config_participates() {
     assert_eq!(run.config, 1);
     assert_eq!(
         run.user, 1,
-        "without the configured name the call is local (R10) and resolves the username"
+        "without the configured name the call is local (`default_sequential`) and \
+         resolves the username"
     );
     assert_eq!(
         run.conversation, 1,
@@ -452,9 +454,9 @@ fn skip_io() -> OrchestrationIo {
 /// reason). The read is counted where it happens, through the reader `transaction::HostIo`
 /// carries, not inferred from the absence of a conversation.
 ///
-/// R1 and R2 skip the handle entirely (no plan, no deadline, no conversation), while R8's
-/// pre-collected handoff *must* touch it — it calls `pam_get_authtok` on the calling thread and
-/// leaves `PAM_AUTHTOK` for the next module.
+/// `remote_refuse` and `dm_login_bypass` skip the handle entirely (no plan, no deadline, no
+/// conversation), while `precollected_locks`' pre-collected handoff *must* touch it — it calls
+/// `pam_get_authtok` on the calling thread and leaves `PAM_AUTHTOK` for the next module.
 #[test]
 fn skip_never_hands_off() {
     for (service, process, expected) in [
@@ -519,7 +521,7 @@ fn skip_never_hands_off() {
         );
     }
 
-    // The positive control: R8's pre-collected host reaches the handoff, so the same reader
+    // The positive control: `precollected_locks`' host reaches the handoff, so the same reader
     // counts exactly one read and the verdict is the handoff's. Without it the two zeros above
     // would also pass for a reader that is never wired into the handoff at all.
     HANDOFF_TOKEN_READS.store(0, Ordering::SeqCst);

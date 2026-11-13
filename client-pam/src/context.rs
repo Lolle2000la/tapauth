@@ -8,8 +8,8 @@ use std::path::Path;
 
 /// The caller facts, captured before any other work in `authenticate`.
 ///
-/// R1 is keyed on the service name alone (see `policy::table::remote_refuse`),
-/// so this type carries no remote-presence fact: nothing reads `PAM_RHOST`.
+/// `remote_refuse` is keyed on the service name alone (`policy::table`), so this
+/// type carries no remote-presence fact: nothing reads `PAM_RHOST`.
 pub(crate) struct CallerContext {
     service: Option<ServiceName>,
     process: ProcessIdentity,
@@ -243,8 +243,9 @@ mod tests {
     }
 
     /// The defect this catches: the strip dropped, so an upgraded or swapped
-    /// binary (`swaylock (deleted)`) no longer matches R8, falls through to R10 and
-    /// rings the phone for a host that already collected the password.
+    /// binary (`swaylock (deleted)`) no longer matches `precollected_locks`, falls
+    /// through to `default_sequential` and rings the phone for a host that already
+    /// collected the password.
     #[test]
     fn strip_deleted_suffix() {
         assert_eq!(
@@ -278,15 +279,15 @@ mod tests {
         let trimmed = classify_identity(None, Some("  kscreenlocker_w \n"));
         assert_eq!(trimmed, ProcessIdentity::Comm("kscreenlocker_w".into()));
         // The name the policy matches, not just the shape of the value: the
-        // trimmed spelling is what R5 sees.
+        // trimmed spelling is what `kscreenlocker_worker` sees.
         let ctx = CallerContext::from_parts(Some("kde"), trimmed, GdmReauth::Absent);
         let (rule, classification) = crate::policy::classify(&ctx);
         assert!(
             matches!(
                 classification,
                 crate::policy::Classification::Participate(_)
-            ) && rule == crate::policy::RuleId::R5,
-            "the trimmed comm spelling must reach R5"
+            ) && rule == crate::policy::RuleId::KscreenlockerWorker,
+            "the trimmed comm spelling must reach `kscreenlocker_worker`"
         );
 
         assert_eq!(
@@ -319,14 +320,17 @@ mod tests {
 
     /// The defect this catches: `is_gdm_reauth` testing only
     /// `GDM_SESSION_FOR_REAUTH`, so the variable alone exempts any display manager
-    /// from R2 — an `sddm` login with the variable set would participate instead of
-    /// populating `PAM_AUTHTOK`, leaving its keyring locked.
+    /// from `dm_login_bypass` — an `sddm` login with the variable set would
+    /// participate instead of populating `PAM_AUTHTOK`, leaving its keyring locked.
     #[test]
     fn gdm_reauth_requires_service() {
         let worker = || ProcessIdentity::Exe("gdm-session-worker".into());
 
         let reauth = CallerContext::from_parts(Some("gdm-password"), worker(), GdmReauth::Present);
-        assert!(reauth.is_gdm_reauth(), "gdm-password plus the flag is R3's");
+        assert!(
+            reauth.is_gdm_reauth(),
+            "gdm-password plus the flag is `gdm_reauth_worker`'s"
+        );
 
         let login = CallerContext::from_parts(Some("gdm-password"), worker(), GdmReauth::Absent);
         assert!(

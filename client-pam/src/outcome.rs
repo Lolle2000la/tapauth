@@ -54,11 +54,11 @@ pub(crate) enum DenyVia {
 /// `try_error`. A single `IpcError` could recover neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnavailableReason {
-    /// R2: the display manager's own stack must populate `PAM_AUTHTOK`.
+    /// `dm_login_bypass`: the display manager's own stack must populate `PAM_AUTHTOK`.
     KeyringBypass,
-    /// R8: the host already collected the password; the token was handed on.
+    /// `precollected_locks`: the host already collected the password; the token was handed on.
     PasswordHandoff,
-    /// R1: the module does not take part in a remote authentication.
+    /// `remote_refuse`: the module does not take part in a remote authentication.
     RemoteAuthentication,
     /// The daemon socket could not be opened.
     DaemonUnreachable,
@@ -565,9 +565,10 @@ mod tests {
         );
     }
 
-    /// The defect this catches: R1's refusal mapped to R2's reason (or to a bare
-    /// `AUTHINFO_UNAVAIL` with no reason at all), which only `remote_under_dm`
-    /// distinguishes by rule id, so an inverted mapping would otherwise pass.
+    /// The defect this catches: `remote_refuse`'s refusal mapped to
+    /// `dm_login_bypass`'s reason (or to a bare `AUTHINFO_UNAVAIL` with no reason at
+    /// all), which only `remote_under_dm` distinguishes by rule id, so an inverted
+    /// mapping would otherwise pass.
     #[test]
     fn skip_policy_maps_to_outcome() {
         assert_eq!(

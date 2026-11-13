@@ -1,8 +1,8 @@
 //! The decision record: `RULES`, an ordered list of named rules over
 //! `CallerContext`, matched first-wins and keyed on whichever caller fact
-//! identifies the host or service — the service name for `R1` and `R2`, the
-//! process name for the rest — plus the test-only audit record that names each
-//! rule and cites the evidence for it.
+//! identifies the host or service — the service name for `remote_refuse` and
+//! `dm_login_bypass`, the process name for the rest — plus the test-only audit
+//! record that names each rule and cites the evidence for it.
 
 use crate::context::{CallerContext, ProcessIdentity};
 
@@ -19,9 +19,9 @@ pub(super) struct Rule {
     pub(crate) decision: Decision,
 }
 
-/// The conversation policy, in order: R1 first (a remote call is refused
-/// whatever its process or service), R2 next (its keyring constraint belongs
-/// to the service, not the process), R10 last and unconditional.
+/// The conversation policy, in order: `remote_refuse` first (a remote call is
+/// refused whatever its process or service), `dm_login_bypass` next (its keyring
+/// constraint is the service's), `default_sequential` last and unconditional.
 ///
 /// Adding a host edits the `Rule` row, the predicate with both its full and
 /// its `/proc/self/comm`-truncated (15-byte) spelling, the `RuleId` variant
@@ -36,88 +36,88 @@ pub(super) struct Rule {
 /// `scripts/ci/test-pam-conv-thread.sh`, which no Rust test checks.
 pub(super) static RULES: [Rule; 10] = [
     Rule {
-        id: RuleId::R1,
+        id: RuleId::RemoteRefuse,
         class: FailureDirection::RefuseRemote,
         predicate: remote_refuse,
         decision: Decision::Skip(SkipPolicy::RemoteAuthentication),
     },
     Rule {
-        id: RuleId::R2,
+        id: RuleId::DmLoginBypass,
         class: FailureDirection::Keyring,
         predicate: dm_login_bypass,
         decision: Decision::Skip(SkipPolicy::KeyringNeedsAuthtok),
     },
     Rule {
-        id: RuleId::R3,
+        id: RuleId::GdmReauthWorker,
         class: FailureDirection::DeadlockAvoidance,
         predicate: gdm_reauth_worker,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R4,
+        id: RuleId::PolkitAgent,
         class: FailureDirection::DeadlockAvoidance,
         predicate: polkit_agent,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R5,
+        id: RuleId::KscreenlockerWorker,
         class: FailureDirection::DeadlockAvoidance,
         predicate: kscreenlocker_worker,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R6,
+        id: RuleId::Hyprlock,
         class: FailureDirection::AlwaysRing,
         predicate: hyprlock,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R7,
+        id: RuleId::Xsecurelock,
         class: FailureDirection::AlwaysRing,
         predicate: xsecurelock,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R8,
+        id: RuleId::PreCollectedLocks,
         class: FailureDirection::NeverRing,
         predicate: precollected_locks,
         decision: Decision::Participate(Conversation::PreCollected),
     },
     Rule {
-        id: RuleId::R9,
+        id: RuleId::PolkitServiceWithoutProc,
         class: FailureDirection::DeadlockAvoidance,
         predicate: polkit_service_without_proc,
         decision: Decision::Participate(Conversation::Threaded),
     },
     Rule {
-        id: RuleId::R10,
+        id: RuleId::DefaultSequential,
         class: FailureDirection::DeadlockAvoidance,
         predicate: default_sequential,
         decision: Decision::Participate(Conversation::Sequential),
     },
 ];
 
-/// R10's result, and the value `classify` falls back to. R10's predicate is
-/// unconditional, so this value is unreachable: it makes `classify` total
-/// without a panic path, and `unreachable_rule_rows` asserts it is what the
-/// table's last row produces.
+/// The `default_sequential` row's result, and the value `classify` falls back to.
+/// Its predicate is unconditional, so this value is unreachable: it makes
+/// `classify` total without a panic path, and `unreachable_rule_rows` asserts it
+/// is what the table's last row produces.
 pub(super) const DEFAULT_SEQUENTIAL: Classification = Classification::Participate(Participation {
     conversation: Conversation::Sequential,
     failure_direction: FailureDirection::DeadlockAvoidance,
 });
 
-/// The service names R1 refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`),
+/// The service names `remote_refuse` refuses (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`),
 /// compared ASCII case-insensitively: `PAM_SERVICE` is a `pam.d` filename, so
 /// a service literally named `SSHD` is sshd's stack whatever its spelling.
 ///
 /// `sshd` is OpenSSH's compiled-in `PAMServiceName` default and
 /// `sshd-session` its per-connection session service, so a deployment that
-/// renames the service falls through to R10 (the documented false negative,
-/// `svc_sshd_near_miss`) unless it declares the new name in
+/// renames the service falls through to `default_sequential` (the documented
+/// false negative, `svc_sshd_near_miss`) unless it declares the new name in
 /// `pam_refused_services`.
 const REMOTE_SERVICES: &[&str] = shared::config::DEFAULT_PAM_REFUSED_SERVICES;
 
-/// R1 — refuse a remote authentication, keyed on the service name.
+/// `remote_refuse` — refuse a remote authentication, keyed on the service name.
 ///
 /// The module never reads `PAM_RHOST`: `sudo` sets it to the local hostname
 /// (`Defaults pam_rhost`), so a presence-only rule would silence the module
@@ -182,7 +182,7 @@ fn kscreenlocker_worker(ctx: &CallerContext) -> bool {
     )
 }
 
-/// R6 — hyprlock.
+/// `hyprlock` — the lock screen's worker thread.
 ///
 /// Accepted risk: the host answers from a worker `std::thread` with a
 /// mutex/condvar — a genuine concurrent race — and an unsynchronised
@@ -191,7 +191,7 @@ fn hyprlock(ctx: &CallerContext) -> bool {
     matches!(ctx.process().name(), Some("hyprlock"))
 }
 
-/// R7 — xsecurelock's helper.
+/// `xsecurelock` — the helper's own thread pool.
 ///
 /// Accepted risk: the conversation is answered by the helper's own thread pool,
 /// and `CallPAMWithRetries` can re-run the module up to three times.
@@ -199,7 +199,7 @@ fn xsecurelock(ctx: &CallerContext) -> bool {
     matches!(ctx.process().name(), Some("authproto_pam"))
 }
 
-/// R8 — hosts that collected the password before calling `pam_authenticate`.
+/// `precollected_locks` — hosts that collect the password before `pam_authenticate`.
 fn precollected_locks(ctx: &CallerContext) -> bool {
     matches!(
         ctx.process().name(),
@@ -207,7 +207,7 @@ fn precollected_locks(ctx: &CallerContext) -> bool {
     )
 }
 
-/// R9 — polkit with an unreadable `/proc`.
+/// `polkit_service_without_proc` — polkit with an unreadable `/proc`.
 ///
 /// The service comparison is exact bytes, deliberately: `POLKIT-1` with an
 /// unreadable `/proc` stays sequential.
@@ -245,7 +245,7 @@ pub(super) struct Audit {
 #[cfg(test)]
 pub(super) fn audit(id: RuleId) -> Audit {
     match id {
-        RuleId::R1 => Audit {
+        RuleId::RemoteRefuse => Audit {
             name: "remote_refuse",
             why: "the sshd stack authenticates a remote peer, so ringing the phone \
                   for it can only add a wait nobody is sitting at",
@@ -256,7 +256,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                  name is a compile-time default, not a constant of the protocol",
             ],
         },
-        RuleId::R2 => Audit {
+        RuleId::DmLoginBypass => Audit {
             name: "dm_login_bypass",
             why: "the login manager has to populate `PAM_AUTHTOK` for the session \
                   keyring, and a grant without it is useless",
@@ -265,7 +265,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/outcome.rs:59",
             ],
         },
-        RuleId::R3 => Audit {
+        RuleId::GdmReauthWorker => Audit {
             name: "gdm_reauth_worker",
             why: "a GDM reauthentication is driven by the session worker, whose \
                   conversation stays answerable while a worker thread waits",
@@ -274,7 +274,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/context.rs:80",
             ],
         },
-        RuleId::R4 => Audit {
+        RuleId::PolkitAgent => Audit {
             name: "polkit_agent",
             why: "polkit's agent helper feeds its conversation from a separate \
                   process, so it can be answered while the caller waits",
@@ -283,7 +283,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
-        RuleId::R5 => Audit {
+        RuleId::KscreenlockerWorker => Audit {
             name: "kscreenlocker_worker",
             why: "kscreenlocker 6.8's worker answers on Qt's D-Bus daemon thread, so \
                   the conversation survives the calling thread blocking",
@@ -292,7 +292,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
-        RuleId::R6 => Audit {
+        RuleId::Hyprlock => Audit {
             name: "hyprlock",
             why: "hyprlock answers from a worker thread; its unsynchronised \
                   `resetConversation`/`checkWaiting` race is the accepted risk",
@@ -301,7 +301,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
-        RuleId::R7 => Audit {
+        RuleId::Xsecurelock => Audit {
             name: "xsecurelock",
             why: "xsecurelock's helper answers from its own thread pool, at the cost \
                   of up to three rings when `CallPAMWithRetries` re-runs the module",
@@ -310,7 +310,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/mechanism/threaded.rs:170",
             ],
         },
-        RuleId::R8 => Audit {
+        RuleId::PreCollectedLocks => Audit {
             name: "precollected_locks",
             why: "these hosts collected the password before `pam_authenticate`, so \
                   the phone must not be rung and the token is handed on instead",
@@ -319,7 +319,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/mechanism/handoff.rs:25",
             ],
         },
-        RuleId::R9 => Audit {
+        RuleId::PolkitServiceWithoutProc => Audit {
             name: "polkit_service_without_proc",
             why: "polkit with an unreadable `/proc` cannot be shown to answer \
                   concurrently, so it stays on the threaded conversation",
@@ -328,7 +328,7 @@ pub(super) fn audit(id: RuleId) -> Audit {
                 "client-pam/src/context.rs:164",
             ],
         },
-        RuleId::R10 => Audit {
+        RuleId::DefaultSequential => Audit {
             name: "default_sequential",
             why: "every other caller is driven sequentially on the calling thread, \
                   which is slower but can never wedge the host's event loop",

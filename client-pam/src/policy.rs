@@ -2,8 +2,8 @@
 //! written in, and the first-match engine `classify` that walks them.
 //! `refine` is the second, config-dependent phase; it can only add a skip.
 //!
-//! R1 keys on the service name, never on `PAM_RHOST` (`table.rs`,
-//! `remote_refuse`): `sudo` sets the latter to the local hostname.
+//! `remote_refuse` keys on the service name, never on `PAM_RHOST` (`table.rs`):
+//! `sudo` sets the latter to the local hostname.
 
 use crate::context::CallerContext;
 
@@ -21,17 +21,17 @@ pub(crate) enum Classification {
     Participate(Participation),
 }
 
-/// Why the phone is not consulted at all. R8's pre-collected handoff is
-/// deliberately *not* one of these — it touches the handle, so it is a
-/// `Participation`.
+/// Why the phone is not consulted at all. `precollected_locks`' pre-collected
+/// handoff is deliberately *not* one of these — it touches the handle, so it is
+/// a `Participation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipPolicy {
-    /// R1's: a service in the built-in or configuration-declared refused
-    /// lists, whatever the caller's process.
+    /// `remote_refuse`'s: a service in the built-in or configuration-declared
+    /// refused lists, whatever the caller's process.
     RemoteAuthentication,
-    /// R2's: the display manager's own stack has to populate `PAM_AUTHTOK`,
-    /// and a second `PAM_PROMPT_ECHO_OFF` on a greeter handle is what the
-    /// bypass prevents.
+    /// `dm_login_bypass`'s: the display manager's own stack has to populate
+    /// `PAM_AUTHTOK`, and a second `PAM_PROMPT_ECHO_OFF` on a greeter handle
+    /// is what the bypass prevents.
     KeyringNeedsAuthtok,
 }
 
@@ -64,7 +64,7 @@ impl Conversation {
 /// decision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FailureDirection {
-    /// The phone must not be consulted at all: R8's
+    /// The phone must not be consulted at all: `precollected_locks`'
     /// `Conversation::PreCollected`, not a `SkipPolicy`.
     NeverRing,
     /// The conversation must not be driven from a second thread (or not
@@ -147,19 +147,21 @@ pub(crate) struct Participation {
 }
 
 /// A rule's stable id: a fixture label returned beside the classification, not
-/// part of `Participation`.
+/// part of `Participation`. Each variant is named for the host or service shape
+/// its row is written for; the canonical spelling is the audit record's own
+/// `name` (see `as_str`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RuleId {
-    R1,
-    R2,
-    R3,
-    R4,
-    R5,
-    R6,
-    R7,
-    R8,
-    R9,
-    R10,
+    RemoteRefuse,
+    DmLoginBypass,
+    GdmReauthWorker,
+    PolkitAgent,
+    KscreenlockerWorker,
+    Hyprlock,
+    Xsecurelock,
+    PreCollectedLocks,
+    PolkitServiceWithoutProc,
+    DefaultSequential,
 }
 
 impl RuleId {
@@ -171,46 +173,48 @@ impl RuleId {
     /// omitted here.
     #[cfg(test)]
     pub(crate) const ALL: &[Self] = &[
-        Self::R1,
-        Self::R2,
-        Self::R3,
-        Self::R4,
-        Self::R5,
-        Self::R6,
-        Self::R7,
-        Self::R8,
-        Self::R9,
-        Self::R10,
+        Self::RemoteRefuse,
+        Self::DmLoginBypass,
+        Self::GdmReauthWorker,
+        Self::PolkitAgent,
+        Self::KscreenlockerWorker,
+        Self::Hyprlock,
+        Self::Xsecurelock,
+        Self::PreCollectedLocks,
+        Self::PolkitServiceWithoutProc,
+        Self::DefaultSequential,
     ];
 
-    /// The spelling the fixture corpus uses (`R1` … `R10`).
+    /// The rule's canonical name: the fixture corpus's `expected_rule` spelling
+    /// and the audit record's `name`, never the design document's row number.
+    /// `every_rule_names_its_audit_record` pins the two together.
     #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            RuleId::R1 => "R1",
-            RuleId::R2 => "R2",
-            RuleId::R3 => "R3",
-            RuleId::R4 => "R4",
-            RuleId::R5 => "R5",
-            RuleId::R6 => "R6",
-            RuleId::R7 => "R7",
-            RuleId::R8 => "R8",
-            RuleId::R9 => "R9",
-            RuleId::R10 => "R10",
+            RuleId::RemoteRefuse => "remote_refuse",
+            RuleId::DmLoginBypass => "dm_login_bypass",
+            RuleId::GdmReauthWorker => "gdm_reauth_worker",
+            RuleId::PolkitAgent => "polkit_agent",
+            RuleId::KscreenlockerWorker => "kscreenlocker_worker",
+            RuleId::Hyprlock => "hyprlock",
+            RuleId::Xsecurelock => "xsecurelock",
+            RuleId::PreCollectedLocks => "precollected_locks",
+            RuleId::PolkitServiceWithoutProc => "polkit_service_without_proc",
+            RuleId::DefaultSequential => "default_sequential",
         }
     }
 }
 
-/// The first rule that matches wins; R10 is unconditional, so this is total.
-/// The id comes back next to the classification so a failing test names the
-/// row.
+/// The first rule that matches wins; `default_sequential` is unconditional, so
+/// this is total. The id comes back next to the classification so a failing
+/// test names the row.
 pub(crate) fn classify(ctx: &CallerContext) -> (RuleId, Classification) {
     RULES
         .iter()
         .find(|rule| (rule.predicate)(ctx))
-        // Unreachable fallback: R10 is unconditional (`table.rs`, `DEFAULT_SEQUENTIAL`),
-        // so this only keeps `classify` total.
-        .map_or((RuleId::R10, DEFAULT_SEQUENTIAL), |rule| {
+        // Unreachable fallback: `default_sequential` is unconditional
+        // (`table.rs`, `DEFAULT_SEQUENTIAL`), so this only keeps `classify` total.
+        .map_or((RuleId::DefaultSequential, DEFAULT_SEQUENTIAL), |rule| {
             (rule.id, classification_of(rule))
         })
 }
@@ -410,12 +414,12 @@ mod tests {
     /// The rule an id-less classification belongs to. `classify` reports the
     /// id itself; `refine` returns a bare `Classification`, so its skip is
     /// mapped back through the policy, which belongs to exactly one rule
-    /// (`RemoteAuthentication` is R1's, `KeyringNeedsAuthtok` is R2's). A
-    /// participation maps to nothing here.
+    /// (`RemoteAuthentication` is `remote_refuse`'s, `KeyringNeedsAuthtok` is
+    /// `dm_login_bypass`'s). A participation maps to nothing here.
     fn skip_rule(classification: &Classification) -> Option<RuleId> {
         match classification {
-            Classification::Skip(SkipPolicy::RemoteAuthentication) => Some(RuleId::R1),
-            Classification::Skip(SkipPolicy::KeyringNeedsAuthtok) => Some(RuleId::R2),
+            Classification::Skip(SkipPolicy::RemoteAuthentication) => Some(RuleId::RemoteRefuse),
+            Classification::Skip(SkipPolicy::KeyringNeedsAuthtok) => Some(RuleId::DmLoginBypass),
             Classification::Participate(_) => None,
         }
     }
@@ -448,7 +452,7 @@ mod tests {
     fn context_for_process(id: RuleId, name: &str) -> CallerContext {
         let process = ProcessIdentity::Exe(name.into());
         match id {
-            RuleId::R3 => {
+            RuleId::GdmReauthWorker => {
                 CallerContext::from_parts(Some("gdm-password"), process, GdmReauth::Present)
             }
             _ => CallerContext::from_parts(Some("kde"), process, GdmReauth::Absent),
@@ -559,10 +563,10 @@ mod tests {
         for row in &rows {
             assert!(!row.why.is_empty(), "row {} has no justification", row.id);
             assert!(
-                row.expected_rule.strip_prefix('R').is_some_and(|number| {
-                    number.parse::<u8>().is_ok_and(|n| (1..=10).contains(&n))
-                }),
-                "row {}: expected_rule {:?} is not R1..R10",
+                RuleId::ALL
+                    .iter()
+                    .any(|id| id.as_str() == row.expected_rule),
+                "row {}: expected_rule {:?} is not a known rule name",
                 row.id,
                 row.expected_rule
             );
@@ -739,6 +743,42 @@ mod tests {
         }
     }
 
+    /// A rule's canonical spelling *is* its audit record's name, and no two
+    /// rules share it.
+    ///
+    /// The defect this catches: a variant renamed (or an `as_str` string edited)
+    /// while the `audit` arm kept the old `name`, which would leave the corpus
+    /// asserting one spelling and the record defending another; a naming clash,
+    /// which would make a corpus row's `expected_rule` ambiguous; and a rule
+    /// added to `RuleId::ALL` without a fresh name.
+    #[test]
+    fn every_rule_names_its_audit_record() {
+        assert_eq!(
+            RuleId::ALL.len(),
+            10,
+            "the table has ten rows, so there are ten names to pin"
+        );
+
+        for id in RuleId::ALL {
+            assert_eq!(
+                id.as_str(),
+                audit(*id).name,
+                "{id:?}: `as_str` and the audit record's `name` must be the same \
+                 spelling, or a corpus row names a rule the record does not"
+            );
+        }
+
+        let mut seen: Vec<&'static str> = Vec::new();
+        for id in RuleId::ALL {
+            assert!(
+                !seen.contains(&id.as_str()),
+                "{id:?} repeats the name {:?} of another rule",
+                id.as_str()
+            );
+            seen.push(id.as_str());
+        }
+    }
+
     /// Every class × conversation cell, against an independently written
     /// table: a literal, because an expectation computed from the function
     /// under test agrees with it by construction.
@@ -868,7 +908,8 @@ mod tests {
     }
 
     /// The process-keyed rules own disjoint literal sets, so their order is not
-    /// load-bearing; R9 keys on a *missing* identity instead.
+    /// load-bearing; `polkit_service_without_proc` keys on a *missing* identity
+    /// instead.
     ///
     /// The literals are declared here because a set cannot be read back out of a `fn`
     /// pointer; the test then checks the *predicates* against them, so a spelling
@@ -876,12 +917,24 @@ mod tests {
     #[test]
     fn rules_are_process_disjoint() {
         let keys: &[(RuleId, &[&str])] = &[
-            (RuleId::R3, &["gdm-session-worker", "gdm-session-wor"]),
-            (RuleId::R4, &["polkit-agent-helper-1", "polkit-agent-he"]),
-            (RuleId::R5, &["kscreenlocker_worker", "kscreenlocker_w"]),
-            (RuleId::R6, &["hyprlock"]),
-            (RuleId::R7, &["authproto_pam"]),
-            (RuleId::R8, &["swaylock", "gtklock", "i3lock"]),
+            (
+                RuleId::GdmReauthWorker,
+                &["gdm-session-worker", "gdm-session-wor"],
+            ),
+            (
+                RuleId::PolkitAgent,
+                &["polkit-agent-helper-1", "polkit-agent-he"],
+            ),
+            (
+                RuleId::KscreenlockerWorker,
+                &["kscreenlocker_worker", "kscreenlocker_w"],
+            ),
+            (RuleId::Hyprlock, &["hyprlock"]),
+            (RuleId::Xsecurelock, &["authproto_pam"]),
+            (
+                RuleId::PreCollectedLocks,
+                &["swaylock", "gtklock", "i3lock"],
+            ),
         ];
 
         for (index, (id_a, keys_a)) in keys.iter().enumerate() {
@@ -918,21 +971,24 @@ mod tests {
             );
             assert_eq!(
                 classify(&ctx).0,
-                RuleId::R10,
+                RuleId::DefaultSequential,
                 "{name:?} is nobody's key and must fall to the default"
             );
         }
 
-        // R9's key is the absence of a process name, and its service comparison
-        // is exact bytes.
+        // `polkit_service_without_proc`'s key is the absence of a process name,
+        // and its service comparison is exact bytes.
         let unknown_polkit = CallerContext::from_parts(
             Some("polkit-1"),
             ProcessIdentity::Unknown,
             GdmReauth::Absent,
         );
-        assert_eq!(classify(&unknown_polkit).0, RuleId::R9);
-        let named_polkit = context_for_process(RuleId::R5, "kscreenlocker_worker");
-        assert_eq!(classify(&named_polkit).0, RuleId::R5);
+        assert_eq!(
+            classify(&unknown_polkit).0,
+            RuleId::PolkitServiceWithoutProc
+        );
+        let named_polkit = context_for_process(RuleId::KscreenlockerWorker, "kscreenlocker_worker");
+        assert_eq!(classify(&named_polkit).0, RuleId::KscreenlockerWorker);
     }
 
     /// A context for `service`/`process` with no reauth flag.
@@ -944,13 +1000,13 @@ mod tests {
         CallerContext::from_parts(service, process, GdmReauth::Absent)
     }
 
-    /// R1's predicate: the two remote service names, ASCII case-insensitively, and
-    /// nothing else — and it outranks every process rule.
+    /// `remote_refuse`'s predicate: the two remote service names, ASCII
+    /// case-insensitively, and nothing else — and it outranks every process rule.
     ///
-    /// The defect this catches: R1 missing or inverted (an `sshd` call would wait out
-    /// the GUI timeout), a case-sensitive comparison (`SSHD` escapes), a substring or
-    /// prefix match (`my-sshd` refused, silencing a local stack), an unresolved
-    /// service matching, and R1 losing precedence to a process rule.
+    /// The defect this catches: the rule missing or inverted (an `sshd` call would
+    /// wait out the GUI timeout), a case-sensitive comparison (`SSHD` escapes), a
+    /// substring or prefix match (`my-sshd` refused, silencing a local stack), an
+    /// unresolved service matching, and it losing precedence to a process rule.
     #[test]
     fn remote_rules() {
         for service in ["sshd", "sshd-session", "SSHD", "Sshd-Session"] {
@@ -963,7 +1019,7 @@ mod tests {
             ] {
                 assert_eq!(
                     classify(&context(Some(service), process)).0,
-                    RuleId::R1,
+                    RuleId::RemoteRefuse,
                     "{service:?} with process {process:?} must be refused before any process rule"
                 );
             }
@@ -972,22 +1028,22 @@ mod tests {
         for service in [Some("my-sshd"), Some("sshd-old"), Some("SSH"), None] {
             assert_ne!(
                 classify(&context(service, Some("sh"))).0,
-                RuleId::R1,
+                RuleId::RemoteRefuse,
                 "{service:?} is not a remote service and must take the normal path"
             );
         }
 
-        // The near miss by value, not merely "not R1": a renamed service on an
-        // `sshd`-looking process is the documented false negative.
+        // The near miss by value, not merely "not the remote refusal": a renamed
+        // service on an `sshd`-looking process is the documented false negative.
         assert_eq!(
             classify(&context(Some("my-sshd"), Some("sshd"))).0,
-            RuleId::R10
+            RuleId::DefaultSequential
         );
     }
 
     /// The configured-refusal matcher's fixture table: the CSV corpus has no
     /// column for a runtime config, so this literal is the fixture for the
-    /// configured half of R1.
+    /// configured half of `remote_refuse`.
     ///
     /// The defect this catches: a matcher that returns true for any
     /// participating call (the rename refused without being declared — the
@@ -1147,12 +1203,13 @@ mod tests {
                     assert_eq!(
                         after_policy,
                         ExpectedPolicy::SkipRemote,
-                        "{label}: a configured service must be refused through R1's policy",
+                        "{label}: a configured service must be refused through \
+                         `remote_refuse`'s policy",
                     );
                     assert_eq!(
                         skip_rule(&after),
-                        Some(RuleId::R1),
-                        "{label}: row {} must be refused through R1, not another rule",
+                        Some(RuleId::RemoteRefuse),
+                        "{label}: row {} must be refused through `remote_refuse`, not another rule",
                         row.id
                     );
                 } else {
@@ -1180,34 +1237,35 @@ mod tests {
     /// leave every other row where it was.
     ///
     /// Two load-bearing orderings:
-    /// * R2 after R8 — `swaylock_under_sddm` and `i3lock_under_gdm_login` become
-    ///   R8/pre-collected, because a process rule would then outrank the keyring
-    ///   constraint.
-    /// * R1 after R8 — `svc_sshd_under_swaylock` becomes R8/pre-collected, because R1
-    ///   must precede the process rules.
+    /// * `dm_login_bypass` after `precollected_locks` — `swaylock_under_sddm` and
+    ///   `i3lock_under_gdm_login` become `precollected_locks`/pre-collected, because
+    ///   a process rule would then outrank the keyring constraint.
+    /// * `remote_refuse` after `precollected_locks` — `svc_sshd_under_swaylock`
+    ///   becomes `precollected_locks`/pre-collected, because the remote refusal must
+    ///   precede the process rules.
     ///
-    /// R1-after-R2 is deliberately *not* a case: their predicates are disjoint, so that
-    /// swap changes no row at all.
+    /// `remote_refuse`-after-`dm_login_bypass` is deliberately *not* a case: their
+    /// predicates are disjoint, so that swap changes no row at all.
     #[test]
     fn rule_permutation_moves_named_rows() {
         assert_moved_rows(
-            &reordered(RuleId::R2, RuleId::R8),
+            &reordered(RuleId::DmLoginBypass, RuleId::PreCollectedLocks),
             &[
                 (
                     "swaylock_under_sddm",
-                    (RuleId::R8, ExpectedPolicy::PreCollected),
+                    (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
                 ),
                 (
                     "i3lock_under_gdm_login",
-                    (RuleId::R8, ExpectedPolicy::PreCollected),
+                    (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
                 ),
             ],
         );
         assert_moved_rows(
-            &reordered(RuleId::R1, RuleId::R8),
+            &reordered(RuleId::RemoteRefuse, RuleId::PreCollectedLocks),
             &[(
                 "svc_sshd_under_swaylock",
-                (RuleId::R8, ExpectedPolicy::PreCollected),
+                (RuleId::PreCollectedLocks, ExpectedPolicy::PreCollected),
             )],
         );
     }
@@ -1228,7 +1286,7 @@ mod tests {
         let rule = ordered
             .iter()
             .find(|rule| (rule.predicate)(ctx))
-            .expect("the table always ends with the unconditional R10");
+            .expect("the table always ends with the unconditional `default_sequential`");
         (rule.id, policy_for_decision(&rule.decision))
     }
 
@@ -1263,8 +1321,8 @@ mod tests {
         }
     }
 
-    /// A rule placed after the unconditional R10 is dead, and no other rule may
-    /// be unconditional.
+    /// A rule placed after the unconditional `default_sequential` is dead, and no
+    /// other rule may be unconditional.
     #[test]
     fn unreachable_rule_rows() {
         // The null context matches nothing but the default: no service, no
@@ -1274,14 +1332,17 @@ mod tests {
         let last = RULES.last().expect("the rule table is not empty");
         assert_eq!(
             last.id,
-            RuleId::R10,
-            "R10 must be the last row, or the rows after it are dead"
+            RuleId::DefaultSequential,
+            "`default_sequential` must be the last row, or the rows after it are dead"
         );
         assert!(
             (last.predicate)(&null),
-            "R10's predicate must be unconditional"
+            "`default_sequential`'s predicate must be unconditional"
         );
-        for rule in RULES.iter().filter(|rule| rule.id != RuleId::R10) {
+        for rule in RULES
+            .iter()
+            .filter(|rule| rule.id != RuleId::DefaultSequential)
+        {
             assert!(
                 !(rule.predicate)(&null),
                 "rule {} ({}) matches the null context, so it is unconditional and \
@@ -1292,8 +1353,11 @@ mod tests {
         }
 
         // The fallback `classify` uses if the table ever stops matching is
-        // exactly what R10 produces, id included.
-        assert_eq!(classify(&null), (RuleId::R10, DEFAULT_SEQUENTIAL));
+        // exactly what `default_sequential` produces, id included.
+        assert_eq!(
+            classify(&null),
+            (RuleId::DefaultSequential, DEFAULT_SEQUENTIAL)
+        );
     }
 
     /// The symbol `line` declares, as `(keyword, name)`, or `None` when it
@@ -1426,42 +1490,45 @@ mod tests {
             }
         }
 
-        // Positive control: plant one line of drift under R6's own citation in an
-        // in-memory copy of the record, observe the strengthened check reject it, then
-        // revert and observe it accept again — without which a check that accepted any
-        // non-blank line would pass too.
-        let r6 = audit(RuleId::R6);
-        let citation = r6
+        // Positive control: plant one line of drift under `hyprlock`'s own citation
+        // in an in-memory copy of the record, observe the strengthened check reject
+        // it, then revert and observe it accept again — without which a check that
+        // accepted any non-blank line would pass too.
+        let hyprlock = audit(RuleId::Hyprlock);
+        let citation = hyprlock
             .evidence
             .iter()
             .find(|citation| citation.starts_with("client-pam/src/policy/table.rs:"))
-            .expect("R6 cites its own predicate");
+            .expect("`hyprlock` cites its own predicate");
         let line_number: usize = citation
             .rsplit_once(':')
             .and_then(|(_, line)| line.parse().ok())
-            .expect("R6's table citation ends in a line number");
+            .expect("`hyprlock`'s table citation ends in a line number");
         let table = std::fs::read_to_string(root.join(TABLE_PATH))
             .expect("the decision record is readable");
         let mut drifted: Vec<&str> = table.lines().collect();
         let planted = drifted[line_number - 1];
         assert!(
-            table_citation_problem(r6.name, citation, &table, line_number).is_none(),
-            "control precondition: R6's citation resolves before the plant"
+            table_citation_problem(hyprlock.name, citation, &table, line_number).is_none(),
+            "control precondition: `hyprlock`'s citation resolves before the plant"
         );
-        drifted[line_number - 1] = "/// R6 — hyprlock.";
+        drifted[line_number - 1] = "/// `hyprlock` — the lock screen's worker thread.";
         assert!(
-            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_some(),
-            "positive control: a one-line drift onto R6's doc comment must be rejected"
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_some(),
+            "positive control: a one-line drift onto `hyprlock`'s doc comment must be rejected"
         );
         drifted[line_number - 1] = "fn xsecurelock(ctx: &CallerContext) -> bool {";
         assert!(
-            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_some(),
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_some(),
             "positive control: a shift onto another row's predicate must be rejected too"
         );
         drifted[line_number - 1] = planted;
         assert!(
-            table_citation_problem(r6.name, citation, &drifted.join("\n"), line_number).is_none(),
-            "reverted plant: R6's citation resolves again"
+            table_citation_problem(hyprlock.name, citation, &drifted.join("\n"), line_number)
+                .is_none(),
+            "reverted plant: `hyprlock`'s citation resolves again"
         );
 
         assert!(
