@@ -35,9 +35,10 @@ import org.junit.runner.RunWith
  * "tapauth://pair?v=2&sid=...&pk=...&p=...&ip4=..." \ [-e reject_sas true] \
  * dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
  *
- * `pairing_url` is the preferred extra: it carries the QR `sid` and `pk` the v2 handshake needs.
- * When it is absent the test falls back to `pairing_host` + `pairing_port`, the legacy harness path
- * with no QR session id or client ephemeral key (the session is built with `qrPublicKey = null`).
+ * `pairing_url` is **required**: it carries the QR `sid` and `pk` a v2 handshake needs, and the QR
+ * pin (`PairingResponse.client_x25519_public_key == pk`) cannot be established without it. A run
+ * given only `pairing_host`/`pairing_port` fails with a descriptive assertion instead of silently
+ * pairing against an unpinned ephemeral key.
  *
  * With `reject_sas true` this runs the negative case (Phase 1a): the flow progresses far enough to
  * derive the SAS, then the test rejects it, asserts the rejection is reported, and asserts nothing
@@ -57,13 +58,6 @@ class PairingE2eTest {
 
         private const val SAS_TIMEOUT_MS = 30_000L
         private const val OUTCOME_TIMEOUT_MS = 60_000L
-
-        /** `00` × 16 — the legacy `pairing_host`/`pairing_port` path carries no QR session id. */
-        private const val LEGACY_SESSION_ID = "00000000000000000000000000000000"
-
-        /** `00` × 32 — the legacy path carries no QR client ephemeral X25519 public key. */
-        private const val LEGACY_PUBLIC_KEY =
-            "0000000000000000000000000000000000000000000000000000000000000000"
     }
 
     @Test
@@ -78,13 +72,12 @@ class PairingE2eTest {
         val expectedUser = args.getString("pairing_username")?.takeIf { it.isNotBlank() }
 
         val pairingUrl = resolvePairingUrl(args)
-        val fromQrExtra = !args.getString("pairing_url").isNullOrBlank()
 
         Log.i(
             TAG,
             "Starting E2E pairing: v=${pairingUrl.version}, p=${pairingUrl.port}, " +
                 "ip4=${pairingUrl.ipv4}, ip6=${pairingUrl.ipv6}, " +
-                "sid=${pairingUrl.sessionId}, fromQrExtra=$fromQrExtra, rejectSas=$rejectSas",
+                "sid=${pairingUrl.sessionId}, rejectSas=$rejectSas",
         )
 
         val repository = DeviceRepository(context)
@@ -99,9 +92,6 @@ class PairingE2eTest {
                 context = context,
                 pairingUrl = pairingUrl,
                 clientDeviceName = "tapauth-e2e",
-                // The legacy host/port path has no QR key to pin, so the session must accept the
-                // peer key it is given instead of comparing it against an all-zero one.
-                qrPublicKey = if (fromQrExtra) pairingUrl.publicKeyBytes() else null,
             )
 
         try {
@@ -195,35 +185,32 @@ class PairingE2eTest {
     /**
      * Build the pairing target from the extras.
      *
-     * `pairing_url` wins when present. A QR carrying no UDP endpoint at all (`p`, `ip4` and `ip6`
-     * all absent) is a legitimate BLE-only pairing and is accepted as parsed. The `pairing_host` /
-     * `pairing_port` fallback is the legacy harness path: no QR session id, no QR client key.
+     * `pairing_url` is required. It is the only extra that can carry the QR `sid` and `pk` a v2
+     * handshake needs, and the QR pin is mandatory (`PairingResponse.client_x25519_public_key` must
+     * equal `pk`), so `pairing_host`/`pairing_port` alone describe a session that cannot be
+     * authenticated. A QR carrying no UDP endpoint at all (`p`, `ip4` and `ip6` all absent) is a
+     * legitimate BLE-only pairing and is accepted as parsed.
      */
     private fun resolvePairingUrl(args: Bundle): PairingUrl {
         val raw = args.getString("pairing_url")?.trim()
-        if (!raw.isNullOrEmpty()) {
-            val parsed = PairingUrl.parse(raw)
-            if (parsed == null) {
-                throw AssertionError(
-                    "pairing_url extra is not a well-formed v2 pairing URL " +
-                        "(expected tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=…&ip4=…&ip6=…]): " +
-                        raw,
-                )
-            }
-            return parsed
+        if (raw.isNullOrEmpty()) {
+            throw AssertionError(
+                "The pairing_url extra is required: a v2 pairing cannot be started from " +
+                    "pairing_host/pairing_port alone, because those carry neither the QR " +
+                    "session id (sid) nor the Client ephemeral public key (pk) the handshake " +
+                    "must pin. Pass -e pairing_url \"tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>" +
+                    "[&p=…&ip4=…&ip6=…]\".",
+            )
         }
-
-        val host = args.getString("pairing_host") ?: "10.0.2.2"
-        val port = args.getString("pairing_port")?.toIntOrNull() ?: 36693
-        Log.i(TAG, "No pairing_url extra; using legacy host/port path: host=$host, port=$port")
-        return PairingUrl(
-            version = 2,
-            sessionId = LEGACY_SESSION_ID,
-            publicKey = LEGACY_PUBLIC_KEY,
-            port = port,
-            ipv4 = host,
-            ipv6 = null,
-        )
+        val parsed = PairingUrl.parse(raw)
+        if (parsed == null) {
+            throw AssertionError(
+                "pairing_url extra is not a well-formed v2 pairing URL " +
+                    "(expected tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=…&ip4=…&ip6=…]): " +
+                    raw,
+            )
+        }
+        return parsed
     }
 
     /**

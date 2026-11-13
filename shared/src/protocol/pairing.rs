@@ -2208,4 +2208,163 @@ mod tests {
             .unwrap();
         assert_eq!(desktop.sas(), phone.sas());
     }
+
+    // --- 11. Whole handshake over the wire codec --------------------------
+
+    /// The full handshake with **every** frame serialized by
+    /// [`encode_pairing_packet`] and read back by [`decode_pairing_packet`], as a UDP
+    /// datagram or BLE value would be.
+    ///
+    /// The defect this catches: a state machine that only agrees with itself when the
+    /// caller passes structs straight through — a field that changes meaning across the
+    /// protobuf encoding (an algorithm list order, an enum value, a `bytes` field) makes
+    /// the two sides derive different `H`/SAS over the wire while an in-process test
+    /// still passes.
+    #[test]
+    fn full_pairing_round_trips_every_frame_through_the_wire_codec() {
+        fn wire(session_id: &[u8; PAIRING_SESSION_ID_LEN], msg: pairing_packet::Msg) -> Vec<u8> {
+            encode_pairing_packet(&PairingPacket {
+                version: PROTOCOL_VERSION_V2,
+                session_id: session_id.to_vec(),
+                msg: Some(msg),
+            })
+            .unwrap()
+        }
+
+        fn read(bytes: &[u8], session_id: &[u8; PAIRING_SESSION_ID_LEN]) -> pairing_packet::Msg {
+            let packet = decode_pairing_packet(bytes).unwrap();
+            assert_eq!(packet.version, PROTOCOL_VERSION_V2);
+            assert_eq!(packet.session_id.as_slice(), session_id.as_slice());
+            assert!(packet.msg.is_some());
+            packet.msg.unwrap()
+        }
+
+        let (mut desktop, started) = start_desktop();
+        let mut phone =
+            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+
+        // 1. Phone → desktop: PairingInit.
+        let init_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::Init(phone.create_init().unwrap()),
+        );
+        let init = match read(&init_bytes, &started.session_id) {
+            pairing_packet::Msg::Init(init) => init,
+            other => panic!("expected PairingInit, got {other:?}"),
+        };
+        assert_eq!(init.server_device_name, "pixel");
+
+        // 2. Desktop → phone: PairingResponse, carrying Ed_C (not X_C, not Ed_S).
+        let response_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::Response(desktop.handle_init(&init).unwrap().clone()),
+        );
+        let response = match read(&response_bytes, &started.session_id) {
+            pairing_packet::Msg::Response(response) => response,
+            other => panic!("expected PairingResponse, got {other:?}"),
+        };
+        assert_eq!(
+            response.client_ed25519_public_key,
+            desktop_identity().verifying_key_bytes().to_vec()
+        );
+        assert_eq!(
+            response.client_x25519_public_key,
+            started.client_x25519_public_key.to_vec()
+        );
+
+        // The QR pin the phone scanned still matches after the round trip.
+        phone
+            .verify_response(&response, &started.client_x25519_public_key)
+            .unwrap();
+        assert_sas_shape(phone.sas().unwrap());
+        assert_eq!(desktop.sas(), phone.sas());
+        assert_eq!(desktop.transcript_hash(), phone.transcript_hash());
+        assert_eq!(desktop.negotiated(), phone.negotiated());
+
+        // 3. Desktop → phone: the provisioning payload, CSK included.
+        let csk = [0x42u8; 32];
+        let confirm_client_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::ConfirmClient(
+                desktop
+                    .create_confirm_client(&csk, "luca", "thinkpad")
+                    .unwrap(),
+            ),
+        );
+        let provision = match read(&confirm_client_bytes, &started.session_id) {
+            pairing_packet::Msg::ConfirmClient(confirm) => {
+                phone.process_confirm_client(&confirm).unwrap()
+            }
+            other => panic!("expected PairingConfirmClient, got {other:?}"),
+        };
+        assert_eq!(provision.csk, csk.to_vec());
+        assert_eq!(provision.username, "luca");
+        assert_eq!(provision.client_hostname, "thinkpad");
+
+        // 4. A PairingKeepalive survives the wire with the session id intact.
+        let keepalive_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::Keepalive(PairingKeepalive {}),
+        );
+        assert_eq!(
+            read(&keepalive_bytes, &started.session_id),
+            pairing_packet::Msg::Keepalive(PairingKeepalive {})
+        );
+
+        // 5. Phone → desktop: the completion proof still verifies.
+        let confirm_server_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::ConfirmServer(phone.create_confirm_server(&csk).unwrap()),
+        );
+        let confirm_server = match read(&confirm_server_bytes, &started.session_id) {
+            pairing_packet::Msg::ConfirmServer(confirm) => confirm,
+            other => panic!("expected PairingConfirmServer, got {other:?}"),
+        };
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+        assert!(matches!(
+            desktop
+                .verify_confirm_server(&confirm_server, &[0x43u8; 32])
+                .unwrap_err(),
+            ProtocolError::InvalidSignature
+        ));
+
+        // 6. Aborts, both directions, over the wire: each verifies with the peer's
+        // directional key and fails with the key its own side uses.
+        let phone_abort_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::Abort(
+                phone.create_abort(PairingAbortReason::KeyMismatch).unwrap(),
+            ),
+        );
+        let phone_abort = match read(&phone_abort_bytes, &started.session_id) {
+            pairing_packet::Msg::Abort(abort) => abort,
+            other => panic!("expected PairingAbort, got {other:?}"),
+        };
+        assert_eq!(phone_abort.auth_tag.len(), 32);
+        assert!(desktop.verify_abort(&phone_abort).unwrap());
+        assert!(matches!(
+            phone.verify_abort(&phone_abort).unwrap_err(),
+            ProtocolError::InvalidSignature
+        ));
+
+        let desktop_abort_bytes = wire(
+            &started.session_id,
+            pairing_packet::Msg::Abort(
+                desktop
+                    .create_abort(PairingAbortReason::UserRejectedSas)
+                    .unwrap(),
+            ),
+        );
+        let desktop_abort = match read(&desktop_abort_bytes, &started.session_id) {
+            pairing_packet::Msg::Abort(abort) => abort,
+            other => panic!("expected PairingAbort, got {other:?}"),
+        };
+        assert!(phone.verify_abort(&desktop_abort).unwrap());
+        assert!(matches!(
+            desktop.verify_abort(&desktop_abort).unwrap_err(),
+            ProtocolError::InvalidSignature
+        ));
+    }
 }

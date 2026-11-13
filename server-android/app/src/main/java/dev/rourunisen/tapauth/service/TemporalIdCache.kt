@@ -1,7 +1,7 @@
 package dev.rourunisen.tapauth.service
 
 import android.util.Log
-import dev.rourunisen.tapauth.crypto.generateTemporalIdWithAlg
+import dev.rourunisen.tapauth.crypto.TapAuthCrypto
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +19,11 @@ import kotlinx.coroutines.launch
  * The precomputed ID set is refreshed when the 60s window rolls over (checked lazily on the first
  * packet of a new window, so a Doze-frozen coroutine loop can never leave it stale) and immediately
  * whenever the paired-device list changes.
+ *
+ * The window is [TapAuthCrypto.currentTimeWindow], not `System.currentTimeMillis()`: the
+ * identifiers are derived in Rust from `unix_seconds / 60`, and computing that split in two
+ * languages would let a rounding difference between them silently invalidate every identifier in
+ * the cache.
  */
 class TemporalIdCache(
     private val deviceRepository: DeviceRepository,
@@ -92,8 +97,7 @@ class TemporalIdCache(
     }
 
     private fun ensureCacheIsCurrent() {
-        val now = System.currentTimeMillis()
-        val currentWindow = now / TIME_WINDOW_MS
+        val currentWindow = TapAuthCrypto.currentTimeWindow()
 
         if (currentWindow != lastComputedWindow || !devicesLoaded) {
             synchronized(this) {
@@ -134,7 +138,7 @@ class TemporalIdCache(
             synchronized(this) {
                 cachedDevices = mapped
                 devicesLoaded = true
-                val currentWindow = System.currentTimeMillis() / TIME_WINDOW_MS
+                val currentWindow = TapAuthCrypto.currentTimeWindow()
                 validIds = computeValidIds(mapped, currentWindow)
                 lastComputedWindow = currentWindow
             }
@@ -156,11 +160,9 @@ class TemporalIdCache(
 
         for (device in devices) {
             try {
-                newIds[generateTemporalIdentifier(device, currentWindow * TIME_WINDOW_MS)] =
-                    device.deviceId
+                newIds[generateTemporalIdentifier(device, currentWindow)] = device.deviceId
 
-                newIds[generateTemporalIdentifier(device, previousWindow * TIME_WINDOW_MS)] =
-                    device.deviceId
+                newIds[generateTemporalIdentifier(device, previousWindow)] = device.deviceId
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
             }
@@ -172,10 +174,13 @@ class TemporalIdCache(
     /**
      * Hash one 60s window with the hash algorithm this pairing negotiated, so a device paired with
      * e.g. BLAKE3 is matched by BLAKE3 ids and never by SHA-256 ones.
+     *
+     * `window` is the 60-second window (`unix_seconds / 60`), which is what the Rust derivation
+     * expects — not a unix timestamp.
      */
-    private fun generateTemporalIdentifier(device: CachedDevice, timestampMs: Long): String {
-        val timestampSeconds = timestampMs / 1000
-        return generateTemporalIdWithAlg(device.csk, timestampSeconds, device.hashAlgorithm).toHex()
+    private fun generateTemporalIdentifier(device: CachedDevice, window: Long): String {
+        return TapAuthCrypto.generateTemporalIdentifier(device.csk, window, device.hashAlgorithm)
+            .toHex()
     }
 
     private fun ByteArray.toHex(): String {
@@ -184,8 +189,5 @@ class TemporalIdCache(
 
     companion object {
         private const val TAG = "TemporalIdCache"
-
-        // Time window: 60 seconds (60,000 milliseconds)
-        private const val TIME_WINDOW_MS = 60_000L
     }
 }

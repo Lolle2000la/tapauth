@@ -2,6 +2,17 @@ package dev.rourunisen.tapauth.crypto
 
 /**
  * JNI bridge to the TapAuth shared Rust library Provides cryptographic operations via native code
+ *
+ * Rust is the protocol: this object only moves opaque protobuf blobs and primitives across the
+ * boundary. Kotlin never derives a key, builds an AAD, picks an abort MAC direction, or
+ * hand-encodes a `PairingPacket` — every one of those happens behind an entry point below.
+ *
+ * The declaration set is frozen: a CI guard asserts exact set equality against the exported Rust
+ * symbols, so adding or dropping a member here fails the build. `shared/src/jni_api.rs` documents
+ * the exception contract of each entry (`IllegalArgumentException` for malformed input or an
+ * unknown handle, `GeneralSecurityException` for a failed signature/AEAD/QR-pin check,
+ * `IOException` for bytes that are not a decodable protobuf message, `IllegalStateException` for
+ * internal failures).
  */
 object TapAuthCrypto {
 
@@ -43,124 +54,28 @@ object TapAuthCrypto {
     /** `PairingAbortReason.KEY_MISMATCH` */
     const val PAIRING_ABORT_KEY_MISMATCH = 2
 
-    // ========== Key Generation & Signatures ==========
+    /** `PairingAbortReason.UNSUPPORTED_ALGORITHM` */
+    const val PAIRING_ABORT_UNSUPPORTED_ALGORITHM = 3
+
+    /** `PairingAbortReason.PROTOCOL_ERROR` */
+    const val PAIRING_ABORT_PROTOCOL_ERROR = 4
+
+    /** `PairingAbortReason.SESSION_EXPIRED` */
+    const val PAIRING_ABORT_SESSION_EXPIRED = 5
+
+    // ========== Key Generation ==========
 
     /**
-     * Generate a new Ed25519 keypair
+     * Generate a new Ed25519 keypair for this phone's long-term identity (`Ed_S`).
      *
-     * @return Array of [privateKey: ByteArray, publicKey: ByteArray]
+     * @return Array of [privateKey: ByteArray (32), publicKey: ByteArray (32)]
      */
     external fun generateKeypair(): Array<ByteArray>
-
-    /**
-     * Generate a new X25519 keypair (for key exchange)
-     *
-     * @return Array of [privateKey: ByteArray, publicKey: ByteArray]
-     */
-    external fun generateX25519Keypair(): Array<ByteArray>
-
-    /**
-     * Perform X25519 key exchange
-     *
-     * @param ourPrivateKey Our X25519 private key (32 bytes)
-     * @param theirPublicKey Their X25519 public key (32 bytes)
-     * @return Shared secret derived from the ECDH exchange (32 bytes)
-     */
-    external fun keyExchange(ourPrivateKey: ByteArray, theirPublicKey: ByteArray): ByteArray
-
-    /**
-     * Compute SHA-256 hash
-     *
-     * @param data Data to hash
-     * @return Hex-encoded hash
-     */
-    external fun sha256(data: ByteArray): String
-
-    /**
-     * Verify Ed25519 signature
-     *
-     * @param publicKey Signer's public key (32 bytes)
-     * @param message The message that was signed
-     * @param signature The signature to verify (64 bytes)
-     * @return true if signature is valid
-     */
-    external fun verifySignature(
-        publicKey: ByteArray,
-        message: ByteArray,
-        signature: ByteArray,
-    ): Boolean
-
-    /**
-     * Sign data with Ed25519 private key
-     *
-     * @param privateKey Private key (32 bytes)
-     * @param message Data to sign
-     * @return Signature bytes (64 bytes)
-     */
-    external fun signData(privateKey: ByteArray, message: ByteArray): ByteArray
 
     // ========== Encrypted Packet Layer ==========
 
     /**
-     * Parse EncryptedPacket structure from protobuf bytes (without decryption)
-     *
-     * @param packetBytes Protobuf-encoded EncryptedPacket
-     * @return EncryptedPacketInfo object with packet structure (temporal_identifier,
-     *   encryption_algorithm, ciphertext)
-     */
-    external fun parseEncryptedPacketStructure(packetBytes: ByteArray): EncryptedPacketInfo
-
-    /**
-     * Extract temporal_identifier from EncryptedPacket protobuf bytes.
-     *
-     * This is used for DoS mitigation: allows checking the temporal_identifier before performing
-     * expensive decryption operations.
-     *
-     * @param packetBytes Serialized EncryptedPacket protobuf
-     * @return 16-byte temporal_identifier
-     * @throws IOException if the packet cannot be parsed
-     */
-    external fun extractTemporalIdentifier(packetBytes: ByteArray): ByteArray
-
-    /**
-     * Determine the message type from a WrapperMessage protobuf.
-     *
-     * Returns a string indicating which payload type the wrapper carries.
-     *
-     * @param wrapperMessageBytes Serialized WrapperMessage protobuf
-     * @return "AUTH_REQUEST", "AUTH_GRANT", "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL", or
-     *   "UNKNOWN"
-     * @throws IOException if the message cannot be parsed
-     */
-    external fun determineMessageType(wrapperMessageBytes: ByteArray): String
-
-    /**
-     * Create an EncryptedPacket from a WrapperMessage payload.
-     *
-     * Both algorithms are inputs so the packet can express what the pairing negotiated: the
-     * rotating temporal identifier is derived with [hashAlgorithm], and the AEAD associated data
-     * binds `encryption_algorithm` (`"tapauth-pkt-v2" || be32(encryption_algorithm) ||
-     * be16(temporal_identifier.len()) || temporal_identifier`), so [symmetricAlgorithm],
-     * [hashAlgorithm] and the identifier must all be final before this is called. Rust owns the
-     * packet layout; Kotlin only supplies the negotiated pair.
-     *
-     * @param csk Client Symmetric Key (32 bytes)
-     * @param wrapperMessageBytes Serialized WrapperMessage protobuf
-     * @param symmetricAlgorithm The paired device's `SymmetricAlgorithm` (e.g.
-     *   [SYMMETRIC_AES_256_GCM]); also written to `EncryptedPacket.encryption_algorithm`
-     * @param hashAlgorithm The paired device's `HashAlgorithm` (e.g. [HASH_SHA256]), used to derive
-     *   the temporal identifier the AAD binds
-     * @return Serialized EncryptedPacket protobuf bytes
-     */
-    external fun createEncryptedPacket(
-        csk: ByteArray,
-        wrapperMessageBytes: ByteArray,
-        symmetricAlgorithm: Int,
-        hashAlgorithm: Int,
-    ): ByteArray
-
-    /**
-     * Decrypt an EncryptedPacket to get the WrapperMessage.
+     * Decrypt an `EncryptedPacket` to get its `WrapperMessage`.
      *
      * Dispatches on the packet's own `encryption_algorithm`, requires it to equal [expectedSymAlg]
      * (no algorithm downgrade), and verifies the AAD-bound AEAD tag.
@@ -178,10 +93,35 @@ object TapAuthCrypto {
         expectedSymAlg: Int,
     ): ByteArray
 
+    /**
+     * Extract temporal_identifier from EncryptedPacket protobuf bytes.
+     *
+     * This is used for DoS mitigation: allows checking the temporal_identifier before performing
+     * expensive decryption operations.
+     *
+     * @param packetBytes Serialized EncryptedPacket protobuf
+     * @return 16-byte temporal_identifier
+     * @throws IOException if the packet cannot be parsed
+     */
+    external fun extractTemporalIdentifier(packetBytes: ByteArray): ByteArray
+
+    /**
+     * Determine the message type from a WrapperMessage protobuf.
+     *
+     * The result is **not** authenticated: it only chooses which verifying parse entry point to
+     * call next, and that entry point re-checks the signature and the payload type.
+     *
+     * @param wrapperMessageBytes Serialized WrapperMessage protobuf
+     * @return "AUTH_REQUEST", "AUTH_GRANT", "AUTH_DENIAL", "GRANT_CONFIRMATION", "AUTH_CANCEL", or
+     *   "UNKNOWN"
+     * @throws IOException if the message cannot be parsed
+     */
+    external fun determineMessageType(wrapperMessageBytes: ByteArray): String
+
     // ========== Authenticated Wrapper Parsing ==========
     //
     // Rust verifies the Ed25519 WrapperMessage signature BEFORE parsing the inner payload, so a
-    // returned data class is always signature-valid for the given Client key.
+    // returned value is always signature-valid for the given Client key.
 
     /**
      * Verify the wrapper signature and parse the AuthenticationRequest inside it.
@@ -189,10 +129,11 @@ object TapAuthCrypto {
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
      * @param protocolVersion Protocol version recorded for the paired device. Verification is
-     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
-     *   there is no v1 verification path. A legacy record is kept by
-     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
-     *   re-paired; nothing purges it automatically.
+     *   fail-closed: **any value other than 2 throws**; there is no v1 verification path. A legacy
+     *   record is kept by [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot
+     *   authenticate until it is re-paired; nothing purges it automatically.
+     * @param expectedSignatureAlgorithm The paired Client's persisted `SignatureAlgorithm` id;
+     *   never derived from the message, so an algorithm downgrade is impossible
      * @return The verified request, including the signed context fields
      * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
      *   [protocolVersion] is not 2
@@ -201,19 +142,17 @@ object TapAuthCrypto {
         wrapperBytes: ByteArray,
         clientEd25519Pub: ByteArray,
         protocolVersion: Int,
-    ): AuthRequest
+        expectedSignatureAlgorithm: Int,
+    ): ParsedAuthRequest
 
     /**
      * Verify the wrapper signature and parse the GrantConfirmation inside it.
      *
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
-     * @param protocolVersion Protocol version recorded for the paired device. Verification is
-     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
-     *   there is no v1 verification path. A legacy record is kept by
-     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
-     *   re-paired; nothing purges it automatically.
-     * @return The verified confirmation
+     * @param protocolVersion Protocol version recorded for the paired device; must be 2
+     * @param expectedSignatureAlgorithm The paired Client's persisted `SignatureAlgorithm` id
+     * @return The 32-byte challenge the Client confirmed
      * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
      *   [protocolVersion] is not 2
      */
@@ -221,19 +160,17 @@ object TapAuthCrypto {
         wrapperBytes: ByteArray,
         clientEd25519Pub: ByteArray,
         protocolVersion: Int,
-    ): GrantConfirmation
+        expectedSignatureAlgorithm: Int,
+    ): ByteArray
 
     /**
      * Verify the wrapper signature and parse the AuthenticationCancel inside it.
      *
      * @param wrapperBytes Serialized WrapperMessage protobuf
      * @param clientEd25519Pub Paired Client's Ed25519 public key (32 bytes)
-     * @param protocolVersion Protocol version recorded for the paired device. Verification is
-     *   fail-closed: **any value other than 2 throws [java.security.GeneralSecurityException]**;
-     *   there is no v1 verification path. A legacy record is kept by
-     *   [dev.rourunisen.tapauth.data.DeviceRepository] but simply cannot authenticate until it is
-     *   re-paired; nothing purges it automatically.
-     * @return The verified cancel
+     * @param protocolVersion Protocol version recorded for the paired device; must be 2
+     * @param expectedSignatureAlgorithm The paired Client's persisted `SignatureAlgorithm` id
+     * @return The 32-byte challenge the Client cancelled
      * @throws java.security.GeneralSecurityException if the wrapper signature is invalid or
      *   [protocolVersion] is not 2
      */
@@ -241,312 +178,247 @@ object TapAuthCrypto {
         wrapperBytes: ByteArray,
         clientEd25519Pub: ByteArray,
         protocolVersion: Int,
-    ): AuthenticationCancel
+        expectedSignatureAlgorithm: Int,
+    ): ByteArray
 
     // ========== Server Responses ==========
 
     /**
-     * Create a signed WrapperMessage containing an AuthenticationGrant.
+     * Sign a Grant and encrypt it: the finished `EncryptedPacket` to send.
      *
-     * The grant carries the raw [challenge] only; the single Ed25519 signature covers the wrapper.
+     * The single Ed25519 signature covers `"tapauth-sig-v2" || be32(version) ||
+     * be32(signature_algorithm) || be32(payload_type) || payload`; the packet is then
+     * AEAD-encrypted under [csk] with the negotiated algorithms, and the AAD binds
+     * `encryption_algorithm` and the rotating temporal identifier. Kotlin must not wrap, encrypt or
+     * re-sign the result.
      *
      * @param challenge The 32-byte challenge from the request
-     * @param serverPrivateKey Ed25519 private key (32 bytes) for signing the wrapper
-     * @return Serialized WrapperMessage protobuf bytes (signed)
+     * @param serverPrivKey Ed25519 private key (32 bytes) for signing the wrapper
+     * @param csk Client Symmetric Key (32 bytes)
+     * @param symmetricAlgorithm The paired device's `SymmetricAlgorithm` (e.g.
+     *   [SYMMETRIC_AES_256_GCM]); also written to `EncryptedPacket.encryption_algorithm`
+     * @param hashAlgorithm The paired device's `HashAlgorithm` (e.g. [HASH_SHA256]), used to derive
+     *   the temporal identifier the AAD binds
+     * @return Serialized EncryptedPacket protobuf bytes, ready to send
      */
     external fun createGrantWrapperMessage(
         challenge: ByteArray,
-        serverPrivateKey: ByteArray,
+        serverPrivKey: ByteArray,
+        csk: ByteArray,
+        symmetricAlgorithm: Int,
+        hashAlgorithm: Int,
     ): ByteArray
 
     /**
-     * Create a signed WrapperMessage containing an AuthenticationDenial.
+     * Sign a Denial and encrypt it: the finished `EncryptedPacket` to send.
      *
-     * The denial is bound to [challenge]; the single Ed25519 signature covers the wrapper.
-     *
-     * @param challenge The 32-byte challenge from the request
-     * @param reason Human-readable denial reason shown/forwarded by the Client
-     * @param serverPrivateKey Ed25519 private key (32 bytes) for signing the wrapper
-     * @return Serialized WrapperMessage protobuf bytes (signed)
+     * @param challenge The 32-byte challenge from the request the denial is bound to
+     * @param reason Human-readable denial reason shown/forwarded by the Client; never a secret
+     * @param serverPrivKey Ed25519 private key (32 bytes) for signing the wrapper
+     * @param csk Client Symmetric Key (32 bytes)
+     * @param symmetricAlgorithm The paired device's `SymmetricAlgorithm`
+     * @param hashAlgorithm The paired device's `HashAlgorithm`
+     * @return Serialized EncryptedPacket protobuf bytes, ready to send
      */
     external fun createDenialWrapperMessage(
         challenge: ByteArray,
         reason: String,
-        serverPrivateKey: ByteArray,
+        serverPrivKey: ByteArray,
+        csk: ByteArray,
+        symmetricAlgorithm: Int,
+        hashAlgorithm: Int,
     ): ByteArray
 
     // ========== Temporal Identifiers ==========
 
     /**
-     * Generate temporal identifier for a given timestamp (SHA-256 default)
+     * Derive the 16-byte UDP/GATT temporal identifier for a 60-second window.
+     *
+     * **Semantic trap: [window] is the window (`unix_seconds / 60`), not a unix timestamp.** Use
+     * [currentTimeWindow] to obtain it.
      *
      * @param csk Client Symmetric Key (32 bytes)
-     * @param timestampSeconds Unix timestamp in seconds
-     * @return Temporal ID as byte array (16 bytes for UDP)
+     * @param window The 60-second time window (`unix_seconds / 60`)
+     * @param hashAlgorithm HashAlgorithm value from the paired device (e.g. [HASH_SHA256])
+     * @return Temporal ID as byte array (16 bytes for UDP/GATT)
      */
-    external fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): ByteArray
+    external fun generateTemporalIdentifier(
+        csk: ByteArray,
+        window: Long,
+        hashAlgorithm: Int,
+    ): ByteArray
 
     /**
-     * Generate temporal identifier for BLE (10 bytes) for matching advertisements (SHA-256)
+     * Derive the 10-byte BLE advertisement temporal identifier for a 60-second window.
      *
      * @param csk Client Symmetric Key (32 bytes)
-     * @param timestampSeconds Unix timestamp in seconds
+     * @param window The 60-second time window (`unix_seconds / 60`)
+     * @param hashAlgorithm HashAlgorithm value from the paired device (e.g. [HASH_SHA256])
      * @return Temporal ID as byte array (10 bytes for BLE)
      */
-    external fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): ByteArray
-
-    /**
-     * Generate a 16-byte UDP temporal identifier with the device's negotiated hash algorithm.
-     *
-     * @param csk Client Symmetric Key (32 bytes)
-     * @param timestampSeconds Unix timestamp in seconds
-     * @param hashAlgorithm HashAlgorithm value from the paired device (e.g. [HASH_SHA256])
-     * @return Temporal ID as byte array (16 bytes)
-     */
-    external fun generateTemporalIdWithAlg(
+    external fun generateBleTemporalIdentifier(
         csk: ByteArray,
-        timestampSeconds: Long,
+        window: Long,
         hashAlgorithm: Int,
     ): ByteArray
 
     /**
-     * Generate a 10-byte BLE temporal identifier with the device's negotiated hash algorithm.
+     * The current 60-second time window (`unix_seconds / 60`).
      *
-     * @param csk Client Symmetric Key (32 bytes)
-     * @param timestampSeconds Unix timestamp in seconds
-     * @param hashAlgorithm HashAlgorithm value from the paired device (e.g. [HASH_SHA256])
-     * @return Temporal ID as byte array (10 bytes)
+     * @throws java.security.GeneralSecurityException if the system clock is before the Unix epoch
      */
-    external fun generateTemporalIdBleWithAlg(
-        csk: ByteArray,
-        timestampSeconds: Long,
-        hashAlgorithm: Int,
-    ): ByteArray
+    external fun currentTimeWindow(): Long
 
     /**
-     * Verify temporal identifier matches current or previous time window
+     * Check a received temporal identifier against the current and previous window.
      *
-     * @param id Temporal ID to verify (10 or 16 bytes)
+     * Accepts both the 16-byte UDP/GATT form and the 10-byte BLE form.
+     *
+     * @param temporalIdentifier The identifier from the packet (10 or 16 bytes)
      * @param csk Client Symmetric Key (32 bytes)
-     * @return true if ID is valid
+     * @param hashAlgorithm HashAlgorithm value from the paired device
+     * @return true if the identifier matches the current or previous window
      */
-    external fun verifyTemporalId(id: ByteArray, csk: ByteArray): Boolean
+    external fun verifyTemporalIdentifier(
+        temporalIdentifier: ByteArray,
+        csk: ByteArray,
+        hashAlgorithm: Int,
+    ): Boolean
 
     // ========== v2 Pairing ==========
     //
-    // These are the JNI entries `shared/src/jni_api.rs` must provide for the unified UDP + BLE
-    // pairing handshake. Android is the pairing Server (`PairingInit` carries the `server_*` keys,
-    // `PairingResponse` the `client_*` keys), so it sends `PairingInit` and verifies the Client's
-    // `PairingResponse` against the QR code's `pk`.
-    //
-    // Every packet argument and packet return is a whole serialized `PairingPacket` (Rust owns
-    // protobuf); Kotlin only passes bytes and inspects the documented return slots.
-    // `proto/auth_protocol.proto` requires every `PairingPacket` to carry `version = 2` and the
-    // QR code's `session_id`, and the daemon drops a frame whose `session_id` does not match the
-    // QR (`ble-gatt-specification.md` §1), so each builder takes the session id explicitly.
-    //
-    // Return-slot contract — this comment is the single source of truth for slot order and is
-    // mirrored by `network/PairingSession.kt`, which reads the slots positionally:
-    //   pairingInit            -> one PairingPacket{init}
-    //   pairingVerifyResponse  -> [0]=transcriptHash H (32B), [1]=K_c2s (32B), [2]=K_s2c (32B),
-    //                             [3]=sas (UTF-8 bytes, e.g. "123-456"), [4]=client Ed25519
-    //                             public key (32B), [5]=selected SymmetricAlgorithm (4-byte BE),
-    //                             [6]=selected HashAlgorithm (4-byte BE),
-    //                             [7]=selected SignatureAlgorithm (4-byte BE)
-    //   pairingDecryptProvision-> [0]=csk (32B), [1]=username (UTF-8), [2]=clientHostname (UTF-8)
-    //   pairingCreateConfirmServer -> one PairingPacket{confirm_server}
-    //   pairingCreateAbort     -> one PairingPacket{abort}
-    //   pairingCreateKeepalive -> one PairingPacket{keepalive}
-    //   pairingVerifyAbort     -> PairingAbortReason value; throws GeneralSecurityException if the
-    //                             auth tag does not verify
+    // Phone-side pairing is **stateful**: [pairingServerSessionCreate] returns an opaque handle
+    // that
+    // owns the ephemeral X25519 secret, `Ed_S`, the directional keys `K_c2s`/`K_s2c` and the
+    // transcript hash. None of that is ever returned to Kotlin, so Kotlin cannot pick an abort MAC
+    // direction or rebuild an AAD. Every packet argument and packet return is a whole serialized
+    // `PairingPacket`; Rust owns the protobuf.
 
     /**
      * Derive the 10-byte BLE pairing advertisement id: `SHA-256("tapauth-ble-pair-v2" || sid ||
      * pk)[..10]`.
      *
      * @param sessionId 16-byte pairing session id from the QR code
-     * @param clientX25519PublicKey Client ephemeral X25519 public key (32 bytes) from the QR code
+     * @param clientX25519Pub Client ephemeral X25519 public key (32 bytes) from the QR code
      * @return 10-byte advertisement id to match with a hardware ScanFilter
      */
     external fun deriveBlePairingAdvId(
         sessionId: ByteArray,
-        clientX25519PublicKey: ByteArray,
+        clientX25519Pub: ByteArray,
     ): ByteArray
 
     /**
-     * Compute the canonical SHA-256 handshake transcript hash `H` over both handshake packets.
+     * Start a phone-side pairing session from the scanned QR code.
      *
-     * @param sessionId 16-byte pairing session id
-     * @param initPacketBytes Serialized `PairingPacket` carrying our `PairingInit`
-     * @param responsePacketBytes Serialized `PairingPacket` carrying the Client's `PairingResponse`
-     * @return 32-byte transcript hash
+     * @param sessionId 16-byte `sid` from the QR code
+     * @param serverEd25519PrivKey 32-byte (or 64-byte keypair) private `Ed_S`
+     * @param serverDeviceName Display name, truncated to 64 UTF-8 bytes by Rust
+     * @return A positive session handle, or 0 after throwing. `0` is never a valid handle.
      */
-    external fun computePairingTranscriptHash(
+    external fun pairingServerSessionCreate(
         sessionId: ByteArray,
-        initPacketBytes: ByteArray,
-        responsePacketBytes: ByteArray,
-    ): ByteArray
-
-    /**
-     * Build our `PairingInit` (Server role) with the supported algorithm lists in preference order.
-     *
-     * @return Serialized `PairingPacket` carrying `PairingInit`
-     */
-    external fun pairingInit(
-        sessionId: ByteArray,
-        serverX25519PublicKey: ByteArray,
-        serverEd25519PublicKey: ByteArray,
+        serverEd25519PrivKey: ByteArray,
         serverDeviceName: String,
-        supportedSymmetricAlgorithms: IntArray,
-        supportedHashAlgorithms: IntArray,
-        supportedSignatureAlgorithms: IntArray,
-    ): ByteArray
+    ): Long
 
     /**
-     * Verify and accept the Client's `PairingResponse`, deriving the session keys and SAS.
+     * Drop a pairing session and zeroize its keys.
      *
-     * Returns eight slots, in this order (the same order documented in the section comment above,
-     * which is the single source of truth):
-     * - `[0]` 32-byte transcript hash `H`
-     * - `[1]` `K_c2s` (32 bytes)
-     * - `[2]` `K_s2c` (32 bytes)
-     * - `[3]` SAS as UTF-8 bytes, already grouped (for example `"123-456"`)
-     * - `[4]` the Client's Ed25519 public key (32 bytes)
-     * - `[5]` the SymmetricAlgorithm the Client selected, as a 4-byte big-endian integer
-     * - `[6]` the HashAlgorithm the Client selected, as a 4-byte big-endian integer
-     * - `[7]` the SignatureAlgorithm the Client selected, as a 4-byte big-endian integer
+     * @throws IllegalArgumentException if the handle is unknown (already freed or never created)
+     */
+    external fun pairingServerSessionFree(handle: Long)
+
+    /**
+     * Build the `PairingInit` to send (serialized `PairingPacket`).
      *
-     * An **all-zero** [expectedClientX25519PublicKey] means "QR `pk` unavailable, skip the
-     * constant-time comparison": that is the E2E harness path, where the session is configured with
-     * a pairing host/port instead of a QR URL and therefore has no `pk` to pin (see
-     * `PairingSession`'s "Legacy harness path"). Any non-zero expected key is always compared in
-     * constant time and a mismatch throws. Every other validation — the Client's signature over the
-     * transcript and a non-empty algorithm intersection — still applies on that path; only the pin
-     * is skipped. `PairingUrl.parse` requires a 64-hex `pk`, so the all-zero form is unreachable
-     * from a scanned QR code.
+     * Retransmissions must re-send the returned bytes rather than calling this again for a fresh
+     * message; the cached copy is returned either way, so one session has exactly one init payload
+     * and therefore exactly one SAS.
+     */
+    external fun pairingCreateInit(handle: Long): ByteArray
+
+    /**
+     * Verify the desktop's `PairingResponse`.
      *
-     * @param sessionId 16-byte pairing session id
-     * @param responsePacketBytes Serialized `PairingPacket` carrying the Client's `PairingResponse`
-     * @param expectedClientX25519PublicKey The QR code's `pk` (32 bytes), or 32 zero bytes to skip
-     *   the pin (E2E harness only)
-     * @param serverX25519PrivateKey Our ephemeral X25519 private key (32 bytes)
-     * @return `[transcriptHash(32B), K_c2s(32B), K_s2c(32B), sas(UTF-8), clientEd25519(32B),
-     *   symmetricAlg(4B BE), hashAlg(4B BE), signatureAlg(4B BE)]`
-     * @throws java.security.GeneralSecurityException on QR-pk mismatch, bad client signature, or an
-     *   empty algorithm intersection
+     * The QR commitment (`client_x25519_public_key == expectedQrPk`) is checked first, then the
+     * Client's Ed25519 signature over the transcript hash, then the keys and SAS are derived inside
+     * the handle.
+     *
+     * @param handle Session handle from [pairingServerSessionCreate]
+     * @param responsePacket Serialized `PairingPacket` carrying `PairingResponse`
+     * @param expectedQrPk 32-byte `pk` from the scanned QR code; always compared
+     * @return The SAS to display plus what the phone persists for the new device
+     * @throws java.security.GeneralSecurityException on a QR-`pk` mismatch, a bad Client signature
+     *   or an unsupported algorithm selection
      */
     external fun pairingVerifyResponse(
-        sessionId: ByteArray,
-        responsePacketBytes: ByteArray,
-        expectedClientX25519PublicKey: ByteArray,
-        serverX25519PrivateKey: ByteArray,
-    ): Array<ByteArray>
+        handle: Long,
+        responsePacket: ByteArray,
+        expectedQrPk: ByteArray,
+    ): ParsedPairingResponse
 
     /**
-     * Client-role step: build the encrypted `PairingConfirmClient` provision payload.
+     * Decrypt the desktop's provisioning payload (`PairingConfirmClient`).
      *
-     * @param sessionId 16-byte pairing session id from the QR code
-     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
-     *   `PairingConfirmClient`
-     */
-    external fun pairingEncryptProvision(
-        sessionId: ByteArray,
-        kC2s: ByteArray,
-        transcriptHash: ByteArray,
-        csk: ByteArray,
-        username: String,
-        clientHostname: String,
-    ): ByteArray
-
-    /**
-     * Client-role step: verify our `PairingConfirmServer` against the Server's Ed25519 key.
-     *
-     * @param confirmServerPacketBytes Serialized `PairingPacket` carrying `PairingConfirmServer`
-     * @param serverEd25519PublicKey The Server's static Ed25519 public key (32 bytes)
-     * @return The 32-byte CSK echoed inside the authenticated completion payload
-     * @throws java.security.GeneralSecurityException if the tag or the server signature is invalid
-     */
-    external fun pairingDecryptComplete(
-        kS2c: ByteArray,
-        transcriptHash: ByteArray,
-        confirmServerPacketBytes: ByteArray,
-        serverEd25519PublicKey: ByteArray,
-    ): ByteArray
-
-    /**
-     * Server-role step: decrypt the Client's provision payload.
-     *
-     * @param confirmClientPacketBytes Serialized `PairingPacket` carrying `PairingConfirmClient`
-     * @return `[csk(32B), username(UTF-8), clientHostname(UTF-8)]`
+     * @param confirmClientPacket Serialized `PairingPacket` carrying `PairingConfirmClient`
+     * @return The 32-byte CSK, the authorized username and the Client hostname
      * @throws java.security.GeneralSecurityException if the AEAD tag fails
      */
-    external fun pairingDecryptProvision(
-        kC2s: ByteArray,
-        transcriptHash: ByteArray,
-        confirmClientPacketBytes: ByteArray,
-    ): Array<ByteArray>
+    external fun pairingProcessConfirmClient(
+        handle: Long,
+        confirmClientPacket: ByteArray,
+    ): ParsedPairingProvision
 
     /**
-     * Server-role step: build the signed and encrypted `PairingConfirmServer`.
+     * Build the completion proof (serialized `PairingPacket` with `PairingConfirmServer`).
      *
-     * @param sessionId 16-byte pairing session id from the QR code
-     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
-     *   `PairingConfirmServer`
+     * The phone signs `"tapauth-pair-server-sig-v2" || H || csk` with `Ed_S` and encrypts it under
+     * `K_s2c`. Retransmissions must re-send the same bytes.
      */
-    external fun pairingCreateConfirmServer(
-        sessionId: ByteArray,
-        kS2c: ByteArray,
-        transcriptHash: ByteArray,
-        serverEd25519PrivateKey: ByteArray,
-        csk: ByteArray,
-    ): ByteArray
+    external fun pairingCreateConfirmServer(handle: Long, csk: ByteArray): ByteArray
 
     /**
-     * Build an authenticated `PairingAbort` for either direction.
+     * Build an authenticated `PairingAbort`.
      *
-     * @param sessionId 16-byte pairing session id from the QR code
-     * @param kDir `K_c2s` or `K_s2c`, whichever the abort travels under
-     * @param transcriptHash 32-byte transcript hash `H`
+     * Once the session keys exist the abort carries an HMAC tag, so a network observer cannot spoof
+     * a cancellation. Rust tags it with `K_s2c`; Kotlin must not choose a direction.
+     *
      * @param reason A `PairingAbortReason` value (e.g. [PAIRING_ABORT_USER_REJECTED_SAS])
-     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
-     *   `PairingAbort`
+     * @return Serialized `PairingPacket` carrying `PairingAbort`
      */
-    external fun pairingCreateAbort(
-        sessionId: ByteArray,
-        kDir: ByteArray,
-        transcriptHash: ByteArray,
-        reason: Int,
-    ): ByteArray
+    external fun pairingCreateAbort(handle: Long, reason: Int): ByteArray
 
     /**
-     * Build the empty `PairingKeepalive` frame that keeps an idle pairing transport alive.
+     * Verify an abort received from the desktop.
      *
-     * The payload is empty, but the envelope is not: Rust encodes it so Kotlin never hand-writes
-     * protobuf.
-     *
-     * @param sessionId 16-byte pairing session id from the QR code
-     * @return A complete `PairingPacket` with `version = 2` and the given `session_id`, carrying
-     *   `PairingKeepalive`
+     * @return `true` for an authenticated abort; **`false` for a tag-less abort received before any
+     *   key existed, which is unauthenticated and must be ignored, never treated as an abort**
+     * @throws java.security.GeneralSecurityException for a bad abort tag
+     * @throws IllegalArgumentException for a packet of another session or of another type
      */
-    external fun pairingCreateKeepalive(sessionId: ByteArray): ByteArray
+    external fun pairingVerifyAbort(handle: Long, abortPacket: ByteArray): Boolean
 
     /**
-     * Verify an incoming `PairingAbort` auth tag and return its reason.
+     * Build the `PairingKeepalive` frame that keeps an idle pairing transport alive.
      *
-     * @param kDir `K_c2s` or `K_s2c`, matching the direction the abort arrived on
-     * @param transcriptHash 32-byte transcript hash `H`
-     * @param abortPacketBytes Serialized `PairingPacket` carrying `PairingAbort`
-     * @return The `PairingAbortReason` value carried by the verified abort
-     * @throws java.security.GeneralSecurityException if the auth tag does not verify
+     * The message body is empty, but the envelope is not: Rust encodes it so Kotlin never
+     * hand-writes protobuf. It is idempotent to retransmit.
      */
-    external fun pairingVerifyAbort(
-        kDir: ByteArray,
-        transcriptHash: ByteArray,
-        abortPacketBytes: ByteArray,
-    ): Int
+    external fun pairingCreateKeepalive(handle: Long): ByteArray
+
+    /**
+     * Extract the 16-byte `session_id` of a serialized `PairingPacket`.
+     *
+     * Lets the phone drop a frame that belongs to another pairing (the BLE characteristic and the
+     * UDP port are shared) before spending any crypto on it.
+     *
+     * @throws IllegalArgumentException for an undecodable packet, a wrong protocol version or a
+     *   session id that is not 16 bytes
+     */
+    external fun pairingPacketSessionId(packetBytes: ByteArray): ByteArray
 }
 
-/** Kotlin wrapper for Ed25519 keypair */
+/** Kotlin wrapper for the phone's long-term Ed25519 identity keypair (`Ed_S`). */
 data class Ed25519Keypair(val privateKey: ByteArray, val publicKey: ByteArray) {
     companion object {
         fun generate(): Ed25519Keypair {
@@ -572,156 +444,4 @@ data class Ed25519Keypair(val privateKey: ByteArray, val publicKey: ByteArray) {
         result = 31 * result + publicKey.contentHashCode()
         return result
     }
-}
-
-/** X25519 keypair for ECDH key exchange */
-data class X25519Keypair(val privateKey: ByteArray, val publicKey: ByteArray) {
-    companion object {
-        fun generate(): X25519Keypair {
-            val result = TapAuthCrypto.generateX25519Keypair()
-            return X25519Keypair(privateKey = result[0], publicKey = result[1])
-        }
-    }
-
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as X25519Keypair
-
-        if (!privateKey.contentEquals(other.privateKey)) return false
-        if (!publicKey.contentEquals(other.publicKey)) return false
-
-        return true
-    }
-
-    override fun hashCode(): Int {
-        var result = privateKey.contentHashCode()
-        result = 31 * result + publicKey.contentHashCode()
-        return result
-    }
-}
-
-/** Compute SHA-256 hash and return as hex string */
-fun sha256(data: ByteArray): String {
-    return TapAuthCrypto.sha256(data)
-}
-
-/** Verify Ed25519 signature */
-fun verifySignature(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {
-    return TapAuthCrypto.verifySignature(publicKey, message, signature)
-}
-
-/** Sign data with Ed25519 private key */
-fun signData(privateKey: ByteArray, message: ByteArray): ByteArray {
-    return TapAuthCrypto.signData(privateKey, message)
-}
-
-/**
- * Generate temporal identifier for current time
- *
- * @return Temporal ID as byte array (16 bytes)
- */
-fun generateTemporalId(csk: ByteArray): ByteArray {
-    val timestampSeconds = System.currentTimeMillis() / 1000
-    return TapAuthCrypto.generateTemporalId(csk, timestampSeconds)
-}
-
-/**
- * Generate temporal identifier for specific timestamp
- *
- * @return Temporal ID as byte array (16 bytes)
- */
-fun generateTemporalId(csk: ByteArray, timestampSeconds: Long): ByteArray {
-    return TapAuthCrypto.generateTemporalId(csk, timestampSeconds)
-}
-
-/**
- * Generate temporal identifier for a specific timestamp and hash algorithm
- *
- * @return Temporal ID as byte array (16 bytes)
- */
-fun generateTemporalIdWithAlg(
-    csk: ByteArray,
-    timestampSeconds: Long,
-    hashAlgorithm: Int,
-): ByteArray {
-    return TapAuthCrypto.generateTemporalIdWithAlg(csk, timestampSeconds, hashAlgorithm)
-}
-
-/**
- * Generate BLE temporal identifier (10 bytes) for current time
- *
- * @return Temporal ID as byte array (10 bytes)
- */
-fun generateTemporalIdBle(csk: ByteArray): ByteArray {
-    val timestampSeconds = System.currentTimeMillis() / 1000
-    return TapAuthCrypto.generateTemporalIdBle(csk, timestampSeconds)
-}
-
-/**
- * Generate BLE temporal identifier (10 bytes) for specific timestamp
- *
- * @return Temporal ID as byte array (10 bytes)
- */
-fun generateTemporalIdBle(csk: ByteArray, timestampSeconds: Long): ByteArray {
-    return TapAuthCrypto.generateTemporalIdBle(csk, timestampSeconds)
-}
-
-/**
- * Generate BLE temporal identifier (10 bytes) for a specific timestamp and hash algorithm
- *
- * @return Temporal ID as byte array (10 bytes)
- */
-fun generateTemporalIdBleWithAlg(
-    csk: ByteArray,
-    timestampSeconds: Long,
-    hashAlgorithm: Int,
-): ByteArray {
-    return TapAuthCrypto.generateTemporalIdBleWithAlg(csk, timestampSeconds, hashAlgorithm)
-}
-
-/** Verify temporal identifier */
-fun verifyTemporalId(id: ByteArray, csk: ByteArray): Boolean {
-    return TapAuthCrypto.verifyTemporalId(id, csk)
-}
-
-/** Create a WrapperMessage containing an AuthenticationGrant */
-fun createGrantWrapperMessage(challenge: ByteArray, serverPrivateKey: ByteArray): ByteArray {
-    return TapAuthCrypto.createGrantWrapperMessage(challenge, serverPrivateKey)
-}
-
-/** Create a WrapperMessage containing an AuthenticationDenial */
-fun createDenialWrapperMessage(
-    challenge: ByteArray,
-    reason: String,
-    serverPrivateKey: ByteArray,
-): ByteArray {
-    return TapAuthCrypto.createDenialWrapperMessage(challenge, reason, serverPrivateKey)
-}
-
-/**
- * Create an EncryptedPacket from a WrapperMessage, using the paired device's negotiated algorithms
- */
-fun createEncryptedPacket(
-    csk: ByteArray,
-    wrapperMessage: ByteArray,
-    symmetricAlgorithm: Int,
-    hashAlgorithm: Int,
-): ByteArray {
-    return TapAuthCrypto.createEncryptedPacket(
-        csk,
-        wrapperMessage,
-        symmetricAlgorithm,
-        hashAlgorithm,
-    )
-}
-
-/** Decrypt an EncryptedPacket to get the WrapperMessage */
-fun decryptEncryptedPacket(
-    encryptedPacket: ByteArray,
-    csk: ByteArray,
-    expectedSymAlg: Int,
-): ByteArray {
-    return TapAuthCrypto.decryptEncryptedPacket(encryptedPacket, csk, expectedSymAlg)
 }

@@ -72,7 +72,9 @@ use crate::jni::conversions::{
 use crate::jni::exceptions::{
     throw_illegal_argument, throw_illegal_state, throw_io_exception, throw_security_exception,
 };
-use crate::jni::objects::{create_parsed_auth_request, create_parsed_pairing_provision};
+use crate::jni::objects::{
+    create_parsed_auth_request, create_parsed_pairing_provision, create_parsed_pairing_response,
+};
 
 use crate::crypto::Ed25519KeyPair;
 use crate::protocol::pairing::PAIRING_SESSION_ID_LEN;
@@ -954,11 +956,14 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingC
     }
 }
 
-/// Verify the desktop's `PairingResponse` and return the SAS to display.
+/// Verify the desktop's `PairingResponse` and return the SAS, `Ed_C` and the
+/// negotiated algorithms.
 ///
-/// The QR commitment (`client_x25519_public_key == pk`) is checked first, then the
-/// Client's Ed25519 signature over the transcript hash, then the keys and SAS are
-/// derived.
+/// The QR commitment (`client_x25519_public_key == pk`) is checked first, in constant
+/// time and without any "skip the pin" sentinel, then the Client's Ed25519 signature
+/// over the transcript hash, then the keys and SAS are derived. A response that fails
+/// any of these caches nothing, so a later genuine response still verifies. `H`,
+/// `K_c2s` and `K_s2c` stay inside the handle and are never returned.
 ///
 /// ## Arguments
 ///
@@ -967,7 +972,9 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingC
 ///
 /// ## Returns
 ///
-/// The SAS (for example `"123-456"`), shown to the user for comparison.
+/// A `ParsedPairingResponse` (sas, clientEd25519PublicKey, symmetricAlgorithm,
+/// hashAlgorithm, signatureAlgorithm). The SAS is shown to the user for comparison;
+/// the key and the three algorithm ids are what the phone persists for the device.
 ///
 /// ## Errors
 ///
@@ -975,6 +982,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingC
 ///   packet, wrong packet type or key length
 /// - `GeneralSecurityException`: QR key mismatch, bad client signature, unsupported
 ///   algorithm selection, key derivation failure
+/// - `IllegalStateException`: `ParsedPairingResponse` cannot be constructed
 #[no_mangle]
 pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingVerifyResponse(
     mut env: JNIEnv,
@@ -982,7 +990,7 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingV
     handle: jlong,
     response_packet: JByteArray,
     expected_qr_pk: JByteArray,
-) -> jstring {
+) -> jobject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let packet_bytes = match jbytearray_to_vec(&mut env, response_packet, "responsePacket") {
             Some(bytes) => bytes,
@@ -997,15 +1005,24 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingV
             None => return std::ptr::null_mut(),
         };
 
-        match ops::pairing_verify_response(handle, &packet_bytes, &qr_public_key) {
-            Ok(sas) => match string_to_jstring(&mut env, &sas) {
-                Some(string) => string.into_raw(),
-                None => std::ptr::null_mut(),
-            },
+        let verified = match ops::pairing_verify_response(handle, &packet_bytes, &qr_public_key) {
+            Ok(verified) => verified,
             Err(err) => {
                 throw(&mut env, &err);
-                std::ptr::null_mut()
+                return std::ptr::null_mut();
             }
+        };
+
+        match create_parsed_pairing_response(
+            &mut env,
+            &verified.sas,
+            &verified.client_ed25519_public_key,
+            verified.symmetric_algorithm,
+            verified.hash_algorithm,
+            verified.signature_algorithm,
+        ) {
+            Some(object) => object.into_raw(),
+            None => std::ptr::null_mut(),
         }
     })) {
         Ok(result) => result,
@@ -1099,6 +1116,33 @@ pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingC
         Ok(result) => result,
         Err(_) => {
             throw_illegal_state(&mut env, "panic caught in pairingCreateConfirmServer");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).
+///
+/// The frame carries no key material and drives no state transition: it only keeps
+/// the transport path open while the users compare the SAS. Retransmission is
+/// idempotent, since the message body is empty.
+///
+/// ## Errors
+///
+/// - `IllegalArgumentException`: unknown handle
+/// - `IllegalStateException`: the packet cannot be encoded
+#[no_mangle]
+pub extern "system" fn Java_dev_rourunisen_tapauth_crypto_TapAuthCrypto_pairingCreateKeepalive(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bytes_or_throw(&mut env, ops::pairing_create_keepalive(handle))
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            throw_illegal_state(&mut env, "panic caught in pairingCreateKeepalive");
             std::ptr::null_mut()
         }
     }

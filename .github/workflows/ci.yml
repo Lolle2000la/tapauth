@@ -123,6 +123,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      # Kotlin's `external fun` declarations in TapAuthCrypto.kt and the `Java_*`
+      # exports in shared/src/jni_api.rs must name the same functions; a one-sided
+      # entry compiles and then throws UnsatisfiedLinkError on the device. Both
+      # sides are parsed from source text, so this needs no toolchain: running it
+      # first turns that divergence into a failure in seconds instead of after the
+      # cargo builds below.
+      - name: Check JNI surface matches between Kotlin and Rust
+        run: ./scripts/ci/check-jni-surface.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

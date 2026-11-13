@@ -33,8 +33,8 @@ use crate::protocol::pairing::{
     PAIRING_SESSION_ID_LEN,
 };
 use crate::protocol::pb::{
-    pairing_packet, EncryptedPacket, HashAlgorithm, PairingAbortReason, PairingPacket, PayloadType,
-    SignatureAlgorithm, SymmetricAlgorithm, WrapperMessage,
+    pairing_packet, EncryptedPacket, HashAlgorithm, PairingAbortReason, PairingKeepalive,
+    PairingPacket, PayloadType, SignatureAlgorithm, SymmetricAlgorithm, WrapperMessage,
 };
 
 /// Length of an authentication challenge (`AuthenticationRequest.challenge`).
@@ -140,6 +140,27 @@ pub(crate) struct ProvisionedClient {
     pub(crate) username: String,
     /// Authenticated Client hostname.
     pub(crate) client_hostname: String,
+}
+
+/// A `PairingResponse` whose QR commitment, signature and algorithm selection all
+/// verified on the phone.
+///
+/// These are exactly the values the phone persists for the new paired device (its
+/// static `Ed_C` and the three negotiated algorithms) plus the SAS the two users
+/// compare out of band. `H`, `K_c2s`, `K_s2c` and the ephemeral secrets are
+/// deliberately absent: they stay behind the pairing handle, in Rust.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedPairingResponse {
+    /// The SAS to display, for example `"123-456"`.
+    pub(crate) sas: String,
+    /// The desktop's static `Ed_C`, persisted as the paired device's public key.
+    pub(crate) client_ed25519_public_key: [u8; 32],
+    /// Negotiated AEAD algorithm (client-wide, bound to the CSK).
+    pub(crate) symmetric_algorithm: i32,
+    /// Negotiated hash algorithm (client-wide, bound to the CSK).
+    pub(crate) hash_algorithm: i32,
+    /// Negotiated signature algorithm (per-server).
+    pub(crate) signature_algorithm: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -616,24 +637,52 @@ pub(crate) fn pairing_create_init(handle: i64) -> Result<Vec<u8>, JniError> {
     })
 }
 
-/// Verify the desktop's `PairingResponse` and return the SAS to display.
+/// Verify the desktop's `PairingResponse` and return what the phone persists and shows.
+///
+/// The QR commitment (`client_x25519_public_key == expected_qr_public_key`) is the
+/// whole point of the pin: it is checked inside
+/// [`ClientPairingSession::verify_response`] in constant time, first, and there is no
+/// sentinel that skips it. Nothing is cached until every check passed, so a response
+/// that fails here leaves the session unkeyed and a later genuine one still verifies.
 pub(crate) fn pairing_verify_response(
     handle: i64,
     response_packet: &[u8],
     expected_qr_public_key: &[u8; 32],
-) -> Result<String, JniError> {
+) -> Result<VerifiedPairingResponse, JniError> {
     with_session(handle, |session| {
         let packet = decode_session_packet(session, response_packet)?;
         match packet.msg {
             Some(pairing_packet::Msg::Response(response)) => {
                 session.verify_response(&response, expected_qr_public_key)?;
+
+                let client_ed25519_public_key: [u8; 32] = response
+                    .client_ed25519_public_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| {
+                        JniError::Argument(format!(
+                            "PairingResponse client Ed25519 key must be 32 bytes, got {}",
+                            response.client_ed25519_public_key.len()
+                        ))
+                    })?;
+
                 let sas = session
                     .sas()
                     .ok_or_else(|| {
                         JniError::State("SAS unavailable after a verified response".to_string())
                     })?
                     .to_string();
-                Ok(sas)
+                let negotiated = session.negotiated().ok_or_else(|| {
+                    JniError::State("algorithms unavailable after a verified response".to_string())
+                })?;
+
+                Ok(VerifiedPairingResponse {
+                    sas,
+                    client_ed25519_public_key,
+                    symmetric_algorithm: negotiated.symmetric_algorithm as i32,
+                    hash_algorithm: negotiated.hash_algorithm as i32,
+                    signature_algorithm: negotiated.signature_algorithm as i32,
+                })
             }
             _ => Err(JniError::Argument(
                 "PairingPacket does not carry a PairingResponse".to_string(),
@@ -679,6 +728,17 @@ pub(crate) fn pairing_create_confirm_server(
     with_session(handle, |session| {
         let confirm = session.create_confirm_server(csk)?;
         encode_session_packet(session, pairing_packet::Msg::ConfirmServer(confirm))
+    })
+}
+
+/// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).
+///
+/// The frame carries no key material and no state transition: it only keeps a NAT
+/// or BLE link alive while the two users compare the SAS. Kotlin must not hand-build
+/// the wire format, so the empty message is encoded here.
+pub(crate) fn pairing_create_keepalive(handle: i64) -> Result<Vec<u8>, JniError> {
+    with_session(handle, |session| {
+        encode_session_packet(session, pairing_packet::Msg::Keepalive(PairingKeepalive {}))
     })
 }
 
@@ -773,14 +833,16 @@ mod tests {
     use super::*;
     use crate::protocol::messages::create_auth_request_with_context;
     use crate::protocol::packet::{wrap_auth_cancel, wrap_auth_request, wrap_grant_confirmation};
-    use crate::protocol::pairing::ServerPairingState;
+    use crate::protocol::pairing::{PinnedAlgorithms, ServerPairingState};
     use crate::protocol::pb::{
-        AuthenticationCancel, AuthenticationRequest, GrantConfirmation, WrapperMessage,
+        AuthenticationCancel, AuthenticationRequest, GrantConfirmation, PairingAbort,
+        WrapperMessage,
     };
 
     const AES: i32 = SymmetricAlgorithm::Aes256Gcm as i32;
     const CHACHA: i32 = SymmetricAlgorithm::Chacha20Poly1305 as i32;
     const SHA256: i32 = HashAlgorithm::Sha256 as i32;
+    const BLAKE3: i32 = HashAlgorithm::Blake3 as i32;
     const ED25519: i32 = SignatureAlgorithm::Ed25519 as i32;
 
     fn context_request(challenge: [u8; 32]) -> AuthenticationRequest {
@@ -1601,9 +1663,10 @@ mod tests {
         ));
 
         // The genuine response verifies and both sides derive the same SAS.
-        let sas =
+        let verified =
             pairing_verify_response(handle, &response_bytes, &started.client_x25519_public_key)
                 .unwrap();
+        let sas = verified.sas;
         assert_eq!(sas, desktop.sas().unwrap());
         assert_eq!(sas.len(), 7, "SAS is 6 digits plus the dash");
         assert!(sas.as_bytes()[3] == b'-');
@@ -1700,6 +1763,256 @@ mod tests {
             Err(JniError::Argument(_))
         ));
         pairing_session_free(other_handle).unwrap();
+    }
+
+    /// A phone session behind a handle, plus the desktop's `PairingResponse` as a wire
+    /// frame the phone has not verified yet. This is the state
+    /// `pairingVerifyResponse` is called from.
+    ///
+    /// The desktop is started with client-wide pins for a **non-baseline** algorithm
+    /// pair, so the negotiated triple differs from the AES-256-GCM/SHA-256/Ed25519
+    /// default: a caller that hard-codes the baseline instead of reporting
+    /// `session.negotiated()` fails here. The phone advertises both algorithms, so
+    /// negotiation picks up the pins.
+    fn pending_handle_session() -> (
+        ServerPairingState,
+        i64,
+        [u8; PAIRING_SESSION_ID_LEN],
+        [u8; 32],
+        Vec<u8>,
+    ) {
+        let (mut desktop, started) = ServerPairingState::start(
+            Ed25519KeyPair::generate().unwrap(),
+            "thinkpad",
+            36_692,
+            None,
+            None,
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Blake3,
+            }),
+        )
+        .unwrap();
+        let handle = pairing_session_create(
+            started.session_id,
+            Ed25519KeyPair::generate().unwrap(),
+            "pixel",
+        )
+        .unwrap();
+
+        let init = match decode_pairing_packet(&pairing_create_init(handle).unwrap())
+            .unwrap()
+            .msg
+        {
+            Some(pairing_packet::Msg::Init(init)) => init,
+            other => panic!("expected PairingInit, got {other:?}"),
+        };
+        let response = desktop.handle_init(&init).unwrap().clone();
+        let response_bytes =
+            session_packet(&started.session_id, pairing_packet::Msg::Response(response));
+        (
+            desktop,
+            handle,
+            started.session_id,
+            started.client_x25519_public_key,
+            response_bytes,
+        )
+    }
+
+    /// `pairingVerifyResponse` returns exactly what the phone persists — the SAS, the
+    /// desktop's `Ed_C` and the negotiated algorithm triple — and the desktop derives
+    /// the same SAS and transcript hash from the very same wire frame.
+    /// The defect this catches: a result that drops the device key or the algorithms
+    /// (leaving `PairedDevice` unverifiable), one that carries the ephemeral `X_C` or
+    /// the phone's own `Ed_S` instead of `Ed_C`, or one that reports a fixed triple —
+    /// the AES-256-GCM/SHA-256/Ed25519 baseline — rather than the pinned algorithms
+    /// the session actually negotiated.
+    #[test]
+    fn pairing_verify_response_returns_the_persistable_fields() {
+        let (desktop, handle, session_id, qr_pk, response_bytes) = pending_handle_session();
+
+        let verified = pairing_verify_response(handle, &response_bytes, &qr_pk).unwrap();
+
+        // The SAS is the one both sides derived; the desktop's is the out-of-band
+        // reference, and it is shaped `ddd-ddd`.
+        assert_eq!(verified.sas, desktop.sas().unwrap());
+        assert_eq!(verified.sas.len(), 7, "SAS is 6 digits plus the dash");
+        assert_eq!(verified.sas.as_bytes()[3], b'-');
+
+        // The persisted key is the desktop's static `Ed_C`, not the ephemeral `X_C`
+        // committed in the QR code and not anything else.
+        assert_eq!(
+            verified.client_ed25519_public_key,
+            desktop.client_ed25519_public_key()
+        );
+        assert_ne!(verified.client_ed25519_public_key, qr_pk);
+        assert_ne!(verified.client_ed25519_public_key, [0u8; 32]);
+
+        // The triple is what negotiation selected — the pinned, non-baseline pair, so
+        // a hard-coded (AES-256-GCM, SHA-256, Ed25519) fails here — and the desktop's
+        // own answer agrees with it. (`Chacha20Poly1305` and `Blake3` are both id 2,
+        // so the wire numbers alone cannot tell the two fields apart; the
+        // `desktop.negotiated()` comparisons below are what pin the mapping.)
+        assert_eq!(verified.symmetric_algorithm, CHACHA);
+        assert_eq!(verified.hash_algorithm, BLAKE3);
+        assert_eq!(verified.signature_algorithm, ED25519);
+        let negotiated = desktop.negotiated().unwrap();
+        assert_eq!(
+            negotiated.symmetric_algorithm,
+            SymmetricAlgorithm::Chacha20Poly1305
+        );
+        assert_eq!(negotiated.hash_algorithm, HashAlgorithm::Blake3);
+        assert_eq!(
+            verified.symmetric_algorithm,
+            negotiated.symmetric_algorithm as i32
+        );
+        assert_eq!(verified.hash_algorithm, negotiated.hash_algorithm as i32);
+        assert_eq!(
+            verified.signature_algorithm,
+            negotiated.signature_algorithm as i32
+        );
+
+        // The frame the handle read is the one the desktop answered, so the phone's
+        // transcript hash is the desktop's.
+        let phone_transcript_hash =
+            with_session(handle, |session| Ok(session.transcript_hash().copied())).unwrap();
+        assert_eq!(phone_transcript_hash, desktop.transcript_hash().copied());
+        assert_eq!(&session_id, desktop.session_id());
+    }
+
+    /// The QR pin is mandatory: a response checked against the wrong `pk` — including
+    /// the all-zero sentinel — is a security failure that caches nothing, so the
+    /// genuine response still verifies afterwards.
+    /// The defect this catches: a "no QR key available, skip the comparison" path
+    /// (which lets a substituted `X_C` pair silently), or a failed attempt that leaves
+    /// the session poisoned or already keyed.
+    #[test]
+    fn pairing_verify_response_rejects_a_wrong_qr_pin_and_stays_usable() {
+        let (desktop, handle, _session_id, qr_pk, response_bytes) = pending_handle_session();
+
+        let mut wrong_pin = qr_pk;
+        wrong_pin[0] ^= 0x01;
+        for pin in [wrong_pin, [0x00u8; 32]] {
+            assert!(matches!(
+                pairing_verify_response(handle, &response_bytes, &pin),
+                Err(JniError::Security(message)) if message.contains("challenge")
+            ));
+            // Nothing was cached: no SAS, no transcript hash, no keys.
+            let state = with_session(handle, |session| {
+                Ok((
+                    session.sas().map(str::to_string),
+                    session.transcript_hash().is_some(),
+                    session.negotiated().is_some(),
+                ))
+            })
+            .unwrap();
+            assert_eq!(state, (None, false, false));
+        }
+
+        // The session is still usable: the genuine response now verifies.
+        let verified = pairing_verify_response(handle, &response_bytes, &qr_pk).unwrap();
+        assert_eq!(verified.sas, desktop.sas().unwrap());
+        assert_eq!(
+            verified.client_ed25519_public_key,
+            desktop.client_ed25519_public_key()
+        );
+    }
+
+    /// Aborts authenticate in the right direction through the ops layer: a phone-built
+    /// abort (from `pairingCreateAbort`) verifies on the desktop, a desktop-built abort
+    /// verifies on the phone, a flipped tag byte fails, and a tag-less abort once the
+    /// keys exist is refused rather than reported as the "unauthenticated" `false`.
+    /// The defect this catches: `pairingVerifyAbort` checking the wrong directional key
+    /// (`K_s2c` instead of `K_c2s`), or accepting an empty tag after the keys exist, so
+    /// any observer on the path can cancel a pairing.
+    #[test]
+    fn pairing_aborts_authenticate_in_both_directions() {
+        let (desktop, handle, session_id, qr_pk, response_bytes) = pending_handle_session();
+        pairing_verify_response(handle, &response_bytes, &qr_pk).unwrap();
+
+        // Phone → desktop: built here, verified by the desktop state machine.
+        let phone_abort = match decode_pairing_packet(
+            &pairing_create_abort(handle, PairingAbortReason::UserRejectedSas as i32).unwrap(),
+        )
+        .unwrap()
+        .msg
+        {
+            Some(pairing_packet::Msg::Abort(abort)) => abort,
+            other => panic!("expected PairingAbort, got {other:?}"),
+        };
+        assert_eq!(
+            phone_abort.reason,
+            PairingAbortReason::UserRejectedSas as i32
+        );
+        assert_eq!(phone_abort.auth_tag.len(), 32);
+        assert!(desktop.verify_abort(&phone_abort).unwrap());
+
+        // Desktop → phone: verified here, with the `K_c2s` direction the desktop does
+        // not use, so the desktop itself must reject its own frame.
+        let desktop_abort = desktop
+            .create_abort(PairingAbortReason::KeyMismatch)
+            .unwrap();
+        let desktop_abort_bytes = session_packet(
+            &session_id,
+            pairing_packet::Msg::Abort(desktop_abort.clone()),
+        );
+        assert!(pairing_verify_abort(handle, &desktop_abort_bytes).unwrap());
+        assert!(desktop.verify_abort(&desktop_abort).is_err());
+
+        // One flipped tag byte fails the direction check.
+        let mut flipped = desktop_abort.clone();
+        flipped.auth_tag[0] ^= 0xFF;
+        assert!(matches!(
+            pairing_verify_abort(
+                handle,
+                &session_packet(&session_id, pairing_packet::Msg::Abort(flipped))
+            ),
+            Err(JniError::Security(message)) if message.contains("signature")
+        ));
+
+        // Keys exist, so a tag-less abort is spoofable: it must be an error, not the
+        // `false` that means "unauthenticated abort before any key existed".
+        let untagged = PairingAbort {
+            reason: PairingAbortReason::ProtocolError as i32,
+            auth_tag: Vec::new(),
+        };
+        assert!(matches!(
+            pairing_verify_abort(
+                handle,
+                &session_packet(&session_id, pairing_packet::Msg::Abort(untagged))
+            ),
+            Err(JniError::Security(message)) if message.contains("signature")
+        ));
+    }
+
+    /// `pairingCreateKeepalive` emits a real, decodable `PairingPacket` for the
+    /// session: v2, its 16-byte session id and an empty `PairingKeepalive`.
+    /// The defect this catches: a frame Kotlin hand-built to another version or with
+    /// the wrong session id (which the peer's envelope filter drops), or an envelope
+    /// carrying the wrong `msg` variant.
+    #[test]
+    fn pairing_create_keepalive_emits_a_decodable_v2_frame() {
+        let session_id = [0xF1u8; PAIRING_SESSION_ID_LEN];
+        let handle =
+            pairing_session_create(session_id, Ed25519KeyPair::generate().unwrap(), "pixel")
+                .unwrap();
+
+        let bytes = pairing_create_keepalive(handle).unwrap();
+        let packet = decode_pairing_packet(&bytes).unwrap();
+        assert_eq!(packet.version, PROTOCOL_VERSION_V2);
+        assert_eq!(packet.session_id, session_id.to_vec());
+        assert_eq!(packet.session_id.len(), PAIRING_SESSION_ID_LEN);
+        assert_eq!(
+            packet.msg,
+            Some(pairing_packet::Msg::Keepalive(PairingKeepalive {}))
+        );
+
+        // An unknown handle is a caller error, never a silently empty frame.
+        pairing_session_free(handle).unwrap();
+        assert!(matches!(
+            pairing_create_keepalive(handle),
+            Err(JniError::Argument(message)) if message.contains("unknown pairing session handle")
+        ));
     }
 
     /// `pairingPacketSessionId` validates the envelope and returns the 16-byte id.

@@ -1,51 +1,58 @@
 package dev.rourunisen.tapauth.crypto
 
 /**
- * Data transfer objects for TapAuth protocol messages. These classes provide type-safe access to
- * parsed protobuf data from the Rust JNI layer.
+ * Data transfer objects the Rust JNI layer builds with `NewObject`.
+ *
+ * Rust is the canonical side: it verifies the `WrapperMessage` signature and parses the inner
+ * protobuf before constructing one of these, so a returned object is always signature-valid for the
+ * paired Client key. Kotlin must not reorder, rename, retype or give a field a default value — the
+ * shapes below are a wire contract with `shared/src/jni/objects.rs`, and `crypto/JniDescriptorTest`
+ * pins the exact JVM constructor descriptors:
+ *
+ * - [ParsedAuthRequest]:
+ *   `([BLjava/lang/String;Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V`
+ * - [ParsedPairingProvision]: `([BLjava/lang/String;Ljava/lang/String;)V`
+ * - [ParsedPairingResponse]: `(Ljava/lang/String;[BIII)V`
+ *
+ * A default value would add a synthetic constructor, and a field Kotlin declares but Rust does not
+ * pass makes the JNI `NewObject` throw at runtime on the device only.
  */
 
 /**
  * Parsed AuthenticationRequest message.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
- * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
+ * The wrapper signature is verified inside Rust and is deliberately not returned: a
+ * [ParsedAuthRequest] that exists at all is authentic for the Client key it was verified against.
  *
  * @property challenge 32-byte authentication challenge
  * @property username Username requesting authentication
  * @property hostname Hostname where authentication is requested
  * @property timestampUnixSeconds Unix timestamp when request was created
- * @property signatureAlgorithm Signature algorithm from WrapperMessage (e.g., Ed25519 = 1)
- * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
  * @property pamService PAM service name (e.g. "sudo"); empty when the Client did not send it
  * @property processName Calling process name; empty when the Client did not send it
  * @property commandPreview Sanitized command line preview; empty when the Client did not send it
  * @property ttyPresent Whether the caller had a controlling terminal
  */
-data class AuthRequest(
+data class ParsedAuthRequest(
     val challenge: ByteArray,
     val username: String,
     val hostname: String,
     val timestampUnixSeconds: Long,
-    val signatureAlgorithm: Int,
-    val signature: ByteArray,
-    val pamService: String = "",
-    val processName: String = "",
-    val commandPreview: String = "",
-    val ttyPresent: Boolean = false,
+    val pamService: String,
+    val processName: String,
+    val commandPreview: String,
+    val ttyPresent: Boolean,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
         if (javaClass != other?.javaClass) return false
 
-        other as AuthRequest
+        other as ParsedAuthRequest
 
         if (!challenge.contentEquals(other.challenge)) return false
         if (username != other.username) return false
         if (hostname != other.hostname) return false
         if (timestampUnixSeconds != other.timestampUnixSeconds) return false
-        if (signatureAlgorithm != other.signatureAlgorithm) return false
-        if (!signature.contentEquals(other.signature)) return false
         if (pamService != other.pamService) return false
         if (processName != other.processName) return false
         if (commandPreview != other.commandPreview) return false
@@ -59,8 +66,6 @@ data class AuthRequest(
         result = 31 * result + username.hashCode()
         result = 31 * result + hostname.hashCode()
         result = 31 * result + timestampUnixSeconds.hashCode()
-        result = 31 * result + signatureAlgorithm
-        result = 31 * result + signature.contentHashCode()
         result = 31 * result + pamService.hashCode()
         result = 31 * result + processName.hashCode()
         result = 31 * result + commandPreview.hashCode()
@@ -70,106 +75,75 @@ data class AuthRequest(
 }
 
 /**
- * Parsed GrantConfirmation message.
+ * Decrypted `PairingProvisionPayload` from the desktop's `PairingConfirmClient`.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
- * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
- *
- * @property challenge 32-byte challenge that was signed
- * @property signatureAlgorithm Signature algorithm from WrapperMessage
- * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
+ * @property csk 32-byte Client Symmetric Key the desktop provisioned; persist it as-is
+ * @property username The desktop user authorizing this pairing
+ * @property clientHostname The desktop's hostname (peer-supplied, sanitize before display)
  */
-data class GrantConfirmation(
-    val challenge: ByteArray,
-    val signatureAlgorithm: Int,
-    val signature: ByteArray,
+data class ParsedPairingProvision(
+    val csk: ByteArray,
+    val username: String,
+    val clientHostname: String,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
         if (javaClass != other?.javaClass) return false
 
-        other as GrantConfirmation
+        other as ParsedPairingProvision
 
-        if (!challenge.contentEquals(other.challenge)) return false
-        if (signatureAlgorithm != other.signatureAlgorithm) return false
-        if (!signature.contentEquals(other.signature)) return false
+        if (!csk.contentEquals(other.csk)) return false
+        if (username != other.username) return false
+        if (clientHostname != other.clientHostname) return false
 
         return true
     }
 
     override fun hashCode(): Int {
-        var result = challenge.contentHashCode()
-        result = 31 * result + signatureAlgorithm
-        result = 31 * result + signature.contentHashCode()
+        var result = csk.contentHashCode()
+        result = 31 * result + username.hashCode()
+        result = 31 * result + clientHostname.hashCode()
         return result
     }
 }
 
 /**
- * Parsed AuthenticationCancel message.
+ * Verified `PairingResponse`, with the session keys already derived inside Rust.
  *
- * Note: In protocol v2+, signatures are stored in WrapperMessage, not in individual messages. The
- * JNI layer extracts wrapper.signature_algorithm and wrapper.signature for compatibility.
- *
- * @property challenge 32-byte challenge of the request being cancelled
- * @property signatureAlgorithm Signature algorithm from WrapperMessage
- * @property signature Digital signature from WrapperMessage (signs entire WrapperMessage)
+ * @property sas The short authentication string (`"123-456"`) the user compares with the desktop
+ * @property clientEd25519PublicKey The Client's static Ed25519 public key, i.e. the device identity
+ * @property symmetricAlgorithm The `SymmetricAlgorithm` the Client selected for the CSK
+ * @property hashAlgorithm The `HashAlgorithm` the Client selected for temporal identifiers
+ * @property signatureAlgorithm The `SignatureAlgorithm` the Client selected for wrapper signatures
  */
-data class AuthenticationCancel(
-    val challenge: ByteArray,
+data class ParsedPairingResponse(
+    val sas: String,
+    val clientEd25519PublicKey: ByteArray,
+    val symmetricAlgorithm: Int,
+    val hashAlgorithm: Int,
     val signatureAlgorithm: Int,
-    val signature: ByteArray,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this == other) return true
         if (javaClass != other?.javaClass) return false
 
-        other as AuthenticationCancel
+        other as ParsedPairingResponse
 
-        if (!challenge.contentEquals(other.challenge)) return false
+        if (sas != other.sas) return false
+        if (!clientEd25519PublicKey.contentEquals(other.clientEd25519PublicKey)) return false
+        if (symmetricAlgorithm != other.symmetricAlgorithm) return false
+        if (hashAlgorithm != other.hashAlgorithm) return false
         if (signatureAlgorithm != other.signatureAlgorithm) return false
-        if (!signature.contentEquals(other.signature)) return false
 
         return true
     }
 
     override fun hashCode(): Int {
-        var result = challenge.contentHashCode()
+        var result = sas.hashCode()
+        result = 31 * result + clientEd25519PublicKey.contentHashCode()
+        result = 31 * result + symmetricAlgorithm
+        result = 31 * result + hashAlgorithm
         result = 31 * result + signatureAlgorithm
-        result = 31 * result + signature.contentHashCode()
-        return result
-    }
-}
-
-/**
- * Parsed EncryptedPacket metadata (structure without decryption).
- *
- * @property temporalIdentifier Temporal identifier for DoS mitigation
- * @property encryptionAlgorithm Encryption algorithm used
- * @property ciphertext Encrypted payload
- */
-data class EncryptedPacketInfo(
-    val temporalIdentifier: ByteArray,
-    val encryptionAlgorithm: Int,
-    val ciphertext: ByteArray,
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this == other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as EncryptedPacketInfo
-
-        if (!temporalIdentifier.contentEquals(other.temporalIdentifier)) return false
-        if (encryptionAlgorithm != other.encryptionAlgorithm) return false
-        if (!ciphertext.contentEquals(other.ciphertext)) return false
-
-        return true
-    }
-
-    override fun hashCode(): Int {
-        var result = temporalIdentifier.contentHashCode()
-        result = 31 * result + encryptionAlgorithm
-        result = 31 * result + ciphertext.contentHashCode()
         return result
     }
 }

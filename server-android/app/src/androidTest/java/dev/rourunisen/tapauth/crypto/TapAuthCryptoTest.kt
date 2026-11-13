@@ -2,24 +2,26 @@ package dev.rourunisen.tapauth.crypto
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.security.GeneralSecurityException
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
-import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Instrumentation tests for the protocol-v2 TapAuth JNI crypto bindings.
+ * Instrumentation tests for the protocol-v2 TapAuth JNI surface.
  *
- * These tests are the executable proof of the Rust <-> Kotlin JNI contract: they validate the FFI
- * type conversions, the exception contract, and the cryptographic properties the Rust side must
- * guarantee (AAD binding, no algorithm downgrade, verify-before-parse, transcript-bound pairing
- * AEAD). The contract itself is documented on `TapAuthCrypto` (see `crypto/TapAuthCrypto.kt`) and
- * in `docs/design-documents/protocol-stabilization-plan.md` §2.3 / §6.1.
+ * These are the executable proof of the Rust ↔ Kotlin JNI contract: FFI conversions, the exception
+ * contract, and the properties the Rust side must guarantee (AAD binding, no algorithm downgrade,
+ * verify-before-parse, a mandatory QR pin, authenticated aborts, window-based temporal
+ * identifiers). The surface itself is documented on `TapAuthCrypto`; the plan is
+ * `docs/design-documents/protocol-stabilization-plan.md` §2.3 / §6.1.
  *
  * ## Running These Tests
  *
@@ -36,376 +38,134 @@ import org.junit.runner.RunWith
  * ./gradlew connectedAndroidTest
  * ```
  *
- * Or run this specific test class:
- * ```bash
- * ./gradlew connectedAndroidTest \
- *   -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest
- * ```
- *
  * See server-android/TESTING.md for more details.
  */
 @RunWith(AndroidJUnit4::class)
 class TapAuthCryptoTest {
 
-    @Before
-    fun loadNativeLibrary() {
-        // Native library is loaded automatically via static initializer in TapAuthCrypto
-        // This ensures it's available before tests run
-    }
-
-    // ========== Key Generation Tests ==========
+    // ========== Key Generation ==========
 
     @Test
-    fun testGenerateKeypairsHaveExpectedSizes() {
-        val ed25519 = TapAuthCrypto.generateKeypair()
-        assertEquals("Ed25519 keypair should have 2 elements", 2, ed25519.size)
-        assertEquals("Ed25519 private key should be 32 bytes", 32, ed25519[0].size)
-        assertEquals("Ed25519 public key should be 32 bytes", 32, ed25519[1].size)
+    fun testGenerateKeypairHasExpectedSizesAndIsUnique() {
+        val keypair = TapAuthCrypto.generateKeypair()
+        assertEquals("Ed25519 keypair should have 2 elements", 2, keypair.size)
+        assertEquals("Ed25519 private key should be 32 bytes", 32, keypair[0].size)
+        assertEquals("Ed25519 public key should be 32 bytes", 32, keypair[1].size)
         assertFalse(
             "A keypair must not return the same bytes for both halves",
-            ed25519[0].contentEquals(ed25519[1]),
-        )
-
-        val x25519 = TapAuthCrypto.generateX25519Keypair()
-        assertEquals("X25519 keypair should have 2 elements", 2, x25519.size)
-        assertEquals("X25519 private key should be 32 bytes", 32, x25519[0].size)
-        assertEquals("X25519 public key should be 32 bytes", 32, x25519[1].size)
-        assertFalse(
-            "A keypair must not return the same bytes for both halves",
-            x25519[0].contentEquals(x25519[1]),
-        )
-    }
-
-    @Test
-    fun testGenerateKeypairsAreUnique() {
-        val edPrivate1 = TapAuthCrypto.generateKeypair()[0]
-        val edPrivate2 = TapAuthCrypto.generateKeypair()[0]
-        assertFalse(
-            "Two Ed25519 keypairs must not share a private key",
-            edPrivate1.contentEquals(edPrivate2),
-        )
-
-        val xPrivate1 = TapAuthCrypto.generateX25519Keypair()[0]
-        val xPrivate2 = TapAuthCrypto.generateX25519Keypair()[0]
-        assertFalse(
-            "Two X25519 keypairs must not share a private key",
-            xPrivate1.contentEquals(xPrivate2),
-        )
-    }
-
-    // ========== Key Exchange Tests ==========
-
-    @Test
-    fun testKeyExchangeDerivesSameSecretOnBothSides() {
-        val alice = X25519Keypair.generate()
-        val bob = X25519Keypair.generate()
-
-        val aliceSecret = TapAuthCrypto.keyExchange(alice.privateKey, bob.publicKey)
-        val bobSecret = TapAuthCrypto.keyExchange(bob.privateKey, alice.publicKey)
-
-        assertEquals("Shared secret should be 32 bytes", 32, aliceSecret.size)
-        assertArrayEquals("Both parties must derive the same secret", aliceSecret, bobSecret)
-
-        val carol = X25519Keypair.generate()
-        val otherSecret = TapAuthCrypto.keyExchange(alice.privateKey, carol.publicKey)
-        assertFalse(
-            "A different peer must derive a different secret",
-            otherSecret.contentEquals(aliceSecret),
-        )
-    }
-
-    @Test
-    fun testKeyExchangeWithInvalidKeyLength() {
-        val validPrivate = TapAuthCrypto.generateX25519Keypair()[0]
-        val invalidPublic = ByteArray(16)
-
-        assertThrows(IllegalArgumentException::class.java) {
-            TapAuthCrypto.keyExchange(validPrivate, invalidPublic)
-        }
-    }
-
-    // ========== SHA-256 Tests ==========
-
-    @Test
-    fun testSha256KnownAnswerAndDeterminism() {
-        val abc = "abc".toByteArray(Charsets.UTF_8)
-        // FIPS 180-2 test vector, lower-case hex.
-        val expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-
-        val hash = TapAuthCrypto.sha256(abc)
-        assertEquals("SHA-256 must match the FIPS 180-2 vector for \"abc\"", expected, hash)
-        assertEquals(
-            "Hashing the same input twice must produce the same digest",
-            hash,
-            TapAuthCrypto.sha256(abc.copyOf()),
+            keypair[0].contentEquals(keypair[1]),
         )
         assertFalse(
-            "A different input must produce a different digest",
-            expected == TapAuthCrypto.sha256("abd".toByteArray(Charsets.UTF_8)),
+            "Two keypairs must not share a private key",
+            TapAuthCrypto.generateKeypair()[0].contentEquals(keypair[0]),
         )
     }
 
-    // ========== Signature Tests ==========
+    // ========== EncryptedPacket round-trip ==========
 
     @Test
-    fun testSignAndVerify() {
-        val signer = Ed25519Keypair.generate()
-        val message = "Test message for signing".toByteArray(Charsets.UTF_8)
-
-        val signature = TapAuthCrypto.signData(signer.privateKey, message)
-
-        assertEquals("Ed25519 signature should be 64 bytes", 64, signature.size)
-        assertTrue(
-            "Signature must verify under the matching public key",
-            TapAuthCrypto.verifySignature(signer.publicKey, message, signature),
-        )
-    }
-
-    @Test
-    fun testVerifySignatureWithWrongMessage() {
-        val signer = Ed25519Keypair.generate()
-        val signature = TapAuthCrypto.signData(signer.privateKey, "Original message".toByteArray())
-
-        assertFalse(
-            "Signature must not verify against a modified message",
-            TapAuthCrypto.verifySignature(
-                signer.publicKey,
-                "Modified message".toByteArray(),
-                signature,
-            ),
-        )
-    }
-
-    @Test
-    fun testVerifySignatureWithWrongPublicKey() {
-        val signer = Ed25519Keypair.generate()
-        val impostor = Ed25519Keypair.generate()
-        val message = "Test message".toByteArray()
-
-        val signature = TapAuthCrypto.signData(signer.privateKey, message)
-
-        assertFalse(
-            "Signature must not verify under another identity's public key",
-            TapAuthCrypto.verifySignature(impostor.publicKey, message, signature),
-        )
-    }
-
-    @Test
-    fun testSignAndVerifyRejectInvalidLengths() {
-        val signer = Ed25519Keypair.generate()
-        val message = "test".toByteArray()
-
-        assertThrows(IllegalArgumentException::class.java) {
-            TapAuthCrypto.signData(ByteArray(16), message)
-        }
-        assertThrows(IllegalArgumentException::class.java) {
-            TapAuthCrypto.verifySignature(ByteArray(16), message, ByteArray(64))
-        }
-        assertThrows(IllegalArgumentException::class.java) {
-            TapAuthCrypto.verifySignature(signer.publicKey, message, ByteArray(32))
-        }
-    }
-
-    // ========== Temporal Identifier Tests ==========
-
-    @Test
-    fun testGenerateTemporalIdUdpAndBle() {
-        val csk = ByteArray(32) { it.toByte() }
-        val timestamp = 1_700_000_000L
-
-        val udpId = TapAuthCrypto.generateTemporalId(csk, timestamp)
-        assertEquals("UDP temporal ID should be 16 bytes", 16, udpId.size)
-        assertArrayEquals(
-            "The same 60s window must yield the same UDP temporal ID",
-            udpId,
-            TapAuthCrypto.generateTemporalId(csk, timestamp),
-        )
-        assertFalse(
-            "A different window must yield a different UDP temporal ID",
-            udpId.contentEquals(TapAuthCrypto.generateTemporalId(csk, timestamp + 60)),
-        )
-
-        val bleId = TapAuthCrypto.generateTemporalIdBle(csk, timestamp)
-        assertEquals("BLE temporal ID should be 10 bytes", 10, bleId.size)
-        assertArrayEquals(
-            "The same 60s window must yield the same BLE temporal ID",
-            bleId,
-            TapAuthCrypto.generateTemporalIdBle(csk, timestamp),
-        )
-        assertFalse(
-            "A different window must yield a different BLE temporal ID",
-            bleId.contentEquals(TapAuthCrypto.generateTemporalIdBle(csk, timestamp + 60)),
-        )
-    }
-
-    @Test
-    fun testVerifyTemporalIdAcceptsOwnAndRejectsWrongCsk() {
-        val csk = ByteArray(32) { it.toByte() }
-        val wrongCsk = ByteArray(32) { (it + 1).toByte() }
-        val timestamp = System.currentTimeMillis() / 1000
-
-        val udpId = TapAuthCrypto.generateTemporalId(csk, timestamp)
-        assertTrue(
-            "A freshly generated UDP temporal ID must verify",
-            TapAuthCrypto.verifyTemporalId(udpId, csk),
-        )
-        assertFalse(
-            "A UDP temporal ID must not verify under a different CSK",
-            TapAuthCrypto.verifyTemporalId(udpId, wrongCsk),
-        )
-
-        val bleId = TapAuthCrypto.generateTemporalIdBle(csk, timestamp)
-        assertTrue(
-            "A freshly generated BLE temporal ID must verify",
-            TapAuthCrypto.verifyTemporalId(bleId, csk),
-        )
-        assertFalse(
-            "A BLE temporal ID must not verify under a different CSK",
-            TapAuthCrypto.verifyTemporalId(bleId, wrongCsk),
-        )
-    }
-
-    @Test
-    fun testVerifyTemporalIdWithInvalidLength() {
-        val csk = ByteArray(32) { it.toByte() }
-
-        assertThrows(IllegalArgumentException::class.java) {
-            TapAuthCrypto.verifyTemporalId(ByteArray(8), csk)
-        }
-    }
-
-    @Test
-    fun testGenerateTemporalIdWithSha256MatchesDefault() {
-        val csk = ByteArray(32) { it.toByte() }
-        val timestamp = 1_700_000_000L
-
-        assertArrayEquals(
-            "HASH_SHA256 must reproduce the default UDP wrapper's output",
-            TapAuthCrypto.generateTemporalId(csk, timestamp),
-            TapAuthCrypto.generateTemporalIdWithAlg(csk, timestamp, TapAuthCrypto.HASH_SHA256),
-        )
-        assertArrayEquals(
-            "HASH_SHA256 must reproduce the default BLE wrapper's output",
-            TapAuthCrypto.generateTemporalIdBle(csk, timestamp),
-            TapAuthCrypto.generateTemporalIdBleWithAlg(
-                csk,
-                timestamp,
-                TapAuthCrypto.HASH_SHA256,
-            ),
-        )
-    }
-
-    @Test
-    fun testGenerateTemporalIdWithBlake3DiffersFromSha256() {
-        val csk = ByteArray(32) { it.toByte() }
-        val timestamp = 1_700_000_000L
-
-        val sha256Id =
-            TapAuthCrypto.generateTemporalIdWithAlg(csk, timestamp, TapAuthCrypto.HASH_SHA256)
-        val blake3Id = TapAuthCrypto.generateTemporalIdWithAlg(csk, timestamp, HASH_BLAKE3)
-
-        assertEquals("BLAKE3 temporal ID should be 16 bytes", 16, blake3Id.size)
-        assertFalse(
-            "BLAKE3 and SHA-256 must not derive the same temporal ID for one input",
-            blake3Id.contentEquals(sha256Id),
-        )
-        assertArrayEquals(
-            "BLAKE3 temporal ID must be stable for one input",
-            blake3Id,
-            TapAuthCrypto.generateTemporalIdWithAlg(csk, timestamp, HASH_BLAKE3),
-        )
-    }
-
-    @Test
-    fun testGenerateTemporalIdBleWithBlake3DiffersFromSha256() {
-        val csk = ByteArray(32) { it.toByte() }
-        val timestamp = 1_700_000_000L
-
-        val sha256Id =
-            TapAuthCrypto.generateTemporalIdBleWithAlg(csk, timestamp, TapAuthCrypto.HASH_SHA256)
-        val blake3Id = TapAuthCrypto.generateTemporalIdBleWithAlg(csk, timestamp, HASH_BLAKE3)
-
-        assertEquals("BLAKE3 BLE temporal ID should be 10 bytes", 10, blake3Id.size)
-        assertFalse(
-            "BLAKE3 and SHA-256 must not derive the same BLE temporal ID",
-            blake3Id.contentEquals(sha256Id),
-        )
-        assertArrayEquals(
-            "BLAKE3 BLE temporal ID must be stable for one input",
-            blake3Id,
-            TapAuthCrypto.generateTemporalIdBleWithAlg(csk, timestamp, HASH_BLAKE3),
-        )
-    }
-
-    // ========== EncryptedPacket Tests ==========
-
-    @Test
-    fun testCreateAndDecryptEncryptedPacket() {
-        val csk = ByteArray(32) { it.toByte() }
-        val server = Ed25519Keypair.generate()
+    fun testGrantPacketRoundTripsThroughDecrypt() {
+        val csk = csk()
+        val server = TapAuthCrypto.generateKeypair()
         val challenge = ByteArray(32) { (it + 32).toByte() }
 
-        val wrapper = TapAuthCrypto.createGrantWrapperMessage(challenge, server.privateKey)
-        val packet =
-            createEncryptedPacket(
-                csk,
-                wrapper,
-                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
-                TapAuthCrypto.HASH_SHA256,
-            )
+        val packet = createGrant(server, challenge, csk)
+        val wrapper =
+            TapAuthCrypto.decryptEncryptedPacket(packet, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
 
-        val decrypted = decryptEncryptedPacket(packet, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
-        assertArrayEquals("Round-tripped wrapper must be byte-identical", wrapper, decrypted)
         assertEquals(
-            "Round-tripped wrapper must still be the grant we put in",
+            "The decrypted grant wrapper must still be a grant",
             "AUTH_GRANT",
-            TapAuthCrypto.determineMessageType(decrypted),
+            TapAuthCrypto.determineMessageType(wrapper),
+        )
+        // v2 signs only the WrapperMessage, so the grant carries the raw 32-byte challenge.
+        assertTrue(
+            "The signed grant payload must contain the raw challenge",
+            indexOfSubsequence(wrapper, challenge) >= 0,
         )
     }
 
     @Test
-    fun testDecryptEncryptedPacketWithWrongKey() {
-        val csk = ByteArray(32) { it.toByte() }
-        val wrongCsk = ByteArray(32) { (it + 1).toByte() }
-        val wrapper = ByteArray(10) { 0x42 }
+    fun testDenialPacketRoundTripsThroughDecrypt() {
+        val csk = csk()
+        val server = TapAuthCrypto.generateKeypair()
+        val challenge = ByteArray(32) { (it + 1).toByte() }
 
         val packet =
-            createEncryptedPacket(
+            TapAuthCrypto.createDenialWrapperMessage(
+                challenge,
+                "Denied on device",
+                server[0],
                 csk,
-                wrapper,
                 TapAuthCrypto.SYMMETRIC_AES_256_GCM,
                 TapAuthCrypto.HASH_SHA256,
             )
+        val wrapper =
+            TapAuthCrypto.decryptEncryptedPacket(packet, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
+
+        assertEquals(
+            "The decrypted denial wrapper must still be a denial",
+            "AUTH_DENIAL",
+            TapAuthCrypto.determineMessageType(wrapper),
+        )
+        assertTrue(
+            "The signed denial payload must contain the challenge it denies",
+            indexOfSubsequence(wrapper, challenge) >= 0,
+        )
+        assertTrue(
+            "The signed denial payload must contain the reason the Client forwards",
+            indexOfSubsequence(wrapper, "Denied on device".toByteArray(Charsets.UTF_8)) >= 0,
+        )
+    }
+
+    @Test
+    fun testBuildPacketEmbedsTheWindowDerivedTemporalIdentifier() {
+        val csk = csk()
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk)
+
+        val identifier = TapAuthCrypto.extractTemporalIdentifier(packet)
+        assertEquals("EncryptedPacket.temporal_identifier must be 16 bytes", 16, identifier.size)
+
+        // The identifier is the keyed MAC of the *window* the packet was built in, so it must match
+        // the negotiated hash derivation for that window rather than anything time-of-day shaped.
+        val window = TapAuthCrypto.currentTimeWindow()
+        val acceptable =
+            listOf(window, window - 1).map {
+                TapAuthCrypto.generateTemporalIdentifier(csk, it, TapAuthCrypto.HASH_SHA256)
+            }
+        assertTrue(
+            "Packet temporal identifier must be the HMAC of the current or previous window",
+            acceptable.any { it.contentEquals(identifier) },
+        )
+    }
+
+    // ========== EncryptedPacket rejections ==========
+
+    @Test
+    fun testDecryptWithWrongCskIsRejected() {
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk())
+        val wrongCsk = ByteArray(32) { (it + 1).toByte() }
 
         assertThrows(GeneralSecurityException::class.java) {
-            decryptEncryptedPacket(packet, wrongCsk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
+            TapAuthCrypto.decryptEncryptedPacket(
+                packet,
+                wrongCsk,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+            )
         }
     }
 
     @Test
-    fun testDecryptEncryptedPacketRejectsTamperedTemporalIdentifier() {
-        val csk = ByteArray(32) { it.toByte() }
-        val wrapper =
-            TapAuthCrypto.createGrantWrapperMessage(
-                ByteArray(32) { it.toByte() },
-                Ed25519Keypair.generate().privateKey,
-            )
-        val packet =
-            createEncryptedPacket(
-                csk,
-                wrapper,
-                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
-                TapAuthCrypto.HASH_SHA256,
-            )
+    fun testTamperedTemporalIdentifierIsRejectedByTheAad() {
+        val csk = csk()
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk)
 
         val temporalId = TapAuthCrypto.extractTemporalIdentifier(packet)
         val offset = indexOfSubsequence(packet, temporalId)
         assertTrue("temporal_identifier must be embedded verbatim in the packet", offset >= 0)
 
         val tampered =
-            packet.copyOf().also {
-                it[offset + 1] = (it[offset + 1].toInt() xor 0x01).toByte()
-            }
+            packet.copyOf().also { it[offset + 1] = (it[offset + 1].toInt() xor 0x01).toByte() }
         assertFalse(
             "The tampered packet must carry a different temporal_identifier",
             temporalId.contentEquals(TapAuthCrypto.extractTemporalIdentifier(tampered)),
@@ -413,25 +173,38 @@ class TapAuthCryptoTest {
 
         // temporal_identifier is bound into the AAD, so the tag must no longer verify.
         assertThrows(GeneralSecurityException::class.java) {
-            decryptEncryptedPacket(tampered, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
+            TapAuthCrypto.decryptEncryptedPacket(
+                tampered,
+                csk,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+            )
         }
     }
 
     @Test
-    fun testDecryptEncryptedPacketRejectsAlgorithmDowngrade() {
-        val csk = ByteArray(32) { it.toByte() }
-        val wrapper = ByteArray(10) { 0x42 }
-        val packet =
-            createEncryptedPacket(
+    fun testTamperedCiphertextIsRejected() {
+        val csk = csk()
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk)
+        val tampered =
+            packet.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 0x01).toByte() }
+
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.decryptEncryptedPacket(
+                tampered,
                 csk,
-                wrapper,
                 TapAuthCrypto.SYMMETRIC_AES_256_GCM,
-                TapAuthCrypto.HASH_SHA256,
             )
+        }
+    }
+
+    @Test
+    fun testAlgorithmRelabelIsRejected() {
+        val csk = csk()
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk)
 
         val algorithmOffset = encryptionAlgorithmOffset(packet)
         assertEquals(
-            "createEncryptedPacket must declare AES-256-GCM",
+            "createGrantWrapperMessage must declare AES-256-GCM",
             TapAuthCrypto.SYMMETRIC_AES_256_GCM,
             packet[algorithmOffset].toInt(),
         )
@@ -439,664 +212,461 @@ class TapAuthCryptoTest {
         // Re-label an AES-GCM packet as ChaCha20-Poly1305: dispatch, not the caller's word, must
         // decide, and the AAD binding makes the original tag invalid either way.
         val relabelled =
-            packet.copyOf().also {
-                it[algorithmOffset] = SYMMETRIC_CHACHA20_POLY1305.toByte()
-            }
+            packet.copyOf().also { it[algorithmOffset] = SYMMETRIC_CHACHA20_POLY1305.toByte() }
         assertThrows(GeneralSecurityException::class.java) {
-            decryptEncryptedPacket(relabelled, csk, TapAuthCrypto.SYMMETRIC_AES_256_GCM)
+            TapAuthCrypto.decryptEncryptedPacket(
+                relabelled,
+                csk,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+            )
         }
     }
 
     @Test
-    fun testParseEncryptedPacketStructureMatchesExtractedIdentifier() {
-        val csk = ByteArray(32) { it.toByte() }
-        val wrapper = ByteArray(10) { 0x42 }
-        val packet =
-            createEncryptedPacket(
+    fun testUnknownAlgorithmIdsAreRejectedAsArguments() {
+        val csk = csk()
+        val packet = createGrant(TapAuthCrypto.generateKeypair(), ByteArray(32), csk)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.decryptEncryptedPacket(packet, csk, 99)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.createGrantWrapperMessage(
+                ByteArray(32),
+                TapAuthCrypto.generateKeypair()[0],
                 csk,
-                wrapper,
-                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                99,
                 TapAuthCrypto.HASH_SHA256,
             )
-
-        val info = TapAuthCrypto.parseEncryptedPacketStructure(packet)
-
-        assertEquals("temporal_identifier should be 16 bytes", 16, info.temporalIdentifier.size)
-        assertArrayEquals(
-            "Structure and extractor must report the same temporal_identifier",
-            TapAuthCrypto.extractTemporalIdentifier(packet),
-            info.temporalIdentifier,
-        )
-        assertEquals(
-            "Packet must declare AES-256-GCM",
-            TapAuthCrypto.SYMMETRIC_AES_256_GCM,
-            info.encryptionAlgorithm,
-        )
-        assertEquals(
-            "ciphertext must be nonce(12) || AEAD ciphertext || tag(16)",
-            wrapper.size + 12 + 16,
-            info.ciphertext.size,
-        )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.createGrantWrapperMessage(
+                ByteArray(32),
+                TapAuthCrypto.generateKeypair()[0],
+                csk,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                99,
+            )
+        }
     }
 
     @Test
-    fun testExtractTemporalIdentifierFromInvalidData() {
+    fun testBuildPacketRejectsShortChallengeAndCsk() {
+        val server = TapAuthCrypto.generateKeypair()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.createGrantWrapperMessage(
+                ByteArray(31),
+                server[0],
+                csk(),
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.createGrantWrapperMessage(
+                ByteArray(32),
+                server[0],
+                ByteArray(16),
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+                TapAuthCrypto.HASH_SHA256,
+            )
+        }
+    }
+
+    @Test
+    fun testExtractTemporalIdentifierRejectsGarbage() {
         assertThrows(IOException::class.java) {
             TapAuthCrypto.extractTemporalIdentifier(ByteArray(5) { 0xFF.toByte() })
         }
     }
 
-    @Test
-    fun testDetermineMessageType() {
-        val server = Ed25519Keypair.generate()
-        val challenge = ByteArray(32) { it.toByte() }
-
-        assertEquals(
-            "A grant wrapper must report AUTH_GRANT",
-            "AUTH_GRANT",
-            TapAuthCrypto.determineMessageType(
-                TapAuthCrypto.createGrantWrapperMessage(challenge, server.privateKey),
-            ),
-        )
-        assertEquals(
-            "A denial wrapper must report AUTH_DENIAL",
-            "AUTH_DENIAL",
-            TapAuthCrypto.determineMessageType(
-                TapAuthCrypto.createDenialWrapperMessage(challenge, "denied", server.privateKey),
-            ),
-        )
-    }
-
-    // ========== Authenticated Wrapper Parsing Tests ==========
+    // ========== Temporal identifiers ==========
 
     @Test
-    fun testParseAndVerifyGrantConfirmation() {
-        val server = Ed25519Keypair.generate()
-        val challenge = ByteArray(32) { (it + 32).toByte() }
+    fun testTemporalIdentifierMatchesTheHmacSha256Formula() {
+        val csk = csk()
+        val window = TapAuthCrypto.currentTimeWindow()
 
-        val wrapper = TapAuthCrypto.createGrantWrapperMessage(challenge, server.privateKey)
-        val confirmation =
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(wrapper, server.publicKey, PROTOCOL_V2)
+        // `HMAC-SHA256(csk, be64(window))[..16]` (cryptography-specification.md §1). Computing it
+        // with the JDK proves Rust hashes the *window*, big-endian, keyed by the CSK — not a
+        // timestamp, not a little-endian encoding, not an unkeyed digest.
+        val expected = hmacSha256(csk, bigEndianBytes(window))
 
         assertArrayEquals(
-            "Parsed challenge must match the granted one",
-            challenge,
-            confirmation.challenge,
+            "UDP temporal identifier must be the 16-byte HMAC of the window",
+            expected.copyOf(16),
+            TapAuthCrypto.generateTemporalIdentifier(csk, window, TapAuthCrypto.HASH_SHA256),
         )
-        assertEquals(
-            "Wrapper signature algorithm must be surfaced as Ed25519",
-            TapAuthCrypto.SIGNATURE_ED25519,
-            confirmation.signatureAlgorithm,
+        assertArrayEquals(
+            "BLE temporal identifier must be the 10-byte truncation of the same MAC",
+            expected.copyOf(10),
+            TapAuthCrypto.generateBleTemporalIdentifier(csk, window, TapAuthCrypto.HASH_SHA256),
         )
-        assertEquals(
-            "Parsed wrapper signature must be the 64-byte Ed25519 signature",
-            64,
-            confirmation.signature.size,
+        assertFalse(
+            "A different window must produce a different identifier",
+            TapAuthCrypto.generateTemporalIdentifier(csk, window + 1, TapAuthCrypto.HASH_SHA256)
+                .contentEquals(expected.copyOf(16)),
         )
     }
 
     @Test
-    fun testParseAndVerifyGrantConfirmationWithWrongPublicKey() {
-        val server = Ed25519Keypair.generate()
-        val impostor = Ed25519Keypair.generate()
-        val wrapper = TapAuthCrypto.createGrantWrapperMessage(ByteArray(32), server.privateKey)
+    fun testVerifyTemporalIdentifierAcceptsCurrentAndPreviousWindowOnly() {
+        val csk = csk()
 
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(wrapper, impostor.publicKey, PROTOCOL_V2)
+        assertTrue(
+            "The current window's identifier must verify",
+            verifiesForWindowOffset(csk, 0),
+        )
+        assertTrue(
+            "The previous window's identifier must verify (clock skew tolerance)",
+            verifiesForWindowOffset(csk, -1),
+        )
+        assertFalse(
+            "An identifier from two windows ago must not verify (replay window)",
+            verifiesForWindowOffset(csk, -2),
+        )
+        assertFalse(
+            "A future window's identifier must not verify",
+            verifiesForWindowOffset(csk, 2),
+        )
+
+        val window = TapAuthCrypto.currentTimeWindow()
+        val identifier =
+            TapAuthCrypto.generateTemporalIdentifier(csk, window, TapAuthCrypto.HASH_SHA256)
+        assertFalse(
+            "A wrong CSK must never verify",
+            TapAuthCrypto.verifyTemporalIdentifier(
+                identifier,
+                csk().also { it[0] = (it[0].toInt() xor 0x01).toByte() },
+                TapAuthCrypto.HASH_SHA256,
+            ),
+        )
+        // The 10-byte BLE form follows the same window.
+        val bleIdentifier =
+            TapAuthCrypto.generateBleTemporalIdentifier(csk, window, TapAuthCrypto.HASH_SHA256)
+        assertTrue(
+            "The BLE identifier must verify through the same entry point",
+            TapAuthCrypto.verifyTemporalIdentifier(bleIdentifier, csk, TapAuthCrypto.HASH_SHA256),
+        )
+    }
+
+    @Test
+    fun testVerifyTemporalIdentifierRejectsWrongLengthAndUnknownAlgorithm() {
+        val csk = csk()
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.verifyTemporalIdentifier(ByteArray(8), csk, TapAuthCrypto.HASH_SHA256)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.verifyTemporalIdentifier(ByteArray(16), csk, 99)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.generateTemporalIdentifier(csk, 41_000_000L, 99)
         }
     }
 
     @Test
-    fun testParseAndVerifyGrantConfirmationRejectsTamperedSignature() {
-        val server = Ed25519Keypair.generate()
-        val wrapper =
-            TapAuthCrypto.createGrantWrapperMessage(
-                ByteArray(32) { it.toByte() },
-                server.privateKey,
-            )
+    fun testCurrentTimeWindowIsUnixSecondsOverSixty() {
+        val window = TapAuthCrypto.currentTimeWindow()
+        val expected = System.currentTimeMillis() / 1000 / 60
 
-        // The signature is the last field of the wrapper: flip its final bit.
-        val tampered =
-            wrapper.copyOf().also {
-                it[it.size - 1] = (it[it.size - 1].toInt() xor 0x01).toByte()
-            }
-
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(tampered, server.publicKey, PROTOCOL_V2)
-        }
+        // Within one window: proves the value is a window count, not a timestamp (which would be
+        // ~60× larger — the mistake that made every generated identifier unmatchable).
+        assertTrue(
+            "currentTimeWindow $window must be within one window of $expected",
+            window in (expected - 1)..(expected + 1),
+        )
+        assertTrue("A plausible clock must be past 2020", window > 26_000_000)
     }
 
-    @Test
-    fun testParseAndVerifyGrantConfirmationRejectsTamperedPayload() {
-        val server = Ed25519Keypair.generate()
-        val challenge = ByteArray(32) { (it + 32).toByte() }
-        val wrapper = TapAuthCrypto.createGrantWrapperMessage(challenge, server.privateKey)
-
-        // Flip a challenge byte but leave the signature intact: verification must cover the
-        // payload.
-        val offset = indexOfSubsequence(wrapper, challenge)
-        assertTrue("The challenge must be embedded verbatim in the wrapper", offset >= 0)
-        val tampered =
-            wrapper.copyOf().also {
-                it[offset] = (it[offset].toInt() xor 0x01).toByte()
-            }
-
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(tampered, server.publicKey, PROTOCOL_V2)
-        }
-    }
+    // ========== BLE pairing advertisement id ==========
 
     @Test
-    fun testGrantConfirmationParserRejectsDenialWrapper() {
-        val server = Ed25519Keypair.generate()
-        val denial =
-            TapAuthCrypto.createDenialWrapperMessage(
-                ByteArray(32),
-                "user denied",
-                server.privateKey,
-            )
-
-        // Valid signature, wrong payload type: the parser must not hand back a "confirmation", and
-        // the rejection must be the documented "this is not a GrantConfirmation" IOException rather
-        // than an arbitrary failure such as a parser NPE.
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(denial, server.publicKey, PROTOCOL_V2)
-        }
-    }
-
-    @Test
-    fun testAuthRequestAndCancelParsersRejectGrantWrapper() {
-        val server = Ed25519Keypair.generate()
-        val grant = TapAuthCrypto.createGrantWrapperMessage(ByteArray(32), server.privateKey)
-
-        // No JNI entry builds an AuthenticationRequest or AuthenticationCancel wrapper (the Client
-        // role's request builder lives in shared/src/protocol/messages.rs and is not exported), so
-        // these two parsers can only be proved to reject a signature-valid wrapper of another type,
-        // as the documented "not an AuthenticationRequest/Cancel" IOException.
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.parseAndVerifyAuthRequest(grant, server.publicKey, PROTOCOL_V2)
-        }
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.parseAndVerifyAuthCancel(grant, server.publicKey, PROTOCOL_V2)
-        }
-    }
-
-    @Test
-    fun testParseAndVerifyAuthRequestRejectsGarbage() {
-        val server = Ed25519Keypair.generate()
-
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.parseAndVerifyAuthRequest(
-                ByteArray(12) { 0xFF.toByte() },
-                server.publicKey,
-                PROTOCOL_V2,
-            )
-        }
-    }
-
-    // ========== v2 Pairing: BLE advertisement id & transcript hash ==========
-
-    @Test
-    fun testDeriveBlePairingAdvId() {
+    fun testDeriveBlePairingAdvIdMatchesTheSpecFormula() {
         val sessionId = ByteArray(16) { it.toByte() }
-        val clientPublic = X25519Keypair.generate().publicKey
+        val clientPublic = ByteArray(32) { (it * 3 + 1).toByte() }
 
         val advId = TapAuthCrypto.deriveBlePairingAdvId(sessionId, clientPublic)
-
         assertEquals("BLE pairing advertisement id must be 10 bytes", 10, advId.size)
+
+        // `SHA-256("tapauth-ble-pair-v2" || sid || pk)[..10]`, no length prefix.
+        val digest =
+            java.security.MessageDigest.getInstance("SHA-256")
+                .apply {
+                    update("tapauth-ble-pair-v2".toByteArray(Charsets.UTF_8))
+                    update(sessionId)
+                    update(clientPublic)
+                }
+                .digest()
+        assertArrayEquals(
+            "The advertisement id must be the truncated context-prefixed SHA-256",
+            digest.copyOf(10),
+            advId,
+        )
         assertArrayEquals(
             "The advertisement id must be deterministic for one QR code",
             advId,
             TapAuthCrypto.deriveBlePairingAdvId(sessionId, clientPublic),
         )
         assertFalse(
-            "A different session id must yield a different advertisement id",
-            advId.contentEquals(
-                TapAuthCrypto.deriveBlePairingAdvId(
-                    ByteArray(16) { (it + 1).toByte() },
-                    clientPublic,
-                ),
-            ),
-        )
-        assertFalse(
             "A different client public key must yield a different advertisement id",
             advId.contentEquals(
                 TapAuthCrypto.deriveBlePairingAdvId(
                     sessionId,
-                    X25519Keypair.generate().publicKey,
+                    clientPublic.copyOf().also { it[0] = (it[0].toInt() xor 0x01).toByte() },
                 ),
             ),
         )
     }
 
+    // ========== Authenticated wrapper parsing (rejections) ==========
+
     @Test
-    fun testComputePairingTranscriptHashIsBoundToBothPackets() {
-        val fixture = PairingFixture()
-        val base =
-            TapAuthCrypto.computePairingTranscriptHash(
-                fixture.sessionId,
-                fixture.initPacket,
-                fixture.responseStub,
+    fun testParsersRejectAGrantWrapper() {
+        // No JNI entry builds an AuthenticationRequest, GrantConfirmation or AuthenticationCancel
+        // wrapper (those are the Client's, and `shared/src/protocol/messages.rs` is not exported),
+        // so
+        // a signature-valid wrapper of another payload type is the strongest input available. The
+        // payload type is bound by the signature, so the parser must refuse it as a security error.
+        val csk = csk()
+        val server = TapAuthCrypto.generateKeypair()
+        val wrapper =
+            TapAuthCrypto.decryptEncryptedPacket(
+                createGrant(server, ByteArray(32), csk),
+                csk,
+                TapAuthCrypto.SYMMETRIC_AES_256_GCM,
             )
 
-        assertEquals("Transcript hash must be 32 bytes", 32, base.size)
-        assertArrayEquals(
-            "Transcript hash must be deterministic",
-            base,
-            TapAuthCrypto.computePairingTranscriptHash(
-                fixture.sessionId,
-                fixture.initPacket,
-                fixture.responseStub,
-            ),
-        )
-        assertFalse(
-            "Changing the init packet must change the transcript hash",
-            base.contentEquals(
-                TapAuthCrypto.computePairingTranscriptHash(
-                    fixture.sessionId,
-                    fixture.initPacket.withXorAt(fixture.initPacket.size - 1, 0x01),
-                    fixture.responseStub,
-                ),
-            ),
-        )
-        assertFalse(
-            "Changing the response packet must change the transcript hash",
-            base.contentEquals(
-                TapAuthCrypto.computePairingTranscriptHash(
-                    fixture.sessionId,
-                    fixture.initPacket,
-                    fixture.responseStub.withXorAt(fixture.responseStub.size - 1, 0x01),
-                ),
-            ),
-        )
-        assertFalse(
-            "Changing the session id must change the transcript hash",
-            base.contentEquals(
-                TapAuthCrypto.computePairingTranscriptHash(
-                    fixture.sessionId.withXorAt(0, 0x01),
-                    fixture.initPacket,
-                    fixture.responseStub,
-                ),
-            ),
-        )
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.parseAndVerifyGrantConfirmation(wrapper, server[1], PROTOCOL_V2, ED25519)
+        }
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.parseAndVerifyAuthCancel(wrapper, server[1], PROTOCOL_V2, ED25519)
+        }
+        assertThrows(GeneralSecurityException::class.java) {
+            TapAuthCrypto.parseAndVerifyAuthRequest(wrapper, server[1], PROTOCOL_V2, ED25519)
+        }
     }
 
-    // ========== v2 Pairing: handshake packets ==========
+    @Test
+    fun testParsersRejectGarbageBytesAsIoErrors() {
+        val server = TapAuthCrypto.generateKeypair()
+
+        assertThrows(IOException::class.java) {
+            TapAuthCrypto.parseAndVerifyAuthRequest(
+                ByteArray(12) { 0xFF.toByte() },
+                server[1],
+                PROTOCOL_V2,
+                ED25519,
+            )
+        }
+        assertThrows(IOException::class.java) {
+            TapAuthCrypto.parseAndVerifyGrantConfirmation(
+                ByteArray(12) { 0xFF.toByte() },
+                server[1],
+                PROTOCOL_V2,
+                ED25519,
+            )
+        }
+        assertThrows(IOException::class.java) {
+            TapAuthCrypto.determineMessageType(ByteArray(12) { 0xFF.toByte() })
+        }
+    }
 
     @Test
-    fun testPairingInitCarriesServerMaterial() {
-        val fixture = PairingFixture()
-        val init = fixture.initPacket
+    fun testParsersRejectAnUnsupportedProtocolVersionOrAlgorithm() {
+        val server = TapAuthCrypto.generateKeypair()
+        val wrapper = ByteArray(12) { 0x00 }
 
-        assertTrue(
-            "PairingInit must carry the session id",
-            indexOfSubsequence(init, fixture.sessionId) >= 0,
+        // Both checks run before the wrapper is even decoded, so the caller's pinned values can
+        // never be talked down by a peer.
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.parseAndVerifyAuthRequest(wrapper, server[1], 1, ED25519)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.parseAndVerifyAuthRequest(wrapper, server[1], PROTOCOL_V2, 99)
+        }
+    }
+
+    // ========== Pairing handle ==========
+
+    @Test
+    fun testPairingSessionHandleLifecycle() {
+        val sessionId = ByteArray(16) { (it * 11 + 3).toByte() }
+        val identity = TapAuthCrypto.generateKeypair()
+
+        val handle = createSession(sessionId, identity[0])
+        assertTrue("A created pairing session must return a positive handle", handle > 0)
+
+        val init = TapAuthCrypto.pairingCreateInit(handle)
+        assertArrayEquals(
+            "PairingInit must carry the QR session id",
+            sessionId,
+            TapAuthCrypto.pairingPacketSessionId(init),
         )
-        assertTrue(
-            "PairingInit must carry our ephemeral X25519 public key",
-            indexOfSubsequence(init, fixture.serverX25519.publicKey) >= 0,
-        )
-        assertTrue(
-            "PairingInit must carry our static Ed25519 public key",
-            indexOfSubsequence(init, fixture.serverEd25519.publicKey) >= 0,
+        // Rust caches the init: a second, different init payload would derive a second SAS because
+        // the transcript hash binds the init bytes.
+        assertArrayEquals(
+            "PairingInit must be the same bytes on every retransmission",
+            init,
+            TapAuthCrypto.pairingCreateInit(handle),
         )
         assertTrue(
             "PairingInit must carry our device name",
             indexOfSubsequence(init, SERVER_DEVICE_NAME.toByteArray(Charsets.UTF_8)) >= 0,
         )
 
-        // A different keypair must produce different bytes (no cached/constant packet).
+        val keepalive = TapAuthCrypto.pairingCreateKeepalive(handle)
+        assertArrayEquals(
+            "PairingKeepalive must carry the QR session id",
+            sessionId,
+            TapAuthCrypto.pairingPacketSessionId(keepalive),
+        )
         assertFalse(
-            "PairingInit must not be a fixed constant",
-            init.contentEquals(
-                TapAuthCrypto.pairingInit(
-                    fixture.sessionId,
-                    X25519Keypair.generate().publicKey,
-                    fixture.serverEd25519.publicKey,
-                    SERVER_DEVICE_NAME,
-                    intArrayOf(TapAuthCrypto.SYMMETRIC_AES_256_GCM),
-                    intArrayOf(TapAuthCrypto.HASH_SHA256),
-                    intArrayOf(TapAuthCrypto.SIGNATURE_ED25519),
-                ),
-            ),
-        )
-    }
-
-    @Test
-    fun testPairingVerifyResponseRejectsGarbage() {
-        val fixture = PairingFixture()
-
-        // No JNI entry builds a valid PairingResponse, so only the rejection path is reachable. A
-        // packet that is not a PairingPacket at all is the documented IOException, not just "any
-        // exception".
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.pairingVerifyResponse(
-                fixture.sessionId,
-                ByteArray(64) { 0xFF.toByte() },
-                fixture.clientX25519.publicKey,
-                fixture.serverX25519.privateKey,
-            )
-        }
-    }
-
-    @Test
-    fun testPairingVerifyResponseRejectsInitPacketInResponseSlot() {
-        val fixture = PairingFixture()
-
-        // Our own PairingInit is a well-formed PairingPacket of the wrong role: accepting it as the
-        // Client's response would derive keys from the Server's own ephemeral key.
-        assertThrows(IOException::class.java) {
-            TapAuthCrypto.pairingVerifyResponse(
-                fixture.sessionId,
-                fixture.initPacket,
-                fixture.clientX25519.publicKey,
-                fixture.serverX25519.privateKey,
-            )
-        }
-    }
-
-    @Test
-    fun testPairingProvisionRoundTrip() {
-        val fixture = PairingFixture()
-
-        val packet =
-            TapAuthCrypto.pairingEncryptProvision(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                fixture.csk,
-                PAIRED_USERNAME,
-                CLIENT_HOSTNAME,
-            )
-        val provision =
-            TapAuthCrypto.pairingDecryptProvision(fixture.kC2s, fixture.transcriptHash, packet)
-
-        assertEquals("Provision must expose 3 slots", 3, provision.size)
-        assertEquals("CSK slot must be 32 bytes", 32, provision[0].size)
-        assertArrayEquals("CSK must survive the provision round-trip", fixture.csk, provision[0])
-        assertEquals(
-            "Username must survive the provision round-trip",
-            PAIRED_USERNAME,
-            String(provision[1], Charsets.UTF_8),
-        )
-        assertEquals(
-            "Client hostname must survive the provision round-trip",
-            CLIENT_HOSTNAME,
-            String(provision[2], Charsets.UTF_8),
+            "A keepalive must not be the init frame",
+            keepalive.contentEquals(init),
         )
 
-        // A second encryption with the same inputs (fresh nonce) must decrypt identically.
-        val secondPacket =
-            TapAuthCrypto.pairingEncryptProvision(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                fixture.csk,
-                PAIRED_USERNAME,
-                CLIENT_HOSTNAME,
-            )
-        val secondProvision =
-            TapAuthCrypto.pairingDecryptProvision(
-                fixture.kC2s,
-                fixture.transcriptHash,
-                secondPacket,
-            )
-        assertArrayEquals(
-            "Re-encrypting the same provision must yield the same plaintext",
-            fixture.csk,
-            secondProvision[0],
-        )
-        assertEquals(
-            "Re-encrypting the same provision must yield the same username",
-            PAIRED_USERNAME,
-            String(secondProvision[1], Charsets.UTF_8),
-        )
-    }
-
-    @Test
-    fun testPairingDecryptProvisionRejectsWrongKeyAndCorruption() {
-        val fixture = PairingFixture()
-        val packet =
-            TapAuthCrypto.pairingEncryptProvision(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                fixture.csk,
-                PAIRED_USERNAME,
-                CLIENT_HOSTNAME,
-            )
-
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptProvision(
-                fixture.kC2s.withXorAt(0, 0xFF),
-                fixture.transcriptHash,
-                packet,
-            )
-        }
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptProvision(
-                fixture.kC2s,
-                fixture.transcriptHash.withXorAt(0, 0x01),
-                packet,
-            )
-        }
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptProvision(
-                fixture.kC2s,
-                fixture.transcriptHash,
-                packet.withXorAt(packet.size - 1, 0x01),
-            )
-        }
-    }
-
-    @Test
-    fun testPairingConfirmServerRoundTripReturnsCsk() {
-        val fixture = PairingFixture()
-
-        val packet =
-            TapAuthCrypto.pairingCreateConfirmServer(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                fixture.serverEd25519.privateKey,
-                fixture.csk,
-            )
-        val completed =
-            TapAuthCrypto.pairingDecryptComplete(
-                fixture.kS2c,
-                fixture.transcriptHash,
-                packet,
-                fixture.serverEd25519.publicKey,
-            )
-
-        assertEquals("Completed CSK must be 32 bytes", 32, completed.size)
-        assertArrayEquals("PairingComplete must echo the exact CSK", fixture.csk, completed)
-
-        // A different CSK must echo back unchanged, not a constant.
-        val otherCsk = ByteArray(32) { (it * 3 + 1).toByte() }
-        val otherPacket =
-            TapAuthCrypto.pairingCreateConfirmServer(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                fixture.serverEd25519.privateKey,
-                otherCsk,
-            )
-        assertArrayEquals(
-            "PairingComplete must echo whichever CSK the Server provisioned",
-            otherCsk,
-            TapAuthCrypto.pairingDecryptComplete(
-                fixture.kS2c,
-                fixture.transcriptHash,
-                otherPacket,
-                fixture.serverEd25519.publicKey,
-            ),
-        )
-    }
-
-    @Test
-    fun testPairingDecryptCompleteWithWrongTranscriptHashThrows() {
-        val fixture = PairingFixture()
-        val packet =
-            TapAuthCrypto.pairingCreateConfirmServer(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                fixture.serverEd25519.privateKey,
-                fixture.csk,
-            )
-
-        // The transcript hash is the AEAD AAD: a different H must not decrypt.
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptComplete(
-                fixture.kS2c,
-                fixture.transcriptHash.withXorAt(0, 0x01),
-                packet,
-                fixture.serverEd25519.publicKey,
-            )
-        }
-    }
-
-    @Test
-    fun testPairingDecryptCompleteRejectsTamperedPacket() {
-        val fixture = PairingFixture()
-        val packet =
-            TapAuthCrypto.pairingCreateConfirmServer(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                fixture.serverEd25519.privateKey,
-                fixture.csk,
-            )
-
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptComplete(
-                fixture.kS2c,
-                fixture.transcriptHash,
-                packet.withXorAt(packet.size - 1, 0x01),
-                fixture.serverEd25519.publicKey,
-            )
-        }
-        // The completion is authenticated against the Server's static Ed25519 identity too.
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingDecryptComplete(
-                fixture.kS2c,
-                fixture.transcriptHash,
-                packet,
-                Ed25519Keypair.generate().publicKey,
-            )
-        }
-    }
-
-    // ========== v2 Pairing: authenticated abort ==========
-
-    @Test
-    fun testPairingAbortRoundTripPreservesReason() {
-        val fixture = PairingFixture()
-
-        val rejected =
-            TapAuthCrypto.pairingCreateAbort(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            )
-        assertEquals(
-            "USER_REJECTED_SAS must survive the abort round-trip",
-            TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            TapAuthCrypto.pairingVerifyAbort(fixture.kC2s, fixture.transcriptHash, rejected),
-        )
-
-        val mismatch =
-            TapAuthCrypto.pairingCreateAbort(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                TapAuthCrypto.PAIRING_ABORT_KEY_MISMATCH,
-            )
-        assertEquals(
-            "KEY_MISMATCH must survive the abort round-trip",
-            TapAuthCrypto.PAIRING_ABORT_KEY_MISMATCH,
-            TapAuthCrypto.pairingVerifyAbort(fixture.kS2c, fixture.transcriptHash, mismatch),
-        )
-    }
-
-    @Test
-    fun testPairingAbortRejectsTheOppositeDirectionKey() {
-        val fixture = PairingFixture()
-
-        // `K_c2s` carries Client -> Server aborts, `K_s2c` Server -> Client ones
-        // (`cryptography-specification.md` §2.2). A swapped direction must not verify.
-        val fromClient =
-            TapAuthCrypto.pairingCreateAbort(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            )
-        val fromServer =
-            TapAuthCrypto.pairingCreateAbort(
-                fixture.sessionId,
-                fixture.kS2c,
-                fixture.transcriptHash,
-                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            )
-
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingVerifyAbort(fixture.kS2c, fixture.transcriptHash, fromClient)
-        }
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingVerifyAbort(fixture.kC2s, fixture.transcriptHash, fromServer)
-        }
-        // Each still verifies under its own direction, so the rejection above is the direction and
-        // not a broken packet.
-        assertEquals(
-            TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            TapAuthCrypto.pairingVerifyAbort(fixture.kC2s, fixture.transcriptHash, fromClient),
-        )
-        assertEquals(
-            TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            TapAuthCrypto.pairingVerifyAbort(fixture.kS2c, fixture.transcriptHash, fromServer),
-        )
-    }
-
-    @Test
-    fun testPairingVerifyAbortRejectsTamperedTagAndWrongTranscript() {
-        val fixture = PairingFixture()
         val abort =
-            TapAuthCrypto.pairingCreateAbort(
-                fixture.sessionId,
-                fixture.kC2s,
-                fixture.transcriptHash,
-                TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS,
-            )
+            TapAuthCrypto.pairingCreateAbort(handle, TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS)
+        assertArrayEquals(
+            "PairingAbort must carry the QR session id",
+            sessionId,
+            TapAuthCrypto.pairingPacketSessionId(abort),
+        )
+        assertFalse(
+            "A tag-less abort (no key exists yet) must report unauthenticated, never success",
+            TapAuthCrypto.pairingVerifyAbort(handle, abort),
+        )
 
+        // The completion proof needs the session keys, which only a verified PairingResponse
+        // installs; before that it is a security failure, not a packet.
         assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingVerifyAbort(
-                fixture.kC2s,
-                fixture.transcriptHash,
-                abort.withXorAt(abort.size - 1, 0x01),
-            )
+            TapAuthCrypto.pairingCreateConfirmServer(handle, csk())
         }
-        // The tag covers the transcript hash: replaying an abort from another handshake must fail.
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingVerifyAbort(
-                fixture.kC2s,
-                fixture.transcriptHash.withXorAt(0, 0x01),
-                abort,
-            )
+
+        // A frame belonging to another session is a caller error, never attributed to this one.
+        val otherHandle = createSession(ByteArray(16) { (it * 7 + 1).toByte() }, identity[0])
+        val foreignInit = TapAuthCrypto.pairingCreateInit(otherHandle)
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.pairingVerifyAbort(handle, foreignInit)
         }
-        // ... and the direction key.
-        assertThrows(GeneralSecurityException::class.java) {
-            TapAuthCrypto.pairingVerifyAbort(
-                fixture.kC2s.withXorAt(0, 0x01),
-                fixture.transcriptHash,
-                abort,
-            )
+        TapAuthCrypto.pairingServerSessionFree(otherHandle)
+
+        // Freeing zeroizes the session keys and retires the handle.
+        TapAuthCrypto.pairingServerSessionFree(handle)
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.pairingServerSessionFree(handle)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.pairingCreateInit(handle)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.pairingCreateKeepalive(handle)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            TapAuthCrypto.pairingCreateAbort(handle, TapAuthCrypto.PAIRING_ABORT_SESSION_EXPIRED)
+        }
+    }
+
+    @Test
+    fun testPairingSessionCreateRejectsMalformedArguments() {
+        val identity = TapAuthCrypto.generateKeypair()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            createSession(ByteArray(15), identity[0])
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            createSession(ByteArray(16), ByteArray(16))
+        }
+    }
+
+    @Test
+    fun testPairingVerifyResponseRejectsUndecodableAndForeignPackets() {
+        val sessionId = ByteArray(16) { (it * 5 + 9).toByte() }
+        val identity = TapAuthCrypto.generateKeypair()
+        val handle = createSession(sessionId, identity[0])
+        val qrPublicKey = ByteArray(32) { (it + 2).toByte() }
+
+        try {
+            assertThrows(IllegalArgumentException::class.java) {
+                TapAuthCrypto.pairingVerifyResponse(
+                    handle,
+                    ByteArray(64) { 0xFF.toByte() },
+                    qrPublicKey,
+                )
+            }
+
+            // Our own PairingInit is a well-formed PairingPacket of the wrong role and the right
+            // session: accepting it as the Client's response would derive keys from the Server's
+            // own ephemeral key.
+            val init = TapAuthCrypto.pairingCreateInit(handle)
+            assertThrows(IllegalArgumentException::class.java) {
+                TapAuthCrypto.pairingVerifyResponse(handle, init, qrPublicKey)
+            }
+
+            // The QR pin cannot be skipped and its length is fixed.
+            assertThrows(IllegalArgumentException::class.java) {
+                TapAuthCrypto.pairingVerifyResponse(handle, init, ByteArray(16))
+            }
+        } finally {
+            TapAuthCrypto.pairingServerSessionFree(handle)
         }
     }
 
     // ========== Helpers ==========
+
+    private fun csk(): ByteArray = ByteArray(32) { it.toByte() }
+
+    private fun createGrant(server: Array<ByteArray>, challenge: ByteArray, csk: ByteArray) =
+        TapAuthCrypto.createGrantWrapperMessage(
+            challenge,
+            server[0],
+            csk,
+            TapAuthCrypto.SYMMETRIC_AES_256_GCM,
+            TapAuthCrypto.HASH_SHA256,
+        )
+
+    private fun createSession(sessionId: ByteArray, ed25519PrivateKey: ByteArray): Long =
+        TapAuthCrypto.pairingServerSessionCreate(sessionId, ed25519PrivateKey, SERVER_DEVICE_NAME)
+
+    /**
+     * Whether an identifier built [offset] windows away from the current one verifies.
+     *
+     * The window is re-read after the check and the attempt repeated when it rolled over, so a
+     * 60-second boundary landing between the two calls cannot turn a correct rejection into a
+     * flake.
+     */
+    private fun verifiesForWindowOffset(csk: ByteArray, offset: Long): Boolean {
+        val window = TapAuthCrypto.currentTimeWindow()
+        val identifier =
+            TapAuthCrypto.generateTemporalIdentifier(
+                csk,
+                window + offset,
+                TapAuthCrypto.HASH_SHA256,
+            )
+        val verified =
+            TapAuthCrypto.verifyTemporalIdentifier(identifier, csk, TapAuthCrypto.HASH_SHA256)
+        if (TapAuthCrypto.currentTimeWindow() == window) return verified
+
+        val fresh = TapAuthCrypto.currentTimeWindow()
+        val freshIdentifier =
+            TapAuthCrypto.generateTemporalIdentifier(csk, fresh + offset, TapAuthCrypto.HASH_SHA256)
+        return TapAuthCrypto.verifyTemporalIdentifier(
+            freshIdentifier,
+            csk,
+            TapAuthCrypto.HASH_SHA256,
+        )
+    }
+
+    private fun hmacSha256(key: ByteArray, message: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key, "HmacSHA256"))
+        return mac.doFinal(message)
+    }
+
+    private fun bigEndianBytes(value: Long): ByteArray =
+        ByteBuffer.allocate(Long.SIZE_BYTES).putLong(value).array()
 
     /**
      * Offset of the `EncryptedPacket.encryption_algorithm` varint payload.
@@ -1122,81 +692,14 @@ class TapAuthCryptoTest {
     }
 }
 
-/** `HashAlgorithm.BLAKE3` (`proto/auth_protocol.proto`); `TapAuthCrypto` has no constant yet. */
-private const val HASH_BLAKE3 = 2
-
 /** `SymmetricAlgorithm.CHACHA20_POLY1305` (`proto/auth_protocol.proto`). */
 private const val SYMMETRIC_CHACHA20_POLY1305 = 2
 
+/** `SignatureAlgorithm.ED25519`, spelled once as the fourth JNI argument. */
+private const val ED25519 = TapAuthCrypto.SIGNATURE_ED25519
+
 private const val PROTOCOL_V2 = 2
 private const val SERVER_DEVICE_NAME = "Pixel 9 Pro"
-private const val PAIRED_USERNAME = "testuser"
-private const val CLIENT_HOSTNAME = "testhost.local"
-
-/**
- * Material for the in-process v2 pairing handshake: one process plays both the Phone (Server) and
- * the Desktop (Client) role, with no network involved.
- */
-private class PairingFixture {
-    val sessionId: ByteArray = ByteArray(16) { (it * 11 + 3).toByte() }
-    val clientX25519: X25519Keypair = X25519Keypair.generate()
-    val serverX25519: X25519Keypair = X25519Keypair.generate()
-    val serverEd25519: Ed25519Keypair = Ed25519Keypair.generate()
-    val csk: ByteArray = ByteArray(32) { (it * 5 + 7).toByte() }
-
-    val initPacket: ByteArray =
-        TapAuthCrypto.pairingInit(
-            sessionId,
-            serverX25519.publicKey,
-            serverEd25519.publicKey,
-            SERVER_DEVICE_NAME,
-            intArrayOf(TapAuthCrypto.SYMMETRIC_AES_256_GCM),
-            intArrayOf(TapAuthCrypto.HASH_SHA256),
-            intArrayOf(TapAuthCrypto.SIGNATURE_ED25519),
-        )
-
-    /**
-     * Stand-in for the Client's `PairingResponse` packet.
-     *
-     * No JNI entry builds one: the Client role's `handle_init` lives in
-     * `shared/src/protocol/pairing.rs` and is not exported. Only
-     * [testComputePairingTranscriptHashIsBoundToBothPackets] consumes it, as an opaque second
-     * input.
-     */
-    val responseStub: ByteArray = ByteArray(48) { (it + 5).toByte() }
-
-    /**
-     * Fixed 32-byte transcript hash `H`.
-     *
-     * `H` is opaque to every AEAD / abort helper: it is only ever concatenated into the AAD or the
-     * tag input. Using a constant here keeps those tests attributable to the helper under test.
-     * `computePairingTranscriptHash` itself is covered by
-     * [testComputePairingTranscriptHashIsBoundToBothPackets].
-     */
-    val transcriptHash: ByteArray = ByteArray(32) { (it * 13 + 1).toByte() }
-
-    /**
-     * Raw ECDH secret between the two ephemeral X25519 keys.
-     *
-     * Production derives `K_c2s` and `K_s2c` from this secret through
-     * `derive_pairing_keys_and_sas(secret, H)`, which the JNI exposes only through
-     * `pairingVerifyResponse` — unreachable without a real `PairingResponse`. Using the secret
-     * itself still exercises the AEAD / AAD wiring around the directional keys; the HKDF split is
-     * covered by the Rust unit tests.
-     */
-    val sharedSecret: ByteArray =
-        TapAuthCrypto.keyExchange(clientX25519.privateKey, serverX25519.publicKey)
-
-    /**
-     * Directional keys, kept **distinct** because production derives two different HKDF expansions.
-     *
-     * Equal keys would let a swapped direction pass unnoticed: `PairingSession` tags an outgoing
-     * abort with `K_s2c` and verifies an incoming one with `K_c2s`, so
-     * [testPairingAbortRejectsTheOppositeDirectionKey] relies on the two diverging.
-     */
-    val kC2s: ByteArray = sharedSecret.withXorAt(0, 0x01)
-    val kS2c: ByteArray = sharedSecret.withXorAt(0, 0x02)
-}
 
 /** Index of [needle] inside this array, or -1. */
 private fun indexOfSubsequence(haystack: ByteArray, needle: ByteArray): Int {
@@ -1209,7 +712,3 @@ private fun indexOfSubsequence(haystack: ByteArray, needle: ByteArray): Int {
     }
     return -1
 }
-
-/** A copy of this array with the byte at [index] XOR-ed by [mask]. */
-private fun ByteArray.withXorAt(index: Int, mask: Int): ByteArray =
-    copyOf().also { it[index] = (it[index].toInt() xor mask).toByte() }

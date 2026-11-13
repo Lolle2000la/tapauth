@@ -52,9 +52,10 @@ data class PairingUrl(
 
             val publicKey = params["pk"] ?: return null
             if (!isHex(publicKey, PUBLIC_KEY_HEX_LENGTH)) return null
-            // An all-zero `pk` is the documented "skip the constant-time QR comparison" sentinel in
-            // `pairingVerifyResponse`. A scanned QR code must never be able to request it, or a
-            // hostile sticker would disable the only pre-SAS MitM defence.
+            // Rust always compares the QR `pk` in constant time, so an all-zero value would be a
+            // legitimate pin only for a peer that really published a zero ephemeral key — which no
+            // Client does. Rejecting it here keeps a hostile sticker from pinning a predictable
+            // key.
             if (publicKey.all { it == '0' }) return null
 
             val port =

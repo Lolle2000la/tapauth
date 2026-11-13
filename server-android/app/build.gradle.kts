@@ -198,4 +198,14 @@ spotless {
     }
 }
 
-kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_11) } }
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_11)
+        // Emit the `MethodParameters` attribute so `JniDescriptorTest` can read the primary
+        // constructor's parameter *names*. A descriptor alone cannot tell a same-typed field swap
+        // apart (two adjacent `String`s produce one signature either way), and `objects.rs` passes
+        // its arguments positionally — so the names are the only half of the contract that catches
+        // an argument handed to the wrong slot.
+        javaParameters.set(true)
+    }
+}

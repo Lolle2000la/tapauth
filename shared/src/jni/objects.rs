@@ -1,7 +1,7 @@
 //! JNI helpers for creating Java objects.
 //!
 //! Provides strongly-typed wrappers for creating Java data transfer objects
-//! instead of using error-prone JSON string serialization. Only the two objects the
+//! instead of using error-prone JSON string serialization. Only the three objects the
 //! protocol v2 surface returns are built here; every other result is an opaque
 //! protobuf `byte[]` or a primitive.
 
@@ -172,6 +172,55 @@ pub fn create_parsed_pairing_provision<'local>(
         env,
         "dev/rourunisen/tapauth/crypto/ParsedPairingProvision",
         "([BLjava/lang/String;Ljava/lang/String;)V",
+        &args,
+    )
+}
+
+/// Create a `ParsedPairingResponse` Java object from a verified pairing response.
+///
+/// The values here are what the phone must persist for the new paired device (its
+/// `Ed_C` and the negotiated algorithms) plus the SAS the user compares. The
+/// directional keys, the transcript hash and the ephemeral secrets stay in Rust,
+/// behind the pairing handle.
+///
+/// Corresponds to: `dev.rourunisen.tapauth.crypto.ParsedPairingResponse`
+///
+/// ## Constructor signature
+///
+/// ```kotlin
+/// data class ParsedPairingResponse(
+///     val sas: String,
+///     val clientEd25519PublicKey: ByteArray,
+///     val symmetricAlgorithm: Int,
+///     val hashAlgorithm: Int,
+///     val signatureAlgorithm: Int,
+/// )
+/// ```
+///
+/// JVM descriptor: `(Ljava/lang/String;[BIII)V`
+pub fn create_parsed_pairing_response<'local>(
+    env: &mut JNIEnv<'local>,
+    sas: &str,
+    client_ed25519_public_key: &[u8],
+    symmetric_algorithm: i32,
+    hash_algorithm: i32,
+    signature_algorithm: i32,
+) -> Option<JObject<'local>> {
+    let sas_str = string_to_jstring(env, sas)?;
+    let public_key_array = vec_to_jbytearray(env, client_ed25519_public_key)?;
+
+    let args = [
+        JValue::Object(sas_str.as_ref()),
+        JValue::Object(&public_key_array),
+        JValue::Int(symmetric_algorithm),
+        JValue::Int(hash_algorithm),
+        JValue::Int(signature_algorithm),
+    ];
+
+    create_object(
+        env,
+        "dev/rourunisen/tapauth/crypto/ParsedPairingResponse",
+        "(Ljava/lang/String;[BIII)V",
         &args,
     )
 }
