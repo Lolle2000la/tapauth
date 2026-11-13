@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -39,40 +39,58 @@ struct PortControl {
     is_open: bool,
 }
 
-/// Per-port state.  The global map is locked only briefly to retrieve or
-/// insert the `Arc<Mutex<PortControl>>` for a port.  The costly external
-/// commands (`iptables`, `firewall-cmd`) run under the per-port lock only,
-/// so concurrent sessions on *different* ports never block each other.
-static GUARDS: OnceLock<Mutex<HashMap<u16, Arc<Mutex<PortControl>>>>> = OnceLock::new();
+/// One shared control slot per `(port, protocol)`.
+type PortSlot = Arc<Mutex<PortControl>>;
 
-fn guards() -> &'static Mutex<HashMap<u16, Arc<Mutex<PortControl>>>> {
+/// Key of the global guard map.
+type PortKey = (u16, Protocol);
+
+/// Per-port state, keyed by `(port, protocol)` so the TCP pairing port and the
+/// UDP multicast port on the same number never share one `PortControl`.  The
+/// global map is locked only briefly to retrieve or insert the
+/// `Arc<Mutex<PortControl>>`.  The costly external commands (`iptables`,
+/// `firewall-cmd`) run under the per-entry lock only, so concurrent sessions on
+/// *different* ports never block each other.
+static GUARDS: OnceLock<Mutex<HashMap<PortKey, PortSlot>>> = OnceLock::new();
+
+fn guards() -> &'static Mutex<HashMap<PortKey, PortSlot>> {
     GUARDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Get or insert the shared `PortControl` slot for `(port, protocol)`.
+///
+/// This touches only the global map: it runs **no** external command, so it is
+/// safe to call from a test (and from any context that must not spawn
+/// `iptables`/`firewall-cmd`). `FirewallGuard::new` performs the actual
+/// open/refcount work on the returned slot.
+fn reserve_slot(port: u16, protocol: Protocol) -> Result<PortSlot, FirewallError> {
+    let mut map = guards()
+        .lock()
+        .map_err(|e| FirewallError::LockPoisoned(format!("guard map lock poisoned: {}", e)))?;
+
+    Ok(map
+        .entry((port, protocol))
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(PortControl {
+                weak: Weak::new(),
+                is_open: false,
+            }))
+        })
+        .clone())
+}
+
 impl FirewallGuard {
-    /// Create a shared `Arc<FirewallGuard>` for the given port.
+    /// Create a shared `Arc<FirewallGuard>` for the given port and protocol.
     ///
-    /// If another caller already holds a live guard for this port, the existing
-    /// `Arc` is cloned and returned (the port remains open).  Otherwise a new
-    /// guard is created, the port is opened, and a `Weak` pointer is stored for
-    /// future sharing.
+    /// If another caller already holds a live guard for this `(port, protocol)`,
+    /// the existing `Arc` is cloned and returned (the port remains open).
+    /// Otherwise a new guard is created, the port is opened, and a `Weak` pointer
+    /// is stored for future sharing.
     ///
     /// When the last strong reference is dropped, the port is automatically
     /// closed in a background thread/task — no manual ref-counting needed.
     pub fn new(port: u16, protocol: Protocol) -> Result<Arc<Self>, FirewallError> {
-        let port_ctrl = {
-            let mut map = guards().lock().map_err(|e| {
-                FirewallError::LockPoisoned(format!("guard map lock poisoned: {}", e))
-            })?;
-            map.entry(port)
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(PortControl {
-                        weak: Weak::new(),
-                        is_open: false,
-                    }))
-                })
-                .clone()
-        };
+        let port_ctrl = reserve_slot(port, protocol)?;
 
         let mut ctrl = port_ctrl.lock().map_err(|e| {
             FirewallError::LockPoisoned(format!("port control lock poisoned: {}", e))
@@ -99,7 +117,7 @@ impl Drop for FirewallGuard {
 }
 
 /// Check whether the weak entry is still alive and, if not, close the
-/// port.  Uses only the per-port lock for the close decision so that
+/// port.  Uses only the per-entry lock for the close decision so that
 /// operations on other ports are never blocked.
 fn do_drop_close(port: u16, protocol: Protocol) {
     let port_ctrl = {
@@ -110,7 +128,7 @@ fn do_drop_close(port: u16, protocol: Protocol) {
                 return;
             }
         };
-        match map.get(&port) {
+        match map.get(&(port, protocol)) {
             Some(ctrl) => ctrl.clone(),
             None => return,
         }
@@ -277,5 +295,54 @@ fn run_firewalld_port_action(
             String::from_utf8_lossy(&output.stdout).trim_end(),
             String::from_utf8_lossy(&output.stderr).trim_end()
         )))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// A high fixed port, outside the ephemeral range the kernel hands out.
+    ///
+    /// NOTE: `GUARDS` is a process-global map shared by every test in this
+    /// binary. `reserve_slot` never opens a port and never spawns a command, so
+    /// using it (rather than `FirewallGuard::new`) keeps this test free of
+    /// `iptables`/`firewall-cmd` side effects and safe to share.
+    const TEST_PORT: u16 = 45_678;
+
+    /// The guard map must be keyed by `(port, protocol)`.
+    /// The defect this catches: a TCP and a UDP guard on the same port number
+    /// sharing one entry, so dropping the TCP pairing guard would close the UDP
+    /// multicast port an authentication attempt is still using (and vice versa).
+    #[test]
+    fn reserve_slot_separates_protocols_on_the_same_port() {
+        let udp = reserve_slot(TEST_PORT, Protocol::Udp).unwrap();
+        let tcp = reserve_slot(TEST_PORT, Protocol::Tcp).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&udp, &tcp),
+            "TCP and UDP on the same port must not share one slot"
+        );
+
+        // Re-reserving the same (port, protocol) yields the same slot.
+        let udp_again = reserve_slot(TEST_PORT, Protocol::Udp).unwrap();
+        assert!(
+            Arc::ptr_eq(&udp, &udp_again),
+            "the same (port, protocol) must reuse its slot"
+        );
+
+        // Both entries exist, and each maps to its own slot.
+        let map = guards().lock().unwrap();
+        let udp_entry = map.get(&(TEST_PORT, Protocol::Udp)).unwrap();
+        let tcp_entry = map.get(&(TEST_PORT, Protocol::Tcp)).unwrap();
+        assert!(Arc::ptr_eq(udp_entry, &udp));
+        assert!(Arc::ptr_eq(tcp_entry, &tcp));
+        assert!(!Arc::ptr_eq(udp_entry, tcp_entry));
     }
 }

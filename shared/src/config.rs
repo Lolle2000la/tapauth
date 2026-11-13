@@ -31,6 +31,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
+use crate::protocol::pb::{HashAlgorithm, SignatureAlgorithm, SymmetricAlgorithm};
 use nix::unistd::{geteuid, User};
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,9 @@ pub const CLIENT_KEY_FILE: &str = "client_key";
 
 /// Client symmetric key file
 pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
+
+/// Client-wide algorithm metadata that accompanies the CSK (v2)
+pub const CSK_META_FILE: &str = "csk_meta.json";
 
 /// Check if the current process is running as root.
 ///
@@ -268,6 +272,14 @@ pub struct PairedServer {
     pub allowed_users: Vec<String>,
     /// When this pairing was created
     pub paired_at: chrono::DateTime<chrono::Utc>,
+    /// Signature algorithm negotiated with this server (`SignatureAlgorithm::Ed25519`
+    /// for a v1 pairing, which stored no algorithm).
+    #[serde(default = "default_signature_algorithm")]
+    pub signature_algorithm: SignatureAlgorithm,
+}
+
+fn default_signature_algorithm() -> SignatureAlgorithm {
+    SignatureAlgorithm::Ed25519
 }
 
 impl PairedServer {
@@ -301,6 +313,38 @@ impl PairedClient {
     /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
     pub fn is_user_allowed(&self, username: &str) -> bool {
         self.allowed_users.iter().any(|u| u == username)
+    }
+}
+
+/// Client-wide cryptographic algorithm metadata for the CSK.
+///
+/// One multicast/BLE advertisement targets every paired server at once, so the
+/// symmetric and hash algorithms are properties of the CSK, not of an individual
+/// pairing (cryptography-specification.md §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CskMetadata {
+    /// AEAD algorithm used for `EncryptedPacket.ciphertext`.
+    #[serde(default = "default_symmetric_algorithm")]
+    pub symmetric_algorithm: SymmetricAlgorithm,
+    /// Hash algorithm used for the rotating temporal identifiers.
+    #[serde(default = "default_hash_algorithm")]
+    pub hash_algorithm: HashAlgorithm,
+}
+
+fn default_symmetric_algorithm() -> SymmetricAlgorithm {
+    SymmetricAlgorithm::Aes256Gcm
+}
+
+fn default_hash_algorithm() -> HashAlgorithm {
+    HashAlgorithm::Sha256
+}
+
+impl Default for CskMetadata {
+    fn default() -> Self {
+        Self {
+            symmetric_algorithm: default_symmetric_algorithm(),
+            hash_algorithm: default_hash_algorithm(),
+        }
     }
 }
 
@@ -497,13 +541,49 @@ impl ClientConfigManager {
         self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE).exists()
     }
 
+    /// Load the CSK algorithm metadata.
+    ///
+    /// A missing `csk_meta.json` (a v1 state directory, or a CSK that predates
+    /// the metadata file) yields [`CskMetadata::default`]: AES-256-GCM + SHA-256,
+    /// the v1 wire behaviour.
+    pub fn load_csk_metadata(&self) -> Result<CskMetadata, ConfigError> {
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+
+        if !meta_path.exists() {
+            return Ok(CskMetadata::default());
+        }
+
+        let data = read_secure_file(&meta_path)?;
+        let metadata = serde_json::from_slice(&data)?;
+        Ok(metadata)
+    }
+
+    /// Save the CSK algorithm metadata.
+    pub fn save_csk_metadata(&self, meta: &CskMetadata) -> Result<(), ConfigError> {
+        self.init()?;
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+        let data = serde_json::to_vec_pretty(meta)?;
+        write_secure_file(&meta_path, &data)?;
+        Ok(())
+    }
+
+    /// Whether the CSK algorithm metadata file is present on disk
+    pub fn has_csk_metadata_file(&self) -> bool {
+        self.config_dir.join(CSK_META_FILE).exists()
+    }
+
     /// Rotate CSK (generates new one, invalidating all pairings)
     pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
         // Delete all paired servers since they have the old CSK
         let _ = self.clear_paired_servers();
 
         // Generate and save new CSK
-        self.generate_and_save_csk()
+        let csk = self.generate_and_save_csk()?;
+
+        // A fresh CSK resets the negotiated algorithm pair to the baseline.
+        self.save_csk_metadata(&CskMetadata::default())?;
+
+        Ok(csk)
     }
 
     /// Load paired servers
@@ -684,6 +764,7 @@ mod tests {
             public_key: "abc123".to_string(),
             allowed_users: vec!["alice".to_string(), "bob".to_string()],
             paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
         };
 
         // Allowed users should pass
@@ -703,6 +784,7 @@ mod tests {
             public_key: "abc123".to_string(),
             allowed_users: vec![],
             paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
         };
 
         // No user should be allowed when list is empty
@@ -728,5 +810,139 @@ mod tests {
         assert_eq!(client.public_key, deserialized.public_key);
         assert_eq!(client.csk, deserialized.csk);
         assert_eq!(client.allowed_users, deserialized.allowed_users);
+    }
+
+    /// A `PairedServer` must round-trip its negotiated signature algorithm, and
+    /// the JSON form must be the canonical proto name.
+    /// The defect this catches: the field silently dropped from the on-disk
+    /// record (so a re-pairing/restart forgets what the server negotiated).
+    #[test]
+    fn test_paired_server_signature_algorithm_roundtrip() {
+        let server = PairedServer {
+            name: "Phone".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec!["alice".to_string()],
+            paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        };
+
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(
+            json.contains("\"signature_algorithm\":\"ED25519\""),
+            "the canonical proto name must be persisted, got: {}",
+            json
+        );
+        let deserialized: PairedServer = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.signature_algorithm,
+            SignatureAlgorithm::Ed25519
+        );
+        assert_eq!(deserialized.name, server.name);
+        assert_eq!(deserialized.public_key, server.public_key);
+        assert_eq!(deserialized.paired_at, server.paired_at);
+    }
+
+    /// A v1 `paired_servers.json` entry has no `signature_algorithm`; it must
+    /// load as Ed25519 rather than failing the whole file.
+    /// The defect this catches: an upgrade from v1 making every pairing
+    /// unreadable (the daemon would then see no paired devices at all).
+    #[test]
+    fn test_legacy_paired_server_defaults_to_ed25519() {
+        let legacy = r#"{
+            "name": "OldPhone",
+            "public_key": "deadbeef",
+            "allowed_users": ["alice"],
+            "paired_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let server: PairedServer = serde_json::from_str(legacy).unwrap();
+        assert_eq!(server.signature_algorithm, SignatureAlgorithm::Ed25519);
+        assert_eq!(server.allowed_users, vec!["alice".to_string()]);
+    }
+
+    /// Only the canonical name string deserialises; the numeric form is rejected.
+    /// The defect this catches: an integer silently loading as the "same"
+    /// algorithm, which would keep a legacy numeric spelling alive in the config
+    /// contract (and let an out-of-range value be coerced instead of refused).
+    #[test]
+    fn test_signature_algorithm_accepts_name_only() {
+        let by_name = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": "ED25519"
+        }"#;
+        let server: PairedServer = serde_json::from_str(by_name).unwrap();
+        assert_eq!(server.signature_algorithm, SignatureAlgorithm::Ed25519);
+
+        let by_integer = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": 1
+        }"#;
+        assert!(serde_json::from_str::<PairedServer>(by_integer).is_err());
+
+        // An unknown name is rejected, not silently defaulted.
+        let bogus = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": "ED25519_TYPO"
+        }"#;
+        assert!(serde_json::from_str::<PairedServer>(bogus).is_err());
+    }
+
+    /// `CskMetadata::default()` is the v1 baseline pair, and an empty JSON object
+    /// (a metadata file written before any algorithm was negotiated) loads as it.
+    /// The defect this catches: a fresh/legacy metadata file defaulting to
+    /// anything other than AES-256-GCM + SHA-256, which would break the wire
+    /// format every already-paired server expects.
+    #[test]
+    fn test_csk_metadata_defaults_and_legacy_json() {
+        let default = CskMetadata::default();
+        assert_eq!(default.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(default.hash_algorithm, HashAlgorithm::Sha256);
+
+        let legacy: CskMetadata = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, default);
+
+        // Missing single field: only that one falls back.
+        let partial: CskMetadata = serde_json::from_str(r#"{"hash_algorithm": "BLAKE3"}"#).unwrap();
+        assert_eq!(partial.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(partial.hash_algorithm, HashAlgorithm::Blake3);
+    }
+
+    /// `CskMetadata` must survive a full JSON round-trip with the canonical names.
+    #[test]
+    fn test_csk_metadata_roundtrip() {
+        let metadata = CskMetadata {
+            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(
+            json.contains("\"symmetric_algorithm\":\"CHACHA20_POLY1305\""),
+            "unexpected JSON: {}",
+            json
+        );
+        assert!(
+            json.contains("\"hash_algorithm\":\"BLAKE3\""),
+            "unexpected JSON: {}",
+            json
+        );
+
+        let parsed: CskMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, metadata);
+
+        // Integer values are rejected: the name is the only on-disk spelling.
+        assert!(serde_json::from_str::<CskMetadata>(
+            r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#
+        )
+        .is_err());
     }
 }

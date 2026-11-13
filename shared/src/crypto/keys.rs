@@ -162,21 +162,6 @@ impl<'de> Deserialize<'de> for ClientSymmetricKey {
     }
 }
 
-/// Pairing Symmetric Key (PSK) - ephemeral key for pairing only
-pub struct PairingSymmetricKey(SecretBox<[u8; 32]>);
-
-impl PairingSymmetricKey {
-    /// Create from derived key material
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(SecretBox::new(Box::new(bytes)))
-    }
-
-    /// Get key bytes (exposes secret for cryptographic operations)
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        self.0.expose_secret()
-    }
-}
-
 use super::CryptoError;
 
 #[cfg(test)]
