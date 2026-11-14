@@ -18,103 +18,56 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.PairingUrl
-import dev.rourunisen.tapauth.network.PairingSession
 import dev.rourunisen.tapauth.network.PairingTransport
 import dev.rourunisen.tapauth.network.PairingUpdate
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-
-/** How long a deferred back-out waits for the session's terminal update before leaving anyway. */
-private const val EXIT_FALLBACK_MS = 1_500L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
     pairingUrl: PairingUrl,
+    viewModel: PairingViewModel,
     onPairingComplete: () -> Unit,
     onPairingFailed: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    // The composition scope is main-dispatched, so updates reported from a background dispatcher
-    // are marshalled onto the main thread by the `scope.launch` in the collector below.
-    val scope = rememberCoroutineScope()
+    // The session lives in the ViewModel, so this collector only renders what it reports.
+    val update by viewModel.update.collectAsState()
 
-    // Bumped by the retry button: it recreates the session (and its coroutines) from scratch.
-    var attempt by remember(pairingUrl) { mutableStateOf(0) }
-    val session = remember(pairingUrl, attempt) { PairingSession(context, pairingUrl) }
-    var update by
-        remember(pairingUrl, attempt) {
-            mutableStateOf<PairingUpdate>(PairingUpdate.Connecting)
-        }
-    // Terminal outcomes reach the host exactly once, no matter which path reports them first.
-    var terminalReported by remember(pairingUrl, attempt) { mutableStateOf(false) }
-    // Set while a back-out waits for the abort to be written; the screen leaves on the terminal
-    // update (or the fallback below), never before.
-    var pendingExit by remember(pairingUrl, attempt) { mutableStateOf(false) }
-    var exited by remember(pairingUrl, attempt) { mutableStateOf(false) }
+    // Idempotent: an attempt that is still running for this QR code is reused, so a re-created
+    // composition (rotation) re-attaches to it instead of starting a second handshake.
+    LaunchedEffect(pairingUrl) { viewModel.beginPairing(pairingUrl) }
 
-    val reportComplete: () -> Unit = {
-        if (!terminalReported) {
-            terminalReported = true
-            onPairingComplete()
-        }
-    }
-
-    LaunchedEffect(pairingUrl, attempt) {
-        session.start(scope) { newUpdate ->
-            scope.launch {
-                update = newUpdate
-                when {
-                    newUpdate is PairingUpdate.Complete -> reportComplete()
-                    newUpdate is PairingUpdate.Failed && !terminalReported -> {
-                        terminalReported = true
-                        onPairingFailed(newUpdate.message)
-                    }
-                    newUpdate is PairingUpdate.Cancelled && !terminalReported -> {
-                        terminalReported = true
-                        onPairingFailed(context.getString(R.string.pairing_cancelled_message))
-                    }
-                }
+    // Terminal outcomes arrive as events, once each, from the ViewModel. They are deliberately not
+    // re-derived from the collected state: that state stays `Complete` after a successful pairing,
+    // so a screen seeded with it would report the previous attempt's outcome as the *next* one's
+    // and send the user straight back to Home — before the new session's `Connecting` even reached
+    // the collector, leaving that session running with no screen to show its SAS.
+    LaunchedEffect(Unit) {
+        viewModel.outcomes.collect { outcome ->
+            when (outcome) {
+                is PairingUpdate.Complete -> onPairingComplete()
+                is PairingUpdate.Failed -> onPairingFailed(outcome.message)
+                PairingUpdate.Cancelled ->
+                    onPairingFailed(context.getString(R.string.pairing_cancelled_message))
+                else -> Unit
             }
         }
     }
 
-    DisposableEffect(pairingUrl, attempt) { onDispose { session.close() } }
-
-    // Leaving the screen disposes it, and disposal closes the session — so a back-out during the
-    // SAS must not navigate immediately or the reject's `PairingAbort(USER_REJECTED_SAS)` is
-    // cancelled before it is written and the desktop never learns. It records the decision, then
-    // leaves when the terminal update reports the abort is out; the fallback below guarantees the
-    // user can never be stuck here.
-    val navigateAway: () -> Unit = {
-        if (!exited) {
-            exited = true
-            if (!terminalReported) {
-                terminalReported = true
-                onPairingFailed(context.getString(R.string.pairing_cancelled_message))
-            }
-            onBack()
-        }
+    // Disposing the composition is not a user decision. The ViewModel keeps the session alive and
+    // sends no `PairingAbort`, which is what makes a rotation during the SAS a non-event; only the
+    // explicit exits below end the pairing.
+    DisposableEffect(pairingUrl) {
+        onDispose { viewModel.leave(PairingExit.ScreenDisposed) }
     }
 
+    // A deliberate exit, by contrast, has to tell the desktop: the ViewModel aborts a live SAS
+    // prompt. It no longer waits here for the abort to be written, because the session outlives
+    // this screen — leaving immediately cannot cancel it.
     val leavePairing: () -> Unit = {
-        if (update is PairingUpdate.AwaitingSas && !pendingExit) {
-            pendingExit = true
-            session.rejectSas()
-        } else {
-            navigateAway()
-        }
-    }
-
-    if (pendingExit) {
-        LaunchedEffect(update) {
-            if (update is PairingUpdate.Cancelled || update is PairingUpdate.Failed) navigateAway()
-        }
-        LaunchedEffect(Unit) {
-            delay(EXIT_FALLBACK_MS)
-            navigateAway()
-        }
+        viewModel.leave(PairingExit.UserRequested)
+        onBack()
     }
 
     BackHandler(onBack = leavePairing)
@@ -146,27 +99,27 @@ fun PairingScreen(
                     VerifySASView(
                         sas = state.sas,
                         transport = state.transport,
-                        onConfirm = { session.approveSas() },
-                        onCancel = { session.rejectSas() },
+                        onConfirm = { viewModel.approveSas() },
+                        onCancel = { viewModel.rejectSas() },
                     )
                 }
                 is PairingUpdate.Confirming -> {
                     ConfirmingView()
                 }
                 is PairingUpdate.Complete -> {
-                    SuccessView(onDone = reportComplete)
+                    SuccessView(onDone = onPairingComplete)
                 }
                 is PairingUpdate.Failed -> {
                     FailedView(
                         message = state.message,
-                        onRetry = { attempt++ },
+                        onRetry = { viewModel.retry() },
                         onBack = leavePairing,
                     )
                 }
                 PairingUpdate.Cancelled -> {
                     FailedView(
                         message = stringResource(R.string.pairing_user_cancelled),
-                        onRetry = { attempt++ },
+                        onRetry = { viewModel.retry() },
                         onBack = leavePairing,
                     )
                 }

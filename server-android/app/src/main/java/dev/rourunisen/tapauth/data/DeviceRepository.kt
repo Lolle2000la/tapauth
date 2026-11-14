@@ -20,20 +20,29 @@ class DeviceRepository(context: Context) {
         private const val KEY_DEVICES = "paired_devices"
 
         /**
-         * Single-slot device-change hook, used by [dev.rourunisen.tapauth.service.TemporalIdCache]
-         * to refresh its precomputed IDs immediately after pairing/un-pairing.
+         * Observers told about every paired-device mutation, used by the temporal-ID caches of the
+         * UDP and BLE transports to refresh immediately after pairing/un-pairing.
          *
-         * There is only ever one cache in the process, so registering deliberately replaces any
-         * previous listener instead of accumulating them.
+         * More than one observer is expected (one per transport), and an observer registered while
+         * another notification is being dispatched must still receive the next one, so the registry
+         * is a [DeviceChangeListeners] rather than a single slot.
          */
-        @Volatile private var changeListener: (() -> Unit)? = null
+        private val deviceChangeListeners = DeviceChangeListeners()
 
-        fun setOnDevicesChangedListener(listener: (() -> Unit)?) {
-            changeListener = listener
+        /**
+         * Register [listener] for paired-device changes. Registering the same instance is a no-op.
+         */
+        fun addOnDevicesChangedListener(listener: () -> Unit) {
+            deviceChangeListeners.add(listener)
         }
 
-        private fun notifyListener() {
-            changeListener?.invoke()
+        /** Unregister [listener]; unregistering one that was never added is a no-op. */
+        fun removeOnDevicesChangedListener(listener: () -> Unit) {
+            deviceChangeListeners.remove(listener)
+        }
+
+        private fun notifyListeners() {
+            deviceChangeListeners.dispatch()
         }
     }
 
@@ -47,7 +56,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListener()
+            notifyListeners()
         }
 
     fun getAllPairedDevicesSync(): List<PairedDevice> {
@@ -80,7 +89,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListener()
+            notifyListeners()
         }
 
     /**
@@ -115,7 +124,7 @@ class DeviceRepository(context: Context) {
             devices.forEach { json.put(deviceToJson(it)) }
 
             prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
-            notifyListener()
+            notifyListeners()
 
             return@withContext entirelyRemoved
         }
@@ -167,5 +176,40 @@ class DeviceRepository(context: Context) {
             signatureAlgorithm = json.optInt("signatureAlgorithm", 1),
             protocolVersion = json.optInt("protocolVersion", 1),
         )
+    }
+}
+
+/**
+ * Thread-safe set of paired-device change observers.
+ *
+ * Registration and removal are allowed at any time, including from inside a dispatch: a
+ * [java.util.concurrent.CopyOnWriteArraySet] iterates a snapshot, so an observer that unregisters
+ * itself while it runs neither breaks the loop nor starves the observers after it. Registration is
+ * idempotent, and a removed observer is never invoked again.
+ */
+internal class DeviceChangeListeners {
+
+    private val listeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
+
+    /** Register [listener]; returns false when it was already registered. */
+    fun add(listener: () -> Unit): Boolean = listeners.add(listener)
+
+    /** Unregister [listener]; returns false when it was not registered. */
+    fun remove(listener: () -> Unit): Boolean = listeners.remove(listener)
+
+    /** Drop every observer. */
+    fun clear() {
+        listeners.clear()
+    }
+
+    /** Number of registered observers (tests and diagnostics). */
+    val size: Int
+        get() = listeners.size
+
+    /** Invoke every observer registered at the time of the call. */
+    fun dispatch() {
+        for (listener in listeners) {
+            listener()
+        }
     }
 }

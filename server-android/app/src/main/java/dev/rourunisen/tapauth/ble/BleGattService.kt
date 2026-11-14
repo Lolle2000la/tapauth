@@ -19,12 +19,9 @@ import dev.rourunisen.tapauth.biometric.BiometricHelper
 import dev.rourunisen.tapauth.crypto.TapauthException
 import dev.rourunisen.tapauth.crypto.createDenialWrapperMessage
 import dev.rourunisen.tapauth.crypto.createGrantWrapperMessage
-import dev.rourunisen.tapauth.crypto.currentTimeWindow
 import dev.rourunisen.tapauth.crypto.decryptEncryptedPacket
 import dev.rourunisen.tapauth.crypto.determineMessageType
 import dev.rourunisen.tapauth.crypto.extractTemporalIdentifier
-import dev.rourunisen.tapauth.crypto.generateBleTemporalIdentifier
-import dev.rourunisen.tapauth.crypto.generateTemporalIdentifier
 import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthCancel
 import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthRequest
 import dev.rourunisen.tapauth.crypto.parseAndVerifyGrantConfirmation
@@ -137,6 +134,19 @@ class BleGattService : Service() {
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val transportLockManager = TransportLockManager.getInstance()
 
+    /**
+     * Orders duplicate in-flight AuthenticationRequests ahead of the replay cache, so a same-peer
+     * repeat of a challenge the user is approving on cannot be classified as a replay and tear the
+     * GATT link down.
+     */
+    private val authRequestGate =
+        BleAuthRequestGate(
+            isReplay = { challenge, timestampUnixSeconds ->
+                replayMitigationCache.isReplay(challenge, timestampUnixSeconds)
+            },
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
+
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // Track active GATT connections by challenge for cancellation
@@ -229,11 +239,20 @@ class BleGattService : Service() {
             }
         }
 
-    // Map of temporal IDs to device CSKs for quick lookup
-    @Volatile private var temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private val cacheMutex = kotlinx.coroutines.sync.Mutex()
-    private var cacheUpdateJob: Job? = null
-    @Volatile private var bleLastComputedWindow: Long = -1
+    /**
+     * Temporal-ID → paired-device index for both BLE paths (advertisement ids and GATT packet ids).
+     *
+     * A lookup is a map read: the index is rebuilt only when the paired-device list changes
+     * ([BleTemporalIdIndex.invalidate], driven by the [DeviceRepository] observer registered in
+     * [startTemporalIdCache]) or the 60 s window rolls over, so a device paired mid-window resolves
+     * immediately instead of at the next minute boundary, and a GATT packet never triggers a
+     * device-list reload.
+     */
+    private val temporalIdIndex =
+        BleTemporalIdIndex(devices = { deviceRepository.getAllPairedDevicesSync() })
+
+    /** Registered in [onCreate], removed in [onDestroy], so the service holds no observer. */
+    private val deviceChangeObserver: () -> Unit = { temporalIdIndex.invalidate() }
 
     private var scanPendingIntent: PendingIntent? = null
 
@@ -266,6 +285,9 @@ class BleGattService : Service() {
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
                         connectingOrConnectedDevices.remove(deviceAddress)
+                        // No authentication can be in flight on a link that is gone, so the peer's
+                        // in-flight challenges are released here rather than on their own paths.
+                        authRequestGate.concludePeer(deviceAddress)
 
                         // Drop any challenge-tracked connections that pointed at this (now dead)
                         // GATT handle so a stale response can never be written through it.
@@ -563,92 +585,9 @@ class BleGattService : Service() {
     }
 
     private fun startTemporalIdCache() {
-        cacheUpdateJob?.cancel()
-        cacheUpdateJob = serviceScope.launch { updateTemporalIdCache() }
-    }
-
-    private suspend fun updateTemporalIdCache() {
-        temporalIdCache.clear()
-
-        val pairedDevices = deviceRepository.getAllPairedDevices()
-        // The window (unix_seconds / 60) is what the Rust derivation expects; a unix timestamp
-        // would hash a different value and match none of the Client's identifiers.
-        val currentWindow = currentTimeWindow()
-        val previousWindow = currentWindow - 1
-
-        for (device in pairedDevices) {
-            try {
-                val currentId =
-                    generateBleTemporalIdentifier(
-                        device.csk,
-                        currentWindow,
-                        device.hashAlgorithm,
-                    )
-                val previousId =
-                    generateBleTemporalIdentifier(
-                        device.csk,
-                        previousWindow,
-                        device.hashAlgorithm,
-                    )
-
-                val cskHex = device.csk.toHex()
-                temporalIdCache[currentId.toHex()] = cskHex
-                temporalIdCache[previousId.toHex()] = cskHex
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to generate temporal ID for device ${device.deviceId}", e)
-            }
-        }
-
-        bleLastComputedWindow = currentWindow
-        Log.i(
-            TAG,
-            "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
-        )
-    }
-
-    private suspend fun matchTemporalIdOnDemand(temporalIdHex: String): String? {
-        val currentWindow = currentTimeWindow()
-
-        if (currentWindow != bleLastComputedWindow) {
-            cacheMutex.withLock {
-                if (currentWindow != bleLastComputedWindow) {
-                    val newCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-                    val pairedDevices = deviceRepository.getAllPairedDevices()
-                    val previousWindow = currentWindow - 1
-
-                    for (device in pairedDevices) {
-                        try {
-                            val currentId =
-                                generateBleTemporalIdentifier(
-                                    device.csk,
-                                    currentWindow,
-                                    device.hashAlgorithm,
-                                )
-                            val previousId =
-                                generateBleTemporalIdentifier(
-                                    device.csk,
-                                    previousWindow,
-                                    device.hashAlgorithm,
-                                )
-
-                            val cskHex = device.csk.toHex()
-                            newCache[currentId.toHex()] = cskHex
-                            newCache[previousId.toHex()] = cskHex
-                        } catch (e: Exception) {
-                            Log.e(
-                                TAG,
-                                "Failed to generate temporal ID for device ${device.deviceId}",
-                                e,
-                            )
-                        }
-                    }
-                    temporalIdCache = newCache
-                    bleLastComputedWindow = currentWindow
-                }
-            }
-        }
-
-        return temporalIdCache[temporalIdHex]
+        DeviceRepository.addOnDevicesChangedListener(deviceChangeObserver)
+        // Warm the index so the first advertisement does not pay for the rebuild.
+        serviceScope.launch { temporalIdIndex.refresh() }
     }
 
     private fun startScanning() {
@@ -711,7 +650,6 @@ class BleGattService : Service() {
             Log.i(TAG, "BLE scanning stopped")
         }
         scanPendingIntent = null
-        cacheUpdateJob?.cancel()
     }
 
     private fun connectToClient(device: BluetoothDevice, csk: String) {
@@ -972,9 +910,12 @@ class BleGattService : Service() {
         }
 
         // Subscribe before reading, so a request the client has already queued still reaches us.
-        // PAIRING_CHAR_UUID only exists while pairing, so its absence is not an error.
+        // Only the two authentication characteristics are subscribed: nothing on this connection
+        // reads or writes PAIRING_CHAR_UUID (pairing runs its own GATT connection in
+        // BlePairingClient), so subscribing to it would cost a round-trip for a notification no
+        // handler consumes.
         val notifyingCharacteristics =
-            listOf(CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID, PAIRING_CHAR_UUID)
+            listOf(CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID)
         for (uuid in notifyingCharacteristics) {
             enableCharacteristicNotifications(gatt, service, uuid)
         }
@@ -1057,56 +998,15 @@ class BleGattService : Service() {
                 "Parsed EncryptedPacket: temporal_id=${temporalIdBytes.toHexPreview()}..., ciphertext=${data.size} bytes",
             )
 
-            // Step 2: Find the CSK by matching temporal ID
-            val pairedDevices = deviceRepository.getAllPairedDevices()
-
-            if (pairedDevices.isEmpty()) {
-                Log.w(TAG, "No paired devices found, rejecting BLE request")
-                // Silently disconnect - no valid response possible without CSK
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
-                }
-                return
-            }
-
-            Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
-
-            // Try to match temporal ID with paired devices
-            // Note: EncryptedPacket contains 16-byte temporal ID (same as UDP), hashed with the
+            // Step 2: Resolve the paired device by its temporal ID: one map read, with no
+            // device-list reload and no re-derivation per packet.
+            // Note: EncryptedPacket contains the 16-byte temporal ID (same as UDP), hashed with the
             // algorithm this pairing negotiated.
-            var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
             val temporalIdHex = temporalIdBytes.toHex()
-            // Window, not timestamp: the identifiers are HMACs over `unix_seconds / 60`.
-            val currentWindow = currentTimeWindow()
-            for (device in pairedDevices) {
-                // Check if this temporal ID matches (current or previous window)
-                val currentId =
-                    generateTemporalIdentifier(
-                        device.csk,
-                        currentWindow,
-                        device.hashAlgorithm,
-                    )
-                val previousId =
-                    generateTemporalIdentifier(
-                        device.csk,
-                        currentWindow - 1,
-                        device.hashAlgorithm,
-                    )
-
-                if (temporalIdHex == currentId.toHex() || temporalIdHex == previousId.toHex()) {
-                    matchedDevice = device
-                    Log.d(TAG, "Temporal ID matched device: ${device.displayName}")
-                    break
-                }
-            }
+            val matchedDevice = temporalIdIndex.lookupPacket(temporalIdHex)
 
             if (matchedDevice == null) {
-                Log.w(TAG, "No device matched the temporal ID")
+                Log.w(TAG, "No paired device matched the temporal ID")
                 // Silently disconnect - no valid response possible without CSK
                 if (
                     ActivityCompat.checkSelfPermission(
@@ -1118,6 +1018,8 @@ class BleGattService : Service() {
                 }
                 return
             }
+
+            Log.d(TAG, "Temporal ID matched device: ${matchedDevice.displayName}")
 
             // Step 3: Decrypt the EncryptedPacket to get the WrapperMessage
             val wrapperMessageBytes =
@@ -1215,6 +1117,9 @@ class BleGattService : Service() {
 
             // Remove from active connections
             activeConnectionsByChallenge.remove(challengeKey)
+            // The Client abandoned this authentication, so a later request carrying the same
+            // challenge is a replay again, not a duplicate in flight.
+            authRequestGate.conclude(challengeBytes)
 
             // Cancel pending auth requests
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
@@ -1338,19 +1243,41 @@ class BleGattService : Service() {
             activeConnectionsByChallenge[challengeKey] = gatt
             Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
 
-            // Step 6: Replay attack mitigation
-            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
-                Log.w(TAG, "BLE replay attack detected, rejecting request")
-                // Silently disconnect - don't help attacker with denial message
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
+            // Step 6: Duplicate-in-flight check, then replay attack mitigation.
+            //
+            // A same-peer repeat of the challenge already in flight (a notification racing the
+            // initial read, or a re-notification of the same request) is an idempotent no-op: it
+            // must not reach the replay cache, which would report it as a replay and disconnect a
+            // link whose prompt the user is answering. A different peer replaying the same captured
+            // bytes is not a duplicate and still reaches the cache, exactly as before.
+            when (
+                authRequestGate.evaluate(
+                    challengeBytes,
+                    authRequest.timestampUnixSeconds,
+                    gatt.device.address,
+                )
+            ) {
+                BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT -> {
+                    Log.d(
+                        TAG,
+                        "BLE duplicate of in-flight challenge from ${gatt.device.address}, ignoring",
+                    )
+                    return
                 }
-                return
+                BleAuthRequestGate.Verdict.REPLAY -> {
+                    Log.w(TAG, "BLE replay attack detected, rejecting request")
+                    // Silently disconnect - don't help attacker with denial message
+                    if (
+                        ActivityCompat.checkSelfPermission(
+                            this@BleGattService,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        gatt.disconnect()
+                    }
+                    return
+                }
+                BleAuthRequestGate.Verdict.PROCESS -> Unit
             }
 
             // The signature was already verified by parseAndVerifyAuthRequest above, which also
@@ -1404,6 +1331,10 @@ class BleGattService : Service() {
 
                         // Release transport lock after successful grant
                         transportLockManager.releaseLock(challengeBytes)
+                        // The gate's claim is deliberately kept here: the Client retransmits
+                        // this request until it has the grant, and a released claim would send
+                        // those retransmissions to the replay cache, which answers "replay" and
+                        // disconnects. BleAuthRequestGate documents the full reasoning.
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
                         // Ensure disconnection on error
@@ -1433,6 +1364,9 @@ class BleGattService : Service() {
 
                         // Release transport lock after denial
                         transportLockManager.releaseLock(challengeBytes)
+                        // Gate claim intentionally retained, as on the grant path above: the
+                        // Client keeps retransmitting until it has the denial, and those copies
+                        // arrive while the link is still up.
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
                         // Ensure disconnection on error
@@ -1444,6 +1378,8 @@ class BleGattService : Service() {
                     disconnectGatt(gatt)
                     // Release transport lock even on timeout
                     transportLockManager.releaseLock(challengeBytes)
+                    // The gate's claim is not released here: this path disconnects the link,
+                    // and the resulting STATE_DISCONNECTED -> concludePeer releases it.
                 }
             }
         } catch (e: Exception) {
@@ -1763,10 +1699,11 @@ class BleGattService : Service() {
         Log.i(TAG, "Scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)")
 
         serviceScope.launch {
-            val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
-            if (matchedCsk != null) {
+            // One map read: the index already holds the current and previous window's identifiers.
+            val matchedDevice = temporalIdIndex.lookupAdvertisement(temporalIdHex)
+            if (matchedDevice != null) {
                 Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                withContext(Dispatchers.Main) { connectToClient(device, matchedCsk) }
+                withContext(Dispatchers.Main) { connectToClient(device, matchedDevice.csk.toHex()) }
             } else {
                 Log.d(TAG, "Temporal ID does not match any paired device")
             }
@@ -1808,6 +1745,10 @@ class BleGattService : Service() {
         // Closed-handle tombstones live here too; the service is going away, so drop them.
         gattConnections.clear()
         connectionDevices.clear()
+        authRequestGate.clear()
+        // The registry is process-wide: leaving this observer behind would keep a dead service's
+        // index alive for every later device change.
+        DeviceRepository.removeOnDevicesChangedListener(deviceChangeObserver)
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
@@ -1821,6 +1762,8 @@ class BleGattService : Service() {
     private fun handleCancelConnection(challengeBytes: ByteArray) {
         val challengeKey = challengeBytes.toHex()
         val gatt = activeConnectionsByChallenge.remove(challengeKey)
+        // The request is no longer in flight, so its challenge must reach the replay cache again.
+        authRequestGate.conclude(challengeBytes)
 
         if (gatt != null) {
             Log.d(TAG, "Disconnecting BLE connection for cancelled challenge: $challengeKey")

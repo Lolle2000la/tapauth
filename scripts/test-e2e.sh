@@ -1560,9 +1560,11 @@ PHASE1_UDP_OK=1
 
 # ── 1c: BLE-only pairing over the Bumble /dev/vhci bridge ────────────────────
 #
-# A v2 QR carrying none of `p`/`ip4`/`ip6` describes a BLE-only pairing: the phone
+# A v2 QR carrying no `ip4`/`ip6` describes a BLE-only pairing: the phone
 # has no address to send PairingInit to, so it scans for the GATT service and
-# writes the init to the characteristic instead. The Bumble bridge and its
+# writes the init to the characteristic instead. `p` is still present — the format
+# allows a portless QR, but the daemon always emits its configured UDP port — so
+# the strip below removes only the addresses. The Bumble bridge and its
 # /dev/vhci adapter were brought up in Step 3, and the daemon advertises on that
 # adapter — but only when BLE is enabled in the config it reads at session start.
 echo "==> Step 1c: BLE-only pairing over the Bumble /dev/vhci bridge..."
@@ -1704,14 +1706,131 @@ echo "==> Starting Android foreground services for authentication..."
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
 # Clear the log buffer so the group-configuration line the next phase asserts on
 # is guaranteed to still be present even on a noisy runner (the logcat ring buffer
-# can rotate between app start and Phase 2).
-adb logcat -c 2>/dev/null || true
+# can rotate between app start and Phase 2). A rejected clear must fail the run
+# rather than be swallowed: the caller-context tokens below carry no per-run
+# entropy, so a stale line from an earlier run would satisfy Phase 2/2b/3.
+clear_logcat "Phase 2"
 adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity"
 sleep 2
 
 # Start background biometric auto-grant listener for auth tests
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
 sleep 1
+
+# ── Caller-context (protocol v2) helpers ─────────────────────────────────────
+#
+# Protocol v2 carries the Client's caller context — `pam_service`,
+# `process_name`, `command_preview` — so the phone can show what is being
+# approved. A daemon-side line only proves a request was *sent*, so every
+# assertion below reads the phone's own line instead:
+#
+#   Auth request caller context: pamService=…, processName=…, commandPreview=…
+#
+# emitted by AuthRequestManager.submitRequest, the single funnel both transports
+# pass through (AuthenticationService for UDP, BleGattService for BLE), so one
+# line proves delivery over either transport. Each field is asserted on its own
+# so a failure names the field that did not arrive.
+
+# assert_phone_logged <fixed-string> <label>
+#
+# Fails unless the phone's logcat dump contains <fixed-string>. The whole dump is
+# grepped, deliberately not a window anchored to a line count: the logcat ring
+# buffer can rotate between taking a mark and checking it, which slides a counted
+# window forward and drops a line the phase did emit — a spurious failure. What
+# keeps an earlier phase's line from satisfying this assertion is the per-phase
+# token in every fixed string below, together with the `clear_logcat` issued
+# before the app is started for Phase 2 (see Step 5b), so a stale line cannot
+# match and this can only ever fail for a line that is genuinely missing.
+#
+# The dump is captured into a variable and grepped through a here-string instead
+# of being piped straight into `grep -q`: `grep -q` exits at the first match and
+# SIGPIPEs the producer, which this script only survives because it does not set
+# `pipefail` — under `set -o pipefail` that SIGPIPE would turn a match into a
+# failed pipeline. Capturing first keeps the pattern pipefail-safe, and it also
+# means one assertion greps one snapshot instead of re-reading logcat mid-write.
+assert_phone_logged() {
+    local needle=$1 label=$2 dump
+    dump=$(adb logcat -d 2>/dev/null || true)
+    if grep -qF "$needle" <<< "$dump"; then
+        echo "✅ ${label}"
+        return 0
+    fi
+    echo "❌ ERROR (${label}): the phone never logged '${needle}'."
+    echo "---- caller-context lines in the phone log ----"
+    grep -F 'caller context' <<< "$dump" || true
+    exit 1
+}
+
+# caller_context_tokens <label>: per-phase context values in CTX_SERVICE,
+# CTX_PROCESS, CTX_REQUEST_ID and CTX_CLI.
+#
+# The tokens are phase-unique ASCII with no control characters, so neither
+# sanitiser (Rust on the Client, ContextSanitizer on the phone) can rewrite them
+# and a logcat line from an earlier phase cannot satisfy this phase's assertion.
+#
+# `process_name` needs the copy: the daemon prefers the kernel's view of the
+# caller (`/proc/<pid>/exe`) and falls back to the Client's self-report only when
+# it cannot read it (tapauthd/src/caller_context.rs:97-100), so the two branches
+# disagree for one and the same request — dev mode reads the real binary name,
+# the shipped unit (no CAP_SYS_PTRACE) uses the self-report. Invoking a copy of
+# the CLI named after the token makes both branches yield the token: the copy's
+# `exe` basename is the token, and the same token travels as `--process-name`.
+caller_context_tokens() {
+    local label=$1
+    CTX_SERVICE="e2e-ctx-${label}"
+    CTX_PROCESS="e2e-ctx-proc-${label}"
+    CTX_REQUEST_ID="e2e-ctx-${label}-$$"
+    CTX_CLI="${TEST_DIR}/${CTX_PROCESS}"
+    cp -f "$CLI_BIN" "$CTX_CLI"
+    chmod +x "$CTX_CLI"
+}
+
+# caller_context_preview_checkable: whether `command_preview` can be non-empty at
+# all for this run.
+#
+# The daemon derives it from `/proc/<caller>/cmdline`, which needs ptrace access
+# to a process of another UID. The shipped unit runs as `tapauthd` and states
+# "CAP_SYS_PTRACE is deliberately absent" (systemd/tapauthd.service), so under
+# systemd mode — the CI configuration — the daemon legitimately sends an empty
+# preview for a root caller and there is nothing to assert. In dev mode this
+# script starts the daemon as itself, so the read succeeds.
+caller_context_preview_checkable() {
+    local daemon_user daemon_uid
+    if [ "$E2E_DAEMON_MODE" = "dev" ]; then
+        return 0
+    fi
+    daemon_user=$(systemctl show -p User --value tapauthd.service 2>/dev/null || true)
+    # Older systemctl ignores --value and prints `User=<name>`.
+    daemon_user=${daemon_user#User=}
+    # No answer means the unit is not the one this suite installs, so the
+    # daemon's identity is unknown: skip rather than guess.
+    [ -n "$daemon_user" ] || return 1
+    daemon_uid=$(id -u "$daemon_user" 2>/dev/null) || return 1
+    [ "$daemon_uid" = "$(id -u)" ]
+}
+
+# assert_caller_context_delivered <label> <pam_service> <process_name> <preview_argv>
+#
+# One assertion per field, so a failure names the field that did not arrive.
+# <preview_argv> is the argv prefix the phone must show as `command_preview`; the
+# daemon truncates that field to 128 bytes, so it is matched as a prefix.
+assert_caller_context_delivered() {
+    local label=$1 service=$2 process=$3 preview=$4
+    assert_phone_logged "pamService=${service}," \
+        "${label}: the phone received pam_service='${service}'"
+    assert_phone_logged "processName=${process}," \
+        "${label}: the phone received process_name='${process}'"
+    if ! caller_context_preview_checkable; then
+        echo "ℹ️  ${label}: command_preview is NOT asserted in this daemon mode."
+        echo "    The daemon runs as a different uid without CAP_SYS_PTRACE, so it cannot"
+        echo "    read /proc/<caller>/cmdline and sends an empty preview by design"
+        echo "    (systemd/tapauthd.service; tapauthd/src/caller_context.rs:104-108)."
+        echo "    A dev-mode run (TAPAUTH_E2E_DAEMON_MODE=dev) asserts it."
+        return 0
+    fi
+    assert_phone_logged "commandPreview=${preview}" \
+        "${label}: the phone received command_preview beginning '${preview}'"
+}
 
 # Step 6: Phase 2 - Local Network (UDP) Authentication
 echo ""
@@ -1790,7 +1909,13 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 echo "==> Requesting authentication for user '$TEST_USER'..."
-UDP_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
+# The request carries a protocol-v2 caller context so the phone-side assertions
+# below have something to check (see the caller-context helpers above). The
+# request id is passed explicitly because it also appears in the expected
+# command preview.
+caller_context_tokens "udp"
+UDP_AUTH_OUTPUT=$("$CTX_CLI" pam-auth "$TEST_USER" 20 "$CTX_REQUEST_ID" \
+    --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS" || true)
 echo "$UDP_AUTH_OUTPUT"
 
 if echo "$UDP_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
@@ -1804,6 +1929,13 @@ else
     fi
     exit 1
 fi
+
+# The grant above proves *something* answered; it does not prove the phone ever
+# received the caller context, which is what protocol v2 added. Assert the three
+# fields on the phone itself, over this (UDP-only) transport.
+assert_caller_context_delivered "Phase 2 (UDP)" \
+    "$CTX_SERVICE" "$CTX_PROCESS" \
+    "${CTX_CLI} pam-auth ${TEST_USER} 20 ${CTX_REQUEST_ID}"
 
 # Stop capture and take the first captured server grant packet
 CAPTURE_OK=0
@@ -1907,6 +2039,16 @@ if [ "$PAM_TESTABLE" = "true" ]; then
         exit 1
     fi
 
+    # The exit code only says the module returned success. This is the one phase
+    # that exercises the *shipped* caller: libpam loaded into `pamtester`, so it
+    # also has to prove the module projected the caller context onto the wire and
+    # that the phone received it — `pam_service` as libpam spelled it, and
+    # `process_name` as this process's own image (the daemon's kernel view and the
+    # module's self-report agree on that name, so the assertion holds either way).
+    assert_caller_context_delivered "Phase 2b (PAM module)" \
+        "$PAM_SERVICE_NAME" "pamtester" \
+        "pamtester ${PAM_SERVICE_NAME} ${TEST_USER} authenticate"
+
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
     # PAM_AUTHINFO_UNAVAIL is expanded to `ignore` by the [success=1
     # default=ignore] flag below, so it falls through to pam_unix, and a grant
@@ -2003,12 +2145,18 @@ restart_android_app_for_ble() {
 # Authenticate over the currently-configured transport(s), retrying with an app
 # restart a bounded number of times. Returns 0 on success; returns 1 after the
 # final attempt so the caller can dump diagnostics and fail the phase.
+#
+# Optional: `authenticate_with_ble_retry <label> [cli] [extra pam-auth args…]`,
+# so a phase can send a caller context through a copy of the CLI (Phase 3 does;
+# see caller_context_tokens). Without them the behaviour is unchanged.
 authenticate_with_ble_retry() {
     local label="$1"
+    local cli="${2:-$CLI_BIN}"
+    local -a extra=("${@:3}")
     local attempt output
     for ((attempt = 1; attempt <= BLE_MAX_ATTEMPTS; attempt++)); do
         echo "==> ${label}: BLE authentication attempt ${attempt}/${BLE_MAX_ATTEMPTS}..."
-        output=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
+        output=$("$cli" pam-auth "$TEST_USER" 30 "${extra[@]}" || true)
         echo "$output"
         if echo "$output" | grep -q 'OUTCOME=SUCCESS'; then
             return 0
@@ -2192,7 +2340,11 @@ echo "==> Setting transport config: BLE enabled, UDP disabled..."
 
 LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
+# The same protocol-v2 caller context as Phase 2, now carried over BLE (UDP is
+# switched off above, so a phone-side line here can only have arrived over BLE).
+caller_context_tokens "ble"
+if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication" "$CTX_CLI" \
+    "$CTX_REQUEST_ID" --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS"; then
     # UDP is switched off above, so `OUTCOME=SUCCESS` alone does not prove BLE did
     # anything — it only proves *something* satisfied the request. The daemon names
     # the transport that carried the grant, and this phase requires it to say Ble:
@@ -2201,6 +2353,9 @@ if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
     sleep 1
     assert_log_since "$LOG_BASE" "Authentication granted over Ble" \
         "Daemon reports the grant was delivered over BLE"
+    assert_caller_context_delivered "Phase 3 (BLE)" \
+        "$CTX_SERVICE" "$CTX_PROCESS" \
+        "${CTX_CLI} pam-auth ${TEST_USER} 30 ${CTX_REQUEST_ID}"
     echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
 else
     echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."

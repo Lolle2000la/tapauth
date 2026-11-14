@@ -278,6 +278,203 @@ class TapAuthCryptoTest {
         }
     }
 
+    // ========== Algorithm suite 2: ChaCha20-Poly1305 + BLAKE3 ==========
+    //
+    // Suite 1 (AES-256-GCM + SHA-256) is what every test above exercises. The Rust layer
+    // implements both (`shared/src/crypto/encryption.rs:95` dispatches on the negotiated
+    // algorithm, `shared/src/crypto/temporal.rs:43` on the negotiated hash), so suite 2 is
+    // reachable through this surface and has to work through it too.
+
+    @Test
+    fun testChaCha20GrantRoundTripsAndDeclaresSuite2OnTheWire() {
+        val csk = csk()
+        val challenge = ByteArray(32) { (it + 64).toByte() }
+
+        val packet = createSuite2Grant(generateKeypair(), challenge, csk)
+
+        // The header is what a peer dispatches on. An AEAD that encrypts with
+        // ChaCha20-Poly1305 but writes AES-256-GCM into field 2 would still round-trip
+        // locally and then fail against every Client that trusts the header.
+        assertEquals(
+            "A suite-2 grant must declare CHACHA20_POLY1305 in EncryptedPacket field 2",
+            SYMMETRIC_CHACHA20_POLY1305,
+            packet[encryptionAlgorithmOffset(packet)].toInt(),
+        )
+
+        // The identifier is derived with the *negotiated* hash, so a suite-2 packet carries
+        // keyed BLAKE3. A BLAKE3 Client whose identifier came back as the HMAC-SHA256 value
+        // would never match its own pre-computed identifiers.
+        val window = currentTimeWindow()
+        val identifier = extractTemporalIdentifier(packet)
+        val candidates = listOf(window, window - 1)
+        assertTrue(
+            "A suite-2 packet's temporal identifier must be the keyed BLAKE3 of the current or previous window",
+            candidates.any {
+                generateTemporalIdentifier(csk, it, HASH_BLAKE3).contentEquals(identifier)
+            },
+        )
+        assertTrue(
+            "The BLAKE3 identifier must not be the HMAC-SHA256 one for either candidate window",
+            candidates.none {
+                generateTemporalIdentifier(csk, it, HASH_SHA256).contentEquals(identifier)
+            },
+        )
+
+        val wrapper = decryptEncryptedPacket(packet, csk, SYMMETRIC_CHACHA20_POLY1305)
+        assertEquals(
+            "The decrypted suite-2 grant must still be a grant",
+            "AUTH_GRANT",
+            determineMessageType(wrapper),
+        )
+        assertTrue(
+            "The signed suite-2 grant payload must contain the raw challenge",
+            indexOfSubsequence(wrapper, challenge) >= 0,
+        )
+    }
+
+    @Test
+    fun testChaCha20DenialRoundTripsUnderSuite2() {
+        val csk = csk()
+        val server = generateKeypair()
+        val challenge = ByteArray(32) { (it + 3).toByte() }
+
+        // The denial builder is a separate exported entry point, so it can hard-code suite 1
+        // while the grant builder honours the negotiated one.
+        val packet =
+            createDenialWrapperMessage(
+                challenge,
+                "Denied on device",
+                server[0],
+                csk,
+                SYMMETRIC_CHACHA20_POLY1305,
+                HASH_BLAKE3,
+            )
+        assertEquals(
+            "A suite-2 denial must declare CHACHA20_POLY1305 in EncryptedPacket field 2",
+            SYMMETRIC_CHACHA20_POLY1305,
+            packet[encryptionAlgorithmOffset(packet)].toInt(),
+        )
+
+        val wrapper = decryptEncryptedPacket(packet, csk, SYMMETRIC_CHACHA20_POLY1305)
+        assertEquals(
+            "The decrypted suite-2 denial must still be a denial",
+            "AUTH_DENIAL",
+            determineMessageType(wrapper),
+        )
+        assertTrue(
+            "The suite-2 denial must carry the challenge it denies",
+            indexOfSubsequence(wrapper, challenge) >= 0,
+        )
+        assertTrue(
+            "The suite-2 denial must carry the reason the Client forwards",
+            indexOfSubsequence(wrapper, "Denied on device".toByteArray(Charsets.UTF_8)) >= 0,
+        )
+    }
+
+    @Test
+    fun testSuite1CiphertextIsRejectedAsSuite2AndViceVersa() {
+        val csk = csk()
+        val server = generateKeypair()
+        val challenge = ByteArray(32) { (it + 96).toByte() }
+
+        val suite1 = createGrant(server, challenge, csk)
+        val suite2 = createSuite2Grant(server, challenge, csk)
+
+        // The header-vs-pinned comparison runs before any AEAD work
+        // (`shared/src/ffi/ops.rs:297`), so a peer cannot talk the phone down to the
+        // algorithm it prefers. The detail is pinned because a *tag* failure would also be a
+        // `Security` error: only the message distinguishes the downgrade check from it.
+        val downgrade =
+            assertThrows(TapauthException.Security::class.java) {
+                decryptEncryptedPacket(suite1, csk, SYMMETRIC_CHACHA20_POLY1305)
+            }
+        assertTrue(
+            "An AES-256-GCM packet presented as suite 2 must fail the pinned-algorithm check, got: ${downgrade.detail}",
+            downgrade.detail.contains("does not match the negotiated algorithm"),
+        )
+        assertThrows(TapauthException.Security::class.java) {
+            decryptEncryptedPacket(suite2, csk, SYMMETRIC_AES_256_GCM)
+        }
+
+        // UNSPECIFIED is not a wildcard: asking for it must not fall back to a default
+        // algorithm, which would turn a malformed persisted record into an accepted packet.
+        assertThrows(TapauthException.Argument::class.java) {
+            decryptEncryptedPacket(suite2, csk, 0)
+        }
+    }
+
+    @Test
+    fun testChaCha20TamperedCiphertextIsRejected() {
+        val csk = csk()
+        val packet = createSuite2Grant(generateKeypair(), ByteArray(32), csk)
+        val body = ciphertextRange(packet)
+
+        // The body is `nonce(12) || ciphertext || tag(16)`, so its midpoint is real
+        // ciphertext. Flipping a *header* byte instead would only prove the AAD is bound.
+        val middle = body.first + body.count() / 2
+        val tampered = packet.copyOf().also { it[middle] = (it[middle].toInt() xor 0x01).toByte() }
+        assertThrows(TapauthException.Security::class.java) {
+            decryptEncryptedPacket(tampered, csk, SYMMETRIC_CHACHA20_POLY1305)
+        }
+    }
+
+    @Test
+    fun testChaCha20TamperedTemporalIdentifierIsRejectedByTheAad() {
+        val csk = csk()
+        val packet = createSuite2Grant(generateKeypair(), ByteArray(32), csk)
+
+        val temporalId = extractTemporalIdentifier(packet)
+        val offset = indexOfSubsequence(packet, temporalId)
+        assertTrue("temporal_identifier must be embedded verbatim in the packet", offset >= 0)
+
+        // The suite-2 AAD is `"tapauth-pkt-v2" || be32(2) || be16(16) || temporal_identifier`
+        // (`shared/src/crypto/encryption.rs:137`), so a tampered identifier must fail the
+        // Poly1305 tag even though the algorithm header still matches what the caller pinned.
+        val tampered =
+            packet.copyOf().also { it[offset + 2] = (it[offset + 2].toInt() xor 0x01).toByte() }
+        assertFalse(
+            "The tampered packet must carry a different temporal_identifier",
+            temporalId.contentEquals(extractTemporalIdentifier(tampered)),
+        )
+        assertThrows(TapauthException.Security::class.java) {
+            decryptEncryptedPacket(tampered, csk, SYMMETRIC_CHACHA20_POLY1305)
+        }
+    }
+
+    @Test
+    fun testChaCha20PacketsForTheSameInputsUseFreshNonces() {
+        val csk = csk()
+        val server = generateKeypair()
+        val challenge = ByteArray(32) { (it + 17).toByte() }
+
+        // Both packets must be built inside one window, otherwise the differing temporal
+        // identifiers would make the packets differ for the wrong reason.
+        val (first, second) = twoSuite2GrantsInOneWindow(csk, server, challenge)
+
+        val firstBody = ciphertextRange(first)
+        val secondBody = ciphertextRange(second)
+        assertEquals(
+            "Two packets for the same plaintext must be the same size",
+            firstBody.count(),
+            secondBody.count(),
+        )
+        // Both packets must carry the identical plaintext, otherwise differing ciphertext
+        // bodies would prove nothing about the nonce.
+        assertArrayEquals(
+            "The two packets must encrypt the same plaintext",
+            decryptEncryptedPacket(first, csk, SYMMETRIC_CHACHA20_POLY1305),
+            decryptEncryptedPacket(second, csk, SYMMETRIC_CHACHA20_POLY1305),
+        )
+        // A reused nonce under the same key is the ChaCha20-Poly1305 catastrophic failure:
+        // the two ciphertext bodies (nonce || ciphertext || tag) would be byte-identical.
+        assertFalse(
+            "Two suite-2 packets for the same plaintext must use fresh nonces",
+            first
+                .copyOfRange(firstBody.first, firstBody.last + 1)
+                .contentEquals(second.copyOfRange(secondBody.first, secondBody.last + 1)),
+        )
+    }
+
     // ========== Temporal identifiers ==========
 
     @Test
@@ -663,6 +860,82 @@ class TapAuthCryptoTest {
             HASH_SHA256,
         )
 
+    /** A grant under algorithm suite 2: ChaCha20-Poly1305 + keyed BLAKE3. */
+    private fun createSuite2Grant(server: List<ByteArray>, challenge: ByteArray, csk: ByteArray) =
+        createGrantWrapperMessage(
+            challenge,
+            server[0],
+            csk,
+            SYMMETRIC_CHACHA20_POLY1305,
+            HASH_BLAKE3,
+        )
+
+    /**
+     * Two suite-2 grants built from identical inputs inside one 60-second window.
+     *
+     * The window is re-read after both builds and the pair rebuilt when it rolled over, so a caller
+     * comparing the two packets is never comparing different windows by accident.
+     */
+    private fun twoSuite2GrantsInOneWindow(
+        csk: ByteArray,
+        server: List<ByteArray>,
+        challenge: ByteArray,
+    ): Pair<ByteArray, ByteArray> {
+        repeat(3) {
+            val first = createSuite2Grant(server, challenge, csk)
+            val second = createSuite2Grant(server, challenge, csk)
+            val firstId = extractTemporalIdentifier(first)
+            val secondId = extractTemporalIdentifier(second)
+            if (firstId.contentEquals(secondId)) return first to second
+        }
+        throw AssertionError("the 60-second window rolled over on every attempt")
+    }
+
+    /**
+     * The byte range of `EncryptedPacket.ciphertext`'s payload.
+     *
+     * `EncryptedPacket` serialises in field order (`proto/auth_protocol.proto`): field 1 the
+     * 16-byte `temporal_identifier`, field 2 the `encryption_algorithm` varint, field 3 the
+     * length-delimited `ciphertext`. The field-3 tag and the length are asserted against the packet
+     * rather than assumed, so a layout change fails here instead of silently pointing a tamper test
+     * at a header byte it did not mean to touch.
+     */
+    private fun ciphertextRange(packet: ByteArray): IntRange {
+        val algorithmOffset = encryptionAlgorithmOffset(packet)
+        val (_, algorithmVarintLength) = readVarint(packet, algorithmOffset)
+        val tagOffset = algorithmOffset + algorithmVarintLength
+        assertEquals(
+            "EncryptedPacket field 3 tag (length-delimited ciphertext)",
+            0x1A,
+            packet[tagOffset].toInt(),
+        )
+        val (length, lengthVarintLength) = readVarint(packet, tagOffset + 1)
+        val start = tagOffset + 1 + lengthVarintLength
+        assertEquals(
+            "ciphertext must be the last field, running to the end of the packet",
+            packet.size,
+            start + length,
+        )
+        // `nonce(12) || ciphertext || tag(16)` at minimum.
+        assertTrue("the ciphertext must carry a body beyond nonce and tag", length > 28)
+        return start until (start + length)
+    }
+
+    /** Read the LEB128 varint at [offset] as its value and its byte length. */
+    private fun readVarint(packet: ByteArray, offset: Int): Pair<Int, Int> {
+        var value = 0
+        var shift = 0
+        var cursor = offset
+        while (cursor < packet.size && shift <= 28) {
+            val byte = packet[cursor].toInt() and 0xFF
+            value = value or ((byte and 0x7F) shl shift)
+            cursor += 1
+            if (byte and 0x80 == 0) return value to (cursor - offset)
+            shift += 7
+        }
+        throw AssertionError("no complete varint at offset $offset")
+    }
+
     private fun createSession(sessionId: ByteArray, ed25519PrivateKey: ByteArray): PairingSession =
         PairingSession(sessionId, ed25519PrivateKey, SERVER_DEVICE_NAME)
 
@@ -730,6 +1003,9 @@ private const val SYMMETRIC_CHACHA20_POLY1305 = 2
 
 /** `HashAlgorithm.SHA256` (`proto/auth_protocol.proto`). */
 private const val HASH_SHA256 = 1
+
+/** `HashAlgorithm.BLAKE3` (`proto/auth_protocol.proto`). */
+private const val HASH_BLAKE3 = 2
 
 /**
  * `SignatureAlgorithm.ED25519` (`proto/auth_protocol.proto`), spelled once as the fourth parser

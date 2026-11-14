@@ -109,9 +109,6 @@
     <string name="settings_allow_background_dialog_message">Damit TapAuth auf Authentifizierungsanfragen reagieren kann, während die App geschlossen ist, erlauben Sie bitte, dass die App von Akku-Optimierungen ausgeschlossen wird. Sie werden zum Systemeinstellungsbildschirm weitergeleitet.</string>
     <string name="settings_footer">TapAuth – Sichere biometrische Authentifizierung</string>
     <string name="settings_app_version">App-Version</string>
-    <string name="settings_protocol_version">Protokoll-Version</string>
-    <string name="settings_encryption">Verschlüsselung</string>
     <string name="settings_key_exchange">Schlüsselaustausch</string>
-    <string name="settings_signing">Signierung</string>
     <string name="settings_never">nie</string>
 </resources>

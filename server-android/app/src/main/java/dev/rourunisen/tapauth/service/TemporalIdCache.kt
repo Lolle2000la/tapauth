@@ -52,17 +52,21 @@ class TemporalIdCache(
         val hashAlgorithm: Int,
     )
 
+    /**
+     * Stable instance, so [stop] can unregister exactly this observer: the device-change registry
+     * holds one listener per transport and cannot be cleared wholesale from here.
+     */
+    private val devicesChangedListener: () -> Unit = { scope.launch { refreshDeviceList() } }
+
     fun start() {
         stop()
-        DeviceRepository.setOnDevicesChangedListener {
-            scope.launch { refreshDeviceList() }
-        }
+        DeviceRepository.addOnDevicesChangedListener(devicesChangedListener)
         scope.launch { refreshDeviceList() }
         Log.d(TAG, "Started temporal ID cache")
     }
 
     fun stop() {
-        DeviceRepository.setOnDevicesChangedListener(null)
+        DeviceRepository.removeOnDevicesChangedListener(devicesChangedListener)
         validIds.clear()
         cachedDevices = emptyList()
         lastComputedWindow = -1
