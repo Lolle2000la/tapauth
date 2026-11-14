@@ -1,0 +1,103 @@
+Compiled from "TapAuthCrypto.kt"
+public final class dev.rourunisen.tapauth.crypto.TapAuthCrypto {
+  public static final dev.rourunisen.tapauth.crypto.TapAuthCrypto INSTANCE;
+    descriptor: Ldev/rourunisen/tapauth/crypto/TapAuthCrypto;
+  public static final int SYMMETRIC_AES_256_GCM;
+    descriptor: I
+  public static final int HASH_SHA256;
+    descriptor: I
+  public static final int SIGNATURE_ED25519;
+    descriptor: I
+  public static final int PAIRING_ABORT_USER_REJECTED_SAS;
+    descriptor: I
+  public static final int PAIRING_ABORT_KEY_MISMATCH;
+    descriptor: I
+  public static final int PAIRING_ABORT_UNSUPPORTED_ALGORITHM;
+    descriptor: I
+  public static final int PAIRING_ABORT_PROTOCOL_ERROR;
+    descriptor: I
+  public static final int PAIRING_ABORT_SESSION_EXPIRED;
+    descriptor: I
+  public static final int $stable;
+    descriptor: I
+  private dev.rourunisen.tapauth.crypto.TapAuthCrypto();
+    descriptor: ()V
+
+  private final native void initLogging();
+    descriptor: ()V
+
+  public final native byte[][] generateKeypair();
+    descriptor: ()[[B
+
+  public final native byte[] decryptEncryptedPacket(byte[], byte[], int);
+    descriptor: ([B[BI)[B
+
+  public final native byte[] extractTemporalIdentifier(byte[]);
+    descriptor: ([B)[B
+
+  public final native java.lang.String determineMessageType(byte[]);
+    descriptor: ([B)Ljava/lang/String;
+
+  public final native dev.rourunisen.tapauth.crypto.ParsedAuthRequest parseAndVerifyAuthRequest(byte[], byte[], int, int);
+    descriptor: ([B[BII)Ldev/rourunisen/tapauth/crypto/ParsedAuthRequest;
+
+  public final native byte[] parseAndVerifyGrantConfirmation(byte[], byte[], int, int);
+    descriptor: ([B[BII)[B
+
+  public final native byte[] parseAndVerifyAuthCancel(byte[], byte[], int, int);
+    descriptor: ([B[BII)[B
+
+  public final native byte[] createGrantWrapperMessage(byte[], byte[], byte[], int, int);
+    descriptor: ([B[B[BII)[B
+
+  public final native byte[] createDenialWrapperMessage(byte[], java.lang.String, byte[], byte[], int, int);
+    descriptor: ([BLjava/lang/String;[B[BII)[B
+
+  public final native byte[] generateTemporalIdentifier(byte[], long, int);
+    descriptor: ([BJI)[B
+
+  public final native byte[] generateBleTemporalIdentifier(byte[], long, int);
+    descriptor: ([BJI)[B
+
+  public final native long currentTimeWindow();
+    descriptor: ()J
+
+  public final native boolean verifyTemporalIdentifier(byte[], byte[], int);
+    descriptor: ([B[BI)Z
+
+  public final native byte[] deriveBlePairingAdvId(byte[], byte[]);
+    descriptor: ([B[B)[B
+
+  public final native long pairingServerSessionCreate(byte[], byte[], java.lang.String);
+    descriptor: ([B[BLjava/lang/String;)J
+
+  public final native void pairingServerSessionFree(long);
+    descriptor: (J)V
+
+  public final native byte[] pairingCreateInit(long);
+    descriptor: (J)[B
+
+  public final native dev.rourunisen.tapauth.crypto.ParsedPairingResponse pairingVerifyResponse(long, byte[], byte[]);
+    descriptor: (J[B[B)Ldev/rourunisen/tapauth/crypto/ParsedPairingResponse;
+
+  public final native dev.rourunisen.tapauth.crypto.ParsedPairingProvision pairingProcessConfirmClient(long, byte[]);
+    descriptor: (J[B)Ldev/rourunisen/tapauth/crypto/ParsedPairingProvision;
+
+  public final native byte[] pairingCreateConfirmServer(long, byte[]);
+    descriptor: (J[B)[B
+
+  public final native byte[] pairingCreateAbort(long, int);
+    descriptor: (JI)[B
+
+  public final native boolean pairingVerifyAbort(long, byte[]);
+    descriptor: (J[B)Z
+
+  public final native byte[] pairingCreateKeepalive(long);
+    descriptor: (J)[B
+
+  public final native byte[] pairingPacketSessionId(byte[]);
+    descriptor: ([B)[B
+
+  static {};
+    descriptor: ()V
+}

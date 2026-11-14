@@ -132,6 +132,16 @@ jobs:
       - name: Check JNI surface matches between Kotlin and Rust
         run: ./scripts/ci/check-jni-surface.sh
 
+      # The C ABI these two sides share carries no types: a `jlong` implemented
+      # as `jint`, or two same-typed parameters swapped in Rust, still compiles,
+      # still links, and still passes the name check above — it is undefined
+      # behaviour on the device. This compares each Rust parameter list and
+      # return type against the Kotlin declaration's JVM descriptor, which is in
+      # turn pinned to real `javap` output by a checked-in fixture because this
+      # job has no Android toolchain and cannot compile Kotlin.
+      - name: Check JNI signatures match between Kotlin and Rust
+        run: ./scripts/ci/check-jni-signatures.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
