@@ -1,6 +1,7 @@
 package dev.rourunisen.tapauth.network
 
 import android.util.Log
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 
 /**
@@ -136,9 +137,52 @@ internal interface PairingConfirmationCrypto {
 
     /**
      * Conclude the session: zeroize the directional keys, the transcript hash and the ephemeral
-     * X25519 secret. Every later call reports `State`. Idempotent.
+     * X25519 secret. Every later call reports `State`. Idempotent, **including after a concurrent
+     * release closed the session** — see [LiveConfirmationCrypto.conclude].
      */
     fun conclude()
+}
+
+/**
+ * Adapts the live Rust pairing session onto [PairingConfirmationCrypto].
+ *
+ * The session is resolved per call rather than captured, because the object only exists between
+ * `prepareSession` and the release.
+ *
+ * [conclude] is deliberately not a plain delegation. The generated UniFFI object is ref-counted and
+ * `close()` drops the last reference, after which every call throws `IllegalStateException("…
+ * object has already been destroyed")`. The release runs on another thread (a back press,
+ * `onCleared`, a configuration change), so a completion that is already in its `finally` can find
+ * the object closed under it. That is the close winning — the session is concluded and gone, which
+ * is the whole of what this call asks for — so it must not replace the phase's result: an exception
+ * escaping there turns a cancellation (`finish` returning null) into `PairingUpdate.Failed` for a
+ * pairing the user ended themselves.
+ */
+internal class LiveConfirmationCrypto(
+    private val buildConfirmation: (csk: ByteArray) -> ByteArray,
+    private val decryptConfirmation: (packet: ByteArray) -> ByteArray?,
+    private val concludeSession: () -> Unit,
+) : PairingConfirmationCrypto {
+    private companion object {
+        /** The session's own tag: this is its conclusion path. */
+        const val TAG = "PairingSession"
+    }
+
+    override fun createConfirmServer(csk: ByteArray): ByteArray = buildConfirmation(csk)
+
+    override fun processConfirmClient(packet: ByteArray): ByteArray? = decryptConfirmation(packet)
+
+    override fun conclude() {
+        try {
+            concludeSession()
+        } catch (e: IllegalStateException) {
+            // The generated wrapper's only `IllegalStateException` from this call is the
+            // destroyed/call-counter one: the release concluded and closed the session already, so
+            // there is nothing left to zeroize. Rust errors arrive as `TapauthException` and still
+            // reach the caller.
+            Log.d(TAG, "Pairing session was already released: ${e.message}")
+        }
+    }
 }
 
 /**
@@ -154,15 +198,22 @@ internal interface PairingConfirmationCrypto {
  * committing yet", a commit can observe "not closed yet", and both proceed. The close then cancels
  * the session's coroutine while `persist()` is suspended, so the device is on disk with no
  * `PairingConfirmServer` behind it — the phone is paired and the desktop times out retrying into a
- * socket this side already closed. Hence one lock over one three-state field:
+ * socket this side already closed. Hence one lock over one four-state field:
  * ```
- * Open --beginCommit()--> Committed   (a close is deferred; the confirmation runs to its end)
+ * Open --beginCommit()--> Committed --completeCommit()--> Completed
+ *                          (a close is deferred)          (a close releases)
  * Open --requestClose()-> Closed      (a later beginCommit() is refused: nothing happens)
+ * Committed/Completed --requestClose()-> Closed
  * ```
  *
- * Both outcomes are terminal, so the two transitions can never both succeed. `requestClose()` after
- * the commit keeps answering "deferred", and `beginCommit()` after a deferred close keeps answering
- * "the close did not win": neither transition can be undone by the other.
+ * The deferral is bounded by the confirmation, not permanent: while [State.Committed] the
+ * `PairingConfirmServer` burst and the linger that answers the desktop's retransmissions are still
+ * running, so cutting the coroutine there is what loses the pairing. Once the confirmation is over
+ * ([completeCommit], reached from `finally` so a burst that throws ends it too) there is nothing
+ * left to protect, so a close releases like it does before the commit — otherwise a close arriving
+ * after a finished pairing would be answered "deferred" forever and nothing would ever cancel the
+ * coroutine that owns the transports. A close that won the boundary keeps `beginCommit` refused and
+ * a deferred close keeps the commit standing: neither transition can be undone by the other.
  */
 internal class PairingCommitLatch {
     private enum class State {
@@ -171,6 +222,9 @@ internal class PairingCommitLatch {
 
         /** The device record is being written; the confirmation must finish. */
         Committed,
+
+        /** The confirmation finished; the commit no longer defers a close. */
+        Completed,
 
         /** The session is being released; nothing may be persisted or sent. */
         Closed,
@@ -190,10 +244,22 @@ internal class PairingCommitLatch {
         synchronized(lock) {
             if (state == State.Closed) false
             else {
-                state = State.Committed
+                if (state == State.Open) state = State.Committed
                 true
             }
         }
+
+    /**
+     * The confirmation is over: the commit is no longer in flight.
+     *
+     * Called from a `finally`, so a burst that throws also ends the deferral. It only moves
+     * [State.Committed] on; a close that won the boundary stays won.
+     */
+    fun completeCommit() {
+        synchronized(lock) {
+            if (state == State.Committed) state = State.Completed
+        }
+    }
 
     /**
      * Ask to release the session.
@@ -201,7 +267,7 @@ internal class PairingCommitLatch {
      * @return true when the close is **deferred** — a commit is in flight, so the confirmation
      *   burst and linger must still run and the session releases itself afterwards; false when the
      *   close may release now, either because it won the boundary just now (nothing was or will be
-     *   persisted) or because it had already won
+     *   persisted), because it had already won, or because the confirmation has completed
      */
     fun requestClose(): Boolean =
         synchronized(lock) {
@@ -211,6 +277,10 @@ internal class PairingCommitLatch {
                     false
                 }
                 State.Committed -> true
+                State.Completed -> {
+                    state = State.Closed
+                    false
+                }
                 State.Closed -> false
             }
         }
@@ -229,6 +299,9 @@ internal class PairingCommitLatch {
  * `PairingViewModel.releaseSession()` acts on. Getting it wrong either way undoes finding F: a
  * deferred close answered `false` cancels the attempt scope mid-confirmation (the phone persists
  * and the desktop times out), and a close that won answered `true` leaks a session with no screen.
+ * A close that arrives once the confirmation has completed (`PairingCommitLatch.completeCommit`)
+ * releases like any other: the latch no longer reports a deferral, so there is no state in which a
+ * finished session answers "deferred" and keeps its transports for the life of the process.
  *
  * [onRelease] runs at most once, because a repeat close finds nothing left to release.
  */
@@ -266,6 +339,112 @@ internal class PairingSessionRelease(
                     false
                 }
             }
+        }
+}
+
+/**
+ * The lifecycle seam of one pairing: whether it is closed, when a close may release, and the one
+ * release that follows.
+ *
+ * `PairingSession` cannot be constructed from a JVM test — it needs an Android `Context`, a running
+ * transport and the generated UniFFI object — so the composition it ships lives here, with the two
+ * side effects injected: [onClose] (cancel the coroutine and close the transports) and [zeroize]
+ * (conclude and drop the Rust session, clear the handshake buffers). `PairingSession` delegates
+ * every lifecycle decision to this object:
+ *
+ * * [close], the release decision [PairingSessionRelease] owns on top of [PairingCommitLatch];
+ * * [isClosed], the flag every wait loop reads and the confirmation linger is handed as `isClosed`;
+ * * [beginCommit] / [completeCommit], the boundary the confirmation phase is gated on;
+ * * [zeroizeEphemeralState], which the success path and the release path both reach and which
+ *   therefore runs [zeroize] exactly once.
+ *
+ * [finish] is part of the seam on purpose: it hands [PairingConfirmPhase.finish] *this* object's
+ * [beginCommit] and [isClosed] rather than values a caller picked, so a test that drives [finish]
+ * exercises the boundary the production close actually competes with. A test that armed the phase
+ * with `{ true }` (as the phase's own tests do, for their unrelated assertions) would stay green
+ * with the whole boundary unwired.
+ */
+internal class PairingSessionLifecycle(
+    private val onClose: () -> Unit,
+    private val zeroize: () -> Unit,
+) {
+    private val latch = PairingCommitLatch()
+
+    private val closed = AtomicBoolean(false)
+
+    private val zeroized = AtomicBoolean(false)
+
+    /** The release body: stop waiting, tear the transports down, drop the keys. */
+    private val release =
+        PairingSessionRelease(latch) {
+            closed.set(true)
+            onClose()
+            zeroizeEphemeralState()
+        }
+
+    /** True once a close has won the boundary; every wait loop and the linger read it. */
+    fun isClosed(): Boolean = closed.get()
+
+    /**
+     * The commit transition, taken synchronously before anything is written or sent.
+     *
+     * @return false when a close already won the boundary, so nothing may be persisted or sent
+     */
+    fun beginCommit(): Boolean = latch.beginCommit()
+
+    /**
+     * The confirmation is over: from here a close releases instead of deferring to it.
+     *
+     * Idempotent, and it never undoes a close.
+     */
+    fun completeCommit() {
+        latch.completeCommit()
+    }
+
+    /** Run [zeroize] at most once, whether the success path or the release reaches it first. */
+    fun zeroizeEphemeralState() {
+        if (zeroized.compareAndSet(false, true)) zeroize()
+    }
+
+    /**
+     * Ask for the release.
+     *
+     * @return true when it was deferred to the confirmation in flight, false when it ran now (or
+     *   had already run, or the confirmation had completed)
+     */
+    fun close(): Boolean = release.requestClose()
+
+    /**
+     * Run the confirmation phase under this lifecycle's boundary.
+     *
+     * Zeroization runs here rather than around the call, so the Rust session outlives the linger
+     * and a retransmitted `PairingConfirmClient` can still be decrypted; it happens once even
+     * though `runSession`'s epilogue asks again.
+     *
+     * @return what [persist] returned, or null when a close had already won the boundary
+     */
+    suspend fun <T : Any> finish(
+        phase: PairingConfirmPhase,
+        link: PairingLink,
+        csk: ByteArray,
+        burstDelaysMs: List<Long>,
+        persist: suspend () -> T,
+    ): T? =
+        try {
+            phase
+                .finish(
+                    link = link,
+                    csk = csk,
+                    burstDelaysMs = burstDelaysMs,
+                    persist = persist,
+                    beginCommit = ::beginCommit,
+                    isClosed = ::isClosed,
+                )
+                ?.also { zeroizeEphemeralState() }
+        } finally {
+            // From `finally`, so a burst that throws still ends the deferral; a close that won the
+            // boundary keeps it (completeCommit only moves Committed on).
+            completeCommit()
         }
 }
 

@@ -12,16 +12,18 @@ import org.junit.Test
 
 /**
  * The commit/close boundary: either the device record begins to be written and a close defers to
- * the confirmation, or a close wins and nothing is persisted at all. Never both.
+ * the confirmation, or a close wins and nothing is persisted at all. Never both — and once the
+ * confirmation has completed, a close releases again instead of deferring forever.
  *
- * The two transitions are exercised here directly — this class needs no transport, no Android
- * `Context` and no coroutines — and again in [PairingConfirmPhaseTest] through the code that ships.
+ * The transitions are exercised here directly — this class needs no transport, no Android `Context`
+ * and no coroutines — and again in [PairingConfirmPhaseTest] and [PairingSessionLifecycleTest]
+ * through the code that ships.
  */
 class PairingCommitLatchTest {
 
     /**
-     * The commit comes first, so the session must keep running: the close reports "deferred" and
-     * keeps doing so, however often it is asked.
+     * The commit comes first, so the session must keep running: for as long as the confirmation is
+     * in flight the close reports "deferred" and keeps doing so, however often it is asked.
      *
      * The defect this catches: a close that releases anyway when it arrives after the commit — the
      * phone persists the device and cancels the confirmation that would have told the desktop.
@@ -71,6 +73,51 @@ class PairingCommitLatchTest {
         assertFalse("The commit must be refused", latch.beginCommit())
         assertFalse("A repeated close may still release", latch.requestClose())
         assertFalse("The refusal must not be undone", latch.beginCommit())
+    }
+
+    /**
+     * A close that arrives once the confirmation has completed releases like any other: there is no
+     * persist left to protect, so answering "deferred" would leave the session (its coroutine, its
+     * socket, its key entry) with no release path at all — the ViewModel has already dropped the
+     * attempt scope by then.
+     *
+     * The defect this catches: a `Committed` that is permanent. `completeCommit()` without the
+     * release transition, or a `requestClose()` with no `Completed` case, keeps answering
+     * "deferred" for the rest of the session's life, including after the linger finished and the
+     * keys were zeroized.
+     */
+    @Test
+    fun aCloseAfterTheCompletionReleasesInsteadOfDeferring() {
+        val latch = PairingCommitLatch()
+
+        assertTrue("The commit must be allowed to begin", latch.beginCommit())
+        assertTrue("A close during the confirmation must defer", latch.requestClose())
+
+        latch.completeCommit()
+
+        assertFalse("A close after the completion must release", latch.requestClose())
+        assertFalse("A repeated close still reports the release", latch.requestClose())
+        assertFalse(
+            "The close that released also refuses a later commit",
+            latch.beginCommit(),
+        )
+    }
+
+    /**
+     * Completing a commit that never began changes nothing: the close side is still Open, so the
+     * close wins and a later commit is refused.
+     *
+     * The defect this catches: a `completeCommit()` that moves `Open` to `Completed`, which would
+     * make a session that never reached the confirmation refuse its own release.
+     */
+    @Test
+    fun aCompletionWithoutACommitLeavesTheCloseSideIntact() {
+        val latch = PairingCommitLatch()
+
+        latch.completeCommit()
+
+        assertFalse("The close must release", latch.requestClose())
+        assertFalse("The commit must stay refused", latch.beginCommit())
     }
 
     /**

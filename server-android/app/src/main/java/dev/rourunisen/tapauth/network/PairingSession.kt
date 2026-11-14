@@ -16,7 +16,6 @@ import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import dev.rourunisen.tapauth.data.PairingUrl
 import java.io.IOException
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -197,7 +196,15 @@ class PairingSession(
      */
     private val confirmPhase =
         PairingConfirmPhase(
-            crypto = RustConfirmationCrypto(),
+            crypto =
+                LiveConfirmationCrypto(
+                    buildConfirmation = { csk -> requireSession().createConfirmServer(csk) },
+                    // Reuses this session's own decrypt path (and its "not a confirm client"
+                    // handling), so the retransmission predicate and `awaitProvision` cannot
+                    // disagree about a frame.
+                    decryptConfirmation = { packet -> processConfirmClient(packet)?.csk },
+                    concludeSession = { synchronized(sessionLock) { pairingSession }?.conclude() },
+                ),
             frameReader = frameReader,
             completion = completion,
             belongsToSession = ::belongsToSession,
@@ -234,35 +241,25 @@ class PairingSession(
     @Volatile private var stashedPacket: ByteArray? = null
 
     /**
-     * Set once the session must stop waiting for new work: every wait loop reads it to stop, and
-     * [PairingConfirmPhase] passes it to the linger as `isClosed`.
+     * The lifecycle seam: whether the session is closed, the commit/close boundary and the one
+     * release. A close that is deferred (see [close]) deliberately leaves
+     * [PairingSessionLifecycle.isClosed] clear, because the confirmation the desktop is waiting for
+     * is exactly the work that must still happen.
      *
-     * A close that is deferred (see [close]) deliberately leaves it clear: the confirmation the
-     * desktop is waiting for is exactly the work that must still happen.
+     * It is a separate class so a JVM test drives the wiring this class ships — the phase gated on
+     * the latch, the linger reading the closed flag, the release body running once — instead of a
+     * fake restating it; see [PairingSessionLifecycle].
      */
-    private val closed = AtomicBoolean(false)
-
-    /**
-     * The commit/close boundary: either the device record starts being written and a close defers
-     * to the confirmation, or a close wins and nothing is persisted at all. One lock decides, so a
-     * close cannot cancel the coroutine in the middle of `persist()`.
-     */
-    private val commitLatch = PairingCommitLatch()
-
-    /**
-     * The close itself, behind the boundary in [commitLatch]: the Context-free decision
-     * [PairingSessionRelease] owns, testable without an Android `Context`.
-     */
-    private val release =
-        PairingSessionRelease(commitLatch) {
-            // From here on every wait loop stops waiting for new work.
-            closed.set(true)
-            job?.cancel()
-            // Close the transports directly as well: a coroutine parked in a blocking socket read
-            // only notices cancellation after its current slice.
-            closeLinks()
-            zeroizeEphemeralState()
-        }
+    private val lifecycle =
+        PairingSessionLifecycle(
+            onClose = {
+                job?.cancel()
+                // Close the transports directly as well: a coroutine parked in a blocking socket
+                // read only notices cancellation after its current slice.
+                closeLinks()
+            },
+            zeroize = ::zeroizeEphemeralState,
+        )
 
     /** Completed by [approveSas] / [rejectSas]; drives the transition out of the SAS screen. */
     private val userDecision = CompletableDeferred<UserDecision>()
@@ -323,17 +320,25 @@ class PairingSession(
      * Which of the two happens is [PairingCommitLatch]'s decision, taken under its lock, so a close
      * either defers to the whole confirmation or arrives first and prevents all of it; there is no
      * interleaving in which the device is persisted *and* this coroutine is cancelled. The decision
-     * and the release it guards live in [PairingSessionRelease].
+     * and the release it guards live in [PairingSessionLifecycle].
+     *
+     * Once the confirmation has completed the deferral ends with it: the commit is no longer in
+     * flight, so a close releases like any other and there is no state in which a finished session
+     * answers "deferred" and holds its transports for the life of the process. A deferred close
+     * still has a release path before that: the burst delays and the linger are constants, every
+     * receive the linger makes is bounded by what is left of it, and a BLE write is bounded by
+     * `BlePairingClient.WRITE_TIMEOUT_MS`, so the confirmation cannot outlive those bounds and
+     * `runSession`'s epilogue releases the transports and the keys when it ends.
      *
      * @return true when the close was deferred and the session is still finishing its confirmation,
-     *   false when this call may release everything — it won the boundary just now, or had already
-     *   won
+     *   false when this call may release everything — it won the boundary just now, had already
+     *   won, or the confirmation has already completed
      */
-    fun close(): Boolean = release.requestClose()
+    fun close(): Boolean = lifecycle.close()
 
     private suspend fun runSession() {
         try {
-            if (closed.get()) return
+            if (lifecycle.isClosed()) return
             emit(PairingUpdate.Connecting)
             val init = prepareSession()
 
@@ -379,7 +384,7 @@ class PairingSession(
             emitFailure((e as? TapauthException)?.rawMessage() ?: e.message ?: "Pairing failed")
         } finally {
             closeLinks()
-            zeroizeEphemeralState()
+            lifecycle.zeroizeEphemeralState()
         }
     }
 
@@ -607,7 +612,7 @@ class PairingSession(
     private suspend fun awaitApproval(locked: Locked): Approval {
         val deadline = System.currentTimeMillis() + SAS_APPROVAL_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
-            if (closed.get()) return Approval.Cancelled
+            if (lifecycle.isClosed()) return Approval.Cancelled
             if (userDecision.isCompleted) {
                 return when (userDecision.await()) {
                     UserDecision.Approve -> Approval.Approved
@@ -638,7 +643,7 @@ class PairingSession(
         val deadline = System.currentTimeMillis() + CONFIRM_TIMEOUT_MS
 
         while (System.currentTimeMillis() < deadline) {
-            if (closed.get()) return ProvisionOutcome.Cancelled
+            if (lifecycle.isClosed()) return ProvisionOutcome.Cancelled
             if (keepalive != null && System.currentTimeMillis() >= nextKeepalive) {
                 locked.link.send(keepalive)
                 nextKeepalive = System.currentTimeMillis() + KEEPALIVE_INTERVAL_MS
@@ -677,7 +682,7 @@ class PairingSession(
         return try {
             session.createKeepalive()
         } catch (e: TapauthException.State) {
-            if (closed.get() || synchronized(sessionLock) { pairingSession !== session }) {
+            if (lifecycle.isClosed() || synchronized(sessionLock) { pairingSession !== session }) {
                 Log.i(TAG, "PairingKeepalive skipped: the session was released")
                 null
             } else {
@@ -712,9 +717,10 @@ class PairingSession(
     private suspend fun finishPairing(
         locked: Locked,
         provision: ParsedPairingProvision,
-    ): ProvisionOutcome {
-        val device =
-            confirmPhase.finish(
+    ): ProvisionOutcome =
+        lifecycle
+            .finish(
+                phase = confirmPhase,
                 link = locked.link,
                 csk = provision.csk,
                 burstDelaysMs =
@@ -722,51 +728,20 @@ class PairingSession(
                         PairingTransport.UDP -> UDP_CONFIRM_BURST_DELAYS_MS
                         PairingTransport.BLE -> BLE_CONFIRM_BURST_DELAYS_MS
                     },
+                // The commit boundary (and the zeroization after the linger) is the lifecycle's:
+                // it hands the phase its own `beginCommit`/`isClosed`, so a close that already won
+                // refuses the persist outright and a close during the confirmation is deferred.
                 persist = { persistDevice(locked.response, provision) },
-                // The commit boundary: taken before anything is written or sent, so from here on a
-                // close is deferred to the confirmation instead of cancelling it — and a close that
-                // already won refuses this outright.
-                beginCommit = { commitLatch.beginCommit() },
-                isClosed = { closed.get() },
             )
-                // A close reached the boundary first, so nothing was persisted and nothing was
-                // sent. `Cancelled` is what every other "the session was released" path in this
-                // class reports (`awaitApproval`, `awaitProvision`), so the UI treats it the same.
-                ?: return ProvisionOutcome.Cancelled
+            // A close reached the boundary first, so nothing was persisted and nothing was sent.
+            // `Cancelled` is what every other "the session was released" path in this class reports
+            // (`awaitApproval`, `awaitProvision`), so the UI treats it the same.
+            ?.let { ProvisionOutcome.Completed(it) } ?: ProvisionOutcome.Cancelled
 
-        // Deferred until the linger is over so a retransmitted PairingConfirmClient can still be
-        // decrypted. `PairingUpdate.Complete` is what tells the UI the attempt succeeded, and the
-        // screen does not own the session — a disposed composition leaves it running, while the
-        // next `beginPairing` or the ViewModel's `onCleared` is what closes it — so an update sent
-        // early would let the user end the attempt while the linger is still answering.
-        zeroizeEphemeralState()
-        return ProvisionOutcome.Completed(device)
-    }
-
-    /**
-     * Adapts the live Rust session onto [PairingConfirmationCrypto], so the confirmation phase can
-     * be driven by a unit test that cannot load `libshared.so`.
-     *
-     * Every call resolves the session at call time rather than capturing it: the Rust object only
-     * exists after [prepareSession], and [zeroizeEphemeralState] swaps it to null.
-     */
-    private inner class RustConfirmationCrypto : PairingConfirmationCrypto {
-        override fun createConfirmServer(csk: ByteArray): ByteArray =
-            requireSession().createConfirmServer(csk)
-
-        override fun processConfirmClient(packet: ByteArray): ByteArray? =
-            // Reuses the phase's own decrypt path (and its "not a confirm client" handling), so
-            // the retransmission predicate and `awaitProvision` cannot disagree about a frame.
-            this@PairingSession.processConfirmClient(packet)?.csk
-
-        override fun conclude() {
-            synchronized(sessionLock) { pairingSession }?.conclude()
-        }
-
-        private fun requireSession(): CryptoPairingSession =
-            synchronized(sessionLock) { pairingSession }
-                ?: error("Pairing session was released before the completion proof")
-    }
+    /** The live Rust pairing session, or an error explaining that a release won the race. */
+    private fun requireSession(): CryptoPairingSession =
+        synchronized(sessionLock) { pairingSession }
+            ?: error("Pairing session was released before the completion proof")
 
     /**
      * Save the paired device, merging with any existing record for the same Client identity.
@@ -891,8 +866,9 @@ class PairingSession(
      * long-term identity key and lives in Rust's identity copy, untouched.
      *
      * Idempotent: the field is swapped to null under the lock, `conclude()` and the generated
-     * object's `close()` both tolerate a second call, because [close] and the session epilogue can
-     * both reach this.
+     * object's `close()` both tolerate a second call. It is reached only through
+     * [PairingSessionLifecycle.zeroizeEphemeralState], which runs it once even though the success
+     * path and the session epilogue both ask for it.
      */
     private fun zeroizeEphemeralState() {
         val session = synchronized(sessionLock) { pairingSession.also { pairingSession = null } }

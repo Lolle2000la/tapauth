@@ -59,9 +59,11 @@ interface PairingHandle {
     /**
      * Ask the session to release its transports, keys and coroutine.
      *
-     * @return true when the close was **deferred** because a pairing was already being persisted —
-     *   the session keeps its confirmation burst and linger running and releases itself when they
-     *   end — false when this call released everything. See `PairingSession.close`.
+     * @return true when the close was **deferred** because the pairing confirmation is still in
+     *   flight — the device record is written but the `PairingConfirmServer` burst and the linger
+     *   that answers the desktop's retransmissions have not finished, so the session keeps running
+     *   and releases itself when they end — false when this call released everything, including
+     *   when the confirmation has already completed. See `PairingSession.close`.
      */
     fun close(): Boolean
 }
@@ -273,10 +275,11 @@ class PairingViewModel(
     private fun releaseSession() {
         if (sessionClosed) return
         sessionClosed = true
-        // A deferred close means the device record is already being written: the session is
-        // finishing the confirmation the desktop is waiting for, so cancelling the attempt scope
-        // here would cut it mid-flight and leave the phone paired with a desktop that timed out.
-        // The session's own linger and burst bound that, after which it releases itself.
+        // A deferred close means the confirmation is still in flight: the device record is written
+        // but the burst and linger that tell the desktop have not finished, so cancelling the
+        // attempt scope here would cut them and leave the phone paired with a desktop that timed
+        // out. The session bounds that itself and releases when it ends — after which a close
+        // releases normally instead of deferring again.
         if (session?.close() != true) attemptScope?.cancel()
         attemptScope = null
     }
