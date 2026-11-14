@@ -153,6 +153,37 @@ impl PairingScreen {
         close_action(&self.state, self.session.take())
     }
 
+    /// A screen holding a session from `StartPairing`, for the close-path tests
+    /// that need one without a daemon.
+    #[cfg(test)]
+    pub(crate) fn showing_qr_for_test(port: u16) -> Self {
+        Self::for_test(
+            PairingState::ShowingQRCode {
+                url: "tapauth://pair?v=2".to_string(),
+                qr_data: Rc::new(QrData::new("tapauth://pair?v=2").expect("test URL must encode")),
+            },
+            port,
+        )
+    }
+
+    /// A screen whose `CompletePairing` is already with the daemon.
+    #[cfg(test)]
+    pub(crate) fn completing_for_test(port: u16) -> Self {
+        Self::for_test(PairingState::CompletingPairing, port)
+    }
+
+    #[cfg(test)]
+    fn for_test(state: PairingState, port: u16) -> Self {
+        let mut screen = Self::new(L10n::new("en"));
+        screen.state = state;
+        screen.session = Some(PairingSession {
+            url: "tapauth://pair?v=2".to_string(),
+            port,
+            session_id: vec![0xab; 16],
+        });
+        screen
+    }
+
     /// Take the address the error screen's Cancel action must hand to
     /// `CancelPairing`, and move the screen back to `Loading` so the
     /// `PairingStarted` that follows starts a fresh session.
@@ -481,10 +512,7 @@ mod tests {
     }
 
     fn screen_in(state: PairingState) -> PairingScreen {
-        let mut screen = PairingScreen::new(L10n::new("en"));
-        screen.session = Some(session(41234));
-        screen.state = state;
-        screen
+        PairingScreen::for_test(state, 41234)
     }
 
     #[test]
