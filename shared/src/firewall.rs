@@ -136,18 +136,39 @@ impl FirewallGuard {
     /// Idempotent: the first call does the work, a second call is a no-op, and the
     /// [`Drop`] that follows sees the `closed` flag and does not enqueue a second
     /// removal. The blocking subprocess runs on the blocking pool and is awaited,
-    /// so a failure is reported here (and logged) rather than detached.
+    /// so a failure is reported here rather than detached.
     ///
-    /// A call that could **not** reach a decision — the shared slot is poisoned, or
-    /// the blocking task died — returns `Err` and re-arms the best-effort [`Drop`],
-    /// so a close that did not happen is never reported as one.
+    /// A close that did not happen is **never** reported as one, and whether the
+    /// best-effort [`Drop`] is re-armed depends on whether a retry could help:
+    ///
+    /// * A poisoned slot, or a blocking task that died, returns `Err` **and**
+    ///   re-arms `closed`. Nothing ran, and a later detached attempt can still
+    ///   succeed.
+    /// * A removal command that ran and failed returns its own error and leaves
+    ///   `closed` set. A missing `iptables` or a missing `CAP_NET_ADMIN` fails the
+    ///   same way every time, so re-arming would only repeat the failure from a
+    ///   detached task nobody awaits.
     pub async fn close(&self) -> Result<(), FirewallError> {
+        self.close_with(close_port).await
+    }
+
+    /// [`FirewallGuard::close`] with the removal injected.
+    ///
+    /// The seam exists so a test can drive the whole awaited close — including its
+    /// error reporting — without shelling out to `iptables`/`firewall-cmd`, which
+    /// needs privileges and a host firewall to observe.
+    async fn close_with<Remove>(&self, remove_rule: Remove) -> Result<(), FirewallError>
+    where
+        Remove: FnOnce(u16, Protocol) -> Result<(), FirewallError> + Send + 'static,
+    {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
 
         let (port, protocol) = (self.port, self.protocol);
-        match tokio::task::spawn_blocking(move || do_explicit_close(port, protocol)).await {
+        match tokio::task::spawn_blocking(move || do_explicit_close(port, protocol, remove_rule))
+            .await
+        {
             Ok(CloseDisposition::Closed) => Ok(()),
             // Still shared with another live guard: nothing was removed, so this
             // guard keeps its best-effort drop.
@@ -165,6 +186,9 @@ impl FirewallGuard {
                     port, protocol, reason
                 )))
             }
+            // The command ran and failed. Report the cause, but do not re-arm: the
+            // same call would fail identically, and `Drop` cannot await it.
+            Ok(CloseDisposition::RemovalFailed(error)) => Err(error),
             // The blocking task panicked or was dropped before it ran. `do_drop_close`
             // re-checks `is_open` under the slot lock, so letting the fallback try
             // again cannot remove a rule twice.
@@ -209,39 +233,29 @@ impl Drop for FirewallGuard {
     }
 }
 
-/// What [`do_explicit_close`] did, so [`FirewallGuard::close`] can undo its own
-/// `closed` flag when it chose not to touch the rule.
+/// What [`do_explicit_close`] did, so [`FirewallGuard::close`] can report it and
+/// undo its own `closed` flag when it chose not to touch the rule.
 enum CloseDisposition {
     /// The rule was removed (or there was nothing left to remove).
     Closed,
     /// Another live guard shares the `(port, protocol)`; the rule stays.
     KeptForAnotherHolder,
-    /// The decision could not be made, so nothing was removed. The reason is
-    /// reported to the caller: silence here would be a close that never happened.
+    /// The decision could not be made (a poisoned lock), so nothing was removed.
+    /// The caller re-arms its best-effort drop: a later attempt may still work.
     Unknown(&'static str),
+    /// The removal was attempted and failed. Reported with its own cause; the
+    /// caller does *not* re-arm, because the same command would fail the same way.
+    RemovalFailed(FirewallError),
 }
 
-/// [`FirewallGuard::close`], on the blocking pool.
+/// [`FirewallGuard::close`], on the blocking pool, with the removal injected.
 ///
 /// The requesting guard is still alive here (it awaits this), so the liveness
 /// check [`do_drop_close`] uses would always say "still held". Instead the slot is
 /// deregistered first — which is what a later `new` on the same port and a later
 /// best-effort drop both observe — and the rule is removed unless another live
 /// guard still holds the slot.
-fn do_explicit_close(port: u16, protocol: Protocol) -> CloseDisposition {
-    do_explicit_close_with(port, protocol, close_port)
-}
-
-/// [`do_explicit_close`] with the external removal injected.
-///
-/// The seam exists so a test can assert *whether* the rule was removed (and with
-/// which port/protocol) without shelling out to `iptables`/`firewall-cmd`, which
-/// needs privileges and a host firewall to observe.
-fn do_explicit_close_with<Remove>(
-    port: u16,
-    protocol: Protocol,
-    remove_rule: Remove,
-) -> CloseDisposition
+fn do_explicit_close<Remove>(port: u16, protocol: Protocol, remove_rule: Remove) -> CloseDisposition
 where
     Remove: FnOnce(u16, Protocol) -> Result<(), FirewallError>,
 {
@@ -280,13 +294,23 @@ where
     }
 
     ctrl.weak = Weak::new();
-    if ctrl.is_open {
-        if let Err(e) = remove_rule(port, protocol) {
-            tracing::error!("Failed to close firewall port: {}", e);
+    let outcome = if ctrl.is_open {
+        remove_rule(port, protocol)
+    } else {
+        Ok(())
+    };
+    // Recorded as closed even when the removal failed, matching `do_drop_close`:
+    // the slot must not keep claiming a rule the session has given up on, and the
+    // failure itself is what the caller gets back.
+    ctrl.is_open = false;
+
+    match outcome {
+        Ok(()) => CloseDisposition::Closed,
+        Err(error) => {
+            tracing::error!("Failed to close firewall port: {}", error);
+            CloseDisposition::RemovalFailed(error)
         }
-        ctrl.is_open = false;
     }
-    CloseDisposition::Closed
 }
 
 /// Check whether the weak entry is still alive and, if not, close the
@@ -533,6 +557,7 @@ mod tests {
     const REMOVE_TEST_PORT: u16 = 45_681;
     const SHARED_REMOVE_TEST_PORT: u16 = 45_683;
     const POISONED_TEST_PORT: u16 = 45_682;
+    const FAILED_REMOVE_TEST_PORT: u16 = 45_684;
 
     /// A guard registered in a slot, so the close decision is exercised without
     /// shelling out.
@@ -583,18 +608,20 @@ mod tests {
     /// the port closed *without* removing the rule, so the rule outlives the phase
     /// it was opened for while every assertion about the slot still passes. The
     /// remover is injected, so this runs without privileges.
-    #[test]
-    fn an_open_rule_is_removed_with_this_port_and_protocol() {
-        let (_guard, slot) = registered_guard(REMOVE_TEST_PORT, true);
-        let removed = std::sync::Mutex::new(Vec::new());
+    #[tokio::test]
+    async fn an_open_rule_is_removed_with_this_port_and_protocol() {
+        let (guard, slot) = registered_guard(REMOVE_TEST_PORT, true);
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&removed);
 
-        let disposition =
-            do_explicit_close_with(REMOVE_TEST_PORT, Protocol::Udp, |port, protocol| {
-                removed.lock().unwrap().push((port, protocol));
+        guard
+            .close_with(move |port, protocol| {
+                recorder.lock().unwrap().push((port, protocol));
                 Ok(())
-            });
+            })
+            .await
+            .unwrap();
 
-        assert!(matches!(disposition, CloseDisposition::Closed));
         assert_eq!(
             &*removed.lock().unwrap(),
             &[(REMOVE_TEST_PORT, Protocol::Udp)],
@@ -603,6 +630,42 @@ mod tests {
         assert!(
             !slot.lock().unwrap().is_open,
             "a removed rule must be recorded as closed"
+        );
+        assert!(guard.closed.load(Ordering::SeqCst));
+    }
+
+    /// A removal that fails is reported, and is not retried by the drop.
+    ///
+    /// The defect this catches: swallowing the command's error so `close()` returns
+    /// `Ok(())` and disarms [`Drop`] — the pairing session then publishes
+    /// `Finished`/`Failed` over a rule that is still in place, and nothing in the
+    /// log says so. The `closed` flag is deliberately left set: `iptables` missing
+    /// or denied fails the same way on every retry, so a detached second attempt
+    /// would only repeat it.
+    #[tokio::test]
+    async fn a_failed_removal_is_reported_and_not_retried_by_the_drop() {
+        let (guard, slot) = registered_guard(FAILED_REMOVE_TEST_PORT, true);
+
+        let error = guard
+            .close_with(|_, _| {
+                Err(FirewallError::Iptables(
+                    "iptables -D failed with exit status: 4".to_string(),
+                ))
+            })
+            .await
+            .expect_err("a removal that failed must not be reported as a close");
+
+        assert!(
+            matches!(&error, FirewallError::Iptables(message) if message.contains("exit status")),
+            "the command's own failure must be reported, got: {error}"
+        );
+        assert!(
+            guard.closed.load(Ordering::SeqCst),
+            "a failed command must not be retried by the best-effort drop"
+        );
+        assert!(
+            !slot.lock().unwrap().is_open,
+            "the session's slot is released even though the rule could not be removed"
         );
     }
 
@@ -635,22 +698,21 @@ mod tests {
     ///
     /// The defect this catches: the close decision ignoring the other holder and
     /// shelling out anyway, which deletes the rule the other session is using.
-    #[test]
-    fn a_shared_port_is_not_removed_for_the_other_holder() {
+    #[tokio::test]
+    async fn a_shared_port_is_not_removed_for_the_other_holder() {
         let (guard, slot) = registered_guard(SHARED_REMOVE_TEST_PORT, true);
         let _other = Arc::clone(&guard);
-        let removed = std::sync::Mutex::new(Vec::new());
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&removed);
 
-        let disposition =
-            do_explicit_close_with(SHARED_REMOVE_TEST_PORT, Protocol::Udp, |port, protocol| {
-                removed.lock().unwrap().push((port, protocol));
+        guard
+            .close_with(move |port, protocol| {
+                recorder.lock().unwrap().push((port, protocol));
                 Ok(())
-            });
+            })
+            .await
+            .unwrap();
 
-        assert!(matches!(
-            disposition,
-            CloseDisposition::KeptForAnotherHolder
-        ));
         assert!(
             removed.lock().unwrap().is_empty(),
             "another live holder's rule must not be removed"
@@ -659,6 +721,14 @@ mod tests {
             slot.lock().unwrap().is_open,
             "the other holder's port must stay open"
         );
+
+        // The decision above is the assertion; this only keeps the fixture from
+        // touching the host. The drop fallback is armed again by the
+        // `KeptForAnotherHolder` path, and with `is_open` cleared it finds nothing
+        // to remove instead of running `iptables -D` for a rule this test never
+        // created.
+        slot.lock().unwrap().is_open = false;
+        drop(_other);
     }
 
     /// A slot that cannot be read is reported as a failure, not as a close.
