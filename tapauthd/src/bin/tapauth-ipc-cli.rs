@@ -230,7 +230,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ipc::CompletePairingRequest { port },
                 )),
             };
-            let resp = send_admin(req, Duration::from_secs(120)).await?;
+            // Must outlive the daemon's `SESSION_REPLY_TIMEOUT` (135 s, see
+            // `tapauthd/src/pairing.rs`) or a slow-but-legitimate pairing is
+            // reported here as a transport failure while the daemon is still
+            // working. Recheck that value when changing this one.
+            let resp = send_admin(req, Duration::from_secs(150)).await?;
             if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
                 eprintln!("ERROR: {}", resp.error_message);
                 std::process::exit(1);
