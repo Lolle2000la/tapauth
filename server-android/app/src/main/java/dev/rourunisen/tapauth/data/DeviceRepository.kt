@@ -3,6 +3,7 @@ package dev.rourunisen.tapauth.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -189,6 +190,10 @@ class DeviceRepository(context: Context) {
  */
 internal class DeviceChangeListeners {
 
+    companion object {
+        private const val TAG = "DeviceChangeListeners"
+    }
+
     private val listeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
 
     /** Register [listener]; returns false when it was already registered. */
@@ -206,10 +211,25 @@ internal class DeviceChangeListeners {
     val size: Int
         get() = listeners.size
 
-    /** Invoke every observer registered at the time of the call. */
+    /**
+     * Invoke every observer registered at the time of the call.
+     *
+     * Each observer is isolated: a throw is logged and dispatch moves on to the rest. Nothing here
+     * can fail the caller, because `notifyListeners()` runs *after* the paired-device record is
+     * committed — a throw would otherwise travel back through `savePairedDevice` into
+     * `PairingSession.persistDevice`, abort the confirm burst in `PairingCompletion.confirm`, and
+     * report a failed pairing for a device that is on disk.
+     *
+     * `Throwable` rather than `Exception`: the caller has no failure channel left to act on, and a
+     * `LinkageError` from one transport's observer must not strand the other transport's.
+     */
     fun dispatch() {
         for (listener in listeners) {
-            listener()
+            try {
+                listener()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Paired-device observer failed; notifying the remaining observers", t)
+            }
         }
     }
 }
