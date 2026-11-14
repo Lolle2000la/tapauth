@@ -1,0 +1,13 @@
+# Binding generation for the Rust↔Kotlin surface declared in `src/ffi.rs`.
+#
+# The Kotlin package the generated bindings land in, and `shared` is the
+# cdylib name the app loads with `System.loadLibrary`.
+
+[bindings.kotlin]
+package_name = "dev.rourunisen.tapauth.crypto"
+cdylib_name = "shared"
+android = true
+# The records mirror the immutable Kotlin DTOs this surface replaced: a parsed message is
+# verified once and then only read, so a `var` field would let a holder rewrite, say, the
+# verified client key after the check.
+generate_immutable_records = true

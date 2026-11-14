@@ -99,7 +99,7 @@ To achieve true wire evolvability (and one-way backwards compatibility when olde
      * Verify `wrapper.signature` over `wrapper_signing_transcript(..., &wrapper.payload)` **before** decoding `wrapper.payload`.
      * Decode `wrapper.payload` according to `wrapper.payload_type`. Unknown optional fields added in future protocol versions remain intact inside `wrapper.payload` during verification and are safely ignored by older decoders.
 * **Mandatory Verification on ALL 5 Message Types**:
-  * **Android (Server)**: JNI (`shared/src/jni_api.rs`) verifies `WrapperMessage.signature` against the paired Client's `ed25519_public_key` **inside Rust** when parsing `AuthenticationRequest`, `GrantConfirmation`, and `AuthenticationCancel` — callers in Kotlin cannot act on an unverified message.
+  * **Android (Server)**: The Rust boundary (`shared/src/ffi.rs` + `shared/src/ffi/ops.rs`) verifies `WrapperMessage.signature` against the paired Client's `ed25519_public_key` **inside Rust** when parsing `AuthenticationRequest`, `GrantConfirmation`, and `AuthenticationCancel` — callers in Kotlin cannot act on an unverified message.
   * **Linux (`tapauthd`, Client)**: Verifies `WrapperMessage.signature` on `AuthenticationGrant` and `AuthenticationDenial` **only** against `PairedServer` entries authorized for the target `username` (`server.is_user_allowed(&username)`). A second paired phone belonging to another user sharing `CSK` cannot grant or deny someone else's authentication.
   * `AuthenticationGrant` carries `bytes challenge = 1` signed once by `WrapperMessage.signature` (removing the redundant inner `signed_challenge`). `AuthenticationDenial` likewise carries `bytes challenge = 1` to bind denials strictly to the active session.
 

@@ -3,16 +3,19 @@ package dev.rourunisen.tapauth.network
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import dev.rourunisen.tapauth.crypto.PairingSession as CryptoPairingSession
 import dev.rourunisen.tapauth.crypto.ParsedPairingProvision
 import dev.rourunisen.tapauth.crypto.ParsedPairingResponse
-import dev.rourunisen.tapauth.crypto.TapAuthCrypto
+import dev.rourunisen.tapauth.crypto.TapauthException
+import dev.rourunisen.tapauth.crypto.deriveBlePairingAdvId
+import dev.rourunisen.tapauth.crypto.pairingPacketSessionId
+import dev.rourunisen.tapauth.crypto.rawMessage
 import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import dev.rourunisen.tapauth.data.PairingUrl
 import java.io.IOException
-import java.security.GeneralSecurityException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
@@ -57,17 +60,16 @@ sealed class PairingUpdate {
  *
  * ### The whole handshake state lives in Rust
  *
- * [TapAuthCrypto.pairingServerSessionCreate] returns an opaque handle that owns the phone's
- * ephemeral `X_S`, `Ed_S`, the directional keys `K_c2s`/`K_s2c` and the transcript hash `H`. This
- * class never sees any of them: it holds the handle, moves whole serialized `PairingPacket` blobs,
- * and reads back only what it persists (the SAS, the Client's `Ed_C` and the three negotiated
- * algorithm ids). Abort MAC direction, AAD construction and key derivation are therefore not
- * Kotlin's to get wrong.
+ * A [CryptoPairingSession] owns the phone's ephemeral `X_S`, `Ed_S`, the directional keys
+ * `K_c2s`/`K_s2c` and the transcript hash `H`. This class never sees any of them: it holds the
+ * session object, moves whole serialized `PairingPacket` blobs, and reads back only what it
+ * persists (the SAS, the Client's `Ed_C` and the three negotiated algorithm ids). Abort MAC
+ * direction, AAD construction and key derivation are therefore not Kotlin's to get wrong.
  *
- * One shared init state — one handle, one serialized `PairingInit` — feeds both transport
+ * One shared init state — one session, one serialized `PairingInit` — feeds both transport
  * candidates, because the transcript hash binds the init bytes: two different `PairingInit`
  * payloads would derive two different SAS values. The UDP and BLE candidates race; the first one
- * that delivers a `PairingResponse` accepted by [TapAuthCrypto.pairingVerifyResponse] locks the
+ * that delivers a `PairingResponse` accepted by [CryptoPairingSession.verifyResponse] locks the
  * transport and the loser is cancelled. A response that fails verification is logged and ignored —
  * one injected bad packet must not end the session — and only an authenticated `PairingAbort` (or
  * the deadline) ends it early.
@@ -155,11 +157,17 @@ class PairingSession(
         /**
          * Shown for a verified abort from the desktop.
          *
-         * `pairingVerifyAbort` returns only a `Boolean`, so the remote `PairingAbortReason` is not
-         * available here; a reason-specific string is only reachable for a reason this phone chose
-         * itself.
+         * [CryptoPairingSession.verifyAbort] returns only a `Boolean`, so the remote
+         * `PairingAbortReason` is not available here; a reason-specific string is only reachable
+         * for a reason this phone chose itself.
          */
         private const val REMOTE_ABORT_MESSAGE = "The desktop aborted the pairing"
+
+        /** `PairingAbortReason.USER_REJECTED_SAS` */
+        private const val PAIRING_ABORT_USER_REJECTED_SAS = 1
+
+        /** `PairingAbortReason.SESSION_EXPIRED` */
+        private const val PAIRING_ABORT_SESSION_EXPIRED = 5
     }
 
     private val deviceRepository = DeviceRepository(context)
@@ -167,20 +175,20 @@ class PairingSession(
 
     private val sessionId = pairingUrl.sessionIdBytes()
 
-    // Ephemeral session state. The keys never leave Rust behind the handle; the handshake buffers
-    // below are cleared on completion/abort/close.
+    // Ephemeral session state. The keys never leave Rust behind the session object; the handshake
+    // buffers below are cleared on completion/abort/close.
     @Volatile private var initPacket: ByteArray? = null
     @Volatile private var acceptedResponsePacket: ByteArray? = null
 
     /**
-     * The Rust pairing session handle, or `0` before [prepareSession] / after
-     * [zeroizeEphemeralState].
+     * The Rust pairing session, or null before [prepareSession] / after [zeroizeEphemeralState].
      *
-     * `0` is never a valid handle (Rust starts its allocator at 1), so it is the natural "nothing
-     * to free" value, and the swap to `0` is what makes freeing idempotent.
+     * The object is reference-counted: dropping the last reference zeroizes the ephemeral keys, so
+     * closing it is the whole of the release, and a second close is a no-op. Null is therefore the
+     * natural "nothing to release" value, and the swap to null is what makes release idempotent.
      */
-    private val handleLock = Any()
-    @Volatile private var pairingHandle: Long = 0L
+    private val sessionLock = Any()
+    @Volatile private var pairingSession: CryptoPairingSession? = null
 
     private val links = mutableListOf<PairingLink>()
 
@@ -265,7 +273,7 @@ class PairingSession(
             when (val approval = awaitApproval(locked)) {
                 is Approval.Approved -> Unit
                 is Approval.Rejected -> {
-                    sendAbort(locked, TapAuthCrypto.PAIRING_ABORT_USER_REJECTED_SAS)
+                    sendAbort(locked, PAIRING_ABORT_USER_REJECTED_SAS)
                     emit(PairingUpdate.Cancelled)
                     return
                 }
@@ -296,7 +304,7 @@ class PairingSession(
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Pairing failed", e)
-            emitFailure(e.message ?: "Pairing failed")
+            emitFailure((e as? TapauthException)?.rawMessage() ?: e.message ?: "Pairing failed")
         } finally {
             closeLinks()
             zeroizeEphemeralState()
@@ -320,13 +328,12 @@ class PairingSession(
                 DEFAULT_SERVER_NAME
             }
 
-        // `0` means the create failed (it throws as well); a zero handle must never be used.
-        val handle =
-            TapAuthCrypto.pairingServerSessionCreate(sessionId, identity.privateKey, serverName)
-        if (handle <= 0L) throw IllegalStateException("Could not create a pairing session")
-        synchronized(handleLock) { pairingHandle = handle }
+        // Construction throws when the QR session id or the identity key is unusable; that failure
+        // reaches runSession's handler exactly as the old handle-create failure did.
+        val session = CryptoPairingSession(sessionId, identity.privateKey, serverName)
+        synchronized(sessionLock) { pairingSession = session }
 
-        val init = TapAuthCrypto.pairingCreateInit(handle)
+        val init = session.createInit()
         initPacket = init
         Log.d(TAG, "PairingInit prepared for session ${sessionId.toHex().take(8)}…")
         return init
@@ -429,7 +436,7 @@ class PairingSession(
         registerLink(link)
         var won = false
         try {
-            val advertisementId = TapAuthCrypto.deriveBlePairingAdvId(sessionId, qrPublicKey)
+            val advertisementId = deriveBlePairingAdvId(sessionId, qrPublicKey)
             if (!client.connect(advertisementId, RESPONSE_DEADLINE_MS)) {
                 Log.w(TAG, "BLE pairing candidate unavailable")
                 return
@@ -470,9 +477,12 @@ class PairingSession(
     /** Whether [packet] is a v2 `PairingPacket` for [sessionId]. */
     private fun belongsToSession(packet: ByteArray): Boolean =
         try {
-            TapAuthCrypto.pairingPacketSessionId(packet).contentEquals(sessionId)
+            pairingPacketSessionId(packet).contentEquals(sessionId)
         } catch (e: Exception) {
-            Log.d(TAG, "Dropping an undecodable pairing frame: ${e.message}")
+            Log.d(
+                TAG,
+                "Dropping an undecodable pairing frame: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
+            )
             false
         }
 
@@ -480,7 +490,7 @@ class PairingSession(
      * Verify a candidate `PairingResponse`.
      *
      * The QR pin, the Client's signature over the transcript hash and the algorithm intersection
-     * are all checked inside Rust, against the handle — Kotlin cannot accidentally skip any of
+     * are all checked inside Rust, against the session — Kotlin cannot accidentally skip any of
      * them.
      *
      * @return the response's persistable fields, or null when the packet is not an acceptable
@@ -488,17 +498,19 @@ class PairingSession(
      *   throws: an injected bad packet must not end the session.
      */
     private fun acceptResponse(packet: ByteArray): ParsedPairingResponse? {
-        val handle = synchronized(handleLock) { pairingHandle }
-        if (handle == 0L) return null
+        val session = synchronized(sessionLock) { pairingSession } ?: return null
         val response =
             try {
-                TapAuthCrypto.pairingVerifyResponse(handle, packet, qrPublicKey)
-            } catch (e: GeneralSecurityException) {
-                Log.w(TAG, "PairingResponse rejected: ${e.message}")
+                session.verifyResponse(packet, qrPublicKey)
+            } catch (e: TapauthException.Security) {
+                Log.w(TAG, "PairingResponse rejected: ${e.rawMessage()}")
                 return null
             } catch (e: Exception) {
                 // Not a PairingResponse (keepalive/abort/duplicate), or a malformed frame.
-                Log.d(TAG, "Ignoring packet that is not a valid PairingResponse: ${e.message}")
+                Log.d(
+                    TAG,
+                    "Ignoring packet that is not a valid PairingResponse: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
+                )
                 return null
             }
         acceptedResponsePacket = packet
@@ -532,7 +544,7 @@ class PairingSession(
             if (stashedPacket == null) stashedPacket = packet
         }
         Log.i(TAG, "SAS approval timed out after ${SAS_APPROVAL_TIMEOUT_MS}ms")
-        sendAbort(locked, TapAuthCrypto.PAIRING_ABORT_SESSION_EXPIRED)
+        sendAbort(locked, PAIRING_ABORT_SESSION_EXPIRED)
         return Approval.Expired
     }
 
@@ -543,10 +555,10 @@ class PairingSession(
      * `PairedDevice`, send `PairingConfirmServer` back and report [ProvisionOutcome] completion.
      */
     private suspend fun awaitProvision(locked: Locked): ProvisionOutcome {
-        val handle = synchronized(handleLock) { pairingHandle }
+        val session = synchronized(sessionLock) { pairingSession }
         val keepalive =
-            if (locked.transport == PairingTransport.UDP && handle != 0L) {
-                TapAuthCrypto.pairingCreateKeepalive(handle)
+            if (locked.transport == PairingTransport.UDP && session != null) {
+                session.createKeepalive()
             } else {
                 null
             }
@@ -577,19 +589,21 @@ class PairingSession(
     /**
      * Decrypt `PairingConfirmClient` in Rust; null when [packet] is something else entirely.
      *
-     * The AEAD AAD is `"tapauth-pair-v2-provision" || H` built inside the handle, so Kotlin cannot
+     * The AEAD AAD is `"tapauth-pair-v2-provision" || H` built inside the session, so Kotlin cannot
      * get it wrong and cannot be tricked into reusing the wrong transcript.
      */
     private fun processConfirmClient(packet: ByteArray): ParsedPairingProvision? {
-        val handle = synchronized(handleLock) { pairingHandle }
-        if (handle == 0L) return null
+        val session = synchronized(sessionLock) { pairingSession } ?: return null
         return try {
-            TapAuthCrypto.pairingProcessConfirmClient(handle, packet)
-        } catch (e: GeneralSecurityException) {
-            Log.d(TAG, "Not a decryptable PairingConfirmClient: ${e.message}")
+            session.processConfirmClient(packet)
+        } catch (e: TapauthException.Security) {
+            Log.d(TAG, "Not a decryptable PairingConfirmClient: ${e.rawMessage()}")
             null
         } catch (e: Exception) {
-            Log.d(TAG, "Ignoring packet while awaiting PairingConfirmClient: ${e.message}")
+            Log.d(
+                TAG,
+                "Ignoring packet while awaiting PairingConfirmClient: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
+            )
             null
         }
     }
@@ -599,13 +613,13 @@ class PairingSession(
         locked: Locked,
         provision: ParsedPairingProvision,
     ): ProvisionOutcome {
-        val handle = synchronized(handleLock) { pairingHandle }
-        check(handle != 0L) { "Pairing session was released before the completion proof" }
+        val session = synchronized(sessionLock) { pairingSession }
+        checkNotNull(session) { "Pairing session was released before the completion proof" }
         // Build the confirmation before persisting: a failure here must not leave a device record
         // for a pairing the desktop never accepted. Rust signs `"tapauth-pair-server-sig-v2" || H
         // ||
         // csk` with `Ed_S` and encrypts it under `K_s2c`.
-        val confirmServer = TapAuthCrypto.pairingCreateConfirmServer(handle, provision.csk)
+        val confirmServer = session.createConfirmServer(provision.csk)
 
         val device = persistDevice(locked.response, provision)
 
@@ -682,14 +696,14 @@ class PairingSession(
      * with `K_c2s`, so passing a key here would be both redundant and a way to break it.
      */
     private suspend fun sendAbort(locked: Locked, reason: Int) {
-        val handle = synchronized(handleLock) { pairingHandle }
-        if (handle == 0L) {
+        val session = synchronized(sessionLock) { pairingSession }
+        if (session == null) {
             Log.w(TAG, "No pairing session to abort with")
             return
         }
         val abort =
             try {
-                TapAuthCrypto.pairingCreateAbort(handle, reason)
+                session.createAbort(reason)
             } catch (e: Exception) {
                 Log.e(TAG, "Could not build PairingAbort", e)
                 return
@@ -713,14 +727,16 @@ class PairingSession(
      * session.
      */
     private fun isVerifiedAbort(packet: ByteArray): Boolean {
-        val handle = synchronized(handleLock) { pairingHandle }
-        if (handle == 0L) return false
+        val session = synchronized(sessionLock) { pairingSession } ?: return false
         return try {
-            TapAuthCrypto.pairingVerifyAbort(handle, packet)
-        } catch (e: GeneralSecurityException) {
+            session.verifyAbort(packet)
+        } catch (e: TapauthException.Security) {
             false
         } catch (e: Exception) {
-            Log.d(TAG, "Ignoring packet while checking for PairingAbort: ${e.message}")
+            Log.d(
+                TAG,
+                "Ignoring packet while checking for PairingAbort: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
+            )
             false
         }
     }
@@ -743,24 +759,19 @@ class PairingSession(
     /**
      * Release the pairing session and clear the handshake buffers.
      *
-     * The Rust handle owns `x_S`, `K_c2s`, `K_s2c` and `H` (`cryptography-specification.md` §4),
-     * and dropping it zeroizes them, so "release the handle" is the whole of zeroization here.
-     * `Ed_S` is the phone's long-term identity key and lives in Rust's identity copy, untouched.
+     * The Rust session owns `x_S`, `K_c2s`, `K_s2c` and `H` (`cryptography-specification.md` §4),
+     * and dropping it zeroizes them, so closing the object is the whole of zeroization here. `Ed_S`
+     * is the phone's long-term identity key and lives in Rust's identity copy, untouched.
      *
-     * Idempotent: the handle is swapped to `0` under the lock, and an already-freed handle (Rust
-     * throws `IllegalArgumentException`) is tolerated because [close] and the session epilogue can
-     * both reach this.
+     * Idempotent: the field is swapped to null under the lock, and the generated object tolerates a
+     * second `close()`, because [close] and the session epilogue can both reach this.
      */
     private fun zeroizeEphemeralState() {
-        val handle = synchronized(handleLock) { pairingHandle.also { pairingHandle = 0L } }
-        if (handle != 0L) {
-            try {
-                TapAuthCrypto.pairingServerSessionFree(handle)
-            } catch (e: IllegalArgumentException) {
-                Log.d(TAG, "Pairing session handle $handle was already released")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to release pairing session handle $handle: ${e.message}")
-            }
+        val session = synchronized(sessionLock) { pairingSession.also { pairingSession = null } }
+        try {
+            session?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release the pairing session: ${e.message}")
         }
         initPacket?.fill(0)
         initPacket = null

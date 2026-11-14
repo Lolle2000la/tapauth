@@ -16,7 +16,19 @@ import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.biometric.BiometricHelper
-import dev.rourunisen.tapauth.crypto.TapAuthCrypto
+import dev.rourunisen.tapauth.crypto.TapauthException
+import dev.rourunisen.tapauth.crypto.createDenialWrapperMessage
+import dev.rourunisen.tapauth.crypto.createGrantWrapperMessage
+import dev.rourunisen.tapauth.crypto.currentTimeWindow
+import dev.rourunisen.tapauth.crypto.decryptEncryptedPacket
+import dev.rourunisen.tapauth.crypto.determineMessageType
+import dev.rourunisen.tapauth.crypto.extractTemporalIdentifier
+import dev.rourunisen.tapauth.crypto.generateBleTemporalIdentifier
+import dev.rourunisen.tapauth.crypto.generateTemporalIdentifier
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthCancel
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthRequest
+import dev.rourunisen.tapauth.crypto.parseAndVerifyGrantConfirmation
+import dev.rourunisen.tapauth.crypto.rawMessage
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import dev.rourunisen.tapauth.service.TransportLockManager
@@ -561,19 +573,19 @@ class BleGattService : Service() {
         val pairedDevices = deviceRepository.getAllPairedDevices()
         // The window (unix_seconds / 60) is what the Rust derivation expects; a unix timestamp
         // would hash a different value and match none of the Client's identifiers.
-        val currentWindow = TapAuthCrypto.currentTimeWindow()
+        val currentWindow = currentTimeWindow()
         val previousWindow = currentWindow - 1
 
         for (device in pairedDevices) {
             try {
                 val currentId =
-                    TapAuthCrypto.generateBleTemporalIdentifier(
+                    generateBleTemporalIdentifier(
                         device.csk,
                         currentWindow,
                         device.hashAlgorithm,
                     )
                 val previousId =
-                    TapAuthCrypto.generateBleTemporalIdentifier(
+                    generateBleTemporalIdentifier(
                         device.csk,
                         previousWindow,
                         device.hashAlgorithm,
@@ -595,7 +607,7 @@ class BleGattService : Service() {
     }
 
     private suspend fun matchTemporalIdOnDemand(temporalIdHex: String): String? {
-        val currentWindow = TapAuthCrypto.currentTimeWindow()
+        val currentWindow = currentTimeWindow()
 
         if (currentWindow != bleLastComputedWindow) {
             cacheMutex.withLock {
@@ -607,13 +619,13 @@ class BleGattService : Service() {
                     for (device in pairedDevices) {
                         try {
                             val currentId =
-                                TapAuthCrypto.generateBleTemporalIdentifier(
+                                generateBleTemporalIdentifier(
                                     device.csk,
                                     currentWindow,
                                     device.hashAlgorithm,
                                 )
                             val previousId =
-                                TapAuthCrypto.generateBleTemporalIdentifier(
+                                generateBleTemporalIdentifier(
                                     device.csk,
                                     previousWindow,
                                     device.hashAlgorithm,
@@ -1025,7 +1037,7 @@ class BleGattService : Service() {
             // Step 1: Extract the temporal identifier (16 bytes, same as UDP) before any crypto.
             val temporalIdBytes =
                 try {
-                    TapAuthCrypto.extractTemporalIdentifier(data)
+                    extractTemporalIdentifier(data)
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
                     // Silently disconnect on parse error - don't send invalid response
@@ -1070,17 +1082,17 @@ class BleGattService : Service() {
             var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
             val temporalIdHex = temporalIdBytes.toHex()
             // Window, not timestamp: the identifiers are HMACs over `unix_seconds / 60`.
-            val currentWindow = TapAuthCrypto.currentTimeWindow()
+            val currentWindow = currentTimeWindow()
             for (device in pairedDevices) {
                 // Check if this temporal ID matches (current or previous window)
                 val currentId =
-                    TapAuthCrypto.generateTemporalIdentifier(
+                    generateTemporalIdentifier(
                         device.csk,
                         currentWindow,
                         device.hashAlgorithm,
                     )
                 val previousId =
-                    TapAuthCrypto.generateTemporalIdentifier(
+                    generateTemporalIdentifier(
                         device.csk,
                         currentWindow - 1,
                         device.hashAlgorithm,
@@ -1110,7 +1122,7 @@ class BleGattService : Service() {
             // Step 3: Decrypt the EncryptedPacket to get the WrapperMessage
             val wrapperMessageBytes =
                 try {
-                    TapAuthCrypto.decryptEncryptedPacket(
+                    decryptEncryptedPacket(
                         data,
                         matchedDevice.csk,
                         matchedDevice.symmetricAlgorithm,
@@ -1135,7 +1147,7 @@ class BleGattService : Service() {
             // Step 4: Determine message type and route accordingly
             val messageType =
                 try {
-                    TapAuthCrypto.determineMessageType(wrapperMessageBytes)
+                    determineMessageType(wrapperMessageBytes) ?: "UNKNOWN"
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to determine BLE message type", e)
                     gatt.disconnect()
@@ -1177,16 +1189,16 @@ class BleGattService : Service() {
             // signed by the Client, so anything else is unauthenticated and must be ignored.
             val challengeBytes =
                 try {
-                    TapAuthCrypto.parseAndVerifyAuthCancel(
+                    parseAndVerifyAuthCancel(
                         wrapperMessageBytes,
                         device.publicKey,
                         device.protocolVersion,
                         device.signatureAlgorithm,
                     )
-                } catch (e: java.security.GeneralSecurityException) {
+                } catch (e: TapauthException.Security) {
                     Log.w(
                         TAG,
-                        "BLE AuthenticationCancel failed verification for device ${device.deviceId}: ${e.message}",
+                        "BLE AuthenticationCancel failed verification for device ${device.deviceId}: ${e.rawMessage()}",
                     )
                     // An unverified cancel is ignored: no dismissal, no retransmission stop, no
                     // response, and the BLE link is left alone.
@@ -1243,16 +1255,16 @@ class BleGattService : Service() {
             // parses anything, so a returned request is always authentic for this pairing.
             val authRequest =
                 try {
-                    TapAuthCrypto.parseAndVerifyAuthRequest(
+                    parseAndVerifyAuthRequest(
                         wrapperMessageBytes,
                         matchedDevice.publicKey,
                         matchedDevice.protocolVersion,
                         matchedDevice.signatureAlgorithm,
                     )
-                } catch (e: java.security.GeneralSecurityException) {
+                } catch (e: TapauthException.Security) {
                     Log.w(
                         TAG,
-                        "BLE auth request failed signature verification for device ${matchedDevice.deviceId}: ${e.message}",
+                        "BLE auth request failed signature verification for device ${matchedDevice.deviceId}: ${e.rawMessage()}",
                     )
                     // Silently disconnect - an unverified request must not reach the user
                     if (
@@ -1379,7 +1391,7 @@ class BleGattService : Service() {
                         // EncryptedPacket, using the algorithms this pairing negotiated (the AAD
                         // binds the algorithm and the temporal identifier).
                         val encryptedPacket =
-                            TapAuthCrypto.createGrantWrapperMessage(
+                            createGrantWrapperMessage(
                                 challenge,
                                 privateKey,
                                 matchedDevice.csk,
@@ -1407,7 +1419,7 @@ class BleGattService : Service() {
                         // Rust signs the denial's WrapperMessage and encrypts it into the finished
                         // EncryptedPacket, bound to the challenge and the negotiated algorithms.
                         val encryptedPacket =
-                            TapAuthCrypto.createDenialWrapperMessage(
+                            createDenialWrapperMessage(
                                 challengeBytes,
                                 DENIAL_REASON_USER_DENIED,
                                 privateKey,
@@ -1655,27 +1667,27 @@ class BleGattService : Service() {
     ): ByteArray? {
         return try {
             val wrapperMessageBytes =
-                TapAuthCrypto.decryptEncryptedPacket(
+                decryptEncryptedPacket(
                     packetBytes,
                     device.csk,
                     device.symmetricAlgorithm,
                 )
-            TapAuthCrypto.parseAndVerifyGrantConfirmation(
+            parseAndVerifyGrantConfirmation(
                 wrapperMessageBytes,
                 device.publicKey,
                 device.protocolVersion,
                 device.signatureAlgorithm,
             )
-        } catch (e: java.security.GeneralSecurityException) {
+        } catch (e: TapauthException.Security) {
             Log.w(
                 TAG,
-                "GrantConfirmation failed verification for device ${device.deviceId}: ${e.message}",
+                "GrantConfirmation failed verification for device ${device.deviceId}: ${e.rawMessage()}",
             )
             null
         } catch (e: Exception) {
             Log.w(
                 TAG,
-                "Failed to parse GrantConfirmation for device ${device.deviceId}: ${e.message}",
+                "Failed to parse GrantConfirmation for device ${device.deviceId}: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
             )
             null
         }

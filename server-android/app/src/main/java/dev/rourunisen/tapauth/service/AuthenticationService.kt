@@ -17,14 +17,21 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.TapAuthApplication
-import dev.rourunisen.tapauth.crypto.TapAuthCrypto
+import dev.rourunisen.tapauth.crypto.TapauthException
+import dev.rourunisen.tapauth.crypto.createDenialWrapperMessage
+import dev.rourunisen.tapauth.crypto.createGrantWrapperMessage
+import dev.rourunisen.tapauth.crypto.decryptEncryptedPacket
+import dev.rourunisen.tapauth.crypto.determineMessageType as determineWrapperMessageType
+import dev.rourunisen.tapauth.crypto.extractTemporalIdentifier
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthCancel
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthRequest
+import dev.rourunisen.tapauth.crypto.parseAndVerifyGrantConfirmation
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketException
-import java.security.GeneralSecurityException
 import kotlinx.coroutines.*
 
 /**
@@ -577,7 +584,7 @@ class AuthenticationService : Service() {
             // rejects an algorithm downgrade before it verifies the AEAD tag.
             val wrapperMessage =
                 try {
-                    TapAuthCrypto.decryptEncryptedPacket(
+                    decryptEncryptedPacket(
                         data,
                         device.csk,
                         device.symmetricAlgorithm,
@@ -634,7 +641,7 @@ class AuthenticationService : Service() {
      */
     private fun extractTemporalIdFromPacket(data: ByteArray): ByteArray? {
         return try {
-            TapAuthCrypto.extractTemporalIdentifier(data)
+            extractTemporalIdentifier(data)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to extract temporal ID from packet", e)
             null
@@ -643,7 +650,7 @@ class AuthenticationService : Service() {
 
     private fun determineMessageType(wrapperMessage: ByteArray): MessageType {
         return try {
-            val typeStr = TapAuthCrypto.determineMessageType(wrapperMessage)
+            val typeStr = determineWrapperMessageType(wrapperMessage) ?: "UNKNOWN"
             when (typeStr) {
                 "AUTH_REQUEST" -> MessageType.AUTH_REQUEST
                 "GRANT_CONFIRMATION" -> MessageType.GRANT_CONFIRMATION
@@ -691,20 +698,20 @@ class AuthenticationService : Service() {
             // both failure paths return here.
             val challengeBytes =
                 try {
-                    TapAuthCrypto.parseAndVerifyGrantConfirmation(
+                    parseAndVerifyGrantConfirmation(
                         wrapperMessage,
                         device.publicKey,
                         device.protocolVersion,
                         device.signatureAlgorithm,
                     )
-                } catch (e: GeneralSecurityException) {
+                } catch (e: TapauthException.Security) {
                     Log.w(
                         TAG,
                         "GrantConfirmation failed signature verification for device ${device.deviceId}; ignoring unverified confirmation",
                         e,
                     )
                     return
-                } catch (e: java.io.IOException) {
+                } catch (e: TapauthException.Io) {
                     Log.w(
                         TAG,
                         "Malformed GrantConfirmation from device ${device.deviceId}; ignoring",
@@ -747,20 +754,20 @@ class AuthenticationService : Service() {
             // retransmission manager.
             val challengeBytes =
                 try {
-                    TapAuthCrypto.parseAndVerifyAuthCancel(
+                    parseAndVerifyAuthCancel(
                         wrapperMessage,
                         device.publicKey,
                         device.protocolVersion,
                         device.signatureAlgorithm,
                     )
-                } catch (e: GeneralSecurityException) {
+                } catch (e: TapauthException.Security) {
                     Log.w(
                         TAG,
                         "AuthenticationCancel failed signature verification for device ${device.deviceId}; ignoring unverified cancel",
                         e,
                     )
                     return
-                } catch (e: java.io.IOException) {
+                } catch (e: TapauthException.Io) {
                     Log.w(
                         TAG,
                         "Malformed AuthenticationCancel from device ${device.deviceId}; ignoring",
@@ -836,19 +843,19 @@ class AuthenticationService : Service() {
             // prompt, or a response.
             val authRequest =
                 try {
-                    TapAuthCrypto.parseAndVerifyAuthRequest(
+                    parseAndVerifyAuthRequest(
                         wrapperMessage,
                         device.publicKey,
                         device.protocolVersion,
                         device.signatureAlgorithm,
                     )
-                } catch (e: GeneralSecurityException) {
+                } catch (e: TapauthException.Security) {
                     Log.w(
                         TAG,
                         "Signature verification failed for device ${device.deviceId}, rejecting request",
                     )
                     return
-                } catch (e: java.io.IOException) {
+                } catch (e: TapauthException.Io) {
                     Log.e(TAG, "Failed to parse AuthenticationRequest", e)
                     return
                 }
@@ -926,7 +933,7 @@ class AuthenticationService : Service() {
                         // EncryptedPacket in one step, using the algorithms this pairing
                         // negotiated (the AAD binds the algorithm and the temporal identifier).
                         val encryptedPacketBytes =
-                            TapAuthCrypto.createGrantWrapperMessage(
+                            createGrantWrapperMessage(
                                 challenge,
                                 privateKey,
                                 device.csk,
@@ -981,7 +988,7 @@ class AuthenticationService : Service() {
                         // Rust signs the denial's WrapperMessage and encrypts it into the finished
                         // EncryptedPacket, bound to the challenge and to the negotiated algorithms.
                         val encryptedPacketBytes =
-                            TapAuthCrypto.createDenialWrapperMessage(
+                            createDenialWrapperMessage(
                                 challengeBytes,
                                 "Denied on device",
                                 privateKey,

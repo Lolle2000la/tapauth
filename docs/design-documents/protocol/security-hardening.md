@@ -23,7 +23,7 @@ All paired Servers for a given Linux Client share that Client's `CSK`. Consequen
 * If Phone A is paired only for user `"bob"` and Phone B is paired for `"alice"`, Phone A cannot approve or deny an authentication attempt for `"alice"` even though Phone A can decrypt the multicast `EncryptedPacket`.
 
 ### 2.2 Mandatory Signature Verification Across ALL Message Types
-* On Android, **all** incoming `WrapperMessage` envelopes — `AuthenticationRequest`, `GrantConfirmation`, and `AuthenticationCancel` — **must** have their Ed25519 signature verified inside the Rust JNI boundary (`shared/src/jni_api.rs`) against the paired Client's `ed25519_public_key` before Kotlin acts on the parsed message.
+* On Android, **all** incoming `WrapperMessage` envelopes — `AuthenticationRequest`, `GrantConfirmation`, and `AuthenticationCancel` — **must** have their Ed25519 signature verified inside the Rust boundary (`shared/src/ffi.rs`, with the verification logic in `shared/src/ffi/ops.rs`) against the paired Client's `ed25519_public_key` before Kotlin acts on the parsed message.
 * Acting on an unverified `GrantConfirmation` or `AuthenticationCancel` (even when `CSK` AEAD decryption succeeded) is forbidden: doing so would let another device holding `CSK` cancel prompts or halt retransmissions.
 
 ### 2.3 QR Key Commitment & Transcript Binding at Pairing

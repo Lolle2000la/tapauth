@@ -255,7 +255,7 @@ cleanup() {
     fi
     if [ "$EXIT_CODE" -ne 0 ]; then
         echo "=== ANDROID LOGCAT DUMP ==="
-        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* AuthActionReceiver:* TemporalIdCache:* 2>/dev/null || true
+        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* AuthActionReceiver:* TemporalIdCache:* 2>/dev/null || true
         echo "==========================="
     fi
     if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
@@ -1166,7 +1166,7 @@ echo "✅ Phase 1a-i PASSED: both sides derived SAS $NEG_SAS, the phone rejected
 #
 # The protocol declares `PairingAbortReason::KEY_MISMATCH`, but NO implementation
 # emits it. On a mismatched `pk` the phone's Rust pin check simply rejects the
-# packet (constant-time comparison in shared/src/jni_api/ops.rs), logs
+# packet (constant-time comparison via shared/src/ffi/ops.rs), logs
 # "PairingResponse rejected: challenge does not match the session" and waits out
 # its own response deadline without sending any abort — so the daemon cannot
 # observe that reason and this phase cannot assert it. What is assertable is the

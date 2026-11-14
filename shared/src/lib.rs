@@ -16,7 +16,7 @@
 //! - `crypto`: Ed25519 signing, X25519 key exchange, AES-GCM encryption, temporal identifiers
 //! - `network`: UDP discovery with IPv4/IPv6 dual-stack multicast support
 //! - `protocol`: Protobuf message definitions and pairing/authentication flows
-//! - `jni`: Android JNI bindings (when `jni` feature is enabled)
+//! - `ffi`: UniFFI-exported Rust↔Kotlin surface (when `jni` feature is enabled)
 //!
 //! ## Security Model
 //!
@@ -41,10 +41,13 @@ pub mod tpm;
 pub mod firewall;
 
 #[cfg(feature = "jni")]
-pub mod jni;
+pub mod ffi;
 
+// Generates the C ABI scaffolding and the metadata the Kotlin bindings are
+// derived from. Must stay at the crate root: the namespace comes from the crate
+// name, so the generated file is `shared.kt`.
 #[cfg(feature = "jni")]
-pub mod jni_api;
+uniffi::setup_scaffolding!();
 
 // Re-export commonly used types
 pub use config::{ClientConfig, ClientConfigManager, ConfigError, PairedClient, PairedServer};

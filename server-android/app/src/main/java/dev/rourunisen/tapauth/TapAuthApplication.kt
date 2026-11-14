@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import androidx.core.app.NotificationManagerCompat
+import dev.rourunisen.tapauth.crypto.initLogging
 import dev.rourunisen.tapauth.service.AuthenticationService
 
 class TapAuthApplication : Application() {
@@ -59,6 +60,12 @@ class TapAuthApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // Install the Rust tracing layer exactly once for the process, before any
+        // crypto call, so `tracing` events from `shared` reach logcat under the
+        // `TapAuthNative` tag. Subscriber installation is idempotent in Rust
+        // (`std::sync::Once`).
+        initLogging()
 
         // Create notification channel for foreground service
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

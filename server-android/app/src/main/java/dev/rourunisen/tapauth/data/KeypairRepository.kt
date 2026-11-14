@@ -6,12 +6,21 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
-import dev.rourunisen.tapauth.crypto.Ed25519Keypair
+import dev.rourunisen.tapauth.crypto.generateKeypair
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+
+/**
+ * The phone's long-term Ed25519 identity keypair (`Ed_S`).
+ *
+ * A plain value holder for the pair this repository persists: [generateKeypair] is the FFI entry
+ * point and returns the two keys positionally as `[privateKey, publicKey]`, which this type keeps
+ * named so callers cannot swap them.
+ */
+data class ServerKeypair(val privateKey: ByteArray, val publicKey: ByteArray)
 
 /**
  * Manages the server's Ed25519 keypair for signing authentication grants. The keypair is generated
@@ -23,10 +32,10 @@ class KeypairRepository(private val context: Context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val keyStore: KeyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
 
-    private var cachedKeypair: Ed25519Keypair? = null
+    private var cachedKeypair: ServerKeypair? = null
 
     /** Get the server keypair, generating it if it doesn't exist */
-    fun getKeypair(): Ed25519Keypair {
+    fun getKeypair(): ServerKeypair {
         // Check cache first
         cachedKeypair?.let {
             return it
@@ -41,7 +50,8 @@ class KeypairRepository(private val context: Context) {
 
         // Generate new keypair
         Log.i(TAG, "Generating new server Ed25519 keypair")
-        val keypair = Ed25519Keypair.generate()
+        val generated = generateKeypair()
+        val keypair = ServerKeypair(privateKey = generated.first(), publicKey = generated.last())
         storeKeypair(keypair)
         cachedKeypair = keypair
 
@@ -80,7 +90,7 @@ class KeypairRepository(private val context: Context) {
         }
     }
 
-    private fun storeKeypair(keypair: Ed25519Keypair) {
+    private fun storeKeypair(keypair: ServerKeypair) {
         // Store public key directly (not sensitive)
         val publicKeyB64 = Base64.encodeToString(keypair.publicKey, Base64.NO_WRAP)
 
@@ -105,7 +115,7 @@ class KeypairRepository(private val context: Context) {
         Log.d(TAG, "Stored server keypair (public key: ${keypair.publicKey.size} bytes)")
     }
 
-    private fun loadKeypair(): Ed25519Keypair? {
+    private fun loadKeypair(): ServerKeypair? {
         val publicKeyB64 = prefs.getString(KEY_PUBLIC_KEY, null) ?: return null
         val encryptedPrivateKeyB64 = prefs.getString(KEY_PRIVATE_KEY_ENCRYPTED, null) ?: return null
         val ivB64 = prefs.getString(KEY_PRIVATE_KEY_IV, null) ?: return null
@@ -124,7 +134,7 @@ class KeypairRepository(private val context: Context) {
             val privateKey = cipher.doFinal(encryptedPrivateKey)
 
             Log.d(TAG, "Loaded server keypair from storage")
-            return Ed25519Keypair(privateKey, publicKey)
+            return ServerKeypair(privateKey, publicKey)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load keypair from storage", e)
             // Clear corrupted data
