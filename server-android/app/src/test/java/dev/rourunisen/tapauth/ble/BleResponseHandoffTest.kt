@@ -10,8 +10,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The decision a duplicate-in-flight BLE arrival needs: are the bytes already built for this
- * challenge owed to the handle it just arrived on?
+ * Which handle an answer is written on: the one the challenge is tracked on now, when the prompt
+ * outlived the link it was raised on ([record]), or else the one a duplicate-in-flight arrival just
+ * presented so the held bytes can be re-aimed at it ([redeliverOn]).
  *
  * The handle is a plain object here on purpose — the class under test compares handles by identity
  * only, and a `BluetoothGatt` cannot be constructed in a JVM test.
@@ -33,7 +34,7 @@ class BleResponseHandoffTest {
 
     @Test
     fun recordedAnswerIsNotRedeliveredToTheHandleItIsAlreadyGoingTo() {
-        handoff.record(challengeKey, peer, deadHandle, response)
+        handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
 
         // The re-notification of the same request on the link that is already being written: a
         // second write would race the retransmission loop, and nothing is owed.
@@ -43,7 +44,7 @@ class BleResponseHandoffTest {
 
     @Test
     fun reconnectOnANewHandleGetsTheSameBytesAndStopsTheOldLoop() {
-        val first = handoff.record(challengeKey, peer, deadHandle, response)
+        val first = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
         val stops = AtomicInteger(0)
         first.onRetransmission { stops.incrementAndGet() }
 
@@ -72,13 +73,56 @@ class BleResponseHandoffTest {
     }
 
     @Test
+    fun recordAimsTheAnswerAtTheLiveHandleWhenThePromptOutlivedTheDrop() {
+        // The prompt was raised on deadHandle, the Client dropped that link and reconnected on
+        // liveHandle before the user answered, so the service records the answer with both: the
+        // handle its callback captured, and the one the challenge is tracked on now.
+        val delivery = handoff.record(challengeKey, peer, deadHandle, liveHandle, response)
+
+        // Aiming at the captured handle is the blocker: it was torn down, so the write fails, the
+        // service disconnects, and the Client — which reads its request only on connect — is never
+        // answered.
+        assertSame(
+            "the answer must be written to the link that exists now",
+            liveHandle,
+            delivery.handle,
+        )
+        // And the reconnected handle is where it is already going, so its own duplicate is
+        // answered.
+        assertNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
+        assertEquals(1, handoff.pendingCount)
+    }
+
+    @Test
+    fun recordFallsBackToTheCapturedHandleWhenNoLiveHandleIsKnownYet() {
+        // The answer is built while the link is down: there is no tracked handle at all.
+        val delivery = handoff.record(challengeKey, peer, deadHandle, null, response)
+
+        assertSame(
+            "with no live handle the answer keeps the handle it was built for",
+            deadHandle,
+            delivery.handle,
+        )
+        // The bytes stay held, so the reconnect's duplicate re-aims them at the new handle rather
+        // than the answer being lost.
+        val redelivery = requireNotNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
+        assertSame(liveHandle, redelivery.delivery.handle)
+        assertSame(response, redelivery.delivery.response)
+        assertEquals(1, handoff.pendingCount)
+    }
+
+    @Test
     fun foreignPeerIsNeverHandedTheBytes() {
-        handoff.record(challengeKey, peer, deadHandle, response)
+        val owner = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
 
         // Another device replaying the captured request must not be answered at all; the gate calls
         // it a replay and the service disconnects it.
         assertNull(handoff.redeliverOn(challengeKey, otherPeer, Handle(otherPeer)))
         assertEquals(1, handoff.pendingCount)
+        // The owner's delivery must come out of that arrival untouched: superseding before the peer
+        // check would strand the owner's retransmission loop while nothing was handed to the
+        // foreign peer, and every assertion above would still pass.
+        assertFalse(owner.superseded)
     }
 
     @Test
@@ -91,9 +135,9 @@ class BleResponseHandoffTest {
 
     @Test
     fun confirmedDeliveryIsRetiredAndNoLongerRedelivered() {
-        val delivery = handoff.record(challengeKey, peer, deadHandle, response)
+        val delivery = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
 
-        handoff.finish(delivery)
+        assertTrue(handoff.finish(delivery, confirmed = true))
 
         assertEquals(0, handoff.pendingCount)
         assertFalse(delivery.superseded)
@@ -102,14 +146,29 @@ class BleResponseHandoffTest {
     }
 
     @Test
+    fun unconfirmedLoopEndKeepsTheAnswerForTheReconnect() {
+        val delivery = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
+
+        // The loop ended without a confirmation: the link died, the window elapsed, or a
+        // re-delivery cancelled it. Retiring the bytes here is the defect — the Client is still
+        // retrying, its reconnect would be answered by nothing, and every redelivery test would
+        // stay green because the guard used to live in the service, not in this class.
+        assertFalse(handoff.finish(delivery, confirmed = false))
+
+        assertEquals(1, handoff.pendingCount)
+        val redelivery = requireNotNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
+        assertSame("the reconnect must still be answered", response, redelivery.delivery.response)
+    }
+
+    @Test
     fun staleLoopFinishingAfterARedeliveryKeepsTheNewDelivery() {
-        val first = handoff.record(challengeKey, peer, deadHandle, response)
+        val first = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
         assertNotNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
 
         // The cancelled loop on the dead handle unwinds and reports itself finished. That must not
         // retire the delivery aimed at the live handle, or the reconnect would be answered by
         // nothing while the retransmission loop on the new link is still running.
-        handoff.finish(first)
+        handoff.finish(first, confirmed = true)
 
         assertEquals(1, handoff.pendingCount)
         assertNull(
@@ -124,7 +183,7 @@ class BleResponseHandoffTest {
     fun expiredAnswerIsPrunedInsteadOfBeingRedelivered() {
         // A link whose teardown is never reported to the service: the grace never runs, so the age
         // bound is what stops the held bytes from living for the process lifetime.
-        handoff.record(challengeKey, peer, deadHandle, response)
+        handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
         nowMillis += 600_001L
 
         assertNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
@@ -134,8 +193,8 @@ class BleResponseHandoffTest {
     @Test
     fun abandonedPeerLosesOnlyItsOwnAnswers() {
         val otherKey = "0d0e0f"
-        handoff.record(challengeKey, peer, deadHandle, response)
-        handoff.record(otherKey, otherPeer, Handle(otherPeer), response)
+        handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
+        handoff.record(otherKey, otherPeer, Handle(otherPeer), Handle(otherPeer), response)
 
         // The grace expires for the first peer: nothing it was owed may stay held, and the other
         // peer's answer is untouched.

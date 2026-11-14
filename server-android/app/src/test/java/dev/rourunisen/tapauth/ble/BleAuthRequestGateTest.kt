@@ -97,8 +97,17 @@ class BleAuthRequestGateTest {
         assertEquals(2, replayChecks.get())
     }
 
+    /**
+     * The gate retains the peer's claim across the grace window, so a repeat of the same challenge
+     * inside that window is a duplicate in flight rather than a replay.
+     *
+     * This pins the gate only: it says nothing about *when* the service releases a peer. That the
+     * `STATE_DISCONNECTED` handler leaves `concludePeer` alone (and runs it only once the grace has
+     * expired without a reconnect) cannot be observed from here — `BluetoothGatt` is a framework
+     * class — so it is pinned by the source guard in `BleGattServiceWiringTest`.
+     */
     @Test
-    fun linkLossThatHasNotReachedTheGraceKeepsTheClaimSoTheReconnectIsADuplicate() {
+    fun theClaimSurvivesTheGraceWindowSoARepeatInsideItIsADuplicate() {
         assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
 
         // The GATT link dropped and the Client reconnected retransmitting the same request. The

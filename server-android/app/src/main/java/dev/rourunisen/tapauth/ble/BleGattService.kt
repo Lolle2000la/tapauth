@@ -1436,13 +1436,42 @@ class BleGattService : Service() {
         // The answer is recorded before the first write and stays recorded until the Client
         // confirms it: a Client that loses this link retransmits the same request on the next one,
         // and those bytes then have to be written there instead of on the dead handle
-        // ([redeliverPendingResponse]). The challenge-tracked connection is likewise kept while the
-        // answer is pending — only the STATE_DISCONNECTED handler drops the handles it tore down.
+        // ([redeliverPendingResponse]).
+        //
+        // [gatt] is the handle this request arrived on, but the prompt can outlive it: the user may
+        // answer after the Client dropped that link and reconnected on another handle. The handle
+        // the challenge is tracked on now is therefore passed as the live one, so the answer is
+        // aimed at the link that exists; the captured handle is only the fallback for an answer
+        // built while no live handle is known, where the reconnect's duplicate re-delivers the
+        // bytes.
         val delivery = challenge?.let {
-            pendingResponses.record(it.toHex(), gatt.device.address, gatt, response)
+            val challengeKey = it.toHex()
+            pendingResponses.record(
+                challengeKey,
+                gatt.device.address,
+                gatt,
+                liveHandleFor(challengeKey, gatt.device.address),
+                response,
+            )
         }
-        deliverResponse(gatt, response, challenge, device, delivery)
+        deliverResponse(delivery?.handle ?: gatt, response, challenge, device, delivery)
     }
+
+    /**
+     * The handle [challengeKey] may still be written on for [peerAddress], or null when there is
+     * none.
+     *
+     * The challenge-tracked handle survives a drop only until the `STATE_DISCONNECTED` handler
+     * removes it, and the Client's reconnect re-registers its own handle as the duplicate arrives:
+     * so this is exactly the live side of a reconnection — null while the link is down, the new
+     * handle afterwards. A closed handle is the tombstone of a torn-down link and is never
+     * returned, and a handle another device registered for the same challenge is not this peer's
+     * link to write an answer to.
+     */
+    private fun liveHandleFor(challengeKey: String, peerAddress: String): BluetoothGatt? =
+        activeConnectionsByChallenge[challengeKey]?.takeIf { handle ->
+            handle.device.address == peerAddress && gattConnections[handle]?.closed != true
+        }
 
     /**
      * Hand the answer already built for [challengeKey] to the handle the Client reconnected on.
@@ -1566,12 +1595,13 @@ class BleGattService : Service() {
                         disconnectGatt(gatt)
                     }
                 } finally {
-                    // Only a confirmed delivery retires the answer. A loop that ended because the
-                    // link died (or was replaced by a re-delivery) leaves the bytes held, so the
-                    // Client's reconnect can still be answered; the grace-expiry release is what
-                    // drops an answer nobody is left to receive.
-                    if (confirmed && delivery != null) {
-                        pendingResponses.finish(delivery)
+                    // Only a confirmed delivery retires the answer, and [BleResponseHandoff.finish]
+                    // is what enforces it. A loop that ended because the link died (or was replaced
+                    // by a re-delivery) leaves the bytes held, so the Client's reconnect can still
+                    // be answered; the grace-expiry release is what drops an answer nobody is left
+                    // to receive.
+                    if (delivery != null) {
+                        pendingResponses.finish(delivery, confirmed)
                     }
                 }
             }

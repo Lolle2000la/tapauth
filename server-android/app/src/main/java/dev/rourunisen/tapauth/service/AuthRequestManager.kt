@@ -151,6 +151,13 @@ class AuthRequestManager private constructor() {
         // prompt is gone. The tokens the E2E suite greps are plain ASCII and pass unchanged.
         // That formatting is still needed for the E2E form; the production form logs no value
         // to format.
+        //
+        // The `BuildConfig.E2E_TESTING` literal below is the one point in this path no test pins:
+        // every JVM unit test runs against the e2e variant (`testBuildType = "e2e"`), where the
+        // flag is true, so `callerContextLogLine`'s false branch is only ever exercised by passing
+        // the flag as a parameter — never through this call. If this line is touched, the guard is
+        // the per-crate production artifact check under `scripts/ci/` (it fails when the preview
+        // content can be logged by a shipped build), not a unit test.
         Log.d(
             TAG,
             callerContextLogLine(

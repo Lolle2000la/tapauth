@@ -77,15 +77,39 @@ internal class BleResponseHandoff<H : Any>(
     val pendingCount: Int
         get() = pending.size
 
-    /** Hold [response] for [challengeKey], written to [handle] on behalf of [peerAddress]. */
+    /**
+     * Hold [response] for [challengeKey] on behalf of [peerAddress], aimed at the link that has to
+     * carry it.
+     *
+     * [capturedHandle] is the handle the answer was built for — the one the service's request
+     * callback closed over, i.e. the handle the prompt was raised on. [liveHandle] is the handle
+     * [challengeKey] is tracked on at the moment the answer is recorded, or null when none is
+     * known.
+     *
+     * The two differ when the prompt outlived the link it was raised on: the Client dropped that
+     * GATT connection and reconnected on a new handle *before* the user answered, so the captured
+     * handle is already closed. Aiming the answer there writes to a dead handle, the write fails,
+     * and the Client — which only reads its request on connect — never hears the verdict. The live
+     * handle therefore wins whenever it is known. The captured handle is the fallback for an answer
+     * built while the link is still down: there the reconnect's duplicate of the challenge is what
+     * re-aims the bytes ([redeliverOn]).
+     */
     fun record(
         challengeKey: String,
         peerAddress: String,
-        handle: H,
+        capturedHandle: H,
+        liveHandle: H?,
         response: ByteArray,
     ): Delivery<H> {
         pruneExpired()
-        val delivery = Delivery(challengeKey, peerAddress, response, handle, elapsedMillis())
+        val delivery =
+            Delivery(
+                challengeKey,
+                peerAddress,
+                response,
+                liveHandle ?: capturedHandle,
+                elapsedMillis(),
+            )
         pending[challengeKey] = delivery
         return delivery
     }
@@ -126,14 +150,26 @@ internal class BleResponseHandoff<H : Any>(
     }
 
     /**
-     * Forget [delivery]: the Client confirmed it, so nothing is owed for that challenge any more.
+     * Retire [delivery] once the Client's [confirmed] it, so nothing is owed for that challenge any
+     * more.
+     *
+     * Retirement is conditioned on the confirmation because every other way a delivery loop can end
+     * — the link dropped, the retransmission window elapsed, a re-delivery cancelled it — leaves
+     * the Client possibly still waiting, and only the held bytes can answer its next copy of the
+     * request. An unconfirmed end therefore keeps the record: the reconnect's duplicate re-delivers
+     * it, and [abandonPeer] or [pruneExpired] eventually bounds it.
      *
      * Only an identity match is removed, so a loop that finishes late (or is cancelled because a
      * re-delivery took over) cannot drop the delivery that replaced it.
+     *
+     * @return true when the delivery was retired, false when it was kept for a possible
+     *   re-delivery.
      */
-    fun finish(delivery: Delivery<H>) {
+    fun finish(delivery: Delivery<H>, confirmed: Boolean): Boolean {
+        if (!confirmed) return false
         delivery.takeCanceller()
         pending.remove(delivery.challengeKey, delivery)
+        return true
     }
 
     /** Drop every answer held for [peerAddress]: its link is gone and is not coming back. */

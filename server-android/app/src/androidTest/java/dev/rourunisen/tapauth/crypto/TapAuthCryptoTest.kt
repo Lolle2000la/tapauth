@@ -526,9 +526,14 @@ class TapAuthCryptoTest {
         // derivation makes every lookup miss, because both indexes key on the derived value.
         assertEquals("A BLE advertisement id must be 10 bytes", 10, advertisement.size)
         assertEquals("A packet temporal identifier must be 16 bytes", 16, packet.size)
-        assertFalse(
-            "The advertisement id and the packet id must not be the same value",
-            advertisement.contentEquals(packet),
+        // The two forms are one derivation: the advertisement id is the packet id truncated to the
+        // advertisement budget, so the prefix has to agree. That is the property a re-derived
+        // advertisement identifier breaks while both lengths still hold. The previous form
+        // (`advertisement.contentEquals(packet)`) could not fail on its own — two arrays of
+        // different lengths are never equal, which the assertions above already pin.
+        assertTrue(
+            "The advertisement id must be the packet id truncated to its length",
+            advertisement.contentEquals(packet.copyOf(advertisement.size)),
         )
 
         // Recomputed from scratch at every lookup: the same CSK and window must reproduce the
