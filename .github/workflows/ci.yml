@@ -178,6 +178,17 @@ jobs:
       - name: Run tests for shared library (with jni feature)
         run: cargo test --manifest-path shared/Cargo.toml --features jni --verbose
 
+      # The wire-level half of the spoofed-source pair
+      # (`transport::udp::tests::a_spoofed_source_on_the_wire_is_not_recorded`)
+      # is compiled only for `dev-udp-loopback`, because the receive-filter
+      # bypass it exercises lives behind that feature in `shared`; the
+      # default-feature workspace run further down never executed it — clippy
+      # only compiled it. This is the one step that runs it. The feature set is
+      # exactly what that test needs: no `ble`, no `firewall`, and no other dev
+      # knob (a shipped build must never carry one).
+      - name: "Run tapauthd tests (UDP loopback: a spoofed on-wire source is not recorded)"
+        run: cargo test -p tapauthd --no-default-features --features dev-udp-loopback --verbose
+
       - name: Run tests for client PAM module
         run: cargo test --manifest-path client-pam/Cargo.toml --verbose
 
