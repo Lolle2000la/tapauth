@@ -54,6 +54,24 @@ impl CallerContext {
     ) -> Self {
         let exe_name = kernel_exe_basename(proc_root, caller_pid);
 
+        // One `warn` per resolved context, not one per failed read: `exe` and
+        // `cmdline` fail together in the cross-UID `EACCES` case, and the debug
+        // lines inside the two readers already carry the errno. Escalated from
+        // `debug` because the consequence is a trust downgrade an operator has to
+        // know about: both display fields then come from the caller, so the name
+        // and command the phone shows are claims, not the kernel's.
+        if caller_pid > 0 && exe_name.is_none() {
+            tracing::warn!(
+                "Cannot read {} for pid {}: the phone will display the caller's self-reported \
+                 process name (and command) instead of the kernel-verified ones. The shipped \
+                 unit runs without CAP_SYS_PTRACE, so this is expected for another user's \
+                 process and is not a failure; grant that capability only if kernel-verified \
+                 display context is required.",
+                proc_dir(proc_root, caller_pid).join("exe").display(),
+                caller_pid
+            );
+        }
+
         // PolKit's helper runs under its own name, and the phone should display
         // the service it authenticates (`polkit-1`) rather than the helper's own
         // argv. The kernel's view of the image decides whenever it can answer:
@@ -105,7 +123,9 @@ impl CallerContext {
 /// Reading another user's `/proc/<pid>/exe` needs `CAP_SYS_PTRACE`, which the
 /// shipped unit deliberately does not grant, so a failure here is the normal
 /// degradation rather than a bug — but it is logged, because it silently makes
-/// the prompt fall back to what the caller about itself reported.
+/// the prompt fall back to what the caller about itself reported. The errno is
+/// logged here at `debug`; [`CallerContext::resolve_with_root`] emits one `warn`
+/// per resolved context with the consequence.
 fn kernel_exe_basename(proc_root: &Path, pid: i32) -> Option<String> {
     if pid <= 0 {
         return None;
@@ -238,6 +258,124 @@ mod tests {
             pam_service: pam_service.to_string(),
             process_name: process_name.to_string(),
         }
+    }
+
+    /// Records every event the daemon emits while the guard is installed, so the
+    /// one `warn` this module produces on the degraded `/proc` path can be
+    /// asserted on level, count and wording instead of being taken on trust.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CapturedLog {
+        fn events(&self) -> Vec<(tracing::Level, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// The `message` field is the only one these assertions care about.
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLog {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message));
+        }
+    }
+
+    /// Run `resolve` under a capturing subscriber and return the lines it emitted
+    /// at `WARN` or above — what an operator sees with the shipped journal filter.
+    fn warnings_during(resolve: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        let log = CapturedLog::default();
+        {
+            let _guard = tracing::subscriber::set_default(log.clone());
+            resolve();
+        }
+        log.events()
+            .into_iter()
+            .filter(|(level, _)| matches!(*level, tracing::Level::WARN | tracing::Level::ERROR))
+            .collect()
+    }
+
+    /// The production degradation: the shipped unit lacks `CAP_SYS_PTRACE`, so a
+    /// caller from another UID has an unreadable `/proc/<pid>/exe` and the phone
+    /// is shown the caller's own claim. That must be a single visible `warn` per
+    /// resolved context — one line covering both reads, not one per field — and it
+    /// must say what the operator is looking at and what would change it.
+    #[test]
+    fn an_unreadable_proc_entry_warns_once_that_the_display_is_caller_supplied() {
+        let proc = TempProc::new();
+        // The pid exists but nothing under it is readable: the cross-UID shape.
+        proc.process_dir(9100);
+
+        let mut ctx = None;
+        let warnings = warnings_during(|| {
+            ctx = Some(CallerContext::resolve_with_root(
+                9100,
+                &request("sudo", "spoofed-name"),
+                proc.path(),
+            ));
+        });
+
+        assert_eq!(ctx.unwrap().process_name, "spoofed-name");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warn per resolved context, not one per unreadable field: {warnings:?}"
+        );
+        let (level, message) = warnings.first().expect("length asserted above");
+        assert_eq!(*level, tracing::Level::WARN);
+        // The consequence and the remedy, so the line is actionable.
+        assert!(message.contains("self-reported"), "{message}");
+        assert!(message.contains("CAP_SYS_PTRACE"), "{message}");
+    }
+
+    /// The warn is for the exceptional path only: a readable `/proc` entry must not
+    /// produce it, or every `sudo` on the host would train operators to ignore it.
+    #[test]
+    fn a_readable_proc_entry_emits_no_warning() {
+        let proc = TempProc::new();
+        proc.with_exe(9101, "/usr/bin/sudo");
+        proc.with_cmdline(9101, &["sudo", "true"]);
+
+        let mut ctx = None;
+        let warnings = warnings_during(|| {
+            ctx = Some(CallerContext::resolve_with_root(
+                9101,
+                &request("sudo", "spoofed-name"),
+                proc.path(),
+            ));
+        });
+
+        assert_eq!(ctx.unwrap().process_name, "sudo");
+        assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
     }
 
     /// The kernel appends `" (deleted)"` to the exe link once the image file is

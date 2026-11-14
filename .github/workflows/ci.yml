@@ -83,6 +83,14 @@ jobs:
       - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
 
+      # `tpm` is a pure cfg gate (`shared/Cargo.toml`: `tpm = []`), so compiling it
+      # needs no TPM device and no `tpm2-tools` (that is a runtime shell-out only).
+      # Nothing else in CI enabled the feature — only `install.sh --tpm` builds it —
+      # so a regression inside it would have shipped unseen. `--features` is
+      # ambiguous on a virtual workspace, hence the explicit package list.
+      - name: "Run clippy (TPM feature)"
+        run: cargo clippy -p shared -p tapauthd -p client-pam -p client-config-gui --all-targets --features tpm -- -D warnings
+
   production-guard:
     name: Production Build Override Scan
     runs-on: ubuntu-latest

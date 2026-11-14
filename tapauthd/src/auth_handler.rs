@@ -933,6 +933,13 @@ impl AuthSession {
         udp_transport: &Arc<crate::transport::UdpTransport>,
         cancel_packet: &EncryptedPacket,
     ) {
+        // Both grant paths funnel through here, so this is the one line that
+        // names the transport which carried the grant. NOTE: the exact phrase and
+        // `WinningTransport`'s Debug output ("Ble"/"Udp") are asserted by E2E
+        // Phase 3 (BLE only) and Phase 4 (either winner), in
+        // `scripts/test-e2e.sh`; keep the format specifier a `{:?}` of the
+        // winner if you rename a variant.
+        tracing::info!("Authentication granted over {:?}", winner);
         self.dismiss_losing_transports(
             success_teardown(winner),
             ble_transport,
@@ -1047,7 +1054,15 @@ impl AuthSession {
             UdpTransport::from_socket(self.state.udp_socket.clone(), toml_config.udp_port);
         let transport_arc = Arc::new(transport);
         let run = Arc::new(self.run_params());
-        Self::authenticate_with_transport(transport_arc, packet, run).await
+        let result = Self::authenticate_with_transport(transport_arc, packet, run).await;
+        if result.is_ok() {
+            // Same phrase as the dual-transport build's grant line in
+            // `multicast_cancel_on_success` (E2E Phases 3 and 4 match it): with
+            // the `ble` feature off, the network path is the only one that can
+            // conclude a session.
+            tracing::info!("Authentication granted over Network");
+        }
+        result
     }
 
     /// Authenticate using any Transport

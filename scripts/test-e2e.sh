@@ -1952,6 +1952,16 @@ assert_log_since() {
     fi
 }
 
+# Print the transport named by the newest "Authentication granted over …" line
+# after a given line offset, or nothing when that window holds none.
+grant_transport_since() {
+    local base=$1
+    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
+        | grep -o "Authentication granted over [A-Za-z]*" \
+        | tail -n 1 \
+        | awk '{print $NF}'
+}
+
 # ── BLE scan resiliency helpers ───────────────────────────────────────────────
 #
 # Phases 3 and 4 depend on the Android app's hardware-offloaded (PendingIntent)
@@ -2180,8 +2190,17 @@ restart_android_app_for_ble
 echo "==> Setting transport config: BLE enabled, UDP disabled..."
 "$CLI_BIN" set-transports --ble true --network false
 
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
 if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
+    # UDP is switched off above, so `OUTCOME=SUCCESS` alone does not prove BLE did
+    # anything — it only proves *something* satisfied the request. The daemon names
+    # the transport that carried the grant, and this phase requires it to say Ble:
+    # a dead BLE path that falls back to another transport (or to a stale session)
+    # must fail here, which is what the earlier blind spot hid.
+    sleep 1
+    assert_log_since "$LOG_BASE" "Authentication granted over Ble" \
+        "Daemon reports the grant was delivered over BLE"
     echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
 else
     echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
@@ -2205,7 +2224,20 @@ settle_for_dedup "Phase 3"
 echo "==> Setting transport config: Both BLE and UDP enabled..."
 "$CLI_BIN" set-transports --ble true --network true
 
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
+    # The race is decided by whichever transport answers first, so requiring a
+    # particular winner would encode a scheduling accident. What must hold is that
+    # the daemon named one: with both transports live, "passed" is only meaningful
+    # if a grant was actually attributed to a transport.
+    sleep 1
+    GRANT_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+    if [ -z "$GRANT_TRANSPORT" ]; then
+        echo "❌ ERROR: the daemon logged no 'Authentication granted over …' line for this phase."
+        tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
+        exit 1
+    fi
+    echo "ℹ️  Parallel race: the grant arrived over ${GRANT_TRANSPORT} (either winner is a pass by design)."
     echo "✅ Parallel Discovery Race Authentication PASSED!"
 else
     echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
