@@ -8,12 +8,12 @@ Protocol v2 replaces the nominal (unused) negotiation in v1 with **end-to-end en
 
 1. **Client-Wide Broadcast Parameters** (associated with the Client's `CSK` because one multicast UDP / BLE advertisement targets **all** paired Servers simultaneously):
    * **`SymmetricAlgorithm`**: `AES_256_GCM` (`1`, baseline mandatory) or `CHACHA20_POLY1305` (`2`).
-   * **`HashAlgorithm`**: `SHA256` (`1`, baseline mandatory, via HMAC-SHA256) or `BLAKE3` (`2`, via keyed BLAKE3 or HMAC-BLAKE3, standardized as HMAC-SHA256 for `SHA256` and BLAKE3 keyed-MAC for `BLAKE3`).
+   * **`HashAlgorithm`**: `SHA256` (`1`, baseline mandatory, via HMAC-SHA256) or `BLAKE3` (`2`, via BLAKE3 in keyed mode — a keyed BLAKE3 MAC with the CSK as the key, not an unkeyed BLAKE3 hash and not HMAC-BLAKE3; see `keyed_window_mac` in `shared/src/crypto/temporal.rs`).
    * **Client `SignatureAlgorithm`**: `ED25519` (`1`, baseline mandatory).
 2. **Per-Server Parameters** (stored individually per `PairedServer` on Linux and `PairedDevice` on Android):
    * **Server `SignatureAlgorithm`** + Server static public key ($Ed_S$).
 3. **Negotiation & Persistence Rules**:
-   * **Android Server** advertises `supported_*` in `PairingInit` with baseline mandatory algorithms listed **first** (`[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so legacy/older v1/v2 Linux Clients remain compatible.
+   * **Android Server** advertises `supported_*` in `PairingInit` with baseline mandatory algorithms listed **first** (`[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so a peer that implements only the baseline still finds a match. The protocol version itself is not negotiable: only `protocolVersion = 2` is accepted, and a v1 record must be re-paired (`shared/src/ffi/ops.rs:201`, [`authentication-flow.md`](authentication-flow.md) §2.6).
    * **Linux Client** intersects `supported_*` with its own supported set (and with the active CSK's algorithm if a `CSK` already exists from a prior pairing). Rotating `CSK` (`RotateCsk`) allows upgrading the Client-wide algorithm when re-pairing.
    * Both sides **persist** the negotiated `SymmetricAlgorithm`, `HashAlgorithm`, and `SignatureAlgorithm` in config/repository storage and dispatch strictly on them at runtime, rejecting `UNSPECIFIED` or mismatched algorithms (`CryptoError::UnsupportedAlgorithm`).
 

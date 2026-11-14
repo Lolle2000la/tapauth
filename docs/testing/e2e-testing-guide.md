@@ -6,7 +6,7 @@ This document describes the automated end-to-end (E2E) test harness for TapAuth,
 
 ## 1. Overview & Test Architecture
 
-The E2E test stack validates real cryptographic protocols, daemon state transitions, IPC boundaries, PAM module integration, network transports (TCP/UDP), and Bluetooth Low Energy (BLE) GATT communication against real Android software stacks and the Linux PAM infrastructure.
+The E2E test stack validates real cryptographic protocols, daemon state transitions, IPC boundaries, PAM module integration, network transports (UDP multicast/unicast and the ephemeral UDP pairing socket), and Bluetooth Low Energy (BLE) GATT communication against real Android software stacks and the Linux PAM infrastructure.
 
 ```mermaid
 graph TB
@@ -26,7 +26,7 @@ graph TB
     subgraph AndroidGuest["Android Device / Emulator"]
         direction TB
         subgraph AndroidServices["Background & UI Services"]
-            PAIR_CLIENT["PairingClient (TCP) / PairingE2eTest"]
+            PAIR_CLIENT["PairingSession / PairingE2eTest<br/>(UDP + BLE GATT)"]
             AUTH_SRV["AuthenticationService (UDP)"]
             BLE_SRV["BleGattService (GATT Server/Client)"]
         end
@@ -41,7 +41,7 @@ graph TB
         BLE_SRV --> BIOMETRICS
     end
 
-    DAEMON <-->|"TCP Pairing Handshake (Ephemeral Port)<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
+    DAEMON <-->|"UDP Pairing Socket (Ephemeral Port) / BLE GATT<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
     DAEMON <-->|"UDP Multicast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
     DAEMON <-->|"BLE GATT Service (b4ad84c0...)<br/>/dev/vhci ◄► Bumble ◄► Netsim"| BLE_SRV
 ```
@@ -52,23 +52,23 @@ graph TB
 
 The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test matrix covering positive authentication, protocol races, adversarial injections, timeout handling, and un-pairing:
 
-### Phase 1: Real TCP Device Pairing & SAS Anti-MITM Verification
-- **Phase 1a (Negative Pairing / SAS Rejection)**:
-  1. Desktop starts an ephemeral TCP pairing listener.
-  2. Android connects via `PairingE2eTest -e reject_sas true`.
-  3. Ephemeral ECDH exchange completes and derives the SAS, but Android rejects the SAS confirmation and closes the TCP connection.
-  4. Desktop's `complete-pairing` fails: the suite asserts both its non-zero exit code and that `get-servers` records 0 paired devices on disk.
-- **Phase 1b (Legitimate Pairing Handshake)**:
-  1. `tapauthd` generates a dynamic TCP listener port and ephemeral X25519 pairing keypair.
-  2. Android emulator runs `PairingE2eTest` connecting to host `10.0.2.2:<port>`.
-  3. Handshake executes:
-     - `PairingHello` with Android public keys.
-     - `PairingResponse` with Desktop public keys.
-     - Both derive ephemeral PSK via ECDH and compute 6-digit Short Authentication String (SAS).
-  4. Desktop and Android assert identical SAS codes (`XXX-XXX`).
-  5. Desktop transmits AES-256-GCM encrypted Client Symmetric Key (CSK) with SHA-256 hash confirmation.
-  6. Android stores paired desktop in `DeviceRepository`, and desktop saves server key to `/var/lib/tapauth/paired_servers.json`.
-  7. State directory security properties are asserted (`/var/lib/tapauth` 700 `tapauthd:tapauthd`, key files 600, socket 660 `root:tapauthd-clients`).
+### Phase 1: Protocol v2 Pairing (UDP + BLE) & SAS Anti-MITM Verification
+Pairing runs over the same two transports as authentication — there is no TCP listener: the desktop opens an ephemeral UDP socket and advertises the pairing over BLE GATT at the same time, the phone races both, and the first acceptable `PairingResponse` locks the transport.
+- **Phase 1a-i (Negative Pairing / SAS Rejection)**:
+  1. Desktop runs `start-pairing`, which prints the ephemeral pairing port, the session id and a `tapauth://pair?v=2&...` QR URL.
+  2. Android runs `PairingE2eTest -e pairing_url <url> -e reject_sas true`; the ECDH/SAS exchange completes and both sides derive the same code.
+  3. Android rejects the SAS and aborts with `USER_REJECTED_SAS`; the suite requires the daemon to log the accepted `PairingInit` and `Pairing aborted by the phone (USER_REJECTED_SAS)`.
+  4. Desktop's `complete-pairing` fails with that abort reason, and `get-servers` records 0 paired devices on disk.
+- **Phase 1a-ii (QR `pk` Pin)**: the harness replaces `pk` in the QR with a different well-formed 64-hex X25519 key. The phone's constant-time pin check rejects the daemon's `PairingResponse`, logs `PairingResponse rejected: …` and **drops the packet without sending any abort** — `KEY_MISMATCH` is declared in the proto but emitted by no implementation — so the run ends on the phone's own response deadline. The harness then cancels the session from the desktop and asserts 0 devices were stored.
+- **Phase 1a-iii (Desktop Cancels a Live Session)**: `cancel-pairing` ends a live session, the phone reports the abort, a later `complete-pairing` refuses it as cancelled, and nothing is stored.
+- **Phase 1b (Legitimate Pairing Handshake over UDP)**:
+  1. `tapauthd` opens the ephemeral UDP pairing socket (and a UDP firewall rule) and prints a v2 QR with `p`/`ip4`/`ip6`.
+  2. The emulator runs `PairingE2eTest` against host `10.0.2.2` (QEMU SLIRP) and sends `PairingInit` until a `PairingResponse` arrives, keeping the NAT mapping alive with `PairingKeepalive`.
+  3. Both sides derive and compare the same 6-digit SAS (`XXX-XXX`).
+  4. `complete-pairing` provisions the CSK inside `PairingConfirmClient` (AEAD under $K_{\text{c2s}}$, AAD `"tapauth-pair-v2-provision" || H`) and the phone proves receipt with `PairingConfirmServer` (signed by `Ed_S`).
+  5. Android stores the paired desktop in `DeviceRepository`, the desktop saves the server key to `/var/lib/tapauth/paired_servers.json` and `get-servers` lists it.
+  6. In systemd mode the state directory security properties are asserted (`/var/lib/tapauth` 700 `tapauthd:tapauthd`, key files 600, socket 660 `root:tapauthd-clients`).
+- **Phase 1c (BLE-Only Pairing)**: with `ip4`/`ip6` stripped from the QR the phone starts no UDP candidate and pairs over the Bumble `/dev/vhci` adapter: the daemon advertises the pairing, the phone connects GATT, writes `PairingInit` and takes the provisioning payload from the characteristic.
 
 ### Phase 2: Local Network (UDP) End-to-End Authentication
 1. Desktop enables UDP transport and disables BLE via admin IPC (`set-transports --network true --ble false`).

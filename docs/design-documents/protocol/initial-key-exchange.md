@@ -102,7 +102,7 @@ Upon scanning the QR code, the Server (Android):
    * `server_x25519_public_key` ($X_S$)
    * `server_ed25519_public_key` ($Ed_S$, the phone's long-term signing key)
    * `server_device_name` (truncated to max 64 UTF-8 bytes)
-   * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — always listing baseline v1/v2 mandatory algorithms first (e.g., `[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so older Clients continue to select compatible algorithms.
+   * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — always listing the baseline mandatory algorithms first (e.g., `[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so a Client that implements only the baseline still finds a match. The protocol version is not negotiated: only v2 is accepted (see [`authentication-flow.md`](authentication-flow.md) §2.6).
 4. Races the transports:
    * **UDP**: If IP & port are present, sends `PairingInit` every **500ms** (up to 15s) until `PairingResponse` arrives.
    * **BLE**: Computes `pairing_adv_id` from `(sid, pk)` and (after a **250ms** head start for LAN UDP, or immediately if no IP/UDP is available) runs a foreground hardware-filtered `ScanFilter` matching the exact 10-byte `pairing_adv_id`, connects GATT, requests `MTU 517`, subscribes to notifications on `PAIRING_CHAR_UUID`, and writes `PairingInit`.
@@ -124,12 +124,14 @@ Upon receiving `PairingInit` matching `session_id`:
 ### Step 4: Server QR Key Verification, Signature Check & Mutual SAS Comparison
 
 Before displaying the SAS to the user, the Server **must**:
-1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk`. If they differ, send `PairingAbort(KEY_MISMATCH)` and abort immediately — an active attacker cannot substitute $X_C$ even before SAS verification.
-2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`. If invalid, send `PairingAbort(PROTOCOL_ERROR)` and abort.
+1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing.rs:755`). An active attacker cannot substitute $X_C$ even before SAS verification.
+2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`.
 3. Verify the selected algorithms are in its own supported sets.
 4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS:
    $$\text{SAS} = \text{format!}(\text{"\{:06\}"},\; \text{u64::from\_be\_bytes}(\text{SAS\_bytes}) \bmod 1{,}000{,}000)$$
    formatted visually as `"123-456"`.
+
+A failing check does **not** produce a `PairingAbort`. The Server logs the rejection (`PairingResponse rejected: …`) and **silently drops the packet**, then keeps listening for an acceptable `PairingResponse` on either transport until its own response deadline expires (`server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt:73-75`, `:500-519`; the Rust entry point returns `ProtocolError::ChallengeMismatch` / `ProtocolError::UnsupportedAlgorithm` for the caller to swallow). This is deliberate: the pairing UDP port and the BLE characteristic are reachable by anyone on the link, so one spoofed packet must not be able to abort a pairing that is in progress. Only an *authenticated* `PairingAbort` (MAC'd under $K_{\text{dir}}$, see below) or the deadline ends the session early, and the Server's own abort reasons are limited to `USER_REJECTED_SAS` and `SESSION_EXPIRED` (`PairingSession.kt:166-170`). `KEY_MISMATCH` and `PROTOCOL_ERROR` therefore remain declared in [`proto/auth_protocol.proto`](../../../proto/auth_protocol.proto) but are never emitted for an unverifiable response — neither side learns why the packet was ignored.
 
 Because **both** $K_{\text{c2s}}/K_{\text{s2c}}$ and $\text{SAS}$ are derived from $\text{HKDF-Extract}(\text{salt}=H, \text{ikm}=Z)$, tampering with **any** field — $X_C, X_S, Ed_C, Ed_S$, device names, or negotiated algorithms — produces a completely different $H$ and causes an overwhelming SAS mismatch (1 in $10^6$).
 

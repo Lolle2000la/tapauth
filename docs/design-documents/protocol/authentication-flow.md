@@ -43,7 +43,7 @@ All post-pairing communication is wrapped in `EncryptedPacket` (`proto/auth_prot
 
 * **Temporal Identifier Generation**:
     1. Both Client and Server compute the 60-second time window `floor(unix_timestamp / 60)`.
-    2. The full **16-byte** identifier is `HMAC(hash_alg, CSK, u64_be(window))[0..16]`, where `hash_alg` is the `HashAlgorithm` persisted for that Client (`SHA256` or `BLAKE3`, default `SHA256`).
+    2. The full **16-byte** identifier is `MAC(hash_alg, CSK, u64_be(window))[0..16]`, where `MAC` is HMAC-SHA256 for `SHA256` and a keyed BLAKE3 MAC (BLAKE3 keyed mode, CSK as the key — not an unkeyed hash) for `BLAKE3`, and `hash_alg` is the `HashAlgorithm` persisted for that Client (`SHA256` or `BLAKE3`, default `SHA256`).
     3. For **BLE Advertisements only**, the identifier is truncated to the first **10 bytes** (`[0..10]`) so the complete legacy advertisement fits within 31 bytes. Once connected over GATT, all `EncryptedPacket` messages use the full 16-byte `temporal_identifier`.
 * **Encryption Process & Header AAD**:
     1. Construct the inner message (e.g., `AuthenticationRequest`) and encode it to `raw_payload`.
@@ -75,7 +75,7 @@ Binding `encryption_algorithm` and `temporal_identifier` via AAD prevents an att
 
 ### 2.3. Raw-Payload Signature Generation & Verification (`WrapperMessage`)
 
-To achieve true wire evolvability (and one-way backwards compatibility when older Linux Clients communicate with newer Android Servers), `WrapperMessage` **never** re-encodes a decoded protobuf struct during signature verification:
+To achieve true wire evolvability, `WrapperMessage` **never** re-encodes a decoded protobuf struct during signature verification:
 
 * **Structure** (`proto/auth_protocol.proto`):
   * `uint32 version = 1` (Protocol version `2`)
@@ -107,7 +107,7 @@ To achieve true wire evolvability (and one-way backwards compatibility when olde
 
 To give users clear context on their phone (e.g., distinguishing `sudo` from lockscreen unlock or seeing the requested command), `AuthenticationRequest` includes optional signed fields:
 * `string pam_service = 5` (max **32 UTF-8 bytes**, e.g., `"sudo"`, `"polkit-1"`, `"su"`)
-* `string process_name = 6` (max **32 UTF-8 bytes**, e.g., `"sudo"`, `"pkexec"`, resolved from `SO_PEERCRED` `/proc/<pid>/exe`)
+* `string process_name = 6` (max **32 UTF-8 bytes**, e.g., `"sudo"`, `"pkexec"`, resolved from the `SO_PEERCRED` PID via `/proc/<pid>/exe`, then the `cmdline` `argv[0]`, then `/proc/<pid>/comm`, and only then the caller's self-reported name — `exe` is EACCES for another UID's process without `CAP_SYS_PTRACE`)
 * `string command_preview = 7` (max **128 UTF-8 bytes**, sanitized argv preview read from `/proc/<pid>/cmdline` via kernel-verified `SO_PEERCRED` PID)
 * `bool tty_present = 8`
 
@@ -122,10 +122,11 @@ With these strict caps, worst-case `EncryptedPacket` size is **470 bytes** (stri
 * **Bluetooth Low Energy (BLE)**:
   * Client acts as **Peripheral / Advertiser**, Server acts as **Central / Scanner**. See [`ble-gatt-specification.md`](ble-gatt-specification.md).
 
-### 2.6. One-Way Backwards Compatibility (Old Client $\leftrightarrow$ New Server)
+### 2.6. Version Policy: v2 Only, No Runtime Fallback
 
-Because Linux distribution packages may keep Clients (`tapauthd`) on older stabilized versions longer than mobile app updates:
-* New Android Servers **must** continue supporting requests from stabilized older Clients:
-  * If a Server pairs with an older v1 Client (sending `PairingHello` rather than v2 `PairingInit`), the Server persists `protocolVersion = 1` on that `PairedDevice` (while still enforcing QR `pk` / transition rules as documented), whereas v2 pairings record `protocolVersion = 2`.
-  * Once stabilized on v2, future optional additions (like new fields on `AuthenticationRequest`, new UI hints, or new context metadata) require **no protocol version bump**: old v2 Clients simply omit new fields and sign `WrapperMessage.payload`, while newer Servers display them when present (and vice versa).
-* Conversely, newer Clients talking to obsolete v1 Servers need not fall back and may prompt the user to update the Android app.
+There is no negotiation and no runtime fallback: every frame and every persisted pairing must be v2.
+
+* `WrapperMessage.version` must be `PROTOCOL_VERSION_V2` (`2`); any other value is refused before the inner payload is decoded (`shared/src/protocol/messages.rs:139`), and again at the UniFFI boundary on the Android side (`shared/src/ffi/ops.rs:229`).
+* A persisted `protocolVersion` other than `2` is a security failure, not a caller error: `check_protocol_version` refuses the request with `TapauthError::Security` (`unsupported protocol version N (this build speaks only v2)`) instead of falling back to the old framing (`shared/src/ffi/ops.rs:201`). Pairing frames carry `version: 2` as well, and a frame with any other version is rejected on decode (`validate_envelope`, `shared/src/protocol/pairing.rs:998`).
+* Devices paired by a pre-v2 build therefore cannot authenticate: their stored record loads with `protocolVersion = 1` and the AES-256-GCM/SHA-256/Ed25519 defaults, and it **must be re-paired** — there is deliberately no compatibility path that would let it fall back to v1 crypto (`server-android/app/src/main/java/dev/rourunisen/tapauth/data/DeviceRepository.kt:143`).
+* Future optional additions (new fields on `AuthenticationRequest`, new UI hints, new context metadata) still require **no protocol version bump**: they are signed inside `WrapperMessage.payload`, so an older v2 Client simply omits them while a newer Server displays them when present (and vice versa).
