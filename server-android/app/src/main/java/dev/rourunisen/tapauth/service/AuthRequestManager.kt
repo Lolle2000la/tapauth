@@ -152,12 +152,14 @@ class AuthRequestManager private constructor() {
         // That formatting is still needed for the E2E form; the production form logs no value
         // to format.
         //
-        // The `BuildConfig.E2E_TESTING` literal below is the one point in this path no test pins:
-        // every JVM unit test runs against the e2e variant (`testBuildType = "e2e"`), where the
-        // flag is true, so `callerContextLogLine`'s false branch is only ever exercised by passing
-        // the flag as a parameter — never through this call. If this line is touched, the guard is
-        // the per-crate production artifact check under `scripts/ci/` (it fails when the preview
-        // content can be logged by a shipped build), not a unit test.
+        // The `BuildConfig.E2E_TESTING` literal below is the one point in this path no automated
+        // check covers: every JVM unit test runs against the e2e variant (`testBuildType = "e2e"`),
+        // where the flag is true, so `callerContextLogLine`'s false branch is only ever exercised
+        // by passing the flag as a parameter — never through this call. Nothing under `scripts/ci/`
+        // looks at an APK or greps for `commandPreview` (it builds the Rust crates and scans the
+        // distro payloads), so flipping this literal to `true` would ship the preview's content in
+        // a `Log.d` that survives release with no check failing. A shipped-artifact check that the
+        // release dex cannot contain the E2E-only marker string is what would close that gap.
         Log.d(
             TAG,
             callerContextLogLine(

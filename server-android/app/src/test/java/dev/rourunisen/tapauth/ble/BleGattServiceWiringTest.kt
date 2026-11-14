@@ -44,6 +44,18 @@ class BleGattServiceWiringTest {
                 "has expired; found it in:\n$branch",
             branch.contains(CONCLUDE_PEER),
         )
+
+        // Same defect class, one registry over: the answer held for the peer is the other thing a
+        // reconnect needs. Dropped at teardown, the Client's retransmission has no bytes to be
+        // re-delivered and the prompt stands on a live link with nothing left to send.
+        for (dropped in DROPPING_HELD_STATE) {
+            assertFalse(
+                "STATE_DISCONNECTED must not drop held response state before the grace has " +
+                    "expired (`$dropped`), or the Client's retransmission cannot be answered:\n" +
+                    branch,
+                branch.contains(dropped),
+            )
+        }
     }
 
     @Test
@@ -71,6 +83,21 @@ class BleGattServiceWiringTest {
                 "block (offset $conclude not in $graceWait..$graceBlockEnd)",
             conclude > graceWait && conclude < graceBlockEnd,
         )
+        // The `if` is the invariant, not the wait: above it the release also fires for a device
+        // that *did* reconnect inside the grace, whose next retransmission then reaches the replay
+        // cache and gets the fresh link torn down — the original bug, one indentation level out.
+        val reconnectCheck = source.indexOf(RECONNECT_CHECK, graceWait)
+        assertTrue(
+            "the release must sit inside the reconnect check `$RECONNECT_CHECK` that follows " +
+                "$GRACE_WAIT (offset $reconnectCheck not in $graceWait..$graceBlockEnd)",
+            reconnectCheck > graceWait && reconnectCheck < graceBlockEnd,
+        )
+        assertTrue(
+            "authRequestGate.concludePeer must be inside `$RECONNECT_CHECK`: released above it, a " +
+                "device that reconnected inside the grace loses its claim and its retransmission " +
+                "is answered as a replay (release at $conclude, check at $reconnectCheck)",
+            conclude > reconnectCheck && conclude < graceBlockEnd,
+        )
         // Outside that block the release would be unconditional on a reconnect having happened,
         // which is the disconnect-handler bug the first test refuses.
         assertTrue(
@@ -88,12 +115,16 @@ class BleGattServiceWiringTest {
         )
 
         val call = source.indexOf(FINISH_CALL)
-        val arguments = source.substring(call, source.indexOf(')', call))
-        assertTrue(
+        val arguments = source.substring(call + FINISH_CALL.length, source.indexOf(')', call))
+        // The pair is what matters, not a mention of `confirmed`: a bare `\bconfirmed\b` match also
+        // accepted `!confirmed`, which retires the held bytes on link loss and keeps them after the
+        // Client confirmed — both halves of the contract inverted, with every test green.
+        assertEquals(
             "the retirement must be passed the loop's confirmation, or a loop that ended without " +
                 "one (link died, window elapsed, re-delivery cancelled it) drops bytes the Client " +
                 "still needs and the re-delivery path can never run; call site: $arguments",
-            Regex("\\bconfirmed\\b").containsMatchIn(arguments.substringAfter(FINISH_CALL)),
+            CONFIRMED_ARGUMENTS,
+            arguments.normalized(),
         )
     }
 
@@ -116,7 +147,28 @@ class BleGattServiceWiringTest {
                 "one; call site: $arguments",
             arguments.contains(LIVE_HANDLE_HELPER),
         )
+
+        // The record alone settles nothing: the bytes still have to be written somewhere. Aiming
+        // the write at the captured handle records the answer against the live one and writes it
+        // to the dead one, so every handoff test stays green and the approval is lost again.
+        val write = source.indexOf(DELIVER_RESPONSE_CALL, call)
+        assertTrue(
+            "the record must be followed by `$DELIVER_RESPONSE_CALL…` that writes the bytes",
+            write > call,
+        )
+        val aim = source.substring(write + DELIVER_RESPONSE_CALL.length, source.indexOf(',', write))
+        assertEquals(
+            "the write after the record must aim at the same live handle (`$HANDLE_AIM`); a first " +
+                "argument of `gatt` writes the answer to the captured — possibly closed — handle, " +
+                "so the record points at a link that never receives it; call site: " +
+                source.substring(write, source.indexOf(')', write)),
+            HANDLE_AIM,
+            aim.normalized(),
+        )
     }
+
+    /** Whitespace and line breaks only, so the shape is compared and not the formatting. */
+    private fun String.normalized(): String = replace(Regex("\\s+"), " ").trim()
 
     /** `STATE_DISCONNECTED` up to the grace coroutine it starts, i.e. the pre-teardown body. */
     private fun disconnectBranchUpToItsGraceCoroutine(): String {
@@ -150,11 +202,22 @@ class BleGattServiceWiringTest {
         const val GRACE_WAIT = "delay(BLE_DISCONNECT_CANCEL_GRACE_MS)"
         const val CONCLUDE_PEER = "authRequestGate.concludePeer("
 
+        /** The reconnect test the grace-expiry release has to stay inside. */
+        const val RECONNECT_CHECK = "if (!connectingOrConnectedDevices.contains(deviceAddress))"
+
+        /** Ways to drop held response state; only the grace expiry may use them. */
+        val DROPPING_HELD_STATE = listOf("abandonPeer(", "clear(")
+
         /** The first line after the grace coroutine, where the torn-down handle is tombstoned. */
         const val GRACE_BLOCK_END = "// The handle is closed below"
         const val CLOSED_HANDLE_TOMBSTONE = "gattConnections.computeIfAbsent(gatt)"
         const val FINISH_CALL = "pendingResponses.finish("
+        const val CONFIRMED_ARGUMENTS = "delivery, confirmed"
         const val RECORD_CALL = "pendingResponses.record("
         const val LIVE_HANDLE_HELPER = "liveHandleFor("
+        const val DELIVER_RESPONSE_CALL = "deliverResponse("
+
+        /** The handle the write after the record has to be aimed at. */
+        const val HANDLE_AIM = "delivery?.handle ?: gatt"
     }
 }
