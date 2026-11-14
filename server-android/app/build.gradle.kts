@@ -104,14 +104,14 @@ android {
     }
 
     // Intentional: unit tests (./gradlew test) and instrumented tests
-    // (connectedE2eAndroidTest) both run against the e2e variant. This is fine
-    // today because no unit-testable logic reads BuildConfig.E2E_TESTING — the
-    // unit tests are pure logic (rate limiter, replay cache, retransmission).
-    // Two caveats to keep in mind:
-    //   1. If you add a test that branches on E2E_TESTING, it would silently
-    //      test e2e behavior, not production behavior — revisit this setting.
-    //   2. Unit tests also run with unitTests.isReturnDefaultValues = true
-    //      (below), a slightly more permissive environment than production.
+    // (connectedE2eAndroidTest) both run against the e2e variant, so in a unit
+    // test BuildConfig.E2E_TESTING is true. Any unit-testable logic that must
+    // behave differently per build type therefore takes the flag as a parameter
+    // instead of reading it (see `callerContextLogLine` in AuthRequestManager.kt,
+    // whose tests cover both values); a test that read E2E_TESTING directly
+    // would silently exercise only e2e behaviour. Also keep in mind that unit
+    // tests run with unitTests.isReturnDefaultValues = true (below), a slightly
+    // more permissive environment than production.
     testBuildType = "e2e"
 
     buildTypes {

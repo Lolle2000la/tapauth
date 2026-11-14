@@ -1,8 +1,10 @@
 package dev.rourunisen.tapauth.network
 
+import java.io.File
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -35,10 +37,83 @@ class PairingCompletionTest {
 
     @Test
     fun theDefaultLingerCoversTheDesktopRetrySchedule() {
+        assertLingerCovers(daemonRetransmitIntervalMs())
+
+        // The cross-check above only ties the linger to the daemon's parsed interval, so a daemon
+        // trimmed to 400 ms would keep it passing. The window itself is a product decision, so its
+        // absolute floor stays pinned too: two 500 ms retries plus 200 ms of margin.
         assertTrue(
-            "The linger must cover the desktop's 500 ms retries past 1.2 s, got " +
+            "The linger must keep its margin past two 500 ms retries, got " +
                 PairingCompletion.DEFAULT_LINGER_MS,
             PairingCompletion.DEFAULT_LINGER_MS >= 1_200L,
+        )
+    }
+
+    /**
+     * Proves the cross-check bites without touching the daemon.
+     *
+     * The linger covers the retry that arrives at `+2 * RETRANSMIT_INTERVAL`, so `2 * interval`
+     * must stay strictly inside it: 625 ms is the first interval at which `2 * interval` reaches
+     * the 1250 ms window, and a daemon retransmitting every 700 ms must fail. The defect this
+     * catches: a coverage check that only compares against a literal, which stays green after the
+     * daemon's interval is raised past what the linger can answer.
+     */
+    @Test
+    fun theLingerCoveragePredicateFailsPastTheRetransmitIntervalItCovers() {
+        assertThrows(AssertionError::class.java) { assertLingerCovers(700L) }
+        assertThrows(AssertionError::class.java) { assertLingerCovers(625L) }
+        // Just inside the window: the predicate must accept a schedule the linger really covers.
+        assertLingerCovers(624L)
+    }
+
+    /**
+     * Fails when [retransmitIntervalMs] puts the desktop's second retry outside the linger.
+     *
+     * `PairingCompletion.DEFAULT_LINGER_MS` documents the window as covering "two desktop retries
+     * (at +500 ms and +1000 ms from a lost burst) with margin", so the second retry — at `2 *
+     * retransmitIntervalMs` — must land strictly before the linger ends.
+     */
+    private fun assertLingerCovers(retransmitIntervalMs: Long) {
+        val lingerMs = PairingCompletion.DEFAULT_LINGER_MS
+        assertTrue(
+            "The ${lingerMs}ms linger must outlast the second of two " +
+                "${retransmitIntervalMs}ms retries (${2 * retransmitIntervalMs}ms): the desktop " +
+                "would retry into a closed socket",
+            lingerMs > 2 * retransmitIntervalMs,
+        )
+    }
+
+    /**
+     * `RETRANSMIT_INTERVAL` from `tapauthd/src/pairing.rs`, in milliseconds.
+     *
+     * The linger is the Kotlin half of a contract whose other half is the daemon's retransmit
+     * schedule, and the two live in different languages. Parsing the real file is what keeps them
+     * from drifting apart — the same approach `client-config-gui/src/ipc.rs:427-450` takes for the
+     * daemon's session deadline. Both a missing constant and an unreadable declaration fail loudly
+     * rather than skip: a silently skipped cross-check is the defect this test exists to prevent.
+     */
+    private fun daemonRetransmitIntervalMs(): Long {
+        val capture =
+            DAEMON_RETRANSMIT_INTERVAL.find(daemonPairingSource())?.groupValues?.get(1)
+                ?: throw AssertionError(
+                    "Could not parse `const RETRANSMIT_INTERVAL: Duration = " +
+                        "Duration::from_millis(<n>)` out of tapauthd/src/pairing.rs; re-read " +
+                        "that file and update this test",
+                )
+        return capture.toLong()
+    }
+
+    /** The daemon's pairing worker source, located by walking up from the test's directory. */
+    private fun daemonPairingSource(): String {
+        var directory: File? = File("").absoluteFile
+        while (directory != null) {
+            val source = File(directory, "tapauthd/src/pairing.rs")
+            if (source.isFile) return source.readText()
+            directory = directory.parentFile
+        }
+        throw AssertionError(
+            "tapauthd/src/pairing.rs was not found above ${File("").absolutePath}; the daemon's " +
+                "retransmit interval cannot be cross-checked from this working directory",
         )
     }
 
@@ -195,5 +270,17 @@ class PairingCompletionTest {
             )
 
         assertEquals("The linger must stop at the close, not the deadline", 400L, clock.now)
+    }
+
+    private companion object {
+        /**
+         * The daemon's `RETRANSMIT_INTERVAL` declaration, i.e. `const RETRANSMIT_INTERVAL: Duration
+         * = Duration::from_millis(<n>)` (`tapauthd/src/pairing.rs:113`).
+         *
+         * Deliberately literal: a rewrite this cannot read must fail the cross-check loudly rather
+         * than quietly pass it.
+         */
+        val DAEMON_RETRANSMIT_INTERVAL =
+            Regex("""const RETRANSMIT_INTERVAL\b[^;]*from_millis\(\s*(\d+)\s*\)""")
     }
 }

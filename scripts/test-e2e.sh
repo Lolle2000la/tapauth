@@ -670,6 +670,10 @@ TEST_PKG="dev.rourunisen.tapauth.e2e.test"
 if [ -f "server-android/app/build/outputs/apk/e2e/app-e2e.apk" ]; then
     adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
 elif [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+    # `debug` instead of `e2e`: the debug variant logs command_preview's length
+    # instead of its content (BuildConfig.E2E_TESTING is false for `debug`), so
+    # assert_caller_context_delivered skips its preview assertion for this run.
+    # Nothing else changes — every later phase still runs against this package.
     APP_PKG="dev.rourunisen.tapauth.debug"
     adb install -r -t server-android/app/build/outputs/apk/debug/app-debug.apk || true
 fi
@@ -1814,6 +1818,13 @@ caller_context_preview_checkable() {
 # One assertion per field, so a failure names the field that did not arrive.
 # <preview_argv> is the argv prefix the phone must show as `command_preview`; the
 # daemon truncates that field to 128 bytes, so it is matched as a prefix.
+#
+# The `commandPreview=` assertion only works against the e2e build variant: the
+# app logs the preview's content when BuildConfig.E2E_TESTING is true, which
+# app/build.gradle.kts sets for the `e2e` build type alone (false for `release`
+# and `debug`), because the desktop's argv can carry credentials such as
+# `-p <password>` and Log.d is not stripped from release builds. Shipped builds
+# log `commandPreview=<N chars, E2E build only>` instead.
 assert_caller_context_delivered() {
     local label=$1 service=$2 process=$3 preview=$4
     assert_phone_logged "pamService=${service}," \
@@ -1826,6 +1837,17 @@ assert_caller_context_delivered() {
         echo "    read /proc/<caller>/cmdline and sends an empty preview by design"
         echo "    (systemd/tapauthd.service; tapauthd/src/caller_context.rs:104-108)."
         echo "    A dev-mode run (TAPAUTH_E2E_DAEMON_MODE=dev) asserts it."
+        return 0
+    fi
+    # Step 2 installs the debug APK when the e2e one is absent, and the debug
+    # variant logs the preview's length rather than its content (see above). Only
+    # this assertion is skipped: the phases still to come (2b, 3) run against the
+    # same package and must not be aborted by a preview the variant cannot print.
+    if [ "$APP_PKG" != "dev.rourunisen.tapauth.e2e" ]; then
+        echo "ℹ️  ${label}: command_preview content is NOT asserted with package ${APP_PKG}."
+        echo "    BuildConfig.E2E_TESTING is true only for the 'e2e' build type; the installed"
+        echo "    package logs the preview's length instead of its content."
+        echo "    Install the e2e variant to assert it: (cd server-android && ./gradlew assembleE2e)"
         return 0
     fi
     assert_phone_logged "commandPreview=${preview}" \

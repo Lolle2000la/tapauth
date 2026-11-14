@@ -97,8 +97,45 @@ class BleAuthRequestGateTest {
         assertEquals(2, replayChecks.get())
     }
 
+    /**
+     * The gate retains the peer's claim across the grace window, so a repeat of the same challenge
+     * inside that window is a duplicate in flight rather than a replay.
+     *
+     * This pins the gate only: it says nothing about *when* the service releases a peer. That the
+     * `STATE_DISCONNECTED` handler leaves `concludePeer` alone (and runs it only once the grace has
+     * expired without a reconnect) cannot be observed from here — `BluetoothGatt` is a framework
+     * class — so it is pinned by the source guard in `BleGattServiceWiringTest`.
+     */
     @Test
-    fun concludePeerReleasesOnlyThatPeersChallenges() {
+    fun theClaimSurvivesTheGraceWindowSoARepeatInsideItIsADuplicate() {
+        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+
+        // The GATT link dropped and the Client reconnected retransmitting the same request. The
+        // service deliberately does not touch the gate on a disconnect, so the claim is still here,
+        // and the arrival must be answered as a duplicate WITHOUT the replay cache ever being asked
+        // (its answer would be "replay", and the service disconnects on that, killing the prompt).
+        nowMillis += 1_000L
+
+        assertEquals(
+            BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT,
+            gate.evaluate(challenge, nowSeconds, peer),
+        )
+        assertEquals(
+            "a reconnect inside the grace must not reach the replay cache",
+            1,
+            replayChecks.get(),
+        )
+        assertEquals(1, gate.inFlightCount)
+    }
+
+    /**
+     * `concludePeer` is the release the service runs at the end of the reconnection grace, and only
+     * when the device did not come back — not the `STATE_DISCONNECTED` handler it used to run it
+     * from. It removes exactly that peer's claims, so an abandoned link leaks nothing while another
+     * peer's in-flight prompt keeps its claim.
+     */
+    @Test
+    fun concludePeerAtGraceExpiryReleasesOnlyThatPeersChallenges() {
         assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
         assertEquals(
             BleAuthRequestGate.Verdict.PROCESS,
@@ -108,6 +145,8 @@ class BleAuthRequestGateTest {
         gate.concludePeer(peer)
 
         assertEquals(1, gate.inFlightCount)
+        // The abandoned request is concluded: nothing is held for it any more, so the next arrival
+        // is decided by the replay cache again, exactly as for a request whose answer was sent.
         assertEquals(
             BleAuthRequestGate.Verdict.REPLAY,
             gate.evaluate(challenge, nowSeconds, peer),
@@ -116,6 +155,7 @@ class BleAuthRequestGateTest {
             BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT,
             gate.evaluate(otherChallenge, nowSeconds, otherPeer),
         )
+        assertEquals("only the released peer's claim may be gone", 1, gate.inFlightCount)
     }
 
     @Test

@@ -136,15 +136,38 @@ class AuthRequestManager private constructor() {
         // values: the prompt shows the command preview *instead of* service/process, and the
         // BLE receipt line logs only two of the three.
         //
+        // The preview's *content* is logged only by the `e2e` build variant, via
+        // BuildConfig.E2E_TESTING (app/build.gradle.kts decides it: false for release and
+        // debug, true only for e2e). It is the desktop process's own argv, which routinely
+        // carries `-p <password>`, `--token` or an `Authorization` header, and `Log.d` is not
+        // stripped from release builds: emitting it would hand the credential to any
+        // `adb logcat` capture or bug report. Every other build logs its length instead, so
+        // the fact that a preview arrived survives without the argv. The E2E suite is the one
+        // consumer that needs the content, and it installs the e2e variant.
+        //
         // Each value is scrubbed first (see `scrubLogValue`): it derives from the caller's own
         // argv, so an unprivileged local user could otherwise embed a newline and forge extra
         // logcat lines, and a secret on that command line would be persisted here after the
         // prompt is gone. The tokens the E2E suite greps are plain ASCII and pass unchanged.
+        // That formatting is still needed for the E2E form; the production form logs no value
+        // to format.
+        //
+        // The `BuildConfig.E2E_TESTING` literal below is the one point in this path no automated
+        // check covers: every JVM unit test runs against the e2e variant (`testBuildType = "e2e"`),
+        // where the flag is true, so `callerContextLogLine`'s false branch is only ever exercised
+        // by passing the flag as a parameter — never through this call. Nothing under `scripts/ci/`
+        // looks at an APK or greps for `commandPreview` (it builds the Rust crates and scans the
+        // distro payloads), so flipping this literal to `true` would ship the preview's content in
+        // a `Log.d` that survives release with no check failing. A shipped-artifact check that the
+        // release dex cannot contain the E2E-only marker string is what would close that gap.
         Log.d(
             TAG,
-            "Auth request caller context: pamService=${scrubLogValue(authRequest.pamService)}, " +
-                "processName=${scrubLogValue(authRequest.processName)}, " +
-                "commandPreview=${scrubLogValue(authRequest.commandPreview)}",
+            callerContextLogLine(
+                authRequest.pamService,
+                authRequest.processName,
+                authRequest.commandPreview,
+                dev.rourunisen.tapauth.BuildConfig.E2E_TESTING,
+            ),
         )
 
         // Store the pending request
@@ -719,3 +742,36 @@ private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
     return this.take(take).joinToString("") { "%02x".format(it) } +
         if (this.size > take) "…" else ""
 }
+
+/** The `commandPreview=` value every non-E2E build logs: the size, and never the argv. */
+private fun previewFact(commandPreview: String): String =
+    "<${commandPreview.length} chars, E2E build only>"
+
+/**
+ * Build the `Auth request caller context:` line [AuthRequestManager.submitRequest] logs.
+ *
+ * [includeCommandPreview] is `BuildConfig.E2E_TESTING` at the call site, and it gates the preview
+ * *content* only: the preview is the desktop process's own argv, which carries `-p <password>`,
+ * `--token` and `Authorization` headers in ordinary use, and `Log.d` survives into release builds,
+ * so logging it would leak the credential into any `adb logcat` capture or bug report. The `e2e`
+ * build variant — which `scripts/test-e2e.sh` installs — gets the content so the suite can prove
+ * `command_preview` was derived by the daemon and delivered to the phone; release and debug log
+ * [previewFact] instead.
+ *
+ * The flag is a parameter rather than a `BuildConfig` read because `testBuildType = "e2e"`
+ * (app/build.gradle.kts) makes `BuildConfig.E2E_TESTING` true in every JVM unit test, so a test
+ * that read it directly could only ever exercise the E2E branch.
+ *
+ * Values are scrubbed by [scrubLogValue] before interpolation (newlines, control characters, the
+ * 200-character cap) — see the rationale there; the E2E form needs that formatting because it still
+ * logs the value.
+ */
+internal fun callerContextLogLine(
+    pamService: String,
+    processName: String,
+    commandPreview: String,
+    includeCommandPreview: Boolean,
+): String =
+    "Auth request caller context: pamService=${scrubLogValue(pamService)}, " +
+        "processName=${scrubLogValue(processName)}, commandPreview=" +
+        if (includeCommandPreview) scrubLogValue(commandPreview) else previewFact(commandPreview)

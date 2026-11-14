@@ -19,9 +19,16 @@ import java.util.concurrent.ConcurrentHashMap
  * "In flight" means: the challenge was accepted for processing from that peer and no repeat of it
  * has to be re-examined yet. An entry is released when the Client abandons the challenge
  * ([conclude] — a verified `AuthenticationCancel` from the peer, or the daemon's own cancel of that
- * challenge), when its GATT link goes away ([concludePeer], driven by `STATE_DISCONNECTED`), when
- * the service stops ([clear]), and — for a link that never reports its teardown — once it is older
- * than [IN_FLIGHT_MAX_AGE_MS].
+ * challenge), when its GATT link has stayed away past the reconnection grace ([concludePeer],
+ * driven by the grace timer `BleGattService` starts on `STATE_DISCONNECTED` — deliberately *not* by
+ * the disconnect itself), when the service stops ([clear]), and — for a link that never reports its
+ * teardown — once it is older than [IN_FLIGHT_MAX_AGE_MS].
+ *
+ * A disconnect is therefore not a release: the Client reconnects to deliver the request it is still
+ * retransmitting, and that reconnect presents the same challenge from the same peer on a new GATT
+ * handle. With the claim held that arrival is a silent [Verdict.DUPLICATE_IN_FLIGHT] and the prompt
+ * the user is answering survives; releasing it on the disconnect would send the arrival to the
+ * replay cache, which reports the retransmitted challenge as a replay and tears the new link down.
  *
  * A concluded challenge is deliberately *not* released at the moment the grant, denial or timeout
  * is sent, and [BleGattService]'s `releaseLock` call sites say so. The Client keeps retransmitting
@@ -98,7 +105,15 @@ internal class BleAuthRequestGate(
         inFlight.remove(challenge.toHex())
     }
 
-    /** Forget everything in flight for [peerAddress], whose GATT link is gone. */
+    /**
+     * Forget everything in flight for [peerAddress], whose link is gone for good.
+     *
+     * Called at the end of the reconnection grace that `BleGattService` starts when a link drops,
+     * and only if the device did not come back: until then the claim has to survive, because the
+     * reconnect that carries the Client's retransmission of the same request arrives as a duplicate
+     * from the same peer. Once the grace has passed the request is treated as concluded — the same
+     * destination a grant, denial or timeout eventually reaches — so no claim outlives its link.
+     */
     fun concludePeer(peerAddress: String) {
         inFlight.entries.removeIf { it.value.peerAddress == peerAddress }
     }

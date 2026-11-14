@@ -504,6 +504,95 @@ class TapAuthCryptoTest {
         )
     }
 
+    // ========== The two default derivations on the real wire ==========
+    //
+    // `BleTemporalIdIndexTest` injects both derivation seams with a JDK digest that discards its
+    // algorithm argument (`BleTemporalIdIndexTest.kt:33-35,139-145`), while `BleGattService` and
+    // `TemporalIdCache` call the real defaults. So swapping the 10-byte advertisement derivation
+    // for the 16-byte packet one — or hard-coding SHA-256 where the paired device's negotiated hash
+    // belongs — leaves every JVM test green while every lookup in the field returns null. Only
+    // these instrumentation tests load the real derivations, so the wire shapes are pinned here.
+
+    @Test
+    fun testAdvertisementAndPacketIdentifiersAreDistinctShapesOfOneKeyAndWindow() {
+        val csk = ByteArray(32) { (it * 2 + 1).toByte() }
+        val window = 29_500_000L
+
+        val advertisement = generateBleTemporalIdentifier(csk, window, HASH_SHA256)
+        val packet = generateTemporalIdentifier(csk, window, HASH_SHA256)
+
+        // The advertisement id has to fit the advertisement budget and the packet id has to match
+        // the 16-byte `EncryptedPacket.temporal_identifier`; handing either caller the other
+        // derivation makes every lookup miss, because both indexes key on the derived value.
+        assertEquals("A BLE advertisement id must be 10 bytes", 10, advertisement.size)
+        assertEquals("A packet temporal identifier must be 16 bytes", 16, packet.size)
+        // The two forms are one derivation: the advertisement id is the packet id truncated to the
+        // advertisement budget, so the prefix has to agree. That is the property a re-derived
+        // advertisement identifier breaks while both lengths still hold. The previous form
+        // (`advertisement.contentEquals(packet)`) could not fail on its own — two arrays of
+        // different lengths are never equal, which the assertions above already pin.
+        assertTrue(
+            "The advertisement id must be the packet id truncated to its length",
+            advertisement.contentEquals(packet.copyOf(advertisement.size)),
+        )
+
+        // Recomputed from scratch at every lookup: the same CSK and window must reproduce the
+        // same bytes, or a device that advertised before a cache rebuild stops resolving.
+        assertArrayEquals(
+            "The advertisement id must be deterministic for one CSK and window",
+            advertisement,
+            generateBleTemporalIdentifier(csk, window, HASH_SHA256),
+        )
+        assertArrayEquals(
+            "The packet id must be deterministic for one CSK and window",
+            packet,
+            generateTemporalIdentifier(csk, window, HASH_SHA256),
+        )
+
+        // The window is an input to both, so an identifier from another window must not match: a
+        // derivation that ignored the window would resolve a replayed advertisement forever.
+        assertFalse(
+            "A different window must change the advertisement id",
+            advertisement.contentEquals(
+                generateBleTemporalIdentifier(csk, window + 1, HASH_SHA256),
+            ),
+        )
+        assertFalse(
+            "A different window must change the packet id",
+            packet.contentEquals(generateTemporalIdentifier(csk, window + 1, HASH_SHA256)),
+        )
+    }
+
+    @Test
+    fun testTheNegotiatedHashAlgorithmChangesBothIdentifierForms() {
+        val csk = ByteArray(32) { (it * 5 + 7).toByte() }
+        val window = 29_500_000L
+
+        // Each paired device persists its own `hashAlgorithm` and both callers pass it in
+        // (`BleTemporalIdIndex.kt:30-33`, `TemporalIdCache.kt:186`), so the derivation has to
+        // dispatch on it. A hard-coded HMAC-SHA256 leaves a BLAKE3-paired device unresolvable
+        // while every JVM test — whose digest ignores the argument — still passes.
+        val shaPacket = generateTemporalIdentifier(csk, window, HASH_SHA256)
+        val blakePacket = generateTemporalIdentifier(csk, window, HASH_BLAKE3)
+        assertEquals("A BLAKE3 packet id must still be 16 bytes", 16, blakePacket.size)
+        assertFalse(
+            "The packet id must differ between the negotiated SHA256 and BLAKE3",
+            shaPacket.contentEquals(blakePacket),
+        )
+
+        val shaAdvertisement = generateBleTemporalIdentifier(csk, window, HASH_SHA256)
+        val blakeAdvertisement = generateBleTemporalIdentifier(csk, window, HASH_BLAKE3)
+        assertEquals(
+            "A BLAKE3 advertisement id must still be 10 bytes",
+            10,
+            blakeAdvertisement.size,
+        )
+        assertFalse(
+            "The advertisement id must differ between the negotiated SHA256 and BLAKE3",
+            shaAdvertisement.contentEquals(blakeAdvertisement),
+        )
+    }
+
     @Test
     fun testVerifyTemporalIdentifierAcceptsCurrentAndPreviousWindowOnly() {
         val csk = csk()

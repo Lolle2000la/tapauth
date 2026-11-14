@@ -43,6 +43,15 @@ class PairingClient(private val pairingUrl: PairingUrl) {
 
     private var socket: DatagramSocket? = null
 
+    /**
+     * The socket [open] bound, or null before [open] and after [close].
+     *
+     * Exposed so a test can observe the binding itself: [send] is best-effort and swallows a
+     * failure, so it cannot tell an open socket from a missing one.
+     */
+    internal val boundSocket: DatagramSocket?
+        get() = socket
+
     /** Addresses resolved from the QR code's `ip4`/`ip6`, filled in by [open]. */
     private val targets = mutableListOf<InetAddress>()
 

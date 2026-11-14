@@ -149,6 +149,19 @@ class BleGattService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * The answer built for an in-flight BLE challenge, held until the Client confirms it.
+     *
+     * The bytes are written to the handle that was live when the user answered, but the Client can
+     * lose that link before they land and reconnect retransmitting the same request. Holding them
+     * here is what lets [redeliverPendingResponse] write them on the new handle; the class
+     * documents the whole handover.
+     */
+    private val pendingResponses =
+        BleResponseHandoff<BluetoothGatt>(
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
+
     // Track active GATT connections by challenge for cancellation
     private val activeConnectionsByChallenge =
         java.util.concurrent.ConcurrentHashMap<String, BluetoothGatt>()
@@ -285,9 +298,13 @@ class BleGattService : Service() {
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
                         connectingOrConnectedDevices.remove(deviceAddress)
-                        // No authentication can be in flight on a link that is gone, so the peer's
-                        // in-flight challenges are released here rather than on their own paths.
-                        authRequestGate.concludePeer(deviceAddress)
+                        // The peer's in-flight challenges are NOT released here: a Client still
+                        // waiting for its answer retransmits the same request and reconnects, and
+                        // the reconnect presents that same challenge from the same peer. With the
+                        // claim held it is a duplicate in flight and the prompt survives; released,
+                        // the arrival would reach the replay cache, be called a replay and tear the
+                        // new link down. Release happens once the reconnection grace below has
+                        // passed without a reconnect.
 
                         // Drop any challenge-tracked connections that pointed at this (now dead)
                         // GATT handle so a stale response can never be written through it.
@@ -298,9 +315,16 @@ class BleGattService : Service() {
                         // link that stays down must not leave an orphaned prompt (and its BLE
                         // connection intent) alive until the daemon timeout: after a short grace
                         // period, if the device has not reconnected, cancel its pending requests.
+                        // The grace is also where the peer's claims are released, so a link that
+                        // never comes back leaves nothing held behind it.
                         serviceScope.launch {
                             delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
                             if (!connectingOrConnectedDevices.contains(deviceAddress)) {
+                                // The prompt is over, so a later request carrying the same
+                                // challenge is a replay again rather than a duplicate in flight,
+                                // and the answer still held for this peer has nobody left to reach.
+                                authRequestGate.concludePeer(deviceAddress)
+                                pendingResponses.abandonPeer(deviceAddress)
                                 if (
                                     dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
                                         .cancelRequestsByBleDisconnection(deviceAddress)
@@ -1246,10 +1270,12 @@ class BleGattService : Service() {
             // Step 6: Duplicate-in-flight check, then replay attack mitigation.
             //
             // A same-peer repeat of the challenge already in flight (a notification racing the
-            // initial read, or a re-notification of the same request) is an idempotent no-op: it
-            // must not reach the replay cache, which would report it as a replay and disconnect a
-            // link whose prompt the user is answering. A different peer replaying the same captured
-            // bytes is not a duplicate and still reaches the cache, exactly as before.
+            // initial read, or a re-notification of the same request) must not reach the replay
+            // cache, which would report it as a replay and disconnect a link whose prompt the user
+            // is answering. It never creates a second prompt: when it arrives on a handle the
+            // Client reconnected on, the bytes already built are written there (below). A
+            // different peer replaying the same captured bytes is not a duplicate and still
+            // reaches the cache, exactly as before.
             when (
                 authRequestGate.evaluate(
                     challengeBytes,
@@ -1262,6 +1288,10 @@ class BleGattService : Service() {
                         TAG,
                         "BLE duplicate of in-flight challenge from ${gatt.device.address}, ignoring",
                     )
+                    // Unless it arrived on a new handle: the Client lost the link before the answer
+                    // reached it, so the same bytes are written again here instead of on the dead
+                    // one, and the prompt the user is answering stays alive.
+                    redeliverPendingResponse(challengeKey, challengeBytes, gatt, matchedDevice)
                     return
                 }
                 BleAuthRequestGate.Verdict.REPLAY -> {
@@ -1378,8 +1408,9 @@ class BleGattService : Service() {
                     disconnectGatt(gatt)
                     // Release transport lock even on timeout
                     transportLockManager.releaseLock(challengeBytes)
-                    // The gate's claim is not released here: this path disconnects the link,
-                    // and the resulting STATE_DISCONNECTED -> concludePeer releases it.
+                    // The gate's claim is not released here: this path disconnects the link, and
+                    // the peer is released only once the reconnection grace has passed without a
+                    // reconnect.
                 }
             }
         } catch (e: Exception) {
@@ -1402,13 +1433,91 @@ class BleGattService : Service() {
         challenge: ByteArray?,
         device: dev.rourunisen.tapauth.data.PairedDevice,
     ) {
-        // Remove from active connections tracking since we're responding
-        if (challenge != null) {
-            val challengeKey = challenge.toHex()
-            activeConnectionsByChallenge.remove(challengeKey)
-            Log.d(TAG, "Removed BLE connection from tracking for challenge: $challengeKey")
+        // The answer is recorded before the first write and stays recorded until the Client
+        // confirms it: a Client that loses this link retransmits the same request on the next one,
+        // and those bytes then have to be written there instead of on the dead handle
+        // ([redeliverPendingResponse]).
+        //
+        // [gatt] is the handle this request arrived on, but the prompt can outlive it: the user may
+        // answer after the Client dropped that link and reconnected on another handle. The handle
+        // the challenge is tracked on now is therefore passed as the live one, so the answer is
+        // aimed at the link that exists; the captured handle is only the fallback for an answer
+        // built while no live handle is known, where the reconnect's duplicate re-delivers the
+        // bytes.
+        val delivery = challenge?.let {
+            val challengeKey = it.toHex()
+            pendingResponses.record(
+                challengeKey,
+                gatt.device.address,
+                gatt,
+                liveHandleFor(challengeKey, gatt.device.address),
+                response,
+            )
+        }
+        deliverResponse(delivery?.handle ?: gatt, response, challenge, device, delivery)
+    }
+
+    /**
+     * The handle [challengeKey] may still be written on for [peerAddress], or null when there is
+     * none.
+     *
+     * The challenge-tracked handle survives a drop only until the `STATE_DISCONNECTED` handler
+     * removes it, and the Client's reconnect re-registers its own handle as the duplicate arrives:
+     * so this is exactly the live side of a reconnection — null while the link is down, the new
+     * handle afterwards. A closed handle is the tombstone of a torn-down link and is never
+     * returned, and a handle another device registered for the same challenge is not this peer's
+     * link to write an answer to.
+     */
+    private fun liveHandleFor(challengeKey: String, peerAddress: String): BluetoothGatt? =
+        activeConnectionsByChallenge[challengeKey]?.takeIf { handle ->
+            handle.device.address == peerAddress && gattConnections[handle]?.closed != true
         }
 
+    /**
+     * Hand the answer already built for [challengeKey] to the handle the Client reconnected on.
+     *
+     * A duplicate of an in-flight challenge on a different handle means the Client lost the link
+     * before the answer reached it. The bytes are still held by [pendingResponses], so they are
+     * written again on the live handle; the loop that was writing the dead one is stopped first so
+     * the two never both retire the same challenge. Nothing happens when no answer has been built
+     * yet (the prompt is still open) or when the bytes are already going to this very handle.
+     */
+    private fun redeliverPendingResponse(
+        challengeKey: String,
+        challenge: ByteArray,
+        gatt: BluetoothGatt,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+    ) {
+        val redelivery =
+            pendingResponses.redeliverOn(challengeKey, gatt.device.address, gatt) ?: return
+        Log.i(
+            TAG,
+            "Re-delivering in-flight BLE response on the reconnected link to ${gatt.device.address}",
+        )
+        redelivery.cancelPrevious?.invoke()
+        deliverResponse(
+            gatt,
+            redelivery.delivery.response,
+            challenge,
+            device,
+            redelivery.delivery,
+        )
+    }
+
+    /**
+     * Write [response] on [gatt] and retransmit it until the Client confirms it or the window
+     * closes.
+     *
+     * [delivery] is the [BleResponseHandoff] record holding these bytes; a re-delivery on a
+     * reconnected handle calls this again with the same bytes and its own record.
+     */
+    private fun deliverResponse(
+        gatt: BluetoothGatt,
+        response: ByteArray,
+        challenge: ByteArray?,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+        delivery: BleResponseHandoff.Delivery<BluetoothGatt>?,
+    ) {
         if (
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED
@@ -1431,51 +1540,73 @@ class BleGattService : Service() {
         }
 
         // The write is a queued GATT op, so it must run in a coroutine rather than on the caller.
-        serviceScope.launch {
-            val connection = connectionState(gatt)
-            val awaitingConfirmation = challenge != null && confirmationChar != null
-
-            // Arm the confirmation waiter BEFORE the response write: the Client notifies its
-            // GrantConfirmation as soon as the write is acknowledged, so a waiter armed afterwards
-            // would drop that first notification and the phone would retransmit for the full 10 s.
-            // The retransmission loop below clears it in its `finally`.
-            if (awaitingConfirmation) {
-                connection?.confirmationNotification = CompletableDeferred()
-            }
-
-            if (!writeCharacteristicQueued(gatt, responseChar, response)) {
-                Log.w(TAG, "Failed to write response to ${gatt.device.address}")
-                // Disconnect immediately on write failure
-                connection?.confirmationNotification = null
-                disconnectGatt(gatt)
-                return@launch
-            }
-            Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
-
-            // If challenge provided, start retransmission with confirmation checking
-            // The retransmission coroutine will ensure disconnection when done
-            if (challenge != null && confirmationChar != null) {
-                try {
-                    retransmitWithConfirmationCheck(
-                        gatt,
-                        responseChar,
-                        confirmationChar,
-                        response,
-                        challenge,
-                        device,
-                    )
-                } finally {
-                    // ALWAYS disconnect after retransmission completes (success or failure)
-                    Log.d(TAG, "Retransmission complete, disconnecting GATT")
-                    connection?.confirmationNotification = null
-                    disconnectGatt(gatt)
+        // It starts lazily so the stop handle is registered before the loop can take a step: a
+        // re-delivery that races the start cancels it instead of letting it write a dead handle.
+        val job =
+            serviceScope.launch(start = CoroutineStart.LAZY) {
+                if (delivery != null && delivery.superseded) {
+                    return@launch
                 }
-            } else {
-                // No retransmission needed, disconnect immediately after write
-                Log.d(TAG, "No retransmission needed, disconnecting GATT")
-                disconnectGatt(gatt)
+
+                val connection = connectionState(gatt)
+                val awaitingConfirmation = challenge != null && confirmationChar != null
+                var confirmed = false
+
+                // Arm the confirmation waiter BEFORE the response write: the Client notifies its
+                // GrantConfirmation as soon as the write is acknowledged, so a waiter armed
+                // afterwards would drop that first notification and the phone would retransmit for
+                // the full 10 s. The retransmission loop below clears it in its `finally`.
+                if (awaitingConfirmation) {
+                    connection?.confirmationNotification = CompletableDeferred()
+                }
+
+                try {
+                    if (!writeCharacteristicQueued(gatt, responseChar, response)) {
+                        Log.w(TAG, "Failed to write response to ${gatt.device.address}")
+                        // Disconnect immediately on write failure
+                        connection?.confirmationNotification = null
+                        disconnectGatt(gatt)
+                        return@launch
+                    }
+                    Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
+
+                    // If challenge provided, start retransmission with confirmation checking
+                    // The retransmission coroutine will ensure disconnection when done
+                    if (challenge != null && confirmationChar != null) {
+                        try {
+                            confirmed =
+                                retransmitWithConfirmationCheck(
+                                    gatt,
+                                    responseChar,
+                                    confirmationChar,
+                                    response,
+                                    challenge,
+                                    device,
+                                )
+                        } finally {
+                            // ALWAYS disconnect after retransmission completes (success or failure)
+                            Log.d(TAG, "Retransmission complete, disconnecting GATT")
+                            connection?.confirmationNotification = null
+                            disconnectGatt(gatt)
+                        }
+                    } else {
+                        // No retransmission needed, disconnect immediately after write
+                        Log.d(TAG, "No retransmission needed, disconnecting GATT")
+                        disconnectGatt(gatt)
+                    }
+                } finally {
+                    // Only a confirmed delivery retires the answer, and [BleResponseHandoff.finish]
+                    // is what enforces it. A loop that ended because the link died (or was replaced
+                    // by a re-delivery) leaves the bytes held, so the Client's reconnect can still
+                    // be answered; the grace-expiry release is what drops an answer nobody is left
+                    // to receive.
+                    if (delivery != null) {
+                        pendingResponses.finish(delivery, confirmed)
+                    }
+                }
             }
-        }
+        delivery?.onRetransmission { job.cancel() }
+        job.start()
     }
 
     /**
@@ -1485,6 +1616,9 @@ class BleGattService : Service() {
      * The Client notifies its confirmation over the CCCD; the read below is only the fallback for a
      * missed notification. Neither path may stop retransmission until the confirmation has been
      * signature-verified against the paired Client key.
+     *
+     * @return true when the loop stopped because that verified confirmation arrived, false when it
+     *   merely ran out of time, lost the link or was cancelled. Only true retires the answer.
      */
     private suspend fun retransmitWithConfirmationCheck(
         gatt: BluetoothGatt,
@@ -1493,13 +1627,14 @@ class BleGattService : Service() {
         response: ByteArray,
         challenge: ByteArray,
         device: dev.rourunisen.tapauth.data.PairedDevice,
-    ) {
+    ): Boolean {
         val startTime = android.os.SystemClock.elapsedRealtime()
         val maxDuration = 10_000L // 10 seconds max retransmission
         var attempt = 0
+        var delivered = false
 
-        // The waiter was armed by [sendResponseToClient] before the first response write; this
-        // loop re-arms it per round and clears it when retransmission ends.
+        // The waiter was armed by [deliverResponse] before the first response write; this loop
+        // re-arms it per round and clears it when retransmission ends.
         val connection = connectionState(gatt)
 
         try {
@@ -1536,6 +1671,7 @@ class BleGattService : Service() {
                                     TAG,
                                     "Received verified confirmation notification, stopping retransmission",
                                 )
+                                delivered = true
                                 break
                             }
                             Log.w(
@@ -1552,6 +1688,7 @@ class BleGattService : Service() {
                                         TAG,
                                         "Received verified confirmation (read), stopping retransmission",
                                     )
+                                    delivered = true
                                     break
                                 }
                                 Log.w(
@@ -1577,6 +1714,7 @@ class BleGattService : Service() {
         } finally {
             connection?.confirmationNotification = null
         }
+        return delivered
     }
 
     /**
@@ -1746,6 +1884,7 @@ class BleGattService : Service() {
         gattConnections.clear()
         connectionDevices.clear()
         authRequestGate.clear()
+        pendingResponses.clear()
         // The registry is process-wide: leaving this observer behind would keep a dead service's
         // index alive for every later device change.
         DeviceRepository.removeOnDevicesChangedListener(deviceChangeObserver)
