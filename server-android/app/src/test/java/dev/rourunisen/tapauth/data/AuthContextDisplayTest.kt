@@ -105,7 +105,9 @@ class AuthContextDisplayTest {
                 request(pamService = "su\u202Edo", processName = "vi\u2066m\tz"),
             )
 
-        assertEquals("sudo · vimz", line)
+        // U+202E/U+2066 are in the forbidden set and are dropped; the tab is whitespace, which the
+        // sanitizer tests first, so it collapses to one ASCII space instead of being deleted.
+        assertEquals("sudo · vim z", line)
         assertFalse(line.contains('\u202E'))
         assertFalse(line.contains('\u2066'))
     }
@@ -126,7 +128,8 @@ class AuthContextDisplayTest {
                 request(deviceName = "evil\u202Epad\nPhone"),
             )
 
-        assertEquals("From device: evilpadPhone via Local Network", description)
+        // The bidi override is dropped and the newline is whitespace, so it collapses to one space.
+        assertEquals("From device: \"evilpad Phone\" via Local Network", description)
         assertFalse(description.contains('\n'))
         assertFalse(description.contains('\u202E'))
     }
@@ -138,11 +141,30 @@ class AuthContextDisplayTest {
                 request(deviceName = "evil\nFrom device: admin-phone via Bluetooth"),
             )
 
-        // A single line: the embedded newline is removed, so the forged line joins the real one
-        // instead of appearing as a second "From device:" paragraph.
+        // A single line: the embedded newline is whitespace and collapses to one space, so the
+        // forged claim joins the real line instead of appearing as a second "From device:"
+        // paragraph. The delimiter added around the peer-chosen name is what keeps it readable as
+        // one odd name rather than as a second device claim, now that whitespace no longer welds
+        // the forged label onto the preceding word.
         assertEquals(1, description.lines().size)
         assertEquals(
-            "From device: evilFrom device: admin-phone via Bluetooth via Local Network",
+            "From device: \"evil From device: admin-phone via Bluetooth\" via Local Network",
+            description,
+        )
+    }
+
+    @Test
+    fun quoteInDeviceNameCannotCloseTheNameDelimiter() {
+        val description =
+            AuthContextDisplay.promptDescription(
+                request(deviceName = "pad\" via Bluetooth \"evil"),
+            )
+
+        // The display doubles the delimiters the peer supplied, so the only un-doubled pair is the
+        // one the display itself added: a name cannot end the quoted value early and pass its own
+        // text off as the trusted "via <transport>" suffix.
+        assertEquals(
+            "From device: \"pad\"\" via Bluetooth \"\"evil\" via Local Network",
             description,
         )
     }
@@ -158,7 +180,7 @@ class AuthContextDisplayTest {
             )
 
         assertEquals(
-            "sudo systemctl restart tapauthd\n\nFrom device: thinkpad via Local Network",
+            "sudo systemctl restart tapauthd\n\nFrom device: \"thinkpad\" via Local Network",
             description,
         )
     }
@@ -173,6 +195,6 @@ class AuthContextDisplayTest {
             AuthContextDisplay.PROMPT_CONTEXT_MAX_BYTES,
             contextParagraph.toByteArray(Charsets.UTF_8).size,
         )
-        assertTrue(description.endsWith("\n\nFrom device: thinkpad via Local Network"))
+        assertTrue(description.endsWith("\n\nFrom device: \"thinkpad\" via Local Network"))
     }
 }

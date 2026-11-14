@@ -25,6 +25,9 @@ object AuthContextDisplay {
     private const val TTY_TAG = "tty"
     private const val CONTEXT_SEPARATOR = " · "
 
+    /** Delimiter wrapped around the untrusted device name in the prompt's device line. */
+    private const val NAME_DELIMITER = "\""
+
     /**
      * Secondary context line rendered under the primary `username@hostname` header (§3.3).
      *
@@ -66,8 +69,24 @@ object AuthContextDisplay {
      */
     fun promptDescription(request: AuthRequest): String {
         val deviceName = ContextSanitizer.sanitize(request.deviceName, IDENTITY_MAX_BYTES)
-        val deviceLine = "From device: $deviceName via ${request.transportType.displayName}"
+        val deviceLine =
+            "From device: ${delimitName(deviceName)} via ${request.transportType.displayName}"
         val contextText = contextLine(request, PROMPT_CONTEXT_MAX_BYTES)
         return if (contextText.isEmpty()) deviceLine else "$contextText\n\n$deviceLine"
     }
+
+    /**
+     * Wrap the untrusted [name] in [NAME_DELIMITER], doubling any delimiter it contains.
+     *
+     * The sanitizer collapses whitespace, so a peer-chosen name such as `"evil From device:
+     * admin-phone"` reaches the prompt with a whitespace-delimited copy of the trusted `From
+     * device:` label inside the value — on one line it then reads as a second device claim rather
+     * than as one odd name. The delimiters mark where the trusted part of the line ends and the
+     * peer's value begins; doubling an inner delimiter (the CSV/OCaml convention) keeps that
+     * boundary the only un-doubled pair, so a name cannot close it early either.
+     */
+    private fun delimitName(name: String): String =
+        NAME_DELIMITER +
+            name.replace(NAME_DELIMITER, NAME_DELIMITER + NAME_DELIMITER) +
+            NAME_DELIMITER
 }
