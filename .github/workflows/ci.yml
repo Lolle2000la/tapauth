@@ -83,6 +83,14 @@ jobs:
       - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
 
+      # `tpm` is a pure cfg gate (`shared/Cargo.toml`: `tpm = []`), so compiling it
+      # needs no TPM device and no `tpm2-tools` (that is a runtime shell-out only).
+      # Nothing else in CI enabled the feature — only `install.sh --tpm` builds it —
+      # so a regression inside it would have shipped unseen. `--features` is
+      # ambiguous on a virtual workspace, hence the explicit package list.
+      - name: "Run clippy (TPM feature)"
+        run: cargo clippy -p shared -p tapauthd -p client-pam -p client-config-gui --all-targets --features tpm -- -D warnings
+
   production-guard:
     name: Production Build Override Scan
     runs-on: ubuntu-latest
@@ -122,6 +130,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      # Kotlin's `external fun` declarations in TapAuthCrypto.kt and the `Java_*`
+      # exports in shared/src/jni_api.rs must name the same functions; a one-sided
+      # entry compiles and then throws UnsatisfiedLinkError on the device. Both
+      # sides are parsed from source text, so this needs no toolchain: running it
+      # first turns that divergence into a failure in seconds instead of after the
+      # cargo builds below.
+      - name: Check JNI surface matches between Kotlin and Rust
+        run: ./scripts/ci/check-jni-surface.sh
+
+      # The C ABI these two sides share carries no types: a `jlong` implemented
+      # as `jint`, or two same-typed parameters swapped in Rust, still compiles,
+      # still links, and still passes the name check above — it is undefined
+      # behaviour on the device. This compares each Rust parameter list and
+      # return type against the Kotlin declaration's JVM descriptor, which is in
+      # turn pinned to real `javap` output by a checked-in fixture because this
+      # job has no Android toolchain and cannot compile Kotlin.
+      - name: Check JNI signatures match between Kotlin and Rust
+        run: ./scripts/ci/check-jni-signatures.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

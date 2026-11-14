@@ -8,6 +8,7 @@ use iced::{
 };
 use shared::config::PairedServer;
 use shared::ipc::pb::PairedServerInfo;
+use shared::pb::SignatureAlgorithm;
 use std::collections::HashMap;
 
 fn convert_to_paired_server(info: &PairedServerInfo) -> (String, PairedServer) {
@@ -20,6 +21,11 @@ fn convert_to_paired_server(info: &PairedServerInfo) -> (String, PairedServer) {
         public_key: info.public_key.clone(),
         allowed_users: info.allowed_users.clone(),
         paired_at,
+        // `ipc::PairedServerInfo` carries no algorithm field (proto/ipc.proto),
+        // and Ed25519 is the only signature algorithm the protocol negotiates —
+        // it is also the serde default for records written before the field
+        // existed.
+        signature_algorithm: SignatureAlgorithm::Ed25519,
     };
     (info.public_key.clone(), server)
 }

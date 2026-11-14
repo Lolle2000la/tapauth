@@ -5,12 +5,16 @@ import android.content.Context
 import android.content.Intent
 import android.util.Base64
 import android.util.Log
+import android.view.View
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.TransportType
 import java.util.UUID
@@ -64,12 +68,18 @@ class AuthRequestManager private constructor() {
     data class PendingAuthRequest(
         val authRequest: AuthRequest,
         val callback:
-            (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
+            (Boolean, ByteArray?, Boolean) -> Unit, // (approved, challenge, explicitDenial)
         val appContext: android.content.Context,
         val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
     )
 
-    /** Submit an authentication request for user approval Returns a request ID */
+    /**
+     * Submit an authentication request for user approval Returns a request ID
+     *
+     * The four context parameters carry the Client's signed caller context (§3.3); they are
+     * defaults so BLE/older call sites keep compiling, and they appear before [callback] because a
+     * trailing lambda always binds to the last parameter.
+     */
     fun submitRequest(
         context: Context,
         deviceId: String,
@@ -80,7 +90,11 @@ class AuthRequestManager private constructor() {
         timestamp: Long,
         transportType: TransportType,
         bleDeviceAddress: String? = null, // Optional: BLE MAC address for disconnect cleanup
-        callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
+        pamService: String = "",
+        processName: String = "",
+        commandPreview: String = "",
+        ttyPresent: Boolean = false,
+        callback: (approved: Boolean, challenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
         val notificationId = notificationIdFor(challenge)
@@ -108,6 +122,10 @@ class AuthRequestManager private constructor() {
                 challenge = challenge,
                 timestamp = timestamp,
                 transportType = transportType,
+                pamService = pamService,
+                processName = processName,
+                commandPreview = commandPreview,
+                ttyPresent = ttyPresent,
             )
 
         // Store the pending request
@@ -217,13 +235,54 @@ class AuthRequestManager private constructor() {
             val sessionTimeoutMs = config.sessionTimeoutSeconds * 1000
             val currentTime = System.currentTimeMillis()
             val timeElapsed = currentTime - timestamp
-            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
+            // `setTimeoutAfter(0)` means "no timeout", and the cleanup delay below would be
+            // skipped, leaving a permanent ongoing notification; a request already past its
+            // session deadline therefore gets the shortest real timeout instead.
+            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(1L)
+
+            // §3.3: the primary header stays `username@hostname`; the secondary line below it is
+            // the re-sanitized caller context, capped at two lines with an end ellipsis.
+            val secondaryLine = AuthContextDisplay.contextLine(authRequest)
+            // The identity strings are peer-chosen (`client_hostname` comes from the provision
+            // payload), so the header is sanitized too rather than rendered verbatim.
+            val displayUsername =
+                ContextSanitizer.sanitize(username, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayHostname =
+                ContextSanitizer.sanitize(hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayDeviceName =
+                ContextSanitizer.sanitize(deviceName, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val contentViews =
+                RemoteViews(
+                        context.packageName,
+                        dev.rourunisen.tapauth.R.layout.notification_auth_request,
+                    )
+                    .apply {
+                        val titleId = dev.rourunisen.tapauth.R.id.notification_title
+                        val contextId = dev.rourunisen.tapauth.R.id.notification_context
+                        setTextViewText(titleId, "$displayUsername@$displayHostname")
+                        if (secondaryLine.isEmpty()) {
+                            setViewVisibility(contextId, View.GONE)
+                        } else {
+                            setTextViewText(contextId, secondaryLine)
+                            setViewVisibility(contextId, View.VISIBLE)
+                        }
+                        // A custom content view does not inherit `setContentIntent`; wire the tap
+                        // target explicitly so tapping the body still opens the prompt.
+                        setOnClickPendingIntent(
+                            dev.rourunisen.tapauth.R.id.notification_root,
+                            pendingIntent,
+                        )
+                    }
 
             val notificationBuilder =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
-                    .setContentText("${deviceName}: ${username}@${hostname}")
+                    .setContentText("$displayDeviceName: $displayUsername@$displayHostname")
+                    .setCustomContentView(contentViews)
+                    // Clone so the collapsed and expanded views are distinct instances; both are
+                    // this same two-row layout, so the summary never loses the context line.
+                    .setCustomBigContentView(contentViews.clone())
                     .setContentIntent(pendingIntent)
                     .addAction(
                         dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground,
@@ -291,16 +350,14 @@ class AuthRequestManager private constructor() {
 
             // Schedule state cleanup on timeout to mirror setTimeoutAfter
             try {
-                if (remainingTimeout > 0) {
-                    scope.launch {
-                        try {
-                            delay(remainingTimeout + 250)
-                            if (pendingRequests.containsKey(requestId)) {
-                                Log.d(TAG, "Timeout reached; cancelling pending request $requestId")
-                                cancelRequest(requestId)
-                            }
-                        } catch (_: Exception) {}
-                    }
+                scope.launch {
+                    try {
+                        delay(remainingTimeout + 250)
+                        if (pendingRequests.containsKey(requestId)) {
+                            Log.d(TAG, "Timeout reached; cancelling pending request $requestId")
+                            cancelRequest(requestId)
+                        }
+                    } catch (_: Exception) {}
                 }
             } catch (_: Exception) {}
         } catch (e: Exception) {
@@ -320,7 +377,7 @@ class AuthRequestManager private constructor() {
     fun handleResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
         val pending = pendingRequests.remove(requestId)
@@ -348,7 +405,7 @@ class AuthRequestManager private constructor() {
             }
 
             // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
-            scope.launch { pending.callback(approved, signedChallenge, explicitDenial) }
+            scope.launch { pending.callback(approved, challenge, explicitDenial) }
             // Cancel the persistent notification
             try {
                 val notificationId = notificationIdFor(pending.authRequest.challenge)
@@ -605,36 +662,32 @@ class AuthRequestManager private constructor() {
         }
 
         /**
-         * Signs the auth challenge using the device's private key and submits an approved response
-         * through AuthRequestManager.
+         * Submits an approved response for [authRequest] through AuthRequestManager.
+         *
+         * v2 signs only the WrapperMessage: Rust computes the single Ed25519 signature over the
+         * grant (via `createGrantWrapperMessage`), so the raw 32-byte challenge is what the
+         * callback must carry. Signing it here as well would replace the challenge with a 64-byte
+         * signature and every approval would fail verification.
          */
         fun approveRequest(context: Context, authRequest: AuthRequest) {
             try {
-                val keypairRepo = KeypairRepository(context)
-                val privateKey = keypairRepo.getPrivateKey()
                 Log.d(
                     TAG,
-                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                    "Approving challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
                 )
-                val signedChallenge =
-                    dev.rourunisen.tapauth.crypto.signData(
-                        privateKey,
-                        authRequest.challenge,
-                    )
-                Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = true,
-                        signedChallenge = signedChallenge,
+                        challenge = authRequest.challenge,
                     )
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to sign challenge", e)
+                Log.e(TAG, "Failed to submit approval", e)
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = false,
-                        signedChallenge = null,
+                        challenge = null,
                         explicitDenial = false,
                     )
             }

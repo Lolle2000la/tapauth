@@ -48,8 +48,6 @@ pub mod jni_api;
 
 // Re-export commonly used types
 pub use config::{ClientConfig, ClientConfigManager, ConfigError, PairedClient, PairedServer};
-pub use crypto::{
-    ClientSymmetricKey, CryptoError, Ed25519KeyPair, PairingSymmetricKey, X25519KeyPair,
-};
+pub use crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair, X25519KeyPair};
 pub use network::NetworkError;
 pub use protocol::pb;

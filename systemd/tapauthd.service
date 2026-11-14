@@ -30,6 +30,15 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # Allow the unprivileged service to manage netfilter rules (pairing opens ephemeral TCP ports)
+#
+# CAP_SYS_PTRACE is deliberately absent: `caller_context.rs` prefers the
+# kernel's view of the calling process (`/proc/<pid>/exe`, `/proc/<pid>/cmdline`),
+# and reading those for another UID's process needs that capability. Without it
+# the daemon falls back to the caller-supplied process name for the prompt shown
+# on the phone and warns once per request (`Cannot read /proc/<pid>/exe …`). That
+# fallback is intended, not a bug, and the capability would let the daemon read
+# any process' memory maps on the host — authorization is unaffected either way
+# (it is decided by `allowed_users`, not by the displayed name).
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 

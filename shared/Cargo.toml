@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Cryptography
 aes-gcm = "0.11.0"
+blake3 = "1"
+chacha20poly1305 = "0.11"
 ed25519-dalek = { version = "3.0.0", features = [
     "rand_core",
     "serde",
@@ -24,6 +26,7 @@ hkdf = "0.13"
 sha2 = "0.11"
 hmac = "0.13"
 rand = "0.10"
+subtle = "2"
 zeroize = { version = "1.9", features = ["derive"] }
 secrecy.workspace = true
 

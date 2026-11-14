@@ -31,6 +31,8 @@ message PamAuthenticateRequest {
   bool tty_present = 2;      // Whether PAM session has an interactive TTY
   uint32 timeout_seconds = 3; // Optional override; 0 => daemon default
   string request_id = 4;     // Client-generated unique id for cancel correlation
+  string pam_service = 5;    // Optional: PAM_SERVICE (e.g., "sudo", "polkit-1", "su")
+  string process_name = 6;   // Optional: caller executable name from client-pam
 }
 
 // Request to cancel a running authentication flow
@@ -73,6 +75,7 @@ message AdminRequest {
     RecoverTpmRequest recover_tpm = 8;
     GetConfigRequest get_config = 9;
     GetDaemonStatusRequest get_daemon_status = 10;
+    CancelPairingRequest cancel_pairing = 11;
   }
 }
 
@@ -80,6 +83,7 @@ message GetServersRequest {}
 message StartPairingRequest {}
 message WaitForPairingRequest { uint32 port = 1; }
 message CompletePairingRequest { uint32 port = 1; }
+message CancelPairingRequest { uint32 port = 1; bytes session_id = 2; }
 message RemoveDeviceRequest { string public_key = 1; }
 message RotateCskRequest {}
 message RecoverTpmRequest {}
@@ -116,10 +120,12 @@ message AdminResponse {
     CompletePairingResponse complete_pairing = 6;
     GetConfigResponse get_config = 7;
     GetDaemonStatusResponse get_daemon_status = 8;
+    CancelPairingResponse cancel_pairing = 9;
   }
 }
 
 message GetServersResponse { repeated PairedServerInfo servers = 1; }
-message StartPairingResponse { string url = 1; uint32 port = 2; }
+message StartPairingResponse { string url = 1; uint32 port = 2; bytes session_id = 3; }
 message WaitForPairingResponse { string sas_code = 1; uint32 port = 2; }
 message CompletePairingResponse { string server_hex = 1; }
+message CancelPairingResponse {}

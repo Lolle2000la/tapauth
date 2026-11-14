@@ -222,7 +222,8 @@ private fun CameraPreview(
                                                     )
                                                     Log.w(
                                                         "QRScanner",
-                                                        "Expected: tapauth://pair?v=1&pk=...&p=...",
+                                                        "Expected: tapauth://pair?v=2&sid=...&pk=..." +
+                                                            "[&p=...&ip4=...&ip6=...]",
                                                     )
                                                     Log.w("QRScanner", "Received: $qrCode")
                                                     onScanStatus(

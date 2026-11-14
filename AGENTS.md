@@ -159,6 +159,9 @@ cargo build --manifest-path client-pam/Cargo.toml
 - JNI crypto tests (`TapAuthCryptoTest.kt`) are **instrumentation tests** requiring an emulator/device.
 - Native build for Android is handled by the `org.mozilla.rust-android-gradle` plugin in `app/build.gradle.kts` (the `cargo` block), not by a standalone script.
 
+### JNI contract guards
+The JNI boundary is checked twice at compile time, because neither check can see what the other does. `scripts/ci/check-jni-surface.sh` compares the `external fun` names Kotlin declares (`TapAuthCrypto.kt`) with the `Java_…_TapAuthCrypto_*` symbols `shared/src/jni_api.rs` exports, **in both directions** — a declaration with no export compiles and then throws `UnsatisfiedLinkError` only on the device, and an export with no declaration is dead code nothing calls. `scripts/ci/check-jni-signatures.py` covers what the name check cannot: the C ABI carries no types, so a `jlong` implemented as `jint`, or two same-typed parameters swapped, still links, so it compares each Rust parameter list and return type against the JVM descriptor of the Kotlin declaration (pinned to a checked-in `javap` fixture, since no CI job has an Android SDK). `JniDescriptorTest`, a JVM unit test in `server-android`, pins the same contract for the DTOs Rust builds with `NewObject`, where a reordered field of the same type leaves the signature byte-identical. Both exist because two workstreams once produced incompatible contracts and nothing noticed until the device did; the `Run clippy (TPM feature)` step answers the same class of gap — `tpm` is a pure cfg gate that no workflow compiled, so a break inside it could only surface after release.
+
 ### GUI Framework
 - `client-config-gui` uses **iced** (Rust GUI framework), not GTK. Requires X11 or Wayland.
 - Runs **unprivileged** — all privileged operations (pairing, device management, config changes) are delegated to `tapauthd` via admin IPC.

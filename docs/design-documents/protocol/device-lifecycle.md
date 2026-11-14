@@ -1,38 +1,32 @@
-# Device Lifecycle Management
+# Device Lifecycle Management (v2)
 
-This document outlines the procedures for managing the lifecycle of paired devices, specifically focusing on revocation (un-pairing) and key rotation.
+This document outlines the procedures for managing the lifecycle of paired devices, focusing on revocation (un-pairing), key rotation, and per-device cryptographic algorithm state.
 
 ## Device Revocation (Un-pairing)
-
-A secure and user-friendly method for revoking trust from a previously paired device is essential.
 
 ### Guiding Principles
 
 * **User-Initiated**: Revocation must be initiated by the user on a device they physically control.
-* **Local Action**: Un-pairing is a local operation. It involves deleting the cryptographic keys associated with the other device. There is no need for a network-based "revocation message."
+* **Local Action**: Un-pairing is a local operation deleting the cryptographic keys and user authorizations associated with the peer. No network "revocation message" is required.
 
 ### Revocation Flow
 
 #### From the Server (Phone)
 
-1.  The Server application **must** display a list of all paired Clients.
-2.  The user selects the Client they wish to remove.
-3.  Upon confirmation, the Server application **must** securely delete the Client's Ed25519 public key (`Client_Pub`, the `publicKey` of its `PairedDevice`) and the shared **`Client Symmetric Key (CSK)`** associated with that specific Client from its storage.
-
-A pairing on either side also records which usernames it may authenticate (the `allowed_users` / `allowedUsers` list), so removal can be scoped to one user: the user is dropped from that list, and the device entry — public key and `CSK` together — is deleted only when the last user is removed (`DeviceRepository.removeUserFromDevice`, `shared::config::PairedServer::allowed_users`).
+1. The Server application displays all paired Clients.
+2. The user selects a Client (or user-scoped permission) to remove.
+3. Upon confirmation, the Server drops the user from `allowedUsers`; when the last user is removed, it deletes the `PairedDevice` entry — including `Client_Pub` ($Ed_C$), the shared `CSK`, its negotiated `symmetricAlgorithm` / `hashAlgorithm` / `signatureAlgorithm` / `protocolVersion`, and its cached temporal identifiers.
 
 #### From the Client (Desktop)
 
-1.  The Client application **must** provide a mechanism to list all paired Servers.
-2.  The user selects the Server they wish to remove.
-3.  Upon confirmation, the Client application **must** securely delete the `Server_Pub` (the Ed25519 public key in the pairing's `public_key` field) associated with that specific Server from its storage. Note: The Client's own `CSK` is not deleted in this case.
+1. The Client GUI (`client-config-gui`) lists all paired Servers retrieved from `tapauthd` over admin IPC (`GetServers`).
+2. The user selects a Server to remove; the GUI sends `RemoveDevice` (authorized via PolKit on `tapauthd`).
+3. `remove_user_from_pairing` drops the calling user from `PairedServer::allowed_users`, deleting the Server entry (`Server_Pub` $Ed_S$, `signature_algorithm`) only when `allowed_users` becomes empty. Note: the Client's own `CSK` is preserved for remaining paired Servers.
 
-Removal on the Client is likewise scoped by username, not only by device: `remove_user_from_pairing` drops the calling user from that server's `allowed_users` and deletes the server entry only when no users remain (`shared/src/config.rs`, reached through `handle_remove_device` in `tapauthd/src/admin_handler.rs`).
+## Client Key Rotation & Algorithm Upgrades
 
-## Client Key Rotation
-
-For security hygiene or in case of a suspected compromise, the Client must support rotating its master symmetric key.
-
-* **Procedure**: The Client application **must** provide a secure, user-initiated function to discard the existing **Client Symmetric Key (`CSK`)** and generate a new one.
-* **Effect**: This action immediately invalidates all existing Server pairings. The implementation drops every paired server along with the old key, so the list of paired Servers is empty afterwards (`ClientConfigManager::rotate_csk` → `clear_paired_servers` + `generate_and_save_csk` in `shared/src/config.rs`).
-* **Recovery**: The user **must** re-pair the Client with any Server they wish to continue using, which will securely distribute the new `CSK`. This acts as a master "de-authorize all" function.
+* **Procedure**: User triggers `RotateCsk` from the GUI (authorized by PolKit in `tapauthd`).
+* **Effect**:
+  1. Discards the existing `CSK` and clears all `PairedServer` entries (since `CSK` is shared across all Servers for multicast broadcast).
+  2. Generates a fresh 32-byte `CSK` and resets/upgrades the Client's active `csk_symmetric_algorithm` and `csk_hash_algorithm` to the Client's preferred defaults (e.g., `AES_256_GCM` or `CHACHA20_POLY1305` and `SHA256` or `BLAKE3`) when the next pairing occurs.
+* **Recovery**: The user re-pairs any Servers they wish to continue using, provisioning the new `CSK` and negotiated algorithms cleanly via the v2 pairing handshake.

@@ -8,7 +8,9 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.service.AuthRequestManager
 
 /**
@@ -82,7 +84,7 @@ class BiometricPromptActivity : FragmentActivity() {
                 TAG,
                 "Biometric authentication not available (strong=$canAuthStrong)",
             )
-            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+            handleAuthResponse(authRequest.requestId, approved = false, challenge = null)
             finish()
         }
     }
@@ -106,7 +108,7 @@ class BiometricPromptActivity : FragmentActivity() {
                                     handleAuthResponse(
                                         authRequest.requestId,
                                         approved = false,
-                                        signedChallenge = null,
+                                        challenge = null,
                                         explicitDenial = true,
                                     )
                                 }
@@ -157,10 +159,13 @@ class BiometricPromptActivity : FragmentActivity() {
         val promptInfo =
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle("Authentication Request")
-                .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
-                .setDescription(
-                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}",
+                .setSubtitle(
+                    "Approve login for " +
+                        "${ContextSanitizer.sanitize(authRequest.username, AuthContextDisplay.IDENTITY_MAX_BYTES)}" +
+                        "@" +
+                        "${ContextSanitizer.sanitize(authRequest.hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)}",
                 )
+                .setDescription(AuthContextDisplay.promptDescription(authRequest))
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                 .setConfirmationRequired(false) // Don't require additional confirmation
@@ -172,11 +177,11 @@ class BiometricPromptActivity : FragmentActivity() {
     private fun handleAuthResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
         val authRequestManager = AuthRequestManager.getInstance()
-        authRequestManager.handleResponse(requestId, approved, signedChallenge, explicitDenial)
+        authRequestManager.handleResponse(requestId, approved, challenge, explicitDenial)
     }
 
     override fun onDestroy() {

@@ -165,6 +165,7 @@ fn orchestrate<T: IpcResponseReader>(
     let mut host = HostIo::new(pamh, Some(&pam_conv), &msgs, io.read_authtok);
     crate::transaction::run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         &username,
         &participation,
         &mut host,

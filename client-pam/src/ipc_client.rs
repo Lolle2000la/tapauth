@@ -105,12 +105,16 @@ impl IpcClient {
         tty_present: bool,
         timeout_seconds: u32,
         request_id: &str,
+        pam_service: &str,
+        process_name: &str,
     ) -> Result<(), IpcError> {
         let req = ipc::PamAuthenticateRequest {
             username: username.to_string(),
             tty_present,
             timeout_seconds,
             request_id: request_id.to_string(),
+            pam_service: pam_service.to_string(),
+            process_name: process_name.to_string(),
         };
         let envelope = ipc::IpcEnvelope {
             msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(req)),

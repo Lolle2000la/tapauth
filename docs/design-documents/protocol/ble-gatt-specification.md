@@ -1,71 +1,70 @@
-# BLE GATT Service Specification
+# BLE GATT Service Specification (v2)
 
-This document specifies the GATT (Generic Attribute Profile) service and characteristics required for the Bluetooth Low Energy transport layer of the authentication protocol.
+This document specifies the Bluetooth Low Energy (BLE) advertisement format and GATT (Generic Attribute Profile) service for both **Authentication** and **Pairing** in TapAuth v2.
 
 * **Service UUID**: `b4ad84c0-2adb-4876-8315-b39d983b2bde`
-  * This unique UUID identifies the TapAuth service.
 
-## Advertisement Packet
+## 1. Legacy 31-Byte Advertisement Budget
 
-For discovery, the Client (desktop) **must** broadcast a BLE advertisement packet containing the following data to allow for private and secure pre-connection identification:
+Every TapAuth BLE advertisement uses the **exact 31-byte legacy BLE advertising budget** so all Linux controllers and BlueZ versions advertise reliably without requiring BLE 5.0 Extended Advertising:
 
-* **Service Data**: A 10-byte **shortened temporal identifier** as service data with the TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`) as the key.
+| AD Structure | Byte Breakdown | Bytes |
+| :--- | :--- | :--- |
+| Flags (`0x01`) | `len(1) + type(1) + flags(1)` (set by BlueZ `discoverable: true`) | **3** |
+| Service Data 128-bit UUID (`0x21`) | `len(1) + type(1) + UUID(16) + payload(10)` | **28** |
+| Local Name | Empty (`local_name: Some("")`) | **0** |
+| **Total** | | **31** (exact maximum; `service_uuids` must NOT be set) |
 
-The BLE advertisement uses the service data format where:
-- **Key**: The TapAuth Service UUID (`b4ad84c0-2adb-4876-8315-b39d983b2bde`)
-- **Value**: The 10-byte shortened temporal identifier
+### Service Data Payload (10 Bytes)
 
-This structure allows the Server (phone) to identify TapAuth advertisements by scanning for service data with the known TapAuth Service UUID, while keeping the advertisement packet small enough to fit within the 31-byte standard advertisement size limit.
+The 10-byte `ServiceData[SERVICE_UUID]` value distinguishes the mode without revealing static device identity:
 
-The shortened temporal identifier is derived using the same HMAC-SHA256 process as the standard temporal identifier (see `authentication-flow.md`), but truncated to the first **10 bytes** instead of 16 bytes. This optimization ensures the BLE advertisement fits within size constraints while still providing sufficient entropy for secure device matching.
+1. **Authentication Discovery**:
+   * **Value**: First **10 bytes** of `HMAC(hash_alg, CSK, u64_be(floor(unix_time / 60)))`.
+   * Matched by paired Servers' background scanner against their cached `(current_window, previous_window)` 10-byte temporal ID table.
+2. **Pairing Discovery**:
+   * **Value**:
+     $$\text{pairing\_adv\_id} = \text{SHA-256}(\texttt{"tapauth-ble-pair-v2"} \parallel \text{session\_id} \parallel X_C)[0..10]$$
+   * Advertised only while a QR-initiated pairing session is open.
+   * Only the Server that just scanned the QR code knows `(sid, pk)` and configures an exact 10-byte hardware `ScanFilter` (`mask = 0xFF * 10`). Other phones see an unrecognized 10-byte value and ignore it completely (zero unsolicited pairing spam).
 
-This rotating identifier allows the Server (phone) to recognize a trusted Client is advertising without revealing any static information that could be used for tracking. The Server will scan for advertisements containing service data with the TapAuth Service UUID and match the temporal identifier against its paired clients, at which point it will initiate a connection.
+Once a GATT connection is established, all encrypted messages use standard `EncryptedPacket` with full **16-byte** `temporal_identifier`, and all pairing messages use `PairingPacket` with full 16-byte `session_id`.
 
-**Important**: The shortened 10-byte temporal identifier is used **only** for BLE advertisement discovery. Once the GATT connection is established, all subsequent communication uses the standard `EncryptedPacket` format with the full 16-byte temporal identifier as specified in `proto/auth_protocol.proto`.
+## 2. Static 4-Characteristic GATT Service
 
-### Characteristics
-
-Once a BLE connection is established, the TapAuth service shall expose three characteristics for the exchange of the full, encrypted protocol messages.
+The daemon exposes a **single static GATT service layout** under `SERVICE_UUID` (`b4ad84c0-2adb-4876-8315-b39d983b2bde`) containing all four characteristics (both authentication and pairing) whenever GATT is registered. Keeping the attribute table invariant ensures Android's per-`BD_ADDR` GATT cache is never stale when transitioning from Pairing directly into Authentication.
 
 1. **Client Command Characteristic**
    * **UUID**: `caf54438-9d78-4697-8886-0a4cfa87ba8d`
-   * **Properties**: `READ`
-   * **Purpose**: This is the primary channel for the Client (desktop) to deliver the authentication request to the Server (phone). The Client stores the `EncryptedPacket` containing the `AuthenticationRequest` as the value of this characteristic. The Server reads it to receive the request.
+   * **Properties**: `READ | NOTIFY`
+   * **Purpose**: Delivers `EncryptedPacket(AuthenticationRequest)` (initially read by the Server upon connecting) and **real-time `EncryptedPacket(AuthenticationCancel)`** via GATT **Notification** (as well as updated value for fallback read). Subscribing to notifications eliminates the 5-second disconnect grace delay when another transport or local password cancels a session.
 
 2. **Server Response Characteristic**
    * **UUID**: `ca6238be-c194-49b7-855b-58f41d3da626`
-   * **Properties**: `WRITE` (write with response, i.e. acknowledged writes — `write: true, write_without_response: false` in `tapauthd/src/transport/ble.rs`, so the Server (phone) can use GATT Prepare/Execute long writes to fragment a payload larger than the MTU)
-   * **Purpose**: The Server (phone) writes the `EncryptedPacket` containing the `AuthenticationGrant` or `AuthenticationDenial` message to this characteristic on the Client. Per the authentication flow specification, the Server will retransmit the response every 500ms until a confirmation is received or timeout occurs.
+   * **Properties**: `WRITE` (Write With Response, acknowledged)
+   * **Purpose**: The Server writes `EncryptedPacket(AuthenticationGrant)` or `EncryptedPacket(AuthenticationDenial)` to the Client, retransmitting every 500ms until confirmed or timed out.
 
 3. **Client Confirmation Characteristic**
    * **UUID**: `ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf`
-   * **Properties**: `READ`
-   * **Purpose**: The Client (desktop) stores the `EncryptedPacket` containing a `GrantConfirmation` as the value of this characteristic after successfully processing an `AuthenticationGrant` or `AuthenticationDenial`. The Server reads this characteristic to detect when the Client has received the response, allowing it to stop retransmitting. This implements the confirmation mechanism required by the authentication flow specification for both UDP and BLE transports.
+   * **Properties**: `READ | NOTIFY`
+   * **Purpose**: The Client writes and **immediately notifies** `EncryptedPacket(GrantConfirmation)` after verifying the Server's grant/denial and authorizing `allowed_users`. Supporting `NOTIFY` lets the Server receive confirmation in ~15ms instead of waiting 500ms to poll `READ` (eliminating the race where Linux tore down GATT at ~410ms before Android's 500ms read poll). Linux keeps the GATT link up until confirmation delivery succeeds or times out, rather than invoking `send_cancel` on the winning BLE transport.
 
-## BLE Transport Flow
+4. **Pairing Channel Characteristic**
+   * **UUID**: `d9e8f1a2-3b4c-4d5e-8f60-7a8b9c0d1e2f`
+   * **Properties**: `WRITE | NOTIFY | READ`
+   * **Purpose**: Unified bidirectional channel for v2 `PairingPacket` frames:
+     * **Phone $\to$ Desktop**: Server writes `PairingInit`, `PairingConfirmServer`, or `PairingAbort` via `WRITE` (Write With Response).
+     * **Desktop $\to$ Phone**: Client pushes `PairingResponse`, `PairingConfirmClient`, or `PairingAbort` via GATT **Notification** (plus updates readable value as fallback).
 
-The BLE transport implements the same retransmission and confirmation protocol as the UDP transport:
+## 3. Transport & Android/BlueZ Implementation Rules
 
-1. **Client provides request**: The Client stores an `EncryptedPacket` containing an `AuthenticationRequest` as the value of the **Client Command Characteristic**. The Server discovers the device via the advertisement, connects, and reads this characteristic to obtain the request.
-2. **Server responds**: The Server writes an `EncryptedPacket` containing an `AuthenticationGrant` or `AuthenticationDenial` to the **Server Response Characteristic**.
-3. **Retransmission**: The Server retransmits the response every 500ms by re-writing to the Server Response Characteristic.
-4. **Confirmation**: Upon receiving the response, the Client stores an `EncryptedPacket` containing a `GrantConfirmation` as the value of the **Client Confirmation Characteristic**.
-5. **Stop retransmission**: The Server periodically reads the **Client Confirmation Characteristic** during retransmission. When it detects the confirmation, it stops retransmitting.
+1. **MTU 517 Negotiation**: Immediately after `STATE_CONNECTED`, the Server (Android) **must** call `gatt.requestMtu(517)` and wait for `onMtuChanged` *before* calling `gatt.discoverServices()`. Since both `EncryptedPacket` ($\le 470\text{ B}$) and `PairingPacket` ($\le 300\text{ B}$) fit under 512 bytes, negotiating MTU 517 ensures single-PDU reads, single-PDU writes, and **untruncated GATT notifications** (ATT notifications cannot be long-fragmented when payload exceeds `MTU - 3`).
+2. **Event-Driven Async Reception**: On Linux (`tapauthd/src/transport/ble.rs`), incoming writes from BlueZ D-Bus handlers **must** push directly into an async `tokio::sync::mpsc` channel rather than polling a mutex queue on a 20ms sleep timer.
+3. **Serialized Single In-Flight GATT Operation**: Android's `BluetoothGatt` drops concurrent operations (`readCharacteristic`, `writeCharacteristic`, `writeDescriptor`, `requestMtu`, `discoverServices`). All GATT operations on Android **must** execute sequentially through a serialized coroutine channel/mutex awaiting each callback (`onMtuChanged`, `onServicesDiscovered`, `onDescriptorWrite`, `onCharacteristicRead`, `onCharacteristicWrite`).
+4. **Connection Lifecycle**:
+   * **Authentication**: Held open until `GrantConfirmation` is notified/read (or 10s retransmission expires). If the BLE link drops while a prompt is pending, a **5-second** reconnect grace period applies before cancelling an unanswered prompt, unless an explicit verified `AuthenticationCancel` was already received.
+   * **Pairing**: Phone subscribes to CCCD (`0x2902`) on `PAIRING_CHAR_UUID` right after `discoverServices()`, then writes `PairingInit`. The GATT link stays open across user SAS review until `PairingConfirmServer` completes or `PairingAbort` / timeout occurs.
 
-This design ensures reliable delivery of authentication results over BLE while maintaining consistency with the UDP transport behavior specified in `authentication-flow.md`.
+## 4. BLE Security Best Practices
 
-### Connection Lifecycle
-
-The GATT connection between the Server (phone, central) and the Client (desktop, peripheral) is managed as follows:
-
-* **Held open during the exchange**: The connection is **not** torn down after each characteristic write. It must stay alive until the response has been delivered *and* the GrantConfirmation has been read, since retransmission and confirmation polling both use the same link. Disconnecting earlier would race with the confirmation round-trip.
-* **Torn down after completion**: Once retransmission stops (confirmation received or the 10s retransmission window expires), or the transaction fails/times out, the Server disconnects the GATT link. Error and rejection paths disconnect immediately and silently.
-* **Disconnect cleanup with grace period**: If the link drops while a prompt is still pending (user has not answered), the pending request is **not** cancelled immediately — transient link drops and duplicate connection callbacks must not dismiss a prompt the user is about to answer. Instead, the Server cancels pending requests for that device only if it has **not reconnected within a short grace period** (currently 5 seconds). Daemon/PAM timeouts remain the upper bound for any pending request.
-
-## BLE Security Best Practices
-
-To protect the confidentiality and integrity of the communication at the transport layer, the following BLE security practice is **strongly recommended** if your implementation has low-level control over BLE security parameters.
-
-* **LE Secure Connections**: If your BLE stack allows configuration of security requirements, the connection between the Client and Server **should** be established using **LE Secure Connections**. Legacy pairing should be disabled where possible. LE Secure Connections provides strong, ECDH-based key exchange and protects against passive eavesdropping and Man-in-the-Middle attacks at the link layer.
-
-**Note**: Many high-level BLE APIs (such as those provided by Android and Linux BlueZ) do not expose direct control over LE Secure Connections enforcement. In such cases, the OS-level BLE stack will negotiate the strongest available security mode automatically. The application-layer encryption provided by the `EncryptedPacket` structure ensures security even when BLE link-layer security cannot be explicitly controlled.
+* Prefer **LE Secure Connections** when platform APIs permit, while relying unconditionally on application-layer AEAD + Ed25519 signatures (`EncryptedPacket` / `PairingPacket`) since neither Android nor Linux BlueZ exposes strict LE-SC enforcement across all adapters without OS pairing dialogs.

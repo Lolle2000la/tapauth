@@ -1,67 +1,92 @@
-# Cryptography Specification
+# Cryptography Specification (v2)
 
-This document specifies the cryptographic algorithms and parameters for the TapAuth protocol. The protocol is designed to be **crypto-agile**, meaning that algorithms can be negotiated and updated without requiring a breaking change to the protocol version. The initial version of the protocol specifies a set of strong, modern, and widely-supported algorithms as the default.
+This document specifies the cryptographic algorithms, key schedule, AEAD framing, and algorithm agility rules for TapAuth v2.
 
-## 1. Cryptographic Agility
+## 1. Real Cryptographic Agility
 
-The protocol achieves crypto-agility through three primary mechanisms:
+Protocol v2 replaces the nominal (unused) negotiation in v1 with **end-to-end enforced and persisted cryptographic agility**, respecting the shared-broadcast constraint of TapAuth:
 
-1.  **Algorithm Enumerations**: The Protobuf schema defines `enum` types for each class of algorithm (e.g., `SignatureAlgorithm`, `SymmetricAlgorithm`). This provides a single source of truth for which algorithms are recognized by the protocol.
-2.  **Negotiation During Pairing**: During the initial key exchange, the `PairingHello` message lets the Server declare which algorithms it supports (`supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms`), and the Client answers with its selection in `PairingResponse` (`selected_symmetric_algorithm`, `selected_hash_algorithm`, `selected_signature_algorithm`) — see `proto/auth_protocol.proto`. (In the shipped implementation each enumeration has exactly one defined value — `ED25519`, `AES_256_GCM`, `SHA256` — so the selection is carried on the wire but has no effect yet: every send and verify path hardcodes those three.)
-3.  **Explicit Algorithm Specification**: Every message that involves a cryptographic operation (e.g., `AuthenticationRequest` with a signature, `EncryptedPacket` with ciphertext) includes a field that explicitly states which algorithm was used.
+1. **Client-Wide Broadcast Parameters** (associated with the Client's `CSK` because one multicast UDP / BLE advertisement targets **all** paired Servers simultaneously):
+   * **`SymmetricAlgorithm`**: `AES_256_GCM` (`1`, baseline mandatory) or `CHACHA20_POLY1305` (`2`).
+   * **`HashAlgorithm`**: `SHA256` (`1`, baseline mandatory, via HMAC-SHA256) or `BLAKE3` (`2`, via keyed BLAKE3 or HMAC-BLAKE3, standardized as HMAC-SHA256 for `SHA256` and BLAKE3 keyed-MAC for `BLAKE3`).
+   * **Client `SignatureAlgorithm`**: `ED25519` (`1`, baseline mandatory).
+2. **Per-Server Parameters** (stored individually per `PairedServer` on Linux and `PairedDevice` on Android):
+   * **Server `SignatureAlgorithm`** + Server static public key ($Ed_S$).
+3. **Negotiation & Persistence Rules**:
+   * **Android Server** advertises `supported_*` in `PairingInit` with baseline mandatory algorithms listed **first** (`[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so legacy/older v1/v2 Linux Clients remain compatible.
+   * **Linux Client** intersects `supported_*` with its own supported set (and with the active CSK's algorithm if a `CSK` already exists from a prior pairing). Rotating `CSK` (`RotateCsk`) allows upgrading the Client-wide algorithm when re-pairing.
+   * Both sides **persist** the negotiated `SymmetricAlgorithm`, `HashAlgorithm`, and `SignatureAlgorithm` in config/repository storage and dispatch strictly on them at runtime, rejecting `UNSPECIFIED` or mismatched algorithms (`CryptoError::UnsupportedAlgorithm`).
 
-This design ensures that the protocol can evolve to support new cryptographic standards as they emerge, and allows for interoperability between clients and servers that may have different capabilities.
+## 2. Cryptographic Primitives & Key Schedule
 
-## 2. Recommended Default Algorithms
+### 2.1 Asymmetric Primitives (Curve25519)
+* **Key Exchange**: **X25519** (ephemeral $(x_C, X_C)$ on Client, $(x_S, X_S)$ on Server). Both peers must reject all-zero shared secrets $Z$.
+* **Digital Signatures**: **Ed25519** (`SignatureAlgorithm::ED25519`).
+  * Post-pairing messages sign the raw-payload transcript (`"tapauth-sig-v2" || be32(version) || be32(sig_alg) || be32(payload_type) || raw_payload`).
+  * Pairing binds static Ed25519 keys via mutual signatures over the handshake transcript $H$.
 
-While the protocol is flexible, for version 1, implementations **should** support the following strong default algorithms.
+### 2.2 Pairing Transcript Hash & HKDF-SHA256 Key Schedule
 
-### 2.1. Asymmetric Cryptography (Curve25519)
+All pairing handshake parameters are committed into a deterministic length-prefixed SHA-256 transcript hash $H$:
 
-The protocol uses modern Elliptic Curve Cryptography (ECC) based on Curve25519, which provides a ~128-bit security level and is highly resistant to timing attacks.
+```text
+H = SHA-256(
+    "tapauth-pair-transcript-v2"
+    || be32(version)
+    || session_id (16B)
+    || client_x25519_public_key (32B)
+    || server_x25519_public_key (32B)
+    || client_ed25519_public_key (32B)
+    || server_ed25519_public_key (32B)
+    || be32(client_device_name.len()) || client_device_name
+    || be32(server_device_name.len()) || server_device_name
+    || be32(supported_sym.len())  || [be32(a) for a in supported_sym]
+    || be32(supported_hash.len()) || [be32(a) for a in supported_hash]
+    || be32(supported_sig.len())  || [be32(a) for a in supported_sig]
+    || be32(selected_symmetric_algorithm)
+    || be32(selected_hash_algorithm)
+    || be32(selected_signature_algorithm)
+)
+```
 
-*   **Key Exchange**: **X25519**
-    *   **Purpose**: Used during the initial pairing to perform an Elliptic Curve Diffie-Hellman (ECDH) key exchange, generating a temporary shared secret.
-*   **Digital Signature**: **Ed25519**
-    *   **Protobuf Enum**: `ED25519`
-    *   **Purpose**: Used to sign all core messages for authenticity and integrity before they are encrypted.
+Using HKDF-SHA256 salted with $H$ and input keying material $Z = \text{X25519}(x, Y)$:
 
-### 2.2. Symmetric Cryptography
+1. $\text{PRK} = \text{HKDF-Extract}_{\text{SHA256}}(\text{salt} = H,\; \text{IKM} = Z)$
+2. $K_{\text{c2s}} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-c2s"},\; 32)$ — encrypts Client $\to$ Server pairing messages (`PairingConfirmClient`, Client `PairingAbort` MAC).
+3. $K_{\text{s2c}} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-s2c"},\; 32)$ — encrypts Server $\to$ Client pairing messages (`PairingConfirmServer`, Server `PairingAbort` MAC).
+4. $\text{SAS\_bytes} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-sas"},\; 8)$
+5. $\text{SAS} = \text{u64::from\_be\_bytes}(\text{SAS\_bytes}) \bmod 1{,}000{,}000$ (6 decimal digits formatted `000-000`).
 
-*   **Authenticated Encryption (AEAD)**: **AES-256-GCM**
-    *   **Protobuf Enum**: `AES_256_GCM`
-    *   **Purpose**: Provides authenticated encryption for all network communication.
-*   **Hashing**: **SHA-256**
-    *   **Protobuf Enum**: `SHA256`
-    *   **Purpose**: Used for hashing operations, such as the confirmation hash during pairing.
-*   **Key Derivation Function (KDF)**: **HKDF-SHA256**
-    *   **Purpose**: Used to derive cryptographically strong symmetric keys from the shared secret generated by the X25519 key exchange. Both derivations use an empty salt and a fixed `info` label: `"tapauth-pairing-key"` for the `PSK` and `"tapauth-sas"` for the `SAS` (`shared/src/crypto/kdf.rs`).
+Salting HKDF with $H$ and using separate directional keys $K_{\text{c2s}} / K_{\text{s2c}}$ guarantees that **every** field in `PairingInit` and `PairingResponse` is cryptographically bound into both the SAS and the provisioning channel, and prevents reflection attacks.
 
-## 3. Nonce Management for AES-GCM
+### 2.3 Post-Pairing Signature Transcript
 
-To prevent catastrophic security failures, the management of nonces (numbers used once) for AES-GCM is critical.
+All `WrapperMessage` signatures are computed directly over `wrapper_signing_transcript` without re-serializing inner protobuf structs:
 
-*   **Uniqueness**: A nonce **MUST NEVER** be reused with the same key for two different plaintexts. This is the most critical security requirement for AES-GCM.
-*   **Generation for EncryptedPacket**: For `EncryptedPacket` messages, a **12-byte cryptographically random nonce** is generated for each encryption operation using a secure random number generator. The nonce is prepended to the ciphertext and transmitted alongside it (nonces are not secret). This ensures that:
-    1. Each packet has a unique nonce, regardless of timing
-    2. Multiple authentication requests within the same time window have different nonces
-    3. No possibility of nonce reuse, eliminating the AES-GCM catastrophic failure mode
-*   **Nonce Transmission**: The 12-byte nonce is prepended to the ciphertext in the `ciphertext` field of `EncryptedPacket`. The receiver extracts the nonce from the first 12 bytes before decrypting the remainder.
-*   **Challenge-Based Nonces**: For messages sent *after* an `AuthenticationRequest` has been decrypted (e.g., `AuthenticationGrant`, `GrantConfirmation`), nonces can optionally be derived from the session's `challenge` field using HKDF-SHA256 with message-type-specific info tags (e.g., `"auth_grant"`, as documented on the JNI entry point `encryptWithCsk`). This is acceptable because the challenge is unique per authentication session and enforced by replay mitigation. The shipped paths do not exercise this option: `tapauthd` and the Android app encrypt every packet — request, grant, denial, confirmation and cancel — with the random prepended nonce above (`create_encrypted_packet_with_csk_nonce`, and `TapAuthCrypto.createEncryptedPacket`), and the challenge-derived helper `encrypt_with_csk` has no production caller.
+```text
+"tapauth-sig-v2" || be32(version) || be32(signature_algorithm) || be32(payload_type) || payload
+```
 
-## 4. Symmetric Key Types
+## 3. Single AEAD Nonce & Header AAD Construction
 
-The protocol uses two distinct types of symmetric keys:
+Protocol v2 **removes** all legacy challenge-derived nonce helpers (`derive_nonce`, `encrypt_with_csk`, `decrypt_with_csk`) so there is **one** unified AEAD construction across UDP, BLE, and Pairing:
 
-*   **Pairing Symmetric Key (`PSK`)**:
-    *   **Scope**: Ephemeral, session-only.
-    *   **Derivation**: Derived from the X25519 ECDH exchange during the initial pairing process using HKDF-SHA256.
-    *   **Purpose**: Its function is to create a secure, temporary channel to encrypt the long-term `CSK` as it is transmitted from the Client to the Server, and to serve as the HKDF secret from which the `SAS` is derived.
-    *   **Lifecycle**: The `PSK` **must** be securely discarded by both the Client and Server immediately after the pairing process is successfully completed or fails.
+* **Key Size**: 32 bytes (`AES-256-GCM` or `ChaCha20-Poly1305`).
+* **Nonce**: 12-byte cryptographically random CSPRNG nonce generated per encryption, prepended directly to `ciphertext || 16-byte tag`.
+* **Associated Data (AAD)**:
+  * **For `EncryptedPacket`**:
+    ```text
+    aad = "tapauth-pkt-v2"
+          || be32(encryption_algorithm as u32)
+          || be16(temporal_identifier.len() as u16)
+          || temporal_identifier
+    ```
+  * **For `PairingConfirmClient`**: `aad = "tapauth-pair-v2-provision" || H`
+  * **For `PairingConfirmServer`**: `aad = "tapauth-pair-v2-complete" || H`
 
-*   **Client Symmetric Key (`CSK`)**:
-    *   **Scope**: Long-term.
-    *   **Generation**: A cryptographically secure 32-byte key generated once by the Client application, typically upon first pairing.
-    *   **Purpose**: This is the primary key used to encrypt all post-pairing communication. It is shared by a single Client with all of its paired Servers, allowing the Client to multicast a single encrypted message that can be decrypted by any authorized Server.
-    *   **Lifecycle**: The `CSK` is stored on the Client in a mode-`0600` file owned by `tapauthd` and on every paired Server in its own app-private storage (see `security-hardening.md` for what that does and does not protect), until a device is explicitly un-paired or the key is rotated.
+Empty AAD (`&[]`) is forbidden in v2: binding cleartext packet headers into the AEAD tag detects any downgrade or temporal-ID tampering before inner decryption/parsing runs.
 
+## 4. Symmetric Key Lifecycle Summary
+
+* **Ephemeral Pairing Keys ($x_C, x_S, Z, \text{PRK}, K_{\text{c2s}}, K_{\text{s2c}}$)**: Strictly session-scoped; zeroized immediately on completion, abort, or timeout.
+* **Client Symmetric Key (`CSK`)**: 32-byte CSPRNG long-term key shared by one Client with all its paired Servers; protected at rest per [`security-hardening.md`](security-hardening.md) and rotated on demand via `RotateCsk`.

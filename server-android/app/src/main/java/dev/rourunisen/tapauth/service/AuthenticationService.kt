@@ -24,6 +24,7 @@ import java.net.InetAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketException
+import java.security.GeneralSecurityException
 import kotlinx.coroutines.*
 
 /**
@@ -571,10 +572,16 @@ class AuthenticationService : Service() {
                 return
             }
 
-            // Decrypt the EncryptedPacket to get WrapperMessage
+            // Decrypt the EncryptedPacket to get WrapperMessage. The packet's own
+            // `encryption_algorithm` must match the algorithm this pairing negotiated, so Rust
+            // rejects an algorithm downgrade before it verifies the AEAD tag.
             val wrapperMessage =
                 try {
-                    dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(device.csk, data)
+                    TapAuthCrypto.decryptEncryptedPacket(
+                        data,
+                        device.csk,
+                        device.symmetricAlgorithm,
+                    )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to decrypt packet", e)
                     return
@@ -653,6 +660,18 @@ class AuthenticationService : Service() {
         return joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * Hex SHA-256 of [data], used only as a stable de-duplication key for the rate limiter.
+     *
+     * Retransmissions and multi-transport deliveries of one request decrypt to identical
+     * `WrapperMessage` bytes, so they collapse to one request id. This is not protocol crypto and
+     * deliberately has no JNI export.
+     */
+    private fun sha256Hex(data: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(data)
+        return digest.toHex()
+    }
+
     private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
         val take = kotlin.math.min(this.size, maxBytes)
         return this.take(take).joinToString("") { "%02x".format(it) } +
@@ -666,22 +685,38 @@ class AuthenticationService : Service() {
         try {
             Log.d(TAG, "Handling GrantConfirmation from device: ${device.displayName}")
 
-            // Parse the confirmation
-            val confirmation =
+            // Rust verifies the WrapperMessage Ed25519 signature against the paired Client key
+            // before it parses the inner message, and returns the acknowledged challenge. An
+            // unverified confirmation must not stop retransmission nor mark anything confirmed, so
+            // both failure paths return here.
+            val challengeBytes =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseGrantConfirmation(
+                    TapAuthCrypto.parseAndVerifyGrantConfirmation(
                         wrapperMessage,
+                        device.publicKey,
+                        device.protocolVersion,
+                        device.signatureAlgorithm,
                     )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse GrantConfirmation", e)
+                } catch (e: GeneralSecurityException) {
+                    Log.w(
+                        TAG,
+                        "GrantConfirmation failed signature verification for device ${device.deviceId}; ignoring unverified confirmation",
+                        e,
+                    )
+                    return
+                } catch (e: java.io.IOException) {
+                    Log.w(
+                        TAG,
+                        "Malformed GrantConfirmation from device ${device.deviceId}; ignoring",
+                        e,
+                    )
                     return
                 }
 
-            Log.d(TAG, "GrantConfirmation received for challenge: ${confirmation.challenge}")
-
-            // Decode Base64 challenge to ByteArray for retransmission manager
-            val challengeBytes =
-                android.util.Base64.decode(confirmation.challenge, android.util.Base64.NO_WRAP)
+            Log.d(
+                TAG,
+                "Verified GrantConfirmation for challenge: ${challengeBytes.toHexPreview()}",
+            )
 
             // Stop retransmission for this challenge
             retransmissionManager.stopRetransmission(challengeBytes)
@@ -705,22 +740,39 @@ class AuthenticationService : Service() {
         try {
             Log.d(TAG, "Handling AuthenticationCancel from device: ${device.displayName}")
 
-            // Parse the cancel message
-            val cancel =
+            // Only a cancel whose WrapperMessage signature verifies against the paired Client key
+            // may dismiss the prompt or cancel the pending grace window. Rust verifies the
+            // signature before parsing and returns the cancelled challenge, so an unverified (or
+            // unparseable) cancel is ignored outright — it never reaches the prompt or the
+            // retransmission manager.
+            val challengeBytes =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(
+                    TapAuthCrypto.parseAndVerifyAuthCancel(
                         wrapperMessage,
+                        device.publicKey,
+                        device.protocolVersion,
+                        device.signatureAlgorithm,
                     )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse AuthenticationCancel", e)
+                } catch (e: GeneralSecurityException) {
+                    Log.w(
+                        TAG,
+                        "AuthenticationCancel failed signature verification for device ${device.deviceId}; ignoring unverified cancel",
+                        e,
+                    )
+                    return
+                } catch (e: java.io.IOException) {
+                    Log.w(
+                        TAG,
+                        "Malformed AuthenticationCancel from device ${device.deviceId}; ignoring",
+                        e,
+                    )
                     return
                 }
 
-            Log.d(TAG, "AuthenticationCancel received for challenge: ${cancel.challenge}")
-
-            // Decode Base64 challenge to ByteArray for retransmission manager
-            val challengeBytes =
-                android.util.Base64.decode(cancel.challenge, android.util.Base64.NO_WRAP)
+            Log.d(
+                TAG,
+                "Verified AuthenticationCancel for challenge: ${challengeBytes.toHexPreview()}",
+            )
             Log.d(TAG, "Processing AuthenticationCancel for challenge")
 
             // Stop retransmission for this challenge
@@ -769,17 +821,34 @@ class AuthenticationService : Service() {
             // Use a hash of the message payload as request identifier for de-duplication.
             // Retransmissions and multi-transport deliveries of the same request will have
             // identical wrapperMessage bytes after decryption, so they produce the same hash.
-            val requestId = TapAuthCrypto.sha256(wrapperMessage)
+            // This is a local de-duplication key, not protocol crypto: the protocol hashes and
+            // signatures all live in Rust, so a plain JDK digest is enough here.
+            val requestId = sha256Hex(wrapperMessage)
             if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex(), requestId)) {
                 Log.w(TAG, "Rate limiting auth request from device: ${device.displayName}")
                 return
             }
 
-            // Parse the AuthenticationRequest from WrapperMessage
+            // Parse and verify the AuthenticationRequest. Rust verifies the WrapperMessage Ed25519
+            // signature against the paired Client key BEFORE parsing the payload, so everything
+            // below operates on a request the Client actually signed. A bad signature throws, and
+            // an unverified request is dropped here — it never reaches the replay cache, the
+            // prompt, or a response.
             val authRequest =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(wrapperMessage)
-                } catch (e: Exception) {
+                    TapAuthCrypto.parseAndVerifyAuthRequest(
+                        wrapperMessage,
+                        device.publicKey,
+                        device.protocolVersion,
+                        device.signatureAlgorithm,
+                    )
+                } catch (e: GeneralSecurityException) {
+                    Log.w(
+                        TAG,
+                        "Signature verification failed for device ${device.deviceId}, rejecting request",
+                    )
+                    return
+                } catch (e: java.io.IOException) {
                     Log.e(TAG, "Failed to parse AuthenticationRequest", e)
                     return
                 }
@@ -801,11 +870,9 @@ class AuthenticationService : Service() {
 
             Log.d(TAG, "Pairing authorized for user: ${authRequest.username}")
 
-            // Decode Base64 strings to ByteArrays
-            val challengeBytes =
-                android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
-            val signatureBytes =
-                android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
+            // The verified parser hands back the raw challenge bytes; there is no Base64 layer on
+            // the v2 wire format.
+            val challengeBytes = authRequest.challenge
 
             // Transport lock - ensure only one channel handles this request
             if (
@@ -825,37 +892,6 @@ class AuthenticationService : Service() {
                 return
             }
 
-            // Verify signature
-            // Reconstruct the message with signature field empty
-            val messageForVerification =
-                try {
-                    dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
-                        challengeBytes,
-                        authRequest.username,
-                        authRequest.hostname,
-                        authRequest.timestampUnixSeconds,
-                        authRequest.signatureAlgorithm,
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to serialize request for verification", e)
-                    return
-                }
-
-            val isValid =
-                dev.rourunisen.tapauth.crypto.verifySignature(
-                    device.publicKey,
-                    messageForVerification,
-                    signatureBytes,
-                )
-
-            if (!isValid) {
-                Log.w(
-                    TAG,
-                    "Signature verification failed for device ${device.deviceId}, rejecting request",
-                )
-                return
-            }
-
             Log.d(TAG, "Signature verified for device: ${device.displayName} (${device.deviceId})")
 
             // Step 5: Request biometric authentication via AuthRequestManager
@@ -869,9 +905,13 @@ class AuthenticationService : Service() {
                 challenge = challengeBytes,
                 timestamp = authRequest.timestampUnixSeconds * 1000,
                 transportType = dev.rourunisen.tapauth.data.TransportType.UDP,
-            ) { approved, signedChallenge, explicitDenial ->
+                pamService = authRequest.pamService,
+                processName = authRequest.processName,
+                commandPreview = authRequest.commandPreview,
+                ttyPresent = authRequest.ttyPresent,
+            ) { approved, challenge, explicitDenial ->
                 // Step 6: Create and send authentication grant
-                if (approved && signedChallenge != null) {
+                if (approved && challenge != null) {
                     Log.d(TAG, "Auth request approved, creating encrypted grant")
                     try {
                         // Get server private key for signing
@@ -882,19 +922,16 @@ class AuthenticationService : Service() {
                             "Signing grant with server public key (trunc): ${publicKey.take(8).joinToString("") { "%02x".format(it) }}…",
                         )
 
-                        // Create WrapperMessage containing AuthenticationGrant (now properly
-                        // signed)
-                        val grantWrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
-                                signedChallenge,
-                                privateKey,
-                            )
-
-                        // Create proper EncryptedPacket per specification
+                        // Rust signs the grant's WrapperMessage and encrypts it into the finished
+                        // EncryptedPacket in one step, using the algorithms this pairing
+                        // negotiated (the AAD binds the algorithm and the temporal identifier).
                         val encryptedPacketBytes =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            TapAuthCrypto.createGrantWrapperMessage(
+                                challenge,
+                                privateKey,
                                 device.csk,
-                                grantWrapperMessage,
+                                device.symmetricAlgorithm,
+                                device.hashAlgorithm,
                             )
 
                         // Send initial response
@@ -941,18 +978,16 @@ class AuthenticationService : Service() {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
 
-                        // Create WrapperMessage containing AuthenticationDenial
-                        val denialWrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
-                                challengeBytes,
-                                privateKey,
-                            )
-
-                        // Create proper EncryptedPacket per specification
+                        // Rust signs the denial's WrapperMessage and encrypts it into the finished
+                        // EncryptedPacket, bound to the challenge and to the negotiated algorithms.
                         val encryptedPacketBytes =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            TapAuthCrypto.createDenialWrapperMessage(
+                                challengeBytes,
+                                "Denied on device",
+                                privateKey,
                                 device.csk,
-                                denialWrapperMessage,
+                                device.symmetricAlgorithm,
+                                device.hashAlgorithm,
                             )
 
                         // Send initial denial response

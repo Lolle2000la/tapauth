@@ -1,18 +1,18 @@
 use crate::auth_handler::DaemonState;
 use crate::peer_identity::{check_authorization, resolve_peer};
 use shared::{
-    config::{ClientConfig, PairedServer},
+    config::{ClientConfig, CskMetadata, PairedServer},
     crypto::keys::ClientSymmetricKey,
-    firewall::{FirewallGuard, Protocol},
     ipc::pb as ipc,
-    models::pairing::generate_pairing_url,
-    protocol::ClientPairingSession,
+    protocol::pairing::ServerPairingState,
 };
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
+
+use crate::pairing::{self, CompletedPairing, SessionPhase};
+
+pub use crate::pairing::PairingState;
 
 fn err_resp(status: ipc::AdminStatus, msg: impl Into<String>) -> ipc::AdminResponse {
     ipc::AdminResponse {
@@ -40,12 +40,16 @@ fn get_servers_success(servers: Vec<ipc::PairedServerInfo>) -> ipc::AdminRespons
     }
 }
 
-fn start_pairing_success(url: String, port: u32) -> ipc::AdminResponse {
+fn start_pairing_success(url: String, port: u32, session_id: Vec<u8>) -> ipc::AdminResponse {
     ipc::AdminResponse {
         status: ipc::AdminStatus::AdminSuccess as i32,
         error_message: String::new(),
         payload: Some(ipc::admin_response::Payload::StartPairing(
-            ipc::StartPairingResponse { url, port },
+            ipc::StartPairingResponse {
+                url,
+                port,
+                session_id,
+            },
         )),
     }
 }
@@ -66,6 +70,16 @@ fn complete_pairing_success(server_hex: String) -> ipc::AdminResponse {
         error_message: String::new(),
         payload: Some(ipc::admin_response::Payload::CompletePairing(
             ipc::CompletePairingResponse { server_hex },
+        )),
+    }
+}
+
+fn cancel_pairing_success() -> ipc::AdminResponse {
+    ipc::AdminResponse {
+        status: ipc::AdminStatus::AdminSuccess as i32,
+        error_message: String::new(),
+        payload: Some(ipc::admin_response::Payload::CancelPairing(
+            ipc::CancelPairingResponse {},
         )),
     }
 }
@@ -101,38 +115,6 @@ fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResp
             },
         )),
     }
-}
-
-pub struct PendingPairing {
-    pub listener: TcpListener,
-    pub firewall_guard: Option<Arc<FirewallGuard>>,
-    pub session: ClientPairingSession,
-    #[allow(dead_code)]
-    pub url: String,
-    pub port: u16,
-    pub generation: u64,
-}
-
-pub struct ActivePairing {
-    pub stream: TcpStream,
-    pub session: ClientPairingSession,
-    pub server_public_key: [u8; 32],
-    pub server_device_name: String,
-    pub port: u16,
-    #[allow(dead_code)]
-    pub firewall_guard: Option<Arc<FirewallGuard>>,
-    pub generation: u64,
-}
-
-pub enum PairingState {
-    Pending(PendingPairing),
-    Active(ActivePairing),
-}
-
-static PAIRING_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-fn next_generation() -> u64 {
-    PAIRING_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 pub async fn handle_admin_request(
@@ -180,6 +162,9 @@ pub async fn handle_admin_request(
             handle_complete_pairing(&daemon, pairing_state, &username, req).await,
             true,
         ),
+        Some(ipc::admin_request::Payload::CancelPairing(req)) => {
+            (handle_cancel_pairing(pairing_state, req).await, false)
+        }
         Some(ipc::admin_request::Payload::RemoveDevice(req)) => {
             (handle_remove_device(&daemon, &username, req).await, true)
         }
@@ -237,6 +222,8 @@ async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::A
     }
 }
 
+/// Start a v2 pairing session: ephemeral dual-stack UDP socket, BLE pairing
+/// advertisement, and one background worker driving the handshake.
 async fn handle_start_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
@@ -272,50 +259,46 @@ async fn handle_start_pairing(
 
     let ipv6 = find_non_loopback_ipv6();
 
-    let listener = match TcpListener::bind("0.0.0.0:0").await {
-        Ok(l) => l,
+    // A session that already ended must not block the next attempt: the worker
+    // publishes a terminal phase but only this side can retire the handle.
+    {
+        let mut guard = pairing_state.lock().await;
+        if matches!(guard.as_ref(), Some(session) if session.is_ended()) {
+            tracing::debug!("Retiring the finished pairing session before starting a new one");
+            *guard = None;
+        }
+        if guard.is_some() {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                "A pairing session is already in progress. Cancel or complete it first.",
+            );
+        }
+    }
+
+    let udp = match pairing::bind_pairing_socket().await {
+        Ok(socket) => socket,
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
-                format!("Failed to bind TCP listener: {}", e),
+                format!("Failed to bind the pairing UDP socket: {}", e),
             )
         }
     };
-
-    let port = match listener.local_addr() {
-        Ok(a) => a.port(),
+    let local_port = match udp.local_addr() {
+        Ok(address) => address.port(),
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
-                format!("Failed to get port: {}", e),
+                format!("Failed to read the pairing port: {}", e),
             )
         }
     };
 
     // Opening the pairing firewall port is best-effort only in test builds
     // (containers/user-namespaces without usable iptables). Production builds
-    // keep the original strict behaviour: a firewall error aborts pairing rather
-    // than leaving the ephemeral TCP listener reachable without a rule.
-    #[cfg(feature = "dev-firewall-bypass")]
-    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            // NOTE: the "dev-firewall-bypass" token in this message is the only
-            // signature the binary scanners can detect for this feature (there
-            // is no env var). scripts/ci/check-production-build.sh and
-            // scripts/ci/scan-package-artifacts.sh grep for it, and their
-            // positive controls fail if it disappears — keep the spelling.
-            tracing::warn!(
-                "Failed to open firewall port for pairing (continuing anyway; dev-firewall-bypass): {}",
-                e
-            );
-            None
-        }
-    };
-
-    #[cfg(not(feature = "dev-firewall-bypass"))]
-    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
-        Ok(g) => Some(g),
+    // abort pairing rather than leaving the ephemeral socket unreachable.
+    let firewall_guard = match pairing::open_pairing_firewall(local_port) {
+        Ok(guard) => guard,
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
@@ -324,173 +307,148 @@ async fn handle_start_pairing(
         }
     };
 
-    let session = match ClientPairingSession::new(keypair) {
-        Ok(s) => s,
+    let (state, started) = match ServerPairingState::start(
+        keypair,
+        &daemon.hostname,
+        local_port,
+        ipv4,
+        ipv6,
+        pairing::pinned_algorithms(daemon),
+    ) {
+        Ok(pair) => pair,
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
-                format!("Session creation failed: {}", e),
+                format!("Pairing session creation failed: {}", e),
             )
         }
     };
 
-    let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
-    let url = generate_pairing_url(&x25519_pubkey_hex, port, ipv4, ipv6);
-
-    let gen = next_generation();
-    let pending = PendingPairing {
-        listener,
+    // Everything the IPC reply carries comes from the state machine's own
+    // `StartedPairing`: the URL is the one the phone will parse, not a
+    // re-generated lookalike.
+    let session_id = started.session_id;
+    let qr_url = started.qr_url.clone();
+    let generation = pairing::next_generation();
+    let enable_ble = shared::config::TapAuthConfig::load().enable_ble;
+    let pairing = pairing::spawn(pairing::SessionSetup {
+        state,
+        started,
+        udp,
+        local_port,
         firewall_guard,
-        session,
-        url: url.clone(),
-        port,
-        generation: gen,
-    };
+        enable_ble,
+        generation,
+    });
 
     let mut guard = pairing_state.lock().await;
     if guard.is_some() {
+        // Another StartPairing won the race while we were binding. Dropping the
+        // handle stops this session's worker, socket and advertisement.
         return err_resp(
             ipc::AdminStatus::AdminError,
             "A pairing session is already in progress. Cancel or complete it first.",
         );
     }
-    *guard = Some(PairingState::Pending(pending));
+    *guard = Some(pairing);
     drop(guard);
 
-    spawn_pairing_timeout(pairing_state, gen);
+    tracing::info!(
+        "Started pairing session on UDP port {} (session {})",
+        local_port,
+        hex::encode(session_id)
+    );
 
-    start_pairing_success(url, port as u32)
+    start_pairing_success(qr_url, u32::from(local_port), session_id.to_vec())
 }
 
-fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
-    let state = pairing_state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Pending(ref p)) if p.generation == generation) {
-            tracing::warn!(
-                "Pending pairing (gen={}) timed out, cleaning up",
-                generation
-            );
-            *guard = None;
-        }
-    });
-}
-
-fn spawn_active_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
-    let state = pairing_state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Active(ref a)) if a.generation == generation) {
-            tracing::warn!(
-                "Active pairing (gen={}, SAS verification) timed out, cleaning up",
-                generation
-            );
-            *guard = None;
-        }
-    });
-}
-
+/// Wait for the phone's `PairingInit` and return the SAS to display.
+///
+/// The wait does not hold the pairing lock (a `CompletePairing` must be able to
+/// run meanwhile), and it is tied to the generation it subscribed to: a wait that
+/// outlives its session fails instead of answering a newer one.
 async fn handle_wait_for_pairing(
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
     req: ipc::WaitForPairingRequest,
 ) -> ipc::AdminResponse {
-    let mut guard = pairing_state.lock().await;
-
-    let expected_port = match &*guard {
-        Some(PairingState::Pending(p)) => p.port,
-        Some(PairingState::Active(_)) => {
+    let (mut phases, port, generation) = {
+        let guard = pairing_state.lock().await;
+        let Some(session) = guard.as_ref() else {
+            return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session");
+        };
+        if req.port != 0 && req.port != u32::from(session.port()) {
             return err_resp(
                 ipc::AdminStatus::AdminError,
-                "Pairing already in active phase",
-            )
+                format!(
+                    "Port mismatch: expected {}, got {}",
+                    session.port(),
+                    req.port
+                ),
+            );
         }
-        None => return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session"),
+        (
+            session.phase_receiver(),
+            session.port(),
+            session.generation(),
+        )
     };
 
-    if req.port != 0 && req.port != expected_port as u32 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!(
-                "Port mismatch: expected {}, got {}",
-                expected_port, req.port
-            ),
-        );
-    }
+    let deadline =
+        tokio::time::sleep(pairing::SESSION_DEADLINE + std::time::Duration::from_secs(5));
+    tokio::pin!(deadline);
 
-    let pending = match guard.take() {
-        Some(PairingState::Pending(p)) => p,
-        _ => unreachable!("checked above"),
-    };
-
-    drop(guard);
-
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        pending.listener.accept(),
-    )
-    .await;
-
-    let (stream, _addr) = match accept_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return err_resp(ipc::AdminStatus::AdminError, format!("Accept error: {}", e))
-        }
-        Err(_) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                "Timeout waiting for connection",
-            )
-        }
-    };
-
-    let client_device_name = daemon_hostname();
-
-    let mut session = pending.session;
-    let gen = pending.generation;
-
-    match session.initiate_pairing(stream, &client_device_name).await {
-        Ok((stream, server_public_key, server_device_name, sas)) => {
-            let sas_display = shared::crypto::format_sas(&sas);
-
-            let active = ActivePairing {
-                stream,
-                session,
-                server_public_key,
-                server_device_name,
-                port: pending.port,
-                firewall_guard: pending.firewall_guard,
-                generation: gen,
-            };
-
-            let mut guard = pairing_state.lock().await;
-            if guard.is_some() {
-                tracing::warn!(
-                    "Pairing state changed during accept (gen={}), discarding completed connection",
-                    gen
-                );
+    loop {
+        let phase = phases.borrow().clone();
+        match phase {
+            SessionPhase::AwaitingSas(sas) => {
+                return wait_pairing_success(sas, u32::from(port));
+            }
+            SessionPhase::Finished => {
                 return err_resp(
                     ipc::AdminStatus::AdminError,
-                    "Pairing session was superseded by a newer request",
-                );
+                    "Pairing session already finished",
+                )
             }
-            *guard = Some(PairingState::Active(active));
-            drop(guard);
-
-            spawn_active_pairing_timeout(pairing_state, gen);
-
-            wait_pairing_success(sas_display, pending.port as u32)
+            SessionPhase::Failed(reason) => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    format!("Pairing session failed: {}", reason),
+                )
+            }
+            SessionPhase::AwaitingPhone => {}
         }
-        Err(e) => err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Pairing initiation failed: {}", e),
-        ),
-    }
-}
 
-fn daemon_hostname() -> String {
-    whoami::hostname().unwrap_or_else(|_| "Unknown".to_string())
+        tokio::select! {
+            changed = phases.changed() => {
+                if changed.is_err() {
+                    return err_resp(
+                        ipc::AdminStatus::AdminError,
+                        "Pairing session ended before the phone connected",
+                    );
+                }
+            }
+            _ = &mut deadline => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    "Timeout waiting for the phone to connect",
+                )
+            }
+        }
+
+        let still_current = {
+            let guard = pairing_state.lock().await;
+            guard
+                .as_ref()
+                .map(PairingState::generation)
+                .is_some_and(|current| current == generation)
+        };
+        if !still_current {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                "Pairing session was superseded by a newer request",
+            );
+        }
+    }
 }
 
 fn find_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
@@ -519,41 +477,61 @@ fn find_non_loopback_ipv6() -> Option<std::net::Ipv6Addr> {
     None
 }
 
+/// Provision the CSK to the phone and record the pairing.
+///
+/// The worker retransmits `PairingConfirmClient` (immediately on every keepalive)
+/// until the phone proves it received the CSK; only then is anything written to
+/// disk, so a failed pairing never leaves a half-written state directory.
 async fn handle_complete_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
     username: &str,
     req: ipc::CompletePairingRequest,
 ) -> ipc::AdminResponse {
-    let mut guard = pairing_state.lock().await;
-
-    let expected_port = match &*guard {
-        Some(PairingState::Active(a)) => a.port,
-        Some(PairingState::Pending(_)) => {
+    let session = {
+        let guard = pairing_state.lock().await;
+        let Some(current) = guard.as_ref() else {
             return err_resp(
                 ipc::AdminStatus::AdminError,
-                "Pairing still pending, wait for connection first",
-            )
+                "No pairing session in progress",
+            );
+        };
+        if req.port != 0 && req.port != u32::from(current.port()) {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!(
+                    "Port mismatch: expected {}, got {}",
+                    current.port(),
+                    req.port
+                ),
+            );
         }
-        None => return err_resp(ipc::AdminStatus::AdminError, "No active pairing session"),
+        match current.phase() {
+            SessionPhase::AwaitingPhone => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    "Pairing still pending, wait for the phone to connect first",
+                )
+            }
+            SessionPhase::AwaitingSas(_) => {}
+            SessionPhase::Finished => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    "Pairing session already finished",
+                )
+            }
+            SessionPhase::Failed(reason) => {
+                return err_resp(
+                    ipc::AdminStatus::AdminError,
+                    format!("Pairing session failed: {}", reason),
+                )
+            }
+        }
+        // Only a clone of the command channel is taken out of the lock, so the
+        // session stays steerable (a concurrent CancelPairing still reaches the
+        // worker) while this call waits for the phone.
+        current.command_sender()
     };
-
-    if req.port != 0 && req.port != expected_port as u32 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!(
-                "Port mismatch: expected {}, got {}",
-                expected_port, req.port
-            ),
-        );
-    }
-
-    let active = match guard.take() {
-        Some(PairingState::Active(a)) => a,
-        _ => unreachable!("checked above"),
-    };
-
-    drop(guard);
 
     let csk = match daemon.config_manager.load_csk() {
         Ok(c) => c,
@@ -583,19 +561,35 @@ async fn handle_complete_pairing(
         }
     };
 
-    let mut session = active.session;
-
-    match session.finish_pairing(active.stream, &csk, username).await {
-        Ok(()) => {}
+    let client_hostname = daemon.hostname.clone();
+    let completed = match pairing::request_completion(
+        &session,
+        *csk.as_bytes(),
+        username.to_string(),
+        client_hostname,
+    )
+    .await
+    {
+        Ok(completed) => completed,
         Err(e) => {
             return err_resp(
                 ipc::AdminStatus::AdminError,
                 format!("Pairing completion failed: {}", e),
             )
         }
-    }
+    };
 
-    if let Err(e) = daemon.config_manager.save_csk(&csk) {
+    persist_pairing(daemon, username, &csk, completed)
+}
+
+/// Write the CSK, its algorithms and the new server after a proven pairing.
+fn persist_pairing(
+    daemon: &Arc<DaemonState>,
+    username: &str,
+    csk: &ClientSymmetricKey,
+    completed: CompletedPairing,
+) -> ipc::AdminResponse {
+    if let Err(e) = daemon.config_manager.save_csk(csk) {
         return err_resp(
             ipc::AdminStatus::AdminError,
             format!(
@@ -607,22 +601,99 @@ async fn handle_complete_pairing(
         );
     }
 
-    let server_hex = hex::encode(active.server_public_key);
+    // The symmetric and hash algorithms belong to the CSK: every paired server
+    // must be able to decrypt the one broadcast, so they are stored with it.
+    let metadata = CskMetadata {
+        symmetric_algorithm: completed.negotiated.symmetric_algorithm,
+        hash_algorithm: completed.negotiated.hash_algorithm,
+    };
+    if let Err(e) = daemon.config_manager.save_csk_metadata(&metadata) {
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            format!(
+                "Paired on phone, but saving local CSK metadata failed: {}",
+                e
+            ),
+        );
+    }
+
+    let server_hex = hex::encode(completed.server_public_key);
     let paired_server = PairedServer {
-        name: active.server_device_name,
+        name: completed.server_device_name,
         public_key: server_hex.clone(),
-        paired_at: chrono::Utc::now(),
         allowed_users: vec![username.to_string()],
+        paired_at: chrono::Utc::now(),
+        signature_algorithm: completed.negotiated.signature_algorithm,
     };
 
     match daemon
         .config_manager
         .add_paired_server(server_hex.clone(), paired_server)
     {
-        Ok(()) => complete_pairing_success(server_hex),
+        Ok(()) => {
+            tracing::info!("Paired server {} saved for user {}", server_hex, username);
+            complete_pairing_success(server_hex)
+        }
         Err(e) => err_resp(
             ipc::AdminStatus::AdminError,
             format!("Failed to save paired server: {}", e),
+        ),
+    }
+}
+
+/// Abandon a pairing session: send an authenticated `PairingAbort` and tear the
+/// socket and advertisement down before answering.
+async fn handle_cancel_pairing(
+    pairing_state: &Arc<Mutex<Option<PairingState>>>,
+    req: ipc::CancelPairingRequest,
+) -> ipc::AdminResponse {
+    let session = {
+        let guard = pairing_state.lock().await;
+        let Some(current) = guard.as_ref() else {
+            // Nothing to cancel: the GUI drops its session as soon as the screen
+            // is torn down, possibly after the session already ended.
+            return cancel_pairing_success();
+        };
+        if req.port != 0 && req.port != u32::from(current.port()) {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!(
+                    "Port mismatch: expected {}, got {}",
+                    current.port(),
+                    req.port
+                ),
+            );
+        }
+        if !req.session_id.is_empty()
+            && req.session_id.as_slice() != current.session_id().as_slice()
+        {
+            return err_resp(
+                ipc::AdminStatus::AdminError,
+                format!(
+                    "Session id mismatch: expected {}, got {}",
+                    hex::encode(current.session_id()),
+                    hex::encode(&req.session_id)
+                ),
+            );
+        }
+        if current.is_ended() {
+            // The session is over and its worker has answered (or is stopping the
+            // advertisement): there is nothing left to abort, and the next
+            // StartPairing retires the handle.
+            return cancel_pairing_success();
+        }
+        (current.command_sender(), current.port())
+    };
+
+    let (commands, port) = session;
+    match pairing::request_cancellation(&commands).await {
+        Ok(()) => {
+            tracing::info!("Cancelled the pairing session on UDP port {}", port);
+            cancel_pairing_success()
+        }
+        Err(e) => err_resp(
+            ipc::AdminStatus::AdminError,
+            format!("Failed to cancel the pairing session: {}", e),
         ),
     }
 }
@@ -656,6 +727,8 @@ async fn handle_remove_device(
 }
 
 async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
+    // `rotate_csk` clears every paired server, writes a fresh CSK and resets the
+    // CSK algorithm metadata to the baseline (`ClientConfigManager::rotate_csk`).
     match daemon.config_manager.rotate_csk() {
         Ok(_) => {
             tracing::info!("CSK rotated successfully");
