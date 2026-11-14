@@ -63,7 +63,7 @@ The daemon exposes a **single static GATT service layout** under `SERVICE_UUID` 
 3. **Serialized Single In-Flight GATT Operation**: Android's `BluetoothGatt` drops concurrent operations (`readCharacteristic`, `writeCharacteristic`, `writeDescriptor`, `requestMtu`, `discoverServices`). All GATT operations on Android **must** execute sequentially through a serialized coroutine channel/mutex awaiting each callback (`onMtuChanged`, `onServicesDiscovered`, `onDescriptorWrite`, `onCharacteristicRead`, `onCharacteristicWrite`).
 4. **Connection Lifecycle**:
    * **Authentication**: Held open until `GrantConfirmation` is notified/read (or 10s retransmission expires). If the BLE link drops while a prompt is pending, a **5-second** reconnect grace period applies before cancelling an unanswered prompt, unless an explicit verified `AuthenticationCancel` was already received.
-   * **Pairing**: Phone subscribes to CCCD (`0x2902`) on `PAIRING_CHAR_UUID` right after `discoverServices()`, then writes `PairingInit`. The GATT link stays open across user SAS review until `PairingConfirmServer` completes or `PairingAbort` / timeout occurs.
+   * **Pairing**: Phone subscribes to CCCD (`0x2902`) on `PAIRING_CHAR_UUID` right after `discoverServices()`, then writes `PairingInit`. The GATT link stays open across user SAS review until `PairingConfirmServer` completes or `PairingAbort` / timeout occurs — and for a further ~1.25 s after the proof, because the Phone lingers to answer a retransmitted `PairingConfirmClient` with the same cached frame before it concludes the session.
 
 ## 4. BLE Security Best Practices
 

@@ -56,7 +56,14 @@ interface PairingHandle {
      */
     fun rejectSas(): Boolean
 
-    fun close()
+    /**
+     * Ask the session to release its transports, keys and coroutine.
+     *
+     * @return true when the close was **deferred** because a pairing was already being persisted —
+     *   the session keeps its confirmation burst and linger running and releases itself when they
+     *   end — false when this call released everything. See `PairingSession.close`.
+     */
+    fun close(): Boolean
 }
 
 /** Creates the session for one attempt. Replaced by a fake in the unit tests. */
@@ -212,6 +219,10 @@ class PairingViewModel(
      * leave the desktop waiting out its deadline. A terminal update is only reported *after* the
      * abort has gone out, so `abortRequested && !terminal` is exactly the window where the write is
      * still in flight; the session releases its own sockets and keys when it returns.
+     *
+     * A pairing that has already started persisting is the other such window, and [releaseSession]
+     * handles it from the session's answer rather than from state here: the confirmation burst and
+     * linger must still go out, or the phone stays paired while the desktop times out.
      */
     override fun onCleared() {
         if (!(abortRequested && !terminal)) releaseSession()
@@ -262,8 +273,11 @@ class PairingViewModel(
     private fun releaseSession() {
         if (sessionClosed) return
         sessionClosed = true
-        session?.close()
-        attemptScope?.cancel()
+        // A deferred close means the device record is already being written: the session is
+        // finishing the confirmation the desktop is waiting for, so cancelling the attempt scope
+        // here would cut it mid-flight and leave the phone paired with a desktop that timed out.
+        // The session's own linger and burst bound that, after which it releases itself.
+        if (session?.close() != true) attemptScope?.cancel()
         attemptScope = null
     }
 
@@ -292,5 +306,5 @@ private class RealPairingHandle(private val session: PairingSession) : PairingHa
 
     override fun rejectSas(): Boolean = session.rejectSas()
 
-    override fun close() = session.close()
+    override fun close(): Boolean = session.close()
 }

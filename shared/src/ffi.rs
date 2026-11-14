@@ -618,9 +618,10 @@ pub fn pairing_packet_session_id(packet_bytes: Vec<u8>) -> Result<Vec<u8>, Tapau
 /// session is released by dropping the reference — there is no handle to free, and
 /// therefore no stale-handle or double-free case to represent or to guard against.
 ///
-/// Dropping the last reference zeroizes the keys: the session's fields are
-/// `SecretBox` (`Ed_S`, `x_S`) and `Zeroizing` (`K_c2s`, `K_s2c`) values, and the
-/// transcript hash is a plain array inside the session struct.
+/// Dropping the last reference zeroizes the keys: [`Drop`] concludes the session
+/// first, and the session's fields are `SecretBox` (`Ed_S`, `x_S`) and `Zeroizing`
+/// (`K_c2s`, `K_s2c`) values, with the transcript hash a plain array inside the
+/// session struct.
 #[derive(uniffi::Object)]
 pub struct PairingSession {
     /// The protocol state machine, guarded so `&self` methods can take `&mut` access.
@@ -642,6 +643,25 @@ impl PairingSession {
         })?;
         f(&mut session)
     }
+
+    /// The one place a session reaches its terminal state, so the test-only counter
+    /// below sees every transition — the explicit [`PairingSession::conclude`] and
+    /// the one [`Drop`] performs.
+    fn conclude_locked(session: &mut ServerPairingSession) {
+        #[cfg(test)]
+        CONCLUDE_COUNT.with(|count| count.set(count.get() + 1));
+        session.conclude();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of `conclude()` transitions this thread performed, so a test can prove
+    /// [`Drop`] concludes a released session.
+    ///
+    /// Thread-local rather than global: `cargo test` runs the suite in parallel, and a
+    /// process-wide counter could not tell this test's transitions from another test's.
+    static CONCLUDE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[uniffi::export]
@@ -745,25 +765,23 @@ impl PairingSession {
     /// The phone signs `"tapauth-pair-server-sig-v2" || H || csk` with `Ed_S` and
     /// encrypts it under `K_s2c`. Retransmissions must re-send the same bytes.
     ///
-    /// This is a **terminal** call: on success the session concludes, so every
-    /// later call fails with [`TapauthError::State`] instead of reviving a session
-    /// whose keys are gone. A failed call leaves the session untouched.
+    /// This is **not** a terminal call: on success the session records that the
+    /// confirmation went out, which refuses a second proof and a late `create_init`
+    /// with [`TapauthError::State`] — the handshake has moved on, not failed — but
+    /// [`PairingSession::process_confirm_client`] stays valid, so the caller keeps
+    /// answering the desktop's provisioning retransmissions. Ending the session is
+    /// [`PairingSession::conclude`], which is also what dropping the object does.
     ///
     /// ## Errors
     ///
     /// - [`TapauthError::Argument`]: wrong CSK length
     /// - [`TapauthError::Security`]: the session is not keyed yet, signing or
     ///   encryption fails
-    /// - [`TapauthError::State`]: the session already concluded, the packet cannot
-    ///   be encoded, or the session lock is poisoned
+    /// - [`TapauthError::State`]: the session already concluded, the confirmation was
+    ///   already sent, the packet cannot be encoded, or the session lock is poisoned
     pub fn create_confirm_server(&self, csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
         let csk = read_csk(&csk)?;
-        self.with(|session| {
-            let frame = ops::pairing_create_confirm_server(session, &csk)?;
-            // Terminal: the completion proof is the last message of the handshake.
-            session.conclude();
-            Ok(frame)
-        })
+        self.with(|session| ops::pairing_create_confirm_server(session, &csk))
     }
 
     /// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).
@@ -774,8 +792,8 @@ impl PairingSession {
     ///
     /// ## Errors
     ///
-    /// - [`TapauthError::State`]: the packet cannot be encoded, or the session lock is
-    ///   poisoned
+    /// - [`TapauthError::State`]: the session already concluded, the packet cannot be
+    ///   encoded, or the session lock is poisoned
     pub fn create_keepalive(&self) -> Result<Vec<u8>, TapauthError> {
         self.with(|session| ops::pairing_create_keepalive(session))
     }
@@ -785,9 +803,9 @@ impl PairingSession {
     /// Once the session keys exist the abort carries an HMAC tag, so a network observer
     /// cannot spoof a cancellation.
     ///
-    /// Like [`PairingSession::create_confirm_server`], this is a **terminal** call:
-    /// on success the session concludes, so a second abort (or any other call) fails
-    /// with [`TapauthError::State`].
+    /// Unlike [`PairingSession::create_confirm_server`], this is a **terminal**
+    /// call: on success the session concludes, so a second abort (or any other call)
+    /// fails with [`TapauthError::State`].
     ///
     /// ## Arguments
     ///
@@ -803,7 +821,7 @@ impl PairingSession {
         self.with(|session| {
             let frame = ops::pairing_create_abort(session, reason)?;
             // Terminal: nothing follows a cancellation.
-            session.conclude();
+            Self::conclude_locked(session);
             Ok(frame)
         })
     }
@@ -826,6 +844,36 @@ impl PairingSession {
     ///   is poisoned
     pub fn verify_abort(&self, abort_packet: Vec<u8>) -> Result<bool, TapauthError> {
         self.with(|session| ops::pairing_verify_abort(session, &abort_packet))
+    }
+
+    /// Conclude the session: zeroize `K_c2s`, `K_s2c`, the transcript hash `H` and the
+    /// ephemeral X25519 secret (`Ed_S` is dropped with the object).
+    ///
+    /// Call it once the pairing is over — the desktop acknowledged the completion
+    /// proof, the pairing failed, or the user backed out. Afterwards every entry point
+    /// fails with [`TapauthError::State`] (the session concluded), which is a normal
+    /// end-of-life answer, not a security failure. Calling it twice is a no-op, and
+    /// dropping the last reference concludes the session anyway.
+    pub fn conclude(&self) {
+        match self.inner.lock() {
+            Ok(mut session) => Self::conclude_locked(&mut session),
+            // A poisoned lock (a panic while the session was borrowed) must not keep
+            // the keys alive either: the guard still hands out the state.
+            Err(poisoned) => Self::conclude_locked(&mut poisoned.into_inner()),
+        }
+    }
+}
+
+impl Drop for PairingSession {
+    /// Conclude before releasing the state, so a session that is dropped without an
+    /// explicit [`PairingSession::conclude`] — a crashed or cancelled pairing on the
+    /// Kotlin side — does not leave live directional keys behind.
+    fn drop(&mut self) {
+        let mut session = match self.inner.lock() {
+            Ok(session) => session,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::conclude_locked(&mut session);
     }
 }
 
@@ -1819,12 +1867,13 @@ mod tests {
     /// The whole phone-side pairing path, driven from a real desktop
     /// `ClientPairingState`: constructor → init (twice, idempotent) → verify response
     /// (correct and wrong QR key) → provision → confirm server, which the desktop then
-    /// verifies.
+    /// verifies while the session goes on answering the desktop's retransmissions.
     /// The defect this catches: a wrong QR `pk` accepted (a substituted `X_C` would
     /// silently pair), a `create_init` that mints a fresh `X_S` on retransmission (the
     /// desktop would answer an init the session never sent), a provisioning payload
-    /// that never reaches Kotlin, or a completion proof the desktop rejects because the
-    /// directional keys or the transcript were wrong.
+    /// that never reaches Kotlin, a completion proof the desktop rejects because the
+    /// directional keys or the transcript were wrong, or a `create_confirm_server`
+    /// that concludes the session and so strands a retransmitted provisioning frame.
     #[test]
     fn pairing_session_path_matches_the_desktop_state_machine() {
         let (mut desktop, started) = ClientPairingState::start(
@@ -1938,16 +1987,35 @@ mod tests {
             .verify_confirm_server(&confirm, &[0xC4u8; 32])
             .is_err());
 
-        // The completion proof concluded the session: no second proof, no late
-        // response and no abort can be built from it any more.
+        // Sending the proof does not end the session: a retransmitted provisioning
+        // frame is still answered from it.
+        let retransmitted = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        let reprovisioned = session
+            .process_confirm_client(session_packet(
+                &started.session_id,
+                pairing_packet::Msg::ConfirmClient(retransmitted),
+            ))
+            .unwrap();
+        assert_eq!(reprovisioned.csk, csk.to_vec());
+
+        // A second proof and a late PairingInit are refused because the handshake
+        // moved on — `State`, never `Security`: this is a legitimate late call, not a
+        // tampered message.
         assert!(matches!(
             session.create_confirm_server(csk.to_vec()),
-            Err(TapauthError::State { detail }) if detail.contains("concluded")
+            Err(TapauthError::State { detail }) if detail.contains("already sent")
         ));
         assert!(matches!(
-            session.create_abort(PairingAbortReason::KeyMismatch as i32),
-            Err(TapauthError::State { detail }) if detail.contains("concluded")
+            session.create_init(),
+            Err(TapauthError::State { detail }) if detail.contains("already sent")
         ));
+
+        // An abort is what ends the session, and it is still available until then.
+        assert!(session
+            .create_abort(PairingAbortReason::KeyMismatch as i32)
+            .is_ok());
         assert!(matches!(
             session.create_init(),
             Err(TapauthError::State { detail }) if detail.contains("concluded")
@@ -2033,6 +2101,147 @@ mod tests {
             started.client_x25519_public_key,
             response_bytes,
         )
+    }
+
+    /// The completion proof is not terminal, and only `conclude()` is: after sending
+    /// it the session still decrypts a retransmitted provisioning frame, and after
+    /// `conclude()` every call reports the conclusion as a `State` error.
+    /// The defect this catches: a `create_confirm_server` that concludes the session
+    /// (Kotlin's retransmission handler then throws `State`/`Security` on a frame the
+    /// desktop is still waiting for, and the pairing times out with the phone already
+    /// paired), an "already sent" or "concluded" answer reported as `Security`, and a
+    /// `conclude()`-then-`create_confirm_server` sequence answered as "already sent"
+    /// instead of "concluded" (which would hide a use-after-conclude).
+    #[test]
+    fn pairing_confirm_server_is_not_terminal_and_conclude_is() {
+        let (desktop, session, session_id, qr_pk, response_bytes) = pending_session();
+        session
+            .verify_response(response_bytes, qr_pk.to_vec())
+            .unwrap();
+
+        let csk = [0x5Au8; 32];
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        let confirm_client_bytes = session_packet(
+            &session_id,
+            pairing_packet::Msg::ConfirmClient(confirm_client),
+        );
+
+        assert!(matches!(
+            decode_pairing_packet(&session.create_confirm_server(csk.to_vec()).unwrap())
+                .unwrap()
+                .msg,
+            Some(pairing_packet::Msg::ConfirmServer(_))
+        ));
+
+        // Both the first delivery and the retransmission are answered, and the whole
+        // payload is identical — every field of `ParsedPairingProvision`, not just the
+        // CSK: a retransmission that reported a different username or hostname would
+        // let the phone persist a device record the desktop never provisioned.
+        let first = session
+            .process_confirm_client(confirm_client_bytes.clone())
+            .unwrap();
+        let first = (first.csk, first.username, first.client_hostname);
+        assert_eq!(first.0, csk.to_vec());
+        assert_eq!(first.1, "luca");
+        assert_eq!(first.2, "thinkpad");
+
+        let second = session
+            .process_confirm_client(confirm_client_bytes.clone())
+            .unwrap();
+        let second = (second.csk, second.username, second.client_hostname);
+        assert_eq!(
+            second, first,
+            "the retransmission must yield the same payload"
+        );
+
+        // A second proof is a `State` error, and so is a late init — the handshake
+        // moved on; neither is a security failure.
+        assert!(matches!(
+            session.create_confirm_server(csk.to_vec()),
+            Err(TapauthError::State { detail }) if detail.contains("already sent")
+        ));
+        assert!(matches!(
+            session.create_init(),
+            Err(TapauthError::State { detail }) if detail.contains("already sent")
+        ));
+
+        // The guard keys on the conclusion, not on the confirmation: a session that has
+        // sent its proof still builds keepalives (that is what keeps the path open for
+        // the desktop's retransmissions during the linger).
+        let keepalive = session.create_keepalive().unwrap();
+        assert!(matches!(
+            decode_pairing_packet(&keepalive).unwrap().msg,
+            Some(pairing_packet::Msg::Keepalive(_))
+        ));
+
+        session.conclude();
+
+        // Liveness is checked first: after `conclude()` the answer is the conclusion,
+        // not "already sent", even though the proof had also been sent.
+        assert!(matches!(
+            session.create_confirm_server(csk.to_vec()),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        assert!(matches!(
+            session.process_confirm_client(confirm_client_bytes),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        // The keepalive carries no key material and is still refused: a path kept open
+        // for a retransmission this session can no longer answer is worse than none.
+        assert!(matches!(
+            session.create_keepalive(),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+
+        // Concluding twice is a no-op, and the session stays concluded.
+        session.conclude();
+        assert!(matches!(
+            session.create_init(),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+    }
+
+    /// Releasing the last reference to a session concludes it, so a pairing that dies
+    /// without an explicit `conclude()` (a crash or a cancellation on the Kotlin side)
+    /// does not leave the directional keys and `H` live.
+    /// The defect this catches: a `Drop` that only frees the object, so the session's
+    /// `K_c2s`/`K_s2c` outlive the pairing until some later allocation overwrites them.
+    #[test]
+    fn dropping_the_last_session_reference_concludes_it() {
+        let before = conclude_count();
+        let session = PairingSession::new(
+            [0x7Bu8; PAIRING_SESSION_ID_LEN].to_vec(),
+            Ed25519KeyPair::generate()
+                .unwrap()
+                .signing_key_bytes()
+                .to_vec(),
+            "pixel".to_string(),
+        )
+        .unwrap();
+        let other_reference = Arc::clone(&session);
+
+        // A released non-last reference is not a conclusion: the session still works.
+        drop(other_reference);
+        assert_eq!(
+            conclude_count(),
+            before,
+            "dropping a non-last reference must not conclude the session"
+        );
+        assert!(session.create_init().is_ok());
+
+        drop(session);
+        assert_eq!(
+            conclude_count(),
+            before + 1,
+            "dropping the last reference must conclude the session"
+        );
+    }
+
+    /// The number of `conclude()` transitions this test thread performed.
+    fn conclude_count() -> usize {
+        CONCLUDE_COUNT.with(std::cell::Cell::get)
     }
 
     /// `verify_response` returns exactly what the phone persists — the SAS, the

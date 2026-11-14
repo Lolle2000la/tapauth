@@ -72,6 +72,13 @@ pub enum ProtocolError {
     /// dropped every key, so no further protocol operation may run on it.
     #[error("Pairing session has already concluded")]
     SessionConcluded,
+    /// The phone already sent its completion proof: the handshake has moved past
+    /// the step the caller is trying to run again, so a second
+    /// `create_confirm_server` (or a `create_init` after it) is refused. Distinct
+    /// from [`ProtocolError::SessionConcluded`]: the session is not over, it still
+    /// answers `process_confirm_client` retransmissions.
+    #[error("Pairing confirmation already sent")]
+    ConfirmationAlreadySent,
 }
 
 /// Build the v2 `WrapperMessage` signing transcript:

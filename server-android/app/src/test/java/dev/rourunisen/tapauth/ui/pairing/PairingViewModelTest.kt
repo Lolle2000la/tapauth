@@ -31,6 +31,19 @@ import org.junit.Test
  * A re-created screen is stood in for by calling [PairingViewModel.beginPairing] again on the same
  * ViewModel — the only thing the screen does when it is re-created — plus [PairingViewModel.leave]
  * with [PairingExit.ScreenDisposed], which is what its `onDispose` runs.
+ *
+ * ### The two ways a pairing can be left, once persisting has begun
+ *
+ * An *abort* is a decision and is written as `PairingAbort(USER_REJECTED_SAS)`; a *release* is the
+ * session being let go. Which one a back press is depends on how far the pairing got:
+ *
+ * * while the SAS is still awaiting, a back press is the rejection the protocol describes and it
+ *   aborts — `leave` looks at `AwaitingSas` first, and the abort goes out from the session's own
+ *   coroutine;
+ * * once the commit window is open (the device record is durable and the confirmation is in
+ *   flight), a back press is a release, and that release is *deferred* — the session answers
+ *   `close() == true`, so the attempt scope keeps running until the burst and linger finish. The
+ *   ViewModel cannot tell the difference by itself: it asks the session, which owns the boundary.
  */
 class PairingViewModelTest {
 
@@ -55,6 +68,12 @@ class PairingViewModelTest {
         var scope: CoroutineScope? = null
 
         /**
+         * Whether `close()` must report a *deferred* release, i.e. the real session's "a pairing
+         * confirmation is being persisted, so this close only asked".
+         */
+        var committing = false
+
+        /**
          * What `rejectSas()` reports: true while no decision is recorded yet, false once one is
          * (the real session's `CompletableDeferred.complete` returns false for the second call).
          */
@@ -77,8 +96,9 @@ class PairingViewModelTest {
             return rejectRecorded
         }
 
-        override fun close() {
+        override fun close(): Boolean {
             closeCount++
+            return committing
         }
 
         /** Report an update the way the real session does, from the main thread. */
@@ -470,5 +490,116 @@ class PairingViewModelTest {
 
         assertEquals(1, session.approveCount)
         assertEquals(0, session.rejectCount)
+    }
+
+    /**
+     * The defect this pins down: the device record is already written and the
+     * `PairingConfirmServer` burst is in flight when the owner is destroyed — a finished activity,
+     * a swipe away, a rotation the host did not survive. Releasing the attempt there cancelled the
+     * session's coroutine (and closed its socket), so the phone kept a paired device that the
+     * desktop never heard about: it retried into a dead port and timed out. The session's own
+     * answer — "this close was deferred" — must keep the attempt scope alive; the session then
+     * terminates itself when its bounded burst and linger are over.
+     */
+    @Test
+    fun destroyingTheViewModelWhileCommittingDoesNotCutTheConfirmation() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Confirming(PairingTransport.UDP))
+        session.committing = true
+
+        harness.destroy()
+
+        assertEquals(1, session.closeCount)
+        assertEquals("A commit in flight is not a user decision", 0, session.rejectCount)
+        assertTrue(
+            "The confirmation must still be able to send its burst and linger",
+            session.scope!!.isActive,
+        )
+    }
+
+    /**
+     * A configuration change releases nothing, and it does so before the commit boundary is even
+     * consulted: `leave(ScreenDisposed)` returns from its first branch. The commit in flight is set
+     * on purpose — it is what turns the assertion below into a statement about *order*: the early
+     * return wins whatever the release would have answered, so a rotation cannot cancel a
+     * confirmation no matter where in the window it lands.
+     *
+     * The defect this catches: a `ScreenDisposed` path that falls through to the release. It would
+     * then close the session and cancel the attempt, dropping the burst and linger the desktop is
+     * waiting for.
+     */
+    @Test
+    fun screenDisposedIsIgnoredEvenWhileCommitting() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Confirming(PairingTransport.BLE))
+        session.committing = true
+
+        harness.viewModel.leave(PairingExit.ScreenDisposed)
+
+        assertEquals("ScreenDisposed must not reach the release at all", 0, session.closeCount)
+        assertEquals(0, session.rejectCount)
+        assertTrue(session.scope!!.isActive)
+    }
+
+    /**
+     * A back press inside the commit window is a **release**, not an abort: the SAS was approved a
+     * while ago and the phase is [PairingUpdate.Confirming], so `leave` takes the release path
+     * (`PairingViewModel.leave` aborts only while `AwaitingSas`). That release is deferred, because
+     * the device record is already durable — writing `PairingAbort` here would be the one thing the
+     * protocol cannot undo, and cancelling instead would drop the burst and linger.
+     *
+     * The abort path is untouched: a back press while the SAS is still *awaiting* is still written
+     * as `PairingAbort(USER_REJECTED_SAS)` — see
+     * [backPressDuringTheSasAbortsOnceAndDestroyingDoesNotAbortAgain]. Nothing is ever both.
+     *
+     * The defect this catches: a `leave` that answers a back press during the commit window by
+     * releasing immediately (cancelling the confirmation) or by aborting a pairing whose device
+     * record already exists.
+     */
+    @Test
+    fun aBackPressInsideTheCommitWindowIsADeferredRelease() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Confirming(PairingTransport.UDP))
+        session.committing = true
+
+        harness.viewModel.leave(PairingExit.UserRequested)
+
+        assertEquals("The release must be attempted", 1, session.closeCount)
+        assertEquals("A durable pairing is not aborted", 0, session.rejectCount)
+        assertTrue(
+            "The deferred release must leave the confirmation running",
+            session.scope!!.isActive,
+        )
+    }
+
+    /**
+     * Outside a commit the release is immediate, exactly as before: the scope is cancelled and the
+     * session is closed in the same call.
+     *
+     * The defect this catches: a `close()` (or `releaseSession`) that always defers, which would
+     * leave an abandoned attempt running with no screen attached — the SAS never shown and the
+     * desktop waiting out its deadline.
+     */
+    @Test
+    fun destroyingTheViewModelWithoutACommitStillCancelsTheAttempt() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Connecting)
+
+        harness.destroy()
+
+        assertEquals(1, session.closeCount)
+        assertEquals(0, session.rejectCount)
+        assertFalse(
+            "Nothing is in flight, so the attempt must be cancelled",
+            session.scope!!.isActive,
+        )
     }
 }
