@@ -5,7 +5,7 @@ mod settings;
 
 pub use device_list::DeviceListScreen;
 pub use main_menu::MainMenuScreen;
-pub use pairing::PairingScreen;
+pub use pairing::{CloseAction, PairingScreen};
 pub use settings::SettingsScreen;
 
 use crate::l10n::L10n;
@@ -24,6 +24,17 @@ impl Screen {
     pub fn default_with_l10n(l10n: L10n) -> (Self, Task<ScreenMessage>) {
         let (screen, task) = MainMenuScreen::new(l10n);
         (Screen::MainMenu(screen), task)
+    }
+
+    /// What closing the window must do about the pairing session the current
+    /// screen still holds. Used by the window-close path, so the daemon is told
+    /// before the process disappears — except while a completion is already in
+    /// flight, which the daemon finishes on its own.
+    pub fn close_action(&mut self) -> CloseAction {
+        match self {
+            Screen::Pairing(screen) => screen.close_action(),
+            _ => CloseAction::CloseNow,
+        }
     }
 }
 
@@ -48,6 +59,7 @@ pub enum ScreenMessage {
     PairingFailed(crate::ipc::GuiIpcError),
     PairingCancelled,
     PairingCancelledOnDaemon, // result of the fire-and-forget CancelPairing
+    PairingCancelRequested,   // user asked to drop a stale session and retry
     PairingSASConfirmed,      // User confirmed SAS
 
     // Device List

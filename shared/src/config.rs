@@ -572,16 +572,52 @@ impl ClientConfigManager {
         self.config_dir.join(CSK_META_FILE).exists()
     }
 
+    /// Delete the CSK algorithm metadata file, if there is one.
+    ///
+    /// Used whenever the device set the metadata describes disappears (a CSK
+    /// rotation, the last un-pairing). Nothing to delete is not an error.
+    pub fn clear_csk_metadata(&self) -> Result<(), ConfigError> {
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+        if meta_path.exists() {
+            fs::remove_file(meta_path)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the CSK algorithm metadata once no paired server is left.
+    ///
+    /// The metadata records the algorithm pair the *paired devices* are committed
+    /// to (one broadcast reaches all of them). With none left there is no
+    /// commitment to honour, so a leftover file would pin a suite for a device
+    /// set that no longer exists; the next pairing must be free to negotiate, and
+    /// `persist_pairing` writes the file again once it has.
+    fn clear_csk_metadata_if_unpaired(
+        &self,
+        servers: &HashMap<String, PairedServer>,
+    ) -> Result<(), ConfigError> {
+        if servers.is_empty() {
+            self.clear_csk_metadata()?;
+        }
+        Ok(())
+    }
+
     /// Rotate CSK (generates new one, invalidating all pairings)
     pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
-        // Delete all paired servers since they have the old CSK
-        let _ = self.clear_paired_servers();
+        // Delete all paired servers since they have the old CSK. A failure here
+        // aborts the rotation: swallowing it would leave devices holding the old
+        // CSK next to a freshly generated one, i.e. a pairing set that can never
+        // authenticate again and a caller that believes it succeeded.
+        self.clear_paired_servers()?;
+
+        // The negotiated algorithm pair described those devices too. It is
+        // removed rather than reset to the baseline: after a rotation nothing is
+        // pinned, so the next pairing negotiates a suite from scratch and records
+        // it on the way out. Writing a default file here would leave a
+        // commitment behind for a device set that no longer exists.
+        self.clear_csk_metadata()?;
 
         // Generate and save new CSK
         let csk = self.generate_and_save_csk()?;
-
-        // A fresh CSK resets the negotiated algorithm pair to the baseline.
-        self.save_csk_metadata(&CskMetadata::default())?;
 
         Ok(csk)
     }
@@ -629,6 +665,7 @@ impl ClientConfigManager {
         let mut servers = self.load_paired_servers()?;
         servers.remove(id);
         self.save_paired_servers(&servers)?;
+        self.clear_csk_metadata_if_unpaired(&servers)?;
         Ok(())
     }
 
@@ -646,6 +683,7 @@ impl ClientConfigManager {
             if server.allowed_users.is_empty() {
                 servers.remove(id);
                 self.save_paired_servers(&servers)?;
+                self.clear_csk_metadata_if_unpaired(&servers)?;
                 Ok(true) // Entire pairing removed
             } else {
                 // Save with updated user list
@@ -653,7 +691,10 @@ impl ClientConfigManager {
                 Ok(false) // Only user removed
             }
         } else {
-            // Server not found - nothing to remove
+            // Server not found - nothing to remove. The set is unchanged, but a
+            // metadata file left over from an earlier, now empty set is still
+            // stale, so the pinning rule is re-asserted.
+            self.clear_csk_metadata_if_unpaired(&servers)?;
             Ok(true)
         }
     }
@@ -944,5 +985,172 @@ mod tests {
             r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#
         )
         .is_err());
+    }
+
+    // ---- CSK metadata lifecycle ------------------------------------------
+
+    fn paired_server(id: &str) -> PairedServer {
+        PairedServer {
+            name: id.to_string(),
+            public_key: id.to_string(),
+            allowed_users: vec!["alice".to_string()],
+            paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        }
+    }
+
+    /// A `ClientConfigManager` rooted at a scratch state directory.
+    ///
+    /// `write_secure_file`/`read_secure_file` only accept a non-`tapauthd` owner
+    /// when `TAPAUTH_STATE_DIR` is set, and that value is process-wide, so the
+    /// directory is held exclusively for as long as this guard lives.
+    struct ScratchStateDir {
+        path: PathBuf,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchStateDir {
+        fn new(tag: &str) -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // A poisoned lock only means an earlier scratch test panicked; the
+            // directory it guarded is thrown away below either way.
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = PathBuf::from(format!(
+                "/tmp/opencode/tapauth-config-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            std::env::set_var("TAPAUTH_STATE_DIR", &path);
+            Self {
+                path,
+                _serial: serial,
+            }
+        }
+
+        fn manager(&self) -> ClientConfigManager {
+            ClientConfigManager {
+                config_dir: self.path.clone(),
+            }
+        }
+    }
+
+    impl Drop for ScratchStateDir {
+        fn drop(&mut self) {
+            std::env::remove_var("TAPAUTH_STATE_DIR");
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A rotation deletes every paired device, so nothing is left that the
+    /// negotiated algorithm pair could be pinned to.
+    ///
+    /// The defect this catches: `rotate_csk` writing `CskMetadata::default()`
+    /// after clearing the devices. The file then claims a commitment for pairings
+    /// that no longer exist, and any reader that trusts the file pins a suite the
+    /// next (first) pairing never negotiated.
+    #[test]
+    fn rotating_the_csk_leaves_nothing_pinned_for_a_renegotiation() {
+        let scratch = ScratchStateDir::new("rotate");
+        let manager = scratch.manager();
+        manager
+            .save_csk_metadata(&CskMetadata {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Blake3,
+            })
+            .unwrap();
+        manager
+            .add_paired_server("aa".to_string(), paired_server("aa"))
+            .unwrap();
+        assert!(manager.has_csk_metadata_file());
+
+        manager.rotate_csk().unwrap();
+
+        assert!(
+            manager.load_paired_servers().unwrap().is_empty(),
+            "a rotation invalidates every pairing"
+        );
+        assert!(manager.has_csk_file(), "a rotation writes a fresh CSK");
+        assert!(
+            !manager.has_csk_metadata_file(),
+            "no device is paired any more, so no algorithm suite may stay pinned"
+        );
+    }
+
+    /// A rotation that cannot delete the paired devices must not replace the CSK.
+    ///
+    /// The defect this catches: `let _ = self.clear_paired_servers()`, which
+    /// reported success while the phones kept a CSK the client had already
+    /// replaced — a device set that can never authenticate again.
+    #[test]
+    fn a_rotation_that_cannot_clear_the_pairings_does_not_replace_the_csk() {
+        let scratch = ScratchStateDir::new("rotate-failure");
+        let manager = scratch.manager();
+        manager.generate_and_save_csk().unwrap();
+        let before = manager.load_csk().unwrap().as_bytes().to_vec();
+        // `paired_servers.json` as a directory: deleting it fails with `EISDIR`
+        // while every other write in the state directory still succeeds.
+        fs::create_dir(scratch.path.join(PAIRED_SERVERS_FILE)).unwrap();
+
+        assert!(
+            manager.rotate_csk().is_err(),
+            "a rotation that cannot clear the pairings must report the failure"
+        );
+        assert_eq!(
+            manager.load_csk().unwrap().as_bytes(),
+            before.as_slice(),
+            "the CSK must not be replaced behind a failed device reset"
+        );
+    }
+
+    /// Un-pairing the last device drops the metadata; un-pairing one of several
+    /// keeps it, because the remaining device is still committed to that suite.
+    ///
+    /// The defect this catches: a removal that leaves the metadata behind after
+    /// the last device is gone (the next pairing is then refused the suite its
+    /// phone offers), and one that drops it too early (a still-paired device's
+    /// broadcast can then be re-negotiated out from under it).
+    #[test]
+    fn un_pairing_the_last_device_drops_the_metadata() {
+        let scratch = ScratchStateDir::new("remove");
+        let manager = scratch.manager();
+        manager
+            .save_csk_metadata(&CskMetadata {
+                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                hash_algorithm: HashAlgorithm::Blake3,
+            })
+            .unwrap();
+        manager
+            .add_paired_server("aa".to_string(), paired_server("aa"))
+            .unwrap();
+        manager
+            .add_paired_server("bb".to_string(), paired_server("bb"))
+            .unwrap();
+
+        assert!(
+            manager.remove_user_from_pairing("aa", "alice").unwrap(),
+            "the only allowed user of aa takes the whole pairing with it"
+        );
+        assert!(
+            manager.has_csk_metadata_file(),
+            "bb is still paired and committed to the stored suite"
+        );
+
+        assert!(manager.remove_user_from_pairing("bb", "alice").unwrap());
+        assert!(
+            !manager.has_csk_metadata_file(),
+            "no device is paired any more, so nothing may stay pinned"
+        );
+
+        // The same lifecycle through the other removal entry point.
+        manager
+            .add_paired_server("cc".to_string(), paired_server("cc"))
+            .unwrap();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
+        manager.remove_paired_server("cc").unwrap();
+        assert!(!manager.has_csk_metadata_file());
     }
 }

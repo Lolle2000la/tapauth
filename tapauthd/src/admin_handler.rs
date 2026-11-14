@@ -4,7 +4,6 @@ use shared::{
     config::{ClientConfig, CskMetadata, PairedServer},
     crypto::keys::ClientSymmetricKey,
     ipc::pb as ipc,
-    protocol::pairing::ServerPairingState,
 };
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -275,42 +274,31 @@ async fn handle_start_pairing(
         }
     }
 
-    let udp = match pairing::bind_pairing_socket().await {
-        Ok(socket) => socket,
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to bind the pairing UDP socket: {}", e),
-            )
-        }
-    };
-    let local_port = match udp.local_addr() {
-        Ok(address) => address.port(),
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to read the pairing port: {}", e),
-            )
-        }
-    };
+    // The config decides which transports this session may use; with the network
+    // transport disabled there is no UDP pairing socket, no firewall rule and no
+    // reachable address in the QR code, so the phone pairs over BLE only.
+    let toml_config = shared::config::TapAuthConfig::load();
+    let transports =
+        pairing::pairing_transports(toml_config.enable_network, toml_config.enable_ble);
 
     // Opening the pairing firewall port is best-effort only in test builds
     // (containers/user-namespaces without usable iptables). Production builds
     // abort pairing rather than leaving the ephemeral socket unreachable.
-    let firewall_guard = match pairing::open_pairing_firewall(local_port) {
-        Ok(guard) => guard,
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Firewall error: {}", e),
-            )
-        }
+    let ports = match pairing::open_transports(
+        transports,
+        pairing::bind_pairing_socket,
+        pairing::open_pairing_firewall,
+    )
+    .await
+    {
+        Ok(ports) => ports,
+        Err(e) => return err_resp(ipc::AdminStatus::AdminError, e.to_string()),
     };
-
-    let (state, started) = match ServerPairingState::start(
+    let (state, started) = match pairing::start_session_state(
         keypair,
         &daemon.hostname,
-        local_port,
+        transports,
+        &ports,
         ipv4,
         ipv6,
         pairing::pinned_algorithms(daemon),
@@ -323,6 +311,7 @@ async fn handle_start_pairing(
             )
         }
     };
+    let (udp, local_port, firewall_guard) = (ports.udp, ports.local_port, ports.firewall_guard);
 
     // Everything the IPC reply carries comes from the state machine's own
     // `StartedPairing`: the URL is the one the phone will parse, not a
@@ -330,14 +319,13 @@ async fn handle_start_pairing(
     let session_id = started.session_id;
     let qr_url = started.qr_url.clone();
     let generation = pairing::next_generation();
-    let enable_ble = shared::config::TapAuthConfig::load().enable_ble;
     let pairing = pairing::spawn(pairing::SessionSetup {
         state,
         started,
         udp,
         local_port,
         firewall_guard,
-        enable_ble,
+        enable_ble: transports.ble,
         generation,
     });
 
@@ -686,9 +674,24 @@ async fn handle_cancel_pairing(
     };
 
     let (commands, port) = session;
-    match pairing::request_cancellation(&commands).await {
-        Ok(()) => {
-            tracing::info!("Cancelled the pairing session on UDP port {}", port);
+    let result = pairing::request_cancellation(&commands).await;
+    if result.is_ok() {
+        tracing::info!("Cancelled the pairing session on UDP port {}", port);
+    }
+    cancel_outcome(result)
+}
+
+/// What a `CancelPairing` answers for `result`.
+///
+/// `Ended` is a success: the worker retired between the phase check and the
+/// command (its teardown had already closed the command channel), so there is
+/// nothing left to abort — which is what the caller asked for. Every other error
+/// keeps the failure answer.
+fn cancel_outcome(result: Result<(), pairing::PairingError>) -> ipc::AdminResponse {
+    match result {
+        Ok(()) => cancel_pairing_success(),
+        Err(pairing::PairingError::Ended(_)) => {
+            tracing::debug!("Cancellation raced the session teardown; nothing left to abort");
             cancel_pairing_success()
         }
         Err(e) => err_resp(
@@ -727,8 +730,9 @@ async fn handle_remove_device(
 }
 
 async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
-    // `rotate_csk` clears every paired server, writes a fresh CSK and resets the
-    // CSK algorithm metadata to the baseline (`ClientConfigManager::rotate_csk`).
+    // `rotate_csk` clears every paired server, deletes the CSK algorithm metadata
+    // (nothing is left that the negotiated suite could be pinned to) and writes a
+    // fresh CSK (`ClientConfigManager::rotate_csk`).
     match daemon.config_manager.rotate_csk() {
         Ok(_) => {
             tracing::info!("CSK rotated successfully");
@@ -843,4 +847,55 @@ async fn handle_get_daemon_status(daemon: &Arc<DaemonState>) -> ipc::AdminRespon
         String::new()
     };
     daemon_status_success(tpm_enabled, tpm_error)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// `CancelPairing` after the worker already retired is a success, while a
+    /// real failure keeps its error answer.
+    ///
+    /// The defect this catches: mapping every `request_cancellation` error to the
+    /// success reply would report a genuine timeout as "cancelled"; mapping
+    /// `Ended` back to an error makes the GUI show "Failed to cancel the pairing
+    /// session" for a session that ended by itself — the race the deferred
+    /// terminal phase widens, because `is_ended()` only becomes true once the
+    /// teardown has finished.
+    #[test]
+    fn a_cancellation_that_races_teardown_is_a_success_and_a_real_failure_is_not() {
+        // The worker answered the cancel.
+        let answered = cancel_outcome(Ok(()));
+        assert_eq!(answered.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert_eq!(answered.error_message, "");
+        assert!(matches!(
+            answered.payload,
+            Some(ipc::admin_response::Payload::CancelPairing(_))
+        ));
+
+        // The worker retired between the phase check and the command.
+        let raced = cancel_outcome(Err(pairing::PairingError::Ended(
+            "the pairing worker is gone".to_string(),
+        )));
+        assert_eq!(raced.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert_eq!(raced.error_message, "");
+
+        // A genuine failure keeps the error answer, with the reason.
+        let failed = cancel_outcome(Err(pairing::PairingError::Timeout));
+        assert_eq!(failed.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            failed
+                .error_message
+                .contains("Failed to cancel the pairing session"),
+            "unexpected message: {}",
+            failed.error_message
+        );
+        assert!(
+            failed.error_message.contains("Timed out"),
+            "the reason must survive into the reply: {}",
+            failed.error_message
+        );
+        assert!(failed.payload.is_none());
+    }
 }

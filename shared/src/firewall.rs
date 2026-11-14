@@ -112,7 +112,25 @@ impl FirewallGuard {
 
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
-        do_drop_close(self.port, self.protocol);
+        let (port, protocol) = (self.port, self.protocol);
+        // Closing a port shells out to `iptables`/`ufw`/`firewall-cmd`, which
+        // blocks until the subprocess exits. The last strong reference is
+        // typically dropped on a tokio worker (a pairing session tearing down),
+        // so the close runs on the blocking pool and is detached: the subprocess
+        // may outlive this drop by the time it takes to spawn it and run.
+        //
+        // Deferring is safe because `do_drop_close` re-checks the shared slot
+        // under its own lock: a guard created before the task runs re-registers
+        // the port as open, so the port is not closed underneath a live session.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Dropping the join handle detaches the task.
+                handle.spawn_blocking(move || do_drop_close(port, protocol));
+            }
+            // No runtime (a plain thread, a test): run the close here, exactly as
+            // before.
+            Err(_) => do_drop_close(port, protocol),
+        }
     }
 }
 

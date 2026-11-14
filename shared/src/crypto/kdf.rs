@@ -28,7 +28,8 @@ const PAIRING_ABORT_PREFIX: &[u8] = b"tapauth-pair-v2-abort";
 #[derive(Debug, Clone, Copy)]
 pub struct PairingTranscript<'a> {
     pub version: u32,
-    pub session_id: &'a [u8],
+    /// Raw 16-byte QR `sid`, written to the transcript with no length prefix.
+    pub session_id: &'a [u8; 16],
     pub client_x25519_public_key: &'a [u8; 32],
     pub server_x25519_public_key: &'a [u8; 32],
     pub client_ed25519_public_key: &'a [u8; 32],
@@ -61,7 +62,7 @@ fn push_algorithm_list<T: Copy + Into<i32>>(out: &mut Vec<u8>, algorithms: &[T])
 /// Compute the canonical pairing transcript hash `H`:
 ///
 /// ```text
-/// SHA-256("tapauth-pair-transcript-v2" || be32(version) || session_id
+/// SHA-256("tapauth-pair-transcript-v2" || be32(version) || session_id(16)
 ///         || X_C(32) || X_S(32) || Ed_C(32) || Ed_S(32)
 ///         || be32(len) || client_device_name || be32(len) || server_device_name
 ///         || be32(n) || [be32(alg)…]   (supported symmetric)
@@ -115,10 +116,11 @@ pub struct PairingSessionKeys {
 ///    [`CryptoError::InvalidKeyLength`];
 /// 2. `HKDF-Extract(salt = H, IKM = Z)` and expand the three `info` strings.
 ///
-/// The extracted PRK lives in a [`Zeroizing`] buffer, so the only copy this
-/// function owns is cleared on return (cryptography-specification.md §4). The
-/// extract/expand pair is byte-for-byte the same as `Hkdf::new` +
-/// `expand`: `from_prk` is exactly the HMAC key `Hkdf::extract` hands back.
+/// The extracted PRK and both expanded directional keys live in [`Zeroizing`]
+/// buffers, so every copy this function owns is cleared on return
+/// (cryptography-specification.md §4). The extract/expand pair is byte-for-byte
+/// the same as `Hkdf::new` + `expand`: `from_prk` is exactly the HMAC key
+/// `Hkdf::extract` hands back.
 pub fn derive_pairing_keys_and_sas(
     shared_secret: &[u8; 32],
     transcript_hash: &[u8; 32],
@@ -138,12 +140,14 @@ pub fn derive_pairing_keys_and_sas(
 
     let hk = Hkdf::<Sha256>::from_prk(&*prk).map_err(|_| CryptoError::KeyDerivationFailed)?;
 
-    let mut k_c2s = [0u8; 32];
-    hk.expand(HKDF_INFO_C2S, &mut k_c2s)
+    // Expanded straight into the `Zeroizing` buffers that are returned, so the
+    // directional keys never exist as an un-zeroized stack copy.
+    let mut k_c2s = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_INFO_C2S, &mut *k_c2s)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
-    let mut k_s2c = [0u8; 32];
-    hk.expand(HKDF_INFO_S2C, &mut k_s2c)
+    let mut k_s2c = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_INFO_S2C, &mut *k_s2c)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
     let mut sas_bytes = [0u8; 8];
@@ -151,13 +155,10 @@ pub fn derive_pairing_keys_and_sas(
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
 
     let sas_number = u64::from_be_bytes(sas_bytes) % 1_000_000;
+    sas_bytes.zeroize();
     let sas = format!("{:03}-{:03}", sas_number / 1000, sas_number % 1000);
 
-    Ok(PairingSessionKeys {
-        k_c2s: Zeroizing::new(k_c2s),
-        k_s2c: Zeroizing::new(k_s2c),
-        sas,
-    })
+    Ok(PairingSessionKeys { k_c2s, k_s2c, sas })
 }
 
 /// Compute the pairing abort authentication tag:
@@ -214,7 +215,7 @@ mod tests {
     }
 
     fn base_transcript<'a>(
-        session_id: &'a [u8],
+        session_id: &'a [u8; 16],
         cx25519: &'a [u8; 32],
         sx25519: &'a [u8; 32],
         ced25519: &'a [u8; 32],
@@ -404,6 +405,39 @@ mod tests {
             &sid, &cx, &sx, &ced, &sed, &names_b, &supported,
         ));
         assert_ne!(hash_a, hash_b);
+    }
+
+    /// The transcript hash byte layout is frozen: this fixture hashes to a value
+    /// derived from the documented layout (cryptography-specification.md §2.2)
+    /// independently of this crate — prefix, be32 version, the raw 16 session-id
+    /// bytes with **no** length prefix, the four 32-byte keys, the
+    /// length-prefixed device names, the three length-prefixed algorithm lists
+    /// and the three selected algorithms.
+    /// The defect this catches: any change to the framing — a length prefix
+    /// added to the session id, fields reordered, a truncation introduced by the
+    /// narrower session-id type — which would silently break pairing with an
+    /// already-shipped peer.
+    #[test]
+    fn test_transcript_hash_matches_frozen_layout() {
+        let sid = session_id();
+        let cx = [0x11u8; 32];
+        let sx = [0x22u8; 32];
+        let ced = [0x33u8; 32];
+        let sed = [0x44u8; 32];
+        let names = ("desktop", "phone");
+        let supported = (
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Sha256],
+            vec![SignatureAlgorithm::Ed25519],
+        );
+
+        let hash = compute_pairing_transcript_hash(&base_transcript(
+            &sid, &cx, &sx, &ced, &sed, &names, &supported,
+        ));
+        assert_eq!(
+            hex::encode(hash),
+            "1c5efee87cc5739f352383b6a47c0e74a0632b4e29c643f5cb347cde363f96f8"
+        );
     }
 
     /// An all-zero X25519 output is a low-order point and must be rejected.

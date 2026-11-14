@@ -23,6 +23,7 @@ use crate::auth_handler::AuthHandlerError as AuthError;
 use shared::config::CskMetadata;
 use shared::protocol::pb::EncryptedPacket;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Pause between publishing a characteristic value and tearing the link down,
@@ -69,6 +70,19 @@ pub trait Transport: Send + Sync {
         timeout: Duration,
         csk_meta: &CskMetadata,
     ) -> impl Future<Output = Result<ReceiveResult, AuthError>> + Send;
+
+    /// Record `addr` as the peer a unicast confirmation or cancel may be sent to.
+    ///
+    /// The authentication handler calls this only once the frame it received from
+    /// `addr` has passed the replay, AEAD and signature checks, so a datagram that
+    /// no authorized Server signed can never become the unicast target: recording
+    /// it in [`Self::receive_response`] — which sees every datagram, authenticated
+    /// or not — would let any host on the link redirect the `GrantConfirmation`
+    /// and the `AuthenticationCancel` to itself.
+    ///
+    /// Default is a no-op: a transport that has no address (BLE) or never unicasts
+    /// keeps nothing to record.
+    fn record_authenticated_peer(&self, _addr: SocketAddr) {}
 
     /// Send a confirmation packet (GrantConfirmation)
     ///

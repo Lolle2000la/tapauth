@@ -20,12 +20,15 @@ use std::time::Duration;
 pub struct UdpTransport {
     socket: Arc<tokio::net::UdpSocket>,
     port: u16,
-    /// Source address of the most recent response accepted by
-    /// [`Transport::receive_response`].
+    /// Source address of the response the session accepted as authenticated by a
+    /// Server authorized for the request, recorded through
+    /// [`Transport::record_authenticated_peer`].
     ///
     /// v2 sends the confirmation unicast to the peer that answered instead of
     /// multicasting it to every device on the link, and copies a cancel there
-    /// too. `None` until a peer has replied.
+    /// too. `None` until a response has passed the session's checks, so an
+    /// unauthenticated datagram from any host on the link cannot become the
+    /// target of either.
     last_peer_addr: Mutex<Option<SocketAddr>>,
 }
 
@@ -43,7 +46,7 @@ impl UdpTransport {
         }
     }
 
-    /// The peer recorded by [`Transport::receive_response`], if any.
+    /// The peer recorded by [`Transport::record_authenticated_peer`], if any.
     ///
     /// A poisoned lock is recovered: the guarded value is a plain
     /// `Option<SocketAddr>`, so poison cannot leave it torn.
@@ -54,12 +57,17 @@ impl UdpTransport {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Record `addr` as the peer that produced the winning response.
-    fn record_peer_addr(&self, addr: SocketAddr) {
-        *self
-            .last_peer_addr
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(addr);
+    /// Hand a received datagram to the session.
+    ///
+    /// The source travels with the datagram and is deliberately *not* recorded
+    /// here: [`Transport::receive_response`] sees every datagram on the link, and
+    /// only the session can tell an authorized answer from an injected one
+    /// (replay cache, AEAD, signature). Recording it at this point would let any
+    /// host redirect the unicast `GrantConfirmation` and `AuthenticationCancel`;
+    /// the authenticated source is recorded through
+    /// [`Transport::record_authenticated_peer`] once the session accepts it.
+    fn deliver_datagram(&self, packet: EncryptedPacket, addr: SocketAddr) -> ReceiveResult {
+        ReceiveResult::Response(packet, addr)
     }
 
     /// Send `bytes` to a single address, logging rather than failing: the
@@ -149,16 +157,16 @@ impl Transport for UdpTransport {
         _csk_meta: &CskMetadata,
     ) -> Result<ReceiveResult, AuthError> {
         match try_receive_udp_packet(&self.socket, timeout).await? {
-            Some((packet, addr)) => {
-                // Filter out local addresses (already done in receive_udp_packet)
-                // The first accepted response is the winner: the handler verifies
-                // it and returns without waiting again, so this is the peer the
-                // confirmation is unicast back to.
-                self.record_peer_addr(addr);
-                Ok(ReceiveResult::Response(packet, addr))
-            }
+            Some((packet, addr)) => Ok(self.deliver_datagram(packet, addr)),
             None => Ok(ReceiveResult::Timeout),
         }
+    }
+
+    fn record_authenticated_peer(&self, addr: SocketAddr) {
+        *self
+            .last_peer_addr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(addr);
     }
 
     async fn send_confirmation(
@@ -203,5 +211,146 @@ impl Transport for UdpTransport {
             self.unicast(&bytes, peer_addr, "cancel").await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use shared::protocol::pb::SymmetricAlgorithm;
+    use std::net::Ipv4Addr;
+
+    /// The address a spoofed datagram claims to come from: any loopback address
+    /// that is not the transport's own.
+    const SPOOFER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
+    fn sample_packet() -> EncryptedPacket {
+        EncryptedPacket {
+            temporal_identifier: vec![7u8; 16],
+            encryption_algorithm: SymmetricAlgorithm::Aes256Gcm as i32,
+            ciphertext: vec![0xAAu8; 32],
+        }
+    }
+
+    /// A transport bound to loopback, plus the socket a spoofed datagram comes
+    /// from.
+    async fn transport_and_peer() -> (UdpTransport, tokio::net::UdpSocket, SocketAddr, SocketAddr) {
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let local = socket.local_addr().unwrap();
+        let peer = tokio::net::UdpSocket::bind((SPOOFER, 0)).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        (
+            UdpTransport::from_socket(socket, local.port()),
+            peer,
+            local,
+            peer_addr,
+        )
+    }
+
+    /// A datagram nobody authenticated must not become the unicast target of the
+    /// confirmation or the cancel.
+    ///
+    /// The defect this catches: recording the source on delivery, i.e. in
+    /// `receive_response`/`deliver_datagram`, which hands every datagram on the
+    /// link — including one injected by any host that can reach the port — to
+    /// `last_peer_addr`, letting that host receive the session's
+    /// `GrantConfirmation` and `AuthenticationCancel`.
+    #[tokio::test]
+    async fn an_unauthenticated_datagram_does_not_become_the_unicast_target() {
+        let (transport, peer, local, peer_addr) = transport_and_peer().await;
+
+        let delivered = transport.deliver_datagram(sample_packet(), peer_addr);
+        match delivered {
+            ReceiveResult::Response(_, source) => {
+                assert_eq!(source, peer_addr, "the datagram's source travels with it")
+            }
+            ReceiveResult::Timeout => panic!("a delivered datagram must reach the session"),
+        }
+        assert!(
+            transport.peer_addr().is_none(),
+            "the source of an unauthenticated datagram must not be recorded"
+        );
+
+        // ...and the confirmation does not go back to it.
+        transport
+            .send_confirmation(&sample_packet(), &CskMetadata::default())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the host that injected the datagram received the confirmation"
+        );
+        assert_eq!(local.port(), transport.port);
+    }
+
+    /// The authenticated path: once the session accepts a response, its source is
+    /// the peer the confirmation is unicast to.
+    ///
+    /// The defect this catches: dropping the recording altogether along with the
+    /// premature one — no peer recorded at all, so `send_confirmation` logs "No
+    /// peer address recorded" and the phone that granted never gets its
+    /// acknowledgement.
+    #[tokio::test]
+    async fn an_authenticated_response_records_the_unicast_target() {
+        let (transport, peer, local, peer_addr) = transport_and_peer().await;
+        assert!(transport.peer_addr().is_none(), "nothing is accepted yet");
+
+        transport.record_authenticated_peer(peer_addr);
+        assert_eq!(transport.peer_addr(), Some(peer_addr));
+
+        let confirmation = sample_packet();
+        transport
+            .send_confirmation(&confirmation, &CskMetadata::default())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (len, source) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("the confirmation never reached the accepted peer")
+            .unwrap();
+        assert_eq!(source.port(), local.port());
+        assert_eq!(
+            buf.get(..len),
+            Some(confirmation.encode_to_vec().as_slice())
+        );
+    }
+
+    /// The same property on the real receive path: a datagram the session has not
+    /// accepted leaves `last_peer_addr` untouched.
+    ///
+    /// `shared`'s receive filter drops every locally-sourced datagram as a
+    /// self-echo unless `TAPAUTH_DEV_MODE` is set, and the bypass only exists in a
+    /// `dev-udp-loopback` build (`cfg(test)` there does not cover a dependency),
+    /// so this half of the pair is compiled only for that feature — which is how
+    /// the E2E sandbox daemon is built.
+    #[cfg(feature = "dev-udp-loopback")]
+    #[tokio::test]
+    async fn a_spoofed_source_on_the_wire_is_not_recorded() {
+        std::env::set_var("TAPAUTH_DEV_MODE", "1");
+        let (transport, peer, local, peer_addr) = transport_and_peer().await;
+        peer.send_to(&sample_packet().encode_to_vec(), local)
+            .await
+            .unwrap();
+
+        match transport
+            .receive_response(Duration::from_millis(500), &CskMetadata::default())
+            .await
+            .unwrap()
+        {
+            ReceiveResult::Response(_, source) => assert_eq!(source, peer_addr),
+            ReceiveResult::Timeout => panic!("the datagram was never delivered to the session"),
+        }
+        assert!(
+            transport.peer_addr().is_none(),
+            "an unauthenticated on-the-wire datagram became the unicast target"
+        );
     }
 }

@@ -62,6 +62,10 @@ fn main() -> iced::Result {
 
     let window_settings = iced::window::Settings {
         icon: Some(icon),
+        // iced must not destroy the window on its own: the close request is
+        // handled in `app::TapAuthConfig::update`, which tells the daemon to
+        // drop an open pairing session before closing (`window::close`).
+        exit_on_close_request: false,
         ..iced::window::Settings::default()
     };
 
@@ -74,6 +78,7 @@ fn main() -> iced::Result {
     )
     .title(|state: &app::TapAuthConfig| state.title())
     .theme(app::TapAuthConfig::theme)
+    .subscription(app::TapAuthConfig::subscription)
     .font(lucide_icons::LUCIDE_FONT_BYTES)
     .window(window_settings)
     .run()

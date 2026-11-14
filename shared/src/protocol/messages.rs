@@ -40,6 +40,12 @@ pub const COMMAND_PREVIEW_MAX_BYTES: usize = 128;
 /// Truncation marker appended inside the byte budget when a context string is cut.
 const ELLIPSIS: char = '\u{2026}';
 
+/// `ESC`, which opens every ANSI escape sequence stripped from a context string.
+const ESC_BYTE: u8 = 0x1B;
+
+/// `BEL`, the short terminator of an OSC sequence.
+const BEL_BYTE: u8 = 0x07;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("Serialization error: {0}")]
@@ -62,6 +68,10 @@ pub enum ProtocolError {
     ChallengeMismatch,
     #[error("Unsupported algorithm")]
     UnsupportedAlgorithm,
+    /// The pairing session reached its terminal state: `conclude()` already
+    /// dropped every key, so no further protocol operation may run on it.
+    #[error("Pairing session has already concluded")]
+    SessionConcluded,
 }
 
 /// Build the v2 `WrapperMessage` signing transcript:
@@ -114,11 +124,21 @@ pub fn sign_wrapper_message(
 /// downgrade to `UNSPECIFIED` or to an algorithm the caller cannot validate), and only
 /// `ED25519` is implemented. Verification happens over the raw payload bytes, so no
 /// inner decode is performed here or implied.
+///
+/// The declared framing version must be [`PROTOCOL_VERSION_V2`]. The version is inside
+/// the signed transcript, so a well-signed v1 frame cannot be forged, but the
+/// verifiers below (`verify_auth_grant`, `verify_auth_denial`,
+/// `verify_and_decode_payload`) are reached from `tapauthd` and the FFI surface without
+/// any other version gate, and a v1 payload must never reach the v2 decoder. Checking
+/// it here is defence in depth and costs one comparison.
 pub fn verify_wrapper_signature(
     wrapper: &WrapperMessage,
     public_key: &[u8; 32],
     expected_signature_algorithm: i32,
 ) -> Result<(), ProtocolError> {
+    if wrapper.version != PROTOCOL_VERSION_V2 {
+        return Err(ProtocolError::InvalidMessageFormat);
+    }
     if wrapper.signature_algorithm != expected_signature_algorithm {
         return Err(ProtocolError::AlgorithmMismatch);
     }
@@ -272,31 +292,27 @@ fn verify_challenge_field(field: &[u8], expected: &[u8; 32]) -> Result<(), Proto
 
 /// Sanitize untrusted contextual metadata for display on the Server prompt.
 ///
-/// Removes C0 controls (U+0000..=U+001F), DEL (U+007F), C1 controls (U+0080..=U+009F),
-/// the bidi formatters U+202A..=U+202E and U+2066..=U+2069, collapses whitespace runs to
-/// a single space and trims both ends. The result is truncated to at most `max_bytes`
-/// bytes on a UTF-8 char boundary; when truncation happens a single `…` is appended
-/// *inside* that budget, so a budget below 4 bytes truncates without an ellipsis.
+/// The Kotlin mirror (`ContextSanitizer` in `server-android`) must implement exactly
+/// this, so both sides are driven by the same vectors in
+/// `shared/testdata/context_sanitizer_vectors.json`:
+///
+/// 1. ANSI escape sequences are removed as a unit, first. A CSI (`ESC '['`, parameter
+///    bytes `0x30..=0x3F`, intermediate bytes `0x20..=0x2F`, one final byte
+///    `0x40..=0x7E`) and an OSC (`ESC ']'` up to `BEL` or `ESC '\'`, terminator
+///    included) are deleted whole — deleting only the `ESC` would leave `[31m` in the
+///    prompt. An unterminated sequence is deleted to end of input. A lone `ESC` is a
+///    forbidden character and is dropped, and the byte after it is filtered normally.
+/// 2. Then, per code point: a whitespace code point (see
+///    [`is_context_whitespace`]) becomes one space, runs collapse to one space and
+///    both ends are trimmed; otherwise a forbidden code point (see
+///    [`is_forbidden_context_char`]) is dropped; everything else is kept. The
+///    whitespace test comes *first*, so `\t`, `\n` and U+0085 separate words instead
+///    of vanishing (`sudo\tapt` must not become `sudoapt`).
+/// 3. The result is truncated to at most `max_bytes` bytes on a UTF-8 char boundary;
+///    when truncation happens a single `…` is appended *inside* that budget, so a
+///    budget of 3 bytes or less truncates without an ellipsis.
 pub fn sanitize_context_string(input: &str, max_bytes: usize) -> String {
-    let mut collapsed = String::with_capacity(input.len());
-    let mut pending_space = false;
-
-    for ch in input.chars() {
-        // Stripping wins over whitespace collapsing: C1 NEL (U+0085) is Unicode
-        // whitespace but is listed as a control to remove.
-        if is_forbidden_context_char(ch) {
-            continue;
-        }
-        if ch.is_whitespace() {
-            pending_space = !collapsed.is_empty();
-            continue;
-        }
-        if pending_space {
-            collapsed.push(' ');
-            pending_space = false;
-        }
-        collapsed.push(ch);
-    }
+    let collapsed = normalize_context_string(input);
 
     if max_bytes == 0 {
         return String::new();
@@ -330,15 +346,145 @@ pub fn sanitize_context_string(input: &str, max_bytes: usize) -> String {
     truncated
 }
 
-/// Characters that must never reach the Server prompt: controls and bidi overrides.
+/// Delete ANSI escape sequences and every forbidden code point, and collapse
+/// whitespace runs to one ASCII space (see [`sanitize_context_string`]).
+///
+/// Byte- and char-addressed at once: the escape scanner walks the byte slice (every
+/// byte of an escape sequence is ASCII), and everything else is consumed one whole
+/// `char` at a time, so the string is never split inside a multi-byte code point.
+fn normalize_context_string(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut pending_space = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes.get(index).copied() == Some(ESC_BYTE) {
+            match ansi_sequence_len(bytes, index) {
+                Some(len) => index = index.saturating_add(len),
+                // A lone `ESC` (end of input, or followed by anything but `[`/`]`) is
+                // just a forbidden character: drop it and filter the next byte normally.
+                None => index = index.saturating_add(1),
+            }
+            continue;
+        }
+
+        // `index` is on a char boundary: every advance above covers ASCII bytes only.
+        let next_char = input.get(index..).and_then(|rest| rest.chars().next());
+        let Some(ch) = next_char else {
+            break;
+        };
+        index = index.saturating_add(ch.len_utf8());
+
+        // Whitespace before the forbidden set: `U+0009..=U+000D` and `U+0085` are both.
+        if is_context_whitespace(ch) {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if is_forbidden_context_char(ch) {
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+/// Length in bytes of the ANSI escape sequence starting at `start`, terminator included.
+///
+/// `None` when `bytes[start]` is an `ESC` that does not begin a CSI or OSC, which the
+/// caller treats as a forbidden character. An unterminated CSI/OSC reports the rest of
+/// the input, so a truncated escape cannot leak its parameter bytes into the prompt.
+fn ansi_sequence_len(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start.checked_add(1)?).copied() {
+        // CSI: ESC '[' params intermediates final
+        Some(b'[') => {
+            let mut cursor = start.saturating_add(2);
+            while bytes.get(cursor).copied().is_some_and(is_csi_parameter) {
+                cursor = cursor.saturating_add(1);
+            }
+            while bytes.get(cursor).copied().is_some_and(is_csi_intermediate) {
+                cursor = cursor.saturating_add(1);
+            }
+            if bytes.get(cursor).copied().is_some_and(is_csi_final) {
+                Some(cursor.saturating_add(1).saturating_sub(start))
+            } else {
+                Some(bytes.len().saturating_sub(start))
+            }
+        }
+        // OSC: ESC ']' ... (BEL | ESC '\')
+        Some(b']') => {
+            let mut cursor = start.saturating_add(2);
+            while cursor < bytes.len() {
+                if bytes.get(cursor).copied() == Some(BEL_BYTE) {
+                    return Some(cursor.saturating_add(1).saturating_sub(start));
+                }
+                let is_string_terminator = bytes.get(cursor).copied() == Some(ESC_BYTE)
+                    && bytes.get(cursor.saturating_add(1)).copied() == Some(b'\\');
+                if is_string_terminator {
+                    return Some(cursor.saturating_add(2).saturating_sub(start));
+                }
+                cursor = cursor.saturating_add(1);
+            }
+            Some(bytes.len().saturating_sub(start))
+        }
+        _ => None,
+    }
+}
+
+/// One byte of a CSI parameter string: `0x30..=0x3F` (ECMA-48 §5.4).
+fn is_csi_parameter(byte: u8) -> bool {
+    (0x30..=0x3F).contains(&byte)
+}
+
+/// One byte of a CSI intermediate string: `0x20..=0x2F` (ECMA-48 §5.4).
+fn is_csi_intermediate(byte: u8) -> bool {
+    (0x20..=0x2F).contains(&byte)
+}
+
+/// The single final byte of a CSI sequence: `0x40..=0x7E` (ECMA-48 §5.4).
+fn is_csi_final(byte: u8) -> bool {
+    (0x40..=0x7E).contains(&byte)
+}
+
+/// The code points that become one ASCII space, collapsed and trimmed.
+///
+/// Spelled out instead of `char::is_whitespace` because the set is part of the display
+/// contract the Kotlin mirror implements; `char::is_whitespace` is a Unicode property
+/// that changes with the Unicode version and does not include `U+200B`.
+fn is_context_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+/// Code points that must never reach the Server prompt: controls and bidi formatters.
 fn is_forbidden_context_char(ch: char) -> bool {
     matches!(
         ch,
         '\u{0000}'..='\u{001F}'
-            | '\u{007F}'
-            | '\u{0080}'..='\u{009F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
     )
 }
 
@@ -412,7 +558,7 @@ pub fn create_auth_request_with_context(
     })
 }
 
-/// Validate timestamp in AuthenticationRequest (within ±5 minutes)
+/// Validate timestamp in AuthenticationRequest (within ±60 seconds)
 pub fn is_request_timestamp_valid(request: &AuthenticationRequest) -> bool {
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
@@ -628,6 +774,54 @@ mod tests {
             ),
             Err(ProtocolError::AlgorithmMismatch)
         ));
+    }
+
+    /// A v1-versioned wrapper is refused by `verify_wrapper_signature` even when it
+    /// carries a valid signature over its own (v1) transcript and a payload that would
+    /// otherwise decode and answer the challenge.
+    ///
+    /// The defect this catches: `verify_wrapper_signature` checking only the signature
+    /// algorithm and the signature, so `tapauthd` — which reaches the shared verifiers
+    /// and never the FFI's own version gate — would accept a v1 frame and hand its
+    /// payload to the v2 decoder.
+    #[test]
+    fn test_wrapper_signature_rejects_non_v2_version_before_payload_handling() {
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let challenge = [0x44u8; 32];
+
+        let mut wrapper = wrap_auth_grant(AuthenticationGrant {
+            challenge: challenge.to_vec(),
+        });
+        // Downgrade to the v1 framing and sign *that* transcript: the signature is
+        // valid, so only the version gate can reject it.
+        wrapper.version = 1;
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+
+        assert!(matches!(
+            verify_wrapper_signature(&wrapper, &keypair.verifying_key_bytes(), ED25519),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+        // `verify_auth_grant` is the entry point tapauthd calls: a matching challenge
+        // must not rescue the frame.
+        assert!(matches!(
+            verify_auth_grant(
+                &wrapper,
+                &challenge,
+                &keypair.verifying_key_bytes(),
+                ED25519
+            ),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+
+        // Control: the same message at v2 verifies, so the gate is the version alone.
+        let mut v2 = wrap_auth_grant(AuthenticationGrant {
+            challenge: challenge.to_vec(),
+        });
+        sign_wrapper_message(&mut v2, &keypair).unwrap();
+        assert_eq!(v2.version, PROTOCOL_VERSION_V2);
+        assert!(
+            verify_auth_grant(&v2, &challenge, &keypair.verifying_key_bytes(), ED25519).is_ok()
+        );
     }
 
     #[test]
@@ -861,20 +1055,116 @@ mod tests {
             "C0 controls, NUL and DEL must be removed"
         );
         assert_eq!(
-            sanitize_context_string("a\u{85}b", 32),
-            "ab",
-            "C1 NEL removed"
-        );
-        assert_eq!(
             sanitize_context_string("\u{202e}evil\u{2066}", 32),
             "evil",
             "bidi overrides/isolates removed"
         );
         assert_eq!(
-            sanitize_context_string("a\u{9f}b", 32),
-            "ab",
-            "C1 end removed"
+            sanitize_context_string("a\u{80}b\u{9f}c", 32),
+            "abc",
+            "C1 controls removed"
         );
+        assert_eq!(
+            sanitize_context_string("a\u{61c}b\u{200b}c\u{feff}d", 32),
+            "abcd",
+            "Arabic letter mark, zero-width space and BOM removed"
+        );
+    }
+
+    /// Whitespace is checked *before* the forbidden set, so a tab or newline separates
+    /// words instead of being deleted: the defect this catches is `sudo\tapt` collapsing
+    /// to `sudoapt`, which renders as one word the user never typed.
+    #[test]
+    fn test_sanitize_context_string_separates_words_on_whitespace() {
+        assert_eq!(
+            sanitize_context_string("sudo\tapt\nupdate", 128),
+            "sudo apt update"
+        );
+        assert_eq!(sanitize_context_string("  a \t\n  b  ", 128), "a b");
+        // U+0085 (NEL) is both Unicode whitespace and a C1 control: it must collapse.
+        assert_eq!(sanitize_context_string("a\u{85}b", 128), "a b");
+        // U+00A0 (NBSP) and U+3000 (ideographic space) are not ASCII spaces either.
+        assert_eq!(
+            sanitize_context_string("sudo\u{a0}apt\u{3000}update", 128),
+            "sudo apt update"
+        );
+    }
+
+    /// An escape sequence is deleted as a unit. The defect this catches is stripping only
+    /// the `ESC`: the parameter bytes (`[31m`, `]0;…`) would survive into the prompt and
+    /// render as text that was never meant to be shown.
+    #[test]
+    fn test_sanitize_context_string_removes_ansi_sequences() {
+        assert_eq!(
+            sanitize_context_string("\u{1b}[31mroot\u{1b}[0m", 128),
+            "root"
+        );
+        // Unterminated CSI: removed to end of input, not leaked as "[31".
+        assert_eq!(sanitize_context_string("x\u{1b}[31", 128), "x");
+        // Parameter byte `1`, intermediate byte `0x20` and the final byte `q`: one
+        // sequence, so the "b" survives and nothing of `ESC [1 q` does.
+        assert_eq!(sanitize_context_string("x\u{1b}[1 qb", 128), "xb");
+        // OSC terminated by BEL, and by ESC '\'.
+        assert_eq!(sanitize_context_string("a\u{1b}]0;evil\u{7}b", 128), "ab");
+        assert_eq!(
+            sanitize_context_string("a\u{1b}]8;;http://evil.example\u{1b}\\b", 128),
+            "ab"
+        );
+        // Unterminated OSC: removed to end of input, so the title text cannot render.
+        assert_eq!(sanitize_context_string("a\u{1b}]0;evil", 128), "a");
+        // A lone ESC is a forbidden character; the byte after it is filtered normally.
+        assert_eq!(sanitize_context_string("a\u{1b}b", 128), "ab");
+        assert_eq!(sanitize_context_string("ab\u{1b}", 128), "ab");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SanitizerVectors {
+        cases: Vec<SanitizerVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SanitizerVector {
+        name: String,
+        input: String,
+        max_bytes: usize,
+        expected: String,
+    }
+
+    /// Every sanitizer vector, including one case per code point of the whitespace and
+    /// forbidden sets and the truncation boundaries.
+    ///
+    /// The same file drives `ContextSanitizerTest.kt` on the Android side, so the two
+    /// implementations cannot drift: the defect this catches is the Kotlin mirror
+    /// silently disagreeing with this one (deleting a tab instead of collapsing it, or
+    /// appending an ellipsis at a 3-byte budget).
+    ///
+    /// The case count is asserted exactly, not as a lower bound: a bound would let the
+    /// file lose whole groups (every truncation boundary, say) while staying green.
+    /// Adding a vector means bumping this number and `ContextSanitizerTest`'s together.
+    #[test]
+    fn test_context_sanitizer_vectors_are_honoured() {
+        const EXPECTED_CASES: usize = 130;
+
+        let vectors: SanitizerVectors = serde_json::from_str(include_str!(
+            "../../testdata/context_sanitizer_vectors.json"
+        ))
+        .expect("context sanitizer vector file must parse");
+        assert_eq!(
+            vectors.cases.len(),
+            EXPECTED_CASES,
+            "the shared vector file must hold exactly {EXPECTED_CASES} cases, found {}",
+            vectors.cases.len()
+        );
+
+        for case in &vectors.cases {
+            assert_eq!(
+                sanitize_context_string(&case.input, case.max_bytes),
+                case.expected,
+                "vector '{}' (max_bytes={})",
+                case.name,
+                case.max_bytes
+            );
+        }
     }
 
     #[test]

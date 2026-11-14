@@ -42,22 +42,67 @@ pub enum PairingState {
 }
 
 impl PairingState {
-    /// Whether a pairing session may still be open on the daemon, so
-    /// abandoning the screen must cancel it.
+    /// Whether a pairing session may still be open on the daemon, so abandoning
+    /// the screen must cancel it.
     ///
-    /// `CompletingPairing` is excluded because `CompletePairing` has already
-    /// consumed the session there — cancelling would race the completion that
-    /// is about to add the device. `Error` is included because the failure that
-    /// got us there (a `WaitForPairing` timeout, say) can leave the daemon's
-    /// session open; a cancel for a session it already dropped is answered with
-    /// an error this task ignores.
+    /// `CompletingPairing` is included: `CompletePairing` has been sent but has
+    /// not answered yet, so the daemon still holds the session and dropping it
+    /// silently leaves the worker running until `SESSION_DEADLINE`. That is why
+    /// this state renders a Cancel control (a deliberate user choice to abort
+    /// the completion). The *implicit* teardown — closing the window — must not
+    /// cancel it: see [`close_action`]. `Error` is included because the failure
+    /// that got us there (a `WaitForPairing` timeout, say) can leave the
+    /// daemon's session open; a cancel for a session it already dropped is
+    /// answered with success.
     fn session_in_flight(&self) -> bool {
         matches!(
             self,
             PairingState::ShowingQRCode { .. }
                 | PairingState::VerifyingSAS { .. }
+                | PairingState::CompletingPairing
                 | PairingState::Error { .. }
         )
+    }
+}
+
+/// What closing the window does about the session the pairing screen holds.
+#[derive(Debug, Clone)]
+pub enum CloseAction {
+    /// Ask the daemon to drop this session before the window closes.
+    Cancel(PairingSession),
+    /// Close without telling the daemon anything.
+    CloseNow,
+}
+
+/// The close decision for a pairing screen: `state` is what the screen shows and
+/// `session` the session it captured from `StartPairing`, if any.
+///
+/// `CompletingPairing` closes without cancelling even though it counts as a
+/// session in flight (so its Cancel *button* still cancels): by then the phone
+/// has confirmed `PairingConfirmClient` and shows success, while `CompletePairing`
+/// is still with the daemon persisting the device. A `CancelPairing` sent from
+/// the close path reaches the worker first and ends the session as failed, so the
+/// device would never be saved — a phone paired to a desktop that never recorded
+/// it. Completion is left to finish on its own.
+fn close_action(state: &PairingState, session: Option<PairingSession>) -> CloseAction {
+    match (state, session) {
+        (PairingState::CompletingPairing, _) => CloseAction::CloseNow,
+        (state, Some(session)) if state.session_in_flight() => CloseAction::Cancel(session),
+        _ => CloseAction::CloseNow,
+    }
+}
+
+/// The `(port, session_id)` pair a `CancelPairing` must carry to address the
+/// session the screen holds, or the daemon-side wildcard.
+///
+/// A rejected `StartPairing` (the daemon still holds an older session) captures
+/// no session, so the error screen's Cancel action has nothing to identify it
+/// with: `port = 0` and an empty id mean "don't check that field" in
+/// `tapauthd/src/admin_handler.rs`, which cancels whatever is still held.
+fn cancel_address(session: Option<PairingSession>) -> (u16, Vec<u8>) {
+    match session {
+        Some(session) => (session.port, session.session_id),
+        None => (0, Vec::new()),
     }
 }
 
@@ -84,13 +129,69 @@ impl PairingScreen {
     /// Task that cancels the open pairing session, if one may still be
     /// waiting on the daemon. Called when the screen is torn down.
     pub fn take_cancel_task(&mut self) -> Task<ScreenMessage> {
-        match self.session.take() {
-            Some(session) if self.state.session_in_flight() => Task::perform(
+        match self.take_pending_session() {
+            Some(session) => Task::perform(
                 crate::ipc::cancel_pairing(session.port, session.session_id),
                 |_| ScreenMessage::PairingCancelledOnDaemon,
             ),
-            _ => Task::none(),
+            None => Task::none(),
         }
+    }
+
+    /// The session the daemon still holds, taken out of the screen so a single
+    /// cancel is ever issued for it.
+    ///
+    /// `None` when no session was captured, or when the state says the daemon
+    /// no longer has one (see [`PairingState::session_in_flight`]).
+    pub fn take_pending_session(&mut self) -> Option<PairingSession> {
+        let session = self.session.take()?;
+        self.state.session_in_flight().then_some(session)
+    }
+
+    /// What closing the window must do about this screen's session.
+    pub fn close_action(&mut self) -> CloseAction {
+        close_action(&self.state, self.session.take())
+    }
+
+    /// A screen holding a session from `StartPairing`, for the close-path tests
+    /// that need one without a daemon.
+    #[cfg(test)]
+    pub(crate) fn showing_qr_for_test(port: u16) -> Self {
+        Self::for_test(
+            PairingState::ShowingQRCode {
+                url: "tapauth://pair?v=2".to_string(),
+                qr_data: Rc::new(QrData::new("tapauth://pair?v=2").expect("test URL must encode")),
+            },
+            port,
+        )
+    }
+
+    /// A screen whose `CompletePairing` is already with the daemon.
+    #[cfg(test)]
+    pub(crate) fn completing_for_test(port: u16) -> Self {
+        Self::for_test(PairingState::CompletingPairing, port)
+    }
+
+    #[cfg(test)]
+    fn for_test(state: PairingState, port: u16) -> Self {
+        let mut screen = Self::new(L10n::new("en"));
+        screen.state = state;
+        screen.session = Some(PairingSession {
+            url: "tapauth://pair?v=2".to_string(),
+            port,
+            session_id: vec![0xab; 16],
+        });
+        screen
+    }
+
+    /// Take the address the error screen's Cancel action must hand to
+    /// `CancelPairing`, and move the screen back to `Loading` so the
+    /// `PairingStarted` that follows starts a fresh session.
+    fn take_cancel_address(&mut self) -> (u16, Vec<u8>) {
+        let address = cancel_address(self.session.take());
+        self.cancel_wait = None;
+        self.state = PairingState::Loading;
+        address
     }
 
     pub fn update(&mut self, message: ScreenMessage) -> Task<ScreenMessage> {
@@ -189,6 +290,23 @@ impl PairingScreen {
                 // the in-flight session is cancelled on the daemon.
                 Task::done(ScreenMessage::NavigateToMainMenu)
             }
+            ScreenMessage::PairingCancelRequested => {
+                // The Cancel action of the error screen: drop whatever the
+                // daemon still holds and start over, so a session orphaned by
+                // an earlier run cannot keep answering `StartPairing` with
+                // "A pairing session is already in progress".
+                let (port, session_id) = self.take_cancel_address();
+
+                Task::perform(
+                    async move {
+                        // The outcome is deliberately discarded: the retry
+                        // reports the daemon's own state, and a failed cancel
+                        // only means `StartPairing` will complain again.
+                        let _ = crate::ipc::cancel_pairing(port, session_id).await;
+                    },
+                    |_| ScreenMessage::PairingStarted,
+                )
+            }
             _ => Task::none(),
         }
     }
@@ -252,10 +370,18 @@ impl PairingScreen {
     }
 
     fn view_completing(&self) -> Element<'_, ScreenMessage> {
+        // `CompletePairing` is still unanswered, so the daemon still holds the
+        // session; abandoning the screen cancels it (see `session_in_flight`).
+        let cancel_button = button(text(self.l10n.tr("btn-cancel")).size(16))
+            .padding(10)
+            .on_press(ScreenMessage::PairingCancelled);
+
         column![
             text(self.l10n.tr("pairing-completing")).size(24),
             Space::new().height(Length::Fixed(20.0)),
             text(self.l10n.tr("label-please-wait")).size(16),
+            Space::new().height(Length::Fixed(40.0)),
+            cancel_button,
         ]
         .align_x(iced::Alignment::Center)
         .into()
@@ -321,6 +447,13 @@ impl PairingScreen {
             .padding(10)
             .on_press(ScreenMessage::NavigateToMainMenu);
 
+        // The failure may leave a session open on the daemon — including one
+        // inherited from a GUI run that exited without cancelling — so offer to
+        // drop it and start over instead of only reporting the error.
+        let cancel_button = button(text(self.l10n.tr("btn-cancel-and-retry")).size(16))
+            .padding(10)
+            .on_press(ScreenMessage::PairingCancelRequested);
+
         let message = error.localized(&self.l10n);
 
         column![
@@ -339,6 +472,8 @@ impl PairingScreen {
             Space::new().height(Length::Fixed(20.0)),
             text(message).size(14),
             Space::new().height(Length::Fixed(40.0)),
+            cancel_button,
+            Space::new().height(Length::Fixed(10.0)),
             back_button,
         ]
         .align_x(iced::Alignment::Center)
@@ -366,6 +501,18 @@ mod tests {
             url: url.to_string(),
             qr_data: Rc::new(QrData::new(url).expect("test URL must encode")),
         }
+    }
+
+    fn session(port: u16) -> PairingSession {
+        PairingSession {
+            url: "tapauth://pair?v=2".to_string(),
+            port,
+            session_id: vec![0xab; 16],
+        }
+    }
+
+    fn screen_in(state: PairingState) -> PairingScreen {
+        PairingScreen::for_test(state, 41234)
     }
 
     #[test]
@@ -403,13 +550,136 @@ mod tests {
         }
         .session_in_flight());
 
+        // `CompletePairing` has been sent but not answered, so the daemon is
+        // still holding the session: tearing the screen down must cancel it.
+        assert!(PairingState::CompletingPairing.session_in_flight());
+
         // No session has been opened yet, or `CompletePairing` already
         // consumed it.
         assert!(!PairingState::Loading.session_in_flight());
-        assert!(!PairingState::CompletingPairing.session_in_flight());
         assert!(!PairingState::Success {
             device_id: "ab".to_string(),
         }
         .session_in_flight());
+    }
+
+    #[test]
+    fn completing_pairing_hands_its_session_to_the_cancel() {
+        let mut screen = screen_in(PairingState::CompletingPairing);
+
+        let pending = screen
+            .take_pending_session()
+            .expect("a session completing on the daemon must be cancelled");
+        assert_eq!(pending.port, 41234);
+        assert_eq!(pending.session_id, vec![0xab; 16]);
+        assert!(
+            screen.take_pending_session().is_none(),
+            "tearing the screen down twice must not cancel the session twice"
+        );
+
+        // `Success` means `CompletePairing` persisted the device: the session is
+        // gone daemon-side, so nothing may be cancelled.
+        let mut screen = screen_in(PairingState::Success {
+            device_id: "ab".to_string(),
+        });
+        assert!(screen.take_pending_session().is_none());
+        assert!(screen.session.is_none());
+    }
+
+    #[test]
+    fn the_error_screens_cancel_action_addresses_the_session_or_the_daemon_wildcard() {
+        // This is the exact address the `PairingCancelRequested` arm hands to
+        // `cancel_pairing`.
+        //
+        // A session captured by `StartPairing`: the cancel must name it, so a
+        // newer session started meanwhile is not the one torn down.
+        let mut screen = screen_in(PairingState::Error {
+            error: GuiIpcError::ResponseTimeout,
+        });
+        assert_eq!(screen.take_cancel_address(), (41234, vec![0xab; 16]));
+        assert!(screen.session.is_none());
+        assert!(
+            matches!(screen.state, PairingState::Loading),
+            "the error screen must return to `Loading` for the retry"
+        );
+
+        // `StartPairing` was rejected with "already in progress", so there is no
+        // captured session to name: the cancel must still be issued, with the
+        // daemon's wildcard, and the screen must go back to `Loading` so
+        // `PairingStarted` retries.
+        let mut screen = screen_in(PairingState::Error {
+            error: GuiIpcError::DaemonError("A pairing session is already in progress.".into()),
+        });
+        screen.session = None;
+        assert_eq!(screen.take_cancel_address(), (0, Vec::new()));
+        assert!(
+            matches!(screen.state, PairingState::Loading),
+            "the error screen must return to `Loading` for the retry"
+        );
+    }
+
+    #[test]
+    fn closing_the_window_cancels_a_pending_session_but_never_an_in_flight_completion() {
+        // Every state that may still hold a session cancels it on close...
+        for state in [
+            qr_state("tapauth://pair?v=2"),
+            PairingState::VerifyingSAS {
+                sas: "123-456".to_string(),
+                port: 41234,
+            },
+            PairingState::Error {
+                error: GuiIpcError::ResponseTimeout,
+            },
+        ] {
+            match close_action(&state, Some(session(41234))) {
+                CloseAction::Cancel(pending) => {
+                    assert_eq!(pending.port, 41234);
+                    assert_eq!(pending.session_id, vec![0xab; 16]);
+                }
+                CloseAction::CloseNow => panic!("{state:?} must cancel its session on close"),
+            }
+        }
+
+        // ...except a completion already in flight: the phone has confirmed and
+        // the daemon is persisting the device, so a cancel would throw it away.
+        assert!(matches!(
+            close_action(&PairingState::CompletingPairing, Some(session(41234))),
+            CloseAction::CloseNow
+        ));
+
+        // Nothing captured, or the daemon already dropped the session.
+        assert!(matches!(
+            close_action(
+                &PairingState::Error {
+                    error: GuiIpcError::ResponseTimeout,
+                },
+                None
+            ),
+            CloseAction::CloseNow
+        ));
+        assert!(matches!(
+            close_action(&PairingState::Loading, Some(session(41234))),
+            CloseAction::CloseNow
+        ));
+        assert!(matches!(
+            close_action(
+                &PairingState::Success {
+                    device_id: "ab".to_string(),
+                },
+                Some(session(41234))
+            ),
+            CloseAction::CloseNow
+        ));
+
+        // The screen forwards its own state and captured session.
+        let mut screen = screen_in(PairingState::CompletingPairing);
+        assert!(matches!(screen.close_action(), CloseAction::CloseNow));
+        assert!(
+            screen.session.is_none(),
+            "the taken session must not be cancelled later by a teardown"
+        );
+
+        let mut screen = screen_in(qr_state("tapauth://pair?v=2"));
+        assert!(matches!(screen.close_action(), CloseAction::Cancel(_)));
     }
 }

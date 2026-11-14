@@ -1,5 +1,6 @@
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::{ClientSymmetricKey, CryptoError};
 use crate::protocol::pb::HashAlgorithm;
@@ -92,6 +93,30 @@ pub fn generate_current_ble_temporal_identifier_with_alg(
     generate_ble_temporal_id_with_alg(csk, current_time_window()?, alg)
 }
 
+/// Compare `identifier` against the identifier derived for `window` and, unless
+/// `window` is `0`, for the previous window.
+///
+/// The comparison is constant time ([`ConstantTimeEq`]), so a mismatch cannot be
+/// told from a match by timing. A `window` of `0` has no previous window: an
+/// identifier that does not match the current one is simply not a match there
+/// (`Ok(false)`), never an error.
+fn verify_window_and_previous<const N: usize>(
+    window: u64,
+    identifier: &[u8; N],
+    derive: impl Fn(u64) -> Result<[u8; N], CryptoError>,
+) -> Result<bool, CryptoError> {
+    let current = derive(window)?;
+    if bool::from(identifier.ct_eq(&current)) {
+        return Ok(true);
+    }
+
+    if window == 0 {
+        return Ok(false);
+    }
+    let previous = derive(window - 1)?;
+    Ok(bool::from(identifier.ct_eq(&previous)))
+}
+
 /// Verify a temporal identifier against the current and previous window using
 /// the negotiated hash algorithm.
 pub fn verify_temporal_identifier_with_alg(
@@ -99,16 +124,9 @@ pub fn verify_temporal_identifier_with_alg(
     identifier: &[u8; 16],
     alg: HashAlgorithm,
 ) -> Result<bool, CryptoError> {
-    let window = current_time_window()?;
-
-    if *identifier == generate_temporal_id_with_alg(csk, window, alg)? {
-        return Ok(true);
-    }
-
-    if window == 0 {
-        return Err(CryptoError::KeyDerivationFailed);
-    }
-    Ok(*identifier == generate_temporal_id_with_alg(csk, window - 1, alg)?)
+    verify_window_and_previous(current_time_window()?, identifier, |window| {
+        generate_temporal_id_with_alg(csk, window, alg)
+    })
 }
 
 /// Verify a BLE temporal identifier (10 bytes) against the current and previous
@@ -118,16 +136,9 @@ pub fn verify_ble_temporal_identifier_with_alg(
     identifier: &[u8; 10],
     alg: HashAlgorithm,
 ) -> Result<bool, CryptoError> {
-    let window = current_time_window()?;
-
-    if *identifier == generate_ble_temporal_id_with_alg(csk, window, alg)? {
-        return Ok(true);
-    }
-
-    if window == 0 {
-        return Err(CryptoError::KeyDerivationFailed);
-    }
-    Ok(*identifier == generate_ble_temporal_id_with_alg(csk, window - 1, alg)?)
+    verify_window_and_previous(current_time_window()?, identifier, |window| {
+        generate_ble_temporal_id_with_alg(csk, window, alg)
+    })
 }
 
 /// Compute the 10-byte BLE pairing advertisement identifier:
@@ -307,6 +318,61 @@ mod tests {
             verify_ble_temporal_identifier_with_alg(&csk, &[0u8; 10], HashAlgorithm::Unspecified),
             Err(CryptoError::UnsupportedAlgorithm)
         ));
+    }
+
+    /// A wrong identifier is `Ok(false)` — not an error — on both the 16-byte and
+    /// the 10-byte form, and a window of `0` (which has no previous window) is
+    /// `Ok(false)` too, not `Err(CryptoError::KeyDerivationFailed)`.
+    /// The defect this catches: reporting "this identifier does not match" as a
+    /// derivation error (a caller may surface that as a failure to verify rather
+    /// than a plain mismatch), and the previous-window step running at window 0
+    /// (`window - 1` underflow).
+    ///
+    /// The constant-time property of the comparison is **not** observable here:
+    /// it is a property of how the bytes are compared (`subtle::ConstantTimeEq`),
+    /// not of the value returned, so no assertion below fails if that regresses
+    /// to `==`.
+    #[test]
+    fn test_wrong_identifier_and_zero_window_are_not_errors() {
+        let csk = ClientSymmetricKey::from_bytes([0x2Au8; 32]);
+        let wrong16 = [0xFFu8; 16];
+        let wrong10 = [0xFFu8; 10];
+
+        // Real clock: a mismatch is `Ok(false)`.
+        assert!(
+            current_time_window().unwrap() > 1,
+            "system clock may be broken"
+        );
+        assert!(matches!(
+            verify_temporal_identifier_with_alg(&csk, &wrong16, HashAlgorithm::Sha256),
+            Ok(false)
+        ));
+        assert!(matches!(
+            verify_ble_temporal_identifier_with_alg(&csk, &wrong10, HashAlgorithm::Sha256),
+            Ok(false)
+        ));
+
+        // Window 0: the current window still matches, a different identifier is
+        // `Ok(false)` and nothing underflows.
+        let current_16 = generate_temporal_id_with_alg(&csk, 0, HashAlgorithm::Sha256).unwrap();
+        assert!(verify_window_and_previous(0, &current_16, |window| {
+            generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256)
+        })
+        .unwrap());
+        assert!(!verify_window_and_previous(0, &wrong16, |window| {
+            generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256)
+        })
+        .unwrap());
+
+        let current_10 = generate_ble_temporal_id_with_alg(&csk, 0, HashAlgorithm::Sha256).unwrap();
+        assert!(verify_window_and_previous(0, &current_10, |window| {
+            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256)
+        })
+        .unwrap());
+        assert!(!verify_window_and_previous(0, &wrong10, |window| {
+            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256)
+        })
+        .unwrap());
     }
 
     /// BLAKE3 verification accepts the current window's identifier and rejects an
