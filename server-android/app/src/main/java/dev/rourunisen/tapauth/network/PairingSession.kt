@@ -249,6 +249,21 @@ class PairingSession(
      */
     private val commitLatch = PairingCommitLatch()
 
+    /**
+     * The close itself, behind the boundary in [commitLatch]: the Context-free decision
+     * [PairingSessionRelease] owns, testable without an Android `Context`.
+     */
+    private val release =
+        PairingSessionRelease(commitLatch) {
+            // From here on every wait loop stops waiting for new work.
+            closed.set(true)
+            job?.cancel()
+            // Close the transports directly as well: a coroutine parked in a blocking socket read
+            // only notices cancellation after its current slice.
+            closeLinks()
+            zeroizeEphemeralState()
+        }
+
     /** Completed by [approveSas] / [rejectSas]; drives the transition out of the SAS screen. */
     private val userDecision = CompletableDeferred<UserDecision>()
 
@@ -307,27 +322,14 @@ class PairingSession(
      *
      * Which of the two happens is [PairingCommitLatch]'s decision, taken under its lock, so a close
      * either defers to the whole confirmation or arrives first and prevents all of it; there is no
-     * interleaving in which the device is persisted *and* this coroutine is cancelled.
+     * interleaving in which the device is persisted *and* this coroutine is cancelled. The decision
+     * and the release it guards live in [PairingSessionRelease].
      *
      * @return true when the close was deferred and the session is still finishing its confirmation,
      *   false when this call may release everything — it won the boundary just now, or had already
      *   won
      */
-    fun close(): Boolean {
-        if (commitLatch.requestClose()) {
-            Log.i(TAG, "close() deferred: the pairing confirmation is in flight")
-            return true
-        }
-        // From here on every wait loop stops waiting for new work. Reaching this twice is harmless:
-        // the latched close that won already released, and every step below is idempotent.
-        closed.set(true)
-        job?.cancel()
-        // Close the transports directly as well: a coroutine parked in a blocking socket read only
-        // notices cancellation after its current slice.
-        closeLinks()
-        zeroizeEphemeralState()
-        return false
-    }
+    fun close(): Boolean = release.requestClose()
 
     private suspend fun runSession() {
         try {
@@ -631,13 +633,7 @@ class PairingSession(
      * `PairedDevice`, send `PairingConfirmServer` back and report [ProvisionOutcome] completion.
      */
     private suspend fun awaitProvision(locked: Locked): ProvisionOutcome {
-        val session = synchronized(sessionLock) { pairingSession }
-        val keepalive =
-            if (locked.transport == PairingTransport.UDP && session != null) {
-                session.createKeepalive()
-            } else {
-                null
-            }
+        val keepalive = if (locked.transport == PairingTransport.UDP) createKeepalive() else null
         var nextKeepalive = 0L
         val deadline = System.currentTimeMillis() + CONFIRM_TIMEOUT_MS
 
@@ -660,6 +656,34 @@ class PairingSession(
             }
         }
         return ProvisionOutcome.TimedOut
+    }
+
+    /**
+     * Build the `PairingKeepalive` frame, or null when there is none to build.
+     *
+     * The session is read under the lock and then called outside it, so a [close] that wins the
+     * commit boundary in between can conclude it (see [zeroizeEphemeralState]) and Rust answers
+     * `State`. That is the phase ending, not the pairing failing: null is returned, and the
+     * caller's loop-top `closed` check reports [ProvisionOutcome.Cancelled] — the same outcome
+     * every other "the session was released" path reports. Letting `State` escape instead would
+     * send a cancellation through `runSession`'s generic failure handler, which logs it as an error
+     * and (where the update can still be delivered) shows the user a pairing failure they caused.
+     *
+     * A `State` from a session that is still the live one — an encoding failure — is a real error
+     * and is rethrown unchanged.
+     */
+    private fun createKeepalive(): ByteArray? {
+        val session = synchronized(sessionLock) { pairingSession } ?: return null
+        return try {
+            session.createKeepalive()
+        } catch (e: TapauthException.State) {
+            if (closed.get() || synchronized(sessionLock) { pairingSession !== session }) {
+                Log.i(TAG, "PairingKeepalive skipped: the session was released")
+                null
+            } else {
+                throw e
+            }
+        }
     }
 
     /**

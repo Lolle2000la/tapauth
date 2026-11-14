@@ -217,6 +217,59 @@ internal class PairingCommitLatch {
 }
 
 /**
+ * The close side of a pairing's commit boundary, and the only place a release is decided.
+ *
+ * `PairingSession.close()` cannot be driven from a JVM test — it needs an Android `Context`, a
+ * running transport and the generated UniFFI object — so the decision it makes, "release now or
+ * defer to a confirmation that is already in flight?", lives here with the release injected:
+ * [PairingCommitLatch] answers the question and [onRelease] is the release itself (`PairingSession`
+ * passes cancel-the-job / close-the-links / zeroize-the-keys).
+ *
+ * The returned Boolean is the whole contract `PairingHandle.close()` publishes and
+ * `PairingViewModel.releaseSession()` acts on. Getting it wrong either way undoes finding F: a
+ * deferred close answered `false` cancels the attempt scope mid-confirmation (the phone persists
+ * and the desktop times out), and a close that won answered `true` leaks a session with no screen.
+ *
+ * [onRelease] runs at most once, because a repeat close finds nothing left to release.
+ */
+internal class PairingSessionRelease(
+    private val latch: PairingCommitLatch,
+    private val onRelease: () -> Unit,
+) {
+    private companion object {
+        /** The session's own tag: this is its close path. */
+        const val TAG = "PairingSession"
+    }
+
+    private val lock = Any()
+
+    private var released = false
+
+    /**
+     * Ask for the release.
+     *
+     * @return true when the release is deferred — a commit is in flight and the confirmation must
+     *   finish, so [onRelease] must not run — false when it ran now, or had already run
+     */
+    fun requestClose(): Boolean =
+        synchronized(lock) {
+            when {
+                // A commit is in flight: the confirmation must finish, so nothing is released.
+                latch.requestClose() -> {
+                    Log.i(TAG, "close() deferred: the pairing confirmation is in flight")
+                    true
+                }
+                released -> false
+                else -> {
+                    released = true
+                    onRelease()
+                    false
+                }
+            }
+        }
+}
+
+/**
  * The confirmation phase of a pairing over one locked transport: everything
  * [PairingSession.finishPairing] does that needs no Android `Context`.
  *

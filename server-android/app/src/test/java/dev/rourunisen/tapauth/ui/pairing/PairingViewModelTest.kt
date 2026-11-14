@@ -31,6 +31,19 @@ import org.junit.Test
  * A re-created screen is stood in for by calling [PairingViewModel.beginPairing] again on the same
  * ViewModel — the only thing the screen does when it is re-created — plus [PairingViewModel.leave]
  * with [PairingExit.ScreenDisposed], which is what its `onDispose` runs.
+ *
+ * ### The two ways a pairing can be left, once persisting has begun
+ *
+ * An *abort* is a decision and is written as `PairingAbort(USER_REJECTED_SAS)`; a *release* is the
+ * session being let go. Which one a back press is depends on how far the pairing got:
+ *
+ * * while the SAS is still awaiting, a back press is the rejection the protocol describes and it
+ *   aborts — `leave` looks at `AwaitingSas` first, and the abort goes out from the session's own
+ *   coroutine;
+ * * once the commit window is open (the device record is durable and the confirmation is in
+ *   flight), a back press is a release, and that release is *deferred* — the session answers
+ *   `close() == true`, so the attempt scope keeps running until the burst and linger finish. The
+ *   ViewModel cannot tell the difference by itself: it asks the session, which owns the boundary.
  */
 class PairingViewModelTest {
 
@@ -507,14 +520,18 @@ class PairingViewModelTest {
     }
 
     /**
-     * A configuration change during the confirmation changes nothing: the disposed composition is
-     * not a decision, so nothing is closed, nothing is aborted and the session keeps running.
+     * A configuration change releases nothing, and it does so before the commit boundary is even
+     * consulted: `leave(ScreenDisposed)` returns from its first branch. The commit in flight is set
+     * on purpose — it is what turns the assertion below into a statement about *order*: the early
+     * return wins whatever the release would have answered, so a rotation cannot cancel a
+     * confirmation no matter where in the window it lands.
      *
-     * The defect this catches: a `ScreenDisposed` path that releases the session — the very case
-     * the exit reason exists to keep out of the pairing.
+     * The defect this catches: a `ScreenDisposed` path that falls through to the release. It would
+     * then close the session and cancel the attempt, dropping the burst and linger the desktop is
+     * waiting for.
      */
     @Test
-    fun screenDisposedWhileCommittingChangesNothing() {
+    fun screenDisposedIsIgnoredEvenWhileCommitting() {
         val harness = Harness()
         harness.viewModel.beginPairing(url)
         val session = harness.factory.current
@@ -523,31 +540,42 @@ class PairingViewModelTest {
 
         harness.viewModel.leave(PairingExit.ScreenDisposed)
 
-        assertEquals(0, session.closeCount)
+        assertEquals("ScreenDisposed must not reach the release at all", 0, session.closeCount)
         assertEquals(0, session.rejectCount)
         assertTrue(session.scope!!.isActive)
     }
 
     /**
-     * An explicit back press is a decision, and it still aborts: the deferral above only changes
-     * what a *release* does, never whether the user's abort is written.
+     * A back press inside the commit window is a **release**, not an abort: the SAS was approved a
+     * while ago and the phase is [PairingUpdate.Confirming], so `leave` takes the release path
+     * (`PairingViewModel.leave` aborts only while `AwaitingSas`). That release is deferred, because
+     * the device record is already durable — writing `PairingAbort` here would be the one thing the
+     * protocol cannot undo, and cancelling instead would drop the burst and linger.
      *
-     * The defect this catches: a "committing" check placed in the exit path, which would swallow
-     * the `PairingAbort(USER_REJECTED_SAS)` the protocol expects from the phone.
+     * The abort path is untouched: a back press while the SAS is still *awaiting* is still written
+     * as `PairingAbort(USER_REJECTED_SAS)` — see
+     * [backPressDuringTheSasAbortsOnceAndDestroyingDoesNotAbortAgain]. Nothing is ever both.
+     *
+     * The defect this catches: a `leave` that answers a back press during the commit window by
+     * releasing immediately (cancelling the confirmation) or by aborting a pairing whose device
+     * record already exists.
      */
     @Test
-    fun backPressWhileCommittingStillAborts() {
+    fun aBackPressInsideTheCommitWindowIsADeferredRelease() {
         val harness = Harness()
         harness.viewModel.beginPairing(url)
         val session = harness.factory.current
-        session.emit(PairingUpdate.AwaitingSas("123-456", PairingTransport.UDP))
+        session.emit(PairingUpdate.Confirming(PairingTransport.UDP))
         session.committing = true
 
         harness.viewModel.leave(PairingExit.UserRequested)
 
-        assertEquals(1, session.rejectCount)
-        assertEquals("The abort is written by the session's own coroutine", 0, session.closeCount)
-        assertTrue(session.scope!!.isActive)
+        assertEquals("The release must be attempted", 1, session.closeCount)
+        assertEquals("A durable pairing is not aborted", 0, session.rejectCount)
+        assertTrue(
+            "The deferred release must leave the confirmation running",
+            session.scope!!.isActive,
+        )
     }
 
     /**

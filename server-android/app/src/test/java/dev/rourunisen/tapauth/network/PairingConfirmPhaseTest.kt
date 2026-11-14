@@ -258,6 +258,78 @@ class PairingConfirmPhaseTest {
     }
 
     /**
+     * A frame of *this* session that arrives behind a stream of another session's frames is still
+     * answered, with the same bytes as the burst, and the linger still ends at its deadline: the
+     * intake drops the foreign frames and keeps reading inside the one budget it was handed.
+     *
+     * This is the scenario `PairingCompletionTest` used to build by hand, wrapping the linger in
+     * its own `PairingFrameReader.awaitOwnFrame` call; it now goes through [PairingConfirmPhase],
+     * the object that ships, so no test re-implements the intake.
+     *
+     * The defect this catches: an intake that stops filtering by session — every datagram on the
+     * ephemeral pairing port then reaches the retransmission predicate and is answered with the
+     * completion proof, so a peer with no business seeing it is told the pairing succeeded.
+     */
+    @Test
+    fun aRetransmissionBehindForeignFramesIsAnswered() = runBlocking {
+        val clock = FakeClock()
+        val log = mutableListOf<String>()
+        val crypto = FakeCrypto(CONFIRMATION, CONFIRM_CLIENT, log)
+        val link =
+            FakeLink(clock, log) { now ->
+                // Another pairing's frames up to 600 ms, this session's one retransmission, then
+                // foreign frames again — and the stream stops long after the linger would have, so
+                // an unbounded read cannot end this test by itself.
+                when {
+                    now == 600L -> CONFIRM_CLIENT
+                    now > STREAM_GUARD_MS -> null
+                    else -> FOREIGN
+                }
+            }
+
+        phase(
+                clock,
+                crypto,
+                lingerMs = PairingCompletion.DEFAULT_LINGER_MS,
+                belongsToSession = { it.contentEquals(CONFIRM_CLIENT) },
+            )
+            .finish(
+                link = link,
+                csk = CSK,
+                burstDelaysMs = listOf(0L),
+                persist = { "paired-device" },
+                beginCommit = { true },
+            )
+
+        assertEquals(
+            "The burst and the one answer must be the only sends, got " +
+                log.filter { it.startsWith("send") },
+            2,
+            link.sends.size,
+        )
+        assertSame("The answer must re-send the exact burst bytes", CONFIRMATION, link.sends.last())
+        assertEquals(
+            "Only this session's own frame may reach the retransmission predicate, got " +
+                crypto.decrypted.size +
+                " for " +
+                link.reads.size +
+                " reads",
+            1,
+            crypto.decrypted.size,
+        )
+        assertEquals(
+            "The retransmission must be answered at 600 ms",
+            "send@600",
+            log.filter { it.startsWith("send") }.last(),
+        )
+        assertEquals(
+            "The linger must still end at its deadline",
+            PairingCompletion.DEFAULT_LINGER_MS,
+            clock.now,
+        )
+    }
+
+    /**
      * The session is concluded once, after the linger and therefore after the last frame has been
      * answered — never before it, or a retransmission would arrive at a session whose keys are
      * already gone and Rust would report `State` instead of decrypting it.
