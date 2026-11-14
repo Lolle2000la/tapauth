@@ -190,6 +190,19 @@ class PairingSession(
     /** The session's frame intake: drops frames of other sessions without losing the budget. */
     private val frameReader = PairingFrameReader(sliceMs = RECEIVE_SLICE_MS)
 
+    /**
+     * The confirmation phase: budgeted frame intake, the retransmission predicate, the linger and
+     * the conclusion. The Context-free part of [finishPairing] lives there so a JVM test drives the
+     * same wiring this class ships.
+     */
+    private val confirmPhase =
+        PairingConfirmPhase(
+            crypto = RustConfirmationCrypto(),
+            frameReader = frameReader,
+            completion = completion,
+            belongsToSession = ::belongsToSession,
+        )
+
     private val sessionId = pairingUrl.sessionIdBytes()
 
     // Ephemeral session state. The keys never leave Rust behind the session object; the handshake
@@ -220,7 +233,21 @@ class PairingSession(
      */
     @Volatile private var stashedPacket: ByteArray? = null
 
+    /**
+     * Set once the session must stop waiting for new work: every wait loop reads it to stop, and
+     * [PairingConfirmPhase] passes it to the linger as `isClosed`.
+     *
+     * A close that is deferred (see [close]) deliberately leaves it clear: the confirmation the
+     * desktop is waiting for is exactly the work that must still happen.
+     */
     private val closed = AtomicBoolean(false)
+
+    /**
+     * The commit/close boundary: either the device record starts being written and a close defers
+     * to the confirmation, or a close wins and nothing is persisted at all. One lock decides, so a
+     * close cannot cancel the coroutine in the middle of `persist()`.
+     */
+    private val commitLatch = PairingCommitLatch()
 
     /** Completed by [approveSas] / [rejectSas]; drives the transition out of the SAS screen. */
     private val userDecision = CompletableDeferred<UserDecision>()
@@ -265,18 +292,41 @@ class PairingSession(
     fun rejectSas(): Boolean = userDecision.complete(UserDecision.Reject)
 
     /**
-     * Cancel everything: running coroutines, sockets, GATT, and the Rust pairing session.
+     * Ask the session to stop: running coroutines, sockets, GATT, and the Rust pairing session.
      *
      * Idempotent, so it is safe from `DisposableEffect`, back navigation, or a second call after
      * the session already finished.
+     *
+     * A close that arrives once the device record is being written is **deferred**. Cutting the
+     * coroutine there would drop the rest of the `PairingConfirmServer` burst and the linger that
+     * answers the desktop's retransmissions, so the phone would keep a device record for a desktop
+     * that never learned the pairing succeeded — it would time out against a socket this phone had
+     * already closed. The confirmation is bounded (burst + [PairingCompletion.DEFAULT_LINGER_MS]),
+     * so the session releases itself moments later: `runSession`'s epilogue closes the links,
+     * concludes the Rust session and zeroizes the handshake buffers.
+     *
+     * Which of the two happens is [PairingCommitLatch]'s decision, taken under its lock, so a close
+     * either defers to the whole confirmation or arrives first and prevents all of it; there is no
+     * interleaving in which the device is persisted *and* this coroutine is cancelled.
+     *
+     * @return true when the close was deferred and the session is still finishing its confirmation,
+     *   false when this call may release everything — it won the boundary just now, or had already
+     *   won
      */
-    fun close() {
-        if (!closed.compareAndSet(false, true)) return
+    fun close(): Boolean {
+        if (commitLatch.requestClose()) {
+            Log.i(TAG, "close() deferred: the pairing confirmation is in flight")
+            return true
+        }
+        // From here on every wait loop stops waiting for new work. Reaching this twice is harmless:
+        // the latched close that won already released, and every step below is idempotent.
+        closed.set(true)
         job?.cancel()
         // Close the transports directly as well: a coroutine parked in a blocking socket read only
         // notices cancellation after its current slice.
         closeLinks()
         zeroizeEphemeralState()
+        return false
     }
 
     private suspend fun runSession() {
@@ -488,18 +538,17 @@ class PairingSession(
      * cannot keep this call from returning, and the caller's own deadline (the completion linger in
      * [PairingCompletion], or a phase deadline) is always re-read.
      *
+     * Delegates to [PairingConfirmPhase.awaitOwnFrame] on purpose: the confirmation linger must
+     * read through the same budgeted adapter as every other phase, and one implementation is what
+     * makes that a property of the code rather than of two copies agreeing.
+     *
      * @param budgetMs how long this call may wait in total; defaults to one receive slice
      * @return the frame, or null once the budget is spent or a receive slice expired
      */
     private suspend fun receivePacket(
         link: PairingLink,
         budgetMs: Long = RECEIVE_SLICE_MS,
-    ): ByteArray? =
-        frameReader.awaitOwnFrame(
-            budgetMs = budgetMs,
-            receive = { sliceMs -> link.receive(sliceMs) },
-            belongsToSession = ::belongsToSession,
-        )
+    ): ByteArray? = confirmPhase.awaitOwnFrame(link, budgetMs)
 
     /** Whether [packet] is a v2 `PairingPacket` for [sessionId]. */
     private fun belongsToSession(packet: ByteArray): Boolean =
@@ -640,33 +689,26 @@ class PairingSession(
         locked: Locked,
         provision: ParsedPairingProvision,
     ): ProvisionOutcome {
-        val session = synchronized(sessionLock) { pairingSession }
-        checkNotNull(session) { "Pairing session was released before the completion proof" }
         val device =
-            completion.confirm(
+            confirmPhase.finish(
+                link = locked.link,
+                csk = provision.csk,
                 burstDelaysMs =
                     when (locked.transport) {
                         PairingTransport.UDP -> UDP_CONFIRM_BURST_DELAYS_MS
                         PairingTransport.BLE -> BLE_CONFIRM_BURST_DELAYS_MS
                     },
-                // Built before persisting: a failure here must not leave a device record for a
-                // pairing the desktop never accepted. Rust signs `"tapauth-pair-server-sig-v2" ||
-                // H || csk` with `Ed_S` and encrypts it under `K_s2c`, drawing a fresh nonce, so a
-                // retransmission must re-send these exact bytes rather than build a new proof.
-                buildConfirmation = { session.createConfirmServer(provision.csk) },
                 persist = { persistDevice(locked.response, provision) },
-                send = { packet ->
-                    if (!locked.link.send(packet)) {
-                        Log.w(TAG, "PairingConfirmServer write failed; device record is kept")
-                    }
-                },
-                receive = { budgetMs -> receivePacket(locked.link, budgetMs) },
-                // The desktop re-sends the frame verbatim, so decrypting it again is how a
-                // retransmission is told apart from a keepalive or an abort. The keys must still be
-                // alive for that, which is why zeroization moves below the linger.
-                isRetransmission = { packet -> processConfirmClient(packet) != null },
+                // The commit boundary: taken before anything is written or sent, so from here on a
+                // close is deferred to the confirmation instead of cancelling it — and a close that
+                // already won refuses this outright.
+                beginCommit = { commitLatch.beginCommit() },
                 isClosed = { closed.get() },
             )
+                // A close reached the boundary first, so nothing was persisted and nothing was
+                // sent. `Cancelled` is what every other "the session was released" path in this
+                // class reports (`awaitApproval`, `awaitProvision`), so the UI treats it the same.
+                ?: return ProvisionOutcome.Cancelled
 
         // Deferred until the linger is over so a retransmitted PairingConfirmClient can still be
         // decrypted. `PairingUpdate.Complete` is what tells the UI the attempt succeeded, and the
@@ -675,6 +717,31 @@ class PairingSession(
         // early would let the user end the attempt while the linger is still answering.
         zeroizeEphemeralState()
         return ProvisionOutcome.Completed(device)
+    }
+
+    /**
+     * Adapts the live Rust session onto [PairingConfirmationCrypto], so the confirmation phase can
+     * be driven by a unit test that cannot load `libshared.so`.
+     *
+     * Every call resolves the session at call time rather than capturing it: the Rust object only
+     * exists after [prepareSession], and [zeroizeEphemeralState] swaps it to null.
+     */
+    private inner class RustConfirmationCrypto : PairingConfirmationCrypto {
+        override fun createConfirmServer(csk: ByteArray): ByteArray =
+            requireSession().createConfirmServer(csk)
+
+        override fun processConfirmClient(packet: ByteArray): ByteArray? =
+            // Reuses the phase's own decrypt path (and its "not a confirm client" handling), so
+            // the retransmission predicate and `awaitProvision` cannot disagree about a frame.
+            this@PairingSession.processConfirmClient(packet)?.csk
+
+        override fun conclude() {
+            synchronized(sessionLock) { pairingSession }?.conclude()
+        }
+
+        private fun requireSession(): CryptoPairingSession =
+            synchronized(sessionLock) { pairingSession }
+                ?: error("Pairing session was released before the completion proof")
     }
 
     /**
@@ -793,15 +860,23 @@ class PairingSession(
     /**
      * Release the pairing session and clear the handshake buffers.
      *
-     * The Rust session owns `x_S`, `K_c2s`, `K_s2c` and `H` (`cryptography-specification.md` §4),
-     * and dropping it zeroizes them, so closing the object is the whole of zeroization here. `Ed_S`
-     * is the phone's long-term identity key and lives in Rust's identity copy, untouched.
+     * The Rust session owns `x_S`, `K_c2s`, `K_s2c` and `H` (`cryptography-specification.md` §4).
+     * It is **concluded** first — the one terminal transition — and then closed, which drops the
+     * last reference; concluding explicitly keeps the Rust `Drop` a backstop rather than the only
+     * thing that ever zeroizes a session that ends on a failure path. `Ed_S` is the phone's
+     * long-term identity key and lives in Rust's identity copy, untouched.
      *
-     * Idempotent: the field is swapped to null under the lock, and the generated object tolerates a
-     * second `close()`, because [close] and the session epilogue can both reach this.
+     * Idempotent: the field is swapped to null under the lock, `conclude()` and the generated
+     * object's `close()` both tolerate a second call, because [close] and the session epilogue can
+     * both reach this.
      */
     private fun zeroizeEphemeralState() {
         val session = synchronized(sessionLock) { pairingSession.also { pairingSession = null } }
+        try {
+            session?.conclude()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to conclude the pairing session: ${e.message}")
+        }
         try {
             session?.close()
         } catch (e: Exception) {
@@ -944,8 +1019,13 @@ internal class PairingFrameReader(
     }
 }
 
-/** Uniform view over either transport, so the session logic is written once. */
-private interface PairingLink {
+/**
+ * Uniform view over either transport, so the session logic is written once.
+ *
+ * Internal rather than private so a unit test can stand in a link that records what the session
+ * asked of it — the slice of the confirmation linger included.
+ */
+internal interface PairingLink {
     suspend fun send(packet: ByteArray): Boolean
 
     suspend fun receive(timeoutMs: Long): ByteArray?
