@@ -4587,7 +4587,6 @@ dependencies = [
  "hmac",
  "hostname",
  "if-addrs",
- "jni",
  "libc",
  "nix 0.31.3",
  "paranoid-android",

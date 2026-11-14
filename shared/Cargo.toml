@@ -64,7 +64,6 @@ socket2.workspace = true
 nix.workspace = true
 
 # JNI/UniFFI support (optional)
-jni = { version = "0.22", optional = true }
 # The Rust↔Kotlin surface is generated from the proc-macro declarations in
 # `src/ffi.rs`; `uniffi` is optional so no other workspace crate gains it.
 uniffi = { version = "=0.32.2", optional = true }
@@ -80,7 +79,7 @@ prost-build.workspace = true
 default = []
 # Enables the UniFFI-exported Rust↔Kotlin surface (`src/ffi.rs`). The Gradle
 # build passes this; nothing else in the workspace enables it.
-jni = ["dep:jni", "dep:uniffi"]
+jni = ["dep:uniffi"]
 # Builds the `uniffi-bindgen` binary that generates the Kotlin bindings from
 # this crate's compiled library.
 cli = ["dep:uniffi", "uniffi/cli"]
