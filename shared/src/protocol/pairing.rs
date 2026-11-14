@@ -70,16 +70,30 @@
 //! ## Key lifetime
 //!
 //! [`ClientPairingState::conclude`] and [`ServerPairingSession::conclude`] drop
-//! the derived keys, the transcript hash and the ephemeral X25519 secret as soon
-//! as pairing completes (or is aborted), per cryptography-specification.md §4.
-//! Each side also takes its ephemeral secret as soon as it derives the keys, so it
-//! exists only for the one Diffie-Hellman call that needs it. `conclude` is
-//! terminal: afterwards [`ClientPairingState::negotiated`] still answers and
-//! [`ProtocolError::MissingField`]`("pairing_session_keys")` is what every
-//! key-dependent reader reports, but every protocol operation (`handle_init`,
-//! `create_init`, `verify_response`, the create/verify confirm and abort methods)
-//! fails with [`ProtocolError::SessionConcluded`] instead of running on a session
-//! whose keys are gone.
+//! the derived keys, the transcript hash and the ephemeral X25519 secret, per
+//! cryptography-specification.md §4. Each side also takes its ephemeral secret as
+//! soon as it derives the keys, so it exists only for the one Diffie-Hellman call
+//! that needs it. `conclude` is terminal: afterwards
+//! [`ClientPairingState::negotiated`] still answers, [`ClientPairingState::sas`]
+//! and the transcript-hash accessors return `None`, and every protocol operation
+//! (`handle_init`, `create_init`, `verify_response`, `process_confirm_client`,
+//! `verify_confirm_server`, `create_keepalive`, the create/verify confirm and abort
+//! methods) fails with [`ProtocolError::SessionConcluded`] instead of running on a
+//! session whose keys are gone. The keepalive is the one that carries no key
+//! material, and it is guarded all the same: a path kept open after `conclude` could
+//! only deliver a retransmission nothing would answer.
+//!
+//! ## Where the handshake ends
+//!
+//! [`ServerPairingSession::create_confirm_server`] builds the last message of the
+//! handshake but does **not** end the session: it records that the confirmation
+//! has been sent, which refuses a second proof ([`ProtocolError::ConfirmationAlreadySent`])
+//! and a late [`ServerPairingSession::create_init`] (same error), while
+//! [`ServerPairingSession::process_confirm_client`] stays valid and idempotent, so
+//! the responder keeps answering retransmissions of the provisioning frame. Without
+//! that, a lost confirmation burst leaves the desktop timing out against a phone
+//! that has already paired. Only `conclude()` ends a session; the FFI layer calls it
+//! explicitly, or on drop of the last reference.
 //!
 //! ## Who signs what
 //!
@@ -474,11 +488,11 @@ impl ClientPairingState {
     /// returned `Ok`) or as soon as it is aborted, so `K_c2s`/`K_s2c`/`H` do not
     /// linger in memory (cryptography-specification.md §4). Afterwards
     /// [`ClientPairingState::sas`] and [`ClientPairingState::transcript_hash`] return
-    /// `None`, [`ClientPairingState::negotiated`] still answers, and every operation
-    /// that needs keys fails with [`ProtocolError::MissingField`]`("pairing_session_keys")`.
+    /// `None`, and [`ClientPairingState::negotiated`] still answers.
     ///
     /// `conclude` is **terminal**: every protocol operation (`handle_init`,
-    /// `create_confirm_client`, `create_abort`, `verify_abort`) then fails with
+    /// `create_confirm_client`, `verify_confirm_server`, `create_abort`,
+    /// `verify_abort`) then fails with
     /// [`ProtocolError::SessionConcluded`], so a late retransmission cannot
     /// resurrect a session whose keys are gone. Calling it twice is a no-op.
     pub fn conclude(&mut self) {
@@ -562,11 +576,16 @@ impl ClientPairingState {
     /// `verify_ed25519(Ed_S, "tapauth-pair-server-sig-v2" || H || csk, signature)`.
     /// `Ed_S` is the `server_ed25519_public_key` captured from the accepted
     /// `PairingInit` — never this desktop's own `Ed_C`.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once
+    /// [`ClientPairingState::conclude`] has run: the keys are gone by design then,
+    /// which is not a malformed message.
     pub fn verify_confirm_server(
         &self,
         confirm: &PairingConfirmServer,
         csk: &[u8; 32],
     ) -> Result<(), ProtocolError> {
+        ensure_live(self.concluded)?;
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
         let server_ed25519_public_key = self
@@ -656,6 +675,10 @@ pub struct ServerPairingSession {
     negotiated: Option<NegotiatedAlgorithms>,
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
+    /// Set by [`ServerPairingSession::create_confirm_server`]: the completion proof
+    /// went out, so the handshake has moved past every earlier step while the keys
+    /// stay available for `process_confirm_client` retransmissions.
+    confirmation_sent: bool,
     /// Terminal flag: set by [`ServerPairingSession::conclude`], after which every
     /// protocol operation is refused.
     concluded: bool,
@@ -702,6 +725,7 @@ impl ServerPairingSession {
             negotiated: None,
             transcript_hash: None,
             keys: None,
+            confirmation_sent: false,
             concluded: false,
         }
     }
@@ -714,9 +738,15 @@ impl ServerPairingSession {
     /// Build (once) the `PairingInit` to send, retransmitting the cached copy.
     ///
     /// Fails with [`ProtocolError::SessionConcluded`] once
-    /// [`ServerPairingSession::conclude`] has run.
+    /// [`ServerPairingSession::conclude`] has run, and with
+    /// [`ProtocolError::ConfirmationAlreadySent`] once
+    /// [`ServerPairingSession::create_confirm_server`] has: the handshake is past
+    /// the init step by then, so a late `PairingInit` must not be answered.
     pub fn create_init(&mut self) -> Result<PairingInit, ProtocolError> {
         ensure_live(self.concluded)?;
+        if self.confirmation_sent {
+            return Err(ProtocolError::ConfirmationAlreadySent);
+        }
         if let Some(init) = self.init.as_ref() {
             return Ok(init.clone());
         }
@@ -867,13 +897,17 @@ impl ServerPairingSession {
 
     /// Drop the session keys, the transcript hash and the ephemeral `x_S`.
     ///
-    /// Call this once [`ServerPairingSession::create_confirm_server`] has been sent
-    /// after the user confirmed the SAS, or as soon as the pairing is aborted, so
+    /// Call this once the completion proof is acknowledged — or simply on
+    /// [`ServerPairingSession::create_abort`], or on releasing the session — so
     /// `K_c2s`/`K_s2c`/`H` do not linger in memory (cryptography-specification.md §4).
+    /// Note that sending the proof itself ([`ServerPairingSession::create_confirm_server`])
+    /// is **not** the moment to conclude: the keys must stay available while the
+    /// desktop may still retransmit its provisioning frame.
     /// Same post-conditions as [`ClientPairingState::conclude`]: `conclude` is
     /// terminal, so every later protocol operation (`create_init`, `verify_response`,
-    /// `create_confirm_server`, `create_abort`, `verify_abort`) fails with
-    /// [`ProtocolError::SessionConcluded`]. Calling it twice is a no-op.
+    /// `create_confirm_server`, `process_confirm_client`, `create_abort`,
+    /// `verify_abort`) fails with [`ProtocolError::SessionConcluded`]. Calling it
+    /// twice is a no-op.
     pub fn conclude(&mut self) {
         if self.concluded {
             return;
@@ -897,12 +931,17 @@ impl ServerPairingSession {
     /// `AAD = "tapauth-pair-v2-provision" || H` and decodes
     /// `PairingProvisionPayload`. Returns `csk`/`username`/`client_hostname`; the
     /// caller persists them and requires `csk` to be 32 bytes (enforced here).
-    /// After [`ServerPairingSession::conclude`] the keys are gone, so this fails with
-    /// [`ProtocolError::MissingField`]`("pairing_session_keys")`.
+    ///
+    /// Idempotent by design: the desktop retransmits the *same* frame until it sees
+    /// the completion proof, so this stays valid after
+    /// [`ServerPairingSession::create_confirm_server`] and returns the same payload
+    /// for the same bytes. Only [`ServerPairingSession::conclude`] ends it, and then
+    /// the call fails with [`ProtocolError::SessionConcluded`].
     pub fn process_confirm_client(
         &self,
         confirm: &PairingConfirmClient,
     ) -> Result<PairingProvisionPayload, ProtocolError> {
+        ensure_live(self.concluded)?;
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
         let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
@@ -930,13 +969,22 @@ impl ServerPairingSession {
     /// Each call draws a fresh nonce: a retransmission must re-send the same
     /// [`PairingConfirmServer`], not call this again.
     ///
-    /// Fails with [`ProtocolError::SessionConcluded`] once
-    /// [`ServerPairingSession::conclude`] has run.
+    /// **Not terminal.** On success the session records that the confirmation went
+    /// out: a second call fails with [`ProtocolError::ConfirmationAlreadySent`] and
+    /// so does a later [`ServerPairingSession::create_init`], but
+    /// [`ServerPairingSession::process_confirm_client`] keeps answering the desktop's
+    /// provisioning retransmissions (it needs the same keys). [`ServerPairingSession::conclude`]
+    /// is what ends the session; afterwards every entry point, including this one,
+    /// fails with [`ProtocolError::SessionConcluded`] — the liveness check runs
+    /// first, so a concluded session is never reported as "already sent".
     pub fn create_confirm_server(
-        &self,
+        &mut self,
         csk: &[u8; 32],
     ) -> Result<PairingConfirmServer, ProtocolError> {
         ensure_live(self.concluded)?;
+        if self.confirmation_sent {
+            return Err(ProtocolError::ConfirmationAlreadySent);
+        }
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
         let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
@@ -949,7 +997,23 @@ impl ServerPairingSession {
             &payload.encode_to_vec(),
             &aad,
         )?;
+        self.confirmation_sent = true;
         Ok(PairingConfirmServer { encrypted_complete })
+    }
+
+    /// Build the empty `PairingKeepalive` body.
+    ///
+    /// A keepalive carries no key material and drives no state transition: it exists
+    /// only to keep a NAT mapping or a BLE link open while the peer's next frame is on
+    /// its way. That is exactly why it needs the liveness check too — the only frame a
+    /// concluded session could still be waiting for is a `PairingConfirmClient`
+    /// retransmission, and [`ServerPairingSession::process_confirm_client`] refuses it
+    /// once the keys are gone, so keeping the path open for it would be pointless.
+    /// Fails with [`ProtocolError::SessionConcluded`] once
+    /// [`ServerPairingSession::conclude`] has run.
+    pub fn create_keepalive(&self) -> Result<PairingKeepalive, ProtocolError> {
+        ensure_live(self.concluded)?;
+        Ok(PairingKeepalive {})
     }
 
     /// Build an abort, authenticated with `K_s2c` when the keys already exist.
@@ -1390,7 +1454,7 @@ mod tests {
     /// which the desktop would then verify against the wrong key.
     #[test]
     fn completion_proof_is_signed_by_ed_s_not_ed_c() {
-        let (desktop, phone) = established();
+        let (desktop, mut phone) = established();
         let csk = [0x42u8; 32];
         let confirm = phone.create_confirm_server(&csk).unwrap();
 
@@ -1997,7 +2061,7 @@ mod tests {
             ],
             vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
         );
-        let (desktop, phone) = outcome.expect("a pinned algorithm the peer offers must pair");
+        let (desktop, mut phone) = outcome.expect("a pinned algorithm the peer offers must pair");
 
         let expected = NegotiatedAlgorithms {
             symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
@@ -2165,11 +2229,12 @@ mod tests {
             desktop.create_confirm_client(&csk, "luca", "thinkpad"),
             Err(ProtocolError::SessionConcluded)
         ));
-        // The key-dependent readers still report the missing keys, which is what
-        // proves `conclude` actually dropped them.
+        // The key-dependent readers report the conclusion, not a missing field:
+        // the keys are gone because the caller ended the session, and the FFI layer
+        // must not turn that into a security failure.
         assert!(matches!(
             desktop.verify_confirm_server(&confirm_server, &csk),
-            Err(ProtocolError::MissingField("pairing_session_keys"))
+            Err(ProtocolError::SessionConcluded)
         ));
         assert!(matches!(
             phone.create_confirm_server(&csk),
@@ -2177,7 +2242,81 @@ mod tests {
         ));
         assert!(matches!(
             phone.process_confirm_client(&confirm_client),
-            Err(ProtocolError::MissingField("pairing_session_keys"))
+            Err(ProtocolError::SessionConcluded)
+        ));
+    }
+
+    /// Sending the completion proof does not end the session: the responder keeps
+    /// answering retransmissions of the provisioning frame, while every step the
+    /// handshake has already passed is refused.
+    /// The defect this catches: `create_confirm_server` concluding the session, so a
+    /// lost confirmation burst is answered with
+    /// `MissingField("pairing_session_keys")` — nothing on the wire — and the desktop
+    /// times out against a phone that has already paired.
+    #[test]
+    fn confirm_server_keeps_answering_retransmissions() {
+        let (desktop, mut phone, response, qr_pk) = exchange();
+        phone.verify_response(&response, &qr_pk).unwrap();
+        let csk = [0x42u8; 32];
+
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        phone.create_confirm_server(&csk).unwrap();
+
+        // The desktop retransmits the same frame until the proof reaches it.
+        let first = phone.process_confirm_client(&confirm_client).unwrap();
+        let second = phone.process_confirm_client(&confirm_client).unwrap();
+        assert_eq!(first.csk, csk.to_vec());
+        assert_eq!(
+            first.encode_to_vec(),
+            second.encode_to_vec(),
+            "a retransmitted provisioning frame must be answered with the same payload"
+        );
+
+        // Past steps stay refused, and as a state error: the handshake moved on, it
+        // did not break.
+        assert!(matches!(
+            phone.create_confirm_server(&csk),
+            Err(ProtocolError::ConfirmationAlreadySent)
+        ));
+        assert!(matches!(
+            phone.create_init(),
+            Err(ProtocolError::ConfirmationAlreadySent)
+        ));
+        assert!(matches!(
+            phone.verify_response(&response, &qr_pk),
+            Err(ProtocolError::InvalidMessageFormat)
+        ));
+    }
+
+    /// A concluded session reports the conclusion on both sides, not the fields
+    /// `conclude` dropped.
+    /// The defect this catches: `SessionConcluded` on the create methods but
+    /// `MissingField("pairing_session_keys")` on `verify_confirm_server` /
+    /// `process_confirm_client`, which the FFI layer maps to `TapauthError::Security`
+    /// — a legitimate post-conclude call reported to Kotlin as an attack.
+    #[test]
+    fn concluded_sessions_report_the_conclusion_not_the_missing_keys() {
+        let (mut desktop, mut phone) = established();
+        let csk = [0x42u8; 32];
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+
+        // The phone sent its proof, then concluded: the provisioning retransmission
+        // finds a concluded session, not a session without keys.
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        phone.conclude();
+        assert!(matches!(
+            phone.process_confirm_client(&confirm_client),
+            Err(ProtocolError::SessionConcluded)
+        ));
+
+        desktop.conclude();
+        assert!(matches!(
+            desktop.verify_confirm_server(&confirm_server, &csk),
+            Err(ProtocolError::SessionConcluded)
         ));
     }
 
@@ -2233,12 +2372,13 @@ mod tests {
             desktop.verify_abort(&abort).unwrap_err(),
             ProtocolError::SessionConcluded
         ));
-        // ... and the key-dependent reader reports the keys that `conclude` dropped.
+        // ... and the key-dependent reader reports the concluded session, exactly
+        // like the state-machine entries (not the keys it dropped).
         assert!(matches!(
             desktop
                 .verify_confirm_server(&confirm_server, &csk)
                 .unwrap_err(),
-            ProtocolError::MissingField("pairing_session_keys")
+            ProtocolError::SessionConcluded
         ));
 
         // Phone: same rule on every entry point.
@@ -2268,7 +2408,13 @@ mod tests {
         ));
         assert!(matches!(
             phone.process_confirm_client(&confirm_client).unwrap_err(),
-            ProtocolError::MissingField("pairing_session_keys")
+            ProtocolError::SessionConcluded
+        ));
+        // The keepalive carries no key material, and is still refused: the path it
+        // would keep open could only deliver a retransmission nothing can answer.
+        assert!(matches!(
+            phone.create_keepalive().unwrap_err(),
+            ProtocolError::SessionConcluded
         ));
 
         // Metadata survives: only key material and protocol operations are gone.
@@ -2322,13 +2468,15 @@ mod tests {
     }
 
     /// Once the desktop concluded after the phone's completion proof, it cannot
-    /// build another provisioning payload.
+    /// build another provisioning payload — while the phone that sent the proof is
+    /// still live (sending it is not a conclusion; see
+    /// `confirm_server_keeps_answering_retransmissions`).
     /// The defect this catches: a concluded desktop that still writes a
     /// `PairingConfirmClient` (provisioning the CSK again) because `conclude` only
     /// cleared the SAS.
     #[test]
     fn create_confirm_server_then_create_confirm_client_is_rejected() {
-        let (mut desktop, phone) = established();
+        let (mut desktop, mut phone) = established();
         let csk = [0x42u8; 32];
 
         let confirm_server = phone.create_confirm_server(&csk).unwrap();
@@ -2424,7 +2572,7 @@ mod tests {
             ],
             vec![HashAlgorithm::Sha256],
         );
-        let (desktop, phone) = outcome.unwrap();
+        let (desktop, mut phone) = outcome.unwrap();
         assert_eq!(
             desktop.negotiated().unwrap().symmetric_algorithm,
             SymmetricAlgorithm::Chacha20Poly1305

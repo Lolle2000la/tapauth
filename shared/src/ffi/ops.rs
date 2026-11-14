@@ -29,8 +29,8 @@ use crate::protocol::pairing::{
     PAIRING_SESSION_ID_LEN,
 };
 use crate::protocol::pb::{
-    pairing_packet, EncryptedPacket, HashAlgorithm, PairingAbortReason, PairingKeepalive,
-    PairingPacket, PayloadType, SignatureAlgorithm, SymmetricAlgorithm, WrapperMessage,
+    pairing_packet, EncryptedPacket, HashAlgorithm, PairingAbortReason, PairingPacket, PayloadType,
+    SignatureAlgorithm, SymmetricAlgorithm, WrapperMessage,
 };
 
 /// Length of an authentication challenge (`AuthenticationRequest.challenge`).
@@ -129,6 +129,11 @@ impl From<ProtocolError> for TapauthError {
             },
             ProtocolError::SessionConcluded => Self::State {
                 detail: "pairing session already concluded".to_string(),
+            },
+            ProtocolError::ConfirmationAlreadySent => Self::State {
+                detail: "pairing confirmation already sent; the handshake has moved past \
+                         this step"
+                    .to_string(),
             },
         }
     }
@@ -715,8 +720,11 @@ pub(crate) fn pairing_process_confirm_client(
 }
 
 /// Build the completion proof (serialized `PairingPacket` with `PairingConfirmServer`).
+///
+/// Marks the session's confirmation as sent; the session stays live so
+/// `pairing_process_confirm_client` can keep answering retransmissions.
 pub(crate) fn pairing_create_confirm_server(
-    session: &ServerPairingSession,
+    session: &mut ServerPairingSession,
     csk: &[u8; CSK_LEN],
 ) -> Result<Vec<u8>, TapauthError> {
     let confirm = session.create_confirm_server(csk)?;
@@ -727,11 +735,14 @@ pub(crate) fn pairing_create_confirm_server(
 ///
 /// The frame carries no key material and no state transition: it only keeps a NAT
 /// or BLE link alive while the two users compare the SAS. Kotlin must not hand-build
-/// the wire format, so the empty message is encoded here.
+/// the wire format, so the empty message is encoded here. A concluded session refuses
+/// it (`State`), like every other entry point: the frame would keep a path open for a
+/// `PairingConfirmClient` retransmission that `process_confirm_client` also refuses.
 pub(crate) fn pairing_create_keepalive(
     session: &ServerPairingSession,
 ) -> Result<Vec<u8>, TapauthError> {
-    encode_session_packet(session, pairing_packet::Msg::Keepalive(PairingKeepalive {}))
+    let keepalive = session.create_keepalive()?;
+    encode_session_packet(session, pairing_packet::Msg::Keepalive(keepalive))
 }
 
 /// Resolve a caller-supplied `PairingAbortReason` id.

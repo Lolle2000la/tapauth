@@ -1980,7 +1980,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_session_answers_the_sas_and_provisions_the_csk() {
-        let Some((session, phone, phone_socket, daemon, session_id, phone_key)) =
+        let Some((session, mut phone, phone_socket, daemon, session_id, phone_key)) =
             session_and_verified_phone().await
         else {
             return;
