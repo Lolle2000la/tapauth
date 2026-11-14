@@ -138,7 +138,11 @@ const CANCEL_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// process-wide GATT permit included). Two steps stay under
 /// [`CANCEL_TEARDOWN_TIMEOUT`], so a `CancelPairing` still gets its answer.
 ///
-/// Tests override the budget on the session rather than sleeping.
+/// This is the production value only; [`teardown_in_order`] takes the budget as a
+/// parameter, which is how the tests use an elapsed or millisecond-scale one
+/// without sleeping. There is no per-session override: a `Session`'s teardown
+/// steps cannot be made to hang without BlueZ or a privileged host firewall, so a
+/// session-level knob could not be tested.
 pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 /// Largest pairing frame accepted from either transport. `PairingPacket` stays
@@ -293,22 +297,6 @@ fn abort_reason_name(reason: i32) -> &'static str {
         Ok(reason) => reason.as_str_name(),
         Err(_) => "UNKNOWN",
     }
-}
-
-/// Whether a rejected `PairingConfirmServer` is the benign tail of the handshake
-/// rather than a proof that did not verify.
-///
-/// [`ClientPairingState::verify_confirm_server`] reports
-/// [`ProtocolError::SessionConcluded`] once the session has concluded — the state
-/// machine dropped its keys by design, so the phone re-sending a proof that
-/// already landed is answered with that error, not with a signature failure. It
-/// must not be logged where a real rejection would be, or a routine
-/// retransmission reads like a tampered message.
-///
-/// Everything else (a bad tag, a missing field in the frame) is a rejection and
-/// keeps the `warn`.
-fn confirm_server_rejection_is_benign(error: &ProtocolError) -> bool {
-    matches!(error, ProtocolError::SessionConcluded)
 }
 
 // ==== Session handle ========================================================
@@ -783,7 +771,6 @@ async fn run_session(
         terminal: None,
         server_public_key: None,
         server_device_name: String::new(),
-        teardown_budget: TEARDOWN_BUDGET,
     };
 
     tracing::info!(
@@ -944,9 +931,6 @@ struct Session {
     server_public_key: Option<[u8; 32]>,
     /// The phone's display name, captured from the accepted `PairingInit`.
     server_device_name: String,
-    /// Bound on each teardown step; [`TEARDOWN_BUDGET`] in production, a
-    /// millisecond-scale value in tests.
-    teardown_budget: Duration,
 }
 
 impl Session {
@@ -1007,12 +991,11 @@ impl Session {
     /// to the session that just ended.
     ///
     /// What is guaranteed is that the removal is **awaited**, not that it always
-    /// succeeds: both steps run under [`Session::teardown_budget`]
-    /// ([`TEARDOWN_BUDGET`]), and a step that overruns is abandoned (its future
-    /// dropped, which releases the GATT permit even when `bluer` is wedged) and
-    /// reported by [`teardown_in_order`] at `warn`. A client may therefore still
-    /// find an open port if `iptables`/`firewall-cmd` failed or hung; what it can
-    /// no longer find is a port the daemon is still *using*.
+    /// succeeds: both steps run under [`TEARDOWN_BUDGET`], and a step that overruns
+    /// is abandoned (its future dropped, which releases the GATT permit even when
+    /// `bluer` is wedged) and reported by [`teardown_in_order`] at `warn`. A client
+    /// may therefore still find an open port if `iptables`/`firewall-cmd` failed or
+    /// hung; what it can no longer find is a port the daemon is still *using*.
     async fn finish(mut self) {
         // No command may be queued from here on: the loop is over, and a
         // `CancelPairing` that slipped in must fail fast instead of waiting out
@@ -1024,7 +1007,7 @@ impl Session {
             // dropped). Observers still get exactly one terminal phase.
             SessionPhase::Failed("the pairing session ended without an outcome".to_string())
         });
-        let budget = self.teardown_budget;
+        let budget = TEARDOWN_BUDGET;
         // Moved into the stop future so that abandoning it drops the link: the
         // `GattRegistration` it holds is what keeps the process-wide GATT permit
         // claimed, and a permit never released blocks every later pairing and
@@ -1331,21 +1314,16 @@ impl Session {
             // may still be settling, and the check is cheap. Keep retransmitting
             // PairingConfirmClient until the deadline (Step 5).
             //
-            // `SessionConcluded` is not a rejected proof: the state machine is
-            // already over (the desktop concluded it), so this is the tail of a
-            // retransmission and belongs at `debug`, not in the warning stream an
-            // operator reads for tampered messages.
-            if confirm_server_rejection_is_benign(&e) {
-                tracing::debug!(
-                    "Ignoring the phone's PairingConfirmServer: the pairing session already \
-                     concluded"
-                );
-            } else {
-                tracing::warn!(
-                    "Rejected the phone's PairingConfirmServer ({}); still provisioning the CSK",
-                    e
-                );
-            }
+            // This arm cannot see `SessionConcluded`: both `conclude()` call sites
+            // (`on_confirm_server`'s own success path and `on_cancel`) return
+            // `Flow::Done`, which ends the loop, so nothing verifies a
+            // `PairingConfirmServer` after the keys are dropped. A concluded
+            // session is therefore never reported here, and every error that
+            // reaches this point is a real rejection.
+            tracing::warn!(
+                "Rejected the phone's PairingConfirmServer ({}); still provisioning the CSK",
+                e
+            );
             return Flow::Continue;
         }
 
@@ -2032,7 +2010,6 @@ mod tests {
             terminal: None,
             server_public_key: None,
             server_device_name: String::new(),
-            teardown_budget: TEARDOWN_BUDGET,
         };
         (session, phases)
     }
@@ -2684,6 +2661,10 @@ mod tests {
     /// The link here stands in for `PairingLink`: what matters is that the value
     /// the stop future owns is dropped when the budget abandons it, which is what
     /// releases the permit in the real type.
+    ///
+    /// The body runs under an outer timeout so the regression this guards against —
+    /// an unbounded `await` — fails in seconds with an assertion instead of parking
+    /// the test binary until CI kills the job.
     #[tokio::test]
     async fn a_hung_teardown_still_publishes_the_terminal_phase_and_releases_the_link() {
         /// Stands in for `PairingLink`: its drop is the permit release.
@@ -2695,69 +2676,104 @@ mod tests {
             }
         }
 
-        let released = Arc::new(AtomicBool::new(false));
-        let published = Arc::new(AtomicBool::new(false));
-        let close_entered = Arc::new(AtomicBool::new(false));
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            // 1. Both steps hang from their first poll, under an already elapsed
+            //    budget.
+            let released = Arc::new(AtomicBool::new(false));
+            let published = Arc::new(AtomicBool::new(false));
+            let close_entered = Arc::new(AtomicBool::new(false));
 
-        let link = Link(released.clone());
-        let publish_flag = published.clone();
-        let close_flag = close_entered.clone();
+            let link = Link(released.clone());
+            let publish_flag = published.clone();
+            let close_flag = close_entered.clone();
 
-        let outcome = teardown_in_order(
-            async move {
-                let _held = link;
-                std::future::pending::<()>().await
-            },
-            async move {
-                close_flag.store(true, Ordering::SeqCst);
-                std::future::pending::<()>().await
-            },
-            move || {
-                publish_flag.store(true, Ordering::SeqCst);
-            },
-            // An elapsed budget: `Duration::ZERO` makes the timeout fire on the
-            // next poll, so the test never sleeps.
-            Duration::ZERO,
-        )
+            let outcome = teardown_in_order(
+                async move {
+                    let _held = link;
+                    std::future::pending::<()>().await
+                },
+                async move {
+                    close_flag.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await
+                },
+                move || {
+                    publish_flag.store(true, Ordering::SeqCst);
+                },
+                // An elapsed budget: `Duration::ZERO` makes the timeout fire on
+                // the next poll, so this case never sleeps.
+                Duration::ZERO,
+            )
+            .await;
+
+            assert!(outcome.stop_timed_out, "a hung stop must be reported");
+            assert!(
+                outcome.firewall_timed_out,
+                "a hung firewall close must be reported"
+            );
+            assert!(
+                published.load(Ordering::SeqCst),
+                "the terminal phase must be published even when the teardown hangs"
+            );
+            assert!(
+                released.load(Ordering::SeqCst),
+                "abandoning the stop future must drop the link, which releases the GATT permit"
+            );
+            assert!(
+                close_entered.load(Ordering::SeqCst),
+                "the firewall close must have been started, not skipped"
+            );
+
+            // 2. A budget that has to be *waited out*: the stop future yields a few
+            //    times before it goes pending, so a teardown that abandons the step
+            //    on the first poll instead of after its budget leaves `driven` unset.
+            let released = Arc::new(AtomicBool::new(false));
+            let driven = Arc::new(AtomicBool::new(false));
+            let published = Arc::new(AtomicBool::new(false));
+            let link = Link(released.clone());
+            let driven_flag = driven.clone();
+            let publish_flag = published.clone();
+
+            let outcome = teardown_in_order(
+                async move {
+                    let _held = link;
+                    for _ in 0..3 {
+                        tokio::task::yield_now().await;
+                    }
+                    driven_flag.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await
+                },
+                async {},
+                move || {
+                    publish_flag.store(true, Ordering::SeqCst);
+                },
+                Duration::from_millis(250),
+            )
+            .await;
+
+            assert!(
+                driven.load(Ordering::SeqCst),
+                "the stop future must be driven until it goes pending, not abandoned on \
+                 the first poll"
+            );
+            assert!(
+                outcome.stop_timed_out,
+                "a stop that outlives its budget must be reported"
+            );
+            assert!(
+                !outcome.firewall_timed_out,
+                "a firewall close that finishes at once must not be reported as timed out"
+            );
+            assert!(
+                released.load(Ordering::SeqCst),
+                "the abandoned link must be dropped in the waited-out case too"
+            );
+            assert!(published.load(Ordering::SeqCst));
+        })
         .await;
 
-        assert!(outcome.stop_timed_out, "a hung stop must be reported");
         assert!(
-            outcome.firewall_timed_out,
-            "a hung firewall close must be reported"
+            finished.is_ok(),
+            "the teardown never finished: a step is awaited without a bound"
         );
-        assert!(
-            published.load(Ordering::SeqCst),
-            "the terminal phase must be published even when the teardown hangs"
-        );
-        assert!(
-            released.load(Ordering::SeqCst),
-            "abandoning the stop future must drop the link, which releases the GATT permit"
-        );
-        assert!(
-            close_entered.load(Ordering::SeqCst),
-            "the firewall close must have been started, not skipped"
-        );
-    }
-
-    /// A late `PairingConfirmServer` on a concluded session is not a rejected
-    /// proof.
-    ///
-    /// The defect this catches: reporting every `verify_confirm_server` error at
-    /// `warn`, so the phone's ordinary post-conclusion retransmission — which is
-    /// `SessionConcluded`, not the `MissingField` it used to be — reads in the
-    /// operator's log like a tampered message.
-    #[test]
-    fn a_late_confirm_server_is_not_reported_as_a_rejected_proof() {
-        assert!(confirm_server_rejection_is_benign(
-            &ProtocolError::SessionConcluded
-        ));
-        // A proof that does not verify stays a warning.
-        assert!(!confirm_server_rejection_is_benign(
-            &ProtocolError::MissingField("signature")
-        ));
-        assert!(!confirm_server_rejection_is_benign(
-            &ProtocolError::InvalidSignature
-        ));
     }
 }

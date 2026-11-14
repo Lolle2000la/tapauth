@@ -137,6 +137,10 @@ impl FirewallGuard {
     /// [`Drop`] that follows sees the `closed` flag and does not enqueue a second
     /// removal. The blocking subprocess runs on the blocking pool and is awaited,
     /// so a failure is reported here (and logged) rather than detached.
+    ///
+    /// A call that could **not** reach a decision — the shared slot is poisoned, or
+    /// the blocking task died — returns `Err` and re-arms the best-effort [`Drop`],
+    /// so a close that did not happen is never reported as one.
     pub async fn close(&self) -> Result<(), FirewallError> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -144,17 +148,33 @@ impl FirewallGuard {
 
         let (port, protocol) = (self.port, self.protocol);
         match tokio::task::spawn_blocking(move || do_explicit_close(port, protocol)).await {
+            Ok(CloseDisposition::Closed) => Ok(()),
             // Still shared with another live guard: nothing was removed, so this
             // guard keeps its best-effort drop.
             Ok(CloseDisposition::KeptForAnotherHolder) => {
                 self.closed.store(false, Ordering::SeqCst);
                 Ok(())
             }
-            Ok(CloseDisposition::Closed) => Ok(()),
-            Err(e) => Err(FirewallError::Io(std::io::Error::other(format!(
-                "the firewall close task failed: {}",
-                e
-            )))),
+            // Nothing was removed and we do not know why: re-arm the fallback and
+            // report, so the caller (`Session::finish`) logs it instead of
+            // publishing a terminal phase over a silent failure.
+            Ok(CloseDisposition::Unknown(reason)) => {
+                self.closed.store(false, Ordering::SeqCst);
+                Err(FirewallError::LockPoisoned(format!(
+                    "could not remove the rule for port {} ({}): {}",
+                    port, protocol, reason
+                )))
+            }
+            // The blocking task panicked or was dropped before it ran. `do_drop_close`
+            // re-checks `is_open` under the slot lock, so letting the fallback try
+            // again cannot remove a rule twice.
+            Err(e) => {
+                self.closed.store(false, Ordering::SeqCst);
+                Err(FirewallError::Io(std::io::Error::other(format!(
+                    "the firewall close task failed: {}",
+                    e
+                ))))
+            }
         }
     }
 }
@@ -196,6 +216,9 @@ enum CloseDisposition {
     Closed,
     /// Another live guard shares the `(port, protocol)`; the rule stays.
     KeptForAnotherHolder,
+    /// The decision could not be made, so nothing was removed. The reason is
+    /// reported to the caller: silence here would be a close that never happened.
+    Unknown(&'static str),
 }
 
 /// [`FirewallGuard::close`], on the blocking pool.
@@ -206,12 +229,28 @@ enum CloseDisposition {
 /// best-effort drop both observe — and the rule is removed unless another live
 /// guard still holds the slot.
 fn do_explicit_close(port: u16, protocol: Protocol) -> CloseDisposition {
+    do_explicit_close_with(port, protocol, close_port)
+}
+
+/// [`do_explicit_close`] with the external removal injected.
+///
+/// The seam exists so a test can assert *whether* the rule was removed (and with
+/// which port/protocol) without shelling out to `iptables`/`firewall-cmd`, which
+/// needs privileges and a host firewall to observe.
+fn do_explicit_close_with<Remove>(
+    port: u16,
+    protocol: Protocol,
+    remove_rule: Remove,
+) -> CloseDisposition
+where
+    Remove: FnOnce(u16, Protocol) -> Result<(), FirewallError>,
+{
     let port_ctrl = {
         let map = match guards().lock() {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("guard map lock poisoned on close: {}", e);
-                return CloseDisposition::Closed;
+                return CloseDisposition::Unknown("the guard map lock is poisoned");
             }
         };
         match map.get(&(port, protocol)) {
@@ -225,7 +264,7 @@ fn do_explicit_close(port: u16, protocol: Protocol) -> CloseDisposition {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("port control lock poisoned on close: {}", e);
-            return CloseDisposition::Closed;
+            return CloseDisposition::Unknown("the port control lock is poisoned");
         }
     };
 
@@ -242,7 +281,7 @@ fn do_explicit_close(port: u16, protocol: Protocol) -> CloseDisposition {
 
     ctrl.weak = Weak::new();
     if ctrl.is_open {
-        if let Err(e) = close_port(port, protocol) {
+        if let Err(e) = remove_rule(port, protocol) {
             tracing::error!("Failed to close firewall port: {}", e);
         }
         ctrl.is_open = false;
@@ -486,13 +525,17 @@ mod tests {
     /// assertion that is true when the test runs alone.
     ///
     /// NOTE: these tests build a `FirewallGuard` directly (rather than through
-    /// `FirewallGuard::new`) and register it in the slot with `is_open = false`,
-    /// which is what keeps them free of `iptables`/`firewall-cmd` side effects.
+    /// `FirewallGuard::new`), so they never open a port. The removal itself is
+    /// injected through [`do_explicit_close_with`], which is what keeps them free
+    /// of `iptables`/`firewall-cmd` while still asserting that it is asked for.
     const CLOSE_TEST_PORT: u16 = 45_679;
     const SHARED_CLOSE_TEST_PORT: u16 = 45_680;
+    const REMOVE_TEST_PORT: u16 = 45_681;
+    const SHARED_REMOVE_TEST_PORT: u16 = 45_683;
+    const POISONED_TEST_PORT: u16 = 45_682;
 
-    /// A guard registered in a slot that claims no open rule, so the close
-    /// decision is exercised without shelling out.
+    /// A guard registered in a slot, so the close decision is exercised without
+    /// shelling out.
     fn registered_guard(port: u16, is_open: bool) -> (Arc<FirewallGuard>, PortSlot) {
         let guard = Arc::new(FirewallGuard {
             port,
@@ -511,11 +554,10 @@ mod tests {
     /// `close()` deregisters the guard before it awaits the removal, so the wait
     /// really sees a port nobody holds.
     ///
-    /// The defects this catches: a close that leaves the requesting guard
-    /// registered (what `do_drop_close`'s liveness check would see), so the
-    /// external command never runs and the close reports success while the port
-    /// stays open — the pairing session would then publish `Finished`/`Failed`
-    /// with its pairing port still reachable.
+    /// The defect this catches: a close that leaves the requesting guard
+    /// registered (what `do_drop_close`'s liveness check would see), so nothing is
+    /// ever removed and the close reports success — the pairing session would then
+    /// publish `Finished`/`Failed` with its pairing port still reachable.
     #[tokio::test]
     async fn close_deregisters_the_guard_before_the_rule_is_removed() {
         let (guard, slot) = registered_guard(CLOSE_TEST_PORT, false);
@@ -533,6 +575,35 @@ mod tests {
             "close must deregister the guard it is closing"
         );
         assert!(guard.closed.load(Ordering::SeqCst));
+    }
+
+    /// An open rule is actually removed, with this port and protocol.
+    ///
+    /// The defect this catches: a close path that deregisters the guard and marks
+    /// the port closed *without* removing the rule, so the rule outlives the phase
+    /// it was opened for while every assertion about the slot still passes. The
+    /// remover is injected, so this runs without privileges.
+    #[test]
+    fn an_open_rule_is_removed_with_this_port_and_protocol() {
+        let (_guard, slot) = registered_guard(REMOVE_TEST_PORT, true);
+        let removed = std::sync::Mutex::new(Vec::new());
+
+        let disposition =
+            do_explicit_close_with(REMOVE_TEST_PORT, Protocol::Udp, |port, protocol| {
+                removed.lock().unwrap().push((port, protocol));
+                Ok(())
+            });
+
+        assert!(matches!(disposition, CloseDisposition::Closed));
+        assert_eq!(
+            &*removed.lock().unwrap(),
+            &[(REMOVE_TEST_PORT, Protocol::Udp)],
+            "the rule of this (port, protocol) must be removed exactly once"
+        );
+        assert!(
+            !slot.lock().unwrap().is_open,
+            "a removed rule must be recorded as closed"
+        );
     }
 
     /// One holder closing a shared guard must not cut the port out from under the
@@ -558,5 +629,68 @@ mod tests {
             "a shared guard must keep its drop fallback, or the port is never closed"
         );
         drop(other);
+    }
+
+    /// A port another live guard still holds is not removed, not even attempted.
+    ///
+    /// The defect this catches: the close decision ignoring the other holder and
+    /// shelling out anyway, which deletes the rule the other session is using.
+    #[test]
+    fn a_shared_port_is_not_removed_for_the_other_holder() {
+        let (guard, slot) = registered_guard(SHARED_REMOVE_TEST_PORT, true);
+        let _other = Arc::clone(&guard);
+        let removed = std::sync::Mutex::new(Vec::new());
+
+        let disposition =
+            do_explicit_close_with(SHARED_REMOVE_TEST_PORT, Protocol::Udp, |port, protocol| {
+                removed.lock().unwrap().push((port, protocol));
+                Ok(())
+            });
+
+        assert!(matches!(
+            disposition,
+            CloseDisposition::KeptForAnotherHolder
+        ));
+        assert!(
+            removed.lock().unwrap().is_empty(),
+            "another live holder's rule must not be removed"
+        );
+        assert!(
+            slot.lock().unwrap().is_open,
+            "the other holder's port must stay open"
+        );
+    }
+
+    /// A slot that cannot be read is reported as a failure, not as a close.
+    ///
+    /// The defect this catches: mapping a poisoned lock to a successful close, so
+    /// `close()` returns `Ok`, the `closed` flag suppresses the best-effort
+    /// `Drop`, and the rule is never removed while the pairing session publishes
+    /// `Finished` over it.
+    #[tokio::test]
+    async fn a_poisoned_slot_reports_the_close_as_failed() {
+        let (guard, slot) = registered_guard(POISONED_TEST_PORT, true);
+
+        let poisoned = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoned.lock().unwrap();
+            panic!("poison the port control so the close decision cannot run");
+        })
+        .join();
+        assert!(slot.is_poisoned(), "the fixture must poison the slot");
+
+        let error = guard
+            .close()
+            .await
+            .expect_err("a close that never reached the slot must not report success");
+
+        assert!(
+            matches!(error, FirewallError::LockPoisoned(_)),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !guard.closed.load(Ordering::SeqCst),
+            "the failed close must leave the best-effort drop armed"
+        );
     }
 }
