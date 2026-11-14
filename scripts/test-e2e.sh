@@ -687,6 +687,13 @@ adb shell pm grant "$APP_PKG" android.permission.ACCESS_FINE_LOCATION 2>/dev/nul
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_SCAN 2>/dev/null || true
+# The grants above are all `|| true`, so a renamed package or a permission model
+# change would silently degrade into a 30 s BLE pairing mystery. Read them back.
+# A *denied* permission still lists its name, so match the granted state.
+PERM_DUMP=$(timeout 20 adb shell dumpsys package "$APP_PKG" 2>/dev/null || true)
+if ! printf '%s\n' "$PERM_DUMP" | grep -q 'android.permission.BLUETOOTH_SCAN: granted=true'; then
+    echo "⚠️  BLUETOOTH_SCAN is NOT granted to $APP_PKG — Phase 1c cannot work; check the pm grant calls above"
+fi
 
 # Step 3: Setup Bridges and Virtual Transport Layers
 echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
@@ -1251,10 +1258,11 @@ if [ "$MISMATCH_OK" != "1" ]; then
 fi
 echo "✅ Phase 1a-ii: the phone pinned the QR pk and dropped the daemon's PairingResponse; the desktop had derived SAS $MISMATCH_SAS and 0 devices were stored."
 
-# Teardown. `complete-pairing` would block for its full 120 s deadline here (the
-# phone is gone and will never send PairingConfirmServer), so the session is
-# cancelled from the desktop instead, and only then is the completion refusal
-# checked.
+# Teardown. `complete-pairing` would block for the daemon's `SESSION_REPLY_TIMEOUT`
+# (135 s, tapauthd/src/pairing.rs) here — the phone is gone and will never send
+# PairingConfirmServer — so the session is cancelled from the desktop instead, and
+# only then is the completion refusal checked. The CLI's own 150 s deadline outlives
+# that daemon bound, so it would report the daemon's timeout rather than its own.
 if ! "$CLI_BIN" cancel-pairing --port "$PORT_MISMATCH" --session-id "$SESSION_ID_MISMATCH" \
     > "${TEST_DIR}/cancel_mismatch_pairing.log" 2>&1; then
     echo "❌ ERROR (Phase 1a-ii): cancel-pairing failed:"
@@ -1614,9 +1622,21 @@ wait "$WAIT_BLE_PID" || {
     cat "$AM_BLE_LOG" || true
     echo "---- logcat (PairingSession / BlePairingClient / PairingE2eTest) ----"
     adb logcat -d -v time -s 'PairingSession:*' 'BlePairingClient:*' 'PairingE2eTest:*' \
-        2>/dev/null | tail -n 60 || true
+        2>/dev/null | tail -n 200 || true
     echo "---- tail -n 80 ${DAEMON_LOG} ----"
     tail -n 80 "$DAEMON_LOG" || true
+    # Three BLE failure modes look identical from the daemon side: the phone never
+    # registered a scan, the scan ran and returned nothing, or results arrived and
+    # the filter dropped them. The guest's own BLE state separates them.
+    echo "--- guest BLE state (dumpsys bluetooth_manager) ---"
+    # `dumpsys bluetooth_manager` blocks on the adapter service; `|| true` guards
+    # the exit code, not the wall clock (see scripts/ci/setup-emulator-ble-bridge.sh).
+    DUMP=$(timeout 20 adb shell dumpsys bluetooth_manager 2>/dev/null || true)
+    printf '%s\n' "$DUMP" | head -n 12
+    printf '%s\n' "$DUMP" | grep -A 12 'GATT Scanner Map' || true
+    adb shell settings get global bluetooth_on 2>/dev/null || true
+    adb shell settings get secure location_mode 2>/dev/null || true
+    timeout 20 adb shell dumpsys package "$APP_PKG" 2>/dev/null | grep -i 'BLUETOOTH_\|FINE_LOCATION' || true
     exit 1
 }
 SAS_BLE=$(grep 'SAS=' "$WAIT_BLE_LOG" | cut -d'=' -f2)

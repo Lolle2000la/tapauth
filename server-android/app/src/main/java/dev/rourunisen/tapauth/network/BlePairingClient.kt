@@ -100,6 +100,13 @@ class BlePairingClient(private val context: Context) {
     private val scanCallback =
         object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+                Log.d(
+                    TAG,
+                    "Matched ${runCatching { result.device.address }.getOrElse { "?" }} " +
+                        "RSSI ${result.rssi} serviceData " +
+                        (serviceData?.joinToString("") { "%02x".format(it) } ?: "none"),
+                )
                 scanResult?.complete(result)
             }
 
@@ -361,11 +368,16 @@ class BlePairingClient(private val context: Context) {
         scanner: BluetoothLeScanner,
         advertisementId: ByteArray,
     ): BluetoothDevice? {
-        // Docs (ble-gatt-specification.md §1): the 10-byte value lives in ServiceData(SERVICE_UUID)
-        // and is matched with an all-0xFF mask, so the filter is service data, not a UUID mask.
+        // Match the 10-byte value in ServiceData(SERVICE_UUID) with an all-0xFF mask, and nothing
+        // else. The daemon's advertisement is exactly 31 bytes (the legacy maximum), so it carries
+        // SERVICE_UUID only inside its Service Data AD structure (type 0x21), never as a
+        // service-UUID list (types 0x02/0x03/0x06/0x07) — ble-gatt-specification.md §1:
+        // "service_uuids must NOT be set". Android ANDs every field of a ScanFilter, and
+        // setServiceUuid() is matched only against the advertised UUID list, which is empty here:
+        // adding it makes the filter reject every packet for the whole scan window. Do not re-add
+        // it.
         val filter =
             ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(SERVICE_UUID))
                 .setServiceData(
                     ParcelUuid(SERVICE_UUID),
                     advertisementId,
@@ -388,6 +400,10 @@ class BlePairingClient(private val context: Context) {
             return null
         }
         Log.d(TAG, "Scanning for pairing advertisement")
+        Log.d(
+            TAG,
+            "Scanning for pairing adv_id ${advertisementId.joinToString("") { "%02x".format(it) }}",
+        )
         val result =
             try {
                 found.await()
