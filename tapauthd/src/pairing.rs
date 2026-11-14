@@ -71,9 +71,14 @@
 //! ## Teardown
 //!
 //! Every exit path — completion, cancellation, an abort from the phone, expiry —
-//! runs [`Session::finish`], which stops the BLE advertisement and only then
-//! answers a pending `CompletePairing`/`CancelPairing` IPC call, so a caller that
-//! got its answer can rely on the socket and the advertisement being gone.
+//! runs [`Session::finish`], which stops the BLE advertisement and removes the
+//! pairing port's firewall rule, and only then answers a pending
+//! `CompletePairing`/`CancelPairing` IPC call and publishes the terminal phase, so
+//! a caller that got its answer can rely on the socket and the advertisement being
+//! gone. Neither teardown step is trusted to return: each runs under
+//! [`TEARDOWN_BUDGET`] and an overrunning one is abandoned (its future dropped,
+//! releasing the GATT permit) and logged, so a wedged `bluetoothd` or `iptables`
+//! cannot keep the daemon from accepting the next session.
 //! Dropping a [`PairingState`] (the session was superseded) aborts the worker as a
 //! backstop; that is the only path that skips the asynchronous teardown, and the
 //! BLE session type is expected to stop advertising on drop.
@@ -121,6 +126,20 @@ const SESSION_REPLY_TIMEOUT: Duration = Duration::from_secs(135);
 /// How long a `CancelPairing` waits for the abort to be sent and the socket to be
 /// torn down. Sending one datagram and stopping an advertisement is local work.
 const CANCEL_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one teardown step may take before it is abandoned.
+///
+/// [`Session::finish`] runs two steps that leave the process — stopping the BLE
+/// link (D-Bus calls into `bluer`) and removing the pairing port's firewall rule
+/// (`iptables`/`firewall-cmd`) — and nothing in either can be trusted to return.
+/// Each is bounded by this budget, so a wedged `bluetoothd` or a hung subprocess
+/// delays the terminal phase by at most `2 ×` this value instead of forever, and
+/// an abandoned step is dropped (which releases whatever it still held, the
+/// process-wide GATT permit included). Two steps stay under
+/// [`CANCEL_TEARDOWN_TIMEOUT`], so a `CancelPairing` still gets its answer.
+///
+/// Tests override the budget on the session rather than sleeping.
+pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 /// Largest pairing frame accepted from either transport. `PairingPacket` stays
 /// under 300 bytes (`shared::models::ble::MAX_GATT_PAYLOAD_BYTES` fits it in one
@@ -274,6 +293,22 @@ fn abort_reason_name(reason: i32) -> &'static str {
         Ok(reason) => reason.as_str_name(),
         Err(_) => "UNKNOWN",
     }
+}
+
+/// Whether a rejected `PairingConfirmServer` is the benign tail of the handshake
+/// rather than a proof that did not verify.
+///
+/// [`ClientPairingState::verify_confirm_server`] reports
+/// [`ProtocolError::SessionConcluded`] once the session has concluded — the state
+/// machine dropped its keys by design, so the phone re-sending a proof that
+/// already landed is answered with that error, not with a signature failure. It
+/// must not be logged where a real rejection would be, or a routine
+/// retransmission reads like a tampered message.
+///
+/// Everything else (a bad tag, a missing field in the frame) is a rejection and
+/// keeps the `warn`.
+fn confirm_server_rejection_is_benign(error: &ProtocolError) -> bool {
+    matches!(error, ProtocolError::SessionConcluded)
 }
 
 // ==== Session handle ========================================================
@@ -748,6 +783,7 @@ async fn run_session(
         terminal: None,
         server_public_key: None,
         server_device_name: String::new(),
+        teardown_budget: TEARDOWN_BUDGET,
     };
 
     tracing::info!(
@@ -802,26 +838,66 @@ struct Provisioning {
     last_sent: Option<Instant>,
 }
 
-/// The teardown order a session must follow.
+/// Which teardown steps ran out of their [`TEARDOWN_BUDGET`].
+///
+/// Returned (not only logged) so a test can prove the timeout path published the
+/// terminal phase and released the link without capturing logs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TeardownOutcome {
+    /// Stopping the BLE link did not finish; the link was dropped instead.
+    stop_timed_out: bool,
+    /// Removing the firewall rule did not finish; the close was abandoned.
+    firewall_timed_out: bool,
+}
+
+/// The teardown order a session must follow, bounded so it always completes.
 ///
 /// `Finished`/`Failed` is published only after the BLE link is stopped (the GATT
-/// application unregistered, advertisement gone) and the firewall rule dropped:
+/// application unregistered, advertisement gone) and the firewall rule removed:
 /// publishing first lets a client that reacts to the terminal phase find a
 /// service and a port that still belong to the session that just ended. Split out
 /// so the order is asserted by a test without BlueZ (see `the_terminal_phase_is_
 /// published_last`).
+///
+/// Neither step is trusted to return: each runs under `budget`, and one that
+/// overruns is abandoned by dropping its future. That drop is load-bearing — the
+/// stop future owns the [`PairingLink`], so dropping it releases the
+/// process-wide GATT permit even when `bluer` never comes back. The terminal
+/// phase is published on every path, timeout included; that publication is what
+/// lets the next `StartPairing` and the next authentication run at all.
 async fn teardown_in_order<Stop, CloseFirewall, Publish>(
     stop: Stop,
     close_firewall: CloseFirewall,
     publish: Publish,
-) where
+    budget: Duration,
+) -> TeardownOutcome
+where
     Stop: std::future::Future<Output = ()>,
-    CloseFirewall: FnOnce(),
+    CloseFirewall: std::future::Future<Output = ()>,
     Publish: FnOnce(),
 {
-    stop.await;
-    close_firewall();
+    let mut outcome = TeardownOutcome::default();
+
+    if tokio::time::timeout(budget, stop).await.is_err() {
+        // The future — and with it the link it owns — was just dropped.
+        tracing::warn!(
+            "Pairing teardown: stopping the BLE link did not finish within {:?}; the link was \
+             dropped and the terminal phase is published anyway",
+            budget
+        );
+        outcome.stop_timed_out = true;
+    }
+    if tokio::time::timeout(budget, close_firewall).await.is_err() {
+        tracing::warn!(
+            "Pairing teardown: removing the pairing port's firewall rule did not finish within \
+             {:?}; the terminal phase is published anyway",
+            budget
+        );
+        outcome.firewall_timed_out = true;
+    }
+
     publish();
+    outcome
 }
 
 /// The next datagram from the pairing socket.
@@ -868,6 +944,9 @@ struct Session {
     server_public_key: Option<[u8; 32]>,
     /// The phone's display name, captured from the accepted `PairingInit`.
     server_device_name: String,
+    /// Bound on each teardown step; [`TEARDOWN_BUDGET`] in production, a
+    /// millisecond-scale value in tests.
+    teardown_budget: Duration,
 }
 
 impl Session {
@@ -922,10 +1001,18 @@ impl Session {
     /// Runs the teardown steps in the only order that makes a terminal phase
     /// true: [`Session::end`] only *records* the outcome, and it is published
     /// here, after the BLE link is stopped (the GATT application unregistered, the
-    /// advertisement gone) and after the firewall rule is dropped. A client that
+    /// advertisement gone) and after the firewall rule is removed. A client that
     /// reacts to `Finished`/`Failed` — the GUI closing its screen, the next
     /// `StartPairing` — can therefore never find a service or a port that belongs
     /// to the session that just ended.
+    ///
+    /// What is guaranteed is that the removal is **awaited**, not that it always
+    /// succeeds: both steps run under [`Session::teardown_budget`]
+    /// ([`TEARDOWN_BUDGET`]), and a step that overruns is abandoned (its future
+    /// dropped, which releases the GATT permit even when `bluer` is wedged) and
+    /// reported by [`teardown_in_order`] at `warn`. A client may therefore still
+    /// find an open port if `iptables`/`firewall-cmd` failed or hung; what it can
+    /// no longer find is a port the daemon is still *using*.
     async fn finish(mut self) {
         // No command may be queued from here on: the loop is over, and a
         // `CancelPairing` that slipped in must fail fast instead of waiting out
@@ -937,36 +1024,62 @@ impl Session {
             // dropped). Observers still get exactly one terminal phase.
             SessionPhase::Failed("the pairing session ended without an outcome".to_string())
         });
-        let link = &mut self.link;
+        let budget = self.teardown_budget;
+        // Moved into the stop future so that abandoning it drops the link: the
+        // `GattRegistration` it holds is what keeps the process-wide GATT permit
+        // claimed, and a permit never released blocks every later pairing and
+        // authentication with "BLE busy".
+        let mut link = self.link;
         let firewall = self._firewall_guard.take();
         let socket = self.udp.take();
         let phases = self.phase.clone();
-        teardown_in_order(
+        let outcome = teardown_in_order(
             async move { link.stop().await },
-            move || {
+            async move {
                 // Both go before the phase does: no port of this session may
-                // still be reachable when a client sees it end.
+                // still be reachable when a client sees it end. The socket is
+                // dropped first so no datagram is answered on a port whose rule
+                // is already gone.
                 drop(socket);
-                drop(firewall);
+                if let Some(guard) = firewall {
+                    // Awaited (bounded by the same budget): a detached close
+                    // would only *start* here, and the phase would go out while
+                    // the rule is still in place.
+                    if let Err(e) = guard.close().await {
+                        tracing::warn!(
+                            "Pairing teardown: the pairing port's firewall rule was not removed: {}",
+                            e
+                        );
+                    }
+                }
             },
             move || {
                 // No receiver left is normal: the GUI may have gone away.
                 let _ = phases.send(terminal);
             },
+            budget,
         )
         .await;
 
         if let Some(provisioning) = self.provisioning.take() {
-            let outcome = self.completion.take().unwrap_or(Err(PairingError::Ended(
+            let completion_outcome = self.completion.take().unwrap_or(Err(PairingError::Ended(
                 "pairing session ended before the phone confirmed the CSK".to_string(),
             )));
-            let _ = provisioning.reply.send(outcome);
+            let _ = provisioning.reply.send(completion_outcome);
         }
         if let Some(reply) = self.cancel_reply.take() {
             let _ = reply.send(());
         }
 
-        tracing::info!("Pairing session on UDP port {} closed", self.local_port);
+        tracing::info!(
+            "Pairing session on UDP port {} closed{}",
+            self.local_port,
+            if outcome.stop_timed_out || outcome.firewall_timed_out {
+                " (teardown incomplete, see the warnings above)"
+            } else {
+                ""
+            }
+        );
     }
 
     fn publish(&self, phase: SessionPhase) {
@@ -1217,10 +1330,22 @@ impl Session {
             // A proof that does not verify must not kill the session: the phone
             // may still be settling, and the check is cheap. Keep retransmitting
             // PairingConfirmClient until the deadline (Step 5).
-            tracing::warn!(
-                "Rejected the phone's PairingConfirmServer ({}); still provisioning the CSK",
-                e
-            );
+            //
+            // `SessionConcluded` is not a rejected proof: the state machine is
+            // already over (the desktop concluded it), so this is the tail of a
+            // retransmission and belongs at `debug`, not in the warning stream an
+            // operator reads for tampered messages.
+            if confirm_server_rejection_is_benign(&e) {
+                tracing::debug!(
+                    "Ignoring the phone's PairingConfirmServer: the pairing session already \
+                     concluded"
+                );
+            } else {
+                tracing::warn!(
+                    "Rejected the phone's PairingConfirmServer ({}); still provisioning the CSK",
+                    e
+                );
+            }
             return Flow::Continue;
         }
 
@@ -1576,6 +1701,7 @@ mod tests {
     use shared::protocol::pairing::ServerPairingSession;
     use shared::protocol::pb::{HashAlgorithm, PairingKeepalive, SymmetricAlgorithm};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicBool;
 
     const DESKTOP_SEED: [u8; 32] = [0x3C; 32];
     const PHONE_SEED: [u8; 32] = [0x4D; 32];
@@ -1906,6 +2032,7 @@ mod tests {
             terminal: None,
             server_public_key: None,
             server_device_name: String::new(),
+            teardown_budget: TEARDOWN_BUDGET,
         };
         (session, phases)
     }
@@ -2446,32 +2573,62 @@ mod tests {
     }
 
     /// The terminal phase is published only after the link is stopped and the
-    /// firewall rule dropped, and exactly once.
+    /// firewall rule **removed**, and exactly once.
     ///
-    /// The defect this catches: `Session::end` publishing `Finished`/`Failed`
+    /// The defects this catches: `Session::end` publishing `Finished`/`Failed`
     /// before teardown, so a client that reacts to it (the GUI closing its screen,
     /// the next `StartPairing`) can still find the GATT service registered and the
-    /// pairing port open.
+    /// pairing port open — and a firewall step that is only *started* (the state
+    /// before this fix: `Drop` enqueued a detached `spawn_blocking`), so the phase
+    /// goes out while `iptables` is still running.
+    ///
+    /// What it cannot observe: the real `iptables`/`firewall-cmd` effect, which
+    /// needs privileges and a live host firewall. The close here is a future that
+    /// yields once and then reports completion, which is exactly the property the
+    /// caller needs from it.
     #[tokio::test]
     async fn the_terminal_phase_is_published_last() {
-        // 1. The order itself, recorded without BlueZ.
+        // 1. The order itself, recorded without BlueZ. The firewall step suspends
+        //    at least once before it reports done, so a teardown that published
+        //    without awaiting it would record `finished_at_publish = false`.
         let trace: Arc<std::sync::Mutex<Vec<&'static str>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = |step: &'static str| {
-            let trace = trace.clone();
-            move || trace.lock().unwrap().push(step)
-        };
+        let firewall_finished = Arc::new(AtomicBool::new(false));
+        let finished_at_publish = Arc::new(AtomicBool::new(false));
         let stop_trace = trace.clone();
-        teardown_in_order(
+        let close_trace = trace.clone();
+        let close_done = firewall_finished.clone();
+        let publish_trace = trace.clone();
+        let observed = finished_at_publish.clone();
+        let outcome = teardown_in_order(
             async move { stop_trace.lock().unwrap().push("stop") },
-            record("firewall"),
-            record("publish"),
+            async move {
+                // A real close suspends on `spawn_blocking(..).await`.
+                tokio::task::yield_now().await;
+                close_done.store(true, Ordering::SeqCst);
+                close_trace.lock().unwrap().push("firewall");
+            },
+            move || {
+                observed.store(firewall_finished.load(Ordering::SeqCst), Ordering::SeqCst);
+                publish_trace.lock().unwrap().push("publish");
+            },
+            TEARDOWN_BUDGET,
         )
         .await;
         assert_eq!(
             &*trace.lock().unwrap(),
             &["stop", "firewall", "publish"],
             "the terminal phase must be published after the transport is gone"
+        );
+        assert!(
+            finished_at_publish.load(Ordering::SeqCst),
+            "the terminal phase must be published after the firewall close resolved, \
+             not after it was merely started"
+        );
+        assert_eq!(
+            outcome,
+            TeardownOutcome::default(),
+            "a teardown that finishes in time must not report a timeout"
         );
 
         // 2. A real session: `end` records, `finish` publishes once.
@@ -2513,5 +2670,94 @@ mod tests {
             "exactly one terminal phase may be published"
         );
         drop(keep_open);
+    }
+
+    /// A teardown step that never finishes must not keep the terminal phase
+    /// unpublished, nor keep the link (and the GATT permit it holds) alive.
+    ///
+    /// The defects this catches: `Session::finish` awaiting an unbounded
+    /// `PairingLink::stop`/firewall close, so one `bluer` call that never returns
+    /// leaves `Finished`/`Failed` unpublished (every later `StartPairing` is
+    /// refused and `WaitForPairing` waits out its own deadline) and the
+    /// process-wide GATT permit claimed (authentication then reports "BLE busy").
+    ///
+    /// The link here stands in for `PairingLink`: what matters is that the value
+    /// the stop future owns is dropped when the budget abandons it, which is what
+    /// releases the permit in the real type.
+    #[tokio::test]
+    async fn a_hung_teardown_still_publishes_the_terminal_phase_and_releases_the_link() {
+        /// Stands in for `PairingLink`: its drop is the permit release.
+        struct Link(Arc<AtomicBool>);
+
+        impl Drop for Link {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicBool::new(false));
+        let close_entered = Arc::new(AtomicBool::new(false));
+
+        let link = Link(released.clone());
+        let publish_flag = published.clone();
+        let close_flag = close_entered.clone();
+
+        let outcome = teardown_in_order(
+            async move {
+                let _held = link;
+                std::future::pending::<()>().await
+            },
+            async move {
+                close_flag.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await
+            },
+            move || {
+                publish_flag.store(true, Ordering::SeqCst);
+            },
+            // An elapsed budget: `Duration::ZERO` makes the timeout fire on the
+            // next poll, so the test never sleeps.
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(outcome.stop_timed_out, "a hung stop must be reported");
+        assert!(
+            outcome.firewall_timed_out,
+            "a hung firewall close must be reported"
+        );
+        assert!(
+            published.load(Ordering::SeqCst),
+            "the terminal phase must be published even when the teardown hangs"
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "abandoning the stop future must drop the link, which releases the GATT permit"
+        );
+        assert!(
+            close_entered.load(Ordering::SeqCst),
+            "the firewall close must have been started, not skipped"
+        );
+    }
+
+    /// A late `PairingConfirmServer` on a concluded session is not a rejected
+    /// proof.
+    ///
+    /// The defect this catches: reporting every `verify_confirm_server` error at
+    /// `warn`, so the phone's ordinary post-conclusion retransmission — which is
+    /// `SessionConcluded`, not the `MissingField` it used to be — reads in the
+    /// operator's log like a tampered message.
+    #[test]
+    fn a_late_confirm_server_is_not_reported_as_a_rejected_proof() {
+        assert!(confirm_server_rejection_is_benign(
+            &ProtocolError::SessionConcluded
+        ));
+        // A proof that does not verify stays a warning.
+        assert!(!confirm_server_rejection_is_benign(
+            &ProtocolError::MissingField("signature")
+        ));
+        assert!(!confirm_server_rejection_is_benign(
+            &ProtocolError::InvalidSignature
+        ));
     }
 }

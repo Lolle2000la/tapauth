@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +33,9 @@ pub enum FirewallError {
 pub struct FirewallGuard {
     port: u16,
     protocol: Protocol,
+    /// Set once [`FirewallGuard::close`] has taken responsibility for removing
+    /// the rule, so the best-effort [`Drop`] does not shell out a second time.
+    closed: AtomicBool,
 }
 
 struct PortControl {
@@ -88,7 +92,9 @@ impl FirewallGuard {
     /// is stored for future sharing.
     ///
     /// When the last strong reference is dropped, the port is automatically
-    /// closed in a background thread/task — no manual ref-counting needed.
+    /// closed in a background thread/task — no manual ref-counting needed. A
+    /// caller that must observe the rule gone calls [`FirewallGuard::close`]
+    /// instead, which awaits the removal.
     pub fn new(port: u16, protocol: Protocol) -> Result<Arc<Self>, FirewallError> {
         let port_ctrl = reserve_slot(port, protocol)?;
 
@@ -104,14 +110,63 @@ impl FirewallGuard {
             open_port(port, protocol)?;
             ctrl.is_open = true;
         }
-        let guard = Arc::new(Self { port, protocol });
+        let guard = Arc::new(Self {
+            port,
+            protocol,
+            closed: AtomicBool::new(false),
+        });
         ctrl.weak = Arc::downgrade(&guard);
         Ok(guard)
+    }
+
+    /// Remove this guard's rule now, awaiting the external command.
+    ///
+    /// [`Drop`] can only *enqueue* the close: the last reference is typically
+    /// dropped on a tokio worker, which must not block on `iptables`. A caller
+    /// that needs the rule gone before it publishes anything a client can react
+    /// to — the pairing session publishing `Finished`/`Failed` — therefore calls
+    /// this and awaits it.
+    ///
+    /// Unlike [`Drop`], the caller is still holding the guard while this runs, so
+    /// liveness cannot be the close decision: the guard deregisters itself from
+    /// the shared slot first, and the port is closed unless the slot still names
+    /// another live guard (another session on the same `(port, protocol)`), whose
+    /// rule would be cut off by removing it.
+    ///
+    /// Idempotent: the first call does the work, a second call is a no-op, and the
+    /// [`Drop`] that follows sees the `closed` flag and does not enqueue a second
+    /// removal. The blocking subprocess runs on the blocking pool and is awaited,
+    /// so a failure is reported here (and logged) rather than detached.
+    pub async fn close(&self) -> Result<(), FirewallError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let (port, protocol) = (self.port, self.protocol);
+        match tokio::task::spawn_blocking(move || do_explicit_close(port, protocol)).await {
+            // Still shared with another live guard: nothing was removed, so this
+            // guard keeps its best-effort drop.
+            Ok(CloseDisposition::KeptForAnotherHolder) => {
+                self.closed.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Ok(CloseDisposition::Closed) => Ok(()),
+            Err(e) => Err(FirewallError::Io(std::io::Error::other(format!(
+                "the firewall close task failed: {}",
+                e
+            )))),
+        }
     }
 }
 
 impl Drop for FirewallGuard {
     fn drop(&mut self) {
+        // [`FirewallGuard::close`] already removed the rule and awaited the
+        // subprocess; running the close again would only fail on a rule that is
+        // no longer there.
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let (port, protocol) = (self.port, self.protocol);
         // Closing a port shells out to `iptables`/`ufw`/`firewall-cmd`, which
         // blocks until the subprocess exits. The last strong reference is
@@ -132,6 +187,67 @@ impl Drop for FirewallGuard {
             Err(_) => do_drop_close(port, protocol),
         }
     }
+}
+
+/// What [`do_explicit_close`] did, so [`FirewallGuard::close`] can undo its own
+/// `closed` flag when it chose not to touch the rule.
+enum CloseDisposition {
+    /// The rule was removed (or there was nothing left to remove).
+    Closed,
+    /// Another live guard shares the `(port, protocol)`; the rule stays.
+    KeptForAnotherHolder,
+}
+
+/// [`FirewallGuard::close`], on the blocking pool.
+///
+/// The requesting guard is still alive here (it awaits this), so the liveness
+/// check [`do_drop_close`] uses would always say "still held". Instead the slot is
+/// deregistered first — which is what a later `new` on the same port and a later
+/// best-effort drop both observe — and the rule is removed unless another live
+/// guard still holds the slot.
+fn do_explicit_close(port: u16, protocol: Protocol) -> CloseDisposition {
+    let port_ctrl = {
+        let map = match guards().lock() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("guard map lock poisoned on close: {}", e);
+                return CloseDisposition::Closed;
+            }
+        };
+        match map.get(&(port, protocol)) {
+            Some(ctrl) => ctrl.clone(),
+            // Never registered (or already deregistered): nothing to remove.
+            None => return CloseDisposition::Closed,
+        }
+    };
+
+    let mut ctrl = match port_ctrl.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("port control lock poisoned on close: {}", e);
+            return CloseDisposition::Closed;
+        }
+    };
+
+    // One strong reference is this guard; more than one means another session
+    // still needs the port.
+    if Weak::strong_count(&ctrl.weak) > 1 {
+        tracing::debug!(
+            "Firewall ({}): port {} is still held by another session; leaving the rule open",
+            protocol,
+            port
+        );
+        return CloseDisposition::KeptForAnotherHolder;
+    }
+
+    ctrl.weak = Weak::new();
+    if ctrl.is_open {
+        if let Err(e) = close_port(port, protocol) {
+            tracing::error!("Failed to close firewall port: {}", e);
+        }
+        ctrl.is_open = false;
+    }
+    CloseDisposition::Closed
 }
 
 /// Check whether the weak entry is still alive and, if not, close the
@@ -362,5 +478,85 @@ mod tests {
         assert!(Arc::ptr_eq(udp_entry, &udp));
         assert!(Arc::ptr_eq(tcp_entry, &tcp));
         assert!(!Arc::ptr_eq(udp_entry, tcp_entry));
+    }
+
+    /// Ports no other test registers, and one per test: `GUARDS` is a
+    /// process-global map, so two tests sharing a `(port, protocol)` would each see
+    /// the other's registered guard (and its strong count) and fail on an
+    /// assertion that is true when the test runs alone.
+    ///
+    /// NOTE: these tests build a `FirewallGuard` directly (rather than through
+    /// `FirewallGuard::new`) and register it in the slot with `is_open = false`,
+    /// which is what keeps them free of `iptables`/`firewall-cmd` side effects.
+    const CLOSE_TEST_PORT: u16 = 45_679;
+    const SHARED_CLOSE_TEST_PORT: u16 = 45_680;
+
+    /// A guard registered in a slot that claims no open rule, so the close
+    /// decision is exercised without shelling out.
+    fn registered_guard(port: u16, is_open: bool) -> (Arc<FirewallGuard>, PortSlot) {
+        let guard = Arc::new(FirewallGuard {
+            port,
+            protocol: Protocol::Udp,
+            closed: AtomicBool::new(false),
+        });
+        let slot = reserve_slot(port, Protocol::Udp).unwrap();
+        {
+            let mut ctrl = slot.lock().unwrap();
+            ctrl.weak = Arc::downgrade(&guard);
+            ctrl.is_open = is_open;
+        }
+        (guard, slot)
+    }
+
+    /// `close()` deregisters the guard before it awaits the removal, so the wait
+    /// really sees a port nobody holds.
+    ///
+    /// The defects this catches: a close that leaves the requesting guard
+    /// registered (what `do_drop_close`'s liveness check would see), so the
+    /// external command never runs and the close reports success while the port
+    /// stays open — the pairing session would then publish `Finished`/`Failed`
+    /// with its pairing port still reachable.
+    #[tokio::test]
+    async fn close_deregisters_the_guard_before_the_rule_is_removed() {
+        let (guard, slot) = registered_guard(CLOSE_TEST_PORT, false);
+        assert!(
+            Arc::ptr_eq(&slot.lock().unwrap().weak.upgrade().unwrap(), &guard),
+            "the fixture registers the guard"
+        );
+
+        guard.close().await.unwrap();
+
+        // The guard is still alive here — `close` takes `&self` — so a live weak
+        // can only mean the slot was never deregistered.
+        assert!(
+            slot.lock().unwrap().weak.upgrade().is_none(),
+            "close must deregister the guard it is closing"
+        );
+        assert!(guard.closed.load(Ordering::SeqCst));
+    }
+
+    /// One holder closing a shared guard must not cut the port out from under the
+    /// other holder.
+    ///
+    /// The defect this catches: `close()` removing a `(port, protocol)` rule that a
+    /// second live guard shares — the other session's port goes dark even though it
+    /// still needs the rule — and clearing its own `closed` flag decision so the
+    /// last holder never closes it either.
+    #[tokio::test]
+    async fn close_leaves_a_shared_guard_to_its_last_holder() {
+        let (guard, slot) = registered_guard(SHARED_CLOSE_TEST_PORT, false);
+        let other = Arc::clone(&guard);
+
+        guard.close().await.unwrap();
+
+        assert!(
+            slot.lock().unwrap().weak.upgrade().is_some(),
+            "a shared guard must stay registered for the remaining holder"
+        );
+        assert!(
+            !other.closed.load(Ordering::SeqCst),
+            "a shared guard must keep its drop fallback, or the port is never closed"
+        );
+        drop(other);
     }
 }
