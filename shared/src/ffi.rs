@@ -86,7 +86,7 @@ use tracing_subscriber::prelude::*;
 /// caller-side log or test that matched on it keeps matching.
 fn fixed<const N: usize>(bytes: &[u8], name: &str) -> Result<[u8; N], TapauthError> {
     bytes.try_into().map_err(|_| TapauthError::Argument {
-        detail: format!("{name} must {N} bytes"),
+        detail: format!("{name} must be {N} bytes"),
     })
 }
 
@@ -1219,6 +1219,45 @@ mod tests {
         // Verbatim as signed: no second sanitization pass collapses the double space.
         assert_eq!(parsed.command_preview, "apt  upgrade");
         assert!(parsed.tty_present);
+    }
+
+    /// A timestamp that does not fit the Kotlin `Long` is an argument failure, while
+    /// the largest value that does fit passes through unchanged.
+    /// The defect this catches: the `u64` timestamp crossing into the `i64` field
+    /// unchecked (a wrapped, negative timestamp reaching the Server), or a range check
+    /// with an off-by-one bound that also rejects `i64::MAX`.
+    #[test]
+    fn parse_auth_request_rejects_timestamp_beyond_i64() {
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let mut request = context_request([0x66; 32]);
+        request.timestamp_unix_seconds = u64::MAX;
+        let bytes = signed_request(&keypair, request);
+
+        match parse_and_verify_auth_request(
+            bytes,
+            keypair.verifying_key_bytes().to_vec(),
+            2,
+            ED25519,
+        ) {
+            Err(TapauthError::Argument { detail }) => {
+                assert_eq!(detail, "timestamp is out of range");
+            }
+            other => panic!("expected a timestamp range rejection, got {other:?}"),
+        }
+
+        // The boundary itself is still accepted: only values that do not fit a `Long`
+        // are refused.
+        let mut request = context_request([0x66; 32]);
+        request.timestamp_unix_seconds = i64::MAX as u64;
+        let bytes = signed_request(&keypair, request);
+        let parsed = parse_and_verify_auth_request(
+            bytes,
+            keypair.verifying_key_bytes().to_vec(),
+            2,
+            ED25519,
+        )
+        .unwrap();
+        assert_eq!(parsed.timestamp_unix_seconds, i64::MAX);
     }
 
     /// A request signed by another key is refused.

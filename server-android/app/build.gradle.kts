@@ -187,6 +187,11 @@ val generateUniffiBindings =
         val uniffiConfig = File(cargoWorkspaceRoot, "shared/uniffi.toml")
         val workspaceRoot = cargoWorkspaceRoot
 
+        // The ABIs this build was narrowed to (Android Studio deploy), in preference
+        // order. Captured at configuration time for the same reason as the paths above.
+        val preferredAbis =
+            injectedAbi?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+
         // The library tree, not a single ABI: which ABIs exist depends on the
         // injected-ABI filter above. UniFFI metadata is architecture-agnostic,
         // so any one of them carries the whole surface.
@@ -198,8 +203,22 @@ val generateUniffiBindings =
         doFirst {
             val abiDirs =
                 jniLibsRoot.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }.orEmpty()
+            val candidates = abiDirs.map { File(it, "libshared.so") }.filter { it.isFile }
+            // Newest wins, not first alphabetically. Under the injected-ABI filter cargo
+            // refreshes only that ABI's directory, so a sibling can still hold a
+            // `libshared.so` built from an older `ffi.rs`; its UniFFI metadata would then
+            // disagree with the library this build packages, surfacing as a checksum
+            // mismatch or an `UnsatisfiedLinkError` and — since `initLogging()` is called
+            // unguarded from `TapAuthApplication.onCreate` — a crash loop until `clean`.
+            // The metadata is ABI-independent, so only freshness matters: prefer the
+            // injected ABI, otherwise the greatest last-modified time. Every candidate is
+            // already declared in `inputs.files` above, so the up-to-date check stays
+            // correct whichever one is read.
             val library =
-                abiDirs.map { File(it, "libshared.so") }.firstOrNull { it.isFile }
+                preferredAbis.firstNotNullOfOrNull { abi ->
+                    candidates.firstOrNull { it.parentFile.name == abi }
+                }
+                    ?: candidates.maxByOrNull { it.lastModified() }
                     ?: throw GradleException(
                         "generateUniffiBindings: no native library carrying UniFFI metadata found. " +
                             "Expected one of " +
