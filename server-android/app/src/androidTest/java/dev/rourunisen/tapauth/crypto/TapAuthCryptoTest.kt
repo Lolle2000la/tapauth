@@ -729,15 +729,13 @@ class TapAuthCryptoTest {
                 keepalive.contentEquals(init),
             )
 
-            val abort = session.createAbort(PAIRING_ABORT_USER_REJECTED_SAS)
-            assertArrayEquals(
-                "PairingAbort must carry the QR session id",
-                sessionId,
-                pairingPacketSessionId(abort),
-            )
+            // A peer's tag-less abort (no key exists yet) must report unauthenticated, never
+            // success. The frame has to be built by another session: `createAbort` concludes the
+            // session that builds it (`testCreatingAnAbortConcludesTheSession`), so no session can
+            // both produce an abort and still be in a state to verify one.
             assertFalse(
                 "A tag-less abort (no key exists yet) must report unauthenticated, never success",
-                session.verifyAbort(abort),
+                session.verifyAbort(taglessAbortFor(sessionId, identity[0])),
             )
 
             // The completion proof needs the session keys, which only a verified PairingResponse
@@ -784,7 +782,7 @@ class TapAuthCryptoTest {
             )
             assertFalse(
                 "A live session must keep its pre-key abort semantics after another is released",
-                other.verifyAbort(other.createAbort(PAIRING_ABORT_USER_REJECTED_SAS)),
+                other.verifyAbort(taglessAbortFor(otherSessionId, identity[0])),
             )
         } finally {
             other.close()
@@ -800,6 +798,33 @@ class TapAuthCryptoTest {
         }
         assertThrows(IllegalStateException::class.java) {
             session.createAbort(PAIRING_ABORT_SESSION_EXPIRED)
+        }
+    }
+
+    @Test
+    fun testCreatingAnAbortConcludesTheSession() {
+        val sessionId = ByteArray(16) { (it * 9 + 4).toByte() }
+        val identity = generateKeypair()
+        val session = createSession(sessionId, identity[0])
+
+        try {
+            // A cancellation is the last message of the handshake: creating the abort drops the
+            // session keys and the ephemeral secret, so a second abort — or any other call, an
+            // incoming abort included — is refused instead of reviving a session whose key material
+            // is gone. The defect this catches: createAbort leaving the session live, which would
+            // let a cancelled handshake keep answering.
+            session.createAbort(PAIRING_ABORT_USER_REJECTED_SAS)
+            assertThrows(TapauthException.State::class.java) {
+                session.createAbort(PAIRING_ABORT_SESSION_EXPIRED)
+            }
+            assertThrows(TapauthException.State::class.java) {
+                session.createInit()
+            }
+            assertThrows(TapauthException.State::class.java) {
+                session.verifyAbort(taglessAbortFor(sessionId, identity[0]))
+            }
+        } finally {
+            session.close()
         }
     }
 
@@ -938,6 +963,48 @@ class TapAuthCryptoTest {
 
     private fun createSession(sessionId: ByteArray, ed25519PrivateKey: ByteArray): PairingSession =
         PairingSession(sessionId, ed25519PrivateKey, SERVER_DEVICE_NAME)
+
+    /**
+     * A tag-less `PairingAbort` frame carrying [sessionId], as a peer sends it before any key
+     * exists.
+     *
+     * A live session cannot build the frame it must verify: `PairingSession.createAbort` is
+     * terminal (it concludes the session, exactly like `create_confirm_server`), which
+     * `testCreatingAnAbortConcludesTheSession` pins. The frame is therefore built by a throwaway
+     * session for a different id and has the envelope's session id rewritten — the abort body is a
+     * reason byte and an empty tag, and neither a signature nor a tag covers the envelope.
+     */
+    private fun taglessAbortFor(sessionId: ByteArray, ed25519PrivateKey: ByteArray): ByteArray {
+        val sourceId = ByteArray(16) { (it * 13 + 5).toByte() }
+        val source = createSession(sourceId, ed25519PrivateKey)
+        try {
+            val frame = source.createAbort(PAIRING_ABORT_USER_REJECTED_SAS)
+            assertArrayEquals(
+                "A PairingAbort must carry the session id it was built for",
+                sourceId,
+                pairingPacketSessionId(frame),
+            )
+            val offset = indexOfSubsequence(frame, sourceId)
+            assertTrue(
+                "The abort envelope must carry the 16-byte session id verbatim",
+                offset >= 0,
+            )
+            assertTrue(
+                "The session id must appear exactly once in a tag-less abort",
+                indexOfSubsequence(frame.copyOfRange(offset + 1, frame.size), sourceId) < 0,
+            )
+            val patched = frame.copyOf()
+            sessionId.copyInto(patched, offset)
+            assertArrayEquals(
+                "The rewritten frame must decode as an abort of the target session",
+                sessionId,
+                pairingPacketSessionId(patched),
+            )
+            return patched
+        } finally {
+            source.close()
+        }
+    }
 
     /**
      * Whether an identifier built [offset] windows away from the current one verifies.
