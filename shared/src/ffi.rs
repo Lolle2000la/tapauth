@@ -21,7 +21,7 @@
 //! ## Threading and safety
 //!
 //! Every free function here is stateless. The only shared state is a
-//! [`PairingSession`], which owns its [`crate::protocol::pairing::ClientPairingSession`]
+//! [`PairingSession`], which owns its [`crate::protocol::pairing::ServerPairingSession`]
 //! behind a [`Mutex`]; UniFFI objects must be `Send + Sync`, so a session is passed
 //! across threads as an `Arc` and each call takes the lock.
 //!
@@ -39,7 +39,8 @@
 //!   temporal identifier, or a signed message of the wrong payload type.
 //! - [`TapauthError::Io`] — bytes that are not a decodable protobuf message.
 //! - [`TapauthError::State`] — internal state failures (a poisoned session lock, an
-//!   unencodable packet).
+//!   unencodable packet, or a protocol call on a pairing session that already
+//!   concluded).
 //!
 //! ## Verification ordering
 //!
@@ -62,7 +63,7 @@ use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 use crate::crypto::Ed25519KeyPair;
-use crate::protocol::pairing::{ClientPairingSession, PAIRING_SESSION_ID_LEN};
+use crate::protocol::pairing::{ServerPairingSession, PAIRING_SESSION_ID_LEN};
 
 use ops::{
     ProvisionedClient, VerifiedAuthRequest, VerifiedPairingResponse, CHALLENGE_LEN, CSK_LEN,
@@ -623,7 +624,7 @@ pub fn pairing_packet_session_id(packet_bytes: Vec<u8>) -> Result<Vec<u8>, Tapau
 #[derive(uniffi::Object)]
 pub struct PairingSession {
     /// The protocol state machine, guarded so `&self` methods can take `&mut` access.
-    inner: Mutex<ClientPairingSession>,
+    inner: Mutex<ServerPairingSession>,
 }
 
 impl PairingSession {
@@ -634,7 +635,7 @@ impl PairingSession {
     /// exception on its own thread instead of an unwind across the FFI boundary.
     fn with<T>(
         &self,
-        f: impl FnOnce(&mut ClientPairingSession) -> Result<T, TapauthError>,
+        f: impl FnOnce(&mut ServerPairingSession) -> Result<T, TapauthError>,
     ) -> Result<T, TapauthError> {
         let mut session = self.inner.lock().map_err(|_| TapauthError::State {
             detail: "pairing session state is poisoned".to_string(),
@@ -665,7 +666,7 @@ impl PairingSession {
     ) -> Result<Arc<Self>, TapauthError> {
         let session_id = fixed::<PAIRING_SESSION_ID_LEN>(&session_id, "sessionId")?;
         let identity = read_ed25519_keypair(&server_ed25519_priv_key, "serverEd25519PrivKey")?;
-        let session = ClientPairingSession::new(session_id, identity, &server_device_name)?;
+        let session = ServerPairingSession::new(session_id, identity, &server_device_name)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(session),
         }))
@@ -678,8 +679,8 @@ impl PairingSession {
     ///
     /// ## Errors
     ///
-    /// - [`TapauthError::State`]: the packet cannot be encoded, or the session lock is
-    ///   poisoned
+    /// - [`TapauthError::State`]: the session already concluded, the packet cannot
+    ///   be encoded, or the session lock is poisoned
     pub fn create_init(&self) -> Result<Vec<u8>, TapauthError> {
         self.with(ops::pairing_create_init)
     }
@@ -700,7 +701,8 @@ impl PairingSession {
     ///   packet type or key length
     /// - [`TapauthError::Security`]: QR key mismatch, bad client signature,
     ///   unsupported algorithm selection, key derivation failure
-    /// - [`TapauthError::State`]: the session lock is poisoned
+    /// - [`TapauthError::State`]: the session already concluded, or the session lock
+    ///   is poisoned
     pub fn verify_response(
         &self,
         response_packet: Vec<u8>,
@@ -743,16 +745,25 @@ impl PairingSession {
     /// The phone signs `"tapauth-pair-server-sig-v2" || H || csk` with `Ed_S` and
     /// encrypts it under `K_s2c`. Retransmissions must re-send the same bytes.
     ///
+    /// This is a **terminal** call: on success the session concludes, so every
+    /// later call fails with [`TapauthError::State`] instead of reviving a session
+    /// whose keys are gone. A failed call leaves the session untouched.
+    ///
     /// ## Errors
     ///
     /// - [`TapauthError::Argument`]: wrong CSK length
     /// - [`TapauthError::Security`]: the session is not keyed yet, signing or
     ///   encryption fails
-    /// - [`TapauthError::State`]: the packet cannot be encoded, or the session lock is
-    ///   poisoned
+    /// - [`TapauthError::State`]: the session already concluded, the packet cannot
+    ///   be encoded, or the session lock is poisoned
     pub fn create_confirm_server(&self, csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
         let csk = read_csk(&csk)?;
-        self.with(|session| ops::pairing_create_confirm_server(session, &csk))
+        self.with(|session| {
+            let frame = ops::pairing_create_confirm_server(session, &csk)?;
+            // Terminal: the completion proof is the last message of the handshake.
+            session.conclude();
+            Ok(frame)
+        })
     }
 
     /// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).
@@ -774,6 +785,10 @@ impl PairingSession {
     /// Once the session keys exist the abort carries an HMAC tag, so a network observer
     /// cannot spoof a cancellation.
     ///
+    /// Like [`PairingSession::create_confirm_server`], this is a **terminal** call:
+    /// on success the session concludes, so a second abort (or any other call) fails
+    /// with [`TapauthError::State`].
+    ///
     /// ## Arguments
     ///
     /// * `reason` - `PairingAbortReason` id (1 = USER_REJECTED_SAS, 2 = KEY_MISMATCH,
@@ -782,10 +797,15 @@ impl PairingSession {
     /// ## Errors
     ///
     /// - [`TapauthError::Argument`]: unknown reason id
-    /// - [`TapauthError::State`]: the packet cannot be encoded, or the session lock is
-    ///   poisoned
+    /// - [`TapauthError::State`]: the session already concluded, the packet cannot
+    ///   be encoded, or the session lock is poisoned
     pub fn create_abort(&self, reason: i32) -> Result<Vec<u8>, TapauthError> {
-        self.with(|session| ops::pairing_create_abort(session, reason))
+        self.with(|session| {
+            let frame = ops::pairing_create_abort(session, reason)?;
+            // Terminal: nothing follows a cancellation.
+            session.conclude();
+            Ok(frame)
+        })
     }
 
     /// Verify an abort received from the desktop.
@@ -802,7 +822,8 @@ impl PairingSession {
     ///   packet type
     /// - [`TapauthError::Security`]: bad abort tag, or a tag-less abort once the keys
     ///   exist
-    /// - [`TapauthError::State`]: the session lock is poisoned
+    /// - [`TapauthError::State`]: the session already concluded, or the session lock
+    ///   is poisoned
     pub fn verify_abort(&self, abort_packet: Vec<u8>) -> Result<bool, TapauthError> {
         self.with(|session| ops::pairing_verify_abort(session, &abort_packet))
     }
@@ -854,7 +875,7 @@ mod tests {
         extract_challenge, wrap_auth_cancel, wrap_auth_request, wrap_grant_confirmation,
     };
     use crate::protocol::pairing::{
-        decode_pairing_packet, encode_pairing_packet, PinnedAlgorithms, ServerPairingState,
+        decode_pairing_packet, encode_pairing_packet, ClientPairingState, PinnedAlgorithms,
         PAIRING_SESSION_ID_LEN,
     };
     use crate::protocol::pb::{
@@ -1796,7 +1817,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// The whole phone-side pairing path, driven from a real desktop
-    /// `ServerPairingState`: constructor → init (twice, idempotent) → verify response
+    /// `ClientPairingState`: constructor → init (twice, idempotent) → verify response
     /// (correct and wrong QR key) → provision → confirm server, which the desktop then
     /// verifies.
     /// The defect this catches: a wrong QR `pk` accepted (a substituted `X_C` would
@@ -1806,7 +1827,7 @@ mod tests {
     /// directional keys or the transcript were wrong.
     #[test]
     fn pairing_session_path_matches_the_desktop_state_machine() {
-        let (mut desktop, started) = ServerPairingState::start(
+        let (mut desktop, started) = ClientPairingState::start(
             Ed25519KeyPair::generate().unwrap(),
             "thinkpad",
             36_692,
@@ -1886,17 +1907,9 @@ mod tests {
         assert_eq!(provision.username, "luca");
         assert_eq!(provision.client_hostname, "thinkpad");
 
-        // Step 4: the phone's completion proof satisfies the desktop.
-        let confirm = confirm_server_of(&session.create_confirm_server(csk.to_vec()).unwrap());
-        desktop.verify_confirm_server(&confirm, &csk).unwrap();
-
-        // The same proof for a different CSK is refused by the desktop, which proves
-        // the phone signed the provisioned key and not something else.
-        assert!(desktop
-            .verify_confirm_server(&confirm, &[0xC4u8; 32])
-            .is_err());
-
-        // Aborts authenticate in both directions once the keys exist.
+        // Aborts authenticate in both directions once the keys exist. The phone
+        // verifies the desktop's abort before it emits its own, because creating an
+        // abort concludes the phone session (see `create_abort`'s doc).
         let abort = desktop
             .create_abort(PairingAbortReason::UserRejectedSas)
             .unwrap();
@@ -1915,20 +1928,29 @@ mod tests {
             Err(TapauthError::Security { .. })
         ));
 
-        // A phone-side abort is encodable and carries the requested reason.
-        match decode_pairing_packet(&session.create_abort(2).unwrap())
-            .unwrap()
-            .msg
-        {
-            Some(pairing_packet::Msg::Abort(abort)) => {
-                assert_eq!(abort.reason, PairingAbortReason::KeyMismatch as i32);
-                assert_eq!(abort.auth_tag.len(), 32);
-            }
-            other => panic!("expected PairingAbort, got {other:?}"),
-        }
+        // Step 4: the phone's completion proof satisfies the desktop.
+        let confirm = confirm_server_of(&session.create_confirm_server(csk.to_vec()).unwrap());
+        desktop.verify_confirm_server(&confirm, &csk).unwrap();
+
+        // The same proof for a different CSK is refused by the desktop, which proves
+        // the phone signed the provisioned key and not something else.
+        assert!(desktop
+            .verify_confirm_server(&confirm, &[0xC4u8; 32])
+            .is_err());
+
+        // The completion proof concluded the session: no second proof, no late
+        // response and no abort can be built from it any more.
         assert!(matches!(
-            session.create_abort(99),
-            Err(TapauthError::Argument { .. })
+            session.create_confirm_server(csk.to_vec()),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        assert!(matches!(
+            session.create_abort(PairingAbortReason::KeyMismatch as i32),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        assert!(matches!(
+            session.create_init(),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
         ));
 
         // Releasing a session is dropping its reference, so "unknown handle" no longer
@@ -1972,13 +1994,13 @@ mod tests {
     /// `session.negotiated()` fails here. The phone advertises both algorithms, so
     /// negotiation picks up the pins.
     fn pending_session() -> (
-        ServerPairingState,
+        ClientPairingState,
         Arc<PairingSession>,
         [u8; PAIRING_SESSION_ID_LEN],
         [u8; 32],
         Vec<u8>,
     ) {
-        let (mut desktop, started) = ServerPairingState::start(
+        let (mut desktop, started) = ClientPairingState::start(
             Ed25519KeyPair::generate().unwrap(),
             "thinkpad",
             36_692,
@@ -2130,25 +2152,6 @@ mod tests {
             .verify_response(response_bytes, qr_pk.to_vec())
             .unwrap();
 
-        // Phone → desktop: built here, verified by the desktop state machine.
-        let phone_abort = match decode_pairing_packet(
-            &session
-                .create_abort(PairingAbortReason::UserRejectedSas as i32)
-                .unwrap(),
-        )
-        .unwrap()
-        .msg
-        {
-            Some(pairing_packet::Msg::Abort(abort)) => abort,
-            other => panic!("expected PairingAbort, got {other:?}"),
-        };
-        assert_eq!(
-            phone_abort.reason,
-            PairingAbortReason::UserRejectedSas as i32
-        );
-        assert_eq!(phone_abort.auth_tag.len(), 32);
-        assert!(desktop.verify_abort(&phone_abort).unwrap());
-
         // Desktop → phone: verified here, with the `K_c2s` direction the desktop does
         // not use, so the desktop itself must reject its own frame.
         let desktop_abort = desktop
@@ -2178,6 +2181,77 @@ mod tests {
         assert!(matches!(
             session.verify_abort(session_packet(&session_id, pairing_packet::Msg::Abort(untagged))),
             Err(TapauthError::Security { detail }) if detail.contains("signature")
+        ));
+
+        // Phone → desktop, built last: creating an abort concludes the phone session,
+        // so nothing else may run on it afterwards.
+        let phone_abort = match decode_pairing_packet(
+            &session
+                .create_abort(PairingAbortReason::UserRejectedSas as i32)
+                .unwrap(),
+        )
+        .unwrap()
+        .msg
+        {
+            Some(pairing_packet::Msg::Abort(abort)) => abort,
+            other => panic!("expected PairingAbort, got {other:?}"),
+        };
+        assert_eq!(
+            phone_abort.reason,
+            PairingAbortReason::UserRejectedSas as i32
+        );
+        assert_eq!(phone_abort.auth_tag.len(), 32);
+        assert!(desktop.verify_abort(&phone_abort).unwrap());
+    }
+
+    /// `create_abort` emits the requested reason with an authenticated tag, rejects an
+    /// unknown reason id before touching the session, and concludes the session.
+    ///
+    /// The defect this catches: an abort whose `reason` is dropped or remapped, a tag
+    /// that is not the phone's `K_s2c` one, or a terminal call that leaves the session
+    /// live so Kotlin can keep using a cancelled pairing.
+    #[test]
+    fn pairing_create_abort_is_terminal_and_validates_the_reason() {
+        let (_desktop, session, _session_id, qr_pk, response_bytes) = pending_session();
+        session
+            .verify_response(response_bytes, qr_pk.to_vec())
+            .unwrap();
+
+        match decode_pairing_packet(
+            &session
+                .create_abort(PairingAbortReason::SessionExpired as i32)
+                .unwrap(),
+        )
+        .unwrap()
+        .msg
+        {
+            Some(pairing_packet::Msg::Abort(abort)) => {
+                assert_eq!(abort.reason, PairingAbortReason::SessionExpired as i32);
+                assert_eq!(abort.auth_tag.len(), 32);
+            }
+            other => panic!("expected PairingAbort, got {other:?}"),
+        }
+
+        // The abort concluded the session: a second one, or any other protocol
+        // operation, reports the terminal state instead of running on.
+        assert!(matches!(
+            session.create_abort(PairingAbortReason::KeyMismatch as i32),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        assert!(matches!(
+            session.create_confirm_server(vec![0x00u8; 32]),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+        assert!(matches!(
+            session.create_init(),
+            Err(TapauthError::State { detail }) if detail.contains("concluded")
+        ));
+
+        // An unknown reason id is a caller error, and it is resolved before the
+        // session is touched, so even a concluded session reports it as such.
+        assert!(matches!(
+            session.create_abort(99),
+            Err(TapauthError::Argument { .. })
         ));
     }
 

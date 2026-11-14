@@ -1,6 +1,14 @@
 use crate::l10n::{self, L10n};
-use crate::screens::{Screen, ScreenMessage};
-use iced::{Element, Task, Theme};
+use crate::screens::{CloseAction, Screen, ScreenMessage};
+use iced::{Element, Subscription, Task, Theme};
+use std::time::Duration;
+
+/// Upper bound on the best-effort `CancelPairing` sent when the window closes.
+///
+/// The cancel is a courtesy to the daemon (its answer is ignored), so a daemon
+/// that accepts the connection but never answers must not hold the window open:
+/// the regular IPC read timeout is 120 s.
+const CLOSE_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Main application state
 pub struct TapAuthConfig {
@@ -13,6 +21,13 @@ pub struct TapAuthConfig {
 #[derive(Debug, Clone)]
 pub enum Message {
     ScreenMessage(ScreenMessage),
+    /// The window manager asked to close the window (title-bar button,
+    /// Alt+F4, session logout). Answered by hand so an open pairing session can
+    /// be handed back to the daemon first; see [`TapAuthConfig::update`].
+    WindowCloseRequested(iced::window::Id),
+    /// The daemon has been told about the session, if there was one: the
+    /// window may now close.
+    WindowCloseNow(iced::window::Id),
 }
 
 impl TapAuthConfig {
@@ -39,7 +54,37 @@ impl TapAuthConfig {
                 let task = self.current_screen.update(screen_msg, &self.l10n);
                 task.map(Message::ScreenMessage)
             }
+            Message::WindowCloseRequested(id) => {
+                // Without this, a window closed mid-pairing leaves the daemon
+                // holding the session (UDP socket, BLE advertisement) until
+                // `SESSION_DEADLINE`, 120 s, and the next `StartPairing` is
+                // rejected with "A pairing session is already in progress".
+                // A completion already in flight is the exception: cancelling it
+                // there would discard the device the phone has just paired.
+                match self.current_screen.close_action() {
+                    CloseAction::Cancel(session) => Task::perform(
+                        async move {
+                            let cancel =
+                                crate::ipc::cancel_pairing(session.port, session.session_id);
+                            // Best effort: the answer is irrelevant, and the
+                            // close must not wait long on a wedged daemon.
+                            let _ = tokio::time::timeout(CLOSE_CANCEL_TIMEOUT, cancel).await;
+                        },
+                        move |_| Message::WindowCloseNow(id),
+                    ),
+                    CloseAction::CloseNow => iced::window::close(id),
+                }
+            }
+            Message::WindowCloseNow(id) => iced::window::close(id),
         }
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        // The window is opened with `exit_on_close_request: false` (see `main`),
+        // so iced never destroys it on its own: the close request arrives here
+        // and `update` closes the window once the daemon has been told to drop
+        // the pairing session.
+        iced::window::close_requests().map(Message::WindowCloseRequested)
     }
 
     pub fn view(&self) -> Element<'_, Message> {

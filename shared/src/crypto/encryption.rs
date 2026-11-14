@@ -148,12 +148,20 @@ pub fn encrypted_packet_aad(encryption_algorithm: i32, temporal_identifier: &[u8
 
 /// Encrypt `plaintext` with a fresh 12-byte CSPRNG nonce, prepended to
 /// `ciphertext || tag`. The algorithm is dispatched on `alg`.
+///
+/// Empty AAD is refused with [`CryptoError::InvalidAad`] (v2 forbids it,
+/// cryptography-specification.md §3), so every wrapper inherits the check and a
+/// caller cannot silently drop the context binding.
 pub fn encrypt_aead_with_random_nonce(
     alg: SymmetricAlgorithm,
     key: &[u8; 32],
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    if aad.is_empty() {
+        return Err(CryptoError::InvalidAad);
+    }
+
     let mut nonce = [0u8; AEAD_NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomGenerationFailed)?;
 
@@ -167,12 +175,19 @@ pub fn encrypt_aead_with_random_nonce(
 
 /// Decrypt `nonce || ciphertext || tag` produced by
 /// [`encrypt_aead_with_random_nonce`] (or [`encrypt_with_key`]).
+///
+/// Empty AAD is refused with [`CryptoError::InvalidAad`], matching
+/// [`encrypt_aead_with_random_nonce`].
 pub fn decrypt_aead_with_prepended_nonce(
     alg: SymmetricAlgorithm,
     key: &[u8; 32],
     combined: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    if aad.is_empty() {
+        return Err(CryptoError::InvalidAad);
+    }
+
     let (nonce, ciphertext) = split_prepended_nonce(combined)?;
     decrypt_with_alg(alg, key, &nonce, ciphertext, aad)
 }
@@ -193,6 +208,9 @@ fn split_prepended_nonce(combined: &[u8]) -> Result<([u8; AEAD_NONCE_LEN], &[u8]
 
 /// Encrypt with the CSK using a random nonce (prepended to ciphertext), under
 /// the negotiated algorithm, binding `aad` into the tag.
+///
+/// Empty AAD is refused with [`CryptoError::InvalidAad`] by the underlying
+/// [`encrypt_aead_with_random_nonce`].
 pub fn encrypt_with_csk_and_random_nonce(
     csk: &ClientSymmetricKey,
     alg: SymmetricAlgorithm,
@@ -203,6 +221,9 @@ pub fn encrypt_with_csk_and_random_nonce(
 }
 
 /// Decrypt with the CSK where the random nonce is prepended to the ciphertext.
+///
+/// Empty AAD is refused with [`CryptoError::InvalidAad`] by the underlying
+/// [`decrypt_aead_with_prepended_nonce`].
 pub fn decrypt_with_csk_and_prepended_nonce(
     csk: &ClientSymmetricKey,
     alg: SymmetricAlgorithm,
@@ -461,6 +482,39 @@ mod tests {
                 decrypt_with_csk_and_prepended_nonce(&csk, alg, &combined, aad).unwrap();
 
             assert_eq!(plaintext, decrypted.as_slice());
+        }
+    }
+
+    /// Empty AAD must be refused by *every* wrapper, including the CSK helpers
+    /// (which previously delegated straight to the base helpers with no check),
+    /// and a non-empty AAD must still round-trip.
+    /// The defect this catches: a wrapper that forwards `aad` unchecked, letting
+    /// a packet be sealed with no header binding at all (`EncryptedPacket` uses
+    /// the CSK helpers, so this is the packet path).
+    #[test]
+    fn test_csk_helpers_reject_empty_aad() {
+        for alg in [
+            SymmetricAlgorithm::Aes256Gcm,
+            SymmetricAlgorithm::Chacha20Poly1305,
+        ] {
+            let csk = ClientSymmetricKey::generate().unwrap();
+
+            assert!(matches!(
+                encrypt_with_csk_and_random_nonce(&csk, alg, b"packet", b""),
+                Err(CryptoError::InvalidAad)
+            ));
+            let combined = encrypt_with_csk_and_random_nonce(&csk, alg, b"packet", b"aad").unwrap();
+            assert!(matches!(
+                decrypt_with_csk_and_prepended_nonce(&csk, alg, &combined, b""),
+                Err(CryptoError::InvalidAad)
+            ));
+
+            // A ciphertext that was sealed empty-AAD-free still decrypts with
+            // its own AAD.
+            assert_eq!(
+                decrypt_with_csk_and_prepended_nonce(&csk, alg, &combined, b"aad").unwrap(),
+                b"packet"
+            );
         }
     }
 

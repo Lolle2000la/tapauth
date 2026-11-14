@@ -25,7 +25,7 @@ use shared::protocol::packet::decrypt_encrypted_packet_with_csk_nonce;
 use shared::protocol::pb::EncryptedPacket;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -131,6 +131,62 @@ enum GattMode {
     Pairing,
 }
 
+impl GattMode {
+    /// How this mode is named in logs and errors.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Pairing => "pairing",
+        }
+    }
+}
+
+/// The one live registration of `SERVICE_UUID` in this process.
+///
+/// Pairing and authentication both expose the same four characteristics under
+/// the same `SERVICE_UUID`, and Android resolves `getService(uuid)` to the first
+/// matching attribute in the table. Two simultaneous BlueZ `Application`s would
+/// therefore hand every write to one of them while the other mode's handler
+/// dropped it — a pairing phone writing `PAIRING_CHAR_UUID` to an authentication
+/// registration would simply be ignored. One permit makes that unrepresentable:
+/// a mode registers only while it owns [`gatt_owner`], and unregisters before
+/// releasing it.
+struct GattRegistration {
+    /// Dropping this unregisters the application (bluer sends
+    /// `UnregisterApplication`, removing the service from the attribute table).
+    ///
+    /// Declared first so it is dropped — and the service removed — before the
+    /// permit is released (fields drop in declaration order).
+    _app: bluer::gatt::local::ApplicationHandle,
+    /// The process-wide ownership permit, held for as long as `_app` is
+    /// registered.
+    _owner: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// The process-wide `SERVICE_UUID` registration permit.
+fn gatt_owner() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static OWNER: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    OWNER.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+}
+
+/// Claim the `SERVICE_UUID` registration slot for `mode`.
+///
+/// Fails with a `BleError` naming the current owner instead of registering a
+/// second application: the loser must be explicit, and both callers already
+/// handle a BLE failure by falling back to UDP (pairing keeps its QR/UDP path,
+/// authentication keeps its multicast path).
+fn try_acquire_gatt_owner(mode: GattMode) -> Result<tokio::sync::OwnedMutexGuard<()>, AuthError> {
+    match Arc::clone(gatt_owner()).try_lock_owned() {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(AuthError::BleError(format!(
+            "BLE is busy: another GATT application already publishes {}, so this {} \
+             registration would be shadowed by Android's attribute lookup",
+            SERVICE_UUID,
+            mode.label()
+        ))),
+    }
+}
+
 /// Values and notification handles of the four static characteristics, shared
 /// with the BlueZ D-Bus callbacks.
 struct GattState {
@@ -175,7 +231,7 @@ pub struct BleTransport {
     auth: Option<AuthState>,
     // Keep advertisement and GATT server alive
     adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
-    gatt_handle: Arc<tokio::sync::Mutex<Option<bluer::gatt::local::ApplicationHandle>>>,
+    gatt_handle: Arc<tokio::sync::Mutex<Option<GattRegistration>>>,
     /// Values and notifiers shared with the GATT callbacks.
     gatt: Arc<GattState>,
     /// Frames the peer wrote to `SERVER_RESPONSE_CHAR_UUID`.
@@ -339,8 +395,14 @@ impl BleTransport {
     ///
     /// Both construction paths register the same four characteristics in the
     /// same order, so a phone's cached handles stay valid across the
-    /// pairing-to-authentication transition.
+    /// pairing-to-authentication transition. Only one mode may own
+    /// `SERVICE_UUID` at a time (see [`GattRegistration`]).
     async fn install_gatt(&self, mode: GattMode) -> Result<(), AuthError> {
+        // Take the process-wide slot *before* touching BlueZ: a second live
+        // application would be shadowed, and the mode that loses would silently
+        // drop every write.
+        let owner = try_acquire_gatt_owner(mode)?;
+
         let service_uuid = parse_uuid(SERVICE_UUID)?;
         let client_cmd_uuid = parse_uuid(CLIENT_COMMAND_CHAR_UUID)?;
         let server_resp_uuid = parse_uuid(SERVER_RESPONSE_CHAR_UUID)?;
@@ -564,12 +626,19 @@ impl BleTransport {
             .await
             .map_err(|e| AuthError::BleError(format!("Failed to register GATT server: {}", e)))?;
 
-        *self.gatt_handle.lock().await = Some(app_handle);
+        *self.gatt_handle.lock().await = Some(GattRegistration {
+            _app: app_handle,
+            _owner: owner,
+        });
         tracing::trace!("GATT server registered (4 characteristics)");
         Ok(())
     }
 
     /// Register the GATT service if it is not up yet.
+    ///
+    /// A transport serves exactly one mode for its whole life (`start_pairing`
+    /// refuses an authentication transport and `send_request` refuses a pairing
+    /// one), so an existing registration is always this mode's.
     async fn ensure_gatt(&self, mode: GattMode) -> Result<(), AuthError> {
         if self.gatt_handle.lock().await.is_some() {
             return Ok(());
@@ -728,7 +797,7 @@ impl BleTransport {
     async fn do_shutdown(
         adapter: bluer::Adapter,
         adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
-        gatt_handle: Arc<tokio::sync::Mutex<Option<bluer::gatt::local::ApplicationHandle>>>,
+        gatt_handle: Arc<tokio::sync::Mutex<Option<GattRegistration>>>,
         connected_devices: Arc<tokio::sync::Mutex<HashMap<bluer::Address, bluer::Device>>>,
     ) -> Result<(), AuthError> {
         // Step 1 - Disconnect all connected BLE devices
@@ -1017,7 +1086,7 @@ pub struct PairingBleSession {
     adv_id: [u8; 10],
     adapter: bluer::Adapter,
     adv_handle: Arc<tokio::sync::Mutex<Option<bluer::adv::AdvertisementHandle>>>,
-    gatt_handle: Arc<tokio::sync::Mutex<Option<bluer::gatt::local::ApplicationHandle>>>,
+    gatt_handle: Arc<tokio::sync::Mutex<Option<GattRegistration>>>,
     connected_devices: Arc<tokio::sync::Mutex<HashMap<bluer::Address, bluer::Device>>>,
     rx: UnboundedReceiver<Vec<u8>>,
     value: Arc<tokio::sync::Mutex<Vec<u8>>>,
@@ -1114,6 +1183,86 @@ impl Drop for BleTransport {
                 "BleTransport dropped. Handles will be released. \
                 Cannot check for connected devices as Arc is still shared."
             );
+        }
+    }
+}
+
+// ==== Tests ================================================================
+//
+// No BlueZ here: these cover the process-wide registration rule and nothing
+// about D-Bus. A real "pairing and authentication both register" race needs two
+// live bluez objects and a phone, which is out of reach of a unit test (see the
+// module report).
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Serialises the tests that drive the process-global [`gatt_owner`] slot.
+    ///
+    /// The slot is one value per process, so two of these tests running in
+    /// parallel (libtest threads them) would each see the other's permit and fail
+    /// on an assertion that is true when it runs alone — a flaky gate, not a
+    /// defect. Holding this for the whole test makes the module deterministic
+    /// under `--test-threads=N` without weakening any assertion; it is not part of
+    /// the production path.
+    static GATT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`GATT_TEST_LOCK`], tolerating a poisoned lock.
+    ///
+    /// Poisoning only means an earlier BLE test panicked; the global slot itself
+    /// is a `tokio::sync::Mutex` that carries no invariant a panic could break,
+    /// so reusing the guard reports the real failure instead of a spurious one.
+    fn serialised() -> std::sync::MutexGuard<'static, ()> {
+        GATT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Two modes must never both hold the `SERVICE_UUID` registration slot: the
+    /// second one is refused with a message naming the "busy" state, and the slot
+    /// is reusable as soon as the first releases it.
+    ///
+    /// The defect this catches: both `BleTransport` kinds registering their own
+    /// `Application` for the same service. Android's `getService()` would resolve
+    /// to one of them, so a pairing phone's `PAIRING_CHAR_UUID` writes would land
+    /// in an authentication registration and be dropped by its handler.
+    #[test]
+    fn only_one_mode_may_publish_the_service_uuid() {
+        let _serial = serialised();
+        let pairing = try_acquire_gatt_owner(GattMode::Pairing).expect("first owner");
+        // A registered `Application` is modelled by holding the permit, which is
+        // exactly what `GattRegistration` keeps alive.
+        let refused = try_acquire_gatt_owner(GattMode::Authentication);
+        match refused {
+            Err(AuthError::BleError(message)) => assert!(
+                message.contains("BLE is busy") && message.contains(SERVICE_UUID),
+                "the loser must be told which service is taken, got: {}",
+                message
+            ),
+            Err(other) => panic!("expected the busy error, got {:?}", other),
+            Ok(_) => panic!("a second registration must not be handed the service"),
+        }
+
+        drop(pairing);
+
+        // Release -> the other mode proceeds (this is the pairing-then-unlock and
+        // unlock-then-pairing transition).
+        let authentication = try_acquire_gatt_owner(GattMode::Authentication)
+            .expect("the slot is free once the first owner is gone");
+        drop(authentication);
+    }
+
+    /// The permit must be reusable after every acquire/release cycle, not consumed
+    /// by the first session: the daemon pairs, authenticates and pairs again.
+    #[test]
+    fn the_gatt_slot_is_reusable_across_sessions() {
+        let _serial = serialised();
+        for _ in 0..3 {
+            let guard = try_acquire_gatt_owner(GattMode::Pairing).expect("slot free");
+            assert!(try_acquire_gatt_owner(GattMode::Pairing).is_err());
+            drop(guard);
         }
     }
 }

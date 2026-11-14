@@ -13,6 +13,16 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
 
+/// Read timeout for the commands that wait on a pairing worker
+/// (`wait-for-pairing`, `complete-pairing`).
+///
+/// The daemon answers a pending pairing at most `SESSION_REPLY_TIMEOUT` (135 s:
+/// `SESSION_DEADLINE`, 120 s, plus 5 s of slack — `tapauthd/src/pairing.rs`)
+/// after `start-pairing`, so a shorter read timeout reports a
+/// slow-but-legitimate pairing here as a transport failure while the daemon is
+/// still working. Recheck that value when changing this one.
+const PAIRING_REPLY_READ_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// Production builds always talk to the systemd-activated socket. Only dev
 /// builds (feature `dev-socket-override`, pulled in by `fallback-socket`) may
 /// redirect the CLI to another socket via TAPAUTHD_SOCK.
@@ -209,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ipc::WaitForPairingRequest { port },
                 )),
             };
-            let resp = send_admin(req, Duration::from_secs(60)).await?;
+            let resp = send_admin(req, PAIRING_REPLY_READ_TIMEOUT).await?;
             if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
                 eprintln!("ERROR: {}", resp.error_message);
                 std::process::exit(1);
@@ -231,10 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
             };
             // Must outlive the daemon's `SESSION_REPLY_TIMEOUT` (135 s, see
-            // `tapauthd/src/pairing.rs`) or a slow-but-legitimate pairing is
-            // reported here as a transport failure while the daemon is still
-            // working. Recheck that value when changing this one.
-            let resp = send_admin(req, Duration::from_secs(150)).await?;
+            // `PAIRING_REPLY_READ_TIMEOUT`).
+            let resp = send_admin(req, PAIRING_REPLY_READ_TIMEOUT).await?;
             if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
                 eprintln!("ERROR: {}", resp.error_message);
                 std::process::exit(1);

@@ -25,7 +25,7 @@ use crate::protocol::messages::{
 };
 use crate::protocol::packet::create_encrypted_packet_with_csk_nonce;
 use crate::protocol::pairing::{
-    decode_pairing_packet, encode_pairing_packet, pairing_session_id, ClientPairingSession,
+    decode_pairing_packet, encode_pairing_packet, pairing_session_id, ServerPairingSession,
     PAIRING_SESSION_ID_LEN,
 };
 use crate::protocol::pb::{
@@ -126,6 +126,9 @@ impl From<ProtocolError> for TapauthError {
             },
             ProtocolError::InvalidMessageFormat => Self::Security {
                 detail: "malformed or unexpected protocol message".to_string(),
+            },
+            ProtocolError::SessionConcluded => Self::State {
+                detail: "pairing session already concluded".to_string(),
             },
         }
     }
@@ -589,7 +592,7 @@ pub(crate) fn ble_pairing_adv_id(
 
 /// Decode a `PairingPacket` and require it to belong to `session`.
 fn decode_session_packet(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     packet_bytes: &[u8],
 ) -> Result<PairingPacket, TapauthError> {
     let packet = decode_pairing_packet(packet_bytes).map_err(|err| TapauthError::Argument {
@@ -606,7 +609,7 @@ fn decode_session_packet(
 
 /// Wrap a pairing message in its `PairingPacket` envelope and serialize it.
 fn encode_session_packet(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     message: pairing_packet::Msg,
 ) -> Result<Vec<u8>, TapauthError> {
     let packet = PairingPacket {
@@ -621,7 +624,7 @@ fn encode_session_packet(
 
 /// Build the `PairingInit` to send (serialized `PairingPacket`).
 pub(crate) fn pairing_create_init(
-    session: &mut ClientPairingSession,
+    session: &mut ServerPairingSession,
 ) -> Result<Vec<u8>, TapauthError> {
     let init = session.create_init()?;
     encode_session_packet(session, pairing_packet::Msg::Init(init))
@@ -631,11 +634,11 @@ pub(crate) fn pairing_create_init(
 ///
 /// The QR commitment (`client_x25519_public_key == expected_qr_public_key`) is the
 /// whole point of the pin: it is checked inside
-/// [`ClientPairingSession::verify_response`] in constant time, first, and there is no
+/// [`ServerPairingSession::verify_response`] in constant time, first, and there is no
 /// sentinel that skips it. Nothing is cached until every check passed, so a response
 /// that fails here leaves the session unkeyed and a later genuine one still verifies.
 pub(crate) fn pairing_verify_response(
-    session: &mut ClientPairingSession,
+    session: &mut ServerPairingSession,
     response_packet: &[u8],
     expected_qr_public_key: &[u8; 32],
 ) -> Result<VerifiedPairingResponse, TapauthError> {
@@ -681,7 +684,7 @@ pub(crate) fn pairing_verify_response(
 
 /// Decrypt the desktop's provisioning payload.
 pub(crate) fn pairing_process_confirm_client(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     confirm_client_packet: &[u8],
 ) -> Result<ProvisionedClient, TapauthError> {
     let packet = decode_session_packet(session, confirm_client_packet)?;
@@ -713,7 +716,7 @@ pub(crate) fn pairing_process_confirm_client(
 
 /// Build the completion proof (serialized `PairingPacket` with `PairingConfirmServer`).
 pub(crate) fn pairing_create_confirm_server(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     csk: &[u8; CSK_LEN],
 ) -> Result<Vec<u8>, TapauthError> {
     let confirm = session.create_confirm_server(csk)?;
@@ -726,7 +729,7 @@ pub(crate) fn pairing_create_confirm_server(
 /// or BLE link alive while the two users compare the SAS. Kotlin must not hand-build
 /// the wire format, so the empty message is encoded here.
 pub(crate) fn pairing_create_keepalive(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
 ) -> Result<Vec<u8>, TapauthError> {
     encode_session_packet(session, pairing_packet::Msg::Keepalive(PairingKeepalive {}))
 }
@@ -740,7 +743,7 @@ fn pairing_abort_reason(value: i32) -> Result<PairingAbortReason, TapauthError> 
 
 /// Build an abort (serialized `PairingPacket` with `PairingAbort`).
 pub(crate) fn pairing_create_abort(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     reason: i32,
 ) -> Result<Vec<u8>, TapauthError> {
     let reason = pairing_abort_reason(reason)?;
@@ -754,7 +757,7 @@ pub(crate) fn pairing_create_abort(
 /// unauthenticated by construction; a tag-less or wrong-tag abort once the keys do
 /// exist is a [`TapauthError::Security`] failure, never `Ok(false)`.
 pub(crate) fn pairing_verify_abort(
-    session: &ClientPairingSession,
+    session: &ServerPairingSession,
     abort_packet: &[u8],
 ) -> Result<bool, TapauthError> {
     let packet = decode_session_packet(session, abort_packet)?;

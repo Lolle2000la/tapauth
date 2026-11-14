@@ -7,44 +7,43 @@
 //! the handshake state machine. It owns no sockets, no threads, no timers and no
 //! I/O — the caller (daemon) does the sending, retransmission and timeouts.
 //!
-//! ## Roles (and the naming oddity)
+//! ## Roles
 //!
 //! TapAuth's terminology comes from authentication: the Linux desktop is the
-//! protocol **Client** and the Android phone is the protocol **Server**. In the
-//! v2 pairing messages the proto author kept that framing, so `PairingInit`
-//! carries the *server*'s keys and `PairingResponse` the *client*'s.
+//! protocol **Client** and the Android phone is the protocol **Server**. Pairing
+//! keeps that framing, so `PairingInit` carries the *server*'s keys and
+//! `PairingResponse` the *client*'s.
 //!
-//! The two state machines are therefore named after the pairing messages they
-//! drive, not after the transport role:
+//! The two state machines are named after the role each one plays:
 //!
-//! * [`ServerPairingState`] — the **desktop**. Owns the ephemeral `x_C`/`X_C`
+//! * [`ClientPairingState`] — the **desktop**. Owns the ephemeral `x_C`/`X_C`
 //!   advertised in the QR code, the static `Ed_C`, the session id, the cached
 //!   `PairingResponse` and the negotiated keys. It answers `PairingInit`, builds
 //!   the `PairingConfirmClient` provisioning payload and verifies the
 //!   `PairingConfirmServer` completion proof against `Ed_S`.
-//! * [`ClientPairingSession`] — the **phone**. Owns the ephemeral `x_S`/`X_S`
+//! * [`ServerPairingSession`] — the **phone**. Owns the ephemeral `x_S`/`X_S`
 //!   and the static `Ed_S` (`PairingInit`). It verifies the QR commitment and the
 //!   desktop's transcript signature, decrypts the provisioning payload, signs the
 //!   completion proof with `Ed_S`, and shows the SAS.
 //!
 //! ## Flow
 //!
-//! 1. Desktop [`ServerPairingState::start`] → `sid` (16 B), `X_C`, `pairing_adv_id`
+//! 1. Desktop [`ClientPairingState::start`] → `sid` (16 B), `X_C`, `pairing_adv_id`
 //!    for the BLE advertisement and the `tapauth://pair?v=2&...` QR URL.
-//! 2. Phone [`ClientPairingSession::new`] + [`ClientPairingSession::create_init`]
+//! 2. Phone [`ServerPairingSession::new`] + [`ServerPairingSession::create_init`]
 //!    → `PairingInit` (`X_S`, `Ed_S`, name, supported algorithm lists).
-//! 3. Desktop [`ServerPairingState::handle_init`] → negotiates, computes the
+//! 3. Desktop [`ClientPairingState::handle_init`] → negotiates, computes the
 //!    transcript hash `H`, derives `K_c2s`/`K_s2c`/SAS and returns `PairingResponse`
 //!    signed with `Ed_C` over `"tapauth-pair-client-sig-v2" || H`.
-//! 4. Phone [`ClientPairingSession::verify_response`] → constant-time QR key
+//! 4. Phone [`ServerPairingSession::verify_response`] → constant-time QR key
 //!    comparison, algorithm check, `Ed_C` signature check, key derivation. Both
 //!    users now compare the SAS out of band.
-//! 5. Desktop [`ServerPairingState::create_confirm_client`] encrypts the
+//! 5. Desktop [`ClientPairingState::create_confirm_client`] encrypts the
 //!    provisioned `{csk, username, client_hostname}` under `K_c2s`; the phone
-//!    decrypts it with [`ClientPairingSession::process_confirm_client`].
-//! 6. Phone [`ClientPairingSession::create_confirm_server`] signs the completion
+//!    decrypts it with [`ServerPairingSession::process_confirm_client`].
+//! 6. Phone [`ServerPairingSession::create_confirm_server`] signs the completion
 //!    proof with `Ed_S` and encrypts it under `K_s2c`; the desktop verifies it
-//!    with [`ServerPairingState::verify_confirm_server`].
+//!    with [`ClientPairingState::verify_confirm_server`].
 //!
 //! Every handshake field (both ephemeral keys, both identity keys, both device
 //! names, the advertised algorithm lists and the selected algorithms) enters `H`,
@@ -58,7 +57,7 @@
 //! every already-paired server (cryptography-specification.md §1.3). When a `CSK`
 //! already exists, the caller must therefore pass its persisted algorithms — read
 //! from `ClientConfigManager::load_csk_metadata` — as [`PinnedAlgorithms`] to
-//! [`ServerPairingState::start`]. A pinned algorithm is then *required* in the
+//! [`ClientPairingState::start`]. A pinned algorithm is then *required* in the
 //! peer's `supported_*` list: a peer that does not offer it is refused with
 //! [`ProtocolError::UnsupportedAlgorithm`] instead of silently negotiating a pair
 //! that would make the existing broadcast undecryptable for its servers.
@@ -70,13 +69,17 @@
 //!
 //! ## Key lifetime
 //!
-//! [`ServerPairingState::conclude`] and [`ClientPairingSession::conclude`] drop
-//! the derived keys and the transcript hash as soon as pairing completes (or is
-//! aborted), per cryptography-specification.md §4. After `conclude` the state
-//! still reports [`ServerPairingState::negotiated`] but every operation that needs
-//! keys fails with [`ProtocolError::MissingField`]`("pairing_session_keys")` and
-//! [`ServerPairingState::sas`]/[`ServerPairingState::transcript_hash`] return
-//! `None`.
+//! [`ClientPairingState::conclude`] and [`ServerPairingSession::conclude`] drop
+//! the derived keys, the transcript hash and the ephemeral X25519 secret as soon
+//! as pairing completes (or is aborted), per cryptography-specification.md §4.
+//! Each side also takes its ephemeral secret as soon as it derives the keys, so it
+//! exists only for the one Diffie-Hellman call that needs it. `conclude` is
+//! terminal: afterwards [`ClientPairingState::negotiated`] still answers and
+//! [`ProtocolError::MissingField`]`("pairing_session_keys")` is what every
+//! key-dependent reader reports, but every protocol operation (`handle_init`,
+//! `create_init`, `verify_response`, the create/verify confirm and abort methods)
+//! fails with [`ProtocolError::SessionConcluded`] instead of running on a session
+//! whose keys are gone.
 //!
 //! ## Who signs what
 //!
@@ -89,10 +92,10 @@
 //! ## Caller responsibilities
 //!
 //! * Session filtering: drop any frame whose `session_id` differs from
-//!   [`ServerPairingState::session_id`] / [`ClientPairingSession::session_id`]
+//!   [`ClientPairingState::session_id`] / [`ServerPairingSession::session_id`]
 //!   before calling into this module ([`pairing_session_id`] extracts it).
 //! * Retries: `PairingInit` retries must be answered from
-//!   [`ServerPairingState::response`] without calling [`ServerPairingState::handle_init`]
+//!   [`ClientPairingState::response`] without calling [`ClientPairingState::handle_init`]
 //!   again; `handle_init` is idempotent for an identical `init` and errors on a
 //!   conflicting one.
 //! * Re-encryption: `PairingConfirmClient`/`PairingConfirmServer` carry a fresh
@@ -211,12 +214,16 @@ pub fn pairing_session_id(
 /// `tapauth://pair?v=2&...` URL, and may all be absent for BLE-only pairing.
 #[derive(Debug, Clone, Copy, Default)]
 struct PairingEndpoint {
-    udp_port: u16,
+    /// The UDP pairing port, or `None` when this session has no UDP endpoint
+    /// (the network transport is disabled and the phone pairs over BLE only).
+    /// `None` omits `&p=` from the QR code entirely; `&p=0` would advertise a
+    /// port nothing can send to.
+    udp_port: Option<u16>,
     ipv4: Option<std::net::Ipv4Addr>,
     ipv6: Option<std::net::Ipv6Addr>,
 }
 
-/// What the desktop needs to show/emit after [`ServerPairingState::start`].
+/// What the desktop needs to show/emit after [`ClientPairingState::start`].
 pub struct StartedPairing {
     /// Random 16-byte session id (`sid`), also carried by every `PairingPacket`.
     pub session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -230,13 +237,19 @@ pub struct StartedPairing {
 
 /// Desktop-side pairing state (the protocol *Client*; see the module docs).
 ///
-/// Created by [`ServerPairingState::start`], fed a `PairingInit` through
-/// [`ServerPairingState::handle_init`], then driven through provisioning and
+/// Created by [`ClientPairingState::start`], fed a `PairingInit` through
+/// [`ClientPairingState::handle_init`], then driven through provisioning and
 /// completion. All key material is dropped (and zeroized) when the value is
 /// dropped, which the caller must do as soon as pairing concludes.
-pub struct ServerPairingState {
+pub struct ClientPairingState {
     session_id: [u8; PAIRING_SESSION_ID_LEN],
-    x25519_keypair: X25519KeyPair,
+    /// Public half `X_C`, committed in the QR code. Public data, kept after the
+    /// secret is taken so the accessor stays answerable.
+    client_x25519_public_key: [u8; 32],
+    /// Ephemeral `x_C`. Taken — and zeroized on drop — as soon as the session
+    /// keys are derived, and again on [`ClientPairingState::conclude`], so the
+    /// secret cannot be reused by a later operation.
+    x25519_keypair: Option<X25519KeyPair>,
     client_identity: Ed25519KeyPair,
     client_device_name: String,
     /// Encoding of the first accepted `PairingInit`, for idempotent retries.
@@ -250,15 +263,20 @@ pub struct ServerPairingState {
     negotiated: Option<NegotiatedAlgorithms>,
     /// The active CSK's algorithms, which negotiation must reproduce.
     pinned: Option<PinnedAlgorithms>,
+    /// Terminal flag: set by [`ClientPairingState::conclude`], after which every
+    /// protocol operation is refused.
+    concluded: bool,
 }
 
-impl ServerPairingState {
+impl ClientPairingState {
     /// Start a pairing session: random `sid`, ephemeral `x_C`, BLE advertisement
     /// id and QR URL.
     ///
     /// `udp_port`, `ipv4` and `ipv6` only feed the QR URL (they may be absent for
-    /// BLE-only pairing). Negotiation happens in
-    /// [`ServerPairingState::handle_init`]; `pinned` carries the algorithms an
+    /// BLE-only pairing). `udp_port == 0` means "this session has no UDP
+    /// endpoint": it is omitted from the QR code rather than published as
+    /// `&p=0`, a port nothing can send to. Negotiation happens in
+    /// [`ClientPairingState::handle_init`]; `pinned` carries the algorithms an
     /// existing `CSK` is already committed to (see the module docs), and must be
     /// `None` for a first pairing.
     pub fn start(
@@ -279,7 +297,9 @@ impl ServerPairingState {
             client_identity,
             client_device_name,
             PairingEndpoint {
-                udp_port,
+                // Port 0 is never a real UDP endpoint: a session that has none
+                // (network transport disabled) must not publish `&p=0`.
+                udp_port: (udp_port != 0).then_some(udp_port),
                 ipv4,
                 ipv6,
             },
@@ -289,7 +309,7 @@ impl ServerPairingState {
 
     /// Assemble the state and its [`StartedPairing`] from already-chosen material.
     ///
-    /// Split out of [`ServerPairingState::start`] so a test can re-create a state
+    /// Split out of [`ClientPairingState::start`] so a test can re-create a state
     /// with the *same* `x_C`/`Ed_C`/`sid` and vary one transcript field at a time.
     fn build(
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -304,14 +324,15 @@ impl ServerPairingState {
         let qr_url = generate_pairing_url_v2(
             &session_id,
             &hex::encode(client_x25519_public_key),
-            Some(endpoint.udp_port),
+            endpoint.udp_port,
             endpoint.ipv4,
             endpoint.ipv6,
         );
 
         let state = Self {
             session_id,
-            x25519_keypair,
+            client_x25519_public_key,
+            x25519_keypair: Some(x25519_keypair),
             client_identity,
             client_device_name: truncate_utf8(client_device_name, PAIRING_DEVICE_NAME_MAX_BYTES),
             accepted_init: None,
@@ -321,6 +342,7 @@ impl ServerPairingState {
             keys: None,
             negotiated: None,
             pinned,
+            concluded: false,
         };
         let started = StartedPairing {
             session_id,
@@ -338,7 +360,7 @@ impl ServerPairingState {
 
     /// The ephemeral `X_C` committed in the QR code.
     pub fn client_x25519_public_key(&self) -> [u8; 32] {
-        self.x25519_keypair.public_key_bytes()
+        self.client_x25519_public_key
     }
 
     /// The static `Ed_C` this desktop proves possession of.
@@ -355,6 +377,7 @@ impl ServerPairingState {
     /// established fails with [`ProtocolError::InvalidMessageFormat`], because the
     /// transcript and the derived keys are already committed.
     pub fn handle_init(&mut self, init: &PairingInit) -> Result<&PairingResponse, ProtocolError> {
+        ensure_live(self.concluded)?;
         let server_x25519_public_key =
             key_32(&init.server_x25519_public_key, "server_x25519_public_key")?;
         let server_ed25519_public_key =
@@ -381,7 +404,7 @@ impl ServerPairingState {
             self.pinned,
         )?;
 
-        let client_x25519_public_key = self.x25519_keypair.public_key_bytes();
+        let client_x25519_public_key = self.client_x25519_public_key;
         let client_ed25519_public_key = self.client_identity.verifying_key_bytes();
 
         let transcript = PairingTranscript {
@@ -405,10 +428,15 @@ impl ServerPairingState {
 
         let shared_secret = Zeroizing::new(
             self.x25519_keypair
+                .as_ref()
+                .ok_or(ProtocolError::MissingField("x25519_keypair"))?
                 .diffie_hellman(&server_x25519_public_key)?,
         );
         let keys = derive_pairing_keys_and_sas(&shared_secret, &transcript_hash)?;
         drop(shared_secret);
+        // `x_C` has served its only purpose. Take it now so it is zeroized and can
+        // never be reused, even by a later retry or a resurrected session.
+        self.x25519_keypair = None;
 
         let signed = context_with_hash(PAIRING_CLIENT_SIG_CONTEXT, &transcript_hash);
         let client_signature = sign_ed25519(&self.client_identity, &signed);
@@ -440,21 +468,37 @@ impl ServerPairingState {
         self.response.as_ref()
     }
 
-    /// Drop the session keys and the transcript hash.
+    /// Drop the session keys, the transcript hash and the ephemeral `x_C`.
     ///
-    /// Call this once the pairing has completed ([`ServerPairingState::verify_confirm_server`]
+    /// Call this once the pairing has completed ([`ClientPairingState::verify_confirm_server`]
     /// returned `Ok`) or as soon as it is aborted, so `K_c2s`/`K_s2c`/`H` do not
     /// linger in memory (cryptography-specification.md §4). Afterwards
-    /// [`ServerPairingState::sas`] and [`ServerPairingState::transcript_hash`] return
-    /// `None`, [`ServerPairingState::negotiated`] still answers, and every operation
+    /// [`ClientPairingState::sas`] and [`ClientPairingState::transcript_hash`] return
+    /// `None`, [`ClientPairingState::negotiated`] still answers, and every operation
     /// that needs keys fails with [`ProtocolError::MissingField`]`("pairing_session_keys")`.
     ///
-    /// The ephemeral `x_C` is not dropped (its public half is still exposed by
-    /// [`ServerPairingState::client_x25519_public_key`]); it is zeroized when the
-    /// state itself is dropped.
+    /// `conclude` is **terminal**: every protocol operation (`handle_init`,
+    /// `create_confirm_client`, `create_abort`, `verify_abort`) then fails with
+    /// [`ProtocolError::SessionConcluded`], so a late retransmission cannot
+    /// resurrect a session whose keys are gone. Calling it twice is a no-op.
     pub fn conclude(&mut self) {
+        if self.concluded {
+            return;
+        }
+        self.concluded = true;
         self.keys = None;
         self.transcript_hash = None;
+        // Zeroized on drop: the secret is gone with the keys it derived.
+        self.x25519_keypair = None;
+    }
+
+    /// Whether [`ClientPairingState::conclude`] has run.
+    ///
+    /// The public half of `x_C` stays exposed by
+    /// [`ClientPairingState::client_x25519_public_key`].
+    #[cfg(test)]
+    fn ephemeral_keypair_present(&self) -> bool {
+        self.x25519_keypair.is_some()
     }
 
     /// The negotiated algorithms, once `PairingInit` has been handled.
@@ -482,12 +526,16 @@ impl ServerPairingState {
     ///
     /// Each call draws a fresh nonce: a retransmission must re-send the same
     /// [`PairingConfirmClient`], not call this again.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once [`ClientPairingState::conclude`]
+    /// has run.
     pub fn create_confirm_client(
         &self,
         csk: &[u8; 32],
         username: &str,
         client_hostname: &str,
     ) -> Result<PairingConfirmClient, ProtocolError> {
+        ensure_live(self.concluded)?;
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
         let payload = PairingProvisionPayload {
@@ -550,7 +598,11 @@ impl ServerPairingState {
     ///
     /// Before the keys exist the abort is sent untagged: the peer only learns that
     /// somebody asked to stop, which is all it can authenticate anyway.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once [`ClientPairingState::conclude`]
+    /// has run.
     pub fn create_abort(&self, reason: PairingAbortReason) -> Result<PairingAbort, ProtocolError> {
+        ensure_live(self.concluded)?;
         let auth_tag = match (self.keys.as_ref(), self.transcript_hash.as_ref()) {
             (Some(keys), Some(transcript_hash)) => {
                 compute_pairing_abort_tag(&keys.k_c2s, transcript_hash, reason as i32).to_vec()
@@ -568,8 +620,10 @@ impl ServerPairingState {
     /// Returns `Ok(true)` for an authenticated abort, `Ok(false)` for a tag-less
     /// abort received before any key exists (unauthenticated by construction), and
     /// [`ProtocolError::InvalidSignature`] for a bad tag, a tag-less abort once
-    /// keys exist, or a tag before keys exist.
+    /// keys exist, or a tag before keys exist. Once the session concluded it fails
+    /// with [`ProtocolError::SessionConcluded`].
     pub fn verify_abort(&self, abort: &PairingAbort) -> Result<bool, ProtocolError> {
+        ensure_live(self.concluded)?;
         verify_abort_tag(
             abort,
             self.keys.as_ref().map(|keys| &*keys.k_s2c),
@@ -583,13 +637,18 @@ impl ServerPairingState {
 /// Created from the QR code's session id, then driven through `PairingInit`,
 /// response verification, provisioning and completion. Dropping it zeroizes the
 /// ephemeral key and the derived session keys.
-pub struct ClientPairingSession {
+pub struct ServerPairingSession {
     session_id: [u8; PAIRING_SESSION_ID_LEN],
-    x25519_keypair: X25519KeyPair,
+    /// Public half `X_S`, kept after the secret is taken so a cached
+    /// `PairingInit` and the transcript stay answerable.
+    server_x25519_public_key: [u8; 32],
+    /// Ephemeral `x_S`. Taken — and zeroized on drop — as soon as the session
+    /// keys are derived, and again on [`ServerPairingSession::conclude`].
+    x25519_keypair: Option<X25519KeyPair>,
     server_identity: Ed25519KeyPair,
     server_device_name: String,
     /// Exactly what `PairingInit` advertised; these lists enter `H`, so they are
-    /// cached and reused verbatim in [`ClientPairingSession::verify_response`].
+    /// cached and reused verbatim in [`ServerPairingSession::verify_response`].
     advertised_symmetric: Vec<SymmetricAlgorithm>,
     advertised_hash: Vec<HashAlgorithm>,
     advertised_signature: Vec<SignatureAlgorithm>,
@@ -597,9 +656,12 @@ pub struct ClientPairingSession {
     negotiated: Option<NegotiatedAlgorithms>,
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
+    /// Terminal flag: set by [`ServerPairingSession::conclude`], after which every
+    /// protocol operation is refused.
+    concluded: bool,
 }
 
-impl ClientPairingSession {
+impl ServerPairingSession {
     /// Create the phone's half of a pairing, from the scanned QR `sid`.
     ///
     /// `server_identity` is the phone's long-term `Ed_S`.
@@ -618,7 +680,7 @@ impl ClientPairingSession {
 
     /// Assemble the session around an already-chosen ephemeral `X_S`.
     ///
-    /// Split out of [`ClientPairingSession::new`] so a test can pin `X_S` and get a
+    /// Split out of [`ServerPairingSession::new`] so a test can pin `X_S` and get a
     /// deterministic `Z`, `H` and SAS (see `transcript_hash_binds_every_negotiated_field`).
     fn build(
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -626,9 +688,11 @@ impl ClientPairingSession {
         server_identity: Ed25519KeyPair,
         server_device_name: &str,
     ) -> Self {
+        let server_x25519_public_key = x25519_keypair.public_key_bytes();
         Self {
             session_id,
-            x25519_keypair,
+            server_x25519_public_key,
+            x25519_keypair: Some(x25519_keypair),
             server_identity,
             server_device_name: truncate_utf8(server_device_name, PAIRING_DEVICE_NAME_MAX_BYTES),
             advertised_symmetric: SUPPORTED_SYMMETRIC_ALGORITHMS.to_vec(),
@@ -638,6 +702,7 @@ impl ClientPairingSession {
             negotiated: None,
             transcript_hash: None,
             keys: None,
+            concluded: false,
         }
     }
 
@@ -647,12 +712,16 @@ impl ClientPairingSession {
     }
 
     /// Build (once) the `PairingInit` to send, retransmitting the cached copy.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once
+    /// [`ServerPairingSession::conclude`] has run.
     pub fn create_init(&mut self) -> Result<PairingInit, ProtocolError> {
+        ensure_live(self.concluded)?;
         if let Some(init) = self.init.as_ref() {
             return Ok(init.clone());
         }
         let init = PairingInit {
-            server_x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
+            server_x25519_public_key: self.server_x25519_public_key.to_vec(),
             server_ed25519_public_key: self.server_identity.verifying_key_bytes().to_vec(),
             server_device_name: self.server_device_name.clone(),
             supported_symmetric_algorithms: self
@@ -684,11 +753,22 @@ impl ClientPairingSession {
     /// A `client_x25519_public_key` that is not 32 bytes is reported as
     /// [`ProtocolError::ChallengeMismatch`] too — it can never equal the QR key,
     /// and the caller's remedy (abort with `KEY_MISMATCH`) is the same.
+    ///
+    /// The phone must have built its `PairingInit` first (the transcript it
+    /// advertised is the one it verifies against) and may verify exactly one
+    /// response: while keys exist, a second response is refused with
+    /// [`ProtocolError::InvalidMessageFormat`] rather than re-deriving over a live
+    /// session. After [`ServerPairingSession::conclude`] the call fails with
+    /// [`ProtocolError::SessionConcluded`].
     pub fn verify_response(
         &mut self,
         response: &PairingResponse,
         expected_qr_pk: &[u8; 32],
     ) -> Result<(), ProtocolError> {
+        ensure_live(self.concluded)?;
+        if self.init.is_none() || self.keys.is_some() {
+            return Err(ProtocolError::InvalidMessageFormat);
+        }
         let client_x25519_public_key: [u8; 32] = response
             .client_x25519_public_key
             .as_slice()
@@ -723,7 +803,7 @@ impl ClientPairingSession {
             signature_algorithm: selected_signature,
         };
 
-        let server_x25519_public_key = self.x25519_keypair.public_key_bytes();
+        let server_x25519_public_key = self.server_x25519_public_key;
         let server_ed25519_public_key = self.server_identity.verifying_key_bytes();
 
         let transcript = PairingTranscript {
@@ -754,10 +834,15 @@ impl ClientPairingSession {
 
         let shared_secret = Zeroizing::new(
             self.x25519_keypair
+                .as_ref()
+                .ok_or(ProtocolError::MissingField("x25519_keypair"))?
                 .diffie_hellman(&client_x25519_public_key)?,
         );
         let keys = derive_pairing_keys_and_sas(&shared_secret, &transcript_hash)?;
         drop(shared_secret);
+        // `x_S` has served its only purpose: take it so it is zeroized and the
+        // session cannot derive a second set of keys from it.
+        self.x25519_keypair = None;
 
         self.negotiated = Some(negotiated);
         self.transcript_hash = Some(transcript_hash);
@@ -780,15 +865,29 @@ impl ClientPairingSession {
         self.keys.as_ref().map(|keys| keys.sas.as_str())
     }
 
-    /// Drop the session keys and the transcript hash.
+    /// Drop the session keys, the transcript hash and the ephemeral `x_S`.
     ///
-    /// Call this once [`ClientPairingSession::create_confirm_server`] has been sent
+    /// Call this once [`ServerPairingSession::create_confirm_server`] has been sent
     /// after the user confirmed the SAS, or as soon as the pairing is aborted, so
     /// `K_c2s`/`K_s2c`/`H` do not linger in memory (cryptography-specification.md §4).
-    /// Same post-conditions as [`ServerPairingState::conclude`].
+    /// Same post-conditions as [`ClientPairingState::conclude`]: `conclude` is
+    /// terminal, so every later protocol operation (`create_init`, `verify_response`,
+    /// `create_confirm_server`, `create_abort`, `verify_abort`) fails with
+    /// [`ProtocolError::SessionConcluded`]. Calling it twice is a no-op.
     pub fn conclude(&mut self) {
+        if self.concluded {
+            return;
+        }
+        self.concluded = true;
         self.keys = None;
         self.transcript_hash = None;
+        self.x25519_keypair = None;
+    }
+
+    /// Whether the ephemeral `x_S` is still held.
+    #[cfg(test)]
+    fn ephemeral_keypair_present(&self) -> bool {
+        self.x25519_keypair.is_some()
     }
 
     /// Decrypt the desktop's provisioning payload (`PairingConfirmClient`).
@@ -798,6 +897,8 @@ impl ClientPairingSession {
     /// `AAD = "tapauth-pair-v2-provision" || H` and decodes
     /// `PairingProvisionPayload`. Returns `csk`/`username`/`client_hostname`; the
     /// caller persists them and requires `csk` to be 32 bytes (enforced here).
+    /// After [`ServerPairingSession::conclude`] the keys are gone, so this fails with
+    /// [`ProtocolError::MissingField`]`("pairing_session_keys")`.
     pub fn process_confirm_client(
         &self,
         confirm: &PairingConfirmClient,
@@ -828,10 +929,14 @@ impl ClientPairingSession {
     ///
     /// Each call draws a fresh nonce: a retransmission must re-send the same
     /// [`PairingConfirmServer`], not call this again.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once
+    /// [`ServerPairingSession::conclude`] has run.
     pub fn create_confirm_server(
         &self,
         csk: &[u8; 32],
     ) -> Result<PairingConfirmServer, ProtocolError> {
+        ensure_live(self.concluded)?;
         let (keys, transcript_hash, negotiated) =
             session_material(&self.keys, &self.transcript_hash, &self.negotiated)?;
         let signed = complete_signature_message(PAIRING_SERVER_SIG_CONTEXT, transcript_hash, csk);
@@ -848,7 +953,11 @@ impl ClientPairingSession {
     }
 
     /// Build an abort, authenticated with `K_s2c` when the keys already exist.
+    ///
+    /// Fails with [`ProtocolError::SessionConcluded`] once
+    /// [`ServerPairingSession::conclude`] has run.
     pub fn create_abort(&self, reason: PairingAbortReason) -> Result<PairingAbort, ProtocolError> {
+        ensure_live(self.concluded)?;
         let auth_tag = match (self.keys.as_ref(), self.transcript_hash.as_ref()) {
             (Some(keys), Some(transcript_hash)) => {
                 compute_pairing_abort_tag(&keys.k_s2c, transcript_hash, reason as i32).to_vec()
@@ -863,8 +972,11 @@ impl ClientPairingSession {
 
     /// Verify an abort received from the desktop (tagged with `K_c2s`).
     ///
-    /// Same result contract as [`ServerPairingState::verify_abort`].
+    /// Same result contract as [`ClientPairingState::verify_abort`]; after
+    /// [`ServerPairingSession::conclude`] it fails with
+    /// [`ProtocolError::SessionConcluded`].
     pub fn verify_abort(&self, abort: &PairingAbort) -> Result<bool, ProtocolError> {
+        ensure_live(self.concluded)?;
         verify_abort_tag(
             abort,
             self.keys.as_ref().map(|keys| &*keys.k_c2s),
@@ -876,6 +988,19 @@ impl ClientPairingSession {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Refuse a protocol operation on a session whose `conclude()` already ran.
+///
+/// `conclude()` is the terminal transition: it drops every key and the ephemeral
+/// secret, so anything arriving afterwards is a retransmission of a finished
+/// handshake — or an attempt to resurrect it — and must be reported as such
+/// instead of being answered from a half-dead state.
+fn ensure_live(concluded: bool) -> Result<(), ProtocolError> {
+    if concluded {
+        return Err(ProtocolError::SessionConcluded);
+    }
+    Ok(())
+}
 
 /// Envelope rules shared by the encoder, the decoder and the session-id accessor.
 fn validate_envelope(packet: &PairingPacket) -> Result<(), ProtocolError> {
@@ -1087,14 +1212,14 @@ mod tests {
         Ed25519KeyPair::from_signing_key_bytes(&PHONE_SEED).unwrap()
     }
 
-    fn start_desktop() -> (ServerPairingState, StartedPairing) {
+    fn start_desktop() -> (ClientPairingState, StartedPairing) {
         start_desktop_with_pins(None)
     }
 
     fn start_desktop_with_pins(
         pinned: Option<PinnedAlgorithms>,
-    ) -> (ServerPairingState, StartedPairing) {
-        ServerPairingState::start(
+    ) -> (ClientPairingState, StartedPairing) {
+        ClientPairingState::start(
             desktop_identity(),
             "thinkpad",
             36692,
@@ -1107,14 +1232,14 @@ mod tests {
 
     /// Rebuild a desktop state that is byte-identical in its key material and
     /// session id, so a test can vary exactly one transcript field.
-    fn seeded_desktop(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ServerPairingState {
-        ServerPairingState::build(
+    fn seeded_desktop(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ClientPairingState {
+        ClientPairingState::build(
             session_id,
             X25519KeyPair::from_secret_bytes([0x11; 32]),
             desktop_identity(),
             "thinkpad",
             PairingEndpoint {
-                udp_port: 36692,
+                udp_port: Some(36692),
                 ipv4: None,
                 ipv6: None,
             },
@@ -1125,8 +1250,8 @@ mod tests {
 
     /// The phone counterpart of [`seeded_desktop`]: a fixed `X_S`, so `Z`, `H` and
     /// the SAS are the same on every run.
-    fn seeded_phone(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ClientPairingSession {
-        ClientPairingSession::build(
+    fn seeded_phone(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ServerPairingSession {
+        ServerPairingSession::build(
             session_id,
             X25519KeyPair::from_secret_bytes([0x22; 32]),
             phone_identity(),
@@ -1137,21 +1262,21 @@ mod tests {
     /// Desktop + phone with `PairingInit` sent and `PairingResponse` received, but
     /// not yet verified by the phone.
     fn exchange() -> (
-        ServerPairingState,
-        ClientPairingSession,
+        ClientPairingState,
+        ServerPairingSession,
         PairingResponse,
         [u8; 32],
     ) {
         let (mut desktop, started) = start_desktop();
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
         let init = phone.create_init().unwrap();
         let response = desktop.handle_init(&init).unwrap().clone();
         (desktop, phone, response, started.client_x25519_public_key)
     }
 
     /// A fully established pairing: keys and SAS derived on both sides.
-    fn established() -> (ServerPairingState, ClientPairingSession) {
+    fn established() -> (ClientPairingState, ServerPairingSession) {
         let (desktop, mut phone, response, qr_pk) = exchange();
         phone.verify_response(&response, &qr_pk).unwrap();
         (desktop, phone)
@@ -1194,7 +1319,7 @@ mod tests {
         assert!(started.qr_url.contains("ip4=192.168.1.10"));
 
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
         assert_eq!(phone.session_id(), &started.session_id);
 
         let init = phone.create_init().unwrap();
@@ -1309,7 +1434,7 @@ mod tests {
         // pairing: the desktop only trusts the `Ed_S` bound into `H`.
         let foreign_session_id = [0x99u8; PAIRING_SESSION_ID_LEN];
         let mut foreign_desktop = seeded_desktop(foreign_session_id);
-        let mut foreign_phone = ClientPairingSession::new(
+        let mut foreign_phone = ServerPairingSession::new(
             foreign_session_id,
             Ed25519KeyPair::from_signing_key_bytes(&[0xC3; 32]).unwrap(),
             "pixel",
@@ -1488,7 +1613,7 @@ mod tests {
     fn response_selecting_unadvertised_algorithm_is_rejected() {
         let (mut desktop, started) = start_desktop();
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
         // The phone only advertises AES-256-GCM, so it can never accept ChaCha20.
         phone.advertised_symmetric = vec![SymmetricAlgorithm::Aes256Gcm];
         let init = phone.create_init().unwrap();
@@ -1585,7 +1710,7 @@ mod tests {
     #[test]
     fn tagless_abort_before_keys_is_unauthenticated() {
         let (desktop, _started) = start_desktop();
-        let phone = ClientPairingSession::new([0x07; 16], phone_identity(), "pixel").unwrap();
+        let phone = ServerPairingSession::new([0x07; 16], phone_identity(), "pixel").unwrap();
 
         let untagged = PairingAbort {
             reason: PairingAbortReason::SessionExpired as i32,
@@ -1790,20 +1915,30 @@ mod tests {
             );
 
             // The phone rebuilds H from its own view, so the desktop's signature
-            // over the mutated transcript no longer verifies.
+            // over the mutated transcript no longer verifies. A verified session
+            // refuses a second `verify_response`, so each attempt runs on a fresh
+            // phone with the same fixed key material (and therefore the same view).
+            let mut fresh_phone = seeded_phone(session_id);
+            fresh_phone.create_init().unwrap();
             assert!(
                 matches!(
-                    phone
+                    fresh_phone
                         .verify_response(&mutated_response, &qr_pk)
                         .unwrap_err(),
                     ProtocolError::InvalidSignature
                 ),
                 "mutating {field} must break the response signature check"
             );
-            // ... and the failed attempt must not have overwritten the phone state.
-            assert_eq!(phone.transcript_hash().unwrap(), &baseline_hash);
-            assert_eq!(phone.sas().unwrap(), baseline_sas.as_str());
+            // ... and the failed attempt must have cached nothing.
+            assert!(fresh_phone.transcript_hash().is_none());
+            assert!(fresh_phone.sas().is_none());
+            assert!(fresh_phone.keys.is_none());
         }
+
+        // The genuine pairing still holds the baseline values: the mutated
+        // attempts above never touched it.
+        assert_eq!(phone.transcript_hash().unwrap(), &baseline_hash);
+        assert_eq!(phone.sas().unwrap(), baseline_sas.as_str());
     }
 
     // --- 8. Client-wide algorithm pinning --------------------------------
@@ -1815,12 +1950,12 @@ mod tests {
         advertised_symmetric: Vec<SymmetricAlgorithm>,
         advertised_hash: Vec<HashAlgorithm>,
     ) -> (
-        Result<(ServerPairingState, ClientPairingSession), ProtocolError>,
+        Result<(ClientPairingState, ServerPairingSession), ProtocolError>,
         [u8; 32],
     ) {
         // Fixed key material: the negotiation outcome, not the keys, is the subject.
         let session_id = [0x7Eu8; PAIRING_SESSION_ID_LEN];
-        let (mut desktop, started) = ServerPairingState::build(
+        let (mut desktop, started) = ClientPairingState::build(
             session_id,
             X25519KeyPair::from_secret_bytes([0x11; 32]),
             desktop_identity(),
@@ -1828,7 +1963,7 @@ mod tests {
             PairingEndpoint::default(),
             pinned,
         );
-        let mut phone = ClientPairingSession::new(started.session_id, phone_identity(), "pixel")
+        let mut phone = ServerPairingSession::new(started.session_id, phone_identity(), "pixel")
             .expect("phone session");
         phone.advertised_symmetric = advertised_symmetric;
         phone.advertised_hash = advertised_hash;
@@ -1944,7 +2079,7 @@ mod tests {
 
         // The refusal leaves the desktop state untouched: no response, no keys.
         let session_id = [0x7Fu8; PAIRING_SESSION_ID_LEN];
-        let (mut desktop, started) = ServerPairingState::build(
+        let (mut desktop, started) = ClientPairingState::build(
             session_id,
             X25519KeyPair::from_secret_bytes([0x11; 32]),
             desktop_identity(),
@@ -1956,7 +2091,7 @@ mod tests {
             }),
         );
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
         phone.advertised_symmetric = vec![SymmetricAlgorithm::Aes256Gcm];
         let init = phone.create_init().unwrap();
         assert!(matches!(
@@ -2028,20 +2163,243 @@ mod tests {
 
         assert!(matches!(
             desktop.create_confirm_client(&csk, "luca", "thinkpad"),
-            Err(ProtocolError::MissingField("pairing_session_keys"))
+            Err(ProtocolError::SessionConcluded)
         ));
+        // The key-dependent readers still report the missing keys, which is what
+        // proves `conclude` actually dropped them.
         assert!(matches!(
             desktop.verify_confirm_server(&confirm_server, &csk),
             Err(ProtocolError::MissingField("pairing_session_keys"))
         ));
         assert!(matches!(
             phone.create_confirm_server(&csk),
-            Err(ProtocolError::MissingField("pairing_session_keys"))
+            Err(ProtocolError::SessionConcluded)
         ));
         assert!(matches!(
             phone.process_confirm_client(&confirm_client),
             Err(ProtocolError::MissingField("pairing_session_keys"))
         ));
+    }
+
+    /// `conclude` is terminal: every protocol entry point of both state machines
+    /// refuses a call afterwards instead of answering from a half-dropped state.
+    /// The defect this catches: a session that stays usable after `conclude`, so a
+    /// retransmitted `PairingInit` or a second completion proof is accepted after
+    /// the keys (and the ephemeral secret) are gone.
+    #[test]
+    fn post_conclude_rejects_every_protocol_entry_point() {
+        let (mut desktop, started) = start_desktop();
+        let mut phone =
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+        let init = phone.create_init().unwrap();
+        let response = desktop.handle_init(&init).unwrap().clone();
+        phone
+            .verify_response(&response, &started.client_x25519_public_key)
+            .unwrap();
+
+        let csk = [0x42u8; 32];
+        let confirm_client = desktop
+            .create_confirm_client(&csk, "luca", "thinkpad")
+            .unwrap();
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+        let abort = desktop
+            .create_abort(PairingAbortReason::UserRejectedSas)
+            .unwrap();
+
+        desktop.conclude();
+        phone.conclude();
+
+        // Desktop: the state-machine entries report the terminal state ...
+        assert!(matches!(
+            desktop.handle_init(&init).unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            desktop
+                .create_confirm_client(&csk, "luca", "thinkpad")
+                .unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            desktop
+                .create_abort(PairingAbortReason::UserRejectedSas)
+                .unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            desktop.verify_abort(&abort).unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        // ... and the key-dependent reader reports the keys that `conclude` dropped.
+        assert!(matches!(
+            desktop
+                .verify_confirm_server(&confirm_server, &csk)
+                .unwrap_err(),
+            ProtocolError::MissingField("pairing_session_keys")
+        ));
+
+        // Phone: same rule on every entry point.
+        assert!(matches!(
+            phone.create_init().unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            phone
+                .verify_response(&response, &started.client_x25519_public_key)
+                .unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            phone.create_confirm_server(&csk).unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            phone
+                .create_abort(PairingAbortReason::UserRejectedSas)
+                .unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            phone.verify_abort(&abort).unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+        assert!(matches!(
+            phone.process_confirm_client(&confirm_client).unwrap_err(),
+            ProtocolError::MissingField("pairing_session_keys")
+        ));
+
+        // Metadata survives: only key material and protocol operations are gone.
+        assert_eq!(desktop.session_id(), &started.session_id);
+        assert_eq!(
+            desktop.client_x25519_public_key(),
+            started.client_x25519_public_key
+        );
+        assert_eq!(desktop.negotiated(), phone.negotiated());
+        assert!(desktop.transcript_hash().is_none());
+        assert!(phone.transcript_hash().is_none());
+    }
+
+    /// The phone verifies exactly one response, and only after it built the
+    /// `PairingInit` whose transcript that response answers.
+    /// The defect this catches: a second `verify_response` re-deriving `H` and the
+    /// directional keys over an already-established session (a replay of an old
+    /// response replacing the live SAS), or a response verified against a transcript
+    /// the phone never advertised.
+    #[test]
+    fn a_second_verify_response_is_rejected() {
+        let (desktop, mut phone, response, qr_pk) = exchange();
+        let session_id = *phone.session_id();
+        phone.verify_response(&response, &qr_pk).unwrap();
+        let hash = *phone.transcript_hash().unwrap();
+        let sas = phone.sas().unwrap().to_string();
+
+        assert!(matches!(
+            phone.verify_response(&response, &qr_pk).unwrap_err(),
+            ProtocolError::InvalidMessageFormat
+        ));
+
+        // The first verification stands: the second call neither re-derived the
+        // keys nor cleared them.
+        assert_eq!(phone.transcript_hash(), Some(&hash));
+        assert_eq!(phone.sas(), Some(sas.as_str()));
+        assert_eq!(phone.negotiated(), desktop.negotiated());
+
+        // A phone that never sent its `PairingInit` has no transcript to verify
+        // against, so it refuses the response instead of inventing one.
+        let mut uninitialised =
+            ServerPairingSession::new(session_id, phone_identity(), "pixel").unwrap();
+        assert!(matches!(
+            uninitialised
+                .verify_response(&response, &qr_pk)
+                .unwrap_err(),
+            ProtocolError::InvalidMessageFormat
+        ));
+        assert!(uninitialised.keys.is_none());
+        assert!(uninitialised.sas().is_none());
+    }
+
+    /// Once the desktop concluded after the phone's completion proof, it cannot
+    /// build another provisioning payload.
+    /// The defect this catches: a concluded desktop that still writes a
+    /// `PairingConfirmClient` (provisioning the CSK again) because `conclude` only
+    /// cleared the SAS.
+    #[test]
+    fn create_confirm_server_then_create_confirm_client_is_rejected() {
+        let (mut desktop, phone) = established();
+        let csk = [0x42u8; 32];
+
+        let confirm_server = phone.create_confirm_server(&csk).unwrap();
+        desktop
+            .verify_confirm_server(&confirm_server, &csk)
+            .unwrap();
+        desktop.conclude();
+
+        assert!(matches!(
+            desktop
+                .create_confirm_client(&csk, "luca", "thinkpad")
+                .unwrap_err(),
+            ProtocolError::SessionConcluded
+        ));
+    }
+
+    /// The ephemeral X25519 secret is taken as soon as it has derived the session
+    /// keys, and on `conclude` even if no keys were ever derived. The public half
+    /// stays answerable so the QR code and the retry path keep working.
+    /// The defect this catches: a session that keeps `x_C`/`x_S` alive for its whole
+    /// lifetime (the secret then outlives the handshake it belongs to).
+    #[test]
+    fn the_ephemeral_keypair_is_taken_on_derivation_and_on_conclude() {
+        let (mut desktop, started) = start_desktop();
+        assert!(
+            desktop.ephemeral_keypair_present(),
+            "x_C exists before the handshake"
+        );
+        let mut phone =
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+        assert!(
+            phone.ephemeral_keypair_present(),
+            "x_S exists before the handshake"
+        );
+
+        let init = phone.create_init().unwrap();
+        let response = desktop.handle_init(&init).unwrap().clone();
+        assert!(
+            !desktop.ephemeral_keypair_present(),
+            "x_C is taken once the keys are derived"
+        );
+        assert_eq!(
+            desktop.client_x25519_public_key(),
+            started.client_x25519_public_key,
+            "the public half stays answerable after the secret is taken"
+        );
+        // A retried init is still answered from the cache.
+        assert_eq!(desktop.handle_init(&init).unwrap(), &response);
+
+        phone
+            .verify_response(&response, &started.client_x25519_public_key)
+            .unwrap();
+        assert!(
+            !phone.ephemeral_keypair_present(),
+            "x_S is taken once the keys are derived"
+        );
+
+        // A session that never derived keys drops its secret at `conclude`, and
+        // concluding twice is a no-op.
+        let (mut unused_desktop, _started) = start_desktop();
+        unused_desktop.conclude();
+        assert!(!unused_desktop.ephemeral_keypair_present());
+        unused_desktop.conclude();
+        assert!(!unused_desktop.ephemeral_keypair_present());
+
+        let mut unused_phone =
+            ServerPairingSession::new([0x33u8; PAIRING_SESSION_ID_LEN], phone_identity(), "pixel")
+                .unwrap();
+        assert!(unused_phone.ephemeral_keypair_present());
+        unused_phone.conclude();
+        assert!(!unused_phone.ephemeral_keypair_present());
     }
 
     // --- 10. ChaCha20-Poly1305 pairing -----------------------------------
@@ -2149,7 +2507,7 @@ mod tests {
     fn handle_init_is_idempotent_for_identical_inits() {
         let mut desktop = seeded_desktop([0x5Au8; PAIRING_SESSION_ID_LEN]);
         let mut phone =
-            ClientPairingSession::new([0x5Au8; PAIRING_SESSION_ID_LEN], phone_identity(), "pixel")
+            ServerPairingSession::new([0x5Au8; PAIRING_SESSION_ID_LEN], phone_identity(), "pixel")
                 .unwrap();
         let init = phone.create_init().unwrap();
 
@@ -2189,12 +2547,12 @@ mod tests {
         assert!(long_name.starts_with(&truncated));
 
         let (mut desktop, started) =
-            ServerPairingState::start(desktop_identity(), &long_name, 36692, None, None, None)
+            ClientPairingState::start(desktop_identity(), &long_name, 36692, None, None, None)
                 .unwrap();
         assert_eq!(desktop.client_device_name.len(), 63);
 
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), &long_name).unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), &long_name).unwrap();
         assert_eq!(phone.server_device_name.len(), 63);
         let init = phone.create_init().unwrap();
         assert_eq!(init.server_device_name.len(), 63);
@@ -2241,7 +2599,7 @@ mod tests {
 
         let (mut desktop, started) = start_desktop();
         let mut phone =
-            ClientPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
 
         // 1. Phone → desktop: PairingInit.
         let init_bytes = wire(

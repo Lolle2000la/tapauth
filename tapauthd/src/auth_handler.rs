@@ -1186,6 +1186,11 @@ impl AuthSession {
                 // Only an authorized Server's signature may take part in the
                 // decision below.
                 if Self::response_signature_authorized(&run.allowed_servers, &wrapper) {
+                    // The frame passed replay, AEAD and signature checks, so this
+                    // source is the one the confirmation may be unicast to. It is
+                    // recorded here rather than in `receive_response`, which also
+                    // sees every datagram nobody authorized.
+                    transport.record_authenticated_peer(server_addr);
                     Ok(WaitOutcome::Response(wrapper, addr_str))
                 } else {
                     tracing::warn!(
@@ -1911,9 +1916,27 @@ mod tests {
         );
     }
 
-    /// A transport that hands back one canned frame, then times out.
+    /// A transport that hands back one canned frame, then times out, and keeps the
+    /// peer the handler asks it to record.
     struct ScriptedTransport {
         frame: Mutex<Option<(EncryptedPacket, std::net::SocketAddr)>>,
+        recorded: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(packet: EncryptedPacket, from: std::net::SocketAddr) -> Self {
+            Self {
+                frame: Mutex::new(Some((packet, from))),
+                recorded: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn script(&self, packet: EncryptedPacket, from: std::net::SocketAddr) {
+            *self.frame.try_lock().unwrap() = Some((packet, from));
+        }
+        fn recorded(&self) -> Option<std::net::SocketAddr> {
+            *self.recorded.lock().unwrap()
+        }
     }
 
     impl Transport for ScriptedTransport {
@@ -1943,6 +1966,79 @@ mod tests {
         async fn send_cancel(&self, _packet: &EncryptedPacket) -> Result<(), AuthHandlerError> {
             Ok(())
         }
+
+        fn record_authenticated_peer(&self, addr: std::net::SocketAddr) {
+            *self.recorded.lock().unwrap() = Some(addr);
+        }
+    }
+
+    /// Only a response that passed authorization may become the peer the
+    /// confirmation is unicast to.
+    ///
+    /// The defect this catches: recording the datagram's source before (or
+    /// without) `response_signature_authorized` — moving
+    /// `record_authenticated_peer` above the check, or back into the transport's
+    /// receive path as it was before this fix — which lets any host on the link
+    /// redirect the unicast `GrantConfirmation` and `AuthenticationCancel`.
+    #[tokio::test]
+    async fn only_an_authorized_response_becomes_the_recorded_peer() {
+        let (phone_a, _phone_b, key_a, key_b) = two_phones();
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let csk_meta = CskMetadata::default();
+        let challenge = [0x4Au8; 32];
+        let from = std::net::SocketAddr::from(([127, 0, 0, 2], 41_000));
+
+        let encrypt = |wrapper: &WrapperMessage| {
+            create_encrypted_packet_with_csk_nonce(
+                &csk,
+                csk_meta.symmetric_algorithm,
+                csk_meta.hash_algorithm,
+                wrapper,
+            )
+            .unwrap()
+        };
+
+        // Phone B is paired for alice and may not answer for bob.
+        let foreign = create_signed_auth_grant(challenge, &key_b).unwrap();
+        let transport = Arc::new(ScriptedTransport::new(encrypt(&foreign), from));
+        let run = AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk: csk.clone(),
+            csk_meta,
+            challenge,
+            username: "bob".to_string(),
+            allowed_servers: Arc::new(vec![phone_a]),
+        };
+        let mut nonce_cache = HashSet::new();
+
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, WaitOutcome::Unattributable));
+        assert_eq!(
+            transport.recorded(),
+            None,
+            "an unauthorized response must not become the unicast target"
+        );
+
+        // The allowed phone's grant, from the same address, is recorded.
+        let allowed = create_signed_auth_grant(challenge, &key_a).unwrap();
+        transport.script(encrypt(&allowed), from);
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, WaitOutcome::Response(_, _)));
+        assert_eq!(transport.recorded(), Some(from));
     }
 
     /// A decryptable frame from a phone that may not answer for this user is not
@@ -1974,12 +2070,10 @@ mod tests {
         )
         .unwrap();
 
-        let transport = Arc::new(ScriptedTransport {
-            frame: Mutex::new(Some((
-                packet,
-                std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
-            ))),
-        });
+        let transport = Arc::new(ScriptedTransport::new(
+            packet,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)),
+        ));
         let run = AuthRunParams {
             keypair: Ed25519KeyPair::generate().unwrap(),
             csk,
