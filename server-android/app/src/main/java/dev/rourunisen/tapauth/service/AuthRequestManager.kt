@@ -128,6 +128,25 @@ class AuthRequestManager private constructor() {
                 ttyPresent = ttyPresent,
             )
 
+        // The protocol-v2 caller context, as the desktop sent it: the renderers
+        // (AuthContextDisplay) sanitize separately, and this line is what
+        // scripts/test-e2e.sh asserts on. It lives here because submitRequest is the one
+        // place both transports funnel through (AuthenticationService for UDP,
+        // BleGattService for BLE), and because nothing else on the phone carries all three
+        // values: the prompt shows the command preview *instead of* service/process, and the
+        // BLE receipt line logs only two of the three.
+        //
+        // Each value is scrubbed first (see `scrubLogValue`): it derives from the caller's own
+        // argv, so an unprivileged local user could otherwise embed a newline and forge extra
+        // logcat lines, and a secret on that command line would be persisted here after the
+        // prompt is gone. The tokens the E2E suite greps are plain ASCII and pass unchanged.
+        Log.d(
+            TAG,
+            "Auth request caller context: pamService=${scrubLogValue(authRequest.pamService)}, " +
+                "processName=${scrubLogValue(authRequest.processName)}, " +
+                "commandPreview=${scrubLogValue(authRequest.commandPreview)}",
+        )
+
         // Store the pending request
         pendingRequests[requestId] =
             PendingAuthRequest(authRequest, callback, context.applicationContext, bleDeviceAddress)

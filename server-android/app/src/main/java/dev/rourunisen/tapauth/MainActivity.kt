@@ -38,6 +38,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,6 +46,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.ViewModelProvider
 import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.ContextSanitizer
@@ -52,7 +54,9 @@ import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
 import dev.rourunisen.tapauth.ui.devices.DeviceListScreen
 import dev.rourunisen.tapauth.ui.home.HomeScreen
+import dev.rourunisen.tapauth.ui.navigation.AppScreenSaver
 import dev.rourunisen.tapauth.ui.pairing.PairingScreen
+import dev.rourunisen.tapauth.ui.pairing.PairingViewModel
 import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
@@ -545,17 +549,36 @@ fun TapAuthApp() {
         return
     }
 
-    // All permissions granted, show main app
-    var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
+    // All permissions granted, show main app.
+    //
+    // Saved, not just remembered: a configuration change used to drop this back to `Home`, which
+    // took the pairing screen (and the session it owned) with it.
+    var currentScreen by
+        rememberSaveable(stateSaver = AppScreenSaver) { mutableStateOf<AppScreen>(AppScreen.Home) }
 
-    // One-shot `tapauth://pair` deeplink hand-off: navigate straight to the pairing screen with
-    // the parsed URL and clear it, so Back (or a rotation) returns to Home instead of re-pairing.
-    val pendingPairingUrl = activity?.pendingPairingUrl
-    val deeplinkUrl = pendingPairingUrl?.value
+    // The pairing session is hosted by a ViewModel, so a configuration change re-attaches to the
+    // live session instead of disposing it mid-handshake. The store lives on the activity and
+    // survives its re-creation, so this returns the same instance after a rotation.
+    //
+    // No null check: the permission gate above can only have passed for a real `MainActivity` —
+    // `allGranted` is false when `activity` is null — so there is no nullable owner left here.
+    val viewModelOwner = activity
+    val pairingViewModel =
+        remember(viewModelOwner) {
+            ViewModelProvider(viewModelOwner, PairingViewModel.factory(viewModelOwner))
+                .get(PairingViewModel::class.java)
+        }
+
+    // One-shot `tapauth://pair` deeplink hand-off: navigate straight to the pairing screen with the
+    // parsed URL and clear it, so Back returns to Home instead of re-pairing. A rotation does not
+    // repeat the hand-off: the saved screen is already `Pairing`, and the cleared deeplink is not
+    // restored, so the rotation restores the pairing screen rather than re-pairing from scratch.
+    val pendingPairingUrl = activity.pendingPairingUrl
+    val deeplinkUrl = pendingPairingUrl.value
     LaunchedEffect(deeplinkUrl) {
         if (deeplinkUrl != null) {
             currentScreen = AppScreen.Pairing(deeplinkUrl)
-            pendingPairingUrl?.value = null
+            pendingPairingUrl.value = null
         }
     }
 
@@ -576,6 +599,7 @@ fun TapAuthApp() {
         is AppScreen.Pairing -> {
             PairingScreen(
                 pairingUrl = screen.url,
+                viewModel = pairingViewModel,
                 onPairingComplete = { currentScreen = AppScreen.Home },
                 onPairingFailed = {
                     /* Handle error specifically if necessary (currently this callback is unused) */

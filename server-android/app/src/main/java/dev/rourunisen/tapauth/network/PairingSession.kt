@@ -151,6 +151,17 @@ class PairingSession(
         private const val CONFIRM_RETRANSMIT_1_MS = 100L
         private const val CONFIRM_RETRANSMIT_2_MS = 150L
 
+        /** `PairingConfirmServer` burst over UDP: 0 ms / 100 ms / 250 ms from the first send. */
+        private val UDP_CONFIRM_BURST_DELAYS_MS =
+            listOf(0L, CONFIRM_RETRANSMIT_1_MS, CONFIRM_RETRANSMIT_2_MS)
+
+        /**
+         * `PairingConfirmServer` burst over BLE: one acknowledged write. The linger in
+         * [PairingCompletion] covers a lost notification, and a GATT write is a confirmed operation
+         * rather than a fire-and-forget datagram.
+         */
+        private val BLE_CONFIRM_BURST_DELAYS_MS = listOf(0L)
+
         /** Shown when the SAS prompt goes unanswered past [SAS_APPROVAL_TIMEOUT_MS]. */
         private const val SAS_EXPIRED_MESSAGE = "The pairing session expired"
 
@@ -172,6 +183,12 @@ class PairingSession(
 
     private val deviceRepository = DeviceRepository(context)
     private val keypairRepository = KeypairRepository(context)
+
+    /** Completion proof, burst and the post-completion retransmission linger. */
+    private val completion = PairingCompletion()
+
+    /** The session's frame intake: drops frames of other sessions without losing the budget. */
+    private val frameReader = PairingFrameReader(sliceMs = RECEIVE_SLICE_MS)
 
     private val sessionId = pairingUrl.sessionIdBytes()
 
@@ -239,10 +256,13 @@ class PairingSession(
         userDecision.complete(UserDecision.Approve)
     }
 
-    /** The user says the SAS differs: send an authenticated `PairingAbort(USER_REJECTED_SAS)`. */
-    fun rejectSas() {
-        userDecision.complete(UserDecision.Reject)
-    }
+    /**
+     * The user says the SAS differs: send an authenticated `PairingAbort(USER_REJECTED_SAS)`.
+     *
+     * Returns false when a decision was already recorded (approval, or an earlier reject), so
+     * nothing was completed and no abort will be written for this call.
+     */
+    fun rejectSas(): Boolean = userDecision.complete(UserDecision.Reject)
 
     /**
      * Cancel everything: running coroutines, sockets, GATT, and the Rust pairing session.
@@ -459,20 +479,27 @@ class PairingSession(
     }
 
     /**
-     * The next frame on [link] that belongs to this pairing session.
+     * The next frame on [link] that belongs to this pairing session, within [budgetMs] in total.
      *
      * The BLE characteristic and the pairing UDP port are shared with any other pairing in flight,
      * so a frame carrying a different `session_id` is dropped before any crypto is spent on it.
+     * That dropping is bounded by [budgetMs] — the time this call may spend as a whole, dropped
+     * frames included — so a peer that keeps spraying foreign frames at the ephemeral pairing port
+     * cannot keep this call from returning, and the caller's own deadline (the completion linger in
+     * [PairingCompletion], or a phase deadline) is always re-read.
      *
-     * @return the frame, or null when the receive slice expired
+     * @param budgetMs how long this call may wait in total; defaults to one receive slice
+     * @return the frame, or null once the budget is spent or a receive slice expired
      */
-    private suspend fun receivePacket(link: PairingLink): ByteArray? {
-        while (true) {
-            val packet = link.receive(RECEIVE_SLICE_MS) ?: return null
-            if (belongsToSession(packet)) return packet
-            Log.d(TAG, "Dropping a pairing frame that belongs to another session")
-        }
-    }
+    private suspend fun receivePacket(
+        link: PairingLink,
+        budgetMs: Long = RECEIVE_SLICE_MS,
+    ): ByteArray? =
+        frameReader.awaitOwnFrame(
+            budgetMs = budgetMs,
+            receive = { sliceMs -> link.receive(sliceMs) },
+            belongsToSession = ::belongsToSession,
+        )
 
     /** Whether [packet] is a v2 `PairingPacket` for [sessionId]. */
     private fun belongsToSession(packet: ByteArray): Boolean =
@@ -615,30 +642,37 @@ class PairingSession(
     ): ProvisionOutcome {
         val session = synchronized(sessionLock) { pairingSession }
         checkNotNull(session) { "Pairing session was released before the completion proof" }
-        // Build the confirmation before persisting: a failure here must not leave a device record
-        // for a pairing the desktop never accepted. Rust signs `"tapauth-pair-server-sig-v2" || H
-        // ||
-        // csk` with `Ed_S` and encrypts it under `K_s2c`.
-        val confirmServer = session.createConfirmServer(provision.csk)
+        val device =
+            completion.confirm(
+                burstDelaysMs =
+                    when (locked.transport) {
+                        PairingTransport.UDP -> UDP_CONFIRM_BURST_DELAYS_MS
+                        PairingTransport.BLE -> BLE_CONFIRM_BURST_DELAYS_MS
+                    },
+                // Built before persisting: a failure here must not leave a device record for a
+                // pairing the desktop never accepted. Rust signs `"tapauth-pair-server-sig-v2" ||
+                // H || csk` with `Ed_S` and encrypts it under `K_s2c`, drawing a fresh nonce, so a
+                // retransmission must re-send these exact bytes rather than build a new proof.
+                buildConfirmation = { session.createConfirmServer(provision.csk) },
+                persist = { persistDevice(locked.response, provision) },
+                send = { packet ->
+                    if (!locked.link.send(packet)) {
+                        Log.w(TAG, "PairingConfirmServer write failed; device record is kept")
+                    }
+                },
+                receive = { budgetMs -> receivePacket(locked.link, budgetMs) },
+                // The desktop re-sends the frame verbatim, so decrypting it again is how a
+                // retransmission is told apart from a keepalive or an abort. The keys must still be
+                // alive for that, which is why zeroization moves below the linger.
+                isRetransmission = { packet -> processConfirmClient(packet) != null },
+                isClosed = { closed.get() },
+            )
 
-        val device = persistDevice(locked.response, provision)
-
-        when (locked.transport) {
-            // 3× at 0 ms / 100 ms / 250 ms so a lost datagram does not leave the desktop pairing.
-            PairingTransport.UDP -> {
-                locked.link.send(confirmServer)
-                delay(CONFIRM_RETRANSMIT_1_MS)
-                locked.link.send(confirmServer)
-                delay(CONFIRM_RETRANSMIT_2_MS)
-                locked.link.send(confirmServer)
-            }
-            PairingTransport.BLE -> {
-                if (!locked.link.send(confirmServer)) {
-                    Log.w(TAG, "BLE PairingConfirmServer write failed; device record is kept")
-                }
-            }
-        }
-
+        // Deferred until the linger is over so a retransmitted PairingConfirmClient can still be
+        // decrypted. `PairingUpdate.Complete` is what tells the UI the attempt succeeded, and the
+        // screen does not own the session — a disposed composition leaves it running, while the
+        // next `beginPairing` or the ViewModel's `onCleared` is what closes it — so an update sent
+        // early would let the user end the attempt while the linger is still answering.
         zeroizeEphemeralState()
         return ProvisionOutcome.Completed(device)
     }
@@ -691,7 +725,7 @@ class PairingSession(
     /**
      * Send an authenticated `PairingAbort` on the locked transport.
      *
-     * The MAC direction is Rust's: `ClientPairingSession::create_abort` tags with `K_s2c` (the
+     * The MAC direction is Rust's: `ServerPairingSession::create_abort` tags with `K_s2c` (the
      * phone→desktop direction of `cryptography-specification.md` §2.2) and verifies incoming aborts
      * with `K_c2s`, so passing a key here would be both redundant and a way to break it.
      */
@@ -859,6 +893,54 @@ class PairingSession(
         data object TimedOut : ProvisionOutcome()
 
         data object Cancelled : ProvisionOutcome()
+    }
+}
+
+/**
+ * Reads the next frame that belongs to this pairing session, within a total time budget.
+ *
+ * ### Why a budget and not a per-frame slice
+ *
+ * The pairing UDP port and the BLE characteristic are shared with any other pairing in flight, so
+ * frames of another session are dropped. Handing every dropped frame a fresh receive slice would
+ * hand the bound to whoever sends the frames: a continuous stream of foreign datagrams to the
+ * ephemeral pairing port would keep the read from ever returning, so the caller would never re-read
+ * its own deadline. That is exactly how [PairingCompletion]'s linger — which keeps the ephemeral
+ * keys alive until it returns — would lose its bound. [budgetMs] is therefore the time the *whole
+ * call* may spend, dropped frames included, and what is left of it is recomputed before every
+ * transport read.
+ *
+ * @param sliceMs longest single transport read, so a close or a user decision is noticed promptly
+ * @param nowMs the clock the budget is measured on; injectable so a unit test needs no wall time
+ */
+internal class PairingFrameReader(
+    private val sliceMs: Long,
+    private val nowMs: () -> Long = System::currentTimeMillis,
+) {
+    private companion object {
+        /** The session's own tag: this is its frame intake. */
+        const val TAG = "PairingSession"
+    }
+
+    /**
+     * @param budgetMs total time this call may spend, dropped frames included
+     * @param receive one transport read, waiting at most the slice it is given
+     * @param belongsToSession whether a frame carries this session's id
+     * @return the first frame of this session, or null once the budget is spent
+     */
+    suspend fun awaitOwnFrame(
+        budgetMs: Long,
+        receive: suspend (sliceMs: Long) -> ByteArray?,
+        belongsToSession: (ByteArray) -> Boolean,
+    ): ByteArray? {
+        val deadline = nowMs() + budgetMs
+        while (true) {
+            val remaining = deadline - nowMs()
+            if (remaining <= 0) return null
+            val packet = receive(minOf(sliceMs, remaining)) ?: return null
+            if (belongsToSession(packet)) return packet
+            Log.d(TAG, "Dropping a pairing frame that belongs to another session")
+        }
     }
 }
 

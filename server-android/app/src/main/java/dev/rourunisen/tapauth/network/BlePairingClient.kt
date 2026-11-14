@@ -72,9 +72,15 @@ class BlePairingClient(private val context: Context) {
 
         /** Bound on a single GATT write, since a lost callback must not wedge the caller. */
         private const val WRITE_TIMEOUT_MS = 5_000L
+
+        /** Bound on a single fallback read, for the same reason as [WRITE_TIMEOUT_MS]. */
+        private const val READ_TIMEOUT_MS = 5_000L
     }
 
     private val gattMutex = Mutex()
+
+    /** Decides when a dropped notification has to be replaced by a read. */
+    private val readFallback = PairingReadFallback()
 
     /** Incoming pairing frames, in arrival order, drained by [awaitPacket]/[setListener]. */
     private val packets = Channel<ByteArray>(Channel.UNLIMITED)
@@ -93,6 +99,7 @@ class BlePairingClient(private val context: Context) {
     @Volatile private var servicesDeferred: CompletableDeferred<Boolean>? = null
     @Volatile private var descriptorDeferred: CompletableDeferred<Boolean>? = null
     @Volatile private var writeDeferred: CompletableDeferred<Boolean>? = null
+    @Volatile private var readDeferred: CompletableDeferred<ByteArray?>? = null
 
     /** Completed by [scanCallback] with the first advertisement matching the pairing filter. */
     @Volatile private var scanResult: CompletableDeferred<ScanResult>? = null
@@ -168,6 +175,29 @@ class BlePairingClient(private val context: Context) {
             ) {
                 Log.d(TAG, "Characteristic ${characteristic.uuid} write status $status")
                 writeDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int,
+            ) {
+                Log.d(TAG, "Characteristic ${characteristic.uuid} read status $status")
+                if (characteristic.uuid != PAIRING_CHAR_UUID) return
+                readDeferred?.complete(if (status == BluetoothGatt.GATT_SUCCESS) value else null)
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                Log.d(TAG, "Characteristic ${characteristic.uuid} read status $status")
+                if (characteristic.uuid != PAIRING_CHAR_UUID) return
+                @Suppress("DEPRECATION") val value = characteristic.value
+                readDeferred?.complete(if (status == BluetoothGatt.GATT_SUCCESS) value else null)
             }
 
             override fun onCharacteristicChanged(
@@ -278,14 +308,72 @@ class BlePairingClient(private val context: Context) {
     /**
      * Wait up to [timeoutMs] for the next incoming pairing frame.
      *
+     * Notifications are the fast path, but they are not the only source: the pairing characteristic
+     * is readable and the daemon keeps the last frame it wrote in that value
+     * (`ble-gatt-specification.md` §2: "plus updates readable value as fallback"). A notification
+     * dropped by a busy link would otherwise stall the pairing on a frame that is still readable
+     * until its deadline expires, so [readPairingValue] is polled whenever no notification arrives
+     * for [PairingReadFallback.DEFAULT_INTERVAL_MS]. A poll that repeats the frame this waiter
+     * already received is dropped, so a notification and the read that follows it deliver one
+     * frame, not two.
+     *
      * @return the frame, or null on timeout or after [close]
      */
     suspend fun awaitPacket(timeoutMs: Long): ByteArray? =
         withTimeoutOrNull(timeoutMs) {
+            readFallback.awaitFrame(
+                isClosed = { closed },
+                awaitNotification = { sliceMs -> awaitNotification(sliceMs) },
+                pollNotification = { packets.tryReceive().getOrNull() },
+                readValue = { readPairingValue() },
+            )
+        }
+
+    /**
+     * The next notified frame, or null when [timeoutMs]'s slice expires or the channel is closed.
+     *
+     * A zero slice is floored to 1 ms so a frame that is already queued is still returned instead
+     * of being skipped by an immediate timeout.
+     */
+    private suspend fun awaitNotification(timeoutMs: Long): ByteArray? =
+        withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
             try {
                 packets.receive()
             } catch (e: ClosedReceiveChannelException) {
                 null
+            }
+        }
+
+    /**
+     * Read the pairing characteristic's current value: the fallback for a dropped notification.
+     *
+     * Serialized with [send] and [prepare] through [gattMutex], because Android's `BluetoothGatt`
+     * drops a second concurrent operation.
+     *
+     * @return the readable value, or null when the link is gone, the read cannot be started, it
+     *   fails, or its callback does not arrive within [READ_TIMEOUT_MS]
+     */
+    private suspend fun readPairingValue(): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (closed) return@withContext null
+            val activeGatt = gatt ?: return@withContext null
+            val activeCharacteristic = characteristic ?: return@withContext null
+            gattMutex.withLock {
+                val deferred = CompletableDeferred<ByteArray?>()
+                readDeferred = deferred
+                try {
+                    val started =
+                        try {
+                            activeGatt.readCharacteristic(activeCharacteristic)
+                        } catch (e: SecurityException) {
+                            Log.w(TAG, "GATT read denied: ${e.message}")
+                            false
+                        }
+                    if (!started) return@withLock null
+                    withTimeoutOrNull(READ_TIMEOUT_MS) { deferred.await() }
+                } finally {
+                    readDeferred = null
+                }
             }
         }
 
@@ -518,6 +606,7 @@ class BlePairingClient(private val context: Context) {
         servicesDeferred?.complete(false)
         descriptorDeferred?.complete(false)
         writeDeferred?.complete(false)
+        readDeferred?.complete(null)
     }
 
     private fun releaseTransport() {

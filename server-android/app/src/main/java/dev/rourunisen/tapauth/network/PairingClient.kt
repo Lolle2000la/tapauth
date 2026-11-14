@@ -53,13 +53,22 @@ class PairingClient(private val pairingUrl: PairingUrl) {
      * port 0 of the wildcard address, so the OS picks a free ephemeral port and a dual-stack
      * platform accepts both address families.
      *
-     * @throws IOException if the socket cannot be bound
+     * A QR whose `ip4`/`ip6` resolve to nothing is a failure here, not a silent no-op: [send] can
+     * only reach the addresses in [targets], so an empty list means nothing can ever arrive and the
+     * pairing would otherwise burn its whole 30 s response deadline before giving up.
+     *
+     * @throws IOException if the socket cannot be bound, or if no QR endpoint resolves
      */
     fun open() {
         val bound = DatagramSocket(null)
         try {
             bound.bind(InetSocketAddress(0))
             val resolved = resolveTargets()
+            if (resolved.isEmpty()) {
+                throw IOException(
+                    "No QR endpoint resolved (ip4=${pairingUrl.ipv4}, ip6=${pairingUrl.ipv6})",
+                )
+            }
             targets.clear()
             targets.addAll(resolved)
         } catch (e: IOException) {

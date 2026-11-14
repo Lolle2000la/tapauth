@@ -31,6 +31,11 @@ import androidx.compose.ui.unit.dp
 import dev.rourunisen.tapauth.BuildConfig
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.AppConfiguration
+import dev.rourunisen.tapauth.data.DeviceRepository
+import dev.rourunisen.tapauth.data.PairedDevice
+import dev.rourunisen.tapauth.protocol.HashAlgorithm
+import dev.rourunisen.tapauth.protocol.SignatureAlgorithm
+import dev.rourunisen.tapauth.protocol.SymmetricAlgorithm
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.delay
@@ -42,6 +47,13 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val config = AppConfiguration.getInstance(context)
+    val deviceRepository = remember { DeviceRepository(context) }
+    // Protocol version and the cipher/hash/signature suite are negotiated per device at pairing
+    // time, so they are read from the stored pairings instead of being stated once for the app.
+    // `null` means "not read yet": rendering that as "no paired devices" would flash a wrong
+    // statement on the first frame.
+    var pairedDevices by remember { mutableStateOf<List<PairedDevice>?>(null) }
+    LaunchedEffect(Unit) { pairedDevices = deviceRepository.getAllPairedDevices() }
     val coroutineScope = rememberCoroutineScope()
     var showBatteryConfirm by remember { mutableStateOf(false) }
     var udpPortText by remember { mutableStateOf(config.udpPort.toString()) }
@@ -164,13 +176,31 @@ fun SettingsScreen(onBack: () -> Unit) {
                 ) {
                     InfoRow(stringResource(R.string.settings_app_version), BuildConfig.VERSION_NAME)
                     HorizontalDivider()
-                    InfoRow(stringResource(R.string.settings_protocol_version), "1")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
-                    InfoRow(stringResource(R.string.settings_encryption), "AES-256-GCM")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
                     InfoRow(stringResource(R.string.settings_key_exchange), "X25519")
-                    HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
-                    InfoRow(stringResource(R.string.settings_signing), "Ed25519")
+                    val devices = pairedDevices
+                    if (devices != null) {
+                        if (devices.isEmpty()) {
+                            HorizontalDivider(
+                                Modifier,
+                                DividerDefaults.Thickness,
+                                DividerDefaults.color,
+                            )
+                            Text(
+                                text = stringResource(R.string.devices_empty),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            devices.forEach { device ->
+                                HorizontalDivider(
+                                    Modifier,
+                                    DividerDefaults.Thickness,
+                                    DividerDefaults.color,
+                                )
+                                InfoRow(device.displayName, negotiatedSuite(device))
+                            }
+                        }
+                    }
                 }
             }
 
@@ -543,6 +573,10 @@ private fun InfoRow(label: String, value: String) {
             text = label,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            // A paired device's name can be up to 64 bytes long, so the label is the flexible
+            // half: it wraps in whatever the value leaves instead of pushing the value to zero
+            // width. For the short labels of the other rows this renders exactly as before.
+            modifier = Modifier.weight(1f),
         )
         Text(
             text = value,
@@ -551,3 +585,39 @@ private fun InfoRow(label: String, value: String) {
         )
     }
 }
+
+/**
+ * The suite [device] negotiated at pairing time, e.g. `v2 · AES-256-GCM · SHA-256 · Ed25519`.
+ *
+ * Every part comes from the stored pairing, so a device paired with a different suite shows its own
+ * values; an algorithm id this build does not know is left out rather than guessed.
+ */
+private fun negotiatedSuite(device: PairedDevice): String {
+    val parts = buildList {
+        add("v${device.protocolVersion}")
+        symmetricAlgorithmName(device.symmetricAlgorithm)?.let(::add)
+        hashAlgorithmName(device.hashAlgorithm)?.let(::add)
+        signatureAlgorithmName(device.signatureAlgorithm)?.let(::add)
+    }
+    return parts.joinToString(" · ")
+}
+
+private fun symmetricAlgorithmName(value: Int): String? =
+    when (value) {
+        SymmetricAlgorithm.AES_256_GCM.value -> "AES-256-GCM"
+        SymmetricAlgorithm.CHACHA20_POLY1305.value -> "ChaCha20-Poly1305"
+        else -> null
+    }
+
+private fun hashAlgorithmName(value: Int): String? =
+    when (value) {
+        HashAlgorithm.SHA256.value -> "SHA-256"
+        HashAlgorithm.BLAKE3.value -> "BLAKE3"
+        else -> null
+    }
+
+private fun signatureAlgorithmName(value: Int): String? =
+    when (value) {
+        SignatureAlgorithm.ED25519.value -> "Ed25519"
+        else -> null
+    }
