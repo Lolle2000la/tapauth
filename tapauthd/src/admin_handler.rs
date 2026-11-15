@@ -5,6 +5,7 @@ use shared::{
     crypto::keys::ClientSymmetricKey,
     ipc::pb as ipc,
 };
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -117,6 +118,36 @@ fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResp
     }
 }
 
+/// What one admin arm decided: the reply, and whether it changed daemon state.
+///
+/// The fact is carried by the type rather than by a boolean beside the reply, so "this request
+/// mutates state" is a property of the arm that answers it. A new mutating request has to say
+/// [`Handled::Mutated`]; writing [`Handled::Read`] instead is a visible classification error
+/// instead of a tuple slot nobody remembered, and the reload itself lives in exactly one `match`
+/// ([`settle`]) instead of one boolean per row.
+enum Handled {
+    /// The request only read state: the in-memory snapshot is still current.
+    Read(ipc::AdminResponse),
+    /// The request changed on-disk state, so the daemon must reload before the next reader.
+    Mutated(ipc::AdminResponse),
+}
+
+/// Turn a dispatched request into its reply: reload the daemon exactly once when the arm that
+/// answered changed state, and never otherwise.
+///
+/// This is the single site where the two classes differ, and the `match` is exhaustive, so a third
+/// class cannot be added without deciding here what it does to the daemon. `reload` is a parameter
+/// rather than a direct call so a unit test can count it.
+async fn settle(handled: Handled, reload: impl Future<Output = ()>) -> ipc::AdminResponse {
+    match handled {
+        Handled::Read(response) => response,
+        Handled::Mutated(response) => {
+            reload.await;
+            response
+        }
+    }
+}
+
 pub async fn handle_admin_request(
     request: ipc::AdminRequest,
     daemon_lock: &RwLock<Arc<DaemonState>>,
@@ -148,59 +179,71 @@ pub async fn handle_admin_request(
 
     let username = identity.username;
 
-    let (response, needs_reload) = match request.payload {
+    settle(
+        dispatch(request, &daemon, pairing_state, &username).await,
+        async {
+            let new_daemon = daemon.reload();
+            *daemon_lock.write().await = new_daemon;
+            tracing::info!("Daemon state reloaded after admin operation");
+        },
+    )
+    .await
+}
+
+/// Dispatch one authorized admin request to its handler, naming the class of every arm.
+///
+/// Each arm says whether the request changed state ([`Handled`]); the reload that follows is
+/// [`settle`]'s single job. There is deliberately no `Some(_)` catch-all, so a new payload variant
+/// does not compile until it is given a class.
+async fn dispatch(
+    request: ipc::AdminRequest,
+    daemon: &Arc<DaemonState>,
+    pairing_state: &Arc<Mutex<Option<PairingState>>>,
+    username: &str,
+) -> Handled {
+    match request.payload {
         Some(ipc::admin_request::Payload::GetServers(_)) => {
-            (handle_get_servers(&daemon, &username).await, false)
+            Handled::Read(handle_get_servers(daemon, username).await)
         }
         Some(ipc::admin_request::Payload::StartPairing(_)) => {
             // The toggles are read per request, like `AuthSession::handle_authenticate`
             // does, so a change made in the GUI takes effect on the next attempt
             // without a daemon restart.
             let transports = EnabledTransports::from_config();
-            (
-                handle_start_pairing(&daemon, pairing_state, transports).await,
-                false,
-            )
+            Handled::Read(handle_start_pairing(daemon, pairing_state, transports).await)
         }
         Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
-            (handle_wait_for_pairing(pairing_state, req).await, false)
+            Handled::Read(handle_wait_for_pairing(pairing_state, req).await)
         }
-        Some(ipc::admin_request::Payload::CompletePairing(req)) => (
-            handle_complete_pairing(&daemon, pairing_state, &username, req).await,
-            true,
-        ),
+        Some(ipc::admin_request::Payload::CompletePairing(req)) => {
+            Handled::Mutated(handle_complete_pairing(daemon, pairing_state, username, req).await)
+        }
         Some(ipc::admin_request::Payload::CancelPairing(req)) => {
-            (handle_cancel_pairing(pairing_state, req).await, false)
+            Handled::Read(handle_cancel_pairing(pairing_state, req).await)
         }
         Some(ipc::admin_request::Payload::RemoveDevice(req)) => {
-            (handle_remove_device(&daemon, &username, req).await, true)
+            Handled::Mutated(handle_remove_device(daemon, username, req).await)
         }
-        Some(ipc::admin_request::Payload::RotateCsk(_)) => (handle_rotate_csk(&daemon).await, true),
+        Some(ipc::admin_request::Payload::RotateCsk(_)) => {
+            Handled::Mutated(handle_rotate_csk(daemon).await)
+        }
         Some(ipc::admin_request::Payload::SaveConfig(req)) => {
-            (handle_save_config(&daemon, req).await, true)
+            Handled::Mutated(handle_save_config(daemon, req).await)
         }
         Some(ipc::admin_request::Payload::RecoverTpm(_)) => {
-            (handle_recover_tpm(&daemon).await, true)
+            Handled::Mutated(handle_recover_tpm(daemon).await)
         }
         Some(ipc::admin_request::Payload::GetConfig(_)) => {
-            (handle_get_config(&daemon).await, false)
+            Handled::Read(handle_get_config(daemon).await)
         }
         Some(ipc::admin_request::Payload::GetDaemonStatus(_)) => {
-            (handle_get_daemon_status(&daemon).await, false)
+            Handled::Read(handle_get_daemon_status(daemon).await)
         }
-        None => (
-            err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
-            false,
-        ),
-    };
-
-    if needs_reload {
-        let new_daemon = daemon.reload();
-        *daemon_lock.write().await = new_daemon;
-        tracing::info!("Daemon state reloaded after admin operation");
+        None => Handled::Read(err_resp(
+            ipc::AdminStatus::AdminError,
+            "Empty admin request",
+        )),
     }
-
-    response
 }
 
 /// Loads paired servers directly from disk (not the in-memory snapshot).
@@ -969,6 +1012,86 @@ mod tests {
         assert!(
             pairing_state.lock().await.is_none(),
             "no session may be registered for a configuration nothing can reach"
+        );
+    }
+
+    /// A mutating request reloads the daemon exactly once, a read-only one never — and the two
+    /// classes come from the arm that answered, through [`settle`].
+    ///
+    /// The defect this catches: a mutating arm written as `Handled::Read` (the old "forgot
+    /// `true` in the tuple slot"), so `CompletePairing` persists the device and the daemon keeps
+    /// serving the snapshot it built before the pairing, `RemoveDevice` leaves the removed server
+    /// able to authenticate, and `SaveConfig`'s transport toggles never reach the next attempt —
+    /// with no error anywhere. It also catches the opposite direction: a read that reloads, which
+    /// dirties the in-memory snapshot for a request that changed nothing.
+    #[tokio::test]
+    async fn only_a_mutating_request_reloads_the_daemon() {
+        let daemon = Arc::new(DaemonState {
+            config_manager: Arc::new(shared::config::ClientConfigManager::new()),
+            paired_servers: Arc::new(std::collections::HashMap::new()),
+            keypair: None,
+            csk: None,
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        });
+        let pairing_state: Arc<Mutex<Option<PairingState>>> = Arc::new(Mutex::new(None));
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+        let count_one_reload = || async {
+            reloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+
+        // A read: answered from the in-memory snapshot, so nothing is reloaded.
+        let read = dispatch(
+            ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::GetDaemonStatus(
+                    ipc::GetDaemonStatusRequest {},
+                )),
+            },
+            &daemon,
+            &pairing_state,
+            "luca",
+        )
+        .await;
+        let read_reply = settle(read, count_one_reload()).await;
+        assert_eq!(read_reply.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert!(
+            matches!(
+                read_reply.payload,
+                Some(ipc::admin_response::Payload::GetDaemonStatus(_))
+            ),
+            "the read must be answered by its own handler"
+        );
+        assert_eq!(
+            reloads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a read-only request must not reload the daemon"
+        );
+
+        // A mutation: with no pairing session pending the handler answers an error, and the class
+        // is about what the arm does to state, not about whether it succeeded — a failed mutation
+        // may still have written something.
+        let mutated = dispatch(
+            ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::CompletePairing(
+                    ipc::CompletePairingRequest { port: 0 },
+                )),
+            },
+            &daemon,
+            &pairing_state,
+            "luca",
+        )
+        .await;
+        let mutated_reply = settle(mutated, count_one_reload()).await;
+        assert_eq!(
+            mutated_reply.status,
+            ipc::AdminStatus::AdminError as i32,
+            "there is no pairing session to complete"
+        );
+        assert_eq!(
+            reloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a mutating request must reload the daemon exactly once"
         );
     }
 }
