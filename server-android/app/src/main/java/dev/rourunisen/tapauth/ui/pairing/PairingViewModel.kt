@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import dev.rourunisen.tapauth.data.PairingUrl
+import dev.rourunisen.tapauth.network.CloseOutcome
 import dev.rourunisen.tapauth.network.PairingSession
 import dev.rourunisen.tapauth.network.PairingUpdate
 import kotlinx.coroutines.CoroutineScope
@@ -59,13 +60,13 @@ interface PairingHandle {
     /**
      * Ask the session to release its transports, keys and coroutine.
      *
-     * @return true when the close was **deferred** because the pairing confirmation is still in
-     *   flight — the device record is written but the `PairingConfirmServer` burst and the linger
-     *   that answers the desktop's retransmissions have not finished, so the session keeps running
-     *   and releases itself when they end — false when this call released everything, including
-     *   when the confirmation has already completed. See `PairingSession.close`.
+     * @return [CloseOutcome.Deferred] when the pairing confirmation is still in flight — the device
+     *   record is written but the `PairingConfirmServer` burst and the linger that answers the
+     *   desktop's retransmissions have not finished, so the session keeps running and releases
+     *   itself when they end — [CloseOutcome.Released] when this call released everything,
+     *   including when the confirmation has already completed. See `PairingSession.close`.
      */
-    fun close(): Boolean
+    fun close(): CloseOutcome
 }
 
 /** Creates the session for one attempt. Replaced by a fake in the unit tests. */
@@ -280,7 +281,7 @@ class PairingViewModel(
         // attempt scope here would cut them and leave the phone paired with a desktop that timed
         // out. The session bounds that itself and releases when it ends — after which a close
         // releases normally instead of deferring again.
-        if (session?.close() != true) attemptScope?.cancel()
+        if (session?.close() != CloseOutcome.Deferred) attemptScope?.cancel()
         attemptScope = null
     }
 
@@ -309,5 +310,5 @@ private class RealPairingHandle(private val session: PairingSession) : PairingHa
 
     override fun rejectSas(): Boolean = session.rejectSas()
 
-    override fun close(): Boolean = session.close()
+    override fun close(): CloseOutcome = session.close()
 }

@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import dev.rourunisen.tapauth.data.PairedDevice
 import dev.rourunisen.tapauth.data.PairingUrl
+import dev.rourunisen.tapauth.network.CloseOutcome
 import dev.rourunisen.tapauth.network.PairingTransport
 import dev.rourunisen.tapauth.network.PairingUpdate
 import kotlinx.coroutines.CoroutineScope
@@ -42,8 +43,9 @@ import org.junit.Test
  *   coroutine;
  * * once the commit window is open (the device record is durable and the confirmation is in
  *   flight), a back press is a release, and that release is *deferred* — the session answers
- *   `close() == true`, so the attempt scope keeps running until the burst and linger finish. The
- *   ViewModel cannot tell the difference by itself: it asks the session, which owns the boundary.
+ *   `CloseOutcome.Deferred`, so the attempt scope keeps running until the burst and linger finish.
+ *   The ViewModel cannot tell the difference by itself: it asks the session, which owns the
+ *   boundary.
  */
 class PairingViewModelTest {
 
@@ -68,8 +70,8 @@ class PairingViewModelTest {
         var scope: CoroutineScope? = null
 
         /**
-         * Whether `close()` must report a *deferred* release, i.e. the real session's "a pairing
-         * confirmation is being persisted, so this close only asked".
+         * What `close()` reports: the real session's "a pairing confirmation is being persisted, so
+         * this close only asked" when set.
          */
         var committing = false
 
@@ -96,9 +98,9 @@ class PairingViewModelTest {
             return rejectRecorded
         }
 
-        override fun close(): Boolean {
+        override fun close(): CloseOutcome {
             closeCount++
-            return committing
+            return if (committing) CloseOutcome.Deferred else CloseOutcome.Released
         }
 
         /** Report an update the way the real session does, from the main thread. */

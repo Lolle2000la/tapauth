@@ -264,26 +264,48 @@ internal class PairingCommitLatch {
     /**
      * Ask to release the session.
      *
-     * @return true when the close is **deferred** — a commit is in flight, so the confirmation
-     *   burst and linger must still run and the session releases itself afterwards; false when the
-     *   close may release now, either because it won the boundary just now (nothing was or will be
-     *   persisted), because it had already won, or because the confirmation has completed
+     * @return [CloseOutcome.Deferred] when a commit is in flight, so the confirmation burst and
+     *   linger must still run and the session releases itself afterwards; [CloseOutcome.Released]
+     *   when the close may release now, either because it won the boundary just now (nothing was or
+     *   will be persisted), because it had already won, or because the confirmation has completed
      */
-    fun requestClose(): Boolean =
+    fun requestClose(): CloseOutcome =
         synchronized(lock) {
             when (state) {
                 State.Open -> {
                     state = State.Closed
-                    false
+                    CloseOutcome.Released
                 }
-                State.Committed -> true
+                State.Committed -> CloseOutcome.Deferred
                 State.Completed -> {
                     state = State.Closed
-                    false
+                    CloseOutcome.Released
                 }
-                State.Closed -> false
+                State.Closed -> CloseOutcome.Released
             }
         }
+}
+
+/**
+ * What one close decided, and what the session did with it.
+ *
+ * The contract `PairingHandle.close()` publishes is exactly these two cases, so a caller reads the
+ * answer by name instead of by the polarity of a Boolean: a close is either deferred to a
+ * confirmation that is already in flight, or it released everything.
+ */
+enum class CloseOutcome {
+    /**
+     * The close is deferred to a confirmation that is in flight: the device record is written but
+     * the `PairingConfirmServer` burst and the linger that answers the desktop's retransmissions
+     * have not finished. The session keeps running and releases itself when they end.
+     */
+    Deferred,
+
+    /**
+     * The session released everything: the coroutine, the transports and the Rust session. Also the
+     * answer when the confirmation had already completed, or on a repeated close.
+     */
+    Released,
 }
 
 /**
@@ -295,13 +317,14 @@ internal class PairingCommitLatch {
  * [PairingCommitLatch] answers the question and [onRelease] is the release itself (`PairingSession`
  * passes cancel-the-job / close-the-links / zeroize-the-keys).
  *
- * The returned Boolean is the whole contract `PairingHandle.close()` publishes and
+ * The [CloseOutcome] it returns is the whole contract `PairingHandle.close()` publishes and
  * `PairingViewModel.releaseSession()` acts on. Getting it wrong either way undoes finding F: a
- * deferred close answered `false` cancels the attempt scope mid-confirmation (the phone persists
- * and the desktop times out), and a close that won answered `true` leaks a session with no screen.
- * A close that arrives once the confirmation has completed (`PairingCommitLatch.completeCommit`)
- * releases like any other: the latch no longer reports a deferral, so there is no state in which a
- * finished session answers "deferred" and keeps its transports for the life of the process.
+ * deferred close answered `Released` cancels the attempt scope mid-confirmation (the phone persists
+ * and the desktop times out), and a close that won answered `Deferred` leaks a session with no
+ * screen. A close that arrives once the confirmation has completed
+ * (`PairingCommitLatch.completeCommit`) releases like any other: the latch no longer reports a
+ * deferral, so there is no state in which a finished session answers "deferred" and keeps its
+ * transports for the life of the process.
  *
  * [onRelease] runs at most once, because a repeat close finds nothing left to release.
  */
@@ -321,22 +344,23 @@ internal class PairingSessionRelease(
     /**
      * Ask for the release.
      *
-     * @return true when the release is deferred — a commit is in flight and the confirmation must
-     *   finish, so [onRelease] must not run — false when it ran now, or had already run
+     * @return [CloseOutcome.Deferred] when the release is deferred — a commit is in flight and the
+     *   confirmation must finish, so [onRelease] must not run — [CloseOutcome.Released] when it ran
+     *   now, or had already run
      */
-    fun requestClose(): Boolean =
+    fun requestClose(): CloseOutcome =
         synchronized(lock) {
             when {
                 // A commit is in flight: the confirmation must finish, so nothing is released.
-                latch.requestClose() -> {
+                latch.requestClose() == CloseOutcome.Deferred -> {
                     Log.i(TAG, "close() deferred: the pairing confirmation is in flight")
-                    true
+                    CloseOutcome.Deferred
                 }
-                released -> false
+                released -> CloseOutcome.Released
                 else -> {
                     released = true
                     onRelease()
-                    false
+                    CloseOutcome.Released
                 }
             }
         }
@@ -409,10 +433,11 @@ internal class PairingSessionLifecycle(
     /**
      * Ask for the release.
      *
-     * @return true when it was deferred to the confirmation in flight, false when it ran now (or
-     *   had already run, or the confirmation had completed)
+     * @return [CloseOutcome.Deferred] when it was deferred to the confirmation in flight,
+     *   [CloseOutcome.Released] when it ran now (or had already run, or the confirmation had
+     *   completed)
      */
-    fun close(): Boolean = release.requestClose()
+    fun close(): CloseOutcome = release.requestClose()
 
     /**
      * Run the confirmation phase under this lifecycle's boundary.
