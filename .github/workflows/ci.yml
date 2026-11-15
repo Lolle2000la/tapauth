@@ -20,11 +20,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
-  # No `paths:` here: these jobs are required status checks, and a required
-  # check cannot be path-filtered — GitHub leaves a check whose run was skipped
-  # `Pending` forever, so the PR could be neither merged nor queued.
+  # No `paths:` and no `branches:` here: these jobs are required status checks,
+  # and a required check cannot be filtered — GitHub leaves a check whose run was
+  # skipped `Pending` forever. `branches:` filters on the base branch, so a
+  # stacked PR onto an integration branch must still report every context.
   pull_request:
-    branches: [main]
   # No `paths:` here either: GitHub supports no path filters on merge_group.
   merge_group:
     types: [checks_requested]
