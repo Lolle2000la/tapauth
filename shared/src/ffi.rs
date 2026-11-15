@@ -99,9 +99,10 @@ fn read_csk(bytes: &[u8]) -> Result<Zeroizing<[u8; CSK_LEN]>, TapauthError> {
 /// Read an Ed25519 keypair: a 32-byte signing key or a 64-byte full keypair.
 ///
 /// A 64-byte keypair carries the signing key in its first half, which is the form
-/// `generate_keypair` hands back, so a caller may persist and return either.
+/// `generate_keypair` hands back, so a caller may persist and return either. The
+/// Rust-side copy of the signing key is zeroized on drop.
 fn read_ed25519_keypair(bytes: &[u8], name: &str) -> Result<Ed25519KeyPair, TapauthError> {
-    let signing_key: [u8; 32] = match bytes.len() {
+    let signing_key: Zeroizing<[u8; 32]> = Zeroizing::new(match bytes.len() {
         32 => fixed(bytes, name)?,
         64 => {
             let (signing_key, _public_key) = bytes.split_at(ED25519_PUBLIC_KEY_LEN);
@@ -112,7 +113,7 @@ fn read_ed25519_keypair(bytes: &[u8], name: &str) -> Result<Ed25519KeyPair, Tapa
                 detail: format!("{name} must be 32 bytes (signing key) or 64 bytes (full keypair)"),
             })
         }
-    };
+    });
 
     Ed25519KeyPair::from_signing_key_bytes(&signing_key).map_err(|err| TapauthError::Argument {
         detail: format!("invalid Ed25519 keypair: {err}"),

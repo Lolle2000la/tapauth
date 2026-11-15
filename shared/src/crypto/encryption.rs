@@ -236,32 +236,30 @@ pub fn decrypt_with_csk_and_prepended_nonce(
 /// Encrypt with a pairing key (`K_c2s` / `K_s2c`) using a random nonce
 /// (prepended to the ciphertext).
 ///
-/// Empty AAD is forbidden in v2 (cryptography-specification.md §3): it rejects
-/// with [`CryptoError::InvalidAad`] so a caller cannot silently drop the
-/// transcript binding.
+/// Empty AAD is forbidden in v2 (cryptography-specification.md §3): the
+/// underlying [`encrypt_aead_with_random_nonce`] rejects it with
+/// [`CryptoError::InvalidAad`], before the nonce is drawn or the algorithm
+/// dispatched, so a caller cannot silently drop the transcript binding.
 pub fn encrypt_with_key(
     alg: SymmetricAlgorithm,
     key: &[u8; 32],
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    if aad.is_empty() {
-        return Err(CryptoError::InvalidAad);
-    }
     encrypt_aead_with_random_nonce(alg, key, plaintext, aad)
 }
 
 /// Decrypt with a pairing key (`K_c2s` / `K_s2c`) where the random nonce is
-/// prepended to the ciphertext. Rejects empty AAD like [`encrypt_with_key`].
+/// prepended to the ciphertext.
+///
+/// Empty AAD is refused with [`CryptoError::InvalidAad`] by the underlying
+/// [`decrypt_aead_with_prepended_nonce`], as for [`encrypt_with_key`].
 pub fn decrypt_with_key(
     alg: SymmetricAlgorithm,
     key: &[u8; 32],
     combined: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    if aad.is_empty() {
-        return Err(CryptoError::InvalidAad);
-    }
     decrypt_aead_with_prepended_nonce(alg, key, combined, aad)
 }
 

@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
 use crate::protocol::pb::{HashAlgorithm, SignatureAlgorithm, SymmetricAlgorithm};
 use nix::unistd::{geteuid, User};
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -434,13 +435,13 @@ impl ClientConfigManager {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let data = read_secure_file(&key_path)?;
+        let data = Zeroizing::new(read_secure_file(&key_path)?);
 
         if data.len() != 32 {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let mut bytes = [0u8; 32];
+        let mut bytes = Zeroizing::new([0u8; 32]);
         bytes.copy_from_slice(&data);
 
         tracing::info!("Loaded Ed25519 keypair from file");
@@ -454,7 +455,10 @@ impl ClientConfigManager {
     pub fn save_keypair(&self, keypair: &Ed25519KeyPair) -> Result<(), ConfigError> {
         self.init()?;
 
-        let bytes = keypair.signing_key_bytes();
+        // Zeroization, same class as `load_keypair` (R2-L5, extended to the save
+        // side): `signing_key_bytes()` hands back a plain `[u8; 32]` that lives on
+        // the stack until this function returns, past the write it feeds.
+        let bytes = Zeroizing::new(keypair.signing_key_bytes());
 
         #[cfg(feature = "tpm")]
         {
@@ -470,12 +474,14 @@ impl ClientConfigManager {
 
                 let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
                 let pcr_list = toml_config.tpm_pcr_policy.pcr_list();
-                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path, pcr_list).map_err(|e| {
-                    ConfigError::Io(std::io::Error::other(format!(
-                        "Failed to seal key with TPM: {}",
-                        e
-                    )))
-                })?;
+                crate::tpm::seal_data_with_tpm(&bytes[..], &tpm_key_path, pcr_list).map_err(
+                    |e| {
+                        ConfigError::Io(std::io::Error::other(format!(
+                            "Failed to seal key with TPM: {}",
+                            e
+                        )))
+                    },
+                )?;
 
                 tracing::info!(
                     "Sealed Ed25519 keypair with TPM using PCR policy {:?} (no plaintext backup)",
@@ -488,7 +494,7 @@ impl ClientConfigManager {
         // File-only mode: save plaintext with 600 permissions
         // (Also used when TPM feature is not compiled in)
         let key_path = self.config_dir.join(CLIENT_KEY_FILE);
-        write_secure_file(&key_path, &bytes)?;
+        write_secure_file(&key_path, &bytes[..])?;
         tracing::info!("Saved Ed25519 keypair to file");
 
         Ok(())
@@ -509,16 +515,16 @@ impl ClientConfigManager {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let data = read_secure_file(&csk_path)?;
+        let data = Zeroizing::new(read_secure_file(&csk_path)?);
 
         if data.len() != 32 {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let mut bytes = [0u8; 32];
+        let mut bytes = Zeroizing::new([0u8; 32]);
         bytes.copy_from_slice(&data);
 
-        Ok(ClientSymmetricKey::from_bytes(bytes))
+        Ok(ClientSymmetricKey::from_bytes(*bytes))
     }
 
     /// Save CSK
