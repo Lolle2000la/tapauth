@@ -35,7 +35,13 @@ pub struct FirewallGuard {
     protocol: Protocol,
     /// Set once [`FirewallGuard::close`] has taken responsibility for removing
     /// the rule, so the best-effort [`Drop`] does not shell out a second time.
-    closed: AtomicBool,
+    ///
+    /// Shared with the blocking close task (`Arc`, not a bare `AtomicBool`) because
+    /// the close may only set it **inside** the slot's critical section, where
+    /// "no other holder" is a fact rather than a guess: a flag set before that
+    /// decision would disarm this guard's [`Drop`] for a close that then decides to
+    /// leave the rule alone.
+    closed: Arc<AtomicBool>,
 }
 
 struct PortControl {
@@ -113,7 +119,7 @@ impl FirewallGuard {
         let guard = Arc::new(Self {
             port,
             protocol,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         });
         ctrl.weak = Arc::downgrade(&guard);
         Ok(guard)
@@ -139,11 +145,11 @@ impl FirewallGuard {
     /// so a failure is reported here rather than detached.
     ///
     /// A close that did not happen is **never** reported as one, and whether the
-    /// best-effort [`Drop`] is re-armed depends on whether a retry could help:
+    /// best-effort [`Drop`] is left armed depends on whether a retry could help:
     ///
-    /// * A poisoned slot, or a blocking task that died, returns `Err` **and**
-    ///   re-arms `closed`. Nothing ran, and a later detached attempt can still
-    ///   succeed.
+    /// * A poisoned slot, or a blocking task that died, returns `Err` with `closed`
+    ///   still armed (or re-armed): nothing ran, so a later detached attempt can
+    ///   still succeed.
     /// * A removal command that ran and failed returns its own error and leaves
     ///   `closed` set. A missing `iptables` or a missing `CAP_NET_ADMIN` fails the
     ///   same way every time, so re-arming would only repeat the failure from a
@@ -161,37 +167,45 @@ impl FirewallGuard {
     where
         Remove: FnOnce(u16, Protocol) -> Result<(), FirewallError> + Send + 'static,
     {
-        if self.closed.swap(true, Ordering::SeqCst) {
+        // Idempotent: a close that already took responsibility for the rule has
+        // nothing left to do. Two concurrent closes do not queue up behind each
+        // other — `spawn_blocking` runs them on different threads — so what keeps
+        // the second one from removing the rule twice is the per-entry `port_ctrl`
+        // lock together with the `ctrl.is_open` re-check `do_explicit_close` makes
+        // while holding it. That re-check is only correct under the lock: taken out
+        // of it, both closes could see the rule open and both remove it.
+        if self.closed.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         let (port, protocol) = (self.port, self.protocol);
-        match tokio::task::spawn_blocking(move || do_explicit_close(port, protocol, remove_rule))
-            .await
+        let closed = Arc::clone(&self.closed);
+        match tokio::task::spawn_blocking(move || {
+            do_explicit_close(port, protocol, closed, remove_rule)
+        })
+        .await
         {
             Ok(CloseDisposition::Closed) => Ok(()),
-            // Still shared with another live guard: nothing was removed, so this
-            // guard keeps its best-effort drop.
-            Ok(CloseDisposition::KeptForAnotherHolder) => {
-                self.closed.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            // Nothing was removed and we do not know why: re-arm the fallback and
-            // report, so the caller (`Session::finish`) logs it instead of
-            // publishing a terminal phase over a silent failure.
-            Ok(CloseDisposition::Unknown(reason)) => {
-                self.closed.store(false, Ordering::SeqCst);
-                Err(FirewallError::LockPoisoned(format!(
-                    "could not remove the rule for port {} ({}): {}",
-                    port, protocol, reason
-                )))
-            }
-            // The command ran and failed. Report the cause, but do not re-arm: the
-            // same call would fail identically, and `Drop` cannot await it.
+            // Still shared with another live guard: nothing was removed, and `closed`
+            // was never set, so this guard keeps its best-effort drop (which the
+            // last holder's departure needs).
+            Ok(CloseDisposition::KeptForAnotherHolder) => Ok(()),
+            // Nothing was removed and the decision could not be made: the flag was
+            // never set, so the fallback stays armed. Report, so the caller
+            // (`Session::finish`) logs it instead of publishing a terminal phase
+            // over a silent failure.
+            Ok(CloseDisposition::Unknown(reason)) => Err(FirewallError::LockPoisoned(format!(
+                "could not remove the rule for port {} ({}): {}",
+                port, protocol, reason
+            ))),
+            // The command ran and failed. Report the cause; `closed` stays set (the
+            // task set it under the slot lock), because the same call would fail
+            // identically and `Drop` cannot await it.
             Ok(CloseDisposition::RemovalFailed(error)) => Err(error),
-            // The blocking task panicked or was dropped before it ran. `do_drop_close`
-            // re-checks `is_open` under the slot lock, so letting the fallback try
-            // again cannot remove a rule twice.
+            // The blocking task panicked or was dropped before it ran. Re-arm: a
+            // task that died may have set `closed` and removed nothing, and
+            // `do_drop_close` re-checks `is_open` under the slot lock, so letting
+            // the fallback try again cannot remove a rule twice.
             Err(e) => {
                 self.closed.store(false, Ordering::SeqCst);
                 Err(FirewallError::Io(std::io::Error::other(format!(
@@ -233,18 +247,18 @@ impl Drop for FirewallGuard {
     }
 }
 
-/// What [`do_explicit_close`] did, so [`FirewallGuard::close`] can report it and
-/// undo its own `closed` flag when it chose not to touch the rule.
+/// What [`do_explicit_close`] did, so [`FirewallGuard::close`] can report it.
 enum CloseDisposition {
     /// The rule was removed (or there was nothing left to remove).
     Closed,
-    /// Another live guard shares the `(port, protocol)`; the rule stays.
+    /// Another live guard shares the `(port, protocol)`; the rule stays and this
+    /// guard keeps its best-effort drop.
     KeptForAnotherHolder,
-    /// The decision could not be made (a poisoned lock), so nothing was removed.
-    /// The caller re-arms its best-effort drop: a later attempt may still work.
+    /// The decision could not be made (a poisoned lock), so nothing was removed
+    /// and no flag was set. A later attempt may still work.
     Unknown(&'static str),
-    /// The removal was attempted and failed. Reported with its own cause; the
-    /// caller does *not* re-arm, because the same command would fail the same way.
+    /// The removal was attempted and failed. Reported with its own cause; `closed`
+    /// stays set, because the same command would fail the same way.
     RemovalFailed(FirewallError),
 }
 
@@ -255,7 +269,17 @@ enum CloseDisposition {
 /// deregistered first — which is what a later `new` on the same port and a later
 /// best-effort drop both observe — and the rule is removed unless another live
 /// guard still holds the slot.
-fn do_explicit_close<Remove>(port: u16, protocol: Protocol, remove_rule: Remove) -> CloseDisposition
+///
+/// `closed` is the requesting guard's flag, set here **under the slot lock and only
+/// after sole ownership is confirmed**: before the lock, "another holder exists" is
+/// still undecided, and a guard disarmed at that point would skip its [`Drop`] if
+/// the decision turned out to keep the rule for that other holder.
+fn do_explicit_close<Remove>(
+    port: u16,
+    protocol: Protocol,
+    closed: Arc<AtomicBool>,
+    remove_rule: Remove,
+) -> CloseDisposition
 where
     Remove: FnOnce(u16, Protocol) -> Result<(), FirewallError>,
 {
@@ -292,6 +316,12 @@ where
         );
         return CloseDisposition::KeptForAnotherHolder;
     }
+
+    // Sole ownership, decided under the slot lock this guard just took: from here
+    // on the rule is this close's responsibility, so the flag that disarms the
+    // best-effort `Drop` may be set. Setting it any earlier would disarm a guard
+    // whose close then decided to leave the rule to somebody else.
+    closed.store(true, Ordering::SeqCst);
 
     ctrl.weak = Weak::new();
     let outcome = if ctrl.is_open {
@@ -558,6 +588,9 @@ mod tests {
     const SHARED_REMOVE_TEST_PORT: u16 = 45_683;
     const POISONED_TEST_PORT: u16 = 45_682;
     const FAILED_REMOVE_TEST_PORT: u16 = 45_684;
+    const UNDECIDED_FLAG_TEST_PORT: u16 = 45_685;
+    const HOLDER_DROP_TEST_PORT: u16 = 45_686;
+    const SECOND_CLOSE_TEST_PORT: u16 = 45_687;
 
     /// A guard registered in a slot, so the close decision is exercised without
     /// shelling out.
@@ -565,7 +598,7 @@ mod tests {
         let guard = Arc::new(FirewallGuard {
             port,
             protocol: Protocol::Udp,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         });
         let slot = reserve_slot(port, Protocol::Udp).unwrap();
         {
@@ -761,6 +794,135 @@ mod tests {
         assert!(
             !guard.closed.load(Ordering::SeqCst),
             "the failed close must leave the best-effort drop armed"
+        );
+    }
+
+    /// The `closed` flag may only be written once sole ownership is a fact, so a
+    /// close that turns out to share the port keeps its own drop fallback.
+    ///
+    /// The defects this catches: setting the flag before the slot lock (which is
+    /// where `close_with` used to `swap(true)`), leaving a window in which this
+    /// guard is disarmed for a close that then answers `KeptForAnotherHolder` and
+    /// has to write the flag back — a `Drop` observing it in that window removes
+    /// nothing, and the rule then has no owner left to remove it.
+    ///
+    /// Holding the slot lock is what makes the window observable without a sleep:
+    /// the close is polled once, so it is provably waiting for the lock with the
+    /// ownership question still open.
+    #[tokio::test]
+    async fn the_close_flag_is_set_only_after_sole_ownership_is_confirmed() {
+        use std::future::Future;
+
+        let (guard, slot) = registered_guard(UNDECIDED_FLAG_TEST_PORT, true);
+        let _other = Arc::clone(&guard);
+
+        let held = slot.lock().unwrap();
+        let mut closing = Box::pin(guard.close_with(|_, _| Ok(())));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(
+            closing.as_mut().poll(&mut context).is_pending(),
+            "the close must still be waiting for the slot lock"
+        );
+        assert!(
+            !guard.closed.load(Ordering::SeqCst),
+            "a close that has not confirmed sole ownership must not disarm the drop"
+        );
+
+        // Let the decision run (it sees two holders) and then release the fixture
+        // the way `a_shared_port_is_not_removed_for_the_other_holder` does.
+        drop(closing);
+        drop(held);
+        slot.lock().unwrap().is_open = false;
+        drop(_other);
+        drop(guard);
+    }
+
+    /// `close()` is idempotent: a second call removes nothing.
+    ///
+    /// The defect this catches: a close that shells out again for a rule it has
+    /// already removed — `iptables -D` then fails ("Bad rule"), so the second call
+    /// reports `RemovalFailed` for a port that is in fact closed, and `Session::
+    /// finish` logs a failure over a rule that is gone.
+    #[tokio::test]
+    async fn a_second_close_removes_nothing() {
+        let (guard, slot) = registered_guard(SECOND_CLOSE_TEST_PORT, true);
+        let removed = Arc::new(Mutex::new(Vec::new()));
+
+        for _ in 0..2 {
+            let recorder = Arc::clone(&removed);
+            guard
+                .close_with(move |port, protocol| {
+                    recorder.lock().unwrap().push((port, protocol));
+                    Ok(())
+                })
+                .await
+                .expect("a close over an open rule must succeed");
+        }
+
+        assert_eq!(
+            &*removed.lock().unwrap(),
+            &[(SECOND_CLOSE_TEST_PORT, Protocol::Udp)],
+            "the rule must be removed once, by the first close"
+        );
+        assert!(
+            !slot.lock().unwrap().is_open,
+            "the slot must be recorded as closed"
+        );
+        assert!(guard.closed.load(Ordering::SeqCst));
+    }
+
+    /// One holder closing while the other one is dropped must remove the rule
+    /// exactly once, and leave the slot closed.
+    ///
+    /// The defects this catches: a close that decides on liveness
+    /// (`weak.upgrade()`) rather than on the slot's deregistration, so the
+    /// departing holder is still counted and the answer is
+    /// `KeptForAnotherHolder` — the rule is left open with nobody left to remove
+    /// it — and a close that removes a port another holder still uses.
+    ///
+    /// The slot lock is held from before the close is spawned until after the
+    /// other holder is gone, so the decision provably runs against one holder
+    /// whatever the scheduler does.
+    #[tokio::test]
+    async fn a_holder_dropped_during_the_awaited_close_removes_the_rule_exactly_once() {
+        let (guard, slot) = registered_guard(HOLDER_DROP_TEST_PORT, true);
+        let other = Arc::clone(&guard);
+        let removed = Arc::new(Mutex::new(Vec::new()));
+
+        let held = slot.lock().unwrap();
+        let recorder = Arc::clone(&removed);
+        // The task owns the closing holder, so it is the only strong reference left
+        // once `other` is dropped — and it reads its own flag before it goes away,
+        // which is what a `Drop` would see.
+        let task = tokio::spawn(async move {
+            let outcome = guard
+                .close_with(move |port, protocol| {
+                    recorder.lock().unwrap().push((port, protocol));
+                    Ok(())
+                })
+                .await;
+            (outcome, guard.closed.load(Ordering::SeqCst))
+        });
+
+        drop(other);
+        drop(held);
+
+        let (outcome, disarmed) = task.await.expect("the close task must not fail");
+        outcome.expect("the close must succeed");
+
+        assert_eq!(
+            &*removed.lock().unwrap(),
+            &[(HOLDER_DROP_TEST_PORT, Protocol::Udp)],
+            "the last holder's departure must remove the rule, exactly once"
+        );
+        assert!(
+            !slot.lock().unwrap().is_open,
+            "a removed rule must be recorded as closed"
+        );
+        assert!(
+            disarmed,
+            "the drop that follows a completed close must not remove the rule again"
         );
     }
 }
