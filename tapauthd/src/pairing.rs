@@ -772,6 +772,12 @@ async fn run_session(
         server_device_name: String::new(),
     };
 
+    // This is the *runtime* predicate (did the socket bind, did the advertisement
+    // start), not `EnabledTransports::refusal()`, which owns the *configuration*
+    // predicate in `transport/selection.rs`: the case that fires below is "the
+    // network is off by configuration and BLE is configured but `bluer` failed",
+    // where `any()` is already true and `refusal()` would claim both transports
+    // were disabled.
     if !transports_ready {
         // Waiting here would run the loop with one arm fewer than it has cheap
         // exits: no socket to receive on, no link to read from, so only the 120 s
@@ -925,6 +931,35 @@ async fn recv_datagram(
     }
 }
 
+/// One pairing session: its transports, its handshake machine, and the IPC
+/// callers waiting on it.
+///
+/// The `Option` fields are not eight independent phases. They hold one atomic
+/// triple, one provisioning pair and two bookkeeping slots, and the relations
+/// below are the contract the handlers rely on. Each names the place that writes
+/// it, so a reader of [`Session::finish`]/[`Session::end`]/`on_*` finds the
+/// whole state machine here instead of reconstructing it:
+///
+/// * **The accepted-init triple** — `peer.is_some() ⟺ response_frame.is_some()
+///   ⟺ server_public_key.is_some()`: written together in [`Session::on_init`]
+///   with no `await` between the writes, and never cleared (`peer` is
+///   re-pointed by that method's refresh arm and by [`Session::on_keepalive`],
+///   never reset to `None`). "The init has been accepted" is one bit, not three.
+/// * **Provisioning** — `confirm_frame.is_some() ⟺ provisioning.is_some()`: two
+///   adjacent writes in [`Session::on_complete`], no `await` between them.
+/// * `completion.is_some() ⟹ provisioning.is_some()`: a pending
+///   `CompletePairing` reply is allocated only by [`Session::on_confirm_server`]
+///   (with the provisioning it concludes) or by [`Session::end`] while one is
+///   live.
+/// * `terminal.is_some() ⟹ end ran ⟹ the loop is over`: [`Session::end`] returns
+///   [`Flow::Done`] unconditionally, so **no handler may return
+///   `Flow::Continue` after calling it**. That is what makes [`Session::finish`]
+///   the only publisher of a terminal phase: the recorded one cannot be
+///   superseded while the session is still running.
+/// * The ninth, implicit one: `server_device_name` uses `""` as the sentinel for
+///   "not known yet" and has no guard anywhere. It is not an `Option`, so no
+///   `is_some` protects a read — a lost write silently pairs a phone with an
+///   empty name.
 struct Session {
     state: ClientPairingState,
     session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -1099,6 +1134,19 @@ impl Session {
     /// The phase is recorded, not published: see [`Session::finish`] for why the
     /// terminal state may only become observable once the session is gone.
     fn end(&mut self, phase: SessionPhase, failure: Option<PairingError>) -> Flow {
+        // The relations documented on `Session`, checked at the point every
+        // ending handler passes through: a later edit that resets one member of a
+        // pair (say `peer` on timeout) fails here instead of silently leaving the
+        // session addressable but keyless — a phone that is never answered.
+        debug_assert_eq!(
+            self.peer.is_some(),
+            self.response_frame.is_some() && self.server_public_key.is_some(),
+            "the accepted-init triple must be all-or-nothing"
+        );
+        debug_assert!(
+            self.completion.is_none() || self.provisioning.is_some(),
+            "a CompletePairing reply may only exist while its provisioning does"
+        );
         if self.provisioning.is_some() && self.completion.is_none() {
             self.completion = Some(Err(failure.unwrap_or(PairingError::Ended(
                 "pairing session ended before the phone confirmed the CSK".to_string(),
@@ -2015,6 +2063,13 @@ mod tests {
 
     /// A session wired to a loopback socket and no BLE half, so the frame
     /// handlers can be driven without the loop or a phone.
+    ///
+    /// The peer is locked to a loopback address. In a live session that can only
+    /// happen once a `PairingInit` has been accepted, so the other two members of
+    /// that triple are set with it (`Session`'s invariants): a session with a
+    /// `peer` and no cached response is a state the daemon never reaches. The
+    /// cached frame is empty because the fixture never ran the handshake, only
+    /// the handlers.
     async fn test_session(
         state: ClientPairingState,
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -2033,13 +2088,13 @@ mod tests {
             phase,
             commands,
             peer: Some(Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)))),
-            response_frame: None,
+            response_frame: Some(Vec::new()),
             confirm_frame: None,
             provisioning: None,
             completion: None,
             cancel_reply: None,
             terminal: None,
-            server_public_key: None,
+            server_public_key: Some([0u8; 32]),
             server_device_name: String::new(),
         };
         (session, phases)
@@ -2203,6 +2258,109 @@ mod tests {
         assert_eq!(
             session.phase(),
             SessionPhase::Failed("the pairing was cancelled".to_string())
+        );
+    }
+
+    /// A `CancelPairing` that arrives while a `CompletePairing` is still waiting
+    /// for the phone must answer **both** callers, and publish the cancel as the
+    /// one terminal phase.
+    ///
+    /// The defects this catches: `Session::finish` answering only the caller it
+    /// was written for — dropping the pending `CompletePairing` reply instead of
+    /// failing it, so `request_completion` waits out `SESSION_REPLY_TIMEOUT`
+    /// (135 s) and the GUI's confirm button hangs on a session that is already
+    /// gone; answering it `Ok`, which tells the admin handler a CSK was
+    /// provisioned and makes it persist a phone that never proved the key; and a
+    /// second terminal phase overwriting the recorded one, so the GUI reports
+    /// "finished" for a pairing the user cancelled.
+    ///
+    /// What it does not re-assert: that the terminal phase is published after
+    /// teardown (`the_terminal_phase_is_published_last` owns that ordering).
+    #[tokio::test]
+    async fn a_cancel_answers_a_pending_completion_and_publishes_only_the_cancel() {
+        let Some((session, _phone, phone_socket, _daemon, _session_id, _phone_key)) =
+            session_and_verified_phone().await
+        else {
+            return;
+        };
+        assert!(
+            matches!(session.phase(), SessionPhase::AwaitingSas(_)),
+            "the cancel must land while the SAS is still being compared"
+        );
+
+        let commands = session.command_sender();
+        // A subscription taken before the cancel, so the published terminal is
+        // observed as a change rather than read back from the current value.
+        let mut phases = session.phase_receiver();
+        phases.borrow_and_update();
+
+        // 1. `CompletePairing`: the worker provisions the CSK and parks the caller
+        //    until the phone proves it.
+        let completing = tokio::spawn({
+            let commands = commands.clone();
+            async move {
+                request_completion(
+                    &commands,
+                    [0x5Au8; 32],
+                    "luca".to_string(),
+                    "thinkpad".to_string(),
+                )
+                .await
+            }
+        });
+        // The frame the phone is being sent says the completion was taken off the
+        // queue, so `provisioning` and its pending reply are live when the cancel
+        // arrives. That is the state this test is about.
+        match recv_frame(&phone_socket).await.msg {
+            Some(pairing_packet::Msg::ConfirmClient(_)) => {}
+            other => panic!("expected a PairingConfirmClient, got {:?}", other),
+        }
+
+        // 2. `CancelPairing` arrives while the session is still `AwaitingSas`.
+        request_cancellation(&commands)
+            .await
+            .expect("a CancelPairing issued while a completion waits must be answered");
+
+        // 3. Both callers are answered, and the completion's answer is `Ended`:
+        //    not a hang and not `Ok`.
+        let completion = tokio::time::timeout(Duration::from_secs(5), completing)
+            .await
+            .expect("the pending CompletePairing caller was never answered")
+            .expect("the completion task panicked");
+        match completion {
+            Err(PairingError::Ended(message)) => assert_eq!(
+                message, "pairing session ended before the phone confirmed the CSK",
+                "the completion must fail for the reason the teardown records"
+            ),
+            other => panic!(
+                "a pending CompletePairing must fail as Ended once the session is cancelled, \
+                 got {other:?}"
+            ),
+        }
+
+        // 4. Exactly one terminal phase, and it is the cancel's. The observer is
+        //    subscribed before the cancel and drained until the worker drops its
+        //    sender, so every value it is woken for is recorded.
+        let mut observed = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), phases.changed()).await {
+                Ok(Ok(())) => observed.push(phases.borrow_and_update().clone()),
+                // The sender is gone: nothing further can be published.
+                Ok(Err(_)) => break,
+                Err(_) => panic!("the worker stopped publishing before the session ended"),
+            }
+        }
+        assert_eq!(
+            observed,
+            vec![SessionPhase::Failed(
+                "the pairing was cancelled".to_string()
+            )],
+            "exactly one terminal phase may be published, and it must be the cancel's"
+        );
+        assert_eq!(
+            session.phase(),
+            SessionPhase::Failed("the pairing was cancelled".to_string()),
+            "the terminal a client observes must be the cancel's"
         );
     }
 
