@@ -92,6 +92,23 @@ fn close_action(state: &PairingState, session: Option<PairingSession>) -> CloseA
     }
 }
 
+/// Run `fut` to completion, or give up as soon as `cancel` is notified.
+///
+/// `Some` carries the answer the future produced, `None` means the cancellation
+/// won and the answer will never be used. Every cancellable task the screen
+/// spawns is built on this, so the handle armed in `cancel_wait` and the future
+/// it is supposed to abort cannot drift apart: they are two arguments of the
+/// same call.
+async fn await_completion_or_cancel<F: std::future::Future>(
+    cancel: Arc<tokio::sync::Notify>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        output = fut => Some(output),
+        _ = cancel.notified() => None,
+    }
+}
+
 /// The `(port, session_id)` pair a `CancelPairing` must carry to address the
 /// session the screen holds, or the daemon-side wildcard.
 ///
@@ -267,12 +284,34 @@ impl PairingScreen {
                 if let PairingState::VerifyingSAS { port, .. } = &self.state {
                     let port = *port;
                     self.state = PairingState::CompletingPairing;
+
+                    // `CompletingPairing` is cancellable (see `session_in_flight`
+                    // and the Cancel button in `view_completing`), so this task
+                    // gets the same select as `wait_for_pairing` above. Without
+                    // it, dropping the screen leaves the reply running, and
+                    // `Screen::update` hands every non-navigation message to
+                    // whichever screen is current — so the abandoned
+                    // `CompletePairing`'s `PairingFailed` would land on the next
+                    // `PairingScreen` and replace its QR code with an error.
+                    let cancel = Arc::new(tokio::sync::Notify::new());
+                    let cancel2 = cancel.clone();
+                    self.cancel_wait = Some(cancel);
+
+                    let completion = crate::ipc::complete_pairing(port as u32);
+
                     return Task::perform(
-                        async move { crate::ipc::complete_pairing(port as u32).await },
-                        |result| match result {
-                            Ok(device_id) => ScreenMessage::PairingComplete(device_id),
-                            Err(e) => ScreenMessage::PairingFailed(e),
+                        async move {
+                            match await_completion_or_cancel(cancel2, completion).await {
+                                Some(Ok(device_id)) => ScreenMessage::PairingComplete(device_id),
+                                Some(Err(e)) => ScreenMessage::PairingFailed(e),
+                                // Inert on purpose: the screen that armed
+                                // `cancel2` has been torn down, so this message
+                                // reaches whichever screen is current now and
+                                // must not act as a cancel there.
+                                None => ScreenMessage::PairingCompletionAbandoned,
+                            }
                         },
+                        |msg| msg,
                     );
                 }
                 Task::none()
@@ -584,6 +623,212 @@ mod tests {
         });
         assert!(screen.take_pending_session().is_none());
         assert!(screen.session.is_none());
+    }
+
+    /// The `CompletePairing` sent from `PairingSASConfirmed` must be abortable,
+    /// because `CompletingPairing` renders a Cancel button: the reply to a
+    /// completion the user abandoned must not reach the screen that comes next.
+    ///
+    /// `Screen::update` routes every non-navigation message to whichever screen
+    /// is current (`screens.rs:152-158`) and there is no screen instance id, so a
+    /// task spawned by the torn-down screen delivers into the new one. Without an
+    /// armed handle the abandoned future runs until the daemon answers, and its
+    /// `PairingFailed` replaces the new screen's QR code with an error.
+    #[tokio::test]
+    async fn cancelling_a_completion_wakes_the_task_that_is_waiting_on_it() {
+        let mut screen = screen_in(PairingState::VerifyingSAS {
+            sas: "123-456".to_string(),
+            port: 41234,
+        });
+        assert!(
+            screen.cancel_wait.is_none(),
+            "`wait_for_pairing` has already answered the SAS, so no handle is armed yet"
+        );
+
+        // The returned task is not polled here: the assertion is about the handle
+        // it captured, which is the one `PairingCancelled` notifies.
+        drop(screen.update(ScreenMessage::PairingSASConfirmed));
+        assert!(
+            matches!(screen.state, PairingState::CompletingPairing),
+            "the screen must be in the state whose Cancel button is offered"
+        );
+        let armed = screen
+            .cancel_wait
+            .clone()
+            .expect("an in-flight `CompletePairing` needs a cancel handle");
+
+        drop(screen.update(ScreenMessage::PairingCancelled));
+        assert!(
+            screen.cancel_wait.is_none(),
+            "the handle must be consumed, so one cancel wakes the task once"
+        );
+
+        // The completion task awaits exactly this handle, so a permit on it is
+        // what aborts `complete_pairing` instead of letting it answer later.
+        tokio::time::timeout(std::time::Duration::from_secs(5), armed.notified())
+            .await
+            .expect("Cancel during CompletingPairing must wake the completion task");
+    }
+
+    /// The cancelled arm of the select: a completion that never answers is
+    /// abandoned as soon as the armed handle is notified, and reports `None`.
+    ///
+    /// The timeout is what turns "the cancellation arm was dropped, so the
+    /// pending future is awaited forever" into a failure instead of a hang.
+    #[tokio::test]
+    async fn a_notified_cancel_abandons_a_completion_that_never_answers() {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                await_completion_or_cancel(
+                    cancel,
+                    std::future::pending::<Result<String, GuiIpcError>>(),
+                )
+                .await
+            }
+        });
+
+        // Park the task inside the `select!` before firing, so the notification
+        // cannot be lost to a race against the spawn.
+        tokio::task::yield_now().await;
+        cancel.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("notifying the armed handle must end the wait, not leave it pending")
+            .expect("the waiting task must not panic");
+        assert!(
+            outcome.is_none(),
+            "a cancelled completion must report `None`, not the future's answer"
+        );
+    }
+
+    /// Only the handle the future was armed with may abandon it: notifying some
+    /// other `Notify` leaves the completion waiting, and the passed one cancels.
+    ///
+    /// This is what keeps `cancel_wait` meaningful — a helper that invented its
+    /// own `Notify`, or awaited a clone of a different one, would ignore the
+    /// handle the Cancel button notifies.
+    #[tokio::test]
+    async fn only_the_handle_armed_with_the_completion_cancels_it() {
+        let armed = Arc::new(tokio::sync::Notify::new());
+        let unrelated = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let armed = armed.clone();
+            async move { await_completion_or_cancel(armed, std::future::pending::<()>()).await }
+        });
+
+        tokio::task::yield_now().await;
+        unrelated.notify_one();
+        let mut task = task;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "an unrelated `Notify` must not abandon the completion"
+        );
+
+        armed.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .expect("the handle the completion was armed with must end the wait")
+            .expect("the waiting task must not panic");
+        assert!(outcome.is_none(), "the cancelled arm must be the one taken");
+    }
+
+    /// The other arm: an answer that is already there wins, and is handed back
+    /// unchanged. A helper that awaited only the cancellation would hang here
+    /// (the timeout reports it) and one that always returned `None` would lose
+    /// the device id.
+    #[tokio::test]
+    async fn an_answer_that_arrives_first_is_handed_back() {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let answer = std::future::ready(Ok::<String, GuiIpcError>("device-1".to_string()));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_completion_or_cancel(cancel, answer),
+        )
+        .await
+        .expect("a ready completion must not wait for a cancellation");
+
+        assert_eq!(
+            outcome.map(|result| result.expect("the ready answer is not an error")),
+            Some("device-1".to_string())
+        );
+    }
+
+    /// The abandoned completion reports itself as a message that changes nothing.
+    ///
+    /// `Screen::update` delivers a task's message to whichever screen is current
+    /// (`screens.rs:152-158`), so this one can land on a *fresh* `PairingScreen`
+    /// that already armed a cancel handle of its own. Reporting
+    /// `PairingCancelled` there would consume that handle, wake the new session's
+    /// wait and navigate away from a pairing the user did not abandon.
+    #[tokio::test]
+    async fn an_abandoned_completion_is_inert_on_whichever_screen_receives_it() {
+        let mut fresh = screen_in(qr_state("tapauth://pair?v=2"));
+        let armed = Arc::new(tokio::sync::Notify::new());
+        fresh.cancel_wait = Some(armed.clone());
+
+        let task = fresh.update(ScreenMessage::PairingCompletionAbandoned);
+
+        assert_eq!(
+            task.units(),
+            0,
+            "the deadline of a torn-down screen must not cause any work here"
+        );
+        assert!(
+            matches!(fresh.state, PairingState::ShowingQRCode { .. }),
+            "the fresh screen must stay on its QR code"
+        );
+        assert!(
+            fresh.cancel_wait.is_some(),
+            "its own cancel handle must stay armed"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), armed.notified())
+                .await
+                .is_err(),
+            "the fresh session's wait must not be woken by the stale abandonment"
+        );
+    }
+
+    /// `update` returns a `Task`, which is opaque, and the completion it wraps
+    /// needs a daemon — so the wiring can only be pinned on the source: the
+    /// `PairingSASConfirmed` arm must hand the completion future to
+    /// [`await_completion_or_cancel`] rather than awaiting it directly, and must
+    /// report an abandoned completion as the message that is inert on arrival.
+    ///
+    /// The state is meant to be checked this way: a partial fix that arms
+    /// `cancel_wait` but leaves the bare `complete_pairing(...).await` spawned
+    /// would pass every runtime assertion above.
+    #[test]
+    fn the_sas_confirmation_completes_through_the_cancel_helper() {
+        const SOURCE: &str = include_str!("pairing.rs");
+
+        let arm_start = SOURCE
+            .find("ScreenMessage::PairingSASConfirmed => {\n                if let")
+            .expect("the `PairingSASConfirmed` arm is not shaped as this guard reads it");
+        let arm_end = SOURCE[arm_start..]
+            .find("ScreenMessage::PairingFailed(error) =>")
+            .expect("the arm after `PairingSASConfirmed` is not `PairingFailed`");
+        let arm = &SOURCE[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("await_completion_or_cancel(cancel2, completion)"),
+            "the completion must be raced against its cancel handle, not awaited on its own"
+        );
+        assert!(
+            !arm.contains("complete_pairing(port as u32).await"),
+            "a bare `complete_pairing(...).await` cannot be cancelled"
+        );
+        assert!(
+            arm.contains("None => ScreenMessage::PairingCompletionAbandoned"),
+            "an abandoned completion must not be reported as a cancel of whatever \
+             screen is current"
+        );
     }
 
     #[test]

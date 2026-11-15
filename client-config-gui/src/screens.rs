@@ -61,6 +61,10 @@ pub enum ScreenMessage {
     PairingCancelledOnDaemon, // result of the fire-and-forget CancelPairing
     PairingCancelRequested,   // user asked to drop a stale session and retry
     PairingSASConfirmed,      // User confirmed SAS
+    /// An abandoned `CompletePairing` was cancelled. Deliberately inert: the
+    /// screen that armed its cancel handle has been torn down, so it is
+    /// delivered to whichever screen is current and must change nothing there.
+    PairingCompletionAbandoned,
 
     // Device List
     RemoveDevice(String), // device_id
