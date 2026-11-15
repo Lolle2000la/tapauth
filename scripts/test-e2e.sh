@@ -258,9 +258,18 @@ print_phase_summary() {
         printf '║  %-46s %-9s     ║\n' "${label}:" "$(phase_outcome_label "$id")"
     done
     if [ "${E2E_DAEMON_MODE:-}" = "systemd" ]; then
-        printf '║  %-61s║\n' "Daemon mode: systemd socket activation (prod)"
+        # The ✔ marks the mode this run used, as the pre-registry matrix did. It
+        # is appended after the padded column because printf pads %s by BYTES and
+        # the glyph is 3 of them; the fixed 12-space tail keeps the row at the
+        # box's 63 content columns (2 + 48 + 1 + 12) and at the same column
+        # offsets the old hand-written row used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: systemd socket activation (prod)   " ""
     else
-        printf '║  %-61s║\n' "Daemon mode: dev sandbox (fallback-socket)"
+        # Same row shape as the systemd branch above: the glyph is appended after
+        # the padded column (printf pads %s by bytes, the glyph is 3 of them) and
+        # the fixed 12-space tail holds the row at 63 content columns, matching
+        # the offsets the old hand-written matrix used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: dev sandbox (fallback-socket)      " ""
     fi
     echo "╠═══════════════════════════════════════════════════════════════╣"
     printf '║  %-61s║\n' \
