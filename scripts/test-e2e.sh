@@ -1772,13 +1772,16 @@ assert_phone_logged() {
 # sanitiser (Rust on the Client, ContextSanitizer on the phone) can rewrite them
 # and a logcat line from an earlier phase cannot satisfy this phase's assertion.
 #
-# `process_name` needs the copy: the daemon prefers the kernel's view of the
-# caller (`/proc/<pid>/exe`) and falls back to the Client's self-report only when
-# it cannot read it (tapauthd/src/caller_context.rs:97-100), so the two branches
-# disagree for one and the same request — dev mode reads the real binary name,
-# the shipped unit (no CAP_SYS_PTRACE) uses the self-report. Invoking a copy of
-# the CLI named after the token makes both branches yield the token: the copy's
-# `exe` basename is the token, and the same token travels as `--process-name`.
+# `process_name` needs the copy. The daemon asks the kernel first, in this order:
+# `/proc/<pid>/exe` basename, then the `cmdline` `argv[0]` basename, then
+# `/proc/<pid>/comm` (tapauthd/src/caller_context.rs:190-194), and falls back to
+# the Client's self-report only when none of those three answers (:371-374). The
+# first entry is the one `ptrace_may_access` gates, so it is EACCES for another
+# UID and `argv[0]` answers in the shipped unit, while `exe` answers in dev mode,
+# where the daemon runs as the caller. Invoking a copy of the CLI named after the
+# token makes both of those yield the token, and the same token travels as
+# `--process-name`. (`comm` would be the kernel's 15-byte truncation of the
+# token, but it is never reached while `argv[0]` answers.)
 caller_context_tokens() {
     local label=$1
     CTX_SERVICE="e2e-ctx-${label}"
@@ -1789,28 +1792,62 @@ caller_context_tokens() {
     chmod +x "$CTX_CLI"
 }
 
-# caller_context_preview_checkable: whether `command_preview` can be non-empty at
-# all for this run.
+# assert_caller_context_preview_readable: fail unless the daemon can read a
+# caller's `/proc/<pid>/cmdline` on this host.
 #
-# The daemon derives it from `/proc/<caller>/cmdline`, which needs ptrace access
-# to a process of another UID. The shipped unit runs as `tapauthd` and states
-# "CAP_SYS_PTRACE is deliberately absent" (systemd/tapauthd.service), so under
-# systemd mode — the CI configuration — the daemon legitimately sends an empty
-# preview for a root caller and there is nothing to assert. In dev mode this
-# script starts the daemon as itself, so the read succeeds.
-caller_context_preview_checkable() {
-    local daemon_user daemon_uid
+# `command_preview` is the kernel's `cmdline` split on NUL
+# (tapauthd/src/caller_context.rs:304-310) and joined by single spaces
+# (:175; the IPC request has no command field), so the assertion below only
+# means something if the daemon can read that file. Only
+# `readlink(/proc/<pid>/exe)` is gated by `ptrace_may_access`:
+# `cmdline` is 0444 and `comm` 0644, world-readable across UIDs. The shipped unit
+# runs as `tapauthd` with `CAP_SYS_PTRACE` deliberately absent
+# (systemd/tapauthd.service) and still fills the preview in from a root caller,
+# which is why comparing the daemon's uid against ours — as this helper used to —
+# switched the assertion off in every `systemd` run, i.e. in every run CI makes.
+#
+# What can still empty the preview for real is a `hidepid=1`/`hidepid=2` procfs
+# mount, which hides other users' entries. So probe by *opening* the file as the
+# daemon user instead of assuming, and treat a failure as fatal rather than a
+# skip: an assertion that turns itself off reports the same green as one that held
+# while checking nothing.
+#
+# The probe pid is this shell's. Every phase invokes the CLI copy (`$CTX_CLI`) or
+# `pamtester` from here, so the caller the daemon resolves runs as this same uid
+# and a procfs that answers for `$$` answers for it too.
+assert_caller_context_preview_readable() {
+    local daemon_user probe="/proc/$$/cmdline" readable=0
     if [ "$E2E_DAEMON_MODE" = "dev" ]; then
-        return 0
+        # Dev mode starts the daemon from this script, so it runs as this uid.
+        daemon_user=$(id -un)
+        if cat "$probe" >/dev/null 2>&1; then
+            readable=1
+        fi
+    else
+        daemon_user=$(systemctl show -p User --value tapauthd.service 2>/dev/null || true)
+        # Older systemctl ignores --value and prints `User=<name>`.
+        daemon_user=${daemon_user#User=}
+        if [ -z "$daemon_user" ] || ! id -u "$daemon_user" >/dev/null 2>&1; then
+            echo "❌ ERROR: cannot resolve the daemon's user from tapauthd.service (got '${daemon_user}')."
+            echo "   The unit this suite installs runs as User=tapauthd. Without it the"
+            echo "   command_preview assertion cannot be armed, and skipping it would"
+            echo "   report a passing run that never checked the preview."
+            systemctl cat tapauthd.service --no-pager 2>&1 | head -n 20 || true
+            exit 1
+        fi
+        if runuser -u "$daemon_user" -- cat "$probe" >/dev/null 2>&1; then
+            readable=1
+        fi
     fi
-    daemon_user=$(systemctl show -p User --value tapauthd.service 2>/dev/null || true)
-    # Older systemctl ignores --value and prints `User=<name>`.
-    daemon_user=${daemon_user#User=}
-    # No answer means the unit is not the one this suite installs, so the
-    # daemon's identity is unknown: skip rather than guess.
-    [ -n "$daemon_user" ] || return 1
-    daemon_uid=$(id -u "$daemon_user" 2>/dev/null) || return 1
-    [ "$daemon_uid" = "$(id -u)" ]
+    if [ "$readable" -ne 1 ]; then
+        echo "❌ ERROR: the daemon user '${daemon_user}' cannot read ${probe}."
+        echo "   /proc/<pid>/cmdline is mode 0444 and needs no CAP_SYS_PTRACE, so a"
+        echo "   cross-uid failure here means procfs hides other users' entries: look"
+        echo "   for hidepid=1 / hidepid=2 on the /proc mount (mount | grep ' /proc ')."
+        echo "   Fix the mount; this security assertion is not skipped."
+        exit 1
+    fi
+    echo "✅ ${daemon_user} can read ${probe} — command_preview is asserted."
 }
 
 # assert_caller_context_delivered <label> <pam_service> <process_name> <preview_argv>
@@ -1831,14 +1868,6 @@ assert_caller_context_delivered() {
         "${label}: the phone received pam_service='${service}'"
     assert_phone_logged "processName=${process}," \
         "${label}: the phone received process_name='${process}'"
-    if ! caller_context_preview_checkable; then
-        echo "ℹ️  ${label}: command_preview is NOT asserted in this daemon mode."
-        echo "    The daemon runs as a different uid without CAP_SYS_PTRACE, so it cannot"
-        echo "    read /proc/<caller>/cmdline and sends an empty preview by design"
-        echo "    (systemd/tapauthd.service; tapauthd/src/caller_context.rs:104-108)."
-        echo "    A dev-mode run (TAPAUTH_E2E_DAEMON_MODE=dev) asserts it."
-        return 0
-    fi
     # Step 2 installs the debug APK when the e2e one is absent, and the debug
     # variant logs the preview's length rather than its content (see above). Only
     # this assertion is skipped: the phases still to come (2b, 3) run against the
@@ -1850,6 +1879,10 @@ assert_caller_context_delivered() {
         echo "    Install the e2e variant to assert it: (cd server-android && ./gradlew assembleE2e)"
         return 0
     fi
+    # Only the branch that really asserts may arm the probe: on a `hidepid` host
+    # the probe is fatal, and it must not be fatal for an assertion this run does
+    # not make.
+    assert_caller_context_preview_readable
     assert_phone_logged "commandPreview=${preview}" \
         "${label}: the phone received command_preview beginning '${preview}'"
 }
