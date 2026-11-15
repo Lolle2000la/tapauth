@@ -392,8 +392,11 @@ class PairingSession(
     /**
      * Create the phone's pairing session in Rust and build the one shared `PairingInit`.
      *
-     * Rust owns the ephemeral `X_S` and `Ed_S` from here on; the baseline algorithms are listed
-     * first by the Rust side (plan §1.1), so Kotlin does not choose the advertised order.
+     * Rust owns the ephemeral `X_S` and `Ed_S` from here on, and it also owns the advertised suite:
+     * `PairingInit.supported_*` is filled from `SUPPORTED_SYMMETRIC_ALGORITHMS` /
+     * `SUPPORTED_HASH_ALGORITHMS` / the signature list in `shared/src/protocol/pairing.rs`, so
+     * Kotlin neither chooses nor orders what this phone offers. That is deliberate — a second list
+     * here could advertise a tag the desktop build no longer implements and fail negotiation.
      */
     private suspend fun prepareSession(): ByteArray {
         require(sessionId.size == SESSION_ID_BYTES) {

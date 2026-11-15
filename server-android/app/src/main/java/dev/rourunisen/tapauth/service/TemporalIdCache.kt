@@ -176,8 +176,13 @@ class TemporalIdCache(
     }
 
     /**
-     * Hash one 60s window with the hash algorithm this pairing negotiated, so a device paired with
-     * e.g. BLAKE3 is matched by BLAKE3 ids and never by SHA-256 ones.
+     * Hash one 60s window with the hash algorithm this pairing negotiated, so an id derived under a
+     * different hash can never match this device's entries.
+     *
+     * The negotiated id is passed straight into Rust (`generateTemporalIdentifier`) rather than
+     * hard-coding SHA-256: `SHA256` is the only algorithm this build implements, so an id it cannot
+     * derive (a tampered or unknown stored value) is rejected there instead of being answered with
+     * a SHA-256 id.
      *
      * `window` is the 60-second window (`unix_seconds / 60`), which is what the Rust derivation
      * expects — not a unix timestamp.

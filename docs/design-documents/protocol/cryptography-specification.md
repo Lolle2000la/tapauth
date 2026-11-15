@@ -6,16 +6,23 @@ This document specifies the cryptographic algorithms, key schedule, AEAD framing
 
 Protocol v2 replaces the nominal (unused) negotiation in v1 with **end-to-end enforced and persisted cryptographic agility**, respecting the shared-broadcast constraint of TapAuth:
 
+**v2 ships one active primitive per slot**: `AES_256_GCM`, `SHA256` (HMAC-SHA256) and `ED25519`. The agility is in the enums, the `supported_*` / `selected_*` negotiation fields and their commitment into $H$ and into the AEAD AAD — not in shipped implementations, because there is exactly one implementation of each and it is the only one a build can name. Every rule below therefore still binds a *negotiated* value rather than a constant: the dispatch reads the stored/travelling algorithm id and refuses what it cannot implement.
+
 1. **Client-Wide Broadcast Parameters** (associated with the Client's `CSK` because one multicast UDP / BLE advertisement targets **all** paired Servers simultaneously):
-   * **`SymmetricAlgorithm`**: `AES_256_GCM` (`1`, baseline mandatory) or `CHACHA20_POLY1305` (`2`).
-   * **`HashAlgorithm`**: `SHA256` (`1`, baseline mandatory, via HMAC-SHA256) or `BLAKE3` (`2`, via BLAKE3 in keyed mode — a keyed BLAKE3 MAC with the CSK as the key, not an unkeyed BLAKE3 hash and not HMAC-BLAKE3; see `keyed_window_mac` in `shared/src/crypto/temporal.rs`).
-   * **Client `SignatureAlgorithm`**: `ED25519` (`1`, baseline mandatory).
+   * **`SymmetricAlgorithm`**: `AES_256_GCM` (`1`) — the one algorithm v2 implements. Tag `2` is `reserved` in `proto/auth_protocol.proto` (it was `CHACHA20_POLY1305` in pre-release builds) and must never be handed to a different algorithm; dispatch is `encrypt_with_alg` / `decrypt_with_alg` (`shared/src/crypto/encryption.rs:60`, `:74`).
+   * **`HashAlgorithm`**: `SHA256` (`1`) — HMAC-SHA256 keyed by the CSK over the big-endian 60-second window (`keyed_window_mac`, `shared/src/crypto/temporal.rs:31`). Tag `2` is `reserved` (it was `BLAKE3` in pre-release builds).
+   * **Client `SignatureAlgorithm`**: `ED25519` (`1`).
 2. **Per-Server Parameters** (stored individually per `PairedServer` on Linux and `PairedDevice` on Android):
    * **Server `SignatureAlgorithm`** + Server static public key ($Ed_S$).
 3. **Negotiation & Persistence Rules**:
-   * **Android Server** advertises `supported_*` in `PairingInit` with baseline mandatory algorithms listed **first** (`[AES_256_GCM, CHACHA20_POLY1305]`, `[SHA256, BLAKE3]`, `[ED25519]`) so a peer that implements only the baseline still finds a match. The protocol version itself is not negotiable: only `protocolVersion = 2` is accepted, and a v1 record must be re-paired (`shared/src/ffi/ops.rs:201`, [`authentication-flow.md`](authentication-flow.md) §2.6).
-   * **Linux Client** intersects `supported_*` with its own supported set (and with the active CSK's algorithm if a `CSK` already exists from a prior pairing). Rotating `CSK` (`RotateCsk`) allows upgrading the Client-wide algorithm when re-pairing.
-   * Both sides **persist** the negotiated `SymmetricAlgorithm`, `HashAlgorithm`, and `SignatureAlgorithm` in config/repository storage and dispatch strictly on them at runtime, rejecting `UNSPECIFIED` or mismatched algorithms (`CryptoError::UnsupportedAlgorithm`).
+   * **Android Server** advertises `supported_*` in `PairingInit` from the Rust constants (`SUPPORTED_SYMMETRIC_ALGORITHMS` / `SUPPORTED_HASH_ALGORITHMS` / `SUPPORTED_SIGNATURE_ALGORITHMS`, `shared/src/protocol/pairing.rs:161-168`) — one element each today: `[AES_256_GCM]`, `[SHA256]`, `[ED25519]`. Kotlin builds none of these lists, so the phone cannot advertise a tag the desktop cannot implement. The protocol version itself is not negotiable: only `protocolVersion = 2` is accepted, and a v1 record must be re-paired (`shared/src/ffi/ops.rs:201`, [`authentication-flow.md`](authentication-flow.md) §2.6).
+   * **Linux Client** intersects `supported_*` with its own supported set (and with the active CSK's algorithm if a `CSK` already exists from a prior pairing). `pick_first` walks the Client's own `SUPPORTED_*` slice in order, so the Client's preference is its list order, not the Server's. Rotating `CSK` (`RotateCsk`) allows upgrading the Client-wide algorithm when re-pairing.
+   * Both sides **persist** what was negotiated, and the layout differs by side because the CSK is Client-wide:
+     * **Linux**: the symmetric and hash algorithms live only in the Client-wide `CskMetadata` (`shared/src/config.rs:326-333`), since the CSK they describe is shared by every paired Server; a `PairedServer` stores just its own `signature_algorithm` and $Ed_S$ (`shared/src/config.rs:264-280`).
+     * **Android**: `PairedDevice` stores all three per device (`server-android/app/src/main/java/dev/rourunisen/tapauth/data/Models.kt:143-145`).
+   * Runtime dispatch is strict on the stored values: `UNSPECIFIED` (`0`), the reserved tag `2` and any unknown id are refused — `CryptoError::UnsupportedAlgorithm` inside `shared`, `TapauthError::Argument` where the id is caller-supplied, `AlgorithmMismatch` when a packet header disagrees with the pinned algorithm — never a default.
+   * The dispatch `match`es (`shared/src/crypto/encryption.rs:60`, `:74`; `keyed_window_mac`, `shared/src/crypto/temporal.rs:31`) are exhaustive over today's variants and carry **no** catch-all arm. That is deliberate and stronger than one: prost generates a plain Rust enum, so an unknown proto tag never arrives as a variant (the field decodes to its raw `i32` and the id comparison refuses it), while a variant added to the proto later is a compile error at every dispatch site instead of being silently absorbed by a wildcard.
+4. **Adding an algorithm later**, which is the point of keeping the machinery: add the enum value with the **next free tag** (never reuse `2`), append it to the Client's `SUPPORTED_*` slice — first if it is newly preferred, since `pick_first` walks that slice in order — and leave the baseline in every Server's advertised list, so an older Client paired with a newer Server still negotiates `AES_256_GCM` / `SHA256`. No wire change is needed: `supported_*`, `selected_*` and the cleartext header tag already carry the id, and they are committed into $H$ and the AAD.
 
 ## 2. Cryptographic Primitives & Key Schedule
 
@@ -71,7 +78,7 @@ All `WrapperMessage` signatures are computed directly over `wrapper_signing_tran
 
 Protocol v2 **removes** all legacy challenge-derived nonce helpers (`derive_nonce`, `encrypt_with_csk`, `decrypt_with_csk`) so there is **one** unified AEAD construction across UDP, BLE, and Pairing:
 
-* **Key Size**: 32 bytes (`AES-256-GCM` or `ChaCha20-Poly1305`).
+* **Key Size**: 32 bytes (`AES-256-GCM`; a future `SymmetricAlgorithm` value must keep the 32-byte key, 12-byte nonce and 16-byte tag contract of §1, which is what lets the same framing carry it).
 * **Nonce**: 12-byte cryptographically random CSPRNG nonce generated per encryption, prepended directly to `ciphertext || 16-byte tag`.
 * **Associated Data (AAD)**:
   * **For `EncryptedPacket`**:

@@ -28,5 +28,5 @@ This document outlines the procedures for managing the lifecycle of paired devic
 * **Procedure**: User triggers `RotateCsk` from the GUI (authorized by PolKit in `tapauthd`).
 * **Effect**:
   1. Discards the existing `CSK` and clears all `PairedServer` entries (since `CSK` is shared across all Servers for multicast broadcast).
-  2. Generates a fresh 32-byte `CSK` and resets/upgrades the Client's active `csk_symmetric_algorithm` and `csk_hash_algorithm` to the Client's preferred defaults (e.g., `AES_256_GCM` or `CHACHA20_POLY1305` and `SHA256` or `BLAKE3`) when the next pairing occurs.
+  2. Generates a fresh 32-byte `CSK` and resets/upgrades the Client's active `csk_symmetric_algorithm` and `csk_hash_algorithm` to the Client's preferred defaults (`AES_256_GCM` and `SHA256` today — the Client's `SUPPORTED_*` head, so a future preferred algorithm replaces them) when the next pairing occurs.
 * **Recovery**: The user re-pairs any Servers they wish to continue using, provisioning the new `CSK` and negotiated algorithms cleanly via the v2 pairing handshake.

@@ -206,15 +206,24 @@ class TapAuthCryptoTest {
             packet[algorithmOffset].toInt(),
         )
 
-        // Re-label an AES-GCM packet as ChaCha20-Poly1305: dispatch, not the caller's word, must
-        // decide, and the AAD binding makes the original tag invalid either way.
-        val relabelled =
-            packet.copyOf().also { it[algorithmOffset] = SYMMETRIC_CHACHA20_POLY1305.toByte() }
-        assertThrows(TapauthException.Security::class.java) {
-            decryptEncryptedPacket(
-                relabelled,
-                csk,
-                SYMMETRIC_AES_256_GCM,
+        // Re-label an AES-GCM packet with the retired tag 2 and with an unknown future one.
+        // Dispatch, not the caller's word, decides — and the *message* is what proves the header
+        // was compared at all: an implementation that ignored the header and decrypted under the
+        // pinned algorithm would fail the AEAD (`packet decryption failed`) rather than the
+        // header check, and one that trusted the header would return plaintext.
+        for (relabel in listOf(SYMMETRIC_CHACHA20_POLY1305, 99)) {
+            val relabelled = packet.copyOf().also { it[algorithmOffset] = relabel.toByte() }
+            val rejected =
+                assertThrows(TapauthException.Security::class.java) {
+                    decryptEncryptedPacket(
+                        relabelled,
+                        csk,
+                        SYMMETRIC_AES_256_GCM,
+                    )
+                }
+            assertTrue(
+                "A header relabelled to $relabel must fail the header check, got: ${rejected.detail}",
+                rejected.detail.contains("does not match the negotiated algorithm"),
             )
         }
     }
@@ -278,178 +287,41 @@ class TapAuthCryptoTest {
         }
     }
 
-    // ========== Algorithm suite 2: ChaCha20-Poly1305 + BLAKE3 ==========
+    // ========== The retired and unknown suite tags ==========
     //
-    // Suite 1 (AES-256-GCM + SHA-256) is what every test above exercises. The Rust layer
-    // implements both (`shared/src/crypto/encryption.rs:95` dispatches on the negotiated
-    // algorithm, `shared/src/crypto/temporal.rs:43` on the negotiated hash), so suite 2 is
-    // reachable through this surface and has to work through it too.
+    // AES-256-GCM + SHA-256 is the only active suite. The tag of the retired one (`2`, `reserved`
+    // in `proto/auth_protocol.proto`) is therefore exactly what a tampered header, a stale stored
+    // record or an older peer presents, and the refusal is what these tests pin: a fallback of the
+    // form "an id we cannot implement means the only algorithm we have" would turn every one of
+    // those into an accepted AES-256-GCM packet.
 
     @Test
-    fun testChaCha20GrantRoundTripsAndDeclaresSuite2OnTheWire() {
+    fun testARetiredOrUnspecifiedSuiteIdIsNotAUsablePin() {
         val csk = csk()
-        val challenge = ByteArray(32) { (it + 64).toByte() }
+        val packet = createGrant(generateKeypair(), ByteArray(32), csk)
 
-        val packet = createSuite2Grant(generateKeypair(), challenge, csk)
-
-        // The header is what a peer dispatches on. An AEAD that encrypts with
-        // ChaCha20-Poly1305 but writes AES-256-GCM into field 2 would still round-trip
-        // locally and then fail against every Client that trusts the header.
-        assertEquals(
-            "A suite-2 grant must declare CHACHA20_POLY1305 in EncryptedPacket field 2",
-            SYMMETRIC_CHACHA20_POLY1305,
-            packet[encryptionAlgorithmOffset(packet)].toInt(),
-        )
-
-        // The identifier is derived with the *negotiated* hash, so a suite-2 packet carries
-        // keyed BLAKE3. A BLAKE3 Client whose identifier came back as the HMAC-SHA256 value
-        // would never match its own pre-computed identifiers.
-        val window = currentTimeWindow()
-        val identifier = extractTemporalIdentifier(packet)
-        val candidates = listOf(window, window - 1)
-        assertTrue(
-            "A suite-2 packet's temporal identifier must be the keyed BLAKE3 of the current or previous window",
-            candidates.any {
-                generateTemporalIdentifier(csk, it, HASH_BLAKE3).contentEquals(identifier)
-            },
-        )
-        assertTrue(
-            "The BLAKE3 identifier must not be the HMAC-SHA256 one for either candidate window",
-            candidates.none {
-                generateTemporalIdentifier(csk, it, HASH_SHA256).contentEquals(identifier)
-            },
-        )
-
-        val wrapper = decryptEncryptedPacket(packet, csk, SYMMETRIC_CHACHA20_POLY1305)
-        assertEquals(
-            "The decrypted suite-2 grant must still be a grant",
-            "AUTH_GRANT",
-            determineMessageType(wrapper),
-        )
-        assertTrue(
-            "The signed suite-2 grant payload must contain the raw challenge",
-            indexOfSubsequence(wrapper, challenge) >= 0,
-        )
-    }
-
-    @Test
-    fun testChaCha20DenialRoundTripsUnderSuite2() {
-        val csk = csk()
-        val server = generateKeypair()
-        val challenge = ByteArray(32) { (it + 3).toByte() }
-
-        // The denial builder is a separate exported entry point, so it can hard-code suite 1
-        // while the grant builder honours the negotiated one.
-        val packet =
-            createDenialWrapperMessage(
-                challenge,
-                "Denied on device",
-                server[0],
-                csk,
-                SYMMETRIC_CHACHA20_POLY1305,
-                HASH_BLAKE3,
-            )
-        assertEquals(
-            "A suite-2 denial must declare CHACHA20_POLY1305 in EncryptedPacket field 2",
-            SYMMETRIC_CHACHA20_POLY1305,
-            packet[encryptionAlgorithmOffset(packet)].toInt(),
-        )
-
-        val wrapper = decryptEncryptedPacket(packet, csk, SYMMETRIC_CHACHA20_POLY1305)
-        assertEquals(
-            "The decrypted suite-2 denial must still be a denial",
-            "AUTH_DENIAL",
-            determineMessageType(wrapper),
-        )
-        assertTrue(
-            "The suite-2 denial must carry the challenge it denies",
-            indexOfSubsequence(wrapper, challenge) >= 0,
-        )
-        assertTrue(
-            "The suite-2 denial must carry the reason the Client forwards",
-            indexOfSubsequence(wrapper, "Denied on device".toByteArray(Charsets.UTF_8)) >= 0,
-        )
-    }
-
-    @Test
-    fun testSuite1CiphertextIsRejectedAsSuite2AndViceVersa() {
-        val csk = csk()
-        val server = generateKeypair()
-        val challenge = ByteArray(32) { (it + 96).toByte() }
-
-        val suite1 = createGrant(server, challenge, csk)
-        val suite2 = createSuite2Grant(server, challenge, csk)
-
-        // The header-vs-pinned comparison runs before any AEAD work
-        // (`shared/src/ffi/ops.rs:297`), so a peer cannot talk the phone down to the
-        // algorithm it prefers. The detail is pinned because a *tag* failure would also be a
-        // `Security` error: only the message distinguishes the downgrade check from it.
-        val downgrade =
-            assertThrows(TapauthException.Security::class.java) {
-                decryptEncryptedPacket(suite1, csk, SYMMETRIC_CHACHA20_POLY1305)
+        // Every one of these is a value the caller may hold: `2` was a real tag before this
+        // release (so it is what a stored record from a pre-release build carries), `0` is the
+        // proto default, `99` is a future peer's tag. None of them may fall back to AES-256-GCM.
+        for (retiredPin in listOf(SYMMETRIC_CHACHA20_POLY1305, 0, 99)) {
+            assertThrows(
+                "pin id $retiredPin must be refused, not defaulted",
+                TapauthException.Argument::class.java,
+            ) {
+                decryptEncryptedPacket(packet, csk, retiredPin)
             }
-        assertTrue(
-            "An AES-256-GCM packet presented as suite 2 must fail the pinned-algorithm check, got: ${downgrade.detail}",
-            downgrade.detail.contains("does not match the negotiated algorithm"),
-        )
-        assertThrows(TapauthException.Security::class.java) {
-            decryptEncryptedPacket(suite2, csk, SYMMETRIC_AES_256_GCM)
-        }
-
-        // UNSPECIFIED is not a wildcard: asking for it must not fall back to a default
-        // algorithm, which would turn a malformed persisted record into an accepted packet.
-        assertThrows(TapauthException.Argument::class.java) {
-            decryptEncryptedPacket(suite2, csk, 0)
         }
     }
 
     @Test
-    fun testChaCha20TamperedCiphertextIsRejected() {
-        val csk = csk()
-        val packet = createSuite2Grant(generateKeypair(), ByteArray(32), csk)
-        val body = ciphertextRange(packet)
-
-        // The body is `nonce(12) || ciphertext || tag(16)`, so its midpoint is real
-        // ciphertext. Flipping a *header* byte instead would only prove the AAD is bound.
-        val middle = body.first + body.count() / 2
-        val tampered = packet.copyOf().also { it[middle] = (it[middle].toInt() xor 0x01).toByte() }
-        assertThrows(TapauthException.Security::class.java) {
-            decryptEncryptedPacket(tampered, csk, SYMMETRIC_CHACHA20_POLY1305)
-        }
-    }
-
-    @Test
-    fun testChaCha20TamperedTemporalIdentifierIsRejectedByTheAad() {
-        val csk = csk()
-        val packet = createSuite2Grant(generateKeypair(), ByteArray(32), csk)
-
-        val temporalId = extractTemporalIdentifier(packet)
-        val offset = indexOfSubsequence(packet, temporalId)
-        assertTrue("temporal_identifier must be embedded verbatim in the packet", offset >= 0)
-
-        // The suite-2 AAD is `"tapauth-pkt-v2" || be32(2) || be16(16) || temporal_identifier`
-        // (`shared/src/crypto/encryption.rs:137`), so a tampered identifier must fail the
-        // Poly1305 tag even though the algorithm header still matches what the caller pinned.
-        val tampered =
-            packet.copyOf().also { it[offset + 2] = (it[offset + 2].toInt() xor 0x01).toByte() }
-        assertFalse(
-            "The tampered packet must carry a different temporal_identifier",
-            temporalId.contentEquals(extractTemporalIdentifier(tampered)),
-        )
-        assertThrows(TapauthException.Security::class.java) {
-            decryptEncryptedPacket(tampered, csk, SYMMETRIC_CHACHA20_POLY1305)
-        }
-    }
-
-    @Test
-    fun testChaCha20PacketsForTheSameInputsUseFreshNonces() {
+    fun testPacketsForTheSameInputsUseFreshNonces() {
         val csk = csk()
         val server = generateKeypair()
         val challenge = ByteArray(32) { (it + 17).toByte() }
 
         // Both packets must be built inside one window, otherwise the differing temporal
         // identifiers would make the packets differ for the wrong reason.
-        val (first, second) = twoSuite2GrantsInOneWindow(csk, server, challenge)
+        val (first, second) = twoGrantsInOneWindow(csk, server, challenge)
 
         val firstBody = ciphertextRange(first)
         val secondBody = ciphertextRange(second)
@@ -462,13 +334,13 @@ class TapAuthCryptoTest {
         // bodies would prove nothing about the nonce.
         assertArrayEquals(
             "The two packets must encrypt the same plaintext",
-            decryptEncryptedPacket(first, csk, SYMMETRIC_CHACHA20_POLY1305),
-            decryptEncryptedPacket(second, csk, SYMMETRIC_CHACHA20_POLY1305),
+            decryptEncryptedPacket(first, csk, SYMMETRIC_AES_256_GCM),
+            decryptEncryptedPacket(second, csk, SYMMETRIC_AES_256_GCM),
         )
-        // A reused nonce under the same key is the ChaCha20-Poly1305 catastrophic failure:
-        // the two ciphertext bodies (nonce || ciphertext || tag) would be byte-identical.
+        // A reused nonce under the same key is the AEAD catastrophic failure: the two ciphertext
+        // bodies (nonce || ciphertext || tag) would be byte-identical.
         assertFalse(
-            "Two suite-2 packets for the same plaintext must use fresh nonces",
+            "Two packets for the same plaintext must use fresh nonces",
             first
                 .copyOfRange(firstBody.first, firstBody.last + 1)
                 .contentEquals(second.copyOfRange(secondBody.first, secondBody.last + 1)),
@@ -564,33 +436,40 @@ class TapAuthCryptoTest {
     }
 
     @Test
-    fun testTheNegotiatedHashAlgorithmChangesBothIdentifierForms() {
+    fun testTheIdentifierFormsRefuseAnUnsupportedHashInsteadOfDefaulting() {
         val csk = ByteArray(32) { (it * 5 + 7).toByte() }
         val window = 29_500_000L
 
         // Each paired device persists its own `hashAlgorithm` and both callers pass it in
-        // (`BleTemporalIdIndex.kt:30-33`, `TemporalIdCache.kt:186`), so the derivation has to
-        // dispatch on it. A hard-coded HMAC-SHA256 leaves a BLAKE3-paired device unresolvable
-        // while every JVM test — whose digest ignores the argument — still passes.
-        val shaPacket = generateTemporalIdentifier(csk, window, HASH_SHA256)
-        val blakePacket = generateTemporalIdentifier(csk, window, HASH_BLAKE3)
-        assertEquals("A BLAKE3 packet id must still be 16 bytes", 16, blakePacket.size)
-        assertFalse(
-            "The packet id must differ between the negotiated SHA256 and BLAKE3",
-            shaPacket.contentEquals(blakePacket),
-        )
-
-        val shaAdvertisement = generateBleTemporalIdentifier(csk, window, HASH_SHA256)
-        val blakeAdvertisement = generateBleTemporalIdentifier(csk, window, HASH_BLAKE3)
-        assertEquals(
-            "A BLAKE3 advertisement id must still be 10 bytes",
-            10,
-            blakeAdvertisement.size,
-        )
-        assertFalse(
-            "The advertisement id must differ between the negotiated SHA256 and BLAKE3",
-            shaAdvertisement.contentEquals(blakeAdvertisement),
-        )
+        // (`BleTemporalIdIndex.kt:100-106`, `TemporalIdCache.kt:186`), so the derivation has to
+        // dispatch on it. With one active hash the observable half of that dispatch is the
+        // refusal: an id this build cannot derive (`2` is the retired BLAKE3 tag, `99` unknown)
+        // must be an error, never the HMAC-SHA256 identifier. A hard-coded digest would answer a
+        // tampered stored record with a valid-looking id, which is the defect this catches.
+        for (unsupported in listOf(HASH_BLAKE3, 99)) {
+            assertThrows(
+                "hash id $unsupported must not be derived",
+                TapauthException.Argument::class.java,
+            ) {
+                generateTemporalIdentifier(csk, window, unsupported)
+            }
+            assertThrows(
+                "hash id $unsupported must not be derived",
+                TapauthException.Argument::class.java,
+            ) {
+                generateBleTemporalIdentifier(csk, window, unsupported)
+            }
+            assertThrows(
+                "hash id $unsupported must not be verified against",
+                TapauthException.Argument::class.java,
+            ) {
+                verifyTemporalIdentifier(
+                    generateTemporalIdentifier(csk, window, HASH_SHA256),
+                    csk,
+                    unsupported,
+                )
+            }
+        }
     }
 
     @Test
@@ -773,6 +652,50 @@ class TapAuthCryptoTest {
     }
 
     // ========== Pairing session ==========
+
+    /**
+     * The `PairingInit` this phone sends must advertise exactly the one active suite.
+     *
+     * `supported_*` is not cosmetic: the desktop intersects it with its own set (`pick_first` over
+     * `SUPPORTED_*` in `shared/src/protocol/pairing.rs`), so a phone that still offered the retired
+     * tag `2` would advertise an algorithm the desktop build no longer implements and the handshake
+     * would fail to negotiate. Both lists are read off the wire here, because the day they disagree
+     * is the day pairing stops working.
+     *
+     * The defect this catches: a Kotlin-side (or stale Rust-side) advertised list that still
+     * carries `CHACHA20_POLY1305` / `BLAKE3`, or one that advertises only `UNSPECIFIED` — the
+     * latter would make `pick_first` find nothing to select.
+     */
+    @Test
+    fun testPairingInitAdvertisesExactlyTheActiveSuite() {
+        val sessionId = ByteArray(16) { (it * 3 + 7).toByte() }
+        val session = createSession(sessionId, generateKeypair()[0])
+        try {
+            val init = session.createInit()
+            // `PairingPacket.init` is field 3, length-delimited.
+            val body =
+                protoLengthDelimited(init, PAIRING_PACKET_INIT_FIELD)
+                    ?: throw AssertionError("the init frame carries no PairingPacket.init body")
+
+            assertEquals(
+                "PairingInit must advertise exactly the active symmetric algorithm",
+                listOf(SYMMETRIC_AES_256_GCM),
+                protoRepeatedVarints(body, PAIRING_INIT_SYMMETRIC_FIELD),
+            )
+            assertEquals(
+                "PairingInit must advertise exactly the active hash algorithm",
+                listOf(HASH_SHA256),
+                protoRepeatedVarints(body, PAIRING_INIT_HASH_FIELD),
+            )
+            assertEquals(
+                "PairingInit must advertise exactly the active signature algorithm",
+                listOf(ED25519),
+                protoRepeatedVarints(body, PAIRING_INIT_SIGNATURE_FIELD),
+            )
+        } finally {
+            session.close()
+        }
+    }
 
     @Test
     fun testPairingSessionHandleLifecycle() {
@@ -974,30 +897,20 @@ class TapAuthCryptoTest {
             HASH_SHA256,
         )
 
-    /** A grant under algorithm suite 2: ChaCha20-Poly1305 + keyed BLAKE3. */
-    private fun createSuite2Grant(server: List<ByteArray>, challenge: ByteArray, csk: ByteArray) =
-        createGrantWrapperMessage(
-            challenge,
-            server[0],
-            csk,
-            SYMMETRIC_CHACHA20_POLY1305,
-            HASH_BLAKE3,
-        )
-
     /**
-     * Two suite-2 grants built from identical inputs inside one 60-second window.
+     * Two grants built from identical inputs inside one 60-second window.
      *
      * The window is re-read after both builds and the pair rebuilt when it rolled over, so a caller
      * comparing the two packets is never comparing different windows by accident.
      */
-    private fun twoSuite2GrantsInOneWindow(
+    private fun twoGrantsInOneWindow(
         csk: ByteArray,
         server: List<ByteArray>,
         challenge: ByteArray,
     ): Pair<ByteArray, ByteArray> {
         repeat(3) {
-            val first = createSuite2Grant(server, challenge, csk)
-            val second = createSuite2Grant(server, challenge, csk)
+            val first = createGrant(server, challenge, csk)
+            val second = createGrant(server, challenge, csk)
             val firstId = extractTemporalIdentifier(first)
             val secondId = extractTemporalIdentifier(second)
             if (firstId.contentEquals(secondId)) return first to second
@@ -1048,6 +961,88 @@ class TapAuthCryptoTest {
             shift += 7
         }
         throw AssertionError("no complete varint at offset $offset")
+    }
+
+    /**
+     * The body of the first length-delimited protobuf field [field] in [message], or null.
+     *
+     * Only the wire format is read here — no generated parser. `PairingInit` is built inside Rust
+     * and reaches Kotlin as opaque bytes, so how the phone advertises itself is only observable by
+     * walking the envelope by hand.
+     */
+    private fun protoLengthDelimited(message: ByteArray, field: Int): ByteArray? {
+        var cursor = 0
+        while (cursor < message.size) {
+            val (tag, tagLength) = readVarint(message, cursor)
+            cursor += tagLength
+            val fieldNumber = tag ushr 3
+            when (tag and 0x07) {
+                0 -> cursor += readVarint(message, cursor).second
+                1 -> cursor += 8
+                2 -> {
+                    val (length, lengthLength) = readVarint(message, cursor)
+                    val start = cursor + lengthLength
+                    if (start + length > message.size) {
+                        throw AssertionError("truncated length-delimited field $fieldNumber")
+                    }
+                    if (fieldNumber == field) return message.copyOfRange(start, start + length)
+                    cursor = start + length
+                }
+                5 -> cursor += 4
+                else -> throw AssertionError("unsupported protobuf wire type ${tag and 0x07}")
+            }
+        }
+        return null
+    }
+
+    /**
+     * The values of the repeated `int32` / enum field [field] in [message], or null when the field
+     * is absent.
+     *
+     * Both wire forms are accepted — packed (the proto3 default, one length-delimited field) and
+     * one varint field per element — because the point of the assertion is which ids are
+     * advertised, not how prost chose to spell them.
+     */
+    private fun protoRepeatedVarints(message: ByteArray, field: Int): List<Int>? {
+        val values = mutableListOf<Int>()
+        var seen = false
+        var cursor = 0
+        while (cursor < message.size) {
+            val (tag, tagLength) = readVarint(message, cursor)
+            cursor += tagLength
+            val fieldNumber = tag ushr 3
+            when (tag and 0x07) {
+                0 -> {
+                    val (value, length) = readVarint(message, cursor)
+                    if (fieldNumber == field) {
+                        seen = true
+                        values += value
+                    }
+                    cursor += length
+                }
+                1 -> cursor += 8
+                2 -> {
+                    val (length, lengthLength) = readVarint(message, cursor)
+                    val start = cursor + lengthLength
+                    if (start + length > message.size) {
+                        throw AssertionError("truncated length-delimited field $fieldNumber")
+                    }
+                    if (fieldNumber == field) {
+                        seen = true
+                        var packed = start
+                        while (packed < start + length) {
+                            val (value, valueLength) = readVarint(message, packed)
+                            values += value
+                            packed += valueLength
+                        }
+                    }
+                    cursor = start + length
+                }
+                5 -> cursor += 4
+                else -> throw AssertionError("unsupported protobuf wire type ${tag and 0x07}")
+            }
+        }
+        return if (seen) values else null
     }
 
     private fun createSession(sessionId: ByteArray, ed25519PrivateKey: ByteArray): PairingSession =
@@ -1154,13 +1149,24 @@ class TapAuthCryptoTest {
  */
 private const val SYMMETRIC_AES_256_GCM = 1
 
-/** `SymmetricAlgorithm.CHACHA20_POLY1305` (`proto/auth_protocol.proto`). */
+/**
+ * The retired `SymmetricAlgorithm` tag `2` (`reserved 2;` in `proto/auth_protocol.proto`).
+ *
+ * It was `CHACHA20_POLY1305` in pre-release builds and names no enum member any more, so the only
+ * way to present it is as a raw id — which is exactly what a tampered header or a stale stored
+ * record does. Named here so the refusal tests say what they refuse.
+ */
 private const val SYMMETRIC_CHACHA20_POLY1305 = 2
 
 /** `HashAlgorithm.SHA256` (`proto/auth_protocol.proto`). */
 private const val HASH_SHA256 = 1
 
-/** `HashAlgorithm.BLAKE3` (`proto/auth_protocol.proto`). */
+/**
+ * The retired `HashAlgorithm` tag `2` (`reserved 2;` in `proto/auth_protocol.proto`).
+ *
+ * It was `BLAKE3` in pre-release builds and names no enum member any more; see
+ * [SYMMETRIC_CHACHA20_POLY1305].
+ */
 private const val HASH_BLAKE3 = 2
 
 /**
@@ -1177,6 +1183,18 @@ private const val PAIRING_ABORT_SESSION_EXPIRED = 5
 
 private const val PROTOCOL_V2 = 2
 private const val SERVER_DEVICE_NAME = "Pixel 9 Pro"
+
+/** `PairingPacket.init` (`proto/auth_protocol.proto`): field 3, length-delimited. */
+private const val PAIRING_PACKET_INIT_FIELD = 3
+
+/** `PairingInit.supported_symmetric_algorithms`: field 4, packed enum. */
+private const val PAIRING_INIT_SYMMETRIC_FIELD = 4
+
+/** `PairingInit.supported_hash_algorithms`: field 5, packed enum. */
+private const val PAIRING_INIT_HASH_FIELD = 5
+
+/** `PairingInit.supported_signature_algorithms`: field 6, packed enum. */
+private const val PAIRING_INIT_SIGNATURE_FIELD = 6
 
 /** Index of [needle] inside this array, or -1. */
 private fun indexOfSubsequence(haystack: ByteArray, needle: ByteArray): Int {

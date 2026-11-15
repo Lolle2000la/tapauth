@@ -605,14 +605,12 @@ private fun negotiatedSuite(device: PairedDevice): String {
 private fun symmetricAlgorithmName(value: Int): String? =
     when (value) {
         SymmetricAlgorithm.AES_256_GCM.value -> "AES-256-GCM"
-        SymmetricAlgorithm.CHACHA20_POLY1305.value -> "ChaCha20-Poly1305"
         else -> null
     }
 
 private fun hashAlgorithmName(value: Int): String? =
     when (value) {
         HashAlgorithm.SHA256.value -> "SHA-256"
-        HashAlgorithm.BLAKE3.value -> "BLAKE3"
         else -> null
     }
 

@@ -43,12 +43,12 @@ All post-pairing communication is wrapped in `EncryptedPacket` (`proto/auth_prot
 
 * **Temporal Identifier Generation**:
     1. Both Client and Server compute the 60-second time window `floor(unix_timestamp / 60)`.
-    2. The full **16-byte** identifier is `MAC(hash_alg, CSK, u64_be(window))[0..16]`, where `MAC` is HMAC-SHA256 for `SHA256` and a keyed BLAKE3 MAC (BLAKE3 keyed mode, CSK as the key — not an unkeyed hash) for `BLAKE3`, and `hash_alg` is the `HashAlgorithm` persisted for that Client (`SHA256` or `BLAKE3`, default `SHA256`).
+    2. The full **16-byte** identifier is `MAC(hash_alg, CSK, u64_be(window))[0..16]`, where `MAC` is HMAC-SHA256 — the only `HashAlgorithm` v2 implements — and `hash_alg` is the `HashAlgorithm` persisted for that Client (`SHA256`, default `SHA256`; the pre-release `BLAKE3` tag `2` is `reserved` and refused rather than derived).
     3. For **BLE Advertisements only**, the identifier is truncated to the first **10 bytes** (`[0..10]`) so the complete legacy advertisement fits within 31 bytes. Once connected over GATT, all `EncryptedPacket` messages use the full 16-byte `temporal_identifier`.
 * **Encryption Process & Header AAD**:
     1. Construct the inner message (e.g., `AuthenticationRequest`) and encode it to `raw_payload`.
     2. Construct and sign `WrapperMessage` (see §2.3), then serialize `WrapperMessage` to `plaintext`.
-    3. Determine `alg = CSK's SymmetricAlgorithm` (`AES_256_GCM` or `CHACHA20_POLY1305`) and the current 16-byte `temporal_identifier`.
+    3. Determine `alg = CSK's SymmetricAlgorithm` (`AES_256_GCM`, the only one v2 implements) and the current 16-byte `temporal_identifier`.
     4. Construct the canonical **AEAD Associated Data (AAD)**:
        ```text
        aad = "tapauth-pkt-v2"
