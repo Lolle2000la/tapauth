@@ -127,7 +127,7 @@ Upon receiving `PairingInit` matching `session_id`:
 ### Step 4: Server QR Key Verification, Signature Check & Mutual SAS Comparison
 
 Before displaying the SAS to the user, the Server **must**:
-1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing.rs:793`). An active attacker cannot substitute $X_C$ even before SAS verification.
+1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing.rs:801`). An active attacker cannot substitute $X_C$ even before SAS verification.
 2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`.
 3. Verify the selected algorithms are in its own supported sets.
 4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS:

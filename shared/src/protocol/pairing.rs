@@ -158,6 +158,14 @@ pub const PAIRING_COMPLETE_AAD_CONTEXT: &[u8] = b"tapauth-pair-v2-complete";
 /// therefore puts the Client's newly preferred algorithm **first** (Servers list
 /// every algorithm they implement, baseline included, so older Clients still
 /// agree on the baseline).
+///
+/// With one algorithm per slot these three assertions are vacuous, so they are
+/// recorded here — at the line an upgrade edits first — as work a second suite
+/// brings back with it: `pinned_algorithms_win_over_the_baseline` (a pin
+/// outvotes the baseline), `the_negotiated_symmetric_algorithm_reaches_the_aead`
+/// (the negotiated id, not a literal at the call site, is what the AEAD
+/// receives) and `the_two_selected_algorithm_ids_are_not_transposed`. Adding a
+/// suite without them leaves pinning, plumbing and field mapping untested.
 pub const SUPPORTED_SYMMETRIC_ALGORITHMS: &[SymmetricAlgorithm] = &[SymmetricAlgorithm::Aes256Gcm];
 
 /// Hash algorithms this implementation supports, baseline mandatory first.
@@ -826,6 +834,11 @@ impl ServerPairingSession {
         {
             return Err(ProtocolError::UnsupportedAlgorithm);
         }
+        // Both ids decode to `1` today, so a transposition of the two fields
+        // below is undetectable by value; the pair only tells itself apart once a
+        // second suite exists. When one is added, restore
+        // `the_two_selected_algorithm_ids_are_not_transposed`: it must have the
+        // peer select a different id per slot and read each back in its own field.
         let negotiated = NegotiatedAlgorithms {
             symmetric_algorithm: selected_symmetric,
             hash_algorithm: selected_hash,
@@ -2167,6 +2180,11 @@ mod tests {
     /// pair and the baseline are the same values, so what is exercised here is
     /// that the pin path runs at all and reports itself, not that it outvotes a
     /// baseline.)
+    ///
+    /// The outvote half is not expressible until a second suite exists: when one
+    /// is added, restore `pinned_algorithms_win_over_the_baseline`, which pins the
+    /// non-baseline suite while the peer lists the baseline first and requires the
+    /// pinned one to win.
     #[test]
     fn a_pinned_suite_is_selected_and_the_pairing_completes() {
         let pinned = PinnedAlgorithms {

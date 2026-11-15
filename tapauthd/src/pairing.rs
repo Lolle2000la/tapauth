@@ -2259,6 +2259,11 @@ mod tests {
     /// pinned", which lets the next pairing select a suite the existing device
     /// never agreed to and leaves it unable to decrypt the single client-wide
     /// broadcast.
+    ///
+    /// The daemon-side pin reaching the negotiation is all this can show while
+    /// one suite ships: a pin outvoting the baseline is only expressible with a
+    /// second one, so restore `pinned_algorithms_win_over_the_baseline`
+    /// (`shared/src/protocol/pairing.rs`) with that suite.
     #[test]
     fn a_v1_state_directory_pins_the_v1_suite_and_cannot_be_renegotiated() {
         let resolved =
