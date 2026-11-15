@@ -152,7 +152,16 @@ pub async fn handle_admin_request(
             (handle_get_servers(&daemon, &username).await, false)
         }
         Some(ipc::admin_request::Payload::StartPairing(_)) => {
-            (handle_start_pairing(&daemon, pairing_state).await, false)
+            // The toggles are read per request, like `AuthSession::handle_authenticate`
+            // does, so a change made in the GUI takes effect on the next attempt
+            // without a daemon restart.
+            let toml_config = shared::config::TapAuthConfig::load();
+            let transports =
+                pairing::pairing_transports(toml_config.enable_network, toml_config.enable_ble);
+            (
+                handle_start_pairing(&daemon, pairing_state, transports).await,
+                false,
+            )
         }
         Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
             (handle_wait_for_pairing(pairing_state, req).await, false)
@@ -223,10 +232,33 @@ async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::A
 
 /// Start a v2 pairing session: ephemeral dual-stack UDP socket, BLE pairing
 /// advertisement, and one background worker driving the handshake.
+///
+/// `transports` is the configuration the session may use, resolved by the caller
+/// (`handle_admin_request`) from the TOML config — the same split
+/// `AuthSession::handle_authenticate` uses, and what lets a test drive this
+/// decision without a config file.
 async fn handle_start_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
+    transports: pairing::PairingTransports,
 ) -> ipc::AdminResponse {
+    // A session with neither transport can never be reached: no UDP socket is
+    // bound, so the QR code carries no endpoint and no firewall rule exists, and no
+    // BLE advertisement goes out — the phone has nothing to answer, and the GUI
+    // would hold a session that can only expire. Refused here, before anything is
+    // keyed, bound or spawned. `enable_ble` alone does not make BLE available: a
+    // daemon built without the `ble` feature has no advertisement to start, which is
+    // why `pairing_transports` gates it on the feature too.
+    if !transports.any() {
+        tracing::info!(
+            "Refusing StartPairing: all transports (BLE and Local Network) are disabled"
+        );
+        return err_resp(
+            ipc::AdminStatus::AdminError,
+            "All transports (BLE and Local Network) are disabled",
+        );
+    }
+
     // The Ed25519 keypair identifies this client to the server during pairing.
     // It MUST be the daemon's persistent keypair — otherwise the server stores
     // a transient public key and subsequent auth requests fail signature verification.
@@ -274,13 +306,11 @@ async fn handle_start_pairing(
         }
     }
 
-    // The config decides which transports this session may use; with the network
-    // transport disabled there is no UDP pairing socket, no firewall rule and no
-    // reachable address in the QR code, so the phone pairs over BLE only.
-    let toml_config = shared::config::TapAuthConfig::load();
-    let transports =
-        pairing::pairing_transports(toml_config.enable_network, toml_config.enable_ble);
-
+    // The config decided which transports this session may use (`transports`); with
+    // the network transport disabled there is no UDP pairing socket, no firewall
+    // rule and no reachable address in the QR code, so the phone pairs over BLE
+    // only.
+    //
     // Opening the pairing firewall port is best-effort only in test builds
     // (containers/user-namespaces without usable iptables). Production builds
     // abort pairing rather than leaving the ephemeral socket unreachable.
@@ -897,5 +927,54 @@ mod tests {
             failed.error_message
         );
         assert!(failed.payload.is_none());
+    }
+
+    /// `StartPairing` must be refused when no transport can work, before anything
+    /// is keyed, bound or spawned.
+    ///
+    /// The defects this catches: `handle_start_pairing` starting a session from a
+    /// configuration with the network transport off and BLE unavailable — the
+    /// worker then has no socket and no advertisement, so nothing can ever reach
+    /// it, `WaitForPairing` holds the GUI until the session expires and the user is
+    /// left with a QR code (and a "pairing in progress" handle) that cannot work.
+    /// The reply's wording is asserted, not just its status, so a refusal that
+    /// reports some other failure does not pass.
+    #[tokio::test]
+    async fn start_pairing_without_any_transport_is_refused() {
+        let daemon = Arc::new(DaemonState {
+            config_manager: Arc::new(shared::config::ClientConfigManager::new()),
+            paired_servers: Arc::new(std::collections::HashMap::new()),
+            keypair: None,
+            csk: None,
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        });
+        let pairing_state: Arc<Mutex<Option<PairingState>>> = Arc::new(Mutex::new(None));
+
+        let refusal = handle_start_pairing(
+            &daemon,
+            &pairing_state,
+            pairing::pairing_transports(false, false),
+        )
+        .await;
+
+        assert_eq!(
+            refusal.status,
+            ipc::AdminStatus::AdminError as i32,
+            "a session with no transport must not be started"
+        );
+        assert_eq!(
+            refusal.error_message, "All transports (BLE and Local Network) are disabled",
+            "the refusal must name the cause the way the PAM side does"
+        );
+        assert!(
+            refusal.payload.is_none(),
+            "a refused StartPairing must not hand out a QR code or a port"
+        );
+        assert!(
+            pairing_state.lock().await.is_none(),
+            "no session may be registered for a configuration nothing can reach"
+        );
     }
 }

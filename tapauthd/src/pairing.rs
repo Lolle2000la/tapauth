@@ -118,6 +118,16 @@ pub(crate) const SCHEDULER_TICK: Duration = Duration::from_millis(100);
 /// Upper bound on one pairing session, `StartPairing` to conclusion.
 pub(crate) const SESSION_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Why a session with no transport at all ends, as the terminal phase carries it.
+///
+/// Reached when the network transport is disabled *and* the BLE half is not
+/// available (`enable_ble = false`, a build without the `ble` feature, or a BLE
+/// setup that failed). Such a session cannot be reached by any phone, so it fails
+/// immediately instead of waiting out [`SESSION_DEADLINE`]; `StartPairing` already
+/// refuses the purely configuration-driven form of it.
+const NO_TRANSPORT_FAILURE: &str =
+    "pairing has no transport: the local network transport is disabled and BLE is unavailable";
+
 /// Slack on top of [`SESSION_DEADLINE`] for an IPC caller that waits on the
 /// worker: the worker always answers at (or before) the deadline, so this only
 /// fires if the worker itself is wedged.
@@ -524,15 +534,30 @@ pub(crate) struct PairingTransports {
     pub ble: bool,
 }
 
+impl PairingTransports {
+    /// Whether at least one transport can be used.
+    ///
+    /// A session for which this is `false` can never be reached by a phone, so
+    /// `StartPairing` refuses it and a session that loses its BLE half with the
+    /// network transport off fails instead of waiting out [`SESSION_DEADLINE`].
+    pub(crate) fn any(self) -> bool {
+        self.network || self.ble
+    }
+}
+
 /// The transports a session runs with, from the two config toggles.
 ///
 /// `enable_network = false` means no UDP pairing socket and no firewall rule at
 /// all — not a bound-but-unadvertised one: the QR code then carries no reachable
 /// endpoint and the phone pairs over BLE.
+///
+/// `ble` is gated on the compile-time feature as well as on the toggle: a daemon
+/// built without `ble` has no advertisement to start whatever the config says, so
+/// `enable_ble = true` in such a build must not count as "BLE available".
 pub(crate) fn pairing_transports(enable_network: bool, enable_ble: bool) -> PairingTransports {
     PairingTransports {
         network: enable_network,
-        ble: enable_ble,
+        ble: cfg!(feature = "ble") && enable_ble,
     }
 }
 
@@ -752,6 +777,13 @@ async fn run_session(
 ) {
     let session_id = *setup.state.session_id();
     let link = PairingLink::start(setup.started.pairing_adv_id, setup.enable_ble).await;
+    // Both halves are known now, so the session can tell "waiting for the phone"
+    // from "nothing can ever arrive": `open_transports` binds no socket with the
+    // network transport off, and the link is inactive when BLE is off by
+    // configuration, failed to start, or is compiled out of the daemon.
+    let udp_ready = setup.udp.is_some();
+    let ble_ready = link.is_active();
+    let transports_ready = udp_ready || ble_ready;
     let mut session = Session {
         state: setup.state,
         session_id,
@@ -773,12 +805,36 @@ async fn run_session(
         server_device_name: String::new(),
     };
 
+    if !transports_ready {
+        // Waiting here would run the loop with one arm fewer than it has cheap
+        // exits: no socket to receive on, no link to read from, so only the 120 s
+        // deadline could end it, and `WaitForPairing` would hold the caller until
+        // then. Record the reason and let the standard teardown publish it, so the
+        // terminal phase still goes out after the (absent) transports are gone.
+        tracing::error!(
+            "Pairing has no transport to offer: the local network transport is disabled and BLE \
+             is {}; failing the session instead of waiting for the deadline",
+            if setup.enable_ble {
+                "unavailable on this host"
+            } else {
+                "disabled by configuration"
+            }
+        );
+        session.end(SessionPhase::Failed(NO_TRANSPORT_FAILURE.to_string()), None);
+    } else if !ble_ready {
+        // Said here rather than by `PairingLink::start`, which cannot know whether
+        // there is a UDP socket to fall back to.
+        tracing::info!("Pairing runs over UDP only: BLE is unavailable for this session");
+    }
+
     tracing::info!(
         "Pairing session started: UDP port {}, session {}",
         session.local_port,
         hex::encode(session.session_id)
     );
-    session.run().await;
+    if transports_ready {
+        session.run().await;
+    }
     session.finish().await;
 }
 
@@ -1564,10 +1620,7 @@ impl PairingLink {
         let transport = match BleTransport::new_for_pairing().await {
             Ok(transport) => transport,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to set up BLE for pairing ({}); pairing over UDP only",
-                    e
-                );
+                tracing::warn!("Failed to set up BLE for pairing: {}", e);
                 return Self {
                     session: None,
                     closed: false,
@@ -1591,7 +1644,7 @@ impl PairingLink {
                 // authentication GATT application was live), which the transport
                 // refuses by design rather than registering a shadowed service.
                 tracing::warn!(
-                    "Failed to start the pairing BLE advertisement (adv_id {}: {}); pairing over UDP only",
+                    "Failed to start the pairing BLE advertisement (adv_id {}: {})",
                     hex::encode(pairing_adv_id),
                     e
                 );
@@ -1601,6 +1654,12 @@ impl PairingLink {
                 }
             }
         }
+    }
+
+    /// Whether this link can carry a pairing frame: `false` when BLE is disabled
+    /// by configuration, when the setup above failed, and after `stop`.
+    fn is_active(&self) -> bool {
+        self.session.is_some() && !self.closed
     }
 
     /// The next frame written to `PAIRING_CHAR_UUID`, or `None` once the link is
@@ -1656,6 +1715,11 @@ struct PairingLink;
 impl PairingLink {
     async fn start(_pairing_adv_id: [u8; 10], _enable_ble: bool) -> Self {
         Self
+    }
+
+    /// Never active: this build has no BLE half at all.
+    fn is_active(&self) -> bool {
+        false
     }
 
     async fn recv(&mut self) -> Option<Vec<u8>> {
@@ -2376,13 +2440,23 @@ mod tests {
         assert_ne!(ports.local_port, 0);
     }
 
+    /// The config toggles map straight onto the transport decision, and a build
+    /// without the `ble` feature never counts BLE as available.
+    ///
+    /// The defects this catches: `pairing_transports` taking `enable_ble` as the
+    /// whole answer, so a daemon compiled without the `ble` feature plans a session
+    /// around an advertisement it cannot start — with `enable_network = false` that
+    /// is a session no phone can reach, and `StartPairing` would accept it. The
+    /// `ble` expectation is `cfg!(feature = "ble")` rather than `true`, which is
+    /// what makes the assertion fail in the `--no-default-features` build CI runs
+    /// (`cargo test -p tapauthd --no-default-features --features dev-udp-loopback`).
     #[test]
     fn the_config_toggles_map_straight_onto_the_transport_decision() {
         assert_eq!(
             pairing_transports(false, true),
             PairingTransports {
                 network: false,
-                ble: true
+                ble: cfg!(feature = "ble"),
             }
         );
         assert_eq!(
@@ -2391,6 +2465,97 @@ mod tests {
                 network: true,
                 ble: false
             }
+        );
+        // The one configuration no pairing session can run with.
+        assert!(
+            !pairing_transports(false, false).any(),
+            "no transport at all must be reported as such"
+        );
+        assert!(pairing_transports(true, false).any());
+        assert_eq!(
+            pairing_transports(false, true).any(),
+            cfg!(feature = "ble"),
+            "with the network off, only a build with the ble feature has a transport"
+        );
+    }
+
+    /// A prepared session for the worker: the given socket (or none) and no BLE.
+    fn worker_setup(udp: Option<UdpSocket>, local_port: u16) -> SessionSetup {
+        // `udp_port = 0` is `ClientPairingState::start`'s "no UDP endpoint", which
+        // is what `start_session_state` produces with the network transport off.
+        let (state, started) = ClientPairingState::start(
+            Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
+            "thinkpad",
+            local_port,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        SessionSetup {
+            state,
+            started,
+            udp,
+            local_port,
+            firewall_guard: None,
+            // Nothing in a unit test can start a BLE advertisement, and the daemon
+            // may be built without the feature: this is the "no BLE half" session.
+            enable_ble: false,
+            generation: 0,
+        }
+    }
+
+    /// A session with no transport at all must fail at once instead of waiting out
+    /// the deadline; a session that still has its UDP socket must keep waiting.
+    ///
+    /// The defects this catches: `run_session` running the loop with `udp = None`
+    /// and an inactive link, where every receive arm is `pending`, so the worker —
+    /// and the `WaitForPairing` holding the GUI — waits the full
+    /// [`SESSION_DEADLINE`] for a phone that has no way to send anything; and the
+    /// over-eager opposite, ending a session that still has its socket because BLE
+    /// is not available.
+    ///
+    /// The command sender is kept alive throughout: a dropped one ends the loop by
+    /// itself, which would make the "keeps waiting" half pass for the wrong reason.
+    #[tokio::test]
+    async fn a_session_without_any_transport_fails_at_once_while_a_udp_session_waits() {
+        // 1. No socket, no BLE half.
+        let (phase_tx, phases) = watch::channel(SessionPhase::AwaitingPhone);
+        let (_commands, command_rx) = mpsc::channel(COMMAND_QUEUE_LEN);
+        tokio::time::timeout(
+            // Far below `SESSION_DEADLINE`: a worker that waits for the deadline
+            // fails here instead of parking the test binary for two minutes.
+            Duration::from_secs(5),
+            run_session(worker_setup(None, 0), phase_tx, command_rx),
+        )
+        .await
+        .expect("a session with no transport must fail instead of waiting for the deadline");
+
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::Failed(NO_TRANSPORT_FAILURE.to_string()),
+            "the terminal phase must say why the session could not run"
+        );
+
+        // 2. The same worker with a socket still waits for the phone: BLE being
+        //    absent on its own must not end a session that UDP can carry.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_port = udp.local_addr().unwrap().port();
+        let (phase_tx, phases) = watch::channel(SessionPhase::AwaitingPhone);
+        let (_commands, command_rx) = mpsc::channel(COMMAND_QUEUE_LEN);
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(250),
+            run_session(worker_setup(Some(udp), local_port), phase_tx, command_rx),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "a session with a UDP socket must keep waiting for the phone"
+        );
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::AwaitingPhone,
+            "a UDP session must not publish a terminal phase before the phone connects"
         );
     }
 
