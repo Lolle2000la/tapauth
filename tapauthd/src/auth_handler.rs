@@ -1342,6 +1342,84 @@ pub(crate) enum ServerResponseVerdict {
     Unattributed,
 }
 
+/// The signature check a row runs: [`verify_auth_grant`] or [`verify_auth_denial`],
+/// which share a signature and differ only in the inner payload they accept.
+type PayloadVerifier = fn(&WrapperMessage, &[u8; 32], &[u8; 32], i32) -> Result<(), ProtocolError>;
+
+/// One row of the response table: the payload type it answers for, the verifier
+/// it runs against every `allowed_servers` entry, and the verdict it produces
+/// when that verifier accepts.
+struct ResponseRow {
+    payload_type: PayloadType,
+    verify: PayloadVerifier,
+    verdict: ServerResponseVerdict,
+}
+
+/// The Server answers a client may act on, keyed on payload type, first match
+/// wins.
+///
+/// Only a payload type with a row here can produce a verdict other than
+/// [`ServerResponseVerdict::Unattributed`], and a row is only reached after the
+/// enclosing checks in [`AuthSession::wait_for_response`] have attributed the
+/// signature to a Server authorized for this user. A new Server answer is one
+/// row plus one case in `covering_cases` (the covering test fails without it),
+/// never another `else if` beside the allowlist check.
+static RESPONSE_ROWS: [ResponseRow; 2] = [
+    ResponseRow {
+        payload_type: PayloadType::AuthGrant,
+        verify: verify_auth_grant,
+        verdict: ServerResponseVerdict::Grant,
+    },
+    ResponseRow {
+        payload_type: PayloadType::AuthDenial,
+        verify: verify_auth_denial,
+        verdict: ServerResponseVerdict::Denial,
+    },
+];
+
+/// The row answering `payload_type`, or `None` when no row does — a payload type
+/// the protocol does not define, or one that is not a decision at all
+/// (`AuthRequest`, `GrantConfirmation`, `AuthCancel`, `Unspecified`).
+fn response_row(payload_type: i32) -> Option<&'static ResponseRow> {
+    RESPONSE_ROWS
+        .iter()
+        .find(|row| row.payload_type as i32 == payload_type)
+}
+
+/// The explicit refusal of a payload type no row answers for.
+///
+/// This is the outcome the dispatch used to reach by falling out of its `if`
+/// chain. It stays [`ServerResponseVerdict::Unattributed`] — not a verdict of its
+/// own — so an unrecognised type is neither a grant nor a denial here, and
+/// `process_auth_response` keeps answering it with `ResponseError::InvalidMessage`
+/// and its "Unexpected message type" debug line.
+fn refuse_unrecognised_payload_type() -> ServerResponseVerdict {
+    ServerResponseVerdict::Unattributed
+}
+
+/// Whether any Server authorized for this session accepts `wrapper` under `verify`.
+///
+/// Each candidate is checked with *its own* negotiated signature algorithm, so a
+/// Server cannot claim an algorithm the pairing did not agree on.
+fn any_authorized_server_verifies(
+    allowed_servers: &[PairedServer],
+    challenge: &[u8; 32],
+    wrapper: &WrapperMessage,
+    verify: PayloadVerifier,
+) -> bool {
+    allowed_servers.iter().any(|server| {
+        server_public_key(server).is_some_and(|public_key| {
+            verify(
+                wrapper,
+                challenge,
+                &public_key,
+                server.signature_algorithm as i32,
+            )
+            .is_ok()
+        })
+    })
+}
+
 /// Decide what a decrypted Server response means for this session.
 ///
 /// Pure — no I/O and no clock — so the authorization decision can be tested
@@ -1353,41 +1431,16 @@ fn classify_server_response(
     challenge: &[u8; 32],
     wrapper: &WrapperMessage,
 ) -> ServerResponseVerdict {
-    let payload_type = wrapper.payload_type;
+    let row = match response_row(wrapper.payload_type) {
+        Some(row) => row,
+        None => return refuse_unrecognised_payload_type(),
+    };
 
-    if payload_type == PayloadType::AuthGrant as i32 {
-        let granted = allowed_servers.iter().any(|server| {
-            server_public_key(server).is_some_and(|public_key| {
-                verify_auth_grant(
-                    wrapper,
-                    challenge,
-                    &public_key,
-                    server.signature_algorithm as i32,
-                )
-                .is_ok()
-            })
-        });
-        if granted {
-            return ServerResponseVerdict::Grant;
-        }
-    } else if payload_type == PayloadType::AuthDenial as i32 {
-        let denied = allowed_servers.iter().any(|server| {
-            server_public_key(server).is_some_and(|public_key| {
-                verify_auth_denial(
-                    wrapper,
-                    challenge,
-                    &public_key,
-                    server.signature_algorithm as i32,
-                )
-                .is_ok()
-            })
-        });
-        if denied {
-            return ServerResponseVerdict::Denial;
-        }
+    if any_authorized_server_verifies(allowed_servers, challenge, wrapper, row.verify) {
+        row.verdict
+    } else {
+        ServerResponseVerdict::Unattributed
     }
-
-    ServerResponseVerdict::Unattributed
 }
 
 /// Decode a paired server's Ed25519 public key.
@@ -1448,6 +1501,133 @@ mod tests {
             phone_a,
             phone_b,
         )
+    }
+
+    /// One correctly signed response per row of [`RESPONSE_ROWS`], answering
+    /// `challenge` from `keypair`'s phone.
+    ///
+    /// A new row needs its case here: `every_response_table_row_is_reached_by_a_case`
+    /// fails on a row this function does not cover.
+    fn covering_cases(
+        challenge: &[u8; 32],
+        keypair: &Ed25519KeyPair,
+    ) -> Vec<(PayloadType, WrapperMessage)> {
+        vec![
+            (
+                PayloadType::AuthGrant,
+                create_signed_auth_grant(*challenge, keypair).unwrap(),
+            ),
+            (
+                PayloadType::AuthDenial,
+                create_signed_auth_denial(*challenge, "user rejected", keypair).unwrap(),
+            ),
+        ]
+    }
+
+    /// Every row of the response table must be reachable by an input that
+    /// produces exactly its verdict.
+    ///
+    /// The defect this catches: a row added (or re-typed) with no covering case,
+    /// i.e. a payload type the table claims to answer for while nothing ever
+    /// reaches it — the case the `else if` chain hid, where a new answer type
+    /// silently fell through to `Unattributed` instead of naming its verdict.
+    #[test]
+    fn every_response_table_row_is_reached_by_a_case() {
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let allowed = vec![paired_server("phone", &keypair, &["bob"])];
+        let challenge = [0x48u8; 32];
+        let cases = covering_cases(&challenge, &keypair);
+
+        for (index, row) in RESPONSE_ROWS.iter().enumerate() {
+            let Some((_, wrapper)) = cases
+                .iter()
+                .find(|(payload_type, _)| *payload_type == row.payload_type)
+            else {
+                panic!(
+                    "table row {index} ({}) has no covering case in `covering_cases`",
+                    row.payload_type.as_str_name()
+                );
+            };
+
+            // First match wins, so the case must land on *this* row and not on a
+            // later one sharing its payload type.
+            assert!(
+                std::ptr::eq(
+                    response_row(wrapper.payload_type).expect("a covered type has a row"),
+                    row
+                ),
+                "`covering_cases` for {} selects a different row than the one under test",
+                row.payload_type.as_str_name()
+            );
+            assert_eq!(
+                classify_server_response(&allowed, &challenge, wrapper),
+                row.verdict,
+                "row {index} ({}) must produce its own verdict",
+                row.payload_type.as_str_name()
+            );
+        }
+
+        // ...and the converse: a case with no row would be dead, and a case for a
+        // payload type the table does not answer is a missing row.
+        for (payload_type, _) in &cases {
+            assert!(
+                response_row(*payload_type as i32).is_some(),
+                "`covering_cases` builds {} but no table row answers for it",
+                payload_type.as_str_name()
+            );
+        }
+    }
+
+    /// A payload type no row answers for is refused explicitly, and never takes
+    /// the grant row's verdict.
+    ///
+    /// The fixture is a grant's bytes behind a type the protobuf enum does not
+    /// define, re-signed over that type so the signature check is not what
+    /// refuses it: the refusal must come from the dispatch, not from a verifier
+    /// that happens to fail.
+    ///
+    /// The defect this catches: a fallback that reuses a row's verdict (an
+    /// unrecognised type read as a grant, or as a denial), instead of the
+    /// explicit [`refuse_unrecognised_payload_type`].
+    #[test]
+    fn an_unrecognised_payload_type_is_refused_and_never_grants() {
+        const UNRECOGNISED: i32 = 99;
+
+        let keypair = Ed25519KeyPair::generate().unwrap();
+        let allowed = vec![paired_server("phone", &keypair, &["bob"])];
+        let challenge = [0x49u8; 32];
+
+        let mut wrapper = create_signed_auth_grant(challenge, &keypair).unwrap();
+        wrapper.payload_type = UNRECOGNISED;
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+
+        // The frame is signed by the authorized phone over the type it declares,
+        // so nothing upstream of the dispatch would drop it.
+        assert!(
+            AuthSession::response_signature_authorized(&allowed, &wrapper),
+            "the fixture must pass the authorized-server signature filter"
+        );
+        assert!(
+            response_row(UNRECOGNISED).is_none(),
+            "no table row may answer for an unrecognised payload type"
+        );
+
+        let verdict = classify_server_response(&allowed, &challenge, &wrapper);
+        assert_eq!(verdict, refuse_unrecognised_payload_type());
+        assert_eq!(
+            verdict,
+            ServerResponseVerdict::Unattributed,
+            "the unrecognised type must keep the verdict it produced before the table"
+        );
+        assert!(
+            RESPONSE_ROWS.iter().all(|row| row.verdict != verdict),
+            "an unrecognised payload type must not take any row's verdict"
+        );
+        assert_ne!(
+            verdict,
+            ServerResponseVerdict::Grant,
+            "the grant arm must be unreachable for an unrecognised payload type"
+        );
     }
 
     /// Phone B is paired for `alice`; the session authenticates `bob`, who is
