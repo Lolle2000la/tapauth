@@ -20,7 +20,7 @@ Every TapAuth BLE advertisement uses the **exact 31-byte legacy BLE advertising 
 The 10-byte `ServiceData[SERVICE_UUID]` value distinguishes the mode without revealing static device identity:
 
 1. **Authentication Discovery**:
-   * **Value**: First **10 bytes** of `HMAC(hash_alg, CSK, u64_be(floor(unix_time / 60)))`.
+   * **Value**: First **10 bytes** of `MAC(hash_alg, CSK, u64_be(window))`, where `window = floor(unix_time / 60)` — the same identifier as [`authentication-flow.md`](authentication-flow.md) §2.1, truncated to the first **10 bytes** for the advertisement. `MAC` is HMAC-SHA256 for `SHA256` and a keyed BLAKE3 MAC (BLAKE3 keyed mode, CSK as the key) for `BLAKE3`.
    * Matched by paired Servers' background scanner against their cached `(current_window, previous_window)` 10-byte temporal ID table.
 2. **Pairing Discovery**:
    * **Value**:
