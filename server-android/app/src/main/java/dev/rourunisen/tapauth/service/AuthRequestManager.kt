@@ -134,7 +134,7 @@ class AuthRequestManager private constructor() {
         // place both transports funnel through (AuthenticationService for UDP,
         // BleGattService for BLE), and because nothing else on the phone carries all three
         // values: the prompt shows the command preview *instead of* service/process, and the
-        // BLE receipt line logs only two of the three.
+        // BLE receipt line logs none of the three (only username/hostname/ttyPresent).
         //
         // The preview's *content* is logged only by the `e2e` build variant, via
         // BuildConfig.E2E_TESTING (app/build.gradle.kts decides it: false for release and

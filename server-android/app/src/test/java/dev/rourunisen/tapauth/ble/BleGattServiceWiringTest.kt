@@ -12,15 +12,17 @@ import org.junit.Test
  *
  * `BleGattService` is an Android `Service` whose callbacks take a framework `BluetoothGatt`, so
  * neither the `STATE_DISCONNECTED` handler nor the response-delivery loop can be constructed off a
- * device. That leaves two real defects with no failing test anywhere: re-adding
+ * device. That leaves real defects with no failing test anywhere: re-adding
  * `authRequestGate.concludePeer(deviceAddress)` to the disconnect handler (a reconnect inside the
  * grace would then reach the replay cache, be called a replay and tear the new link down, killing
  * the prompt), and dropping the confirmation from the retirement call (every loop end — including a
  * link that died mid-delivery — would retire the held bytes and the re-delivery path becomes dead
- * code). A source guard is the only executable statement of those contracts a unit test can make:
- * it is deliberately a parse of the shipped call sites, in the spirit of
- * `client-pam/src/source_guards.rs`, and it does not replace the instrumentation suite that
- * exercises the behaviour.
+ * code). The same holds for the receipt log line, which carries the caller's own `username` and
+ * `hostname`: whether they are wrapped in `scrubLogValue` is a property of one `Log.d` argument,
+ * which no JVM test can read back. A source guard is the only executable statement of those
+ * contracts a unit test can make: it is deliberately a parse of the shipped call sites, in the
+ * spirit of `client-pam/src/source_guards.rs`, and it does not replace the instrumentation suite
+ * that exercises the behaviour.
  *
  * A failure here means the rule moved or changed shape: re-read `BleGattService.kt`, then fix
  * whichever side is wrong. The file is found by walking up from the test's working directory
@@ -107,6 +109,26 @@ class BleGattServiceWiringTest {
     }
 
     @Test
+    fun theTornDownHandlesStateIsDroppedOnceTheGraceHasPassed() {
+        val launch = source.indexOf(SERVICE_SCOPE_LAUNCH, source.indexOf(DISCONNECTED_ARM))
+        assertTrue("the disconnect branch must start its grace coroutine", launch >= 0)
+        val graceWait = source.indexOf(GRACE_WAIT, launch)
+        assertTrue("the grace coroutine must await $GRACE_WAIT", graceWait > launch)
+        val graceBlockEnd = source.indexOf(GRACE_BLOCK_END, graceWait)
+        val forget = source.indexOf(FORGET_CALL, launch)
+
+        // The dead handle's state has to go, or a tombstone is kept per reconnection for the life
+        // of the service. The grace coroutine is where it may go: dropped in the disconnect branch
+        // it would leave a link that merely dropped (and its in-flight answer) without the state
+        // the operations still queued on it look up.
+        assertTrue(
+            "`$FORGET_CALL` must run after $GRACE_WAIT (offset $forget not in " +
+                "$graceWait..$graceBlockEnd)",
+            forget > graceWait && forget < graceBlockEnd,
+        )
+    }
+
+    @Test
     fun theDeliveryLoopRetiresAnAnswerOnlyWithTheConfirmation() {
         assertEquals(
             "the held answer is retired at exactly one call site",
@@ -170,6 +192,39 @@ class BleGattServiceWiringTest {
     /** Whitespace and line breaks only, so the shape is compared and not the formatting. */
     private fun String.normalized(): String = replace(Regex("\\s+"), " ").trim()
 
+    /**
+     * The receipt log line is the only place this service puts the caller's own `username` and
+     * `hostname` into logcat. Both are the desktop's strings — Rust caps the username's length but
+     * sanitizes neither — so an unwrapped one can carry a newline and forge an extra logcat line.
+     * `scrubLogValue` is what removes that, and dropping it compiles, logs and is caught by
+     * nothing: the line is a `Log.d` argument, which a JVM test cannot read back.
+     */
+    @Test
+    fun theReceiptLogLineScrubsTheCallerStrings() {
+        val start = source.indexOf(RECEIPT_LOG_MARKER)
+        assertTrue(
+            "the verified-request log line (`$RECEIPT_LOG_MARKER…`) must still exist; re-read " +
+                "BleGattService.kt if it moved",
+            start >= 0,
+        )
+        val lineEnd = source.indexOf('\n', start)
+        val line = source.substring(start, if (lineEnd >= 0) lineEnd else source.length)
+
+        for (scrubbed in SCRUBBED_RECEIPT_FIELDS) {
+            assertTrue(
+                "the receipt log line must log `$scrubbed`, not the raw caller string; line: $line",
+                line.contains(scrubbed),
+            )
+        }
+        for (raw in RAW_RECEIPT_FIELDS) {
+            assertFalse(
+                "the receipt log line must not interpolate `$raw` directly — a newline in the " +
+                    "desktop's value would forge a logcat line; line: $line",
+                line.contains(raw),
+            )
+        }
+    }
+
     /** `STATE_DISCONNECTED` up to the grace coroutine it starts, i.e. the pre-teardown body. */
     private fun disconnectBranchUpToItsGraceCoroutine(): String {
         val start = source.indexOf(DISCONNECTED_ARM)
@@ -210,7 +265,8 @@ class BleGattServiceWiringTest {
 
         /** The first line after the grace coroutine, where the torn-down handle is tombstoned. */
         const val GRACE_BLOCK_END = "// The handle is closed below"
-        const val CLOSED_HANDLE_TOMBSTONE = "gattConnections.computeIfAbsent(gatt)"
+        const val CLOSED_HANDLE_TOMBSTONE = "gattConnections.markTornDown(gatt)"
+        const val FORGET_CALL = "gattConnections.forget(gatt)"
         const val FINISH_CALL = "pendingResponses.finish("
         const val CONFIRMED_ARGUMENTS = "delivery, confirmed"
         const val RECORD_CALL = "pendingResponses.record("
@@ -219,5 +275,22 @@ class BleGattServiceWiringTest {
 
         /** The handle the write after the record has to be aimed at. */
         const val HANDLE_AIM = "delivery?.handle ?: gatt"
+
+        /** The verified-request log line this service logs the caller's fields on. */
+        const val RECEIPT_LOG_MARKER = "Parsed and verified BLE request: "
+
+        /** What the receipt line must log: the two caller strings, scrubbed. */
+        val SCRUBBED_RECEIPT_FIELDS =
+            listOf(
+                "username=\${scrubLogValue(authRequest.username)}",
+                "hostname=\${scrubLogValue(authRequest.hostname)}",
+            )
+
+        /** The same two fields logged raw — a newline in either forges a logcat line. */
+        val RAW_RECEIPT_FIELDS =
+            listOf(
+                "username=\${authRequest.username}",
+                "hostname=\${authRequest.hostname}",
+            )
     }
 }

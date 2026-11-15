@@ -29,6 +29,7 @@ import dev.rourunisen.tapauth.crypto.rawMessage
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
 import dev.rourunisen.tapauth.service.TransportLockManager
+import dev.rourunisen.tapauth.service.scrubLogValue
 import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -86,9 +87,6 @@ class BleGattService : Service() {
             UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
         val CLIENT_CONFIRMATION_CHAR_UUID: UUID =
             UUID.fromString("ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf")
-
-        /** Pairing characteristic: absent on the authentication GATT service, never fatal. */
-        val PAIRING_CHAR_UUID: UUID = UUID.fromString("d9e8f1a2-3b4c-4d5e-8f60-7a8b9c0d1e2f")
 
         /** Client Characteristic Configuration Descriptor (0x2902). */
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -178,11 +176,13 @@ class BleGattService : Service() {
      * every async call routes through [runGattOperation], which holds [GattConnectionState.lock]
      * while it awaits the matching callback.
      *
-     * A torn-down handle keeps its entry with [GattConnectionState.closed] set, so its identity
-     * cannot be mistaken for a live connection again; [onDestroy] clears the map.
+     * A torn-down handle keeps its entry with [GattConnectionState.closed] set until the disconnect
+     * grace expires ([BLE_DISCONNECT_CANCEL_GRACE_MS]), so its identity cannot be mistaken for a
+     * live connection again; after that its entry is dropped and the registry's tombstone carries
+     * that fact alone, so one entry per reconnection does not pile up. [onDestroy] clears both.
      */
     private val gattConnections =
-        java.util.concurrent.ConcurrentHashMap<BluetoothGatt, GattConnectionState>()
+        BleGattConnectionRegistry<BluetoothGatt, GattConnectionState> { GattConnectionState() }
 
     /** Paired device matched to each connection, so callbacks can verify what arrives on it. */
     private val connectionDevices =
@@ -319,6 +319,13 @@ class BleGattService : Service() {
                         // never comes back leaves nothing held behind it.
                         serviceScope.launch {
                             delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
+                            // The handle is dead whether or not the device came back on another
+                            // one: the stack reports nothing more on it, and the operations it had
+                            // in flight were failed above, so their coroutines have already
+                            // returned. Dropping its state here is what keeps a tombstone per
+                            // reconnection from accumulating; the registry still knows the handle
+                            // as torn down, so nothing can take it for a live connection again.
+                            gattConnections.forget(gatt)
                             if (!connectingOrConnectedDevices.contains(deviceAddress)) {
                                 // The prompt is over, so a later request carrying the same
                                 // challenge is a replay again rather than a duplicate in flight,
@@ -340,9 +347,9 @@ class BleGattService : Service() {
                         // The handle is closed below, so nothing may wait on it any more, and no
                         // state may be re-created for it afterwards (a coroutine that resumes late
                         // would otherwise install a fresh entry for a closed handle that is never
-                        // removed). The closed entry itself is kept as that tombstone.
-                        gattConnections.computeIfAbsent(gatt) { GattConnectionState() }.closed =
-                            true
+                        // removed). The entry stays as that tombstone until the grace coroutine
+                        // above drops it, from when on the registry remembers the handle alone.
+                        gattConnections.markTornDown(gatt).closed = true
                         connectionDevices.remove(gatt)
                         gatt.close()
                     }
@@ -740,11 +747,12 @@ class BleGattService : Service() {
     /**
      * State for [gatt], or null when that handle has been torn down.
      *
-     * `computeIfAbsent` is atomic per key, so a state created here is always the one teardown will
-     * mark closed — a late caller can never resurrect a fresh entry for a closed handle.
+     * The registry refuses to create an entry for a handle it has already seen torn down, so a
+     * coroutine that resumes after the teardown fails here instead of installing a live-looking
+     * entry for a closed handle — the state it would have got is marked closed anyway.
      */
     private fun connectionState(gatt: BluetoothGatt): GattConnectionState? =
-        gattConnections.computeIfAbsent(gatt) { GattConnectionState() }.takeUnless { it.closed }
+        gattConnections.liveOrCreate(gatt)?.takeUnless { it.closed }
 
     /**
      * Run one asynchronous [BluetoothGatt] operation and await its callback.
@@ -816,7 +824,7 @@ class BleGattService : Service() {
         result: GattOperationResult,
         characteristicUuid: UUID? = null,
     ) {
-        val pending = gattConnections[gatt]?.pending
+        val pending = gattConnections.stateFor(gatt)?.pending
         if (
             pending != null &&
                 pending.kind == kind &&
@@ -833,7 +841,7 @@ class BleGattService : Service() {
      * waiting ops then return a failure instead of parking until their timeout.
      */
     private fun cancelPendingGattOperations(gatt: BluetoothGatt, reason: String) {
-        val connection = gattConnections[gatt] ?: return
+        val connection = gattConnections.stateFor(gatt) ?: return
         connection.pending?.let { pending ->
             Log.d(TAG, "Cancelling pending GATT ${pending.kind.name.lowercase()}: $reason")
             pending.result.complete(GattOperationResult(false))
@@ -935,7 +943,7 @@ class BleGattService : Service() {
 
         // Subscribe before reading, so a request the client has already queued still reaches us.
         // Only the two authentication characteristics are subscribed: nothing on this connection
-        // reads or writes PAIRING_CHAR_UUID (pairing runs its own GATT connection in
+        // reads or writes the pairing characteristic (pairing runs its own GATT connection in
         // BlePairingClient), so subscribing to it would cost a round-trip for a notification no
         // handler consumes.
         val notifyingCharacteristics =
@@ -1219,9 +1227,15 @@ class BleGattService : Service() {
                     return
                 }
 
+            // The caller context the desktop sent is logged — scrubbed — by
+            // AuthRequestManager.submitRequest, the one place both transports funnel through, so
+            // `pam_service` and `process_name` are not repeated here. What this line adds is who
+            // the request was for: `username` and `hostname` are the caller's own strings (Rust
+            // caps the username's length but does not sanitize either), so they go through
+            // [scrubLogValue] — a newline in them would otherwise forge an extra logcat line.
             Log.d(
                 TAG,
-                "Parsed and verified BLE request: username=${authRequest.username}, hostname=${authRequest.hostname}, pamService=${authRequest.pamService}, processName=${authRequest.processName}, ttyPresent=${authRequest.ttyPresent}",
+                "Parsed and verified BLE request: username=${scrubLogValue(authRequest.username)}, hostname=${scrubLogValue(authRequest.hostname)}, ttyPresent=${authRequest.ttyPresent}",
             )
 
             // CHECK: Verify this pairing is allowed to authenticate this user
@@ -1470,7 +1484,7 @@ class BleGattService : Service() {
      */
     private fun liveHandleFor(challengeKey: String, peerAddress: String): BluetoothGatt? =
         activeConnectionsByChallenge[challengeKey]?.takeIf { handle ->
-            handle.device.address == peerAddress && gattConnections[handle]?.closed != true
+            handle.device.address == peerAddress && !gattConnections.isTornDown(handle)
         }
 
     /**
@@ -1724,7 +1738,7 @@ class BleGattService : Service() {
      * a returned value is always a signature-valid confirmation.
      */
     private suspend fun awaitConfirmationNotification(gatt: BluetoothGatt): ByteArray? {
-        val waiter = gattConnections[gatt]?.confirmationNotification ?: return null
+        val waiter = gattConnections.stateFor(gatt)?.confirmationNotification ?: return null
         return withTimeoutOrNull(CONFIRMATION_NOTIFICATION_WAIT_MS) { waiter.await() }
     }
 
@@ -1787,7 +1801,7 @@ class BleGattService : Service() {
                 Log.w(TAG, "Ignoring unverified GrantConfirmation notification")
                 return@launch
             }
-            val waiter = gattConnections[gatt]?.confirmationNotification
+            val waiter = gattConnections.stateFor(gatt)?.confirmationNotification
             if (waiter != null && !waiter.isCompleted) {
                 waiter.complete(confirmedChallenge)
             } else {
@@ -1938,5 +1952,62 @@ class BleGattService : Service() {
         val take = kotlin.math.min(this.size, maxBytes)
         return this.take(take).joinToString("") { "%02x".format(it) } +
             if (this.size > take) "…" else ""
+    }
+}
+
+/**
+ * Per-handle GATT state, plus the tombstones of the handles that have been torn down.
+ *
+ * The service keeps one state per `BluetoothGatt` because the stack allows only one asynchronous
+ * operation in flight per connection, and it must never hand a state to a caller for a handle it
+ * has already seen torn down: that caller would park on a lock nothing releases any more.
+ *
+ * [forget] drops the entry of a handle whose disconnect grace has passed. The handle is dead by
+ * then and the stack reports nothing more on it, so holding its state would leave one entry behind
+ * per reconnection for the life of the service. The handle still has to be recognised as torn down
+ * afterwards — nothing else stops a late coroutine from creating a live-looking entry for it —
+ * which is what [markTornDown] is for: those keys are held weakly, so the record flies away with
+ * the last reference to the handle that could ask, instead of accumulating.
+ */
+internal class BleGattConnectionRegistry<K : Any, V : Any>(private val createState: () -> V) {
+
+    private val states = java.util.concurrent.ConcurrentHashMap<K, V>()
+
+    private val tornDownHandles: MutableSet<K> =
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<K, Boolean>()),
+        )
+
+    /** The state [key] was given, or null when it has none right now. Never creates one. */
+    fun stateFor(key: K): V? = states[key]
+
+    /**
+     * The state for [key], created on first use, or null once [key] has been torn down.
+     *
+     * `computeIfAbsent` is atomic per key, so a state created here is always the one teardown marks
+     * closed: a caller racing the teardown can never hand the service a fresh entry the teardown
+     * will not reach.
+     */
+    fun liveOrCreate(key: K): V? =
+        if (isTornDown(key)) null else states.computeIfAbsent(key) { createState() }
+
+    /** Record that [key] is torn down, and hand back its state so the caller can mark it closed. */
+    fun markTornDown(key: K): V {
+        tornDownHandles.add(key)
+        return states.computeIfAbsent(key) { createState() }
+    }
+
+    /** Whether [key] has been torn down, whether its state is still held or already forgotten. */
+    fun isTornDown(key: K): Boolean = tornDownHandles.contains(key)
+
+    /** Drop the state of [key]; a key that has none is a no-op, and it stays torn down. */
+    fun forget(key: K) {
+        states.remove(key)
+    }
+
+    /** Drop every state and every tombstone: the service that owned them is going away. */
+    fun clear() {
+        states.clear()
+        tornDownHandles.clear()
     }
 }
