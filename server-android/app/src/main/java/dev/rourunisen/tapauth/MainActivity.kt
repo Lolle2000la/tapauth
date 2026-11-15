@@ -52,6 +52,7 @@ import dev.rourunisen.tapauth.data.AuthRequest
 import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
+import dev.rourunisen.tapauth.service.scrubLogValue
 import dev.rourunisen.tapauth.ui.devices.DeviceListScreen
 import dev.rourunisen.tapauth.ui.home.HomeScreen
 import dev.rourunisen.tapauth.ui.navigation.AppScreenSaver
@@ -257,7 +258,12 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun handleAuthRequest(authRequest: AuthRequest) {
-        Log.d(TAG, "Received auth request for ${authRequest.username}@${authRequest.hostname}")
+        // The caller's own strings, scrubbed like every other place they reach logcat: an
+        // unwrapped newline would forge a line (see `scrubLogValue`).
+        Log.d(
+            TAG,
+            "Received auth request for ${scrubLogValue(authRequest.username)}@${scrubLogValue(authRequest.hostname)}",
+        )
 
         // Check if biometric authentication is available (Class 3 BIOMETRIC_STRONG required)
         val biometricManager = BiometricManager.from(this)

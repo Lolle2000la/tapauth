@@ -370,9 +370,14 @@ class AuthRequestManager private constructor() {
             }
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
+            // `username`/`hostname` are the caller's own strings and `deviceName` the peer-supplied
+            // hostname a pairing persisted, so each goes through [scrubLogValue] before it lands in
+            // logcat — see the rationale on the caller-context line above.
             Log.d(
                 TAG,
-                "Posting auth notification (id=$notificationId) for $deviceName @ $username@$hostname, challenge=${challengeHex.take(16)}...",
+                "Posting auth notification (id=$notificationId) for ${scrubLogValue(deviceName)} @ " +
+                    "${scrubLogValue(username)}@${scrubLogValue(hostname)}, " +
+                    "challenge=${challengeHex.take(16)}...",
             )
 
             val nm = NotificationManagerCompat.from(context)
@@ -406,7 +411,10 @@ class AuthRequestManager private constructor() {
             Log.w(TAG, "Failed to post auth request notification: ${e.message}")
         }
 
-        Log.d(TAG, "Submitted auth request $requestId for ${username}@${hostname}")
+        Log.d(
+            TAG,
+            "Submitted auth request $requestId for ${scrubLogValue(username)}@${scrubLogValue(hostname)}",
+        )
 
         return requestId
     }

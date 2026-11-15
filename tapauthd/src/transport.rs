@@ -6,6 +6,7 @@
 //!
 //! This module has been reorganized into submodules for better maintainability.
 
+mod selection;
 mod types;
 mod udp;
 
@@ -13,6 +14,7 @@ mod udp;
 mod ble;
 
 // Re-export the Transport trait and implementations at module level
+pub(crate) use selection::EnabledTransports;
 pub use types::ReceiveResult;
 pub use udp::UdpTransport;
 

@@ -2,6 +2,7 @@ package dev.rourunisen.tapauth.network
 
 import android.util.Log
 import dev.rourunisen.tapauth.data.PairingUrl
+import dev.rourunisen.tapauth.service.scrubLogValue
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -148,7 +149,7 @@ class PairingClient(private val pairingUrl: PairingUrl) {
                 val address = InetAddress.getByName(host)
                 if (resolved.none { it == address }) resolved.add(address)
             } catch (e: IOException) {
-                Log.w(TAG, "Cannot resolve QR endpoint '$host': ${e.message}")
+                Log.w(TAG, "Cannot resolve QR endpoint '${scrubLogValue(host)}': ${e.message}")
             }
         }
         return resolved

@@ -1240,9 +1240,18 @@ class BleGattService : Service() {
 
             // CHECK: Verify this pairing is allowed to authenticate this user
             if (!matchedDevice.isUserAllowed(authRequest.username)) {
-                Log.w(TAG, "BLE pairing not authorized for user: ${authRequest.username}")
+                // The same two strings as the receipt line above — the request's `username` and
+                // the entries `allowedUsers` took from a pairing provisioning's `username` — so
+                // they are scrubbed here for the same reason.
+                Log.w(
+                    TAG,
+                    "BLE pairing not authorized for user: ${scrubLogValue(authRequest.username)}",
+                )
                 Log.w(TAG, "  Device: ${matchedDevice.displayName}")
-                Log.w(TAG, "  Allowed users: ${matchedDevice.allowedUsers}")
+                Log.w(
+                    TAG,
+                    "  Allowed users: ${scrubLogValue(matchedDevice.allowedUsers.joinToString())}",
+                )
                 // Silently disconnect - this device shouldn't handle this user
                 if (
                     ActivityCompat.checkSelfPermission(
@@ -1255,7 +1264,7 @@ class BleGattService : Service() {
                 return
             }
 
-            Log.d(TAG, "BLE pairing authorized for user: ${authRequest.username}")
+            Log.d(TAG, "BLE pairing authorized for user: ${scrubLogValue(authRequest.username)}")
 
             // The verified request carries the raw challenge bytes.
             val challengeBytes = authRequest.challenge

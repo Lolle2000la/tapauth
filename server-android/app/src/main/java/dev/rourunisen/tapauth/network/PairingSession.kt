@@ -15,6 +15,7 @@ import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.PairedDevice
 import dev.rourunisen.tapauth.data.PairingUrl
+import dev.rourunisen.tapauth.service.scrubLogValue
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
@@ -784,7 +785,12 @@ class PairingSession(
                 protocolVersion = PROTOCOL_VERSION,
             )
         deviceRepository.savePairedDevice(device)
-        Log.i(TAG, "Paired '$displayName' for user(s) $allowedUsers")
+        // `displayName` was sanitized just above; `allowedUsers` holds the provisioning's raw
+        // `username` strings, so only that half still needs scrubbing.
+        Log.i(
+            TAG,
+            "Paired '$displayName' for user(s) ${scrubLogValue(allowedUsers.joinToString())}",
+        )
         return device
     }
 

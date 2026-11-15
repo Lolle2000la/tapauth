@@ -1,7 +1,7 @@
 //! Authentication request handler that creates on-demand transports and runs auth flow.
 
 use crate::caller_context::CallerContext;
-use crate::transport::{ReceiveResult, Transport, UdpTransport, NOTIFY_SETTLE};
+use crate::transport::{EnabledTransports, ReceiveResult, Transport, UdpTransport, NOTIFY_SETTLE};
 use shared::{
     config::{ClientConfigManager, CskMetadata, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
@@ -50,35 +50,6 @@ pub enum AuthHandlerError {
     TransportDisabled,
     #[error("BLE error: {0}")]
     BleError(String),
-}
-
-/// Which transports may be used for an authentication attempt.
-///
-/// Read from the TOML configuration at the start of each attempt so that
-/// toggling BLE / Local Network connectivity takes effect without a daemon
-/// restart.
-#[derive(Debug, Clone, Copy)]
-struct TransportsEnabled {
-    /// Local Network (UDP multicast) transport
-    network: bool,
-    /// Bluetooth Low Energy transport (always false when the daemon is
-    /// built without the `ble` feature)
-    ble: bool,
-}
-
-impl TransportsEnabled {
-    fn from_config() -> Self {
-        let config = shared::config::TapAuthConfig::load();
-        Self {
-            network: config.enable_network,
-            ble: cfg!(feature = "ble") && config.enable_ble,
-        }
-    }
-
-    /// Whether at least one transport can be used.
-    fn any(self) -> bool {
-        self.network || self.ble
-    }
 }
 
 /// Type alias for transport task handles
@@ -362,7 +333,7 @@ pub struct AuthSession {
     allowed_servers: Arc<Vec<PairedServer>>,
     /// Transports enabled for this attempt (read from config when the
     /// attempt starts)
-    transports: TransportsEnabled,
+    transports: EnabledTransports,
     cancel_registry: Option<CancelRegistry>,
     request_id: Option<String>,
 }
@@ -393,7 +364,7 @@ impl AuthSession {
             tty_present,
             csk_meta,
             allowed_servers: Arc::new(Vec::new()),
-            transports: TransportsEnabled {
+            transports: EnabledTransports {
                 network: true,
                 ble: cfg!(feature = "ble"),
             },
@@ -435,12 +406,12 @@ impl AuthSession {
 
         // Read transport toggles fresh from the TOML config so that changes
         // made via the GUI/admin IPC take effect without a daemon restart.
-        self.transports = TransportsEnabled::from_config();
-        if !self.transports.any() {
-            tracing::info!("All transports (BLE and Local Network) are disabled by configuration");
+        self.transports = EnabledTransports::from_config();
+        if let Some(reason) = self.transports.refusal() {
+            tracing::info!("Refusing the attempt: {}", reason);
             return Ok(ipc::PamAuthenticateResponse {
                 outcome: ipc::PamOutcome::Ignore as i32,
-                detail: "All transports (BLE and Local Network) are disabled".to_string(),
+                detail: reason.to_string(),
                 challenge: self.challenge.to_vec(),
             });
         }
@@ -1658,7 +1629,7 @@ mod tests {
             },
             tty_present: true,
             csk_meta: CskMetadata::default(),
-            transports: TransportsEnabled {
+            transports: EnabledTransports {
                 network: true,
                 ble: false,
             },

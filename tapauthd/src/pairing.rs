@@ -106,6 +106,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
+use crate::transport::EnabledTransports;
+
 #[cfg(feature = "ble")]
 use crate::transport::{BleTransport, PairingBleSession};
 
@@ -522,45 +524,6 @@ pub(crate) async fn bind_pairing_socket() -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
-/// Which transports a new pairing session starts with.
-///
-/// Pure input to [`open_transports`], so the `enable_*` config toggles can be
-/// asserted without binding a socket or touching the firewall.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PairingTransports {
-    /// Whether the session opens the UDP pairing socket (and its firewall rule).
-    pub network: bool,
-    /// Whether the session advertises over BLE.
-    pub ble: bool,
-}
-
-impl PairingTransports {
-    /// Whether at least one transport can be used.
-    ///
-    /// A session for which this is `false` can never be reached by a phone, so
-    /// `StartPairing` refuses it and a session that loses its BLE half with the
-    /// network transport off fails instead of waiting out [`SESSION_DEADLINE`].
-    pub(crate) fn any(self) -> bool {
-        self.network || self.ble
-    }
-}
-
-/// The transports a session runs with, from the two config toggles.
-///
-/// `enable_network = false` means no UDP pairing socket and no firewall rule at
-/// all — not a bound-but-unadvertised one: the QR code then carries no reachable
-/// endpoint and the phone pairs over BLE.
-///
-/// `ble` is gated on the compile-time feature as well as on the toggle: a daemon
-/// built without `ble` has no advertisement to start whatever the config says, so
-/// `enable_ble = true` in such a build must not count as "BLE available".
-pub(crate) fn pairing_transports(enable_network: bool, enable_ble: bool) -> PairingTransports {
-    PairingTransports {
-        network: enable_network,
-        ble: cfg!(feature = "ble") && enable_ble,
-    }
-}
-
 /// What [`open_transports`] produced.
 pub(crate) struct PairingPorts {
     /// The bound pairing socket; `None` when the network transport is off.
@@ -588,8 +551,12 @@ pub(crate) enum TransportSetupError {
 /// disabled network transport must cause **neither**; they are therefore taken as
 /// arguments so a test can count the calls (see the module tests) instead of
 /// reading the handler's source.
+///
+/// A disabled network transport means no UDP pairing socket and no firewall rule
+/// at all — not a bound-but-unadvertised one: the QR code then carries no
+/// reachable endpoint and the phone pairs over BLE.
 pub(crate) async fn open_transports<Bind, BindFut, OpenFirewall, FirewallFut>(
-    transports: PairingTransports,
+    transports: EnabledTransports,
     bind: Bind,
     open_firewall: OpenFirewall,
 ) -> Result<PairingPorts, TransportSetupError>
@@ -633,7 +600,7 @@ where
 pub(crate) fn start_session_state(
     keypair: Ed25519KeyPair,
     hostname: &str,
-    transports: PairingTransports,
+    transports: EnabledTransports,
     ports: &PairingPorts,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
@@ -2387,7 +2354,7 @@ mod tests {
         };
 
         let ports = open_transports(
-            pairing_transports(false, true),
+            EnabledTransports::new(false, true),
             counting_bind,
             counting_firewall,
         )
@@ -2428,7 +2395,7 @@ mod tests {
             }
         };
         let ports = open_transports(
-            pairing_transports(true, true),
+            EnabledTransports::new(true, true),
             counting_bind,
             counting_firewall,
         )
@@ -2443,7 +2410,7 @@ mod tests {
     /// The config toggles map straight onto the transport decision, and a build
     /// without the `ble` feature never counts BLE as available.
     ///
-    /// The defects this catches: `pairing_transports` taking `enable_ble` as the
+    /// The defects this catches: `EnabledTransports::new` taking `enable_ble` as the
     /// whole answer, so a daemon compiled without the `ble` feature plans a session
     /// around an advertisement it cannot start — with `enable_network = false` that
     /// is a session no phone can reach, and `StartPairing` would accept it. The
@@ -2453,27 +2420,27 @@ mod tests {
     #[test]
     fn the_config_toggles_map_straight_onto_the_transport_decision() {
         assert_eq!(
-            pairing_transports(false, true),
-            PairingTransports {
+            EnabledTransports::new(false, true),
+            EnabledTransports {
                 network: false,
                 ble: cfg!(feature = "ble"),
             }
         );
         assert_eq!(
-            pairing_transports(true, false),
-            PairingTransports {
+            EnabledTransports::new(true, false),
+            EnabledTransports {
                 network: true,
                 ble: false
             }
         );
         // The one configuration no pairing session can run with.
         assert!(
-            !pairing_transports(false, false).any(),
+            !EnabledTransports::new(false, false).any(),
             "no transport at all must be reported as such"
         );
-        assert!(pairing_transports(true, false).any());
+        assert!(EnabledTransports::new(true, false).any());
         assert_eq!(
-            pairing_transports(false, true).any(),
+            EnabledTransports::new(false, true).any(),
             cfg!(feature = "ble"),
             "with the network off, only a build with the ble feature has a transport"
         );
@@ -2569,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_network_transport_advertises_no_udp_endpoint_in_the_qr() {
         let ports = open_transports(
-            pairing_transports(false, true),
+            EnabledTransports::new(false, true),
             bind_pairing_socket,
             |_port: u16| async { Ok::<_, FirewallError>(None) },
         )
@@ -2580,7 +2547,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_transports(false, true),
+            EnabledTransports::new(false, true),
             &ports,
             Some(Ipv4Addr::new(192, 168, 1, 5)),
             Some(Ipv6Addr::LOCALHOST),
@@ -2608,7 +2575,7 @@ mod tests {
         // Positive control: with the network transport on, the very same inputs
         // produce the UDP endpoint — so the assertions above are not vacuous.
         let ports = open_transports(
-            pairing_transports(true, true),
+            EnabledTransports::new(true, true),
             bind_pairing_socket,
             |_port: u16| async { Ok::<_, FirewallError>(None) },
         )
@@ -2617,7 +2584,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_transports(true, true),
+            EnabledTransports::new(true, true),
             &ports,
             Some(Ipv4Addr::new(192, 168, 1, 5)),
             None,
@@ -2642,7 +2609,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_transports(false, true),
+            EnabledTransports::new(false, true),
             &PairingPorts {
                 udp: None,
                 local_port: 0,

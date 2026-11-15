@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::pairing::{self, CompletedPairing, SessionPhase};
+use crate::transport::EnabledTransports;
 
 pub use crate::pairing::PairingState;
 
@@ -155,9 +156,7 @@ pub async fn handle_admin_request(
             // The toggles are read per request, like `AuthSession::handle_authenticate`
             // does, so a change made in the GUI takes effect on the next attempt
             // without a daemon restart.
-            let toml_config = shared::config::TapAuthConfig::load();
-            let transports =
-                pairing::pairing_transports(toml_config.enable_network, toml_config.enable_ble);
+            let transports = EnabledTransports::from_config();
             (
                 handle_start_pairing(&daemon, pairing_state, transports).await,
                 false,
@@ -240,7 +239,7 @@ async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::A
 async fn handle_start_pairing(
     daemon: &Arc<DaemonState>,
     pairing_state: &Arc<Mutex<Option<PairingState>>>,
-    transports: pairing::PairingTransports,
+    transports: EnabledTransports,
 ) -> ipc::AdminResponse {
     // A session with neither transport can never be reached: no UDP socket is
     // bound, so the QR code carries no endpoint and no firewall rule exists, and no
@@ -248,15 +247,10 @@ async fn handle_start_pairing(
     // would hold a session that can only expire. Refused here, before anything is
     // keyed, bound or spawned. `enable_ble` alone does not make BLE available: a
     // daemon built without the `ble` feature has no advertisement to start, which is
-    // why `pairing_transports` gates it on the feature too.
-    if !transports.any() {
-        tracing::info!(
-            "Refusing StartPairing: all transports (BLE and Local Network) are disabled"
-        );
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            "All transports (BLE and Local Network) are disabled",
-        );
+    // why `EnabledTransports` gates it on the feature too.
+    if let Some(reason) = transports.refusal() {
+        tracing::info!("Refusing StartPairing: {}", reason);
+        return err_resp(ipc::AdminStatus::AdminError, reason);
     }
 
     // The Ed25519 keypair identifies this client to the server during pairing.
@@ -955,7 +949,7 @@ mod tests {
         let refusal = handle_start_pairing(
             &daemon,
             &pairing_state,
-            pairing::pairing_transports(false, false),
+            EnabledTransports::new(false, false),
         )
         .await;
 
