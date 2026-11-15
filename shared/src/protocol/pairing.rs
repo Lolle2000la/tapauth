@@ -152,17 +152,16 @@ pub const PAIRING_COMPLETE_AAD_CONTEXT: &[u8] = b"tapauth-pair-v2-complete";
 
 /// Symmetric AEAD algorithms this implementation supports, baseline mandatory first.
 ///
-/// The negotiation keeps this order: both sides list the baseline algorithm first
-/// so an older peer still intersects on it.
-pub const SUPPORTED_SYMMETRIC_ALGORITHMS: &[SymmetricAlgorithm] = &[
-    SymmetricAlgorithm::Aes256Gcm,
-    // prost renders `CHACHA20_POLY1305` as `Chacha20Poly1305` (not `ChaCha20Poly1305`).
-    SymmetricAlgorithm::Chacha20Poly1305,
-];
+/// The negotiation keeps this order: `pick_first(SUPPORTED_*, theirs)` walks this
+/// slice, so an algorithm added here is chosen ahead of any later entry while a
+/// peer that only lists the baseline still intersects on it. A future upgrade
+/// therefore puts the Client's newly preferred algorithm **first** (Servers list
+/// every algorithm they implement, baseline included, so older Clients still
+/// agree on the baseline).
+pub const SUPPORTED_SYMMETRIC_ALGORITHMS: &[SymmetricAlgorithm] = &[SymmetricAlgorithm::Aes256Gcm];
 
 /// Hash algorithms this implementation supports, baseline mandatory first.
-pub const SUPPORTED_HASH_ALGORITHMS: &[HashAlgorithm] =
-    &[HashAlgorithm::Sha256, HashAlgorithm::Blake3];
+pub const SUPPORTED_HASH_ALGORITHMS: &[HashAlgorithm] = &[HashAlgorithm::Sha256];
 
 /// Signature algorithms this implementation supports, baseline mandatory first.
 pub const SUPPORTED_SIGNATURE_ALGORITHMS: &[SignatureAlgorithm] = &[SignatureAlgorithm::Ed25519];
@@ -1346,6 +1345,27 @@ mod tests {
         (desktop, phone)
     }
 
+    /// A `PairingInit` carrying the given **raw wire ids** in its three lists, so a
+    /// test can advertise a tag no enum member names (`2`, `99`). The key material
+    /// is fixed, like [`seeded_desktop`]'s, so the negotiation outcome is the
+    /// only variable.
+    fn init_with_algorithms(
+        symmetric: Vec<i32>,
+        hash: Vec<i32>,
+        signature: Vec<i32>,
+    ) -> PairingInit {
+        PairingInit {
+            server_x25519_public_key: X25519KeyPair::from_secret_bytes([0x22; 32])
+                .public_key_bytes()
+                .to_vec(),
+            server_ed25519_public_key: phone_identity().verifying_key_bytes().to_vec(),
+            server_device_name: "pixel".to_string(),
+            supported_symmetric_algorithms: symmetric,
+            supported_hash_algorithms: hash,
+            supported_signature_algorithms: signature,
+        }
+    }
+
     fn assert_sas_shape(sas: &str) {
         let bytes = sas.as_bytes();
         assert_eq!(bytes.len(), 7, "SAS must look like ddd-ddd, got {sas:?}");
@@ -1394,10 +1414,15 @@ mod tests {
         assert_eq!(init.server_device_name, "pixel");
         assert_eq!(
             init.supported_symmetric_algorithms,
-            vec![
-                SymmetricAlgorithm::Aes256Gcm as i32,
-                SymmetricAlgorithm::Chacha20Poly1305 as i32
-            ]
+            vec![SymmetricAlgorithm::Aes256Gcm as i32]
+        );
+        assert_eq!(
+            init.supported_hash_algorithms,
+            vec![HashAlgorithm::Sha256 as i32]
+        );
+        assert_eq!(
+            init.supported_signature_algorithms,
+            vec![SignatureAlgorithm::Ed25519 as i32]
         );
 
         let response = desktop.handle_init(&init).unwrap().clone();
@@ -1673,12 +1698,100 @@ mod tests {
         ));
     }
 
+    /// A `PairingInit` whose only advertised ids are the **reserved** tag `2`
+    /// (retired `CHACHA20_POLY1305` / `BLAKE3`) must be refused, not defaulted
+    /// and not accepted because "something was advertised".
+    /// The defect this catches: a decoder that drops ids it cannot name from the
+    /// list (leaving it empty and the negotiation free to pick a suite the peer
+    /// never offered), or one that maps an unknown id onto the baseline.
+    #[test]
+    fn init_advertising_only_the_reserved_algorithm_tag_is_refused() {
+        let mut init = init_with_algorithms(vec![2], vec![1], vec![1]);
+        let mut desktop = seeded_desktop([0x6Au8; PAIRING_SESSION_ID_LEN]);
+        assert!(
+            matches!(
+                desktop.handle_init(&init).unwrap_err(),
+                ProtocolError::UnsupportedAlgorithm
+            ),
+            "a peer advertising only tag 2 must be refused"
+        );
+
+        // The same raw tag in the hash list.
+        init = init_with_algorithms(vec![1], vec![2], vec![1]);
+        let mut desktop = seeded_desktop([0x6Au8; PAIRING_SESSION_ID_LEN]);
+        assert!(
+            matches!(
+                desktop.handle_init(&init).unwrap_err(),
+                ProtocolError::UnsupportedAlgorithm
+            ),
+            "a peer advertising only hash tag 2 must be refused"
+        );
+
+        // Nothing was committed by either refusal.
+        assert!(desktop.response().is_none());
+        assert!(desktop.negotiated().is_none());
+        assert!(desktop.sas().is_none());
+    }
+
+    /// An id this build cannot name at all (`99`) is refused for every list.
+    /// The defect this catches: `try_from` collapsing an unknown id onto a
+    /// default variant, which would both accept the offer and hash a different
+    /// transcript than the peer did.
+    #[test]
+    fn init_advertising_only_an_unknown_algorithm_id_is_refused() {
+        for lists in [
+            (vec![99], vec![1], vec![1]),
+            (vec![1], vec![99], vec![1]),
+            (vec![1], vec![1], vec![99]),
+        ] {
+            let (symmetric, hash, signature) = lists.clone();
+            let init = init_with_algorithms(symmetric, hash, signature);
+            let mut desktop = seeded_desktop([0x6Bu8; PAIRING_SESSION_ID_LEN]);
+            assert!(
+                matches!(
+                    desktop.handle_init(&init).unwrap_err(),
+                    ProtocolError::UnsupportedAlgorithm
+                ),
+                "lists {lists:?} must be refused"
+            );
+            assert!(desktop.response().is_none());
+        }
+    }
+
+    /// An empty advertised list is refused rather than silently allowing a
+    /// default suite: empty means "I support nothing", which cannot be negotiated.
+    /// The defect this catches: `pick_first` returning a default when the
+    /// intersection is empty (`unwrap_or(Aes256Gcm)`), which would pair with a
+    /// peer that never agreed to the suite.
+    #[test]
+    fn init_advertising_no_algorithms_is_refused() {
+        for lists in [
+            (Vec::new(), vec![1], vec![1]),
+            (vec![1], Vec::new(), vec![1]),
+            (vec![1], vec![1], Vec::new()),
+        ] {
+            let (symmetric, hash, signature) = lists.clone();
+            let init = init_with_algorithms(symmetric, hash, signature);
+            let mut desktop = seeded_desktop([0x6Cu8; PAIRING_SESSION_ID_LEN]);
+            assert!(
+                matches!(
+                    desktop.handle_init(&init).unwrap_err(),
+                    ProtocolError::UnsupportedAlgorithm
+                ),
+                "lists {lists:?} must be refused"
+            );
+            assert!(desktop.negotiated().is_none());
+            assert!(desktop.sas().is_none());
+        }
+    }
+
     #[test]
     fn response_selecting_unadvertised_algorithm_is_rejected() {
         let (mut desktop, started) = start_desktop();
         let mut phone =
             ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
-        // The phone only advertises AES-256-GCM, so it can never accept ChaCha20.
+        // The phone only advertises AES-256-GCM, so it can never accept the
+        // reserved tag 2 (or any other id it did not list).
         phone.advertised_symmetric = vec![SymmetricAlgorithm::Aes256Gcm];
         let init = phone.create_init().unwrap();
         assert_eq!(
@@ -1691,7 +1804,7 @@ mod tests {
             response.selected_symmetric_algorithm,
             SymmetricAlgorithm::Aes256Gcm as i32
         );
-        response.selected_symmetric_algorithm = SymmetricAlgorithm::Chacha20Poly1305 as i32;
+        response.selected_symmetric_algorithm = 2;
         assert!(matches!(
             phone
                 .verify_response(&response, &started.client_x25519_public_key)
@@ -1954,8 +2067,11 @@ mod tests {
             .to_vec();
 
         let mut reordered = init.clone();
+        // Same algorithm, duplicated: the *list* enters H verbatim (length and
+        // order included), so a peer that advertises it twice hashes differently
+        // even though the negotiated pair is identical.
         reordered.supported_hash_algorithms =
-            vec![HashAlgorithm::Blake3 as i32, HashAlgorithm::Sha256 as i32];
+            vec![HashAlgorithm::Sha256 as i32, HashAlgorithm::Sha256 as i32];
 
         for (field, mutated_init) in [
             ("server_device_name", renamed),
@@ -2042,29 +2158,30 @@ mod tests {
         (outcome, started.client_x25519_public_key)
     }
 
-    /// A pinned algorithm must be selected even though the baseline (AES-256-GCM)
-    /// is also on offer, because the client-wide CSK is already committed to it.
-    /// The defect this catches: negotiation ignoring the pins and picking the
-    /// baseline-first algorithm, which would silently produce a pairing whose
-    /// broadcast every already-paired server fails to decrypt.
+    /// A pinned suite is selected, reported in the `PairingResponse`, and the whole
+    /// pairing completes under it.
+    /// The defect this catches: negotiation ignoring the pins and reporting a
+    /// different pair than the one the client-wide `CSK` is committed to, which
+    /// would silently produce a pairing whose broadcast every already-paired
+    /// server fails to decrypt. (With one active primitive per slot the pinned
+    /// pair and the baseline are the same values, so what is exercised here is
+    /// that the pin path runs at all and reports itself, not that it outvotes a
+    /// baseline.)
     #[test]
-    fn pinned_algorithms_win_over_the_baseline() {
+    fn a_pinned_suite_is_selected_and_the_pairing_completes() {
         let pinned = PinnedAlgorithms {
-            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+            symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
             hash_algorithm: HashAlgorithm::Sha256,
         };
         let (outcome, _qr_pk) = pair_with_pins(
             Some(pinned),
-            vec![
-                SymmetricAlgorithm::Aes256Gcm,
-                SymmetricAlgorithm::Chacha20Poly1305,
-            ],
-            vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Sha256],
         );
         let (desktop, mut phone) = outcome.expect("a pinned algorithm the peer offers must pair");
 
         let expected = NegotiatedAlgorithms {
-            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+            symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
             hash_algorithm: HashAlgorithm::Sha256,
             signature_algorithm: SignatureAlgorithm::Ed25519,
         };
@@ -2072,7 +2189,11 @@ mod tests {
         assert_eq!(phone.negotiated(), Some(expected));
         assert_eq!(
             desktop.response().unwrap().selected_symmetric_algorithm,
-            SymmetricAlgorithm::Chacha20Poly1305 as i32
+            SymmetricAlgorithm::Aes256Gcm as i32
+        );
+        assert_eq!(
+            desktop.response().unwrap().selected_hash_algorithm,
+            HashAlgorithm::Sha256 as i32
         );
 
         // The whole pairing still completes under the pinned algorithm.
@@ -2089,35 +2210,36 @@ mod tests {
             .verify_confirm_server(&confirm_server, &csk)
             .unwrap();
         assert_eq!(desktop.sas(), phone.sas());
-
-        // A pinned hash also cannot be overridden by the peer's order.
-        let (outcome, _qr_pk) = pair_with_pins(
-            Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
-                hash_algorithm: HashAlgorithm::Blake3,
-            }),
-            vec![SymmetricAlgorithm::Aes256Gcm],
-            vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
-        );
-        let (desktop, _phone) = outcome.unwrap();
-        assert_eq!(
-            desktop.negotiated().unwrap().hash_algorithm,
-            HashAlgorithm::Blake3
-        );
     }
 
-    /// A peer that does not offer the pinned symmetric algorithm cannot be paired,
-    /// and the refusal must not leave a half-established session behind.
+    /// A peer that does not offer the pinned suite cannot be paired, and the
+    /// refusal must not leave a half-established session behind.
     /// The defect this catches: falling back to a negotiated algorithm the CSK is
     /// not using (the "pair a second phone at the wrong algorithm" bug).
     #[test]
     fn pinned_symmetric_algorithm_absent_from_the_peer_is_refused() {
+        // The peer's hash list is empty, so the pinned hash cannot be honoured.
         let (outcome, _qr_pk) = pair_with_pins(
             Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
                 hash_algorithm: HashAlgorithm::Sha256,
             }),
             vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![],
+        );
+        match outcome {
+            Err(ProtocolError::UnsupportedAlgorithm) => {}
+            Err(other) => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+            Ok(_) => panic!("a peer without the pinned hash algorithm must be refused"),
+        }
+
+        // Same for the symmetric algorithm: an empty list offers nothing.
+        let (outcome, _qr_pk) = pair_with_pins(
+            Some(PinnedAlgorithms {
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+                hash_algorithm: HashAlgorithm::Sha256,
+            }),
+            vec![],
             vec![HashAlgorithm::Sha256],
         );
         match outcome {
@@ -2126,38 +2248,22 @@ mod tests {
             Ok(_) => panic!("a peer without the pinned symmetric algorithm must be refused"),
         }
 
-        // Same for the hash algorithm: SHA-256/SHA-256 pinned, BLAKE3-only peer.
-        let (outcome, _qr_pk) = pair_with_pins(
-            Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
-                hash_algorithm: HashAlgorithm::Sha256,
-            }),
-            vec![SymmetricAlgorithm::Aes256Gcm],
-            vec![HashAlgorithm::Blake3],
-        );
-        match outcome {
-            Err(ProtocolError::UnsupportedAlgorithm) => {}
-            Err(other) => panic!("expected UnsupportedAlgorithm, got {other:?}"),
-            Ok(_) => panic!("a peer without the pinned hash algorithm must be refused"),
-        }
-
         // The refusal leaves the desktop state untouched: no response, no keys.
         let session_id = [0x7Fu8; PAIRING_SESSION_ID_LEN];
-        let (mut desktop, started) = ClientPairingState::build(
+        let (mut desktop, _started) = ClientPairingState::build(
             session_id,
             X25519KeyPair::from_secret_bytes([0x11; 32]),
             desktop_identity(),
             "thinkpad",
             PairingEndpoint::default(),
             Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
                 hash_algorithm: HashAlgorithm::Sha256,
             }),
         );
-        let mut phone =
-            ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
-        phone.advertised_symmetric = vec![SymmetricAlgorithm::Aes256Gcm];
-        let init = phone.create_init().unwrap();
+        // The peer's hash list carries only the reserved tag: nothing the pin can
+        // be honoured with.
+        let init = init_with_algorithms(vec![1], vec![2], vec![1]);
         assert!(matches!(
             desktop.handle_init(&init).unwrap_err(),
             ProtocolError::UnsupportedAlgorithm
@@ -2167,17 +2273,16 @@ mod tests {
         assert!(desktop.keys.is_none());
     }
 
-    /// Without pins, negotiation keeps the baseline-first behaviour that lets an
-    /// older peer intersect on AES-256-GCM + SHA-256.
+    /// Without pins, negotiation selects the suite the peer offers.
+    /// (With a single active primitive per slot there is no second value for the
+    /// peer's list order to steer negotiation towards; what remains verified here
+    /// is that the unpinned path still negotiates and reports the triple.)
     #[test]
-    fn unpinned_negotiation_keeps_the_baseline() {
+    fn unpinned_negotiation_selects_the_offered_suite() {
         let (outcome, _qr_pk) = pair_with_pins(
             None,
-            vec![
-                SymmetricAlgorithm::Chacha20Poly1305,
-                SymmetricAlgorithm::Aes256Gcm,
-            ],
-            vec![HashAlgorithm::Blake3, HashAlgorithm::Sha256],
+            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![HashAlgorithm::Sha256],
         );
         let (desktop, phone) = outcome.unwrap();
         let expected = NegotiatedAlgorithms {
@@ -2548,105 +2653,6 @@ mod tests {
         assert!(unused_phone.ephemeral_keypair_present());
         unused_phone.conclude();
         assert!(!unused_phone.ephemeral_keypair_present());
-    }
-
-    // --- 10. ChaCha20-Poly1305 pairing -----------------------------------
-
-    /// A pairing that negotiates ChaCha20-Poly1305 must seal *both* confirm
-    /// messages with it. The test proves the algorithm actually reached the AEAD by
-    /// opening the ciphertext with the same key under ChaCha (it works) and under
-    /// AES-256-GCM (it must not).
-    /// The defect this catches: confirm paths that ignore
-    /// `negotiated.symmetric_algorithm` and always use AES-256-GCM, which no peer
-    /// that negotiated ChaCha could ever decrypt.
-    #[test]
-    fn chacha20_poly1305_pairing_seals_both_confirm_messages() {
-        let (outcome, _qr_pk) = pair_with_pins(
-            Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-                hash_algorithm: HashAlgorithm::Sha256,
-            }),
-            vec![
-                SymmetricAlgorithm::Chacha20Poly1305,
-                SymmetricAlgorithm::Aes256Gcm,
-            ],
-            vec![HashAlgorithm::Sha256],
-        );
-        let (desktop, mut phone) = outcome.unwrap();
-        assert_eq!(
-            desktop.negotiated().unwrap().symmetric_algorithm,
-            SymmetricAlgorithm::Chacha20Poly1305
-        );
-        assert_eq!(
-            phone.negotiated().unwrap().symmetric_algorithm,
-            SymmetricAlgorithm::Chacha20Poly1305
-        );
-
-        let csk = [0x42u8; 32];
-        let confirm_client = desktop
-            .create_confirm_client(&csk, "luca", "thinkpad")
-            .unwrap();
-        // The desktop's own keys are what both messages are opened with.
-        let keys = desktop.keys.as_ref().unwrap();
-        let transcript_hash = *desktop.transcript_hash().unwrap();
-
-        let provision_aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, &transcript_hash);
-        assert_eq!(
-            decrypt_with_key(
-                SymmetricAlgorithm::Chacha20Poly1305,
-                &keys.k_c2s,
-                &confirm_client.encrypted_payload,
-                &provision_aad,
-            )
-            .unwrap(),
-            PairingProvisionPayload {
-                csk: csk.to_vec(),
-                username: "luca".to_string(),
-                client_hostname: "thinkpad".to_string(),
-            }
-            .encode_to_vec()
-        );
-        assert!(matches!(
-            decrypt_with_key(
-                SymmetricAlgorithm::Aes256Gcm,
-                &keys.k_c2s,
-                &confirm_client.encrypted_payload,
-                &provision_aad,
-            ),
-            Err(CryptoError::DecryptionFailed)
-        ));
-
-        // The high-level path agrees, and the phone's completion proof is ChaCha too.
-        assert_eq!(
-            phone.process_confirm_client(&confirm_client).unwrap().csk,
-            csk.to_vec()
-        );
-        let confirm_server = phone.create_confirm_server(&csk).unwrap();
-        let complete_aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
-        assert_eq!(
-            decrypt_with_key(
-                SymmetricAlgorithm::Chacha20Poly1305,
-                &desktop.keys.as_ref().unwrap().k_s2c,
-                &confirm_server.encrypted_complete,
-                &complete_aad,
-            )
-            .unwrap()
-            .len(),
-            64 + 2,
-        );
-        assert!(matches!(
-            decrypt_with_key(
-                SymmetricAlgorithm::Aes256Gcm,
-                &desktop.keys.as_ref().unwrap().k_s2c,
-                &confirm_server.encrypted_complete,
-                &complete_aad,
-            ),
-            Err(CryptoError::DecryptionFailed)
-        ));
-        desktop
-            .verify_confirm_server(&confirm_server, &csk)
-            .unwrap();
-        assert_eq!(desktop.sas(), phone.sas());
     }
 
     // --- Misc -------------------------------------------------------------

@@ -24,9 +24,10 @@ pub fn current_time_window() -> Result<u64, CryptoError> {
 
 /// Derive the keyed MAC of the time window using the negotiated hash algorithm.
 ///
-/// `SHA256` is HMAC-SHA256, `BLAKE3` is keyed BLAKE3
-/// (cryptography-specification.md §1). The full 32-byte MAC is returned; callers
-/// truncate it to the identifier length they need.
+/// `SHA256` is HMAC-SHA256 and is the only keyed MAC this build implements
+/// (cryptography-specification.md §1); the parameter stays so a future release
+/// can add a second suite. The full 32-byte MAC is returned; callers truncate it
+/// to the identifier length they need.
 fn keyed_window_mac(
     csk: &ClientSymmetricKey,
     window: u64,
@@ -41,7 +42,6 @@ fn keyed_window_mac(
             mac.update(&window_bytes);
             Ok(mac.finalize().into_bytes().into())
         }
-        HashAlgorithm::Blake3 => Ok(*blake3::keyed_hash(csk.as_bytes(), &window_bytes).as_bytes()),
         HashAlgorithm::Unspecified => Err(CryptoError::UnsupportedAlgorithm),
     }
 }
@@ -261,42 +261,6 @@ mod tests {
         );
     }
 
-    /// BLAKE3 must be a different keyed MAC from HMAC-SHA256, deterministic, and
-    /// truncated to 16 / 10 bytes.
-    /// The defect this catches: BLAKE3 silently falling back to SHA-256 (all
-    /// paired Servers using BLAKE3 would never match) or emitting the wrong length.
-    #[test]
-    fn test_blake3_temporal_identifiers() {
-        let csk = ClientSymmetricKey::from_bytes([9u8; 32]);
-        let window = 41_000_001u64;
-
-        let sha16 = generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
-        let blake16 = generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Blake3).unwrap();
-        assert_eq!(blake16.len(), 16);
-        assert_ne!(blake16, sha16);
-        // Deterministic.
-        assert_eq!(
-            blake16,
-            generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Blake3).unwrap()
-        );
-        // Exactly keyed_blake3(csk, be64(window)) truncated to 16 bytes.
-        let expected = blake3::keyed_hash(csk.as_bytes(), &window.to_be_bytes());
-        assert_eq!(blake16.as_slice(), expected.as_bytes().get(..16).unwrap());
-
-        let sha10 = generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256).unwrap();
-        let blake10 =
-            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Blake3).unwrap();
-        assert_eq!(blake10.len(), 10);
-        assert_ne!(blake10, sha10);
-        assert_eq!(blake10.as_slice(), expected.as_bytes().get(..10).unwrap());
-
-        // A different window changes the BLAKE3 identifier.
-        assert_ne!(
-            blake16,
-            generate_temporal_id_with_alg(&csk, window + 1, HashAlgorithm::Blake3).unwrap()
-        );
-    }
-
     /// `UNSPECIFIED` (and therefore any unknown algorithm) must be rejected
     /// rather than defaulting to a hash.
     #[test]
@@ -373,36 +337,6 @@ mod tests {
             generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Sha256)
         })
         .unwrap());
-    }
-
-    /// BLAKE3 verification accepts the current window's identifier and rejects an
-    /// identifier from two windows ago — the same replay window as SHA-256.
-    #[test]
-    fn test_blake3_verification_window() {
-        let csk = ClientSymmetricKey::generate().unwrap();
-        let window = current_time_window().unwrap();
-        assert!(window > 1, "system clock may be broken");
-
-        let current = generate_temporal_id_with_alg(&csk, window, HashAlgorithm::Blake3).unwrap();
-        assert!(
-            verify_temporal_identifier_with_alg(&csk, &current, HashAlgorithm::Blake3).unwrap()
-        );
-
-        let previous =
-            generate_temporal_id_with_alg(&csk, window - 1, HashAlgorithm::Blake3).unwrap();
-        assert!(
-            verify_temporal_identifier_with_alg(&csk, &previous, HashAlgorithm::Blake3).unwrap()
-        );
-
-        let stale = generate_temporal_id_with_alg(&csk, window - 2, HashAlgorithm::Blake3).unwrap();
-        assert!(!verify_temporal_identifier_with_alg(&csk, &stale, HashAlgorithm::Blake3).unwrap());
-
-        let ble_current =
-            generate_ble_temporal_id_with_alg(&csk, window, HashAlgorithm::Blake3).unwrap();
-        assert!(
-            verify_ble_temporal_identifier_with_alg(&csk, &ble_current, HashAlgorithm::Blake3)
-                .unwrap()
-        );
     }
 
     /// The BLE pairing advertisement identifier is a plain SHA-256 (not keyed),

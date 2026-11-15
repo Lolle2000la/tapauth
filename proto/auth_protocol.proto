@@ -9,17 +9,27 @@ package tapauth.protocol;
 // Symmetric AEAD algorithms used to encrypt EncryptedPacket and pairing payloads.
 // All defined algorithms use a 32-byte key, a 12-byte random nonce prepended to
 // the ciphertext, and a 16-byte authentication tag.
+//
+// AES_256_GCM is the single active algorithm of Protocol v2. The enum, the
+// `supported_*` / `selected_*` negotiation fields and the cleartext header tag
+// stay in place so a future release can add an algorithm without a wire change.
+// Tag 2 is reserved: it was `CHACHA20_POLY1305` in pre-release builds and must
+// never be handed to a different algorithm.
 enum SymmetricAlgorithm {
+  reserved 2;
   SYMMETRIC_ALGORITHM_UNSPECIFIED = 0;
   AES_256_GCM = 1;
-  CHACHA20_POLY1305 = 2;
 }
 
-// Hash algorithms used for HMAC-based temporal identifier derivation.
+// Hash algorithms used for the keyed MAC that derives temporal identifiers
+// (the keyed MAC of a time window, see cryptography-specification.md §1).
+//
+// SHA256 is HMAC-SHA256 and is the single active algorithm of Protocol v2; tag 2
+// is reserved (it was `BLAKE3` in pre-release builds).
 enum HashAlgorithm {
+  reserved 2;
   HASH_ALGORITHM_UNSPECIFIED = 0;
   SHA256 = 1;
-  BLAKE3 = 2;
 }
 
 // Digital signature algorithms used for WrapperMessage and pairing identity proofs.

@@ -262,9 +262,9 @@ mod tests {
         let supported = (
             vec![
                 SymmetricAlgorithm::Aes256Gcm,
-                SymmetricAlgorithm::Chacha20Poly1305,
+                SymmetricAlgorithm::Unspecified,
             ],
-            vec![HashAlgorithm::Sha256, HashAlgorithm::Blake3],
+            vec![HashAlgorithm::Sha256, HashAlgorithm::Unspecified],
             vec![SignatureAlgorithm::Ed25519],
         );
 
@@ -337,7 +337,7 @@ mod tests {
         // Supported list member (same length, different order/content).
         let reordered = (
             vec![
-                SymmetricAlgorithm::Chacha20Poly1305,
+                SymmetricAlgorithm::Unspecified,
                 SymmetricAlgorithm::Aes256Gcm,
             ],
             supported.1.clone(),
@@ -349,7 +349,7 @@ mod tests {
 
         let hash_lists = (
             supported.0.clone(),
-            vec![HashAlgorithm::Blake3, HashAlgorithm::Sha256],
+            vec![HashAlgorithm::Unspecified, HashAlgorithm::Sha256],
             supported.2.clone(),
         );
         let mut variant = base;
@@ -367,11 +367,11 @@ mod tests {
 
         // Each selected algorithm.
         let mut variant = base;
-        variant.selected_symmetric = SymmetricAlgorithm::Chacha20Poly1305;
+        variant.selected_symmetric = SymmetricAlgorithm::Unspecified;
         assert_ne!(base_hash, compute_pairing_transcript_hash(&variant));
 
         let mut variant = base;
-        variant.selected_hash = HashAlgorithm::Blake3;
+        variant.selected_hash = HashAlgorithm::Unspecified;
         assert_ne!(base_hash, compute_pairing_transcript_hash(&variant));
 
         let mut variant = base;

@@ -257,8 +257,8 @@ pub fn generate_keypair() -> Result<Vec<Vec<u8>>, TapauthError> {
 ///
 /// * `encrypted_packet_bytes` - serialized `EncryptedPacket`
 /// * `csk` - 32-byte Client Symmetric Key
-/// * `expected_symmetric_algorithm` - negotiated `SymmetricAlgorithm` id (1 =
-///   AES-256-GCM, 2 = ChaCha20-Poly1305)
+/// * `expected_symmetric_algorithm` - negotiated `SymmetricAlgorithm` id
+///   (`1` = AES-256-GCM; `0`, the reserved tag `2` and any other id are refused)
 ///
 /// ## Returns
 ///
@@ -499,9 +499,10 @@ pub fn create_denial_wrapper_message(
 
 /// Derive the 16-byte UDP/GATT temporal identifier for `window`.
 ///
-/// The identifier is `HMAC-SHA256(csk, be64(window))` (or keyed BLAKE3) truncated to
-/// 16 bytes, so it proves CSK possession without revealing the key. Each paired
-/// Client persists its own `hashAlgorithm`; Kotlin must pass that stored value.
+/// The identifier is `HMAC-SHA256(csk, be64(window))` (the only keyed MAC this
+/// build implements) truncated to 16 bytes, so it proves CSK possession without
+/// revealing the key. Each paired Client persists its own `hashAlgorithm`; Kotlin
+/// must pass that stored value.
 ///
 /// ## Errors
 ///
@@ -936,9 +937,10 @@ mod tests {
     use prost::Message as ProstMessage;
 
     const AES: i32 = SymmetricAlgorithm::Aes256Gcm as i32;
-    const CHACHA: i32 = SymmetricAlgorithm::Chacha20Poly1305 as i32;
+    /// Reserved `SymmetricAlgorithm` / `HashAlgorithm` tag: it was
+    /// `CHACHA20_POLY1305` / `BLAKE3` and names nothing in this build.
+    const RESERVED_ALGORITHM_ID: i32 = 2;
     const SHA256: i32 = HashAlgorithm::Sha256 as i32;
-    const BLAKE3: i32 = HashAlgorithm::Blake3 as i32;
     const ED25519: i32 = SignatureAlgorithm::Ed25519 as i32;
 
     fn context_request(challenge: [u8; 32]) -> AuthenticationRequest {
@@ -1045,74 +1047,72 @@ mod tests {
     // decryptEncryptedPacket
     // ---------------------------------------------------------------
 
-    /// A genuine packet decrypts to the exact serialized `WrapperMessage` bytes for
-    /// both AEAD algorithms, byte for byte — including protobuf fields this build does
-    /// not know, which a decode/re-encode round trip would silently drop.
+    /// A genuine packet decrypts to the exact serialized `WrapperMessage` bytes, byte
+    /// for byte — including protobuf fields this build does not know, which a
+    /// decode/re-encode round trip would silently drop.
     /// The defect this catches: a decrypt path that ignores the caller's pinned
-    /// algorithm, rebuilds the plaintext from a decoded struct instead of returning the
-    /// peer's bytes, or only implements one of the two negotiated algorithms.
+    /// algorithm, or one that rebuilds the plaintext from a decoded struct instead of
+    /// returning the peer's bytes.
     #[test]
-    fn decrypt_packet_accepts_genuine_packets_for_both_algorithms() {
+    fn decrypt_packet_accepts_a_genuine_packet_verbatim() {
         let csk = ClientSymmetricKey::generate().unwrap();
         let keypair = Ed25519KeyPair::generate().unwrap();
         let csk_bytes = *csk.as_bytes();
 
-        for symmetric in [AES, CHACHA] {
-            let algorithm = SymmetricAlgorithm::try_from(symmetric).unwrap();
-            let mut wrapper = wrap_auth_request(context_request([0x21; 32]));
-            sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+        let symmetric = AES;
+        let algorithm = SymmetricAlgorithm::try_from(symmetric).unwrap();
+        let mut wrapper = wrap_auth_request(context_request([0x21; 32]));
+        sign_wrapper_message(&mut wrapper, &keypair).unwrap();
 
-            let packet = create_encrypted_packet_with_csk_nonce(
-                &csk,
-                algorithm,
-                HashAlgorithm::Sha256,
-                &wrapper,
-            )
-            .unwrap();
-            let plaintext =
-                decrypt_encrypted_packet(packet.encode_to_vec(), csk_bytes.to_vec(), symmetric)
-                    .unwrap();
-            assert_eq!(plaintext, wrapper.encode_to_vec());
+        let packet = create_encrypted_packet_with_csk_nonce(
+            &csk,
+            algorithm,
+            HashAlgorithm::Sha256,
+            &wrapper,
+        )
+        .unwrap();
+        let plaintext =
+            decrypt_encrypted_packet(packet.encode_to_vec(), csk_bytes.to_vec(), symmetric)
+                .unwrap();
+        assert_eq!(plaintext, wrapper.encode_to_vec());
 
-            // Hand-build the packet so the plaintext carries an unknown field
-            // (field 99, wire type 2: key 0x031A -> [0x9a, 0x06], len 3, "xyz").
-            // A decrypt that re-encodes a decoded `WrapperMessage` loses those bytes.
-            let mut wire = wrapper.encode_to_vec();
-            wire.extend_from_slice(&[0x9a, 0x06, 0x03, b'x', b'y', b'z']);
-            let temporal_identifier = generate_temporal_id_with_alg(
-                &csk,
-                current_time_window().unwrap() as u64,
-                HashAlgorithm::Sha256,
-            )
-            .unwrap();
-            let aad = encrypted_packet_aad(symmetric, &temporal_identifier);
-            let ciphertext =
-                crate::crypto::encrypt_with_csk_and_random_nonce(&csk, algorithm, &wire, &aad)
-                    .unwrap();
-            let raw_packet = EncryptedPacket {
-                temporal_identifier: temporal_identifier.to_vec(),
-                encryption_algorithm: symmetric,
-                ciphertext,
-            };
+        // Hand-build the packet so the plaintext carries an unknown field
+        // (field 99, wire type 2: key 0x031A -> [0x9a, 0x06], len 3, "xyz").
+        // A decrypt that re-encodes a decoded `WrapperMessage` loses those bytes.
+        let mut wire = wrapper.encode_to_vec();
+        wire.extend_from_slice(&[0x9a, 0x06, 0x03, b'x', b'y', b'z']);
+        let temporal_identifier = generate_temporal_id_with_alg(
+            &csk,
+            current_time_window().unwrap() as u64,
+            HashAlgorithm::Sha256,
+        )
+        .unwrap();
+        let aad = encrypted_packet_aad(symmetric, &temporal_identifier);
+        let ciphertext =
+            crate::crypto::encrypt_with_csk_and_random_nonce(&csk, algorithm, &wire, &aad).unwrap();
+        let raw_packet = EncryptedPacket {
+            temporal_identifier: temporal_identifier.to_vec(),
+            encryption_algorithm: symmetric,
+            ciphertext,
+        };
 
-            let plaintext =
-                decrypt_encrypted_packet(raw_packet.encode_to_vec(), csk_bytes.to_vec(), symmetric)
-                    .unwrap();
-            assert_eq!(
-                plaintext, wire,
-                "the peer's plaintext bytes are returned verbatim"
-            );
+        let plaintext =
+            decrypt_encrypted_packet(raw_packet.encode_to_vec(), csk_bytes.to_vec(), symmetric)
+                .unwrap();
+        assert_eq!(
+            plaintext, wire,
+            "the peer's plaintext bytes are returned verbatim"
+        );
 
-            // The decrypted bytes still verify, so the pipeline is intact end to end.
-            let verified = parse_and_verify_auth_request(
-                plaintext,
-                keypair.verifying_key_bytes().to_vec(),
-                2,
-                ED25519,
-            )
-            .unwrap();
-            assert_eq!(verified.challenge, vec![0x21; 32]);
-        }
+        // The decrypted bytes still verify, so the pipeline is intact end to end.
+        let verified = parse_and_verify_auth_request(
+            plaintext,
+            keypair.verifying_key_bytes().to_vec(),
+            2,
+            ED25519,
+        )
+        .unwrap();
+        assert_eq!(verified.challenge, vec![0x21; 32]);
     }
 
     /// A packet whose header names a different algorithm than the caller pinned is
@@ -1125,16 +1125,17 @@ mod tests {
         let keypair = Ed25519KeyPair::generate().unwrap();
         let csk_bytes = *csk.as_bytes();
 
-        let mut packet =
-            EncryptedPacket::decode(grant_packet(&csk_bytes, &keypair, AES, [0x31; 32]).as_slice())
-                .unwrap();
+        let genuine = grant_packet(&csk_bytes, &keypair, AES, [0x31; 32]);
+        let mut packet = EncryptedPacket::decode(genuine.as_slice()).unwrap();
         assert_eq!(packet.encryption_algorithm, AES);
 
         // Unusable ciphertext: only a pre-decryption check can report a mismatch here.
         packet.ciphertext = vec![0x00];
+        // ...and a header relabelled to a tag this build has no implementation for.
+        packet.encryption_algorithm = RESERVED_ALGORITHM_ID;
         let bytes = packet.encode_to_vec();
 
-        match decrypt_encrypted_packet(bytes.clone(), csk_bytes.to_vec(), CHACHA) {
+        match decrypt_encrypted_packet(bytes.clone(), csk_bytes.to_vec(), AES) {
             Err(TapauthError::Security { detail }) => {
                 assert!(detail.contains("algorithm"), "unexpected message: {detail}");
             }
@@ -1143,16 +1144,24 @@ mod tests {
 
         // Control: with the matching algorithm the same packet is a crypto failure,
         // not an algorithm mismatch.
+        packet.encryption_algorithm = AES;
+        let bytes = packet.encode_to_vec();
         assert!(matches!(
             decrypt_encrypted_packet(bytes.clone(), csk_bytes.to_vec(), AES),
             Err(TapauthError::Security { detail }) if detail.contains("decryption failed")
         ));
 
-        // An unknown/unspecified algorithm id is a caller error, not a security event.
-        assert!(matches!(
-            decrypt_encrypted_packet(bytes, csk_bytes.to_vec(), 0),
-            Err(TapauthError::Argument { .. })
-        ));
+        // An unspecified/retired/unknown algorithm id is a caller error, not a
+        // security event: the caller passed a value no build implements.
+        for unknown in [0, RESERVED_ALGORITHM_ID, 99] {
+            assert!(
+                matches!(
+                    decrypt_encrypted_packet(bytes.clone(), csk_bytes.to_vec(), unknown),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "algorithm id {unknown} must be an argument error"
+            );
+        }
     }
 
     /// A flipped ciphertext bit and a flipped temporal-identifier bit both fail the tag.
@@ -1662,130 +1671,166 @@ mod tests {
         let csk_bytes = *csk.as_bytes();
         let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [0x81u8; 32];
+        let symmetric = AES;
 
-        for symmetric in [AES, CHACHA] {
-            let grant_bytes = create_grant_wrapper_message(
-                challenge.to_vec(),
-                keypair.signing_key_bytes().to_vec(),
-                csk_bytes.to_vec(),
-                symmetric,
-                SHA256,
-            )
-            .expect("grant packet");
-            let signature_algorithm = ED25519;
-            let grant = decrypt_encrypted_packet_with_csk_nonce(
-                &csk,
-                SymmetricAlgorithm::try_from(symmetric).unwrap(),
-                &EncryptedPacket::decode(grant_bytes.as_slice()).unwrap(),
-            )
+        let grant_bytes = create_grant_wrapper_message(
+            challenge.to_vec(),
+            keypair.signing_key_bytes().to_vec(),
+            csk_bytes.to_vec(),
+            symmetric,
+            SHA256,
+        )
+        .expect("grant packet");
+        let signature_algorithm = ED25519;
+        let grant = decrypt_encrypted_packet_with_csk_nonce(
+            &csk,
+            SymmetricAlgorithm::try_from(symmetric).unwrap(),
+            &EncryptedPacket::decode(grant_bytes.as_slice()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(grant.payload_type, PayloadType::AuthGrant as i32);
+        assert_eq!(grant.signature.len(), 64);
+        verify_and_decode_payload(&grant, &keypair.verifying_key_bytes(), signature_algorithm)
             .unwrap();
-            assert_eq!(grant.payload_type, PayloadType::AuthGrant as i32);
-            assert_eq!(grant.signature.len(), 64);
-            verify_and_decode_payload(&grant, &keypair.verifying_key_bytes(), signature_algorithm)
-                .unwrap();
-            assert_eq!(extract_challenge(&grant).unwrap(), challenge.to_vec());
+        assert_eq!(extract_challenge(&grant).unwrap(), challenge.to_vec());
 
-            let denial_bytes = create_denial_wrapper_message(
-                challenge.to_vec(),
-                "user rejected".to_string(),
-                keypair.signing_key_bytes().to_vec(),
-                csk_bytes.to_vec(),
-                symmetric,
-                SHA256,
-            )
-            .expect("denial packet");
-            let denial = decrypt_encrypted_packet_with_csk_nonce(
-                &csk,
-                SymmetricAlgorithm::try_from(symmetric).unwrap(),
-                &EncryptedPacket::decode(denial_bytes.as_slice()).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(denial.payload_type, PayloadType::AuthDenial as i32);
-            match verify_and_decode_payload(
-                &denial,
-                &keypair.verifying_key_bytes(),
-                signature_algorithm,
-            )
-            .unwrap()
-            {
-                DecodedPayload::AuthDenial(message) => {
-                    assert_eq!(message.challenge, challenge.to_vec());
-                    assert_eq!(message.reason, "user rejected");
-                }
-                other => panic!("expected an AuthDenial, got {other:?}"),
+        let denial_bytes = create_denial_wrapper_message(
+            challenge.to_vec(),
+            "user rejected".to_string(),
+            keypair.signing_key_bytes().to_vec(),
+            csk_bytes.to_vec(),
+            symmetric,
+            SHA256,
+        )
+        .expect("denial packet");
+        let denial = decrypt_encrypted_packet_with_csk_nonce(
+            &csk,
+            SymmetricAlgorithm::try_from(symmetric).unwrap(),
+            &EncryptedPacket::decode(denial_bytes.as_slice()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(denial.payload_type, PayloadType::AuthDenial as i32);
+        match verify_and_decode_payload(
+            &denial,
+            &keypair.verifying_key_bytes(),
+            signature_algorithm,
+        )
+        .unwrap()
+        {
+            DecodedPayload::AuthDenial(message) => {
+                assert_eq!(message.challenge, challenge.to_vec());
+                assert_eq!(message.reason, "user rejected");
             }
+            other => panic!("expected an AuthDenial, got {other:?}"),
         }
     }
 
     /// An unsupported algorithm id supplied by the caller is refused, not defaulted.
-    /// The defect this catches: `UNSPECIFIED` silently selecting AES-256-GCM or SHA-256.
+    /// The defect this catches: `UNSPECIFIED`, the reserved tag `2` or an unknown id
+    /// silently selecting AES-256-GCM or SHA-256.
     #[test]
     fn builders_reject_unsupported_algorithm_ids() {
         let keypair = Ed25519KeyPair::generate().unwrap();
         let csk = [0x91u8; 32];
         let challenge = [0x92u8; 32];
 
-        assert!(matches!(
-            create_grant_wrapper_message(
-                challenge.to_vec(),
-                keypair.signing_key_bytes().to_vec(),
-                csk.to_vec(),
-                0,
-                SHA256
-            ),
-            Err(TapauthError::Argument { .. })
-        ));
-        assert!(matches!(
-            create_grant_wrapper_message(
-                challenge.to_vec(),
-                keypair.signing_key_bytes().to_vec(),
-                csk.to_vec(),
-                AES,
-                0
-            ),
-            Err(TapauthError::Argument { .. })
-        ));
-        assert!(matches!(
-            create_denial_wrapper_message(
-                challenge.to_vec(),
-                "no".to_string(),
-                keypair.signing_key_bytes().to_vec(),
-                csk.to_vec(),
-                99,
-                SHA256
-            ),
-            Err(TapauthError::Argument { .. })
-        ));
+        for symmetric_id in [0, RESERVED_ALGORITHM_ID, 99] {
+            assert!(
+                matches!(
+                    create_grant_wrapper_message(
+                        challenge.to_vec(),
+                        keypair.signing_key_bytes().to_vec(),
+                        csk.to_vec(),
+                        symmetric_id,
+                        SHA256
+                    ),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "symmetric id {symmetric_id} must be a caller error"
+            );
+            assert!(
+                matches!(
+                    create_denial_wrapper_message(
+                        challenge.to_vec(),
+                        "no".to_string(),
+                        keypair.signing_key_bytes().to_vec(),
+                        csk.to_vec(),
+                        symmetric_id,
+                        SHA256
+                    ),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "symmetric id {symmetric_id} must be a caller error"
+            );
+        }
+
+        for hash_id in [0, RESERVED_ALGORITHM_ID, 99] {
+            assert!(
+                matches!(
+                    create_grant_wrapper_message(
+                        challenge.to_vec(),
+                        keypair.signing_key_bytes().to_vec(),
+                        csk.to_vec(),
+                        AES,
+                        hash_id
+                    ),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "hash id {hash_id} must be a caller error"
+            );
+        }
     }
 
     // ---------------------------------------------------------------
     // Discovery
     // ---------------------------------------------------------------
 
-    /// Temporal identifiers are keyed, window-bound and algorithm-dispatched, and the
-    /// verifier accepts only the current/previous window.
-    /// The defect this catches: a per-device algorithm dispatch that ignores the
-    /// stored `hashAlgorithm` (a BLAKE3 client's packets would never match).
+    /// Temporal identifiers are keyed, window-bound and dispatched on the id Kotlin
+    /// passes, and the verifier accepts only the current/previous window.
+    /// The defect this catches: a per-device dispatcher that defaults an unusable
+    /// `hashAlgorithm` to SHA-256 (a device whose stored id cannot be honoured would
+    /// otherwise silently behave as if it could), or a wrong-length truncation.
     #[test]
     fn temporal_identifiers_dispatch_on_the_persisted_algorithm() {
         let csk = [0xA1u8; 32];
         let window = current_time_window().unwrap();
 
         let sha16 = generate_temporal_identifier(csk.to_vec(), window, SHA256).unwrap();
-        let blake16 = generate_temporal_identifier(csk.to_vec(), window, 2).unwrap();
         assert_eq!(sha16.len(), TEMPORAL_ID_LEN);
-        assert_ne!(sha16, blake16, "the hash algorithm must be dispatched on");
-
         let sha10 = generate_ble_temporal_identifier(csk.to_vec(), window, SHA256).unwrap();
         assert_eq!(sha10.len(), BLE_TEMPORAL_ID_LEN);
         assert_eq!(&sha10[..], &sha16[..BLE_TEMPORAL_ID_LEN]);
 
         assert!(verify_temporal_identifier(sha16.clone(), csk.to_vec(), SHA256).unwrap());
         assert!(verify_temporal_identifier(sha10, csk.to_vec(), SHA256).unwrap());
-        assert!(verify_temporal_identifier(blake16.clone(), csk.to_vec(), 2).unwrap());
 
-        // The wrong algorithm never matches.
-        assert!(!verify_temporal_identifier(blake16, csk.to_vec(), SHA256).unwrap());
+        // Only `SHA256` (1) is implemented: every other id — `UNSPECIFIED`, the
+        // reserved tag 2, an unknown one — is refused by every entry point rather
+        // than treated as the default suite.
+        for hash_id in [0, RESERVED_ALGORITHM_ID, 99] {
+            assert!(
+                matches!(
+                    generate_temporal_identifier(csk.to_vec(), window, hash_id),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "hash id {hash_id} must be a caller error"
+            );
+            assert!(
+                matches!(
+                    generate_ble_temporal_identifier(csk.to_vec(), window, hash_id),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "hash id {hash_id} must be a caller error"
+            );
+            assert!(
+                matches!(
+                    verify_temporal_identifier(sha16.clone(), csk.to_vec(), hash_id),
+                    Err(TapauthError::Argument { .. })
+                ),
+                "hash id {hash_id} must be a caller error"
+            );
+        }
+
         // A window two periods old is stale.
         let stale = generate_temporal_identifier(csk.to_vec(), window - 2, SHA256).unwrap();
         assert!(!verify_temporal_identifier(stale, csk.to_vec(), SHA256).unwrap());
@@ -2057,11 +2102,11 @@ mod tests {
     /// A phone session plus the desktop's `PairingResponse` as a wire frame the phone
     /// has not verified yet. This is the state `verify_response` is called from.
     ///
-    /// The desktop is started with client-wide pins for a **non-baseline** algorithm
-    /// pair, so the negotiated triple differs from the AES-256-GCM/SHA-256/Ed25519
-    /// default: a caller that hard-codes the baseline instead of reporting
-    /// `session.negotiated()` fails here. The phone advertises both algorithms, so
-    /// negotiation picks up the pins.
+    /// The desktop is started with the client-wide pins its `CSK` is committed to, so
+    /// the pin path is the one exercised. With one active primitive per slot the
+    /// pinned pair and the baseline are the same values, so this fixture can no
+    /// longer make a hard-coded baseline triple fail — see the note on
+    /// `pairing_verify_response_returns_the_persistable_fields`.
     fn pending_session() -> (
         ClientPairingState,
         Arc<PairingSession>,
@@ -2076,8 +2121,8 @@ mod tests {
             None,
             None,
             Some(PinnedAlgorithms {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-                hash_algorithm: HashAlgorithm::Blake3,
+                symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+                hash_algorithm: HashAlgorithm::Sha256,
             }),
         )
         .unwrap();
@@ -2249,10 +2294,15 @@ mod tests {
     /// desktop's `Ed_C` and the negotiated algorithm triple — and the desktop derives
     /// the same SAS and transcript hash from the very same wire frame.
     /// The defect this catches: a result that drops the device key or the algorithms
-    /// (leaving `PairedDevice` unverifiable), one that carries the ephemeral `X_C` or
-    /// the phone's own `Ed_S` instead of `Ed_C`, or one that reports a fixed triple —
-    /// the AES-256-GCM/SHA-256/Ed25519 baseline — rather than the pinned algorithms
-    /// the session actually negotiated.
+    /// (leaving `PairedDevice` unverifiable), or one that carries the ephemeral `X_C`
+    /// or the phone's own `Ed_S` instead of `Ed_C`.
+    ///
+    /// The former "reports a fixed triple rather than the negotiated one" half of
+    /// this test is no longer expressible: with one active primitive per slot there is
+    /// exactly one representable triple, so a hard-coded `(1, 1, 1)` and the
+    /// negotiated one cannot differ. What remains is that the reported ids equal
+    /// `session.negotiated()`'s, which a mis-wired field mapping would still break
+    /// only if the values differed — they do not.
     #[test]
     fn pairing_verify_response_returns_the_persistable_fields() {
         let (desktop, session, session_id, qr_pk, response_bytes) = pending_session();
@@ -2276,20 +2326,17 @@ mod tests {
         assert_ne!(verified.client_ed25519_public_key, qr_pk.to_vec());
         assert_ne!(verified.client_ed25519_public_key, vec![0u8; 32]);
 
-        // The triple is what negotiation selected — the pinned, non-baseline pair, so
-        // a hard-coded (AES-256-GCM, SHA-256, Ed25519) fails here — and the desktop's
-        // own answer agrees with it. (`Chacha20Poly1305` and `Blake3` are both id 2,
-        // so the wire numbers alone cannot tell the two fields apart; the
-        // `desktop.negotiated()` comparisons below are what pin the mapping.)
-        assert_eq!(verified.symmetric_algorithm, CHACHA);
-        assert_eq!(verified.hash_algorithm, BLAKE3);
+        // The triple is the pinned suite the desktop negotiated, and the desktop's
+        // own answer agrees with it.
+        assert_eq!(verified.symmetric_algorithm, AES);
+        assert_eq!(verified.hash_algorithm, SHA256);
         assert_eq!(verified.signature_algorithm, ED25519);
         let negotiated = desktop.negotiated().unwrap();
         assert_eq!(
             negotiated.symmetric_algorithm,
-            SymmetricAlgorithm::Chacha20Poly1305
+            SymmetricAlgorithm::Aes256Gcm
         );
-        assert_eq!(negotiated.hash_algorithm, HashAlgorithm::Blake3);
+        assert_eq!(negotiated.hash_algorithm, HashAlgorithm::Sha256);
         assert_eq!(
             verified.symmetric_algorithm,
             negotiated.symmetric_algorithm as i32

@@ -2236,27 +2236,28 @@ mod tests {
     /// the rotation could be refused the suite it offers.
     #[test]
     fn an_empty_device_set_pins_nothing_at_all() {
-        let v2_suite = CskMetadata {
-            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-            hash_algorithm: HashAlgorithm::Blake3,
-        };
+        // The stored suite is irrelevant here: what must not happen is a leftover
+        // metadata file pinning a device set that no longer exists.
+        let stored_suite = CskMetadata::default();
         assert_eq!(pinned_metadata(true, None), None, "no device, no pin");
         assert_eq!(
-            pinned_metadata(true, Some(v2_suite)),
+            pinned_metadata(true, Some(stored_suite)),
             None,
             "a leftover metadata file must not pin a device set that no longer exists"
         );
-        // The same two cases with a device present: the stored suite (or the v1
-        // default, below) is pinned.
-        assert_eq!(pinned_metadata(false, Some(v2_suite)), Some(v2_suite));
+        // The same two cases with a device present: the stored suite is pinned.
+        assert_eq!(
+            pinned_metadata(false, Some(stored_suite)),
+            Some(stored_suite)
+        );
     }
 
     /// A v1 state directory (paired devices, no `csk_meta.json`) resolves to the
     /// v1 suite, and a later pairing cannot renegotiate it away.
     ///
     /// The defect this catches: treating a missing metadata file as "nothing
-    /// pinned", which lets the next pairing select ChaCha20-Poly1305/BLAKE3 and
-    /// leaves the existing v1 device unable to decrypt the single client-wide
+    /// pinned", which lets the next pairing select a suite the existing device
+    /// never agreed to and leaves it unable to decrypt the single client-wide
     /// broadcast.
     #[test]
     fn a_v1_state_directory_pins_the_v1_suite_and_cannot_be_renegotiated() {
@@ -2282,11 +2283,8 @@ mod tests {
                 .unwrap();
         let init = init_offering(
             started.session_id,
-            &[
-                SymmetricAlgorithm::Chacha20Poly1305,
-                SymmetricAlgorithm::Aes256Gcm,
-            ],
-            &[HashAlgorithm::Blake3, HashAlgorithm::Sha256],
+            &[SymmetricAlgorithm::Aes256Gcm],
+            &[HashAlgorithm::Sha256],
         );
         desktop.handle_init(&init).expect("the v1 suite is offered");
         let negotiated = desktop.negotiated().expect("negotiated");
@@ -2296,15 +2294,18 @@ mod tests {
         );
         assert_eq!(negotiated.hash_algorithm, HashAlgorithm::Sha256);
 
-        // A phone that offers only the v2 suite is refused outright.
+        // A phone that offers only the reserved tag `2` is refused outright: it
+        // advertises nothing the pinned suite can be honoured with.
         let (mut desktop, started) =
             ClientPairingState::start(identity(), "thinkpad", 36_692, None, None, Some(pinned))
                 .unwrap();
-        let init = init_offering(
+        let mut init = init_offering(
             started.session_id,
-            &[SymmetricAlgorithm::Chacha20Poly1305],
-            &[HashAlgorithm::Blake3],
+            &[SymmetricAlgorithm::Aes256Gcm],
+            &[HashAlgorithm::Sha256],
         );
+        init.supported_symmetric_algorithms = vec![2];
+        init.supported_hash_algorithms = vec![2];
         assert!(
             matches!(
                 desktop.handle_init(&init),

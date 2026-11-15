@@ -4,8 +4,8 @@
 //! `SignatureAlgorithm`) are persisted in `config.rs` (the negotiated
 //! `PairedServer.signature_algorithm` and the client-wide `CskMetadata`), so
 //! their JSON form is part of the on-disk contract: it is the **canonical proto
-//! name** (`"AES_256_GCM"`, `"CHACHA20_POLY1305"`, `"SHA256"`, `"BLAKE3"`,
-//! `"ED25519"`, `"…_UNSPECIFIED"`), not the Rust variant name.
+//! name** (`"AES_256_GCM"`, `"SHA256"`, `"ED25519"`, `"…_UNSPECIFIED"`), not the
+//! Rust variant name.
 //!
 //! These impls live here rather than in `build.rs`'s blanket
 //! `#[derive(serde::Serialize, serde::Deserialize)]` because a derive cannot

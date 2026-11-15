@@ -201,7 +201,10 @@ mod tests {
 
     const ED25519: i32 = SignatureAlgorithm::Ed25519 as i32;
     const AES: SymmetricAlgorithm = SymmetricAlgorithm::Aes256Gcm;
-    const CHACHA: SymmetricAlgorithm = SymmetricAlgorithm::Chacha20Poly1305;
+    /// The cleartext `EncryptedPacket.encryption_algorithm` tag `2` is **reserved**
+    /// (it was `CHACHA20_POLY1305` in pre-release builds) and names no enum member:
+    /// it can only be written to the wire as a raw id.
+    const RETIRED_SYMMETRIC_ID: i32 = 2;
     const SHA256: HashAlgorithm = HashAlgorithm::Sha256;
 
     /// The payload type a [`DecodedPayload`] was decoded from.
@@ -224,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_round_trip_for_all_payload_types_and_algorithms() {
+    fn test_packet_round_trip_for_all_payload_types() {
         let csk = ClientSymmetricKey::generate().unwrap();
         let keypair = Ed25519KeyPair::generate().unwrap();
         let challenge = [0x2Au8; 32];
@@ -264,39 +267,35 @@ mod tests {
         ];
         assert_eq!(cases.len(), 5);
 
-        for symmetric in [AES, CHACHA] {
-            for (unsigned, expected_type) in &cases {
-                let mut wrapper = unsigned.clone();
-                assert_eq!(wrapper.version, PROTOCOL_VERSION_V2);
-                assert_eq!(wrapper.payload_type, *expected_type as i32);
-                assert!(wrapper.signature.is_empty());
-                // The wrapper carries the raw serialized payload, so a non-empty payload
-                // must already be present before signing.
-                assert!(!wrapper.payload.is_empty());
-                sign_wrapper_message(&mut wrapper, &keypair).unwrap();
-                assert_eq!(wrapper.signature.len(), 64);
+        for (unsigned, expected_type) in &cases {
+            let mut wrapper = unsigned.clone();
+            assert_eq!(wrapper.version, PROTOCOL_VERSION_V2);
+            assert_eq!(wrapper.payload_type, *expected_type as i32);
+            assert!(wrapper.signature.is_empty());
+            // The wrapper carries the raw serialized payload, so a non-empty payload
+            // must already be present before signing.
+            assert!(!wrapper.payload.is_empty());
+            sign_wrapper_message(&mut wrapper, &keypair).unwrap();
+            assert_eq!(wrapper.signature.len(), 64);
 
-                let packet =
-                    create_encrypted_packet_with_csk_nonce(&csk, symmetric, SHA256, &wrapper)
-                        .unwrap();
-                assert_eq!(packet.encryption_algorithm, symmetric as i32);
-                assert_eq!(packet.temporal_identifier.len(), 16);
-                // 12-byte nonce || plaintext || 16-byte tag
-                assert_eq!(
-                    packet.ciphertext.len(),
-                    wrapper.encode_to_vec().len() + 12 + 16
-                );
+            let packet =
+                create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+            assert_eq!(packet.encryption_algorithm, AES as i32);
+            assert_eq!(packet.temporal_identifier.len(), 16);
+            // 12-byte nonce || plaintext || 16-byte tag
+            assert_eq!(
+                packet.ciphertext.len(),
+                wrapper.encode_to_vec().len() + 12 + 16
+            );
 
-                let decrypted =
-                    decrypt_encrypted_packet_with_csk_nonce(&csk, symmetric, &packet).unwrap();
-                assert_eq!(decrypted, wrapper);
+            let decrypted = decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet).unwrap();
+            assert_eq!(decrypted, wrapper);
 
-                let decoded =
-                    verify_and_decode_payload(&decrypted, &keypair.verifying_key_bytes(), ED25519)
-                        .unwrap();
-                assert_eq!(decoded_payload_type(&decoded), *expected_type as i32);
-                assert_eq!(extract_challenge(&decrypted).unwrap(), challenge.to_vec());
-            }
+            let decoded =
+                verify_and_decode_payload(&decrypted, &keypair.verifying_key_bytes(), ED25519)
+                    .unwrap();
+            assert_eq!(decoded_payload_type(&decoded), *expected_type as i32);
+            assert_eq!(extract_challenge(&decrypted).unwrap(), challenge.to_vec());
         }
     }
 
@@ -327,6 +326,14 @@ mod tests {
         assert_eq!(decrypted.payload, wrapper.payload);
     }
 
+    /// A packet whose cleartext header is relabelled to a tag this build cannot
+    /// name (the reserved `2`, or an unknown `99`) is refused, and the algorithm
+    /// id is bound into the tag, so a ciphertext sealed for one header id never
+    /// opens under another.
+    /// The defect this catches: trusting the packet's self-declared algorithm (a
+    /// relabelled header accepted by decrypting under whatever it claims), and an
+    /// AAD built without the header id (a relabelled header whose body still
+    /// authenticates).
     #[test]
     fn test_encryption_algorithm_field_tampering_fails_aead() {
         let csk = ClientSymmetricKey::generate().unwrap();
@@ -334,15 +341,53 @@ mod tests {
         let wrapper = signed_grant_wrapper(&keypair, [0x32u8; 32]);
 
         let packet = create_encrypted_packet_with_csk_nonce(&csk, AES, SHA256, &wrapper).unwrap();
+        assert_eq!(packet.encryption_algorithm, AES as i32);
 
-        // Relabel the packet as ChaCha20-Poly1305 without re-encrypting. The verifier
-        // follows the claimed algorithm, so this must fail authentication: the AAD now
-        // carries a different algorithm id than the tag was produced with.
-        let mut tampered = packet.clone();
-        tampered.encryption_algorithm = CHACHA as i32;
-        assert_eq!(tampered.ciphertext, packet.ciphertext);
+        // Relabel the header to a tag this build has no implementation for. The
+        // body is untouched and still decryptable under its own header, so only the
+        // header check can refuse these — and it must run before the AEAD.
+        for relabel in [
+            RETIRED_SYMMETRIC_ID,
+            99,
+            SymmetricAlgorithm::Unspecified as i32,
+        ] {
+            let mut tampered = packet.clone();
+            tampered.encryption_algorithm = relabel;
+            assert_eq!(tampered.ciphertext, packet.ciphertext);
+            assert!(
+                matches!(
+                    decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &tampered),
+                    Err(ProtocolError::AlgorithmMismatch)
+                ),
+                "header tag {relabel} must be an algorithm mismatch"
+            );
+            // Empty the body: the verdict must not depend on it.
+            tampered.ciphertext = Vec::new();
+            assert!(matches!(
+                decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &tampered),
+                Err(ProtocolError::AlgorithmMismatch)
+            ));
+        }
+
+        // The header id is in the AAD too: a ciphertext sealed for header id `2`
+        // (as a pre-release peer would have) does not open under a header of `1`
+        // even though the body is a well-formed AES-256-GCM frame.
+        let aad_for_two =
+            crate::crypto::encrypted_packet_aad(RETIRED_SYMMETRIC_ID, &packet.temporal_identifier);
+        let sealed_for_two = crate::crypto::encrypt_with_csk_and_random_nonce(
+            &csk,
+            AES,
+            &wrapper.encode_to_vec(),
+            &aad_for_two,
+        )
+        .unwrap();
+        let relabelled = EncryptedPacket {
+            temporal_identifier: packet.temporal_identifier.clone(),
+            encryption_algorithm: AES as i32,
+            ciphertext: sealed_for_two,
+        };
         assert!(matches!(
-            decrypt_encrypted_packet_with_csk_nonce(&csk, CHACHA, &tampered),
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &relabelled),
             Err(ProtocolError::Crypto(_))
         ));
 
@@ -365,14 +410,22 @@ mod tests {
         // before decryption can produce AlgorithmMismatch here.
         packet.ciphertext = vec![0x00; 1];
 
-        // Caller pinned to ChaCha20-Poly1305 while the packet claims AES-256-GCM.
+        // The caller expects AES-256-GCM while the packet claims the reserved tag 2
+        // (or an id nothing implements).
+        packet.encryption_algorithm = RETIRED_SYMMETRIC_ID;
         assert!(matches!(
-            decrypt_encrypted_packet_with_csk_nonce(&csk, CHACHA, &packet),
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet),
+            Err(ProtocolError::AlgorithmMismatch)
+        ));
+        packet.encryption_algorithm = 99;
+        assert!(matches!(
+            decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet),
             Err(ProtocolError::AlgorithmMismatch)
         ));
 
         // Control: with the matching algorithm the same packet fails as a cipher error,
         // not as an algorithm mismatch.
+        packet.encryption_algorithm = AES as i32;
         assert!(matches!(
             decrypt_encrypted_packet_with_csk_nonce(&csk, AES, &packet),
             Err(ProtocolError::Crypto(_))

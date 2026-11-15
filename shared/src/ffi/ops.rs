@@ -469,10 +469,12 @@ pub(crate) fn build_denial_packet(
 
 /// Resolve a caller-supplied `SymmetricAlgorithm` id, rejecting `UNSPECIFIED` and
 /// any value this build cannot implement.
+///
+/// `AES_256_GCM` (1) is the only id this build implements; `0`, the reserved
+/// tag `2` and any other id are caller errors rather than a default.
 fn symmetric_algorithm(value: i32) -> Result<SymmetricAlgorithm, TapauthError> {
     match SymmetricAlgorithm::try_from(value) {
         Ok(SymmetricAlgorithm::Aes256Gcm) => Ok(SymmetricAlgorithm::Aes256Gcm),
-        Ok(SymmetricAlgorithm::Chacha20Poly1305) => Ok(SymmetricAlgorithm::Chacha20Poly1305),
         _ => Err(TapauthError::Argument {
             detail: format!("unsupported symmetric algorithm id {value}"),
         }),
@@ -481,10 +483,12 @@ fn symmetric_algorithm(value: i32) -> Result<SymmetricAlgorithm, TapauthError> {
 
 /// Resolve a caller-supplied `HashAlgorithm` id, rejecting `UNSPECIFIED` and any
 /// value this build cannot implement.
+///
+/// `SHA256` (1) is the only id this build implements; `0`, the reserved tag `2`
+/// and any other id are caller errors rather than a default.
 fn hash_algorithm(value: i32) -> Result<HashAlgorithm, TapauthError> {
     match HashAlgorithm::try_from(value) {
         Ok(HashAlgorithm::Sha256) => Ok(HashAlgorithm::Sha256),
-        Ok(HashAlgorithm::Blake3) => Ok(HashAlgorithm::Blake3),
         _ => Err(TapauthError::Argument {
             detail: format!("unsupported hash algorithm id {value}"),
         }),

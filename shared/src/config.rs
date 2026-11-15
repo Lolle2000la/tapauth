@@ -957,28 +957,35 @@ mod tests {
         let legacy: CskMetadata = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy, default);
 
-        // Missing single field: only that one falls back.
-        let partial: CskMetadata = serde_json::from_str(r#"{"hash_algorithm": "BLAKE3"}"#).unwrap();
+        // Missing single field: only that one falls back (with one active primitive
+        // per slot the fallback and the explicit value are the same suite, so this
+        // exercises `serde(default)` on the omitted field, not a choice of value).
+        let partial: CskMetadata = serde_json::from_str(r#"{"hash_algorithm": "SHA256"}"#).unwrap();
         assert_eq!(partial.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
-        assert_eq!(partial.hash_algorithm, HashAlgorithm::Blake3);
+        assert_eq!(partial.hash_algorithm, HashAlgorithm::Sha256);
     }
 
-    /// `CskMetadata` must survive a full JSON round-trip with the canonical names.
+    /// `CskMetadata` must survive a full JSON round-trip with the canonical names,
+    /// and a *retired* algorithm name written by a pre-release build must fail to
+    /// load instead of falling back to the baseline.
+    /// The defect this catches: a deserialiser that accepts any string it does not
+    /// recognise and defaults (a device then believes it shares a suite it does
+    /// not), or one that keeps aliasing the reserved tags onto live algorithms.
     #[test]
     fn test_csk_metadata_roundtrip() {
         let metadata = CskMetadata {
-            symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-            hash_algorithm: HashAlgorithm::Blake3,
+            symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+            hash_algorithm: HashAlgorithm::Sha256,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
         assert!(
-            json.contains("\"symmetric_algorithm\":\"CHACHA20_POLY1305\""),
+            json.contains("\"symmetric_algorithm\":\"AES_256_GCM\""),
             "unexpected JSON: {}",
             json
         );
         assert!(
-            json.contains("\"hash_algorithm\":\"BLAKE3\""),
+            json.contains("\"hash_algorithm\":\"SHA256\""),
             "unexpected JSON: {}",
             json
         );
@@ -986,11 +993,31 @@ mod tests {
         let parsed: CskMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, metadata);
 
-        // Integer values are rejected: the name is the only on-disk spelling.
-        assert!(serde_json::from_str::<CskMetadata>(
-            r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#
-        )
-        .is_err());
+        // A retired name is not "unknown-but-close": it is refused outright.
+        for retired in [
+            r#"{"symmetric_algorithm": "CHACHA20_POLY1305"}"#,
+            r#"{"hash_algorithm": "BLAKE3"}"#,
+            r#"{"symmetric_algorithm": "UNKNOWN_ALG"}"#,
+            r#"{"hash_algorithm": "UNKNOWN_ALG"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "BLAKE3"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CskMetadata>(retired).is_err(),
+                "{retired} must not load"
+            );
+        }
+
+        // Integer values are rejected: the name is the only on-disk spelling, and
+        // the freed tag `2` in particular must never be read back as an algorithm.
+        for by_integer in [
+            r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#,
+            r#"{"symmetric_algorithm": 1, "hash_algorithm": 1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CskMetadata>(by_integer).is_err(),
+                "{by_integer} must not load"
+            );
+        }
     }
 
     // ---- CSK metadata lifecycle ------------------------------------------
@@ -1062,12 +1089,7 @@ mod tests {
     fn rotating_the_csk_leaves_nothing_pinned_for_a_renegotiation() {
         let scratch = ScratchStateDir::new("rotate");
         let manager = scratch.manager();
-        manager
-            .save_csk_metadata(&CskMetadata {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-                hash_algorithm: HashAlgorithm::Blake3,
-            })
-            .unwrap();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
         manager
             .add_paired_server("aa".to_string(), paired_server("aa"))
             .unwrap();
@@ -1123,12 +1145,7 @@ mod tests {
     fn un_pairing_the_last_device_drops_the_metadata() {
         let scratch = ScratchStateDir::new("remove");
         let manager = scratch.manager();
-        manager
-            .save_csk_metadata(&CskMetadata {
-                symmetric_algorithm: SymmetricAlgorithm::Chacha20Poly1305,
-                hash_algorithm: HashAlgorithm::Blake3,
-            })
-            .unwrap();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
         manager
             .add_paired_server("aa".to_string(), paired_server("aa"))
             .unwrap();
