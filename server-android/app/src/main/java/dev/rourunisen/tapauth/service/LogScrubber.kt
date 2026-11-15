@@ -15,10 +15,43 @@ private const val TRUNCATION_MARKER = "…"
  * secret passed on the command line would outlive the prompt in the phone's log buffer. So the
  * values are scrubbed before they are logged rather than after.
  *
- * ISO control characters — C0 (`\n`, `\r`, `\t`, ESC and the rest), DEL, and the C1 range, plus the
- * Unicode line and paragraph separators — are replaced by a space, which keeps the value on one
- * line and keeps ordinary ASCII tokens (the E2E suite greps them) byte-for-byte unchanged. The
- * result is capped at [MAX_LOG_VALUE_LENGTH] characters plus [TRUNCATION_MARKER].
+ * ## What this guarantees, and nothing else
+ *
+ * 1. **One line.** Every code unit [isLogControl] names — C0 (`\n`, `\r`, `\t`, ESC and the rest),
+ *    DEL, the whole C1 range, and U+2028/U+2029 — becomes one ASCII space, one for one: no run is
+ *    collapsed and nothing is trimmed.
+ * 2. **Everything else byte-for-byte.** Every other code unit, plain ASCII included, is copied
+ *    unchanged: not trimmed, not case-folded, not unescaped. The E2E suite greps
+ *    `pamService=…`/`processName=…` out of this value (`assert_caller_context_delivered` in
+ *    `scripts/test-e2e.sh`), so the field has to stay greppable — but those tokens are
+ *    single-spaced ASCII, which is why the greps cannot police this function and `LogScrubberTest`
+ *    does.
+ *
+ * The result is capped at [MAX_LOG_VALUE_LENGTH] UTF-16 code units (`String.length`, so a non-BMP
+ * character costs two and a cut can land inside a surrogate pair, as
+ * `aCutLandsInsideASurrogatePair` pins) plus [TRUNCATION_MARKER].
+ *
+ * ## What this deliberately does not do
+ *
+ * It is not the canonical context sanitizer (`sanitize_context_string` in `shared`, mirrored by
+ * `ContextSanitizer` in this app), and it must not become it. Those two are pinned to each other by
+ * `shared/testdata/context_sanitizer_vectors.json` because what they return is *rendered on the
+ * prompt*; what this returns is only ever a log line. So it deliberately does not:
+ *
+ * - remove an ANSI sequence as a unit: the `ESC` becomes a space and `[31m` survives as inert text,
+ *   which neutralises the escape without the log path and the prompt path having to agree on what a
+ *   sequence is;
+ * - collapse or trim whitespace, or drop the bidi/zero-width code points: none of them can forge a
+ *   line in a log buffer, and a token's exact spacing, colons and slashes are evidence of what the
+ *   caller's argv actually was;
+ * - budget in UTF-8 bytes with the marker inside the budget: the cap counts code units and the
+ *   marker sits on top of it.
+ *
+ * Unifying the two is still the wrong move: the prompt path's rules buy a log line nothing, and a
+ * value rewritten here no longer says what the caller's argv said. The guard is `LogScrubberTest`,
+ * not the E2E suite — its phase tokens are single-spaced ASCII with no surrounding whitespace, so
+ * trim, whitespace collapse and bidi stripping would return them unchanged and the greps would
+ * never notice.
  *
  * @return the scrubbed value; `""` for null or empty input, so a log line still renders every
  *   `key=` pair.
