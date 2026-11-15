@@ -21,21 +21,161 @@ const WRAPPER_SIGNING_DOMAIN: &[u8] = b"tapauth-sig-v2";
 
 /// Maximum byte length of `AuthenticationRequest.username`.
 ///
-/// A username that exceeds this is **rejected**, never truncated: the phone would
-/// otherwise display (and the PAM module would otherwise authorize) an account
-/// that is not the one being authenticated.
+/// The budget of `ContextField::Username`'s row; that row's
+/// `FieldPolicy::on_overflow` is what says an over-budget username is
+/// **rejected** rather than truncated.
 pub const USERNAME_MAX_BYTES: usize = 32;
 /// Maximum byte length of `AuthenticationRequest.hostname`.
 ///
-/// A hostname is display-only, so an over-long one is sanitized and truncated
-/// instead of rejected — see [`create_auth_request_with_context`].
+/// The budget of `ContextField::Hostname`'s row; that row says an over-budget
+/// hostname is sanitized and truncated instead of rejected.
 pub const HOSTNAME_MAX_BYTES: usize = 64;
 /// Maximum byte length of `AuthenticationRequest.pam_service`.
+///
+/// The budget of `ContextField::PamService`'s row.
 pub const PAM_SERVICE_MAX_BYTES: usize = 32;
 /// Maximum byte length of `AuthenticationRequest.process_name`.
+///
+/// The budget of `ContextField::ProcessName`'s row.
 pub const PROCESS_NAME_MAX_BYTES: usize = 32;
 /// Maximum byte length of `AuthenticationRequest.command_preview`.
+///
+/// The budget of `ContextField::CommandPreview`'s row.
 pub const COMMAND_PREVIEW_MAX_BYTES: usize = 128;
+
+/// What an over-budget context value does.
+///
+/// The variant is the whole security-relevant half of a field's policy, so it is a
+/// value in the table rather than an `if` at a call site: which fields the phone may
+/// see shortened is then one column to read, not a branch to notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overflow {
+    /// Refuse to build the request, with [`ProtocolError::InvalidMessageFormat`].
+    ///
+    /// The value is neither sanitized nor shortened: the field is one the Server acts
+    /// on (or names the account it acts for), so a shortened value would name
+    /// something the caller never asked for. The budget is measured on the value the
+    /// caller passed in.
+    Reject,
+    /// Sanitize with [`sanitize_context_string`] and cut to the budget, `…` inside it.
+    ///
+    /// For a display-only field, where a long value is still worth showing. The budget
+    /// is measured on the sanitized value.
+    Truncate,
+}
+
+/// One row of the per-field table: the byte budget and what an over-budget value
+/// does. A row carries no behaviour of its own — [`bound_context_value`] applies it
+/// and [`sanitize_context_string`] owns the *how* of a cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FieldPolicy {
+    max_bytes: usize,
+    on_overflow: Overflow,
+}
+
+/// A field of `AuthenticationRequest` that [`create_auth_request_with_context`]
+/// bounds: one variant per row of [`ContextField::policy`].
+///
+/// A variant exists only to pick a row, and `policy`'s `match` is exhaustive, so a
+/// field cannot be added here without its budget and its overflow policy; a field
+/// added to the *message* is forced through the same table by
+/// `every_context_field_has_exactly_one_policy_row`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextField {
+    Username,
+    Hostname,
+    PamService,
+    ProcessName,
+    CommandPreview,
+}
+
+impl ContextField {
+    /// The field's row — this is the table: one arm per field, referencing the
+    /// budget constants rather than repeating their values. The `match` is
+    /// exhaustive, so an arm is not optional.
+    const fn policy(self) -> FieldPolicy {
+        match self {
+            ContextField::Username => FieldPolicy {
+                max_bytes: USERNAME_MAX_BYTES,
+                on_overflow: Overflow::Reject,
+            },
+            ContextField::Hostname => FieldPolicy {
+                max_bytes: HOSTNAME_MAX_BYTES,
+                on_overflow: Overflow::Truncate,
+            },
+            ContextField::PamService => FieldPolicy {
+                max_bytes: PAM_SERVICE_MAX_BYTES,
+                on_overflow: Overflow::Truncate,
+            },
+            ContextField::ProcessName => FieldPolicy {
+                max_bytes: PROCESS_NAME_MAX_BYTES,
+                on_overflow: Overflow::Truncate,
+            },
+            ContextField::CommandPreview => FieldPolicy {
+                max_bytes: COMMAND_PREVIEW_MAX_BYTES,
+                on_overflow: Overflow::Truncate,
+            },
+        }
+    }
+
+    /// Every variant, in table order. `policy` is an exhaustive `match`, so a new
+    /// variant cannot compile without a row; this list is what lets
+    /// `every_context_field_has_exactly_one_policy_row` compare the table's size to
+    /// the message's bounded fields and catch the same field listed twice or a row
+    /// whose budget no longer matches its constant.
+    #[cfg(test)]
+    const ALL: &[Self] = &[
+        Self::Username,
+        Self::Hostname,
+        Self::PamService,
+        Self::ProcessName,
+        Self::CommandPreview,
+    ];
+
+    /// The field's spelling, for test failure messages. Exhaustive, so a variant
+    /// without a name does not compile.
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            ContextField::Username => "username",
+            ContextField::Hostname => "hostname",
+            ContextField::PamService => "pam_service",
+            ContextField::ProcessName => "process_name",
+            ContextField::CommandPreview => "command_preview",
+        }
+    }
+
+    /// Read this field's value out of a built request. Exhaustive, so a variant
+    /// without a reader does not compile.
+    #[cfg(test)]
+    fn read(self, request: &AuthenticationRequest) -> &str {
+        match self {
+            ContextField::Username => &request.username,
+            ContextField::Hostname => &request.hostname,
+            ContextField::PamService => &request.pam_service,
+            ContextField::ProcessName => &request.process_name,
+            ContextField::CommandPreview => &request.command_preview,
+        }
+    }
+}
+
+/// Apply `field`'s row to `value`.
+///
+/// The `which` (budget, and what an over-budget value does) comes from the table;
+/// the `how` of a cut is [`sanitize_context_string`]'s. A [`Overflow::Reject`] field
+/// is passed through verbatim and an [`Overflow::Truncate`] field is sanitized, which
+/// is the asymmetry the table records: a rejected value never reaches the phone, so
+/// there is nothing to make display-safe.
+fn bound_context_value(field: ContextField, value: &str) -> Result<String, ProtocolError> {
+    let policy = field.policy();
+    match policy.on_overflow {
+        Overflow::Reject if value.len() > policy.max_bytes => {
+            Err(ProtocolError::InvalidMessageFormat)
+        }
+        Overflow::Reject => Ok(value.to_string()),
+        Overflow::Truncate => Ok(sanitize_context_string(value, policy.max_bytes)),
+    }
+}
 
 /// Truncation marker appended inside the byte budget when a context string is cut.
 const ELLIPSIS: char = '\u{2026}';
@@ -519,19 +659,16 @@ pub fn create_auth_request_with_challenge(
 
 /// Create an AuthenticationRequest carrying sanitized call-site context.
 ///
-/// `pam_service`, `process_name` and `command_preview` are sanitized and truncated to
-/// [`PAM_SERVICE_MAX_BYTES`], [`PROCESS_NAME_MAX_BYTES`] and
-/// [`COMMAND_PREVIEW_MAX_BYTES`] respectively, so the signed payload stays inside the
-/// BLE GATT budget ([`crate::models::ble::MAX_GATT_PAYLOAD_BYTES`]).
-///
-/// `hostname` is bounded the same way, with [`HOSTNAME_MAX_BYTES`].
-///
-/// `username` is the exception: it is **rejected** with
-/// [`ProtocolError::InvalidMessageFormat`] when it exceeds [`USERNAME_MAX_BYTES`]
-/// instead of being sanitized or truncated. The username is the account the Server
-/// (phone) shows and the one the Client authorizes, so a truncated value would name
-/// a different account than the one being authenticated; a caller that cannot name
-/// the account in 32 bytes has a defect, not a long hostname.
+/// Every bounded field takes its budget and its over-budget behaviour from its row of
+/// the per-field table (`ContextField::policy`, whose rows are `FieldPolicy`) rather
+/// than from a check written here: every field but the username is sanitized and
+/// truncated, so the signed payload stays inside the BLE GATT budget
+/// ([`crate::models::ble::MAX_GATT_PAYLOAD_BYTES`]), while `username` is **rejected**
+/// with [`ProtocolError::InvalidMessageFormat`] when it exceeds its budget. That
+/// distinction is a column of the table, not a branch to notice: the username is the
+/// account the Server (phone) shows and the one the Client authorizes, so a truncated
+/// value would name a different account than the one being authenticated, while a
+/// long hostname is only display text.
 pub fn create_auth_request_with_context(
     username: &str,
     hostname: &str,
@@ -544,9 +681,16 @@ pub fn create_auth_request_with_context(
     if challenge.len() != 32 {
         return Err(ProtocolError::InvalidMessageFormat);
     }
-    if username.len() > USERNAME_MAX_BYTES {
-        return Err(ProtocolError::InvalidMessageFormat);
-    }
+
+    // One row per field. A field is bounded only by appearing here, so the table above
+    // is the whole list of what *this builder* asks `sanitize_context_string` to cut —
+    // `tapauthd/src/caller_context.rs` cuts the same three fields on its own, and a row
+    // edited here does not reach it.
+    let username = bound_context_value(ContextField::Username, username)?;
+    let hostname = bound_context_value(ContextField::Hostname, hostname)?;
+    let pam_service = bound_context_value(ContextField::PamService, pam_service)?;
+    let process_name = bound_context_value(ContextField::ProcessName, process_name)?;
+    let command_preview = bound_context_value(ContextField::CommandPreview, command_preview)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -555,12 +699,12 @@ pub fn create_auth_request_with_context(
 
     Ok(AuthenticationRequest {
         challenge: challenge.to_vec(),
-        username: username.to_string(),
-        hostname: sanitize_context_string(hostname, HOSTNAME_MAX_BYTES),
+        username,
+        hostname,
         timestamp_unix_seconds: timestamp,
-        pam_service: sanitize_context_string(pam_service, PAM_SERVICE_MAX_BYTES),
-        process_name: sanitize_context_string(process_name, PROCESS_NAME_MAX_BYTES),
-        command_preview: sanitize_context_string(command_preview, COMMAND_PREVIEW_MAX_BYTES),
+        pam_service,
+        process_name,
+        command_preview,
         tty_present,
     })
 }
@@ -1227,6 +1371,205 @@ mod tests {
         // Below 4 bytes no ellipsis is added.
         assert_eq!(sanitize_context_string(&input, 2), "");
         assert_eq!(sanitize_context_string(&input, 3), "\u{20ac}");
+    }
+
+    /// Every field the module bounds owns exactly one row of the per-field table, with
+    /// the budget of its own constant and the overflow policy the protocol documents.
+    ///
+    /// The defect this catches: a bounded field whose row was never written (so its
+    /// budget and its reject/truncate answer are whatever its call site happens to do),
+    /// two rows sharing one field's budget, and a policy flipped from `Reject` to
+    /// `Truncate` — which would let the phone display, and the client authorize, an
+    /// account that was cut to fit.
+    #[test]
+    fn every_context_field_has_exactly_one_policy_row() {
+        // Exhaustive destructuring of the message: a bounded field *added* to
+        // `AuthenticationRequest` cannot compile past this test without someone
+        // deciding whether it needs a row. `policy`'s exhaustive `match` is the other
+        // half — a `ContextField` variant without a row does not compile at all.
+        let AuthenticationRequest {
+            challenge: _,
+            username,
+            hostname,
+            timestamp_unix_seconds: _,
+            pam_service,
+            process_name,
+            command_preview,
+            tty_present: _,
+        } = sample_request();
+        let bounded_fields = [
+            username,
+            hostname,
+            pam_service,
+            process_name,
+            command_preview,
+        ];
+
+        assert_eq!(
+            ContextField::ALL.len(),
+            bounded_fields.len(),
+            "the table must hold one row per bounded field of AuthenticationRequest, \
+             found {} rows for {} fields",
+            ContextField::ALL.len(),
+            bounded_fields.len()
+        );
+
+        // Each field owns a row of its own: a duplicate would leave another field
+        // without one while the count above still matched.
+        let mut names: Vec<&str> = ContextField::ALL
+            .iter()
+            .map(|field| field.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            [
+                "command_preview",
+                "hostname",
+                "pam_service",
+                "process_name",
+                "username"
+            ],
+            "the table must name every bounded field of the message"
+        );
+
+        // The rows themselves: each budget is the field's named constant (the table
+        // never inlines a number), and the overflow policy is the documented one.
+        let expected = [
+            (ContextField::Username, USERNAME_MAX_BYTES, Overflow::Reject),
+            (
+                ContextField::Hostname,
+                HOSTNAME_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::PamService,
+                PAM_SERVICE_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::ProcessName,
+                PROCESS_NAME_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::CommandPreview,
+                COMMAND_PREVIEW_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+        ];
+        assert_eq!(expected.len(), ContextField::ALL.len());
+        for (field, max_bytes, on_overflow) in expected {
+            assert!(
+                ContextField::ALL.contains(&field),
+                "{} is missing from the table",
+                field.as_str()
+            );
+            assert_eq!(
+                field.policy(),
+                FieldPolicy {
+                    max_bytes,
+                    on_overflow
+                },
+                "row {}",
+                field.as_str()
+            );
+        }
+    }
+
+    /// Build a request with `field` over budget and every other bounded field short.
+    ///
+    /// The `match` is exhaustive, so a field added to the enum needs its own
+    /// over-budget call here before the test compiles.
+    fn request_with_over_budget(
+        field: ContextField,
+        value: &str,
+    ) -> Result<AuthenticationRequest, ProtocolError> {
+        let challenge = [0x2Au8; 32];
+        match field {
+            ContextField::Username => create_auth_request_with_context(
+                value, "host", &challenge, "sudo", "sudo", "apt", false,
+            ),
+            ContextField::Hostname => create_auth_request_with_context(
+                "luca", value, &challenge, "sudo", "sudo", "apt", false,
+            ),
+            ContextField::PamService => create_auth_request_with_context(
+                "luca", "host", &challenge, value, "sudo", "apt", false,
+            ),
+            ContextField::ProcessName => create_auth_request_with_context(
+                "luca", "host", &challenge, "sudo", value, "apt", false,
+            ),
+            ContextField::CommandPreview => create_auth_request_with_context(
+                "luca", "host", &challenge, "sudo", "sudo", value, false,
+            ),
+        }
+    }
+
+    /// Each row is what the builder actually does to that field: a `Reject` row fails
+    /// the request at one byte over its budget (an error, not a shorter `Ok`), and a
+    /// `Truncate` row cuts to exactly its budget and marks the cut — while the same
+    /// field exactly *at* its budget is kept verbatim under either policy.
+    ///
+    /// The defect this catches: a call site that bounds a field some other way than its
+    /// row says (a `Reject` field truncated, a `Truncate` field rejected, or a budget
+    /// read from the wrong constant), i.e. the table describing one policy while the
+    /// builder applies another. The vectors in
+    /// `testdata/context_sanitizer_vectors.json` pin how a cut is made; these pin which
+    /// fields get one.
+    #[test]
+    fn each_context_field_row_is_applied_by_the_builder() {
+        for field in ContextField::ALL.iter().copied() {
+            let policy = field.policy();
+            let name = field.as_str();
+            let at_cap = "x".repeat(policy.max_bytes);
+            let over = "x".repeat(policy.max_bytes + 1);
+
+            match policy.on_overflow {
+                Overflow::Reject => {
+                    assert!(
+                        matches!(
+                            request_with_over_budget(field, &over),
+                            Err(ProtocolError::InvalidMessageFormat)
+                        ),
+                        "{name} must be rejected one byte over its {} byte budget, \
+                         not shortened",
+                        policy.max_bytes
+                    );
+                    let request = request_with_over_budget(field, &at_cap).unwrap();
+                    assert_eq!(
+                        field.read(&request),
+                        at_cap,
+                        "{name} at its budget must be kept verbatim"
+                    );
+                }
+                Overflow::Truncate => {
+                    let request = request_with_over_budget(field, &over).unwrap();
+                    let bounded = field.read(&request);
+                    assert_eq!(
+                        bounded.len(),
+                        policy.max_bytes,
+                        "{name} must use the whole budget, ellipsis included"
+                    );
+                    assert!(
+                        bounded.ends_with(ELLIPSIS),
+                        "{name} must mark the cut, got {bounded:?}"
+                    );
+                    assert!(
+                        bounded.trim_end_matches(ELLIPSIS).chars().all(|c| c == 'x'),
+                        "{name} must keep the input's own bytes, got {bounded:?}"
+                    );
+
+                    // At the budget nothing is cut and no ellipsis is added.
+                    let request = request_with_over_budget(field, &at_cap).unwrap();
+                    assert_eq!(
+                        field.read(&request),
+                        at_cap,
+                        "{name} at its budget must be kept verbatim"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
