@@ -9,16 +9,15 @@ private const val TRUNCATION_MARKER = "…"
 /**
  * Make one caller-supplied value safe to interpolate into a logcat line.
  *
- * The protocol-v2 caller context (`pam_service`, `process_name`, `command_preview`) comes from the
- * desktop's own argv, which any unprivileged local user controls: a newline in it would forge an
- * extra logcat line, an ANSI escape would rewrite the terminal of whoever reads the buffer, and a
- * secret passed on the command line would outlive the prompt in the phone's log buffer. So the
- * values are scrubbed before they are logged rather than after.
+ * ## Guarantees
+ * - Every code point [isLogControl] names (C0, DEL, C1, U+2028/2029) becomes one ASCII space.
+ * - Everything else is copied verbatim, so the E2E greps keep matching the token.
+ * - The cap is [MAX_LOG_VALUE_LENGTH] UTF-16 code units plus [TRUNCATION_MARKER].
  *
- * ISO control characters — C0 (`\n`, `\r`, `\t`, ESC and the rest), DEL, and the C1 range, plus the
- * Unicode line and paragraph separators — are replaced by a space, which keeps the value on one
- * line and keeps ordinary ASCII tokens (the E2E suite greps them) byte-for-byte unchanged. The
- * result is capped at [MAX_LOG_VALUE_LENGTH] characters plus [TRUNCATION_MARKER].
+ * ## Not the prompt sanitizer
+ * Not `sanitize_context_string`/`ContextSanitizer`, and it must not become them: theirs is rendered
+ * on the prompt, this only ever makes a log line — `ESC` neutralised rather than a sequence parsed,
+ * nothing trimmed or collapsed, the cap in code units rather than bytes.
  *
  * @return the scrubbed value; `""` for null or empty input, so a log line still renders every
  *   `key=` pair.

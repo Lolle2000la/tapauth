@@ -54,6 +54,56 @@ class LogScrubberTest {
         assertEquals("", scrubLogValue(""))
     }
 
+    /**
+     * The divergence from the prompt-path sanitizer, pinned as a guarantee rather than as prose.
+     *
+     * `ContextSanitizer` trims and collapses whitespace, so a value like `" pamService=x "` or
+     * `--user=root:wheel /etc` would come back rewritten. Here spacing, slashes and colons are part
+     * of the token: the defect this catches is anyone "unifying" the two sanitizers. The E2E greps
+     * are no guard against that — their phase tokens are single-spaced ASCII with no surrounding
+     * whitespace, so trim, collapse and bidi stripping would hand them back unchanged — which makes
+     * this test the place the split is actually held.
+     */
+    @Test
+    fun aTokenKeepsItsSpacesColonsAndSlashes() {
+        val argv = "/usr/local/bin/tapauth-ipc-cli --user=root:wheel /etc/tapauth"
+
+        assertEquals(argv, scrubLogValue(argv))
+        assertEquals("  pamService=x  ", scrubLogValue("  pamService=x  "))
+        assertEquals("a  b", scrubLogValue("a  b"))
+    }
+
+    /**
+     * The other half of that split: what the divergence still has to hold is the one-line
+     * invariant, for a newline and for a C1 control (U+0085 NEL), which is a plain `Char` here and
+     * so slips past any check written only for the C0 range.
+     *
+     * The defect this catches: treating C1 as printable, which lets a caller-supplied NEL start a
+     * line in the log buffer and forge the line the test above asserts is intact.
+     */
+    @Test
+    fun aNewlineAndAC1NelDoNotSurvive() {
+        val scrubbed = scrubLogValue("cmd --flag\nnext\u0085line")
+
+        assertEquals("cmd --flag next line", scrubbed)
+        assertFalse(scrubbed.contains('\n'))
+        assertFalse(scrubbed.contains('\u0085'))
+    }
+
+    /**
+     * An escape is neutralised, not parsed: only the `ESC` is a cursor-driving code unit, so `[31m`
+     * is left as inert text where the context sanitizer deletes the whole CSI.
+     *
+     * The defect this catches: giving the log path the prompt path's sequence-aware removal, which
+     * means the two can now disagree about what a sequence is and the log value no longer matches
+     * the bytes the Client sent.
+     */
+    @Test
+    fun anAnsiEscapeIsNeutralisedWithoutParsingTheSequence() {
+        assertEquals("a [31mb", scrubLogValue("a\u001B[31mb"))
+        assertEquals("a ]0;titleb", scrubLogValue("a\u001B]0;titleb"))
+    }
+
     @Test
     fun aLongValueIsCutAtTheCapWithAMarker() {
         val scrubbed = scrubLogValue("a".repeat(500))
@@ -66,5 +116,20 @@ class LogScrubberTest {
         val atCap = "b".repeat(MAX_LOG_VALUE_LENGTH)
 
         assertEquals(atCap, scrubLogValue(atCap))
+    }
+
+    /**
+     * The cap counts UTF-16 code units, not code points, so a long enough value is cut between the
+     * two halves of a non-BMP character — the sentence in [scrubLogValue]'s contract.
+     *
+     * The defect this catches: an implementation that counts code points (or refuses to cut a
+     * pair), which makes the 200-unit promise mean 201 units on a value like this one.
+     */
+    @Test
+    fun aCutLandsInsideASurrogatePair() {
+        val scrubbed = scrubLogValue("a" + "\uD83D\uDE00".repeat(100))
+
+        assertEquals("a" + "\uD83D\uDE00".repeat(99) + "\uD83D" + "…", scrubbed)
+        assertEquals(MAX_LOG_VALUE_LENGTH + 1, scrubbed.length)
     }
 }

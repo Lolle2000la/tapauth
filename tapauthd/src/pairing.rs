@@ -90,7 +90,8 @@ use shared::firewall::{FirewallError, FirewallGuard, Protocol as FirewallProtoco
 use shared::protocol::messages::PROTOCOL_VERSION_V2;
 use shared::protocol::pairing::{
     decode_pairing_packet, encode_pairing_packet, pairing_session_id, ClientPairingState,
-    NegotiatedAlgorithms, PinnedAlgorithms, StartedPairing, PAIRING_SESSION_ID_LEN,
+    NegotiatedAlgorithms, PairingEndpoint, PinnedAlgorithms, StartedPairing,
+    PAIRING_SESSION_ID_LEN,
 };
 use shared::protocol::pb::{
     pairing_packet, PairingAbort, PairingAbortReason, PairingConfirmServer, PairingInit,
@@ -526,12 +527,38 @@ pub(crate) async fn bind_pairing_socket() -> std::io::Result<UdpSocket> {
 
 /// What [`open_transports`] produced.
 pub(crate) struct PairingPorts {
-    /// The bound pairing socket; `None` when the network transport is off.
+    /// The bound pairing socket; `None` when the network transport is off. This is
+    /// the fact that decides whether the session has a UDP endpoint at all.
     pub udp: Option<UdpSocket>,
-    /// Its port, or `0` when there is no socket.
+    /// The port `udp` was bound to; only meaningful when `udp` is `Some`.
     pub local_port: u16,
     /// Keeps the pairing firewall rule alive for the life of the session.
     pub firewall_guard: Option<Arc<FirewallGuard>>,
+}
+
+impl PairingPorts {
+    /// The QR endpoint of a session with these transports.
+    ///
+    /// The socket is the authority: a session without one publishes **no**
+    /// `p`/`ip4`/`ip6` at all and lets the phone use BLE, because a port without a
+    /// socket is a port nothing can send to. Both facts live in this struct, so the
+    /// decision cannot be made from a port value that means "none".
+    ///
+    /// See `a_disabled_network_transport_advertises_no_udp_endpoint_in_the_qr`.
+    pub(crate) fn endpoint(
+        &self,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> PairingEndpoint {
+        if self.udp.is_none() {
+            return PairingEndpoint::default();
+        }
+        PairingEndpoint {
+            udp_port: Some(self.local_port),
+            ipv4,
+            ipv6,
+        }
+    }
 }
 
 /// Why the pairing transports could not be opened.
@@ -590,29 +617,14 @@ where
     })
 }
 
-/// Start the handshake machine for a session with these transports and ports.
-///
-/// The QR endpoint follows the transports rather than the bound socket: a
-/// session with no network transport has no reachable UDP endpoint, so it must
-/// publish **no** `p`/`ip4`/`ip6` at all and let the phone use BLE. Deriving that
-/// from `ports` alone would publish `&p=0` — the port `open_transports` reports
-/// when it binds nothing — which no phone can send to.
+/// Start the handshake machine for a session with this QR endpoint.
 pub(crate) fn start_session_state(
     keypair: Ed25519KeyPair,
     hostname: &str,
-    transports: EnabledTransports,
-    ports: &PairingPorts,
-    ipv4: Option<Ipv4Addr>,
-    ipv6: Option<Ipv6Addr>,
+    endpoint: PairingEndpoint,
     pinned: Option<PinnedAlgorithms>,
 ) -> Result<(ClientPairingState, StartedPairing), ProtocolError> {
-    let (udp_port, ipv4, ipv6) = if transports.network {
-        (ports.local_port, ipv4, ipv6)
-    } else {
-        // `0` is `ClientPairingState::start`'s "no UDP endpoint".
-        (0, None, None)
-    };
-    ClientPairingState::start(keypair, hostname, udp_port, ipv4, ipv6, pinned)
+    ClientPairingState::start(keypair, hostname, endpoint, pinned)
 }
 
 /// Open the pairing UDP port in the firewall.
@@ -761,17 +773,20 @@ async fn run_session(
         link,
         phase,
         commands,
-        peer: None,
-        response_frame: None,
+        accepted: None,
         confirm_frame: None,
         provisioning: None,
         completion: None,
         cancel_reply: None,
         terminal: None,
-        server_public_key: None,
-        server_device_name: String::new(),
     };
 
+    // This is the *runtime* predicate (did the socket bind, did the advertisement
+    // start), not `EnabledTransports::refusal()`, which owns the *configuration*
+    // predicate in `transport/selection.rs`: the case that fires below is "the
+    // network is off by configuration and BLE is configured but `bluer` failed",
+    // where `any()` is already true and `refusal()` would claim both transports
+    // were disabled.
     if !transports_ready {
         // Waiting here would run the loop with one arm fewer than it has cheap
         // exits: no socket to receive on, no link to read from, so only the 120 s
@@ -925,6 +940,77 @@ async fn recv_datagram(
     }
 }
 
+/// A `PairingInit` this session accepted, as one value.
+///
+/// These fields belong together and nothing but [`Session::on_init`] ever wrote
+/// them: the peer the phone reached us on, the encoded `PairingResponse` that
+/// answers its retries, the phone's `Ed_S` and the phone's display name. Holding
+/// them in one `Option` makes "the init has been accepted" a single bit instead
+/// of a relation four fields must keep, and [`AcceptedInit::new`] is the only way
+/// to build one.
+struct AcceptedInit {
+    /// The transport that won the race, and the phone's current address on it.
+    /// Re-pointed — never cleared — by a retried init and by a keepalive, so a
+    /// NAT that remapped the phone's source port still reaches it.
+    peer: Peer,
+    /// The encoded `PairingResponse`, re-sent verbatim on every init retry.
+    response_frame: Vec<u8>,
+    /// `Ed_S`, captured from the accepted `PairingInit`.
+    server_public_key: [u8; 32],
+    /// The phone's display name, captured from the accepted `PairingInit`.
+    device_name: String,
+}
+
+impl AcceptedInit {
+    /// Accept an init that names its phone.
+    ///
+    /// `None` when the name is empty: there is no way back from that, because a
+    /// phone persisted with no name is indistinguishable downstream from one
+    /// whose name was lost, so the init is refused instead of half-accepted.
+    fn new(
+        peer: Peer,
+        response_frame: Vec<u8>,
+        server_public_key: [u8; 32],
+        device_name: String,
+    ) -> Option<Self> {
+        if device_name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            peer,
+            response_frame,
+            server_public_key,
+            device_name,
+        })
+    }
+}
+
+/// One pairing session: its transports, its handshake machine, and the IPC
+/// callers waiting on it.
+///
+/// The `Option` fields are not independent phases. They hold one accepted init,
+/// one provisioning pair and two bookkeeping slots, and the relations below are
+/// the contract the handlers rely on. Each names the place that writes it, so a
+/// reader of [`Session::finish`]/[`Session::end`]/`on_*` finds the whole state
+/// machine here instead of reconstructing it:
+///
+/// * **The accepted init** — `accepted.is_some()` *is* "a `PairingInit` was
+///   accepted": its peer, cached response, `Ed_S` and phone name are one
+///   [`AcceptedInit`], built in one expression by [`Session::on_init`]. Its peer
+///   is re-pointed by that method's refresh arm and by [`Session::on_keepalive`],
+///   never cleared. A name cannot go missing from it: [`AcceptedInit::new`]
+///   refuses an empty one, so no `CompletedPairing` can carry a nameless phone.
+/// * **Provisioning** — `confirm_frame.is_some() ⟺ provisioning.is_some()`: two
+///   adjacent writes in [`Session::on_complete`], no `await` between them.
+/// * `completion.is_some() ⟹ provisioning.is_some()`: a pending
+///   `CompletePairing` reply is allocated only by [`Session::on_confirm_server`]
+///   (with the provisioning it concludes) or by [`Session::end`] while one is
+///   live.
+/// * `terminal.is_some() ⟹ end ran ⟹ the loop is over`: [`Session::end`] returns
+///   [`Flow::Done`] unconditionally, so **no handler may return
+///   `Flow::Continue` after calling it**. That is what makes [`Session::finish`]
+///   the only publisher of a terminal phase: the recorded one cannot be
+///   superseded while the session is still running.
 struct Session {
     state: ClientPairingState,
     session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -936,10 +1022,10 @@ struct Session {
     link: PairingLink,
     phase: watch::Sender<SessionPhase>,
     commands: mpsc::Receiver<SessionCommand>,
-    /// The transport that won the race, and the phone's current address on it.
-    peer: Option<Peer>,
-    /// The encoded `PairingResponse`, re-sent verbatim on every init retry.
-    response_frame: Option<Vec<u8>>,
+    /// The accepted `PairingInit`, or `None` before one has been accepted. It is
+    /// also the session's locked peer: the transport in it is the one that won
+    /// the race.
+    accepted: Option<AcceptedInit>,
     /// The encoded `PairingConfirmClient`, re-sent verbatim while provisioning.
     confirm_frame: Option<Vec<u8>>,
     provisioning: Option<Provisioning>,
@@ -950,13 +1036,15 @@ struct Session {
     /// The terminal phase to publish, recorded by [`Session::end`] and published
     /// by [`Session::finish`] once the session is actually gone.
     terminal: Option<SessionPhase>,
-    /// `Ed_S`, captured from the accepted `PairingInit`.
-    server_public_key: Option<[u8; 32]>,
-    /// The phone's display name, captured from the accepted `PairingInit`.
-    server_device_name: String,
 }
 
 impl Session {
+    /// The peer this session is locked to, or `None` before a `PairingInit` was
+    /// accepted.
+    fn peer(&self) -> Option<Peer> {
+        self.accepted.as_ref().map(|accepted| accepted.peer)
+    }
+
     async fn run(&mut self) {
         let deadline = tokio::time::sleep(SESSION_DEADLINE);
         tokio::pin!(deadline);
@@ -1099,6 +1187,16 @@ impl Session {
     /// The phase is recorded, not published: see [`Session::finish`] for why the
     /// terminal state may only become observable once the session is gone.
     fn end(&mut self, phase: SessionPhase, failure: Option<PairingError>) -> Flow {
+        // The relations documented on `Session`, checked at the point every
+        // ending handler passes through: a later edit that resets one member of a
+        // pair fails here instead of silently leaving the session in a state no
+        // handler can finish — a phone that is never answered. The accepted init
+        // is one value now, so the type keeps its own relation; the provisioning
+        // pair is still two fields.
+        debug_assert!(
+            self.completion.is_none() || self.provisioning.is_some(),
+            "a CompletePairing reply may only exist while its provisioning does"
+        );
         if self.provisioning.is_some() && self.completion.is_none() {
             self.completion = Some(Err(failure.unwrap_or(PairingError::Ended(
                 "pairing session ended before the phone confirmed the CSK".to_string(),
@@ -1129,7 +1227,7 @@ impl Session {
                 // registered GATT application and only dropped by `stop()`, so
                 // this is reached only if the app is unregistered behind us.
                 tracing::warn!("BLE pairing link closed by the phone");
-                if self.peer.map(Peer::kind) == Some(TransportKind::Ble) {
+                if self.peer().map(Peer::kind) == Some(TransportKind::Ble) {
                     // The locked transport is gone: nothing can carry the rest of
                     // the handshake. Over UDP pairing simply continues.
                     return self.end(
@@ -1184,12 +1282,13 @@ impl Session {
     // ---- handshake -------------------------------------------------------
 
     async fn on_init(&mut self, init: PairingInit, source: Peer) -> Flow {
-        match init_disposition(self.peer.map(Peer::kind), source.kind()) {
+        let locked = self.peer().map(Peer::kind);
+        match init_disposition(locked, source.kind()) {
             InitDisposition::Ignore => {
                 tracing::debug!(
                     "Ignoring PairingInit over {:?}: the session is locked to {:?}",
                     source.kind(),
-                    self.peer.map(Peer::kind)
+                    locked
                 );
                 return Flow::Continue;
             }
@@ -1217,12 +1316,18 @@ impl Session {
                     );
                     return Flow::Continue;
                 }
-                self.peer = Some(source);
+                if let Some(accepted) = self.accepted.as_mut() {
+                    accepted.peer = source;
+                }
                 tracing::debug!(
                     "PairingInit retried over {:?}; re-sending the cached PairingResponse",
                     source.kind()
                 );
-                if let Some(frame) = self.response_frame.clone() {
+                let cached = self
+                    .accepted
+                    .as_ref()
+                    .map(|accepted| accepted.response_frame.clone());
+                if let Some(frame) = cached {
                     self.send(frame, source).await;
                 }
                 return Flow::Continue;
@@ -1271,23 +1376,30 @@ impl Session {
             }
         };
 
-        self.response_frame = Some(frame);
-        self.server_public_key = Some(server_public_key);
-        self.server_device_name = init.server_device_name;
-        self.peer = Some(source);
+        // One value for the whole of "accepted", so there is no window in which
+        // the peer, the cached response and the phone's identity disagree.
+        let Some(accepted) =
+            AcceptedInit::new(source, frame, server_public_key, init.server_device_name)
+        else {
+            tracing::warn!("Rejecting PairingInit: the phone sent no device name");
+            return self
+                .reject_init(PairingAbortReason::ProtocolError, source)
+                .await;
+        };
+        let sas = self.state.sas().map(str::to_string);
+        let cached = accepted.response_frame.clone();
+        self.accepted = Some(accepted);
 
-        if let Some(sas) = self.state.sas() {
+        if let Some(sas) = sas {
             tracing::info!(
                 "PairingInit accepted over {:?} (phone {}); SAS ready for display",
                 source.kind(),
                 hex::encode(server_public_key)
             );
-            self.publish(SessionPhase::AwaitingSas(sas.to_string()));
+            self.publish(SessionPhase::AwaitingSas(sas));
         }
 
-        if let Some(frame) = self.response_frame.clone() {
-            self.send(frame, source).await;
-        }
+        self.send(cached, source).await;
         Flow::Continue
     }
 
@@ -1304,7 +1416,7 @@ impl Session {
     }
 
     async fn on_keepalive(&mut self, source: Peer) -> Flow {
-        if self.peer.map(Peer::kind) != Some(source.kind()) {
+        if self.peer().map(Peer::kind) != Some(source.kind()) {
             tracing::trace!(
                 "Ignoring PairingKeepalive over {:?}: not the locked transport",
                 source.kind()
@@ -1313,10 +1425,16 @@ impl Session {
         }
         // Keepalives refresh peer_addr (the phone's NAT port may have changed) and
         // request an immediate retransmission of whatever is in flight.
-        self.peer = Some(source);
+        if let Some(accepted) = self.accepted.as_mut() {
+            accepted.peer = source;
+        }
         if self.provisioning.is_some() {
             self.pump_provisioning(true).await;
-        } else if let Some(frame) = self.response_frame.clone() {
+        } else if let Some(frame) = self
+            .accepted
+            .as_ref()
+            .map(|accepted| accepted.response_frame.clone())
+        {
             self.send(frame, source).await;
         }
         Flow::Continue
@@ -1350,8 +1468,7 @@ impl Session {
             return Flow::Continue;
         }
 
-        let (Some(server_public_key), Some(negotiated)) =
-            (self.server_public_key, self.state.negotiated())
+        let (Some(accepted), Some(negotiated)) = (self.accepted.as_ref(), self.state.negotiated())
         else {
             tracing::warn!("Pairing proved out without a recorded phone identity key");
             return self.end(
@@ -1361,12 +1478,17 @@ impl Session {
                 )),
             );
         };
+        // The accepted init is the only source of the two fields the admin handler
+        // persists, and `AcceptedInit::new` refused to hold an empty name, so the
+        // published `CompletedPairing` always names the phone.
+        let server_public_key = accepted.server_public_key;
+        let server_device_name = accepted.device_name.clone();
 
         // The CSK is provisioned and proven: drop the session keys (and H) now.
         self.state.conclude();
         self.completion = Some(Ok(CompletedPairing {
             server_public_key,
-            server_device_name: self.server_device_name.clone(),
+            server_device_name,
             negotiated,
         }));
         tracing::info!(
@@ -1409,7 +1531,7 @@ impl Session {
             "Pairing session expired after {}s",
             SESSION_DEADLINE.as_secs()
         );
-        if let Some(peer) = self.peer {
+        if let Some(peer) = self.peer() {
             self.send_abort(peer, PairingAbortReason::SessionExpired)
                 .await;
         }
@@ -1433,7 +1555,7 @@ impl Session {
             let _ = request.reply.send(Err(PairingError::AlreadyCompleting));
             return Flow::Continue;
         }
-        let Some(peer) = self.peer else {
+        let Some(peer) = self.peer() else {
             let _ = request.reply.send(Err(PairingError::NotInitiated));
             return Flow::Continue;
         };
@@ -1480,7 +1602,7 @@ impl Session {
     async fn on_cancel(&mut self, reply: oneshot::Sender<()>) -> Flow {
         self.cancel_reply = Some(reply);
         let reason = PairingAbortReason::UserRejectedSas;
-        match self.peer {
+        match self.peer() {
             Some(peer) => {
                 tracing::info!(
                     "Cancelling the pairing session: sending {} to the phone",
@@ -1508,7 +1630,7 @@ impl Session {
         if !transmit_due(last_sent, now, keepalive_received) {
             return;
         }
-        let (Some(frame), Some(peer)) = (self.confirm_frame.clone(), self.peer) else {
+        let (Some(frame), Some(peer)) = (self.confirm_frame.clone(), self.peer()) else {
             return;
         };
         self.send(frame, peer).await;
@@ -1730,9 +1852,11 @@ mod tests {
         let (mut desktop, started) = ClientPairingState::start(
             desktop_identity,
             "thinkpad",
-            36692,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            None,
+            PairingEndpoint {
+                udp_port: Some(36692),
+                ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -1931,9 +2055,11 @@ mod tests {
         let (state, started) = ClientPairingState::start(
             desktop_identity,
             "thinkpad",
-            port,
-            Some(Ipv4Addr::LOCALHOST),
-            None,
+            PairingEndpoint {
+                udp_port: Some(port),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -2015,6 +2141,14 @@ mod tests {
 
     /// A session wired to a loopback socket and no BLE half, so the frame
     /// handlers can be driven without the loop or a phone.
+    ///
+    /// The peer is locked to a loopback address. In a live session that can only
+    /// happen once a `PairingInit` has been accepted, so the other two members of
+    /// that value are set with it (`Session`'s invariants): a session with a
+    /// `peer` and no cached response is a state the daemon never reaches. The
+    /// cached frame is empty because the fixture never ran the handshake, only
+    /// the handlers, and the name is a real one because `AcceptedInit` refuses an
+    /// empty one.
     async fn test_session(
         state: ClientPairingState,
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -2032,15 +2166,20 @@ mod tests {
             link: PairingLink::start([0u8; 10], false).await,
             phase,
             commands,
-            peer: Some(Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)))),
-            response_frame: None,
+            accepted: Some(
+                AcceptedInit::new(
+                    Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
+                    Vec::new(),
+                    [0u8; 32],
+                    "pixel".to_string(),
+                )
+                .expect("the fixture names its phone"),
+            ),
             confirm_frame: None,
             provisioning: None,
             completion: None,
             cancel_reply: None,
             terminal: None,
-            server_public_key: None,
-            server_device_name: String::new(),
         };
         (session, phases)
     }
@@ -2065,9 +2204,11 @@ mod tests {
         let (fresh_state, fresh_started) = ClientPairingState::start(
             fresh_identity,
             "thinkpad",
-            36_692,
-            Some(Ipv4Addr::LOCALHOST),
-            None,
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -2206,6 +2347,109 @@ mod tests {
         );
     }
 
+    /// A `CancelPairing` that arrives while a `CompletePairing` is still waiting
+    /// for the phone must answer **both** callers, and publish the cancel as the
+    /// one terminal phase.
+    ///
+    /// The defects this catches: `Session::finish` answering only the caller it
+    /// was written for — dropping the pending `CompletePairing` reply instead of
+    /// failing it, so `request_completion` waits out `SESSION_REPLY_TIMEOUT`
+    /// (135 s) and the GUI's confirm button hangs on a session that is already
+    /// gone; answering it `Ok`, which tells the admin handler a CSK was
+    /// provisioned and makes it persist a phone that never proved the key; and a
+    /// second terminal phase overwriting the recorded one, so the GUI reports
+    /// "finished" for a pairing the user cancelled.
+    ///
+    /// What it does not re-assert: that the terminal phase is published after
+    /// teardown (`the_terminal_phase_is_published_last` owns that ordering).
+    #[tokio::test]
+    async fn a_cancel_answers_a_pending_completion_and_publishes_only_the_cancel() {
+        let Some((session, _phone, phone_socket, _daemon, _session_id, _phone_key)) =
+            session_and_verified_phone().await
+        else {
+            return;
+        };
+        assert!(
+            matches!(session.phase(), SessionPhase::AwaitingSas(_)),
+            "the cancel must land while the SAS is still being compared"
+        );
+
+        let commands = session.command_sender();
+        // A subscription taken before the cancel, so the published terminal is
+        // observed as a change rather than read back from the current value.
+        let mut phases = session.phase_receiver();
+        phases.borrow_and_update();
+
+        // 1. `CompletePairing`: the worker provisions the CSK and parks the caller
+        //    until the phone proves it.
+        let completing = tokio::spawn({
+            let commands = commands.clone();
+            async move {
+                request_completion(
+                    &commands,
+                    [0x5Au8; 32],
+                    "luca".to_string(),
+                    "thinkpad".to_string(),
+                )
+                .await
+            }
+        });
+        // The frame the phone is being sent says the completion was taken off the
+        // queue, so `provisioning` and its pending reply are live when the cancel
+        // arrives. That is the state this test is about.
+        match recv_frame(&phone_socket).await.msg {
+            Some(pairing_packet::Msg::ConfirmClient(_)) => {}
+            other => panic!("expected a PairingConfirmClient, got {:?}", other),
+        }
+
+        // 2. `CancelPairing` arrives while the session is still `AwaitingSas`.
+        request_cancellation(&commands)
+            .await
+            .expect("a CancelPairing issued while a completion waits must be answered");
+
+        // 3. Both callers are answered, and the completion's answer is `Ended`:
+        //    not a hang and not `Ok`.
+        let completion = tokio::time::timeout(Duration::from_secs(5), completing)
+            .await
+            .expect("the pending CompletePairing caller was never answered")
+            .expect("the completion task panicked");
+        match completion {
+            Err(PairingError::Ended(message)) => assert_eq!(
+                message, "pairing session ended before the phone confirmed the CSK",
+                "the completion must fail for the reason the teardown records"
+            ),
+            other => panic!(
+                "a pending CompletePairing must fail as Ended once the session is cancelled, \
+                 got {other:?}"
+            ),
+        }
+
+        // 4. Exactly one terminal phase, and it is the cancel's. The observer is
+        //    subscribed before the cancel and drained until the worker drops its
+        //    sender, so every value it is woken for is recorded.
+        let mut observed = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), phases.changed()).await {
+                Ok(Ok(())) => observed.push(phases.borrow_and_update().clone()),
+                // The sender is gone: nothing further can be published.
+                Ok(Err(_)) => break,
+                Err(_) => panic!("the worker stopped publishing before the session ended"),
+            }
+        }
+        assert_eq!(
+            observed,
+            vec![SessionPhase::Failed(
+                "the pairing was cancelled".to_string()
+            )],
+            "exactly one terminal phase may be published, and it must be the cancel's"
+        );
+        assert_eq!(
+            session.phase(),
+            SessionPhase::Failed("the pairing was cancelled".to_string()),
+            "the terminal a client observes must be the cancel's"
+        );
+    }
+
     // ---- Algorithm pinning ------------------------------------------------
 
     /// One vendor's single-suite phone offer, built from `phone`'s init.
@@ -2263,7 +2507,7 @@ mod tests {
     /// The daemon-side pin reaching the negotiation is all this can show while
     /// one suite ships: a pin outvoting the baseline is only expressible with a
     /// second one, so restore `pinned_algorithms_win_over_the_baseline`
-    /// (`shared/src/protocol/pairing.rs`) with that suite.
+    /// (`shared/src/protocol/pairing/negotiation.rs`) with that suite.
     #[test]
     fn a_v1_state_directory_pins_the_v1_suite_and_cannot_be_renegotiated() {
         let resolved =
@@ -2283,9 +2527,17 @@ mod tests {
         let identity = || Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap();
 
         // A phone that offers the v1 suite still pairs, and pairs *as* v1.
-        let (mut desktop, started) =
-            ClientPairingState::start(identity(), "thinkpad", 36_692, None, None, Some(pinned))
-                .unwrap();
+        let (mut desktop, started) = ClientPairingState::start(
+            identity(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
+            Some(pinned),
+        )
+        .unwrap();
         let init = init_offering(
             started.session_id,
             &[SymmetricAlgorithm::Aes256Gcm],
@@ -2301,9 +2553,17 @@ mod tests {
 
         // A phone that offers only the reserved tag `2` is refused outright: it
         // advertises nothing the pinned suite can be honoured with.
-        let (mut desktop, started) =
-            ClientPairingState::start(identity(), "thinkpad", 36_692, None, None, Some(pinned))
-                .unwrap();
+        let (mut desktop, started) = ClientPairingState::start(
+            identity(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
+            Some(pinned),
+        )
+        .unwrap();
         let mut init = init_offering(
             started.session_id,
             &[SymmetricAlgorithm::Aes256Gcm],
@@ -2454,14 +2714,15 @@ mod tests {
 
     /// A prepared session for the worker: the given socket (or none) and no BLE.
     fn worker_setup(udp: Option<UdpSocket>, local_port: u16) -> SessionSetup {
-        // `udp_port = 0` is `ClientPairingState::start`'s "no UDP endpoint", which
-        // is what `start_session_state` produces with the network transport off.
+        let endpoint = PairingEndpoint {
+            // The endpoint exists exactly when there is a socket to advertise.
+            udp_port: udp.is_some().then_some(local_port),
+            ..Default::default()
+        };
         let (state, started) = ClientPairingState::start(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            local_port,
-            None,
-            None,
+            endpoint,
             None,
         )
         .unwrap();
@@ -2553,10 +2814,10 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(false, true),
-            &ports,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            Some(Ipv6Addr::LOCALHOST),
+            ports.endpoint(
+                Some(Ipv4Addr::new(192, 168, 1, 5)),
+                Some(Ipv6Addr::LOCALHOST),
+            ),
             None,
         )
         .unwrap();
@@ -2590,10 +2851,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(true, true),
-            &ports,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            None,
+            ports.endpoint(Some(Ipv4Addr::new(192, 168, 1, 5)), None),
             None,
         )
         .unwrap();
@@ -2615,14 +2873,12 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(false, true),
-            &PairingPorts {
+            PairingPorts {
                 udp: None,
                 local_port: 0,
                 firewall_guard: None,
-            },
-            None,
-            None,
+            }
+            .endpoint(None, None),
             None,
         )
         .unwrap();
@@ -2657,7 +2913,7 @@ mod tests {
         let (mut session, _phases) = test_session(desktop, session_id).await;
         let locked = Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)));
         assert_eq!(
-            session.peer,
+            session.peer(),
             Some(locked),
             "the fixture locks the transport"
         );
@@ -2672,7 +2928,7 @@ mod tests {
             Flow::Continue
         ));
         assert_eq!(
-            session.peer,
+            session.peer(),
             Some(locked),
             "a differing init must not redirect the session"
         );
@@ -2684,7 +2940,80 @@ mod tests {
             session.on_init(genuine, elsewhere).await,
             Flow::Continue
         ));
-        assert_eq!(session.peer, Some(elsewhere));
+        assert_eq!(session.peer(), Some(elsewhere));
+    }
+
+    /// A `PairingInit` that names no phone must fail the session instead of being
+    /// accepted with an empty name.
+    ///
+    /// The defect this catches: `Session::on_init` keeping an init whose
+    /// `server_device_name` is empty — the pre-`AcceptedInit` shape, where the empty
+    /// string was the sentinel for "the phone sent no name". There the session
+    /// publishes `AwaitingSas`, the phone walks the user through the SAS, and what
+    /// the daemon persists is a `PairedServer` the user can never recognise.
+    #[tokio::test]
+    async fn a_pairing_init_with_no_device_name_fails_the_session() {
+        let (desktop, started) = ClientPairingState::start(
+            Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
+            None,
+        )
+        .unwrap();
+        let mut phone = ServerPairingSession::new(
+            started.session_id,
+            Ed25519KeyPair::from_signing_key_bytes(&PHONE_SEED).unwrap(),
+            "",
+        )
+        .unwrap();
+        let nameless = phone.create_init().unwrap();
+        assert_eq!(
+            nameless.server_device_name, "",
+            "the frame under test must carry no device name"
+        );
+
+        let (mut session, phases) = test_session(desktop, started.session_id).await;
+        // `test_session` pre-accepts an init so the handlers can be driven without a
+        // handshake; a *first* `PairingInit` needs the pre-accept state instead.
+        session.accepted = None;
+
+        let flow = session
+            .on_init(
+                nameless,
+                Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
+            )
+            .await;
+        assert!(
+            matches!(flow, Flow::Done),
+            "a nameless init must end the session"
+        );
+        assert!(
+            session.accepted.is_none(),
+            "a nameless init must not be accepted"
+        );
+        assert!(
+            session.completion.is_none(),
+            "a refused init must not produce a CompletedPairing"
+        );
+        // Nothing is published before teardown, so the shared phase is still the
+        // pre-handshake one: no accepted phase went out.
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::AwaitingPhone,
+            "a refused init must not publish an accepted phase"
+        );
+
+        session.finish().await;
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::Failed(
+                "the phone's pairing request was refused (PROTOCOL_ERROR)".to_string()
+            )
+        );
     }
 
     /// The terminal phase is published only after the link is stopped and the

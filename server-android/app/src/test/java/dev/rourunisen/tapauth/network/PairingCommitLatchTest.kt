@@ -33,8 +33,12 @@ class PairingCommitLatchTest {
         val latch = PairingCommitLatch()
 
         assertTrue("The commit must be allowed to begin", latch.beginCommit())
-        assertTrue("The close must be deferred", latch.requestClose())
-        assertTrue("A repeated close must still be deferred", latch.requestClose())
+        assertEquals("The close must be deferred", CloseOutcome.Deferred, latch.requestClose())
+        assertEquals(
+            "A repeated close must still be deferred",
+            CloseOutcome.Deferred,
+            latch.requestClose(),
+        )
     }
 
     /**
@@ -50,7 +54,11 @@ class PairingCommitLatchTest {
         val latch = PairingCommitLatch()
 
         assertTrue(latch.beginCommit())
-        assertTrue(latch.requestClose())
+        assertEquals(
+            "The close must be deferred",
+            CloseOutcome.Deferred,
+            latch.requestClose(),
+        )
 
         assertTrue(
             "The close was deferred, so the commit side must still hold",
@@ -69,9 +77,17 @@ class PairingCommitLatchTest {
     fun aCommitAfterTheCloseIsRefused() {
         val latch = PairingCommitLatch()
 
-        assertFalse("The close may release immediately", latch.requestClose())
+        assertEquals(
+            "The close may release immediately",
+            CloseOutcome.Released,
+            latch.requestClose(),
+        )
         assertFalse("The commit must be refused", latch.beginCommit())
-        assertFalse("A repeated close may still release", latch.requestClose())
+        assertEquals(
+            "A repeated close may still release",
+            CloseOutcome.Released,
+            latch.requestClose(),
+        )
         assertFalse("The refusal must not be undone", latch.beginCommit())
     }
 
@@ -91,12 +107,24 @@ class PairingCommitLatchTest {
         val latch = PairingCommitLatch()
 
         assertTrue("The commit must be allowed to begin", latch.beginCommit())
-        assertTrue("A close during the confirmation must defer", latch.requestClose())
+        assertEquals(
+            "A close during the confirmation must defer",
+            CloseOutcome.Deferred,
+            latch.requestClose(),
+        )
 
         latch.completeCommit()
 
-        assertFalse("A close after the completion must release", latch.requestClose())
-        assertFalse("A repeated close still reports the release", latch.requestClose())
+        assertEquals(
+            "A close after the completion must release",
+            CloseOutcome.Released,
+            latch.requestClose(),
+        )
+        assertEquals(
+            "A repeated close still reports the release",
+            CloseOutcome.Released,
+            latch.requestClose(),
+        )
         assertFalse(
             "The close that released also refuses a later commit",
             latch.beginCommit(),
@@ -116,7 +144,7 @@ class PairingCommitLatchTest {
 
         latch.completeCommit()
 
-        assertFalse("The close must release", latch.requestClose())
+        assertEquals("The close must release", CloseOutcome.Released, latch.requestClose())
         assertFalse("The commit must stay refused", latch.beginCommit())
     }
 
@@ -144,8 +172,8 @@ class PairingCommitLatchTest {
                 val go = AtomicBoolean(false)
                 val arrived = AtomicInteger(0)
 
-                fun racer(transition: () -> Boolean) =
-                    Callable<Boolean> {
+                fun <T> racer(transition: () -> T) =
+                    Callable<T> {
                         arrived.incrementAndGet()
                         // Both racers spin on the same flag, so they leave it together on-CPU.
                         while (!go.get()) {}
@@ -159,10 +187,9 @@ class PairingCommitLatchTest {
 
                 val commitBegun = commit.get(TIMEOUT_S, TimeUnit.SECONDS)
                 val closeDeferred = close.get(TIMEOUT_S, TimeUnit.SECONDS)
-                // `requestClose()` answering false means the close released immediately, i.e. it
-                // won
-                // the boundary; answering true means the commit had already won.
-                val closeWon = !closeDeferred
+                // `requestClose()` answering `Released` means the close released immediately, i.e.
+                // it won the boundary; `Deferred` means the commit had already won.
+                val closeWon = closeDeferred == CloseOutcome.Released
 
                 assertTrue(
                     "Round $round resolved to two winners: commitBegun=$commitBegun, " +

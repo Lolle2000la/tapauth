@@ -5,6 +5,9 @@
 //! exact wire bytes of `payload` instead of re-serializing a decoded struct, so
 //! unknown fields written by a newer peer survive signature verification and are
 //! ignored by the inner decode that follows.
+//!
+//! The caller context those messages carry — its byte budgets and the sanitizer that
+//! makes it safe to display — lives in the `context` submodule.
 
 use prost::Message as ProstMessage;
 use subtle::ConstantTimeEq;
@@ -13,38 +16,15 @@ use crate::crypto::{sign_ed25519, verify_ed25519, CryptoError, Ed25519KeyPair};
 use crate::protocol::packet::{wrap_auth_denial, wrap_auth_grant};
 use crate::protocol::pb::*;
 
+mod context;
+
+pub use context::*;
+
 /// Protocol version stored in `WrapperMessage.version` for the v2 framing.
 pub const PROTOCOL_VERSION_V2: u32 = 2;
 
 /// Domain separation tag prepended to every `WrapperMessage` signing transcript.
 const WRAPPER_SIGNING_DOMAIN: &[u8] = b"tapauth-sig-v2";
-
-/// Maximum byte length of `AuthenticationRequest.username`.
-///
-/// A username that exceeds this is **rejected**, never truncated: the phone would
-/// otherwise display (and the PAM module would otherwise authorize) an account
-/// that is not the one being authenticated.
-pub const USERNAME_MAX_BYTES: usize = 32;
-/// Maximum byte length of `AuthenticationRequest.hostname`.
-///
-/// A hostname is display-only, so an over-long one is sanitized and truncated
-/// instead of rejected — see [`create_auth_request_with_context`].
-pub const HOSTNAME_MAX_BYTES: usize = 64;
-/// Maximum byte length of `AuthenticationRequest.pam_service`.
-pub const PAM_SERVICE_MAX_BYTES: usize = 32;
-/// Maximum byte length of `AuthenticationRequest.process_name`.
-pub const PROCESS_NAME_MAX_BYTES: usize = 32;
-/// Maximum byte length of `AuthenticationRequest.command_preview`.
-pub const COMMAND_PREVIEW_MAX_BYTES: usize = 128;
-
-/// Truncation marker appended inside the byte budget when a context string is cut.
-const ELLIPSIS: char = '\u{2026}';
-
-/// `ESC`, which opens every ANSI escape sequence stripped from a context string.
-const ESC_BYTE: u8 = 0x1B;
-
-/// `BEL`, the short terminator of an OSC sequence.
-const BEL_BYTE: u8 = 0x07;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -297,204 +277,6 @@ fn verify_challenge_field(field: &[u8], expected: &[u8; 32]) -> Result<(), Proto
     }
 }
 
-/// Sanitize untrusted contextual metadata for display on the Server prompt.
-///
-/// The Kotlin mirror (`ContextSanitizer` in `server-android`) must implement exactly
-/// this, so both sides are driven by the same vectors in
-/// `shared/testdata/context_sanitizer_vectors.json`:
-///
-/// 1. ANSI escape sequences are removed as a unit, first. A CSI (`ESC '['`, parameter
-///    bytes `0x30..=0x3F`, intermediate bytes `0x20..=0x2F`, one final byte
-///    `0x40..=0x7E`) and an OSC (`ESC ']'` up to `BEL` or `ESC '\'`, terminator
-///    included) are deleted whole — deleting only the `ESC` would leave `[31m` in the
-///    prompt. An unterminated sequence is deleted to end of input. A lone `ESC` is a
-///    forbidden character and is dropped, and the byte after it is filtered normally.
-/// 2. Then, per code point: a whitespace code point (see
-///    [`is_context_whitespace`]) becomes one space, runs collapse to one space and
-///    both ends are trimmed; otherwise a forbidden code point (see
-///    [`is_forbidden_context_char`]) is dropped; everything else is kept. The
-///    whitespace test comes *first*, so `\t`, `\n` and U+0085 separate words instead
-///    of vanishing (`sudo\tapt` must not become `sudoapt`).
-/// 3. The result is truncated to at most `max_bytes` bytes on a UTF-8 char boundary;
-///    when truncation happens a single `…` is appended *inside* that budget, so a
-///    budget of 3 bytes or less truncates without an ellipsis.
-pub fn sanitize_context_string(input: &str, max_bytes: usize) -> String {
-    let collapsed = normalize_context_string(input);
-
-    if max_bytes == 0 {
-        return String::new();
-    }
-
-    let sanitized = collapsed.as_str();
-    if sanitized.len() <= max_bytes {
-        return sanitized.to_string();
-    }
-
-    let ellipsis_len = ELLIPSIS.len_utf8();
-    // The ellipsis itself costs 3 bytes and must leave room for at least one content
-    // byte, so budgets below 4 truncate without one.
-    let with_ellipsis = max_bytes > ellipsis_len;
-    let budget = if with_ellipsis {
-        max_bytes - ellipsis_len
-    } else {
-        max_bytes
-    };
-
-    let mut truncated = String::with_capacity(max_bytes);
-    for ch in sanitized.chars() {
-        if truncated.len() + ch.len_utf8() > budget {
-            break;
-        }
-        truncated.push(ch);
-    }
-    if with_ellipsis {
-        truncated.push(ELLIPSIS);
-    }
-    truncated
-}
-
-/// Delete ANSI escape sequences and every forbidden code point, and collapse
-/// whitespace runs to one ASCII space (see [`sanitize_context_string`]).
-///
-/// Byte- and char-addressed at once: the escape scanner walks the byte slice (every
-/// byte of an escape sequence is ASCII), and everything else is consumed one whole
-/// `char` at a time, so the string is never split inside a multi-byte code point.
-fn normalize_context_string(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut pending_space = false;
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes.get(index).copied() == Some(ESC_BYTE) {
-            match ansi_sequence_len(bytes, index) {
-                Some(len) => index = index.saturating_add(len),
-                // A lone `ESC` (end of input, or followed by anything but `[`/`]`) is
-                // just a forbidden character: drop it and filter the next byte normally.
-                None => index = index.saturating_add(1),
-            }
-            continue;
-        }
-
-        // `index` is on a char boundary: every advance above covers ASCII bytes only.
-        let next_char = input.get(index..).and_then(|rest| rest.chars().next());
-        let Some(ch) = next_char else {
-            break;
-        };
-        index = index.saturating_add(ch.len_utf8());
-
-        // Whitespace before the forbidden set: `U+0009..=U+000D` and `U+0085` are both.
-        if is_context_whitespace(ch) {
-            pending_space = !out.is_empty();
-            continue;
-        }
-        if is_forbidden_context_char(ch) {
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.push(ch);
-    }
-
-    out
-}
-
-/// Length in bytes of the ANSI escape sequence starting at `start`, terminator included.
-///
-/// `None` when `bytes[start]` is an `ESC` that does not begin a CSI or OSC, which the
-/// caller treats as a forbidden character. An unterminated CSI/OSC reports the rest of
-/// the input, so a truncated escape cannot leak its parameter bytes into the prompt.
-fn ansi_sequence_len(bytes: &[u8], start: usize) -> Option<usize> {
-    match bytes.get(start.checked_add(1)?).copied() {
-        // CSI: ESC '[' params intermediates final
-        Some(b'[') => {
-            let mut cursor = start.saturating_add(2);
-            while bytes.get(cursor).copied().is_some_and(is_csi_parameter) {
-                cursor = cursor.saturating_add(1);
-            }
-            while bytes.get(cursor).copied().is_some_and(is_csi_intermediate) {
-                cursor = cursor.saturating_add(1);
-            }
-            if bytes.get(cursor).copied().is_some_and(is_csi_final) {
-                Some(cursor.saturating_add(1).saturating_sub(start))
-            } else {
-                Some(bytes.len().saturating_sub(start))
-            }
-        }
-        // OSC: ESC ']' ... (BEL | ESC '\')
-        Some(b']') => {
-            let mut cursor = start.saturating_add(2);
-            while cursor < bytes.len() {
-                if bytes.get(cursor).copied() == Some(BEL_BYTE) {
-                    return Some(cursor.saturating_add(1).saturating_sub(start));
-                }
-                let is_string_terminator = bytes.get(cursor).copied() == Some(ESC_BYTE)
-                    && bytes.get(cursor.saturating_add(1)).copied() == Some(b'\\');
-                if is_string_terminator {
-                    return Some(cursor.saturating_add(2).saturating_sub(start));
-                }
-                cursor = cursor.saturating_add(1);
-            }
-            Some(bytes.len().saturating_sub(start))
-        }
-        _ => None,
-    }
-}
-
-/// One byte of a CSI parameter string: `0x30..=0x3F` (ECMA-48 §5.4).
-fn is_csi_parameter(byte: u8) -> bool {
-    (0x30..=0x3F).contains(&byte)
-}
-
-/// One byte of a CSI intermediate string: `0x20..=0x2F` (ECMA-48 §5.4).
-fn is_csi_intermediate(byte: u8) -> bool {
-    (0x20..=0x2F).contains(&byte)
-}
-
-/// The single final byte of a CSI sequence: `0x40..=0x7E` (ECMA-48 §5.4).
-fn is_csi_final(byte: u8) -> bool {
-    (0x40..=0x7E).contains(&byte)
-}
-
-/// The code points that become one ASCII space, collapsed and trimmed.
-///
-/// Spelled out instead of `char::is_whitespace` because the set is part of the display
-/// contract the Kotlin mirror implements; `char::is_whitespace` is a Unicode property
-/// that changes with the Unicode version and does not include `U+200B`.
-fn is_context_whitespace(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{0085}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-    )
-}
-
-/// Code points that must never reach the Server prompt: controls and bidi formatters.
-fn is_forbidden_context_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0000}'..='\u{001F}'
-            | '\u{007F}'..='\u{009F}'
-            | '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
-}
-
 /// Create an AuthenticationRequest message (without signature)
 /// The signature will be added when wrapping in WrapperMessage
 pub fn create_auth_request(
@@ -514,39 +296,67 @@ pub fn create_auth_request_with_challenge(
     hostname: &str,
     challenge: &[u8],
 ) -> Result<AuthenticationRequest, ProtocolError> {
-    create_auth_request_with_context(username, hostname, challenge, "", "", "", false)
+    create_auth_request_with_context(
+        challenge,
+        ContextFields {
+            username,
+            hostname,
+            pam_service: "",
+            process_name: "",
+            command_preview: "",
+        },
+        false,
+    )
+}
+
+/// The five caller-context strings an [`AuthenticationRequest`] carries, named.
+///
+/// The struct exists so the values cannot be transposed: five of the builder's
+/// parameters were exactly these five strings, which made a wrong order compile.
+/// A named field has no position to get wrong.
+pub struct ContextFields<'a> {
+    pub username: &'a str,
+    pub hostname: &'a str,
+    pub pam_service: &'a str,
+    pub process_name: &'a str,
+    pub command_preview: &'a str,
 }
 
 /// Create an AuthenticationRequest carrying sanitized call-site context.
 ///
-/// `pam_service`, `process_name` and `command_preview` are sanitized and truncated to
-/// [`PAM_SERVICE_MAX_BYTES`], [`PROCESS_NAME_MAX_BYTES`] and
-/// [`COMMAND_PREVIEW_MAX_BYTES`] respectively, so the signed payload stays inside the
-/// BLE GATT budget ([`crate::models::ble::MAX_GATT_PAYLOAD_BYTES`]).
+/// Every bounded field takes its budget and its over-budget behaviour from its row of
+/// the per-field table (`ContextField::policy`, whose rows are `FieldPolicy`) rather
+/// than from a check written here: every field but the username is sanitized and
+/// truncated, so the signed payload stays inside the BLE GATT budget
+/// ([`crate::models::ble::MAX_GATT_PAYLOAD_BYTES`]), while `username` is **rejected**
+/// with [`ProtocolError::InvalidMessageFormat`] when it exceeds its budget. That
+/// distinction is a column of the table, not a branch to notice: the username is the
+/// account the Server (phone) shows and the one the Client authorizes, so a truncated
+/// value would name a different account than the one being authenticated, while a
+/// long hostname is only display text.
 ///
-/// `hostname` is bounded the same way, with [`HOSTNAME_MAX_BYTES`].
-///
-/// `username` is the exception: it is **rejected** with
-/// [`ProtocolError::InvalidMessageFormat`] when it exceeds [`USERNAME_MAX_BYTES`]
-/// instead of being sanitized or truncated. The username is the account the Server
-/// (phone) shows and the one the Client authorizes, so a truncated value would name
-/// a different account than the one being authenticated; a caller that cannot name
-/// the account in 32 bytes has a defect, not a long hostname.
+/// The five bounded values arrive as [`ContextFields`], so their order cannot be
+/// transposed: the function takes the challenge, the fields and `tty_present`, and
+/// nothing else.
 pub fn create_auth_request_with_context(
-    username: &str,
-    hostname: &str,
     challenge: &[u8],
-    pam_service: &str,
-    process_name: &str,
-    command_preview: &str,
+    fields: ContextFields<'_>,
     tty_present: bool,
 ) -> Result<AuthenticationRequest, ProtocolError> {
     if challenge.len() != 32 {
         return Err(ProtocolError::InvalidMessageFormat);
     }
-    if username.len() > USERNAME_MAX_BYTES {
-        return Err(ProtocolError::InvalidMessageFormat);
-    }
+
+    // One row per field. A field is bounded only by appearing here, so the table above
+    // is the whole list of what *this builder* asks `sanitize_context_string` to cut —
+    // `tapauthd/src/caller_context.rs` cuts the same three fields on its own, and a row
+    // edited here does not reach it.
+    let username = bound_context_value(ContextField::Username, fields.username)?;
+    let hostname = bound_context_value(ContextField::Hostname, fields.hostname)?;
+    let pam_service = bound_context_value(ContextField::PamService, fields.pam_service)?;
+    let process_name = bound_context_value(ContextField::ProcessName, fields.process_name)?;
+    let command_preview =
+        bound_context_value(ContextField::CommandPreview, fields.command_preview)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -555,12 +365,12 @@ pub fn create_auth_request_with_context(
 
     Ok(AuthenticationRequest {
         challenge: challenge.to_vec(),
-        username: username.to_string(),
-        hostname: sanitize_context_string(hostname, HOSTNAME_MAX_BYTES),
+        username,
+        hostname,
         timestamp_unix_seconds: timestamp,
-        pam_service: sanitize_context_string(pam_service, PAM_SERVICE_MAX_BYTES),
-        process_name: sanitize_context_string(process_name, PROCESS_NAME_MAX_BYTES),
-        command_preview: sanitize_context_string(command_preview, COMMAND_PREVIEW_MAX_BYTES),
+        pam_service,
+        process_name,
+        command_preview,
         tty_present,
     })
 }
@@ -1029,12 +839,14 @@ mod tests {
         let long_preview = "y".repeat(400);
 
         let request = create_auth_request_with_context(
-            "user",
-            "host",
             &[1u8; 32],
-            "  sudo\u{0} ",
-            "sudo",
-            &long_preview,
+            ContextFields {
+                username: "user",
+                hostname: "host",
+                pam_service: "  sudo\u{0} ",
+                process_name: "sudo",
+                command_preview: &long_preview,
+            },
             true,
         )
         .unwrap();
@@ -1054,179 +866,243 @@ mod tests {
         assert!(!minimal.tty_present);
     }
 
-    #[test]
-    fn test_sanitize_context_string_strips_control_and_bidi_characters() {
-        assert_eq!(
-            sanitize_context_string("a\u{0}b\u{1}c\u{7f}d", 32),
-            "abcd",
-            "C0 controls, NUL and DEL must be removed"
-        );
-        assert_eq!(
-            sanitize_context_string("\u{202e}evil\u{2066}", 32),
-            "evil",
-            "bidi overrides/isolates removed"
-        );
-        assert_eq!(
-            sanitize_context_string("a\u{80}b\u{9f}c", 32),
-            "abc",
-            "C1 controls removed"
-        );
-        assert_eq!(
-            sanitize_context_string("a\u{61c}b\u{200b}c\u{feff}d", 32),
-            "abcd",
-            "Arabic letter mark, zero-width space and BOM removed"
-        );
-    }
-
-    /// Whitespace is checked *before* the forbidden set, so a tab or newline separates
-    /// words instead of being deleted: the defect this catches is `sudo\tapt` collapsing
-    /// to `sudoapt`, which renders as one word the user never typed.
-    #[test]
-    fn test_sanitize_context_string_separates_words_on_whitespace() {
-        assert_eq!(
-            sanitize_context_string("sudo\tapt\nupdate", 128),
-            "sudo apt update"
-        );
-        assert_eq!(sanitize_context_string("  a \t\n  b  ", 128), "a b");
-        // U+0085 (NEL) is both Unicode whitespace and a C1 control: it must collapse.
-        assert_eq!(sanitize_context_string("a\u{85}b", 128), "a b");
-        // U+00A0 (NBSP) and U+3000 (ideographic space) are not ASCII spaces either.
-        assert_eq!(
-            sanitize_context_string("sudo\u{a0}apt\u{3000}update", 128),
-            "sudo apt update"
-        );
-    }
-
-    /// An escape sequence is deleted as a unit. The defect this catches is stripping only
-    /// the `ESC`: the parameter bytes (`[31m`, `]0;…`) would survive into the prompt and
-    /// render as text that was never meant to be shown.
-    #[test]
-    fn test_sanitize_context_string_removes_ansi_sequences() {
-        assert_eq!(
-            sanitize_context_string("\u{1b}[31mroot\u{1b}[0m", 128),
-            "root"
-        );
-        // Unterminated CSI: removed to end of input, not leaked as "[31".
-        assert_eq!(sanitize_context_string("x\u{1b}[31", 128), "x");
-        // Parameter byte `1`, intermediate byte `0x20` and the final byte `q`: one
-        // sequence, so the "b" survives and nothing of `ESC [1 q` does.
-        assert_eq!(sanitize_context_string("x\u{1b}[1 qb", 128), "xb");
-        // OSC terminated by BEL, and by ESC '\'.
-        assert_eq!(sanitize_context_string("a\u{1b}]0;evil\u{7}b", 128), "ab");
-        assert_eq!(
-            sanitize_context_string("a\u{1b}]8;;http://evil.example\u{1b}\\b", 128),
-            "ab"
-        );
-        // Unterminated OSC: removed to end of input, so the title text cannot render.
-        assert_eq!(sanitize_context_string("a\u{1b}]0;evil", 128), "a");
-        // A lone ESC is a forbidden character; the byte after it is filtered normally.
-        assert_eq!(sanitize_context_string("a\u{1b}b", 128), "ab");
-        assert_eq!(sanitize_context_string("ab\u{1b}", 128), "ab");
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SanitizerVectors {
-        cases: Vec<SanitizerVector>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SanitizerVector {
-        name: String,
-        input: String,
-        max_bytes: usize,
-        expected: String,
-    }
-
-    /// Every sanitizer vector, including one case per code point of the whitespace and
-    /// forbidden sets and the truncation boundaries.
+    /// Every field the module bounds owns exactly one row of the per-field table, with
+    /// the budget of its own constant and the overflow policy the protocol documents.
     ///
-    /// The same file drives `ContextSanitizerTest.kt` on the Android side, so the two
-    /// implementations cannot drift: the defect this catches is the Kotlin mirror
-    /// silently disagreeing with this one (deleting a tab instead of collapsing it, or
-    /// appending an ellipsis at a 3-byte budget).
-    ///
-    /// The case count is asserted exactly, not as a lower bound: a bound would let the
-    /// file lose whole groups (every truncation boundary, say) while staying green.
-    /// Adding a vector means bumping this number and `ContextSanitizerTest`'s together.
+    /// The defect this catches: a bounded field whose row was never written (so its
+    /// budget and its reject/truncate answer are whatever its call site happens to do),
+    /// two rows sharing one field's budget, and a policy flipped from `Reject` to
+    /// `Truncate` — which would let the phone display, and the client authorize, an
+    /// account that was cut to fit.
     #[test]
-    fn test_context_sanitizer_vectors_are_honoured() {
-        const EXPECTED_CASES: usize = 130;
-
-        let vectors: SanitizerVectors = serde_json::from_str(include_str!(
-            "../../testdata/context_sanitizer_vectors.json"
-        ))
-        .expect("context sanitizer vector file must parse");
-        assert_eq!(
-            vectors.cases.len(),
-            EXPECTED_CASES,
-            "the shared vector file must hold exactly {EXPECTED_CASES} cases, found {}",
-            vectors.cases.len()
-        );
-
-        for case in &vectors.cases {
-            assert_eq!(
-                sanitize_context_string(&case.input, case.max_bytes),
-                case.expected,
-                "vector '{}' (max_bytes={})",
-                case.name,
-                case.max_bytes
-            );
-        }
-    }
-
-    #[test]
-    fn test_sanitize_context_string_collapses_and_trims_whitespace() {
-        assert_eq!(sanitize_context_string("a \t\n  b", 32), "a b");
-        assert_eq!(sanitize_context_string("  spaced  out  ", 32), "spaced out");
-        assert_eq!(sanitize_context_string("   ", 32), "");
-        assert_eq!(sanitize_context_string("a b", 32), "a b");
-    }
-
-    #[test]
-    fn test_sanitize_context_string_truncates_within_budget() {
-        let input = "x".repeat(64);
-        let out = sanitize_context_string(&input, 10);
+    fn every_context_field_has_exactly_one_policy_row() {
+        // Exhaustive destructuring of the message: a bounded field *added* to
+        // `AuthenticationRequest` cannot compile past this test without someone
+        // deciding whether it needs a row. `policy`'s exhaustive `match` is the other
+        // half — a `ContextField` variant without a row does not compile at all.
+        let AuthenticationRequest {
+            challenge: _,
+            username,
+            hostname,
+            timestamp_unix_seconds: _,
+            pam_service,
+            process_name,
+            command_preview,
+            tty_present: _,
+        } = sample_request();
+        let bounded_fields = [
+            username,
+            hostname,
+            pam_service,
+            process_name,
+            command_preview,
+        ];
 
         assert_eq!(
-            out.len(),
-            10,
-            "must use the whole byte budget, ellipsis included"
+            ContextField::ALL.len(),
+            bounded_fields.len(),
+            "the table must hold one row per bounded field of AuthenticationRequest, \
+             found {} rows for {} fields",
+            ContextField::ALL.len(),
+            bounded_fields.len()
         );
-        assert!(out.ends_with('\u{2026}'));
-        assert_eq!(out.chars().filter(|c| *c == 'x').count(), 7);
 
-        // Short input is not truncated and gains no ellipsis.
-        assert_eq!(sanitize_context_string("short", 10), "short");
+        // Each field owns a row of its own: a duplicate would leave another field
+        // without one while the count above still matched.
+        let mut names: Vec<&str> = ContextField::ALL
+            .iter()
+            .map(|field| field.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            [
+                "command_preview",
+                "hostname",
+                "pam_service",
+                "process_name",
+                "username"
+            ],
+            "the table must name every bounded field of the message"
+        );
 
-        // max_bytes == 0 yields an empty string.
-        assert_eq!(sanitize_context_string("anything", 0), "");
-    }
-
-    #[test]
-    fn test_sanitize_context_string_never_splits_multibyte_characters() {
-        let input = "\u{20ac}".repeat(20); // 3 bytes per character
-
-        for max_bytes in 1..=12usize {
-            let out = sanitize_context_string(&input, max_bytes);
+        // The rows themselves: each budget is the field's named constant (the table
+        // never inlines a number), and the overflow policy is the documented one.
+        let expected = [
+            (ContextField::Username, USERNAME_MAX_BYTES, Overflow::Reject),
+            (
+                ContextField::Hostname,
+                HOSTNAME_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::PamService,
+                PAM_SERVICE_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::ProcessName,
+                PROCESS_NAME_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+            (
+                ContextField::CommandPreview,
+                COMMAND_PREVIEW_MAX_BYTES,
+                Overflow::Truncate,
+            ),
+        ];
+        assert_eq!(expected.len(), ContextField::ALL.len());
+        for (field, max_bytes, on_overflow) in expected {
             assert!(
-                out.len() <= max_bytes,
-                "len {} exceeds budget {}",
-                out.len(),
-                max_bytes
+                ContextField::ALL.contains(&field),
+                "{} is missing from the table",
+                field.as_str()
             );
-            // Valid UTF-8 by construction: every char survived intact.
-            assert_eq!(out.replace('\u{2026}', "").len() % 3, 0);
-            assert!(out.chars().all(|c| c == '\u{20ac}' || c == '\u{2026}'));
+            assert_eq!(
+                field.policy(),
+                FieldPolicy {
+                    max_bytes,
+                    on_overflow
+                },
+                "row {}",
+                field.as_str()
+            );
         }
+    }
 
-        // 10-byte budget: 7 content bytes -> two 3-byte chars, then the ellipsis.
-        assert_eq!(
-            sanitize_context_string(&input, 10),
-            "\u{20ac}\u{20ac}\u{2026}"
-        );
-        // Below 4 bytes no ellipsis is added.
-        assert_eq!(sanitize_context_string(&input, 2), "");
-        assert_eq!(sanitize_context_string(&input, 3), "\u{20ac}");
+    /// Build a request with `field` over budget and every other bounded field short.
+    ///
+    /// The `match` is exhaustive, so a field added to the enum needs its own
+    /// over-budget call here before the test compiles.
+    fn request_with_over_budget(
+        field: ContextField,
+        value: &str,
+    ) -> Result<AuthenticationRequest, ProtocolError> {
+        let challenge = [0x2Au8; 32];
+        match field {
+            ContextField::Username => create_auth_request_with_context(
+                &challenge,
+                ContextFields {
+                    username: value,
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
+            ),
+            ContextField::Hostname => create_auth_request_with_context(
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: value,
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
+            ),
+            ContextField::PamService => create_auth_request_with_context(
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: value,
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
+            ),
+            ContextField::ProcessName => create_auth_request_with_context(
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: value,
+                    command_preview: "apt",
+                },
+                false,
+            ),
+            ContextField::CommandPreview => create_auth_request_with_context(
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: value,
+                },
+                false,
+            ),
+        }
+    }
+
+    /// Each row is what the builder actually does to that field: a `Reject` row fails
+    /// the request at one byte over its budget (an error, not a shorter `Ok`), and a
+    /// `Truncate` row cuts to exactly its budget and marks the cut — while the same
+    /// field exactly *at* its budget is kept verbatim under either policy.
+    ///
+    /// The defect this catches: a call site that bounds a field some other way than its
+    /// row says (a `Reject` field truncated, a `Truncate` field rejected, or a budget
+    /// read from the wrong constant), i.e. the table describing one policy while the
+    /// builder applies another. The vectors in
+    /// `testdata/context_sanitizer_vectors.json` pin how a cut is made; these pin which
+    /// fields get one.
+    #[test]
+    fn each_context_field_row_is_applied_by_the_builder() {
+        for field in ContextField::ALL.iter().copied() {
+            let policy = field.policy();
+            let name = field.as_str();
+            let at_cap = "x".repeat(policy.max_bytes);
+            let over = "x".repeat(policy.max_bytes + 1);
+
+            match policy.on_overflow {
+                Overflow::Reject => {
+                    assert!(
+                        matches!(
+                            request_with_over_budget(field, &over),
+                            Err(ProtocolError::InvalidMessageFormat)
+                        ),
+                        "{name} must be rejected one byte over its {} byte budget, \
+                         not shortened",
+                        policy.max_bytes
+                    );
+                    let request = request_with_over_budget(field, &at_cap).unwrap();
+                    assert_eq!(
+                        field.read(&request),
+                        at_cap,
+                        "{name} at its budget must be kept verbatim"
+                    );
+                }
+                Overflow::Truncate => {
+                    let request = request_with_over_budget(field, &over).unwrap();
+                    let bounded = field.read(&request);
+                    assert_eq!(
+                        bounded.len(),
+                        policy.max_bytes,
+                        "{name} must use the whole budget, ellipsis included"
+                    );
+                    assert!(
+                        bounded.ends_with(ELLIPSIS),
+                        "{name} must mark the cut, got {bounded:?}"
+                    );
+                    assert!(
+                        bounded.trim_end_matches(ELLIPSIS).chars().all(|c| c == 'x'),
+                        "{name} must keep the input's own bytes, got {bounded:?}"
+                    );
+
+                    // At the budget nothing is cut and no ellipsis is added.
+                    let request = request_with_over_budget(field, &at_cap).unwrap();
+                    assert_eq!(
+                        field.read(&request),
+                        at_cap,
+                        "{name} at its budget must be kept verbatim"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1236,7 +1112,17 @@ mod tests {
         // authorizing (and displaying) a different account than the one asking.
         let long_username = "u".repeat(200);
         assert!(matches!(
-            create_auth_request_with_context(&long_username, "host", &[1u8; 32], "", "", "", false),
+            create_auth_request_with_context(
+                &[1u8; 32],
+                ContextFields {
+                    username: &long_username,
+                    hostname: "host",
+                    pam_service: "",
+                    process_name: "",
+                    command_preview: "",
+                },
+                false,
+            ),
             Err(ProtocolError::InvalidMessageFormat)
         ));
         // Just over the cap is already refused; exactly at the cap is accepted.
@@ -1267,12 +1153,14 @@ mod tests {
         // budget, and the signed packet still fits the BLE GATT attribute.
         let long_hostname = "h".repeat(200);
         let request = create_auth_request_with_context(
-            "luca",
-            &long_hostname,
             &[0x5Au8; 32],
-            "sudo",
-            "sudo",
-            &"c".repeat(COMMAND_PREVIEW_MAX_BYTES),
+            ContextFields {
+                username: "luca",
+                hostname: &long_hostname,
+                pam_service: "sudo",
+                process_name: "sudo",
+                command_preview: &"c".repeat(COMMAND_PREVIEW_MAX_BYTES),
+            },
             true,
         )
         .unwrap();

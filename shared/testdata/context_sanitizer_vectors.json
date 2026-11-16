@@ -1,5 +1,5 @@
 {
-  "about": "Canonical vectors for the context-string sanitizer. Read by the Rust test `context_sanitizer_vectors_are_honoured` in shared/src/protocol/messages.rs (via include_str!) and by ContextSanitizerTest.kt in server-android (same path, resolved from the Gradle test working directory server-android/app). Both implementations must reproduce every expected value: add a case here, never in one suite only.",
+  "about": "Canonical vectors for the context-string sanitizer. Read by the Rust test `test_context_sanitizer_vectors_are_honoured` in shared/src/protocol/messages/context.rs (via include_str!) and by ContextSanitizerTest.kt in server-android (same path, resolved from the Gradle test working directory server-android/app). Both implementations must reproduce every expected value: add a case here, never in one suite only.",
   "cases": [
     {
       "name": "tab and newline collapse to one space",

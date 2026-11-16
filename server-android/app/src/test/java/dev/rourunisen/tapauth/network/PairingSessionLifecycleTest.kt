@@ -110,7 +110,7 @@ class PairingSessionLifecycleTest {
         val effects = Effects()
         val lifecycle = lifecycle(effects)
 
-        assertFalse("The close may release now", lifecycle.close())
+        assertEquals("The close may release now", CloseOutcome.Released, lifecycle.close())
         assertTrue("The closed flag must be set by the release", lifecycle.isClosed())
         assertEquals("The release body must run", 1, effects.closes)
         assertEquals("The release must drop the keys", 1, effects.zeroizes)
@@ -152,7 +152,7 @@ class PairingSessionLifecycleTest {
 
         val device =
             lifecycle.finish(phase(clock, FakeCrypto()), link, CSK, listOf(0L)) {
-                deferred = lifecycle.close()
+                deferred = lifecycle.close() == CloseOutcome.Deferred
                 "paired-device"
             }
 
@@ -195,12 +195,20 @@ class PairingSessionLifecycleTest {
         lifecycle.zeroizeEphemeralState()
         assertEquals("The epilogue must not zeroize a second time", 1, effects.zeroizes)
 
-        assertFalse("A close after the completion must release", lifecycle.close())
+        assertEquals(
+            "A close after the completion must release",
+            CloseOutcome.Released,
+            lifecycle.close(),
+        )
         assertTrue("The closed flag must be set by the release", lifecycle.isClosed())
         assertEquals("The release body must run", 1, effects.closes)
         assertEquals("The release must not zeroize a second time", 1, effects.zeroizes)
 
-        assertFalse("A repeated close still reports the release", lifecycle.close())
+        assertEquals(
+            "A repeated close still reports the release",
+            CloseOutcome.Released,
+            lifecycle.close(),
+        )
         assertEquals("The release body must run once", 1, effects.closes)
     }
 
@@ -239,7 +247,11 @@ class PairingSessionLifecycleTest {
         )
         assertEquals("The failed confirmation must still conclude", 1, crypto.concludeCount)
 
-        assertFalse("A close after the failed confirmation must release", lifecycle.close())
+        assertEquals(
+            "A close after the failed confirmation must release",
+            CloseOutcome.Released,
+            lifecycle.close(),
+        )
         assertEquals("The release body must run", 1, effects.closes)
         assertEquals("The release must drop the keys", 1, effects.zeroizes)
     }

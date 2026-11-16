@@ -36,6 +36,406 @@ echo "║      (v2 UDP/BLE Pairing + UDP Network + BLE GATT Auth)       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
+# ── Phase registry ────────────────────────────────────────────────────────────
+#
+# The summary at the end of this suite is GENERATED from what each phase records
+# here while it runs; there is no second, hand-written copy of the phase list to
+# fall out of date. A phase that is added to the suite but not given a record
+# shows up as NOT RUN, and a phase that skipped shows SKIPPED with the reason it
+# skipped — neither can claim PASSED merely because the script reached the
+# summary.
+#
+# PHASE_ORDER    the ids the matrix prints, in PRINT order. That is deliberately
+#                not the run order: 7 and 6b run last but print at positions
+#                10-11, which reproduces the matrix this suite has always
+#                printed. It must name exactly the ids in PHASE_NAME, once each
+#                (checked at startup by registry_selfcheck).
+# PHASE_NAME     id -> phase label. These strings are part of the log surface CI
+#                and the per-distro E2E wrappers key off; do not renumber or
+#                reword them.
+# PHASE_OUTCOME  id -> pass | fail | skip, written only by phase_pass/phase_fail/
+#                phase_skip.
+# PHASE_ASSERTED id -> what that outcome actually asserted, or why it skipped.
+#
+# An id with no recorded outcome prints NOT RUN. Only a `pass` record can ever
+# produce PASSED.
+#
+# The two lists are kept in step by registry_selfcheck, which runs on every
+# invocation: an id that is in PHASE_NAME but not PHASE_ORDER would otherwise
+# record into a key the matrix never prints (no row, no counter, exit 0), and an
+# id in PHASE_ORDER with no label would print a nameless row.
+PHASE_ORDER=(
+    "1a" "1b" "1c" "2" "2-mcast" "2b" "2e" "2c" "2d" "7" "6b" "3" "4" "5" "5b" "6"
+)
+declare -A PHASE_NAME=(
+    ["1a"]="Phase 1a: Pairing negatives (SAS + pk pin)"
+    ["1b"]="Phase 1b: v2 UDP pairing (QEMU SLIRP)"
+    ["1c"]="Phase 1c: v2 BLE-only pairing (vhci)"
+    ["2"]="Phase 2: Local Network (UDP) Authentication"
+    ["2-mcast"]="Phase 2: Custom multicast groups (v4 + v6)"
+    ["2b"]="Phase 2b: Real PAM Module (pamtester)"
+    ["2e"]="Phase 2e: Mixed-stack PAM (grant path)"
+    ["2c"]="Phase 2c: Adversarial Replay + PamCancel"
+    ["2d"]="Phase 2d: Adversarial Tampered Ciphertext"
+    ["7"]="Phase 7: Admin IPC Authorization (PolKit)"
+    ["6b"]="Phase 6b: Mixed-stack PAM password fallback"
+    ["3"]="Phase 3: Bluetooth Low Energy (BLE)"
+    ["4"]="Phase 4: Parallel Race (UDP + BLE)"
+    ["5"]="Phase 5: Explicit Denial & Rejection"
+    ["5b"]="Phase 5b: Authentication Timeout"
+    ["6"]="Phase 6: Device Removal & Ignore Outcome"
+)
+declare -A PHASE_OUTCOME=()
+declare -A PHASE_ASSERTED=()
+
+# The number of phases the matrix publishes. Adding or removing a phase is a
+# deliberate change to a log surface other CI logs are read against, so it is
+# also a deliberate change here; registry_selfcheck fails until it is.
+EXPECTED_PHASE_COUNT=16
+
+# Summary counters, filled in by print_phase_summary.
+SUMMARY_PASSED=0
+SUMMARY_SKIPPED=0
+SUMMARY_FAILED=0
+SUMMARY_NOT_RUN=0
+
+# phase_id_registered <id>: 0 when <id> is one of the published phases.
+phase_id_registered() {
+    local want=$1 known
+    for known in "${PHASE_ORDER[@]}"; do
+        if [ "$known" = "$want" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# phase_record <id> <pass|fail|skip> <what it asserted / why it skipped>
+#
+# Pure bookkeeping: it returns 0 unconditionally, so it can never defuse `set -e`
+# and can never turn a phase's own failure into a pass. A phase still signals
+# failure the way it always has — by exiting non-zero itself — and this only
+# remembers what happened on the way there.
+#
+# An id that is not published by BOTH lists is a bug in this file, not in a
+# phase: recording it would be stored in a key the matrix never prints, so it
+# aborts rather than pass silently.
+phase_record() {
+    local id=$1 outcome=$2 note=${3:-}
+    if ! phase_id_registered "$id" || [ -z "${PHASE_NAME[$id]:-}" ]; then
+        echo "❌ ERROR (phase registry): '${id}' is not a published phase (it is missing from PHASE_ORDER or PHASE_NAME)." >&2
+        exit 1
+    fi
+    case "$outcome" in
+        pass|fail|skip) ;;
+        *)
+            echo "❌ ERROR (phase registry): invalid outcome '${outcome}' for phase '${id}'." >&2
+            exit 1
+            ;;
+    esac
+    PHASE_OUTCOME["$id"]="$outcome"
+    PHASE_ASSERTED["$id"]="$note"
+    return 0
+}
+
+phase_pass() { phase_record "$1" pass "${2:-assertion not recorded}"; }
+phase_fail() { phase_record "$1" fail "${2:-failure reason not recorded}"; }
+phase_skip() { phase_record "$1" skip "${2:-reason not recorded}"; }
+
+# outcome_label <pass|fail|skip|anything else>: the word the matrix prints for a
+# raw registry outcome. This is the ONE place an outcome becomes a word, so the
+# startup self-check and the rendered rows cannot disagree about it.
+outcome_label() {
+    case "$1" in
+        pass) printf 'PASSED' ;;
+        skip) printf 'SKIPPED' ;;
+        fail) printf 'FAILED' ;;
+        *)    printf 'NOT RUN' ;;
+    esac
+}
+
+# phase_outcome_label <id>: the word printed for a registry id. A recorded pass
+# is the only thing that can become PASSED.
+phase_outcome_label() {
+    outcome_label "${PHASE_OUTCOME[$1]:-}"
+}
+
+# count_phase_outcomes: fill the SUMMARY_* counters from the registry. Called by
+# print_phase_summary so the counts and the rows can never disagree.
+count_phase_outcomes() {
+    local id
+    SUMMARY_PASSED=0
+    SUMMARY_SKIPPED=0
+    SUMMARY_FAILED=0
+    SUMMARY_NOT_RUN=0
+    for id in "${PHASE_ORDER[@]}"; do
+        case "$(phase_outcome_label "$id")" in
+            PASSED)  SUMMARY_PASSED=$((SUMMARY_PASSED + 1)) ;;
+            SKIPPED) SUMMARY_SKIPPED=$((SUMMARY_SKIPPED + 1)) ;;
+            FAILED)  SUMMARY_FAILED=$((SUMMARY_FAILED + 1)) ;;
+            *)       SUMMARY_NOT_RUN=$((SUMMARY_NOT_RUN + 1)) ;;
+        esac
+    done
+    return 0
+}
+
+# phase_summary_verdict: 0 when the matrix may be accepted (every phase passed
+# or skipped with a recorded reason), 1 when any phase failed or never reported.
+# This is the gate the suite's own exit status rests on.
+phase_summary_verdict() {
+    if [ "$SUMMARY_FAILED" -ne 0 ] || [ "$SUMMARY_NOT_RUN" -ne 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# registry_selfcheck: run on EVERY invocation, before any phase or device
+# interaction, so the registry's own coherence is checked by real runs instead of
+# only by the env-gated stub below (which is manual-only). Cheap and device-free:
+# it reads the two lists and the outcome mapping, never the host.
+#
+# It exists because the two lists are hand-kept. An id added to PHASE_NAME with a
+# record call but missing from PHASE_ORDER would record into a key nothing
+# renders — no row, no counter change, exit 0 — which is exactly the silent gap
+# the registry is meant to remove.
+registry_selfcheck() {
+    local id problems=""
+    # 1. Both lists must hold the published number of ids...
+    if [ "${#PHASE_ORDER[@]}" -ne "$EXPECTED_PHASE_COUNT" ] \
+        || [ "${#PHASE_NAME[@]}" -ne "$EXPECTED_PHASE_COUNT" ]; then
+        problems="${problems}expected ${EXPECTED_PHASE_COUNT} phases but PHASE_ORDER has ${#PHASE_ORDER[@]} and PHASE_NAME has ${#PHASE_NAME[@]}; "
+    fi
+    # ...the same ones, each once, each labelled.
+    for id in "${PHASE_ORDER[@]}"; do
+        if [ -z "${PHASE_NAME[$id]:-}" ]; then
+            problems="${problems}'${id}' is in PHASE_ORDER but has no PHASE_NAME; "
+        fi
+        if [ "$(printf '%s\n' "${PHASE_ORDER[@]}" | grep -c -x -F -- "$id")" -ne 1 ]; then
+            problems="${problems}'${id}' appears more than once in PHASE_ORDER; "
+        fi
+    done
+    for id in "${!PHASE_NAME[@]}"; do
+        if ! phase_id_registered "$id"; then
+            problems="${problems}'${id}' is in PHASE_NAME but not in PHASE_ORDER, so nothing would print it; "
+        fi
+    done
+    # 2. The outcome -> word mapping, probed through the very function the matrix
+    #    renders with (outcome_label), so it cannot drift from the rows.
+    if [ "$(outcome_label pass)" != "PASSED" ] \
+        || [ "$(outcome_label skip)" != "SKIPPED" ] \
+        || [ "$(outcome_label fail)" != "FAILED" ] \
+        || [ "$(outcome_label "")" != "NOT RUN" ]; then
+        problems="${problems}the pass/skip/fail/unset -> PASSED/SKIPPED/FAILED/NOT RUN mapping is broken; "
+    fi
+    for id in skip fail ""; do
+        if [ "$(outcome_label "$id")" = "PASSED" ]; then
+            problems="${problems}outcome '${id}' maps to PASSED, and only a recorded pass may; "
+        fi
+    done
+    if [ -n "$problems" ]; then
+        echo "❌ ERROR (phase registry): ${problems%; }" >&2
+        echo "   PHASE_ORDER and PHASE_NAME must name the same ${EXPECTED_PHASE_COUNT} phases, once each;" >&2
+        echo "   the matrix at the end of this suite is generated from them." >&2
+        exit 1
+    fi
+    echo "✅ Phase registry self-check: ${EXPECTED_PHASE_COUNT} phases, ids and outcome labels consistent."
+    return 0
+}
+
+registry_selfcheck
+
+# print_phase_summary: render the matrix and the assertion notes from the
+# registry. Sets the SUMMARY_* counters and returns 0 either way; the end of the
+# suite decides what a non-clean matrix means for the exit status.
+print_phase_summary() {
+    local id label note
+    count_phase_outcomes
+    echo "╔═══════════════════════════════════════════════════════════════╗"
+    echo "║  E2E TEST MATRIX SUMMARY                                      ║"
+    echo "╠═══════════════════════════════════════════════════════════════╣"
+    for id in "${PHASE_ORDER[@]}"; do
+        label="${PHASE_NAME[$id]}"
+        printf '║  %-46s %-9s     ║\n' "${label}:" "$(phase_outcome_label "$id")"
+    done
+    if [ "${E2E_DAEMON_MODE:-}" = "systemd" ]; then
+        # The ✔ marks the mode this run used, as the pre-registry matrix did. It
+        # is appended after the padded column because printf pads %s by BYTES and
+        # the glyph is 3 of them; the fixed 12-space tail keeps the row at the
+        # box's 63 content columns (2 + 48 + 1 + 12) and at the same column
+        # offsets the old hand-written row used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: systemd socket activation (prod)   " ""
+    else
+        # Same row shape as the systemd branch above: the glyph is appended after
+        # the padded column (printf pads %s by bytes, the glyph is 3 of them) and
+        # the fixed 12-space tail holds the row at 63 content columns, matching
+        # the offsets the old hand-written matrix used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: dev sandbox (fallback-socket)      " ""
+    fi
+    echo "╠═══════════════════════════════════════════════════════════════╣"
+    printf '║  %-61s║\n' \
+        "${SUMMARY_PASSED} passed, ${SUMMARY_SKIPPED} skipped, ${SUMMARY_FAILED} failed, ${SUMMARY_NOT_RUN} not run (of ${#PHASE_ORDER[@]} phases)"
+    echo "╚═══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Recorded assertions (what each recorded outcome actually checked):"
+    for id in "${PHASE_ORDER[@]}"; do
+        label="${PHASE_NAME[$id]}"
+        note="${PHASE_ASSERTED[$id]:-the phase never recorded an outcome}"
+        printf '  %s\n    %s: %s\n' "$label" "$(phase_outcome_label "$id")" "$note"
+    done
+    return 0
+}
+
+# finish_suite: print the generated summary and turn it into the suite's exit
+# status. Exits 1 when any phase failed or never reported, so a phase that never
+# recorded an outcome cannot ride the 🎉 line into a green run.
+finish_suite() {
+    echo ""
+    print_phase_summary
+    echo ""
+    if ! phase_summary_verdict; then
+        echo "❌ E2E SUITE INCOMPLETE: ${SUMMARY_FAILED} phase(s) FAILED and ${SUMMARY_NOT_RUN} phase(s) never reported an outcome."
+        echo "   A phase with no recorded outcome is a registry/phase mismatch in this script, not a pass."
+        exit 1
+    fi
+    if [ "$SUMMARY_SKIPPED" -ne 0 ]; then
+        echo "✅ Every phase that ran PASSED; ${SUMMARY_SKIPPED} phase(s) SKIPPED (reasons in the matrix above)."
+    else
+        echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"
+    fi
+}
+
+# ── Registry self-test (dry run; needs no device, daemon or emulator) ────────
+#
+# Only entered when TAPAUTH_E2E_SELFTEST is set; the normal path ignores it
+# entirely. It exists so the two things this registry can get wrong are provable
+# without running a phase:
+#
+#   TAPAUTH_E2E_SELFTEST=summary
+#     Register a hand-made pass / skip / fail mix plus one phase deliberately
+#     left unrecorded, print the summary, and assert what it rendered. Exits 0
+#     only when every assertion below holds.
+#
+#   TAPAUTH_E2E_SELFTEST=fail-after-record
+#     Run a stub phase body that records a `pass` and then fails. The script must
+#     abort with the failing command's status: recording an outcome must not
+#     swallow a failure through a helper's return value.
+#
+# Placed before cleanup() is trapped and before any environment is touched, so a
+# dry run cannot alter the host.
+case "${TAPAUTH_E2E_SELFTEST:-}" in
+    "")
+        ;;
+    summary)
+        phase_pass "1a" "stub: recorded pass for the dry run"
+        phase_skip "2c" "stub: no captured grant packet available (not running as root)"
+        phase_fail "2d" "stub: the tampered packet was accepted"
+        # "4" is deliberately left without an outcome.
+        SELFTEST_OUT="$(print_phase_summary)"
+        printf '%s\n' "$SELFTEST_OUT"
+        # The render above ran in a subshell; recompute the counters in this
+        # shell from the same registry the rows came from.
+        count_phase_outcomes
+
+        selftest_fail() {
+            echo "❌ REGISTRY SELF-TEST FAILED: $1"
+            exit 1
+        }
+
+        # 1. A skip prints SKIPPED with its reason and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 2c: Adversarial Replay \+ PamCancel: +SKIPPED +║$' \
+            || selftest_fail "the skipped phase did not render SKIPPED"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 2c: .*PASSED'; then
+            selftest_fail "the skipped phase also rendered PASSED"
+        fi
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -qF 'SKIPPED: stub: no captured grant packet available (not running as root)' \
+            || selftest_fail "the skip reason is missing from the recorded assertions"
+        # 2. A fail prints FAILED and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 2d: Adversarial Tampered Ciphertext: +FAILED +║$' \
+            || selftest_fail "the failed phase did not render FAILED"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 2d: .*PASSED'; then
+            selftest_fail "the failed phase also rendered PASSED"
+        fi
+        # 3. A phase with no recorded outcome prints NOT RUN and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 4: Parallel Race \(UDP \+ BLE\): +NOT RUN +║$' \
+            || selftest_fail "the unrecorded phase did not render NOT RUN"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 4: .*PASSED'; then
+            selftest_fail "the unrecorded phase also rendered PASSED"
+        fi
+        # 4. A recorded pass still renders PASSED (the matrix can say yes).
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 1a: Pairing negatives \(SAS \+ pk pin\): +PASSED +║$' \
+            || selftest_fail "a recorded pass did not render PASSED"
+        # 5. Exactly one row per registered phase.
+        SELFTEST_ROWS="$(printf '%s\n' "$SELFTEST_OUT" | grep -c '^║  Phase ' || true)"
+        [ "$SELFTEST_ROWS" = "16" ] \
+            || selftest_fail "expected 16 phase rows, got ${SELFTEST_ROWS}"
+        # 6. The counters agree with the rows.
+        if [ "$SUMMARY_PASSED" != "1" ] || [ "$SUMMARY_SKIPPED" != "1" ] \
+            || [ "$SUMMARY_FAILED" != "1" ] || [ "$SUMMARY_NOT_RUN" != "13" ]; then
+            selftest_fail "counters are passed=$SUMMARY_PASSED skipped=$SUMMARY_SKIPPED failed=$SUMMARY_FAILED not_run=$SUMMARY_NOT_RUN"
+        fi
+        # 7. The gate the suite's exit status rests on rejects a matrix that
+        # holds a FAILED or an unreported phase — and the whole summary tail says
+        # so instead of claiming a pass.
+        if phase_summary_verdict; then
+            selftest_fail "the suite verdict accepted a FAILED phase and 13 unreported ones"
+        fi
+        set +e
+        SELFTEST_TAIL="$(finish_suite 2>&1)"
+        SELFTEST_RC=$?
+        set -e
+        [ "$SELFTEST_RC" = "1" ] \
+            || selftest_fail "the suite tail exited ${SELFTEST_RC} with a FAILED phase, expected 1"
+        printf '%s\n' "$SELFTEST_TAIL" \
+            | grep -qF "E2E SUITE INCOMPLETE: 1 phase(s) FAILED and 13 phase(s) never reported an outcome" \
+            || selftest_fail "the suite tail did not report the incomplete matrix"
+        # 8. ...and accepts one where every phase passed or skipped explicitly.
+        PHASE_OUTCOME=()
+        PHASE_ASSERTED=()
+        for selftest_id in "${PHASE_ORDER[@]}"; do
+            if [ "$selftest_id" = "2c" ]; then
+                phase_skip "2c" "stub: explicit skip"
+            else
+                phase_pass "$selftest_id" "stub: pass"
+            fi
+        done
+        count_phase_outcomes
+        if ! phase_summary_verdict; then
+            selftest_fail "the suite verdict rejected 15 passes and 1 explicit skip"
+        fi
+        set +e
+        SELFTEST_TAIL="$(finish_suite 2>&1)"
+        SELFTEST_RC=$?
+        set -e
+        [ "$SELFTEST_RC" = "0" ] \
+            || selftest_fail "the suite tail exited ${SELFTEST_RC} for 15 passes and 1 explicit skip, expected 0"
+        printf '%s\n' "$SELFTEST_TAIL" \
+            | grep -qF "Every phase that ran PASSED; 1 phase(s) SKIPPED (reasons in the matrix above)." \
+            || selftest_fail "the suite tail did not report the explicit skip"
+        echo "✅ REGISTRY SELF-TEST PASSED: 1 PASSED, 1 SKIPPED (with reason), 1 FAILED, 13 NOT RUN."
+        exit 0
+        ;;
+    fail-after-record)
+        selftest_phase_body() {
+            phase_pass "1b" "stub: recorded before the failure"
+            # Stands in for any assertion in a phase body that fails after the
+            # outcome was recorded.
+            false
+        }
+        selftest_phase_body
+        echo "❌ REGISTRY SELF-TEST FAILED: a phase body that failed did not abort the script."
+        exit 99
+        ;;
+    *)
+        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record)" >&2
+        exit 2
+        ;;
+esac
+
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # IPv6 host changes this run may make, reverted in cleanup() below so a root run
@@ -203,9 +603,6 @@ DAEMON_PID=""
 JOURNAL_PID=""
 CAPTURE_PID=""
 GROUPS_PID=""
-# Set to 1 only when the on-wire multicast egress assertions actually pass, so
-# the summary matrix does not claim PASSED for a skipped (non-root) run.
-MULTICAST_VERIFIED=0
 
 # systemd-mode teardown bookkeeping: only undo what this run actually installed.
 # (Set for real in the systemd setup block below; defaults keep cleanup() safe if
@@ -1027,12 +1424,10 @@ echo "╔═══════════════════════�
 echo "║  PHASE 1: Protocol v2 Pairing (UDP + BLE) & SAS Anti-MITM     ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-# Per-phase status for the summary matrix. A phase sets its flag only after it
-# has asserted something, so the matrix can print NOT RUN for a phase that never
-# got that far instead of a hardcoded PASSED.
-PHASE1_NEG_OK=0
-PHASE1_UDP_OK=0
-PHASE1_BLE_OK=0
+# Phase outcomes are recorded in the registry at the top of this file
+# (phase_pass / phase_skip / phase_fail); the summary at the end is generated
+# from it. Phase 1a is one registry entry covering the three sub-cases below, so
+# it is recorded once, after the last of them has asserted.
 
 # The daemon's own SAS display form, e.g. 123-456.
 SAS_PATTERN='^[0-9][0-9][0-9]-[0-9][0-9][0-9]$'
@@ -1407,7 +1802,9 @@ fi
 wait_log_since "$LOG_BASE" 'Cancelling the pairing session' \
     "Phase 1a-iii: the daemon logged the desktop-initiated cancellation"
 echo "✅ Phase 1a-iii PASSED: the desktop cancelled a live session, the phone reported the abort, nothing was stored."
-PHASE1_NEG_OK=1
+# One registry entry for the three sub-cases above: the rejected SAS (1a-i), the
+# pinned pk (1a-ii) and the desktop-initiated cancel (1a-iii).
+phase_pass "1a" "the phone rejected SAS ${NEG_SAS} and 0 devices were stored (1a-i), the phone dropped a PairingResponse whose pk did not match the QR and the cancelled completion was refused (1a-ii), and a desktop cancel of a live session was reported by the phone and stored nothing (1a-iii)"
 
 # ── 1b: legitimate UDP pairing over QEMU SLIRP ───────────────────────────────
 echo "==> Step 1b: Legitimate UDP pairing over QEMU SLIRP (10.0.2.2)..."
@@ -1559,8 +1956,10 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
         find /var/lib/tapauth -type f -perm /go+w
         exit 1
     fi
+    phase_pass "1b" "the phone paired over UDP (both sides derived SAS ${SAS_CODE}), the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX}, get-servers lists it, ${SERVERS_COUNT} device(s) were stored, and the state dir/socket modes+owners and 600 file modes held"
+else
+    phase_pass "1b" "the phone paired over UDP (both sides derived SAS ${SAS_CODE}), the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX}, get-servers lists it, and ${SERVERS_COUNT} device(s) were stored"
 fi
-PHASE1_UDP_OK=1
 
 # ── 1c: BLE-only pairing over the Bumble /dev/vhci bridge ────────────────────
 #
@@ -1703,7 +2102,7 @@ if ! "$CLI_BIN" get-servers | grep -qF "key=${SERVER_HEX_BLE}"; then
     exit 1
 fi
 echo "✅ Verified the BLE-paired device is present (${SERVERS_COUNT}) after the BLE-only pairing."
-PHASE1_BLE_OK=1
+phase_pass "1c" "with no endpoint in the QR the phone paired over BLE only (both sides derived SAS ${SAS_BLE}), it logged 'SAS reached the phone over BLE', the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX_BLE}, and get-servers lists it"
 
 # Step 5b: Ensure runtime permissions and start Android app/background services
 echo "==> Starting Android foreground services for authentication..."
@@ -1991,6 +2390,7 @@ fi
 assert_caller_context_delivered "Phase 2 (UDP)" \
     "$CTX_SERVICE" "$CTX_PROCESS" \
     "${CTX_CLI} pam-auth ${TEST_USER} 20 ${CTX_REQUEST_ID}"
+phase_pass "2" "pam-auth returned OUTCOME=SUCCESS and the phone logged the v2 caller context for this request (pam_service='${CTX_SERVICE}', process_name='${CTX_PROCESS}', and command_preview when the e2e build variant is installed)"
 
 # Stop capture and take the first captured server grant packet
 CAPTURE_OK=0
@@ -2039,9 +2439,10 @@ if [ -n "$GROUPS_PID" ]; then
         echo "--- host IPv6 addresses:"; ip -6 addr show 2>/dev/null || true
         exit 1
     fi
-    MULTICAST_VERIFIED=1
+    phase_pass "2-mcast" "the daemon emitted an EncryptedPacket to IPv4 ${IPV4_MCAST} and to IPv6 ${IPV6_MCAST} (observed on the wire, not just configured)"
 else
     echo "ℹ️  Multicast-group egress verification skipped (not running as root)."
+    phase_skip "2-mcast" "not running as root, so the AF_PACKET egress watcher that observes the discovery groups cannot be started"
 fi
 
 # Step 6b: Phase 2b - Real PAM Module Authentication (pamtester)
@@ -2069,8 +2470,6 @@ PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
     PAM_TESTABLE="true"
 fi
-PAM_GRANT_STACK_OK=0
-PAM_FALLBACK_OK=0
 
 if [ "$PAM_TESTABLE" = "true" ]; then
     echo "==> Configuring temporary PAM service at ${PAM_CONFIG_PATH}..."
@@ -2103,6 +2502,7 @@ if [ "$PAM_TESTABLE" = "true" ]; then
     assert_caller_context_delivered "Phase 2b (PAM module)" \
         "$PAM_SERVICE_NAME" "pamtester" \
         "pamtester ${PAM_SERVICE_NAME} ${TEST_USER} authenticate"
+    phase_pass "2b" "pamtester exited ${PAM_EXIT} with the real pam_tapauth.so in the stack, and the phone received the shipped module's caller context (pam_service='${PAM_SERVICE_NAME}', process_name='pamtester')"
 
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
     # PAM_AUTHINFO_UNAVAIL is expanded to `ignore` by the [success=1
@@ -2128,13 +2528,15 @@ if [ "$PAM_TESTABLE" = "true" ]; then
 
     if [ "$MIXED_GRANT_EXIT" -eq 0 ]; then
         echo "✅ Grant path: TapAuth SUCCESS bypassed the password module in a mixed stack."
-        PAM_GRANT_STACK_OK=1
+        phase_pass "2e" "a TapAuth grant in a [success=1 default=ignore] mixed stack bypassed pam_unix and the stack returned ${MIXED_GRANT_EXIT}"
     else
         echo "❌ ERROR: mixed-stack grant path failed (exit $MIXED_GRANT_EXIT)."
         exit 1
     fi
 else
     echo "ℹ️  Real PAM module testing skipped (/etc/pam.d not writable or pamtester missing)."
+    phase_skip "2b" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
+    phase_skip "2e" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
 fi
 
 # Helper: assert a pattern is present in the daemon log AFTER a given line
@@ -2289,8 +2691,10 @@ if [ "$CAPTURE_OK" = "1" ]; then
     # Restore auto-grant for the following positive phases
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
+    phase_pass "2c" "the replayed grant failed challenge verification, the nonce cache detected the duplicate replay, and pam-cancel ended the pending session with OUTCOME=IGNORE"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
+    phase_skip "2c" "no captured server grant packet available (packet capture needs root)"
 fi
 
 # Step 6d: Phase 2d - Adversarial UDP: Tampered packet must never authenticate
@@ -2354,8 +2758,10 @@ if [ "$CAPTURE_OK" = "1" ]; then
     # Restore auto-grant for the following positive phases
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
+    phase_pass "2d" "the corrupted grant ended the session fail-closed (OUTCOME=IGNORE, DETAIL=Authentication failed), the daemon logged the decryption failure, and the exit code was non-zero (${TAMPER_EXIT})"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
+    phase_skip "2d" "no captured server grant packet available (packet capture needs root)"
 fi
 
 
@@ -2412,6 +2818,7 @@ if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication" "$CTX
         "$CTX_SERVICE" "$CTX_PROCESS" \
         "${CTX_CLI} pam-auth ${TEST_USER} 30 ${CTX_REQUEST_ID}"
     echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
+    phase_pass "3" "with UDP disabled, pam-auth returned OUTCOME=SUCCESS, the daemon attributed the grant to Ble, and the phone logged the v2 caller context for this request"
 else
     echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
@@ -2449,6 +2856,7 @@ if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
     fi
     echo "ℹ️  Parallel race: the grant arrived over ${GRANT_TRANSPORT} (either winner is a pass by design)."
     echo "✅ Parallel Discovery Race Authentication PASSED!"
+    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, and the daemon attributed the grant to ${GRANT_TRANSPORT}"
 else
     echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
@@ -2503,6 +2911,7 @@ cat "$DENIAL_OUT_LOG"
 
 if [ "$DENIAL_EXIT" -ne 0 ] && grep -q "OUTCOME=DENIED" "$DENIAL_OUT_LOG"; then
     echo "✅ Explicit Denial correctly rejected with OUTCOME=DENIED (exit code: $DENIAL_EXIT)."
+    phase_pass "5" "a simulated biometric rejection ended the request with OUTCOME=DENIED and exit code ${DENIAL_EXIT}"
 else
     echo "❌ ERROR: Expected explicit denial with OUTCOME=DENIED, but got exit code $DENIAL_EXIT."
     if [ -f "$DAEMON_LOG" ]; then
@@ -2533,6 +2942,7 @@ cat "$TIMEOUT_OUT_LOG"
 
 if grep -q "OUTCOME=TIMEOUT" "$TIMEOUT_OUT_LOG"; then
     echo "✅ Authentication Timeout correctly detected OUTCOME=TIMEOUT!"
+    phase_pass "5b" "with the phone stopped and a 2s deadline, the request ended with OUTCOME=TIMEOUT"
 else
     echo "❌ ERROR: Expected OUTCOME=TIMEOUT, but got:"
     cat "$TIMEOUT_OUT_LOG"
@@ -2572,6 +2982,7 @@ cat "$UNPAIRED_AUTH_LOG"
 
 if grep -q "OUTCOME=IGNORE" "$UNPAIRED_AUTH_LOG"; then
     echo "✅ Un-paired authentication correctly returns OUTCOME=IGNORE (password fallback enabled)!"
+    phase_pass "6" "remove-device left COUNT=0, and an authentication with no paired device returned OUTCOME=IGNORE"
 else
     echo "❌ ERROR: Expected OUTCOME=IGNORE after device removal, but got:"
     cat "$UNPAIRED_AUTH_LOG"
@@ -2616,7 +3027,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
 
     if [ "$FALLBACK_OK_EXIT" -eq 0 ]; then
         echo "✅ TapAuth's skip verdict fell through to pam_unix; correct password authenticated."
-        PAM_FALLBACK_OK=1
+        phase_pass "6b" "with no paired device the module's skip verdict fell through to pam_unix: the correct password authenticated and a wrong password was rejected"
     else
         echo "❌ ERROR: password fallback did not work after the TapAuth skip verdict (rc=$FALLBACK_OK_EXIT)."
         exit 1
@@ -2628,6 +3039,8 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
         exit 1
     fi
     passwd -l "$PAM_FALLBACK_USER" >/dev/null 2>&1 || true
+else
+    phase_skip "6b" "needs a testable PAM stack and root (PAM_TESTABLE=${PAM_TESTABLE}, uid=$(id -u))"
 fi
 
 # Step 11: Phase 7 - IPC Authorization (PolKit) Enforcement
@@ -2669,77 +3082,16 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     cat "${TEST_DIR}/deny-socket.log"
     if [ "$SOCKET_DENY_EXIT" -ne 0 ]; then
         echo "✅ Unprivileged non-group member could not reach the IPC socket (exit code: $SOCKET_DENY_EXIT)."
+        phase_pass "7" "an unprivileged admin request was denied and audited by the daemon, and a user outside tapauthd-clients could not reach the IPC socket"
     else
         echo "❌ ERROR: 'nobody' unexpectedly reached the IPC socket!"
         exit 1
     fi
 else
     echo "ℹ️  SKIPPED (systemd mode only — dev-mode sandbox does not model production authz)."
+    phase_skip "7" "systemd mode only — the dev-mode sandbox does not model production PolKit authorization"
 fi
 
-echo ""
-echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  E2E TEST MATRIX SUMMARY                                      ║"
-echo "╠═══════════════════════════════════════════════════════════════╣"
-if [ "$PHASE1_NEG_OK" = "1" ]; then
-echo "║  Phase 1a: Pairing negatives (SAS + pk pin):     PASSED       ║"
-else
-echo "║  Phase 1a: Pairing negatives (SAS + pk pin):     NOT RUN      ║"
-fi
-if [ "$PHASE1_UDP_OK" = "1" ]; then
-echo "║  Phase 1b: v2 UDP pairing (QEMU SLIRP):          PASSED       ║"
-else
-echo "║  Phase 1b: v2 UDP pairing (QEMU SLIRP):          NOT RUN      ║"
-fi
-if [ "$PHASE1_BLE_OK" = "1" ]; then
-echo "║  Phase 1c: v2 BLE-only pairing (vhci):           PASSED       ║"
-else
-echo "║  Phase 1c: v2 BLE-only pairing (vhci):           NOT RUN      ║"
-fi
-echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
-if [ "$MULTICAST_VERIFIED" = "1" ]; then
-echo "║  Phase 2: Custom multicast groups (v4 + v6):     PASSED       ║"
-else
-echo "║  Phase 2: Custom multicast groups (v4 + v6):     SKIPPED      ║"
-fi
-if [ "$PAM_TESTABLE" = "true" ]; then
-echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
-if [ "$PAM_GRANT_STACK_OK" = "1" ]; then
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         PASSED       ║"
-else
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         SKIPPED      ║"
-fi
-else
-echo "║  Phase 2b: Real PAM Module (pamtester):          SKIPPED      ║"
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         SKIPPED      ║"
-fi
-if [ "$CAPTURE_OK" = "1" ]; then
-echo "║  Phase 2c: Adversarial Replay + PamCancel:       PASSED       ║"
-echo "║  Phase 2d: Adversarial Tampered Ciphertext:      PASSED       ║"
-else
-echo "║  Phase 2c: Adversarial Replay + PamCancel:       SKIPPED      ║"
-echo "║  Phase 2d: Adversarial Tampered Ciphertext:      SKIPPED      ║"
-fi
-if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
-echo "║  Phase 7: Admin IPC Authorization (PolKit):      PASSED       ║"
-echo "║  Daemon mode: systemd socket activation (prod)   ✔            ║"
-else
-echo "║  Daemon mode: dev sandbox (fallback-socket)      ✔            ║"
-fi
-# Phase 6b runs whenever the PAM stack is testable and the suite is root —
-# which includes a root-forced dev-mode run — so report it mode-independently.
-if [ "$PAM_FALLBACK_OK" = "1" ]; then
-echo "║  Phase 6b: Mixed-stack PAM password fallback:    PASSED       ║"
-else
-echo "║  Phase 6b: Mixed-stack PAM password fallback:    SKIPPED      ║"
-fi
-# BLE has no skip path: an unreachable BlueZ or a failed BLE auth exits above,
-# so reaching the summary means both phases ran and passed.
-echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
-echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
-echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
-echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
-echo "║  Phase 6: Device Removal & Ignore Outcome:       PASSED       ║"
-echo "╚═══════════════════════════════════════════════════════════════╝"
-echo ""
-echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"
+# The matrix and its assertion notes are generated from the registry at the top
+# of this file; finish_suite turns that matrix into the suite's exit status.
+finish_suite

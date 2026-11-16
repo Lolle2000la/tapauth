@@ -17,12 +17,14 @@ import org.junit.Test
  * grace would then reach the replay cache, be called a replay and tear the new link down, killing
  * the prompt), and dropping the confirmation from the retirement call (every loop end — including a
  * link that died mid-delivery — would retire the held bytes and the re-delivery path becomes dead
- * code). The same holds for the receipt log line, which carries the caller's own `username` and
- * `hostname`: whether they are wrapped in `scrubLogValue` is a property of one `Log.d` argument,
- * which no JVM test can read back. A source guard is the only executable statement of those
- * contracts a unit test can make: it is deliberately a parse of the shipped call sites, in the
- * spirit of `client-pam/src/source_guards.rs`, and it does not replace the instrumentation suite
- * that exercises the behaviour.
+ * code). The same holds for the effect each verdict of `BleAuthRequestGate.decide` maps to here: a
+ * `disconnect` added to the duplicate arm compiles and keeps every gate test green. The same holds
+ * for the receipt log line, which carries the caller's own `username` and `hostname`: whether they
+ * are wrapped in `scrubLogValue` is a property of one `Log.d` argument, which no JVM test can read
+ * back. A source guard is the only executable statement of those contracts a unit test can make: it
+ * is deliberately a parse of the shipped call sites, in the spirit of
+ * `client-pam/src/source_guards.rs`, and it does not replace the instrumentation suite that
+ * exercises the behaviour.
  *
  * A failure here means the rule moved or changed shape: re-read `BleGattService.kt`, then fix
  * whichever side is wrong. The file is found by walking up from the test's working directory
@@ -193,6 +195,52 @@ class BleGattServiceWiringTest {
     private fun String.normalized(): String = replace(Regex("\\s+"), " ").trim()
 
     /**
+     * The service performs one effect per outcome of `BleAuthRequestGate.decide`, and the ordering
+     * that produces the outcome is no longer here to be re-edited.
+     *
+     * The two halves are what the JVM tests either side cannot state: `BleAuthRequestGateTest`
+     * knows the gate answers `Replay` for a foreign peer but not that the service disconnects it
+     * (the property the gate exists to preserve), and `BleResponseHandoffTest` never runs the
+     * duplicate arm at all. Adding a `disconnect` to the duplicate path compiles, keeps every gate
+     * and handoff test green, and tears down the link whose prompt the user is answering — the
+     * original defect.
+     */
+    @Test
+    fun theDecisionIsMappedToOneEffectPerOutcome() {
+        assertEquals(
+            "the ladder must be asked exactly once, by the service's one `decide` call",
+            1,
+            source.split(DECIDE_CALL).size - 1,
+        )
+
+        val duplicate = decisionArm("Duplicate")
+        assertTrue(
+            "the Duplicate arm must re-deliver the held answer on the handle the Client " +
+                "reconnected on:\n$duplicate",
+            duplicate.contains(REDELIVER_CALL),
+        )
+        assertFalse(
+            "the Duplicate arm must not disconnect the link the prompt still needs:\n$duplicate",
+            duplicate.contains("disconnect"),
+        )
+
+        // A different peer replaying the same captured bytes is decided as Replay, and that
+        // arrival still has to lose its link.
+        val replay = decisionArm("Replay")
+        assertTrue(
+            "the Replay arm must disconnect the replaying peer:\n$replay",
+            replay.contains("gatt.disconnect()"),
+        )
+
+        // A challenge another transport owns has nothing left to do on this link.
+        val claimed = decisionArm("Claimed")
+        assertTrue(
+            "the Claimed arm must disconnect the link:\n$claimed",
+            claimed.contains("disconnectGatt(gatt)"),
+        )
+    }
+
+    /**
      * The receipt log line is the only place this service puts the caller's own `username` and
      * `hostname` into logcat. Both are the desktop's strings — Rust caps the username's length but
      * sanitizes neither — so an unwrapped one can carry a newline and forge an extra logcat line.
@@ -223,6 +271,21 @@ class BleGattServiceWiringTest {
                 line.contains(raw),
             )
         }
+    }
+
+    /**
+     * The body of one `when (decision)` arm: from its label to the next arm's label.
+     *
+     * The done-with-decision check above the `when` mentions a variant too, so the label has to be
+     * matched with its arrow — a bare variant name would read that comparison as the first arm.
+     */
+    private fun decisionArm(variant: String): String {
+        val label = DECISION_PREFIX + variant + " ->"
+        val start = source.indexOf(label)
+        assertTrue("`$label` must be an arm of the decision's `when`", start >= 0)
+        val next = source.indexOf(DECISION_PREFIX, start + label.length)
+        val end = if (next >= 0) next else source.length
+        return source.substring(start, end)
     }
 
     /** `STATE_DISCONNECTED` up to the grace coroutine it starts, i.e. the pre-teardown body. */
@@ -278,6 +341,17 @@ class BleGattServiceWiringTest {
 
         /** The verified-request log line this service logs the caller's fields on. */
         const val RECEIPT_LOG_MARKER = "Parsed and verified BLE request: "
+
+        /**
+         * The one call that asks `BleAuthRequestGate` for the verdict; more than one re-decides it.
+         */
+        const val DECIDE_CALL = "authRequestGate.decide("
+
+        /** The variant prefix of each `when (decision)` arm. */
+        const val DECISION_PREFIX = "BleAuthRequestGate.Decision."
+
+        /** What the Duplicate arm does instead of disconnecting: write the held answer again. */
+        const val REDELIVER_CALL = "redeliverPendingResponse("
 
         /** What the receipt line must log: the two caller strings, scrubbed. */
         val SCRUBBED_RECEIPT_FIELDS =

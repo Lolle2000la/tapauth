@@ -331,11 +331,11 @@ class PairingSession(
      * `BlePairingClient.WRITE_TIMEOUT_MS`, so the confirmation cannot outlive those bounds and
      * `runSession`'s epilogue releases the transports and the keys when it ends.
      *
-     * @return true when the close was deferred and the session is still finishing its confirmation,
-     *   false when this call may release everything — it won the boundary just now, had already
-     *   won, or the confirmation has already completed
+     * @return [CloseOutcome.Deferred] when the session is still finishing its confirmation,
+     *   [CloseOutcome.Released] when this call may release everything — it won the boundary just
+     *   now, had already won, or the confirmation has already completed
      */
-    fun close(): Boolean = lifecycle.close()
+    fun close(): CloseOutcome = lifecycle.close()
 
     private suspend fun runSession() {
         try {
