@@ -39,16 +39,17 @@ pub fn pairing_session_id(
 /// The address information a pairing session publishes in its QR code.
 ///
 /// These values never enter the transcript; they only build the
-/// `tapauth://pair?v=2&...` URL, and may all be absent for BLE-only pairing.
+/// `tapauth://pair?v=2&...` URL. Every field is optional, and `Default` is the
+/// BLE-only endpoint that publishes none of them.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct PairingEndpoint {
+pub struct PairingEndpoint {
     /// The UDP pairing port, or `None` when this session has no UDP endpoint
     /// (the network transport is disabled and the phone pairs over BLE only).
     /// `None` omits `&p=` from the QR code entirely; `&p=0` would advertise a
     /// port nothing can send to.
-    pub(super) udp_port: Option<u16>,
-    pub(super) ipv4: Option<std::net::Ipv4Addr>,
-    pub(super) ipv6: Option<std::net::Ipv6Addr>,
+    pub udp_port: Option<u16>,
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    pub ipv6: Option<std::net::Ipv6Addr>,
 }
 
 /// What the desktop needs to show/emit after [`ClientPairingState::start`](crate::protocol::pairing::ClientPairingState::start).

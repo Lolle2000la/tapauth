@@ -93,19 +93,17 @@ impl ClientPairingState {
     /// Start a pairing session: random `sid`, ephemeral `x_C`, BLE advertisement
     /// id and QR URL.
     ///
-    /// `udp_port`, `ipv4` and `ipv6` only feed the QR URL (they may be absent for
-    /// BLE-only pairing). `udp_port == 0` means "this session has no UDP
-    /// endpoint": it is omitted from the QR code rather than published as
-    /// `&p=0`, a port nothing can send to. Negotiation happens in
-    /// [`ClientPairingState::handle_init`]; `pinned` carries the algorithms an
-    /// existing `CSK` is already committed to (see the module docs), and must be
-    /// `None` for a first pairing.
+    /// `endpoint` only feeds the QR URL. Its port is an `Option` here for the
+    /// same reason the URL's `p` is: a session with no UDP endpoint publishes
+    /// none, so there is no port to spell — see [`PairingEndpoint`]. The caller
+    /// decides whether there is one, because only it knows whether it bound a
+    /// socket. Negotiation happens in [`ClientPairingState::handle_init`];
+    /// `pinned` carries the algorithms an existing `CSK` is already committed to
+    /// (see the module docs), and must be `None` for a first pairing.
     pub fn start(
         client_identity: Ed25519KeyPair,
         client_device_name: &str,
-        udp_port: u16,
-        ipv4: Option<std::net::Ipv4Addr>,
-        ipv6: Option<std::net::Ipv6Addr>,
+        endpoint: PairingEndpoint,
         pinned: Option<PinnedAlgorithms>,
     ) -> Result<(Self, StartedPairing), ProtocolError> {
         let mut session_id = [0u8; PAIRING_SESSION_ID_LEN];
@@ -117,13 +115,7 @@ impl ClientPairingState {
             x25519_keypair,
             client_identity,
             client_device_name,
-            PairingEndpoint {
-                // Port 0 is never a real UDP endpoint: a session that has none
-                // (network transport disabled) must not publish `&p=0`.
-                udp_port: (udp_port != 0).then_some(udp_port),
-                ipv4,
-                ipv6,
-            },
+            endpoint,
             pinned,
         ))
     }

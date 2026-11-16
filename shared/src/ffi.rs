@@ -925,8 +925,8 @@ mod tests {
         extract_challenge, wrap_auth_cancel, wrap_auth_request, wrap_grant_confirmation,
     };
     use crate::protocol::pairing::{
-        decode_pairing_packet, encode_pairing_packet, ClientPairingState, PinnedAlgorithms,
-        PAIRING_SESSION_ID_LEN,
+        decode_pairing_packet, encode_pairing_packet, ClientPairingState, PairingEndpoint,
+        PinnedAlgorithms, PAIRING_SESSION_ID_LEN,
     };
     use crate::protocol::pb::{
         pairing_packet, AuthenticationCancel, AuthenticationRequest, EncryptedPacket,
@@ -1925,9 +1925,11 @@ mod tests {
         let (mut desktop, started) = ClientPairingState::start(
             Ed25519KeyPair::generate().unwrap(),
             "thinkpad",
-            36_692,
-            None,
-            None,
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -2117,9 +2119,11 @@ mod tests {
         let (mut desktop, started) = ClientPairingState::start(
             Ed25519KeyPair::generate().unwrap(),
             "thinkpad",
-            36_692,
-            None,
-            None,
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
             Some(PinnedAlgorithms {
                 symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
                 hash_algorithm: HashAlgorithm::Sha256,

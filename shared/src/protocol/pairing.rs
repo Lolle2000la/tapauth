@@ -130,7 +130,7 @@
 //! * `negotiation.rs` — the `SUPPORTED_*` slices, [`NegotiatedAlgorithms`],
 //!   [`PinnedAlgorithms`] and the intersection that picks a suite.
 //! * `wire.rs` — the envelope codec ([`encode_pairing_packet`] /
-//!   [`decode_pairing_packet`] / [`pairing_session_id`]), `PairingEndpoint` and
+//!   [`decode_pairing_packet`] / [`pairing_session_id`]), [`PairingEndpoint`] and
 //!   [`StartedPairing`].
 //! * `client.rs` — [`ClientPairingState`], the desktop half.
 //! * `server.rs` — [`ServerPairingSession`], the phone half.
@@ -161,7 +161,10 @@ pub use negotiation::{
     SUPPORTED_SIGNATURE_ALGORITHMS, SUPPORTED_SYMMETRIC_ALGORITHMS,
 };
 pub use server::ServerPairingSession;
-pub use wire::{decode_pairing_packet, encode_pairing_packet, pairing_session_id, StartedPairing};
+pub use wire::{
+    decode_pairing_packet, encode_pairing_packet, pairing_session_id, PairingEndpoint,
+    StartedPairing,
+};
 
 /// Length in bytes of the random pairing `session_id` (`sid` in the QR code).
 pub const PAIRING_SESSION_ID_LEN: usize = 16;

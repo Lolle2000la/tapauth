@@ -364,10 +364,7 @@ async fn handle_start_pairing(
     let (state, started) = match pairing::start_session_state(
         keypair,
         &daemon.hostname,
-        transports,
-        &ports,
-        ipv4,
-        ipv6,
+        pairing::pairing_endpoint(transports, &ports, ipv4, ipv6),
         pairing::pinned_algorithms(daemon),
     ) {
         Ok(pair) => pair,

@@ -32,9 +32,11 @@ fn start_desktop_with_pins(
     ClientPairingState::start(
         desktop_identity(),
         "thinkpad",
-        36692,
-        Some(Ipv4Addr::new(192, 168, 1, 10)),
-        None,
+        PairingEndpoint {
+            udp_port: Some(36692),
+            ipv4: Some(Ipv4Addr::new(192, 168, 1, 10)),
+            ipv6: None,
+        },
         pinned,
     )
     .unwrap()
@@ -1573,8 +1575,17 @@ fn device_names_are_truncated_on_a_char_boundary() {
     assert_eq!(truncated.chars().count(), 21);
     assert!(long_name.starts_with(&truncated));
 
-    let (mut desktop, started) =
-        ClientPairingState::start(desktop_identity(), &long_name, 36692, None, None, None).unwrap();
+    let (mut desktop, started) = ClientPairingState::start(
+        desktop_identity(),
+        &long_name,
+        PairingEndpoint {
+            udp_port: Some(36692),
+            ipv4: None,
+            ipv6: None,
+        },
+        None,
+    )
+    .unwrap();
     assert_eq!(desktop.client_device_name().unwrap().len(), 63);
 
     let mut phone =

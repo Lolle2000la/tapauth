@@ -90,7 +90,8 @@ use shared::firewall::{FirewallError, FirewallGuard, Protocol as FirewallProtoco
 use shared::protocol::messages::PROTOCOL_VERSION_V2;
 use shared::protocol::pairing::{
     decode_pairing_packet, encode_pairing_packet, pairing_session_id, ClientPairingState,
-    NegotiatedAlgorithms, PinnedAlgorithms, StartedPairing, PAIRING_SESSION_ID_LEN,
+    NegotiatedAlgorithms, PairingEndpoint, PinnedAlgorithms, StartedPairing,
+    PAIRING_SESSION_ID_LEN,
 };
 use shared::protocol::pb::{
     pairing_packet, PairingAbort, PairingAbortReason, PairingConfirmServer, PairingInit,
@@ -590,29 +591,39 @@ where
     })
 }
 
-/// Start the handshake machine for a session with these transports and ports.
+/// The QR endpoint of a session, from the two facts that decide it: the
+/// configuration (whether the network transport is on at all) and the ports that
+/// were actually opened.
 ///
 /// The QR endpoint follows the transports rather than the bound socket: a
 /// session with no network transport has no reachable UDP endpoint, so it must
-/// publish **no** `p`/`ip4`/`ip6` at all and let the phone use BLE. Deriving that
-/// from `ports` alone would publish `&p=0` — the port `open_transports` reports
-/// when it binds nothing — which no phone can send to.
-pub(crate) fn start_session_state(
-    keypair: Ed25519KeyPair,
-    hostname: &str,
+/// publish **no** `p`/`ip4`/`ip6` at all and let the phone use BLE. Deriving it
+/// from `ports` alone would publish a port nothing can send to — the one
+/// `open_transports` reports when it binds nothing.
+pub(crate) fn pairing_endpoint(
     transports: EnabledTransports,
     ports: &PairingPorts,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
+) -> PairingEndpoint {
+    if !transports.network {
+        return PairingEndpoint::default();
+    }
+    PairingEndpoint {
+        udp_port: Some(ports.local_port),
+        ipv4,
+        ipv6,
+    }
+}
+
+/// Start the handshake machine for a session with this QR endpoint.
+pub(crate) fn start_session_state(
+    keypair: Ed25519KeyPair,
+    hostname: &str,
+    endpoint: PairingEndpoint,
     pinned: Option<PinnedAlgorithms>,
 ) -> Result<(ClientPairingState, StartedPairing), ProtocolError> {
-    let (udp_port, ipv4, ipv6) = if transports.network {
-        (ports.local_port, ipv4, ipv6)
-    } else {
-        // `0` is `ClientPairingState::start`'s "no UDP endpoint".
-        (0, None, None)
-    };
-    ClientPairingState::start(keypair, hostname, udp_port, ipv4, ipv6, pinned)
+    ClientPairingState::start(keypair, hostname, endpoint, pinned)
 }
 
 /// Open the pairing UDP port in the firewall.
@@ -1778,9 +1789,11 @@ mod tests {
         let (mut desktop, started) = ClientPairingState::start(
             desktop_identity,
             "thinkpad",
-            36692,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            None,
+            PairingEndpoint {
+                udp_port: Some(36692),
+                ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -1979,9 +1992,11 @@ mod tests {
         let (state, started) = ClientPairingState::start(
             desktop_identity,
             "thinkpad",
-            port,
-            Some(Ipv4Addr::LOCALHOST),
-            None,
+            PairingEndpoint {
+                udp_port: Some(port),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -2120,9 +2135,11 @@ mod tests {
         let (fresh_state, fresh_started) = ClientPairingState::start(
             fresh_identity,
             "thinkpad",
-            36_692,
-            Some(Ipv4Addr::LOCALHOST),
-            None,
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
             None,
         )
         .unwrap();
@@ -2441,9 +2458,17 @@ mod tests {
         let identity = || Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap();
 
         // A phone that offers the v1 suite still pairs, and pairs *as* v1.
-        let (mut desktop, started) =
-            ClientPairingState::start(identity(), "thinkpad", 36_692, None, None, Some(pinned))
-                .unwrap();
+        let (mut desktop, started) = ClientPairingState::start(
+            identity(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
+            Some(pinned),
+        )
+        .unwrap();
         let init = init_offering(
             started.session_id,
             &[SymmetricAlgorithm::Aes256Gcm],
@@ -2459,9 +2484,17 @@ mod tests {
 
         // A phone that offers only the reserved tag `2` is refused outright: it
         // advertises nothing the pinned suite can be honoured with.
-        let (mut desktop, started) =
-            ClientPairingState::start(identity(), "thinkpad", 36_692, None, None, Some(pinned))
-                .unwrap();
+        let (mut desktop, started) = ClientPairingState::start(
+            identity(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: None,
+                ipv6: None,
+            },
+            Some(pinned),
+        )
+        .unwrap();
         let mut init = init_offering(
             started.session_id,
             &[SymmetricAlgorithm::Aes256Gcm],
@@ -2612,14 +2645,15 @@ mod tests {
 
     /// A prepared session for the worker: the given socket (or none) and no BLE.
     fn worker_setup(udp: Option<UdpSocket>, local_port: u16) -> SessionSetup {
-        // `udp_port = 0` is `ClientPairingState::start`'s "no UDP endpoint", which
-        // is what `start_session_state` produces with the network transport off.
+        let endpoint = PairingEndpoint {
+            // The endpoint exists exactly when there is a socket to advertise.
+            udp_port: udp.is_some().then_some(local_port),
+            ..Default::default()
+        };
         let (state, started) = ClientPairingState::start(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            local_port,
-            None,
-            None,
+            endpoint,
             None,
         )
         .unwrap();
@@ -2711,10 +2745,12 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(false, true),
-            &ports,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            Some(Ipv6Addr::LOCALHOST),
+            pairing_endpoint(
+                EnabledTransports::new(false, true),
+                &ports,
+                Some(Ipv4Addr::new(192, 168, 1, 5)),
+                Some(Ipv6Addr::LOCALHOST),
+            ),
             None,
         )
         .unwrap();
@@ -2748,10 +2784,12 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(true, true),
-            &ports,
-            Some(Ipv4Addr::new(192, 168, 1, 5)),
-            None,
+            pairing_endpoint(
+                EnabledTransports::new(true, true),
+                &ports,
+                Some(Ipv4Addr::new(192, 168, 1, 5)),
+                None,
+            ),
             None,
         )
         .unwrap();
@@ -2773,14 +2811,16 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            EnabledTransports::new(false, true),
-            &PairingPorts {
-                udp: None,
-                local_port: 0,
-                firewall_guard: None,
-            },
-            None,
-            None,
+            pairing_endpoint(
+                EnabledTransports::new(false, true),
+                &PairingPorts {
+                    udp: None,
+                    local_port: 0,
+                    firewall_guard: None,
+                },
+                None,
+                None,
+            ),
             None,
         )
         .unwrap();
